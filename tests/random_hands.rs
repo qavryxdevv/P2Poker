@@ -177,8 +177,8 @@ fn play_hand(
             .filter(|&s| dealt_in[s as usize] && !round.folded[s as usize])
             .collect();
         // --- carry this street's commitments into the hand total ---------
-        for s in 0..seat_count as usize {
-            committed_hand[s] += round.committed[s];
+        for (total, this_street) in committed_hand.iter_mut().zip(&round.committed) {
+            *total += this_street;
         }
         carried += round.committed.iter().sum::<Chips>();
 
@@ -223,9 +223,7 @@ fn play_hand(
     );
 
     // Everything committed left the stacks; hand back what is won.
-    for s in 0..seat_count as usize {
-        stacks[s] = round.stack[s];
-    }
+    stacks.copy_from_slice(&round.stack);
     for r in &refunds {
         stacks[r.seat as usize] += r.amount;
     }

@@ -458,14 +458,28 @@ incoming action locally."* A rejected event leaves the state **bit-identical** (
 |---|---|---|
 | Wall-clock time | scheduler task, `LocalView::armed_timer` | never directly — only as a signed `TimeoutCertificate` event (D-006) |
 | OS randomness | `mental_poker` (`getrandom::SysRng`, `CRYPTO_LIBS.md` §1) and the RNG beacon | as committed then revealed 32-byte values, already agreed |
-| Network arrival order | `protocol` ordering buffer keyed by `(table_id, hand_id, sequence, previous_event_hash)` | the engine sees one total order; out-of-order events are buffered or rejected before `step` |
-| Duplicate / replayed messages | `protocol` replay filter (§14) | rejected before `step`; if one slips through, I21 makes it a no-op |
+| Network arrival order | `protocol` ordering buffer, keyed on the four envelope fields `PROTOCOL.md` §2.3 defines and §5.2 names for this purpose — **not reproduced here** (H8) | the engine sees one total order; out-of-order events are buffered or rejected before `step` (`PROTOCOL.md` §4.0 step 12) |
+| Duplicate / replayed messages | `protocol` replay filter — the anti-replay slot key is **one literal tuple in `PROTOCOL.md` §5.2.1** and its stored form is §5.3's; this document reproduces no part of either (D-011 rule 2) | rejected before `step` (`PROTOCOL.md` §4.0 step 10a); if one slips through, I21 makes it a no-op |
 | Signature validity | `protocol/signatures.rs`, `ed25519-dalek` `verify_strict` | an event reaches `step` only after its signature and canonicality gate pass |
 | Cryptographic verification | `mental_poker` | as `ShuffleVerified` / `ShuffleRejected` / `CardsOpened` verdicts |
 | My hole cards, my key share | `LocalView` | never |
 | Transport (direct vs relayed, RTT, `PeerId`) | `net`, `LocalView::transport` | never (D-001: a relay is a byte pipe and must not be visible to the rules) |
 | Hand-strength evaluator internals | `poker/evaluator.rs` façade over `rs_poker =5.0.0` | only the *derived* result — winner set per pot and chip deltas. `POKER_RULES.md` A′4 constraint 1: a third-party rank score must never enter the hashed state. |
 | Frame timing, animations, `hand_delay_ms` | GUI | never |
+
+**The ordering buffer's key and the anti-replay slot key are two different tuples, and confusing
+them is the M2 error (H8).** The first decides *where in the total order* an event goes; the second
+decides *whether a signer has already occupied a slot*, and is the predicate an `EquivocationProof`
+is built on. Neither is this document's, and neither is reproduced above: the ordering key is
+`PROTOCOL.md` §5.2's, over envelope fields §2.3 defines, and the slot key is §5.2.1's one literal
+tuple, stored as §5.3 bounds it. The previous revision printed the ordering key's four fields in
+the table cell above, unattributed, one column from the replay-filter row — which is exactly the
+adjacency that invites a reader to take it for the slot key and re-derive D-009 rule 1 from the
+wrong tuple. **Residual, recorded rather than resolved:** `PROTOCOL.md` §5.2 attributes the
+ordering buffer to *"`STATE_MACHINE.md` §3.2"*, while this row now points at `PROTOCOL.md`. Under
+D-011 rule 1 the wire's owner owns it — the buffer runs in `protocol`, over envelope fields, before
+`step` is ever called, and the engine cannot see it — so the pointer's direction is the right one
+and the sentence in §5.2 is the one to change. §13 carries it as an objection.
 
 ### 3.3 Canonical bytes and `STATE_HASH`
 

@@ -5,6 +5,13 @@
 `CRYPTOGRAPHY.md` §12 and `PROTOCOL.md` §9.6 already point here; this is the target
 those pointers were waiting for.
 
+**Swept against D-009 to D-012 on 2026-08-28**, the first sweep this document has
+ever had — before it, the file contained zero occurrences of all four. Three things
+changed: the authority order below became a pointer, §3's checklist was rewritten
+against the decisions as they now stand rather than against D-008 scoping that D-010
+had made inert, and §5's measured state was corrected against a run rather than
+against memory. §2.5 is the rule that should have caught this three passes ago.
+
 **Authority.** `docs/DECISIONS.md` outranks this file and every specification
 document, and **this file does not restate its contents** — not the decisions, not
 their numbers, not their count. That is D-011's one-normative-owner rule applied to a
