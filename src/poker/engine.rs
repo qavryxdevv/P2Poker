@@ -188,6 +188,97 @@ pub fn betting_is_closed(round: &BettingRound, dealt_in: &DealtIn) -> bool {
     }
 }
 
+/// Where the button and the blinds sit for one hand.
+///
+/// `button` and `small_blind` are **positions**, not necessarily occupied
+/// seats: under the dead-button rule either may land on a seat whose player has
+/// busted. `big_blind` is always a live seat — the big-blind position never
+/// dies, because somebody has to post it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Positions {
+    pub button: SeatIdx,
+    pub small_blind: SeatIdx,
+    pub big_blind: SeatIdx,
+}
+
+/// The next seat with chips, clockwise from `from`, excluding `from`.
+fn succ_alive(from: SeatIdx, alive: &[bool], seat_count: u8) -> Option<SeatIdx> {
+    ring_after(from, seat_count).find(|&s| alive[s as usize])
+}
+
+/// The two seats still holding chips, if exactly two do.
+fn the_two_alive(alive: &[bool]) -> Option<(SeatIdx, SeatIdx)> {
+    let mut it = alive.iter().enumerate().filter(|(_, &a)| a).map(|(s, _)| s as SeatIdx);
+    match (it.next(), it.next(), it.next()) {
+        (Some(a), Some(b), None) => Some((a, b)),
+        _ => None,
+    }
+}
+
+/// Positions for the first hand, given where the button starts.
+pub fn initial_positions(button: SeatIdx, alive: &[bool], seat_count: u8) -> Option<Positions> {
+    if alive.iter().filter(|&&a| a).count() < 2 {
+        return None;
+    }
+    if let Some((a, b)) = the_two_alive(alive) {
+        // Heads-up: the button *is* the small blind (TDA 34-B).
+        let (button, bb) = if alive[button as usize] { (button, if button == a { b } else { a }) } else { (a, b) };
+        return Some(Positions { button, small_blind: button, big_blind: bb });
+    }
+    let small_blind = succ_alive(button, alive, seat_count)?;
+    let big_blind = succ_alive(small_blind, alive, seat_count)?;
+    Some(Positions { button, small_blind, big_blind })
+}
+
+/// Advance the button and blinds for the next hand — the **dead button** rule.
+///
+/// TDA 32: "Tournament play will use a dead button." The blind positions move
+/// one seat *position* each hand regardless of who is still alive, so no player
+/// ever posts the big blind twice running and no player ever skips it:
+///
+/// ```text
+/// next_big_blind    = succ_alive(big_blind)   // the next survivor, clockwise
+/// next_small_blind  = big_blind               // the previous BB position
+/// next_button       = small_blind             // the previous SB position
+/// ```
+///
+/// If the new button position is empty the button is **dead** — it marks action
+/// order and the odd-chip start, nothing more. If the new small-blind position
+/// is empty the small blind is **dead**: it is simply not posted, and the pot is
+/// one small blind lighter.
+///
+/// This is deliberately **not** what PokerTH does. It shifts the dealer to the
+/// next surviving player (`src/engine/game.cpp:191-210`, whose own comment reads
+/// `// shifting dealer button -> TODO exception-rule !!!`), which lets a player
+/// post the big blind on two consecutive hands when the seat between the blinds
+/// busts. The preset is PokerTH's; this rule is the tournament standard.
+///
+/// Returns `None` when fewer than two seats still hold chips, which is the
+/// tournament's end condition rather than an error.
+pub fn advance_positions(prev: Positions, alive: &[bool], seat_count: u8) -> Option<Positions> {
+    // Guarded explicitly rather than left to `succ_alive`, which wraps the
+    // whole ring and would hand back the lone survivor as its own successor.
+    if alive.iter().filter(|&&a| a).count() < 2 {
+        return None;
+    }
+    if let Some((a, b)) = the_two_alive(alive) {
+        // Heads-up: alternate the big blind, and the other seat is both button
+        // and small blind. Stated directly rather than derived, because the
+        // TDA 34-B adjustment exists precisely so the general rotation cannot
+        // hand one player the big blind twice.
+        let big_blind = if prev.big_blind == a { b } else { a };
+        let other = if big_blind == a { b } else { a };
+        return Some(Positions { button: other, small_blind: other, big_blind });
+    }
+
+    let big_blind = succ_alive(prev.big_blind, alive, seat_count)?;
+    Some(Positions {
+        button: prev.small_blind,
+        small_blind: prev.big_blind,
+        big_blind,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +514,112 @@ mod tests {
         );
         r.apply(0, Action::Call).unwrap();
         assert!(betting_is_closed(&r, &dealt));
+    }
+
+    #[test]
+    fn with_a_full_table_the_positions_simply_advance_by_one() {
+        let alive = [true; 5];
+        let mut pos = initial_positions(0, &alive, 5).unwrap();
+        assert_eq!(pos, Positions { button: 0, small_blind: 1, big_blind: 2 });
+
+        for expected in [
+            Positions { button: 1, small_blind: 2, big_blind: 3 },
+            Positions { button: 2, small_blind: 3, big_blind: 4 },
+            Positions { button: 3, small_blind: 4, big_blind: 0 },
+        ] {
+            pos = advance_positions(pos, &alive, 5).unwrap();
+            assert_eq!(pos, expected);
+        }
+    }
+
+    /// The case the dead button exists for. PokerTH, which moves the button to
+    /// the next surviving player, would give one seat the big blind twice here.
+    #[test]
+    fn the_button_may_land_on_a_busted_seat_rather_than_repeat_a_big_blind() {
+        // Five seats; seat 3 busts after the hand where it was the big blind.
+        let mut alive = [true; 5];
+        let pos = Positions { button: 1, small_blind: 2, big_blind: 3 };
+        alive[3] = false;
+
+        let next = advance_positions(pos, &alive, 5).unwrap();
+        assert_eq!(next.big_blind, 4, "the next survivor posts the big blind");
+        assert_eq!(next.small_blind, 3, "the previous BB position, now empty");
+        assert!(!alive[next.small_blind as usize], "so the small blind is dead");
+        assert_eq!(next.button, 2, "the previous SB position");
+
+        // The point: seat 4 has the big blind now and seat 0 next, so nobody
+        // posts it twice.
+        let after = advance_positions(next, &alive, 5).unwrap();
+        assert_eq!(after.big_blind, 0);
+        assert_ne!(after.big_blind, next.big_blind);
+    }
+
+    #[test]
+    fn heads_up_the_button_is_the_small_blind_and_the_big_blind_alternates() {
+        let alive = [true, false, true, false];
+        let mut pos = initial_positions(0, &alive, 4).unwrap();
+        assert_eq!(pos.button, pos.small_blind, "TDA 34-B: the button is the SB");
+
+        let first_bb = pos.big_blind;
+        pos = advance_positions(pos, &alive, 4).unwrap();
+        assert_ne!(pos.big_blind, first_bb, "the big blind must alternate");
+        assert_eq!(pos.button, pos.small_blind);
+
+        pos = advance_positions(pos, &alive, 4).unwrap();
+        assert_eq!(pos.big_blind, first_bb, "and alternate back");
+    }
+
+    /// The invariant TDA 32 is written to produce, checked over a long run with
+    /// players busting at arbitrary moments: **nobody posts the big blind twice
+    /// running.** This is the property, not the formula, so it is asserted
+    /// directly rather than inferred from the positions.
+    #[test]
+    fn no_seat_ever_posts_the_big_blind_twice_in_a_row() {
+        for seed in 0..64u64 {
+            let mut alive = [true; 6];
+            let mut pos = initial_positions(0, &alive, 6).unwrap();
+            let mut previous_bb = pos.big_blind;
+            let mut rng = seed | 1;
+
+            for hand in 0..200 {
+                // Deterministic xorshift; bust a seat now and then.
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                if hand % 7 == 0 {
+                    let victim = (rng % 6) as usize;
+                    if alive.iter().filter(|&&a| a).count() > 2 {
+                        alive[victim] = false;
+                    }
+                }
+
+                let Some(next) = advance_positions(pos, &alive, 6) else {
+                    break; // fewer than two seats left: the tournament is over
+                };
+                assert!(
+                    alive[next.big_blind as usize],
+                    "seed {seed} hand {hand}: the big blind must be a live seat"
+                );
+                assert_ne!(
+                    next.big_blind, previous_bb,
+                    "seed {seed} hand {hand}: seat {} posted the big blind twice running",
+                    next.big_blind
+                );
+                previous_bb = next.big_blind;
+                pos = next;
+            }
+        }
+    }
+
+    #[test]
+    fn a_field_of_one_has_no_next_hand() {
+        let alive = [true, false, false];
+        let pos = Positions { button: 0, small_blind: 0, big_blind: 0 };
+        assert_eq!(
+            advance_positions(pos, &alive, 3),
+            None,
+            "fewer than two seats with chips is the end condition, not an error"
+        );
     }
 
     #[test]
