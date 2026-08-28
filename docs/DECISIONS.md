@@ -987,6 +987,89 @@ quietly upgraded.
 
 ---
 
+---
+
+## D-011 — One normative owner per concept, and the slot key written down once
+
+**Date:** 2026-08-28
+**Status:** accepted
+**Source:** Phase 2 gate, blockers P3, G1, G2, G3
+**Reinforces:** D-009, D-010
+
+### What the fifth pass showed
+
+D-010 worked on the axis it was aimed at. No defect in that pass moves an
+honest peer's chips, and the corpus got smaller. But four blockers remain, and
+the gate's own summary is the useful part: three of them are **one
+disagreement seen from three angles**. `PROTOCOL.md` and `STATE_MACHINE.md` do
+not agree on the terminal stage's shape, on its sequence number, or on what may
+trigger it — and all three determine where one hand ends and the next begins.
+
+That is not three defects either. It is the consequence of two documents both
+being normative about the same thing. Every pass they are edited by different
+agents, and every pass they drift apart again. Five passes is enough evidence.
+
+The fourth blocker is mine: `NETWORK_STACK.md` was left out of the D-010 pass
+on the judgement that it was unaffected. It was not — D-010 point 3 forbids
+automated eviction, and eviction is a transport action. That document has zero
+mentions of D-010 and ten places that block a peer on a proof, which is exactly
+what turns a liveness bug into an attack on an honest peer.
+
+### Rule 1 — one normative owner per concept
+
+- **`PROTOCOL.md` owns the wire**: message shapes, the event envelope, the
+  chain, sequence numbers, the anti-replay slot, canonical bytes, and what a
+  receiver validates.
+- **`STATE_MACHINE.md` owns state and transitions**: phases, guards, legal
+  actions, pots and invariants.
+- **`CRYPTOGRAPHY.md` owns the constructions.**
+- **`NETWORK_STACK.md` owns transport, discovery and connectivity.**
+- **`THREAT_MODEL.md` owns classifications**, and restates nothing.
+
+A document may **reference** another's definition and must not restate it. Where
+a restatement exists today, it is deleted and replaced with a pointer naming the
+section. Where two documents currently disagree, the owner wins — which for
+P3, G1 and G2 means `PROTOCOL.md` decides the terminal stage, and
+`STATE_MACHINE.md` follows it.
+
+This is the rule that stops the drift, because a copy is what drifts.
+
+### Rule 2 — the anti-replay slot key is one concrete tuple, written once
+
+D-009 rule 1 said the slot key must include every field that legitimately
+varies. It was right and it has now been violated a **fifth** time: **G1**, the
+terminal `HAND_ABORT`, because `event_type` is not in the key, so an honest peer
+that already contributed to a stalled stage signs a second body into an occupied
+slot and incriminates itself. The rule was prose, and prose was re-derived
+differently by each editor.
+
+So the key stops being a principle and becomes a definition, in `PROTOCOL.md`,
+in one place, as a literal tuple, including `event_type` and every other field
+that legitimately varies. Every other document points at it by section number
+and never reproduces it. Any message whose honest emission can collide in that
+key is a defect in the message, not in the key.
+
+### Rule 3 — D-010 point 3 binds every layer, including transport
+
+No automated eviction anywhere: no `block_peer`, no unseating, no allow/block
+list driven by a protocol proof, in any document. A proof is evidence for a
+human. The user may always choose not to play with someone; the protocol may
+not choose for them.
+
+### Why this is the last structural rule
+
+Five passes have each found the same two shapes: a copy that drifted, and a
+consequence that made an attack worth mounting. D-010 removed the consequences.
+D-011 removes the copies. If a sixth pass finds a defect of either shape, the
+right response is not a sixth rule but to cut the mechanism out of the MVP
+entirely, as D-010 did.
+
+The poker layer is not implicated in any of this and has been ready for two
+passes: the phases, the transitions, the determinism contract, the betting
+rules, the pot arithmetic. Implementation continues there while this closes.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |

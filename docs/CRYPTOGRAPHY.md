@@ -34,6 +34,18 @@ the system makes cheating impossible. §11 states precisely which attack classes
 cryptographically prevented, which are only detected, and which are outside the reach
 of the protocol.
 
+**D-010 governs every consequence in this document.** A cryptographic failure — an
+invalid shuffle proof, a bad DLEQ, a token published early or for an index that is not
+due, a share that never arrives — makes the hand **stop**, and the stop is **neutral**:
+stacks are restored to their start-of-hand values and no chips move, in any direction,
+for any cause. The transcript still records which peer failed; that record is
+**evidence with no automatic consequence**. Nothing in this version block-lists,
+unseats or penalises a peer on the strength of a proof, and no proof or certificate
+moves a chip. Wherever this document says a peer is *attributed*, it means exactly
+that a signed observation enters the transcript — never that anything is taken from
+them. The accepted cost is stated plainly in §2.10 and §11: the rage-quit escape
+returns, and a losing player who goes silent gets their chips back.
+
 ---
 
 ## 1. Summary table
@@ -237,6 +249,12 @@ verifies it. A proof that fails is `INVALID_SHUFFLE_PROOF`: the hand stops, and 
 shuffler is named as the source of the protocol failure, per `SPEC_CS.md` §8. There is
 no "continue anyway" path.
 
+The stop is a **neutral abort** (D-010): stacks return to their start-of-hand values
+and nothing is taken from the shuffler. Naming it is a record, not a sanction. This
+costs nothing here, because a bad shuffle proof is caught *before* any card is opened
+and before the pot has grown — the shuffle chain runs ahead of the first betting round
+(§2.9) — so there is no committed money for a forfeiture rule to redistribute anyway.
+
 ```rust
 // illustrative, from probe-cryptodoc — the whole chain for two players
 let (d1, p1) = shuffle.shuffle_initial_deck(&mut rng, apk, ctx);
@@ -418,7 +436,11 @@ binds each token to `(table_id, hand_id, street, card_index)` and the rule is:
   violation to reject and attribute to `P`.
 
 Any token failing either test is rejected and its sender attributed. See §8 rule 3 and
-§8 rule 4.
+§8 rule 4. **Rejection is the whole enforcement.** An illegitimate token never reaches
+the aggregation step, so it cannot open a card it should not open; that is the property
+that matters and it is complete on its own. The attribution that follows is a signed
+line in the transcript and nothing more — under **D-010** it moves no chips and removes
+no player.
 
 ### 2.8 The board, street by street
 
@@ -441,7 +463,8 @@ token for the river index during the pre-flop betting round. Our rules:
 
 1. A token whose `card_index` is not due at the current street is **rejected** and its
    sender attributed. It is a detectable protocol violation, exactly like an invalid
-   shuffle proof.
+   shuffle proof. Rejecting it is what protects the card; the attribution is a record
+   with no automatic consequence (D-010).
 2. Publishing a token is an **automatic client action**, never a human decision. This
    is the load-bearing observation behind **D-006**: a player who walks away from the
    keyboard still cooperates cryptographically, so the board opens on schedule, the
@@ -450,9 +473,13 @@ token for the river index during the pre-flop betting round. Our rules:
    **when the required voter set `V` (`PROTOCOL.md` §8.3) has at least two members;
    when `|V| < 2` the deadline is advisory (D-007, D-008)** — never an abort, and
    never anything that ends the tournament. The scope is `|V|`, never the seat count
-   `n`: see §2.10.
+   `n`: see §2.10. An auto check/fold is **not** a penalty and D-010 does not remove
+   it: it is the ordinary poker treatment of a missed decision, identical to the live
+   rule, and it moves chips only as normal play does — never as a sanction, never
+   beyond what the player had already committed.
 3. **There are no burn cards.** Indices `2m+5 … 51` are never opened and a reveal token
-   for any of them is a protocol violation, attributed to its sender.
+   for any of them is a protocol violation, rejected, and attributed to its sender as a
+   record only.
 
 ### 2.9 The complete per-hand sequence
 
@@ -464,7 +491,8 @@ KEY_SETUP            each player: (sk_i, pk_i, OwnershipProof) ; verify all     
                      apk = Σ pk_i                                                  (33 B each)
   ↓
 SHUFFLE_STEP × n     player k: D_k + ShuffleProof<52>, everyone verifies       (5547 + 3432 B)
-  ↓   any proof fails → INVALID_SHUFFLE_PROOF, hand stops, shuffler attributed
+  ↓   any proof fails → INVALID_SHUFFLE_PROOF, hand stops NEUTRALLY (stacks restored,
+  ↓                     D-010), shuffler named in the transcript as a record only
 DECK_COMMIT          hash of the final verified deck enters the transcript
   ↓
 DEAL_PRIVATE         broadcast: each dealt-in seat emits one message carrying its token
@@ -512,47 +540,52 @@ Barnett–Smart with an n-of-n key has a hard, structural consequence: **any dea
 player who stops publishing tokens makes it impossible for anyone to open any further
 card.** Not the board, not the showdown. This is inherent, not a defect of ziffle.
 
-Per **D-005** and `SPEC_CS.md` §19:
+Per **D-005**, **D-010** and `SPEC_CS.md` §19:
 
 * If the hand can still be decided without opening anything — everyone else folds to
-  one player — it completes normally. No tokens are needed, so a player who quits to
-  escape a loss does not escape if the others simply fold.
-* Otherwise the hand **aborts**. When the required voter set `V` (`PROTOCOL.md` §8.3)
-  has at least two members, the abort carries a signed record naming the peer that
-  failed to publish; the absent player's committed chips are forfeited and
-  distributed to the remaining players in proportion to their own contributions.
-  Restoring stacks would hand every player a free escape from a losing pot, which is an
-  in-protocol exploit available to anyone; forfeiture closes it, at the cost of a
-  documented DoS incentive that the threat model classifies as out of scope, not solved.
-  The deadline machinery that carries this is a certificate signed by **every member of
-  `V`**, and it has effect only **when `|V| >= 2` (D-007, D-008)**.
-* **When `|V| < 2` there is no attribution and no forfeiture.** A certificate whose
-  required voter set has fewer than two members rests on one peer's unilateral
+  one player — it completes normally. No tokens are needed. This is the one case where
+  a player who quits to escape a loss does not escape, and it is worth noting that it
+  costs no machinery at all: the others simply fold, and ordinary poker finishes the
+  hand.
+* Otherwise the hand **aborts, and the abort is neutral.** Stacks are restored to their
+  start-of-hand values. **No chips move on an abort, in any direction, for any cause**
+  (D-010 point 1). The transcript still records which peer stopped publishing, and that
+  record is still signed and verifiable — but it is **evidence with no automatic
+  consequence** (D-010 point 2). Nothing block-lists, unseats or penalises the named
+  peer (D-010 point 3).
+* **This is the same outcome whatever `|V|` is, and that is the point.** The abort is
+  neutral when the required voter set `V` (`PROTOCOL.md` §8.3) has two or more members
+  and neutral when it has fewer, so `|V|` no longer selects between two chip outcomes —
+  there is only one. What `|V|` still selects is whether a peer gets **named**:
+  * With `|V| >= 2` a complete, valid certificate can form, and the abort carries the
+    name of the peer that failed. That name is a record.
+  * With `|V| < 2` **the certificate is inert, and the two halves of that must not be
+    run together into one sentence** (D-009 rule 2, finding M1). First: the certificate
+    itself has *no effect at all* — it is not chained, it is not evidence, it produces
+    no `AbortRecord`, it terminates nothing. It is silently ignored, at every table size
+    and for `kind = Crypto` as much as for anything else. The hand does **not** end
+    there. Second, and separately: the hand ends later, at `hand_deadline_ms` under
+    `PROTOCOL.md` §8.4, on a local timer expiry that every peer reaches from the same
+    signed `HAND_INIT` and the same relative duration rather than on anybody's
+    certificate — and *that* abort names nobody (`attributed = []`). Liveness is not
+    owed in between: `SPEC_CS.md` §19 ranks security above finishing a hand
+    conveniently.
+
+  The reason a below-floor certificate stays inert even though it can no longer take
+  anything is unchanged and is not about chips: it rests on one peer's unilateral
   assertion that a deadline passed — or, at `|V| = 0`, on nobody at all — and no peer
-  can check that assertion: there is no trusted clock and no third party. **Such a
-  certificate is inert, and the two halves of that must not be run together into one
-  sentence** (D-009 rule 2, finding M1). First: the certificate itself has *no effect*
-  at all — it is not chained, it is not evidence, it produces no `AbortRecord`, it
-  terminates nothing and it forfeits nothing. It is silently ignored, at every table
-  size and for `kind = Crypto` as much as for anything else. The hand does **not** end
-  there. Second, and separately: the hand ends later, at `hand_deadline_ms` under
-  `PROTOCOL.md` §8.4, on a local timer expiry that every peer reaches from the same
-  signed `HAND_INIT` and the same relative duration rather than on anybody's
-  certificate — and *that* abort is the one which names nobody (`attributed = []`) and
-  restores stacks to their start-of-hand values. Liveness is not owed in between:
-  `SPEC_CS.md` §19 ranks security above finishing a hand conveniently. This reopens the
-  rage-quit escape
-  D-005 closes when `|V| >= 2`: a player facing a single-member voter set can escape a
-  losing pot by going silent. It is recorded as an unfixed limitation, not solved, and
-  the choice between restoration and forfeiture in that case is escalated as OQ-A
-  (`PROTOCOL.md` §12, `THREAT_MODEL.md` §9.2).
+  can check that assertion, because there is no trusted clock and no third party. A
+  claim nobody can check does not belong in the chain whether or not it pays.
 * **The scope is `|V|`, never the seat count `n` (D-008).** Heads-up is the case where
   `|V| = 1` always — the voter set is the one opponent — but it is not the only one.
   `V` is the dealt-in seats minus the subject minus every seat a *completed, valid*
   certificate has already named, so at a larger table enough completed attributions
   reduce `|V|` to one and the same rule applies there. Being voted against is not
   exclusion, which is what stops `V` being collapsed by assertion. Any rule in this
-  corpus still written on `n` is a defect.
+  corpus still written on `n` is a defect. D-010 shrinks what this scoping protects —
+  a collapsed `V` no longer wins anybody's chips — but it does not retire it: a
+  manufactured certificate can still put a false name in the transcript, and the floor
+  is what stops that.
 * From the **next** hand the absent seat is simply not in `apk` (§2.1). Nothing waits
   for it.
 
@@ -560,15 +593,27 @@ Per **D-005** and `SPEC_CS.md` §19:
 ElGamal with Feldman or Pedersen VSS, so a quorum can finish without the missing
 player. We do **not** do this: with `t < n`, any `t` colluding players can decrypt
 *every* hole card at the table. That is precisely the trade `SPEC_CS.md` §19 forbids
-and it breaks the §35 main invariant. n-of-n stands; abort, and attribute where
-`|V| >= 2` allows it.
+and it breaks the §35 main invariant. n-of-n stands; abort neutrally, and name the
+failing peer where `|V| >= 2` allows a certificate to form.
+
+**The cost, stated plainly, because D-010 requires it and `SPEC_CS.md` §18 requires
+it.** **The rage-quit escape is back, at every table size.** A player who is losing a
+big pot can stop publishing tokens, the hand aborts, and their chips come back. D-005
+closed that with forfeiture; D-010 reopens it knowingly, because forfeiture is the
+prize that made four rounds of attacks worth mounting, and every one of those attacks
+ended in an *honest* peer's chips being taken. An exploit that lets a dishonest player
+escape a loss is worse for fairness and better for safety than one that robs an honest
+player, and that is the trade being made. It is a real regression, it is not solved,
+and no sentence in this corpus may imply otherwise.
 
 Recorded honestly: **a malicious player can always force a hand to abort by going
-silent.** It cannot steal cards, and when `|V| >= 2` it cannot steal chips either — it
-forfeits its own. When `|V| < 2` it recovers its own commitment, so going silent is a
-free escape from a losing pot; that is the unfixed limitation above. In both cases the
-mitigations are social (visible attribution where attribution exists, repeated-abort
-reputation), not cryptographic.
+silent, and always recovers its own commitment when it does.** It cannot steal cards —
+that property is cryptographic and is untouched — and it cannot take another player's
+chips either, because nothing moves. What it gets is a free exit from a losing pot and
+a line in the transcript. The mitigations are social and not cryptographic: the
+attribution is visible to everyone and permanent where a certificate formed, the client
+should show a per-identity abort count in the lobby, and sitting a repeat aborter out
+is a **user** decision, never a protocol action (D-010).
 
 ---
 
@@ -702,7 +747,7 @@ serialising. None of it invents a primitive.
 | 5 | **Street gating and index entitlement checks** on reveal tokens (§2.7, §2.8) | Policy: *when*, and *for which index*, a legitimate library operation may be applied. It adds no primitive; it constrains one |
 | 6 | **The signed, hash-chained event envelope** (§12/§13 of the spec) | Deterministic CBOR + Ed25519 + BLAKE3, all library primitives, composed in the standard way: length-prefixed, domain-separated, `previous_event_hash` chained. The signature prefix is `p2p-poker/v1/event`, defined byte-for-byte in `PROTOCOL.md` §13; this document does not restate it |
 | 7 | **The `DeckCrypto` trait boundary** (§9) | A Rust trait. No cryptographic content at all; it exists so ziffle can be swapped |
-| 8 | **Timeout certificates** (D-006) | `\|V\|`-of-`\|V\|` Ed25519 signatures — one from every member of the required voter set `V` (`PROTOCOL.md` §8.3) — over a canonical CBOR body naming seat, sequence and `previous_event_hash`. A multi-signature by concatenation, not an aggregate signature scheme — no new algebra. D-008's floor `\|V\| >= 2` is a protocol rule and not a cryptographic one: one signature is a perfectly valid multi-signature over one key, so nothing in this row rejects it and nothing here may be scoped on the seat count `n` |
+| 8 | **Timeout certificates** (D-006) | `\|V\|`-of-`\|V\|` Ed25519 signatures — one from every member of the required voter set `V` (`PROTOCOL.md` §8.3) — over a canonical CBOR body naming seat, sequence and `previous_event_hash`. A multi-signature by concatenation, not an aggregate signature scheme — no new algebra. D-008's floor `\|V\| >= 2` is a protocol rule and not a cryptographic one: one signature is a perfectly valid multi-signature over one key, so nothing in this row rejects it and nothing here may be scoped on the seat count `n`. Under **D-010** a certificate may still be *produced* — it is how a human or a later version adjudicates — but consuming one never moves a chip and never removes a player. Whether it should still be produced at all in the MVP is `DECISIONS.md` OQ-F, and it is `PROTOCOL.md`'s to settle, not this document's; the cryptography is the same multi-signature either way |
 | 9 | **The profile key-slot file format** (§10) | An envelope around library AEAD and library KDF. The AEAD's associated data binds the header, so no slot can be stripped or swapped |
 
 **Nothing in this table defines a cipher, a hash function, an RNG, a zero-knowledge
@@ -905,6 +950,36 @@ Field order is exactly as listed and is part of the protocol.
 `shuffle_round = 0xFF` applies to the `ctx` used for `DECK_INIT` ownership proofs and
 for reveal-token DLEQ proofs; those are not shuffle-chain steps and must not share a
 `ctx` with one.
+
+**Re-verified byte-identical against `PROTOCOL.md` §4.5, 2026-08-28, after the D-010
+pass.** The two blocks were extracted from both files and compared as strings rather
+than read side by side, because reading is how the last drift got missed. They are
+equal — field order, the seven parts, every inline comment, the `0xFF` sentinel and the
+`[ … ]` brackets around `u8(shuffle_round)`. `PROTOCOL.md` §4.5 owns the construction;
+this is a reproduction, and if the two ever differ, §4.5 wins.
+
+`PROTOCOL.md` §4.5, quoted verbatim:
+
+```
+ctx = h("p2p-poker v1 deck-ctx", [
+          u16_be(protocol_version),   //  2 B
+          table_id,                   // 32 B  the table's Ed25519 public key
+          session_id,                 // 32 B  = SPEC_CS.md §14/§20 "session nonce"
+          u64_be(hand_id),            //  8 B
+          u64_be(sequence),           //  8 B  the chain stage index of the event carrying the proof
+          [ u8(shuffle_round) ],      //  1 B  0-based position of this shuffler in the chain;
+                                      //       0xFF for every ctx that is not a shuffle step
+          sender_public_key           // 32 B  the emitter's application Ed25519 key
+      ])
+```
+
+and this document's copy, immediately above, is the same bytes. **Verification: (a)
+executed** — both blocks read out of the two files and compared for equality, result
+`True`. D-010 could not have touched this and did not: `ctx` is the Fiat–Shamir binding
+for a *deck proof* under `"p2p-poker v1 deck-ctx"`, it carries no attribution, no
+certificate and no chip rule, and the certificate's own digest is separately
+domain-separated under `"p2p-poker v1 timeout-cert"` (`PROTOCOL.md` §2.8). Nothing D-010
+deletes is reachable from either.
 
 This supersedes the raw-concatenation form
 (`"p2ppoker/v1" ‖ 0x00 ‖ … ‖ session_nonce ‖ …`) that earlier drafts of this section
@@ -1324,10 +1399,30 @@ both:
   **Verification: (b) source** — `rand-0.8.8/Cargo.toml` `[features]`,
   `small_rng = []`; **(a) executed** — `cargo tree -e features -i rand@0.8.8` resolves
   exactly `alloc`, `default`, `getrandom`, `libc`, `rand_chacha`, `std`, `std_rng`
-  across both its consumers, `ark-std 0.5.0` and `libp2p-autonat 0.15.0`. `rand 0.10.2`
-  has no `small_rng` feature at all — `rand-0.10.2/Cargo.toml` l. 58–74 — but resolves
-  `std_rng`, `sys_rng` and `thread_rng`. So across the three majors: `StdRng` is in the
-  build at all three, `thread_rng` at 0.9.5 and 0.10.2, `SmallRng` at 0.9.5.
+  across both its consumers, `ark-std 0.5.0` and `libp2p-autonat 0.15.0`.
+
+  **`rand 0.10.2` has no `small_rng` feature at all — and a third pass nearly wrote
+  that down as a third absence.** It is not one. The feature was removed because the
+  type stopped being optional: `rand-0.10.2/src/rngs/mod.rs` declares `mod small;` at
+  l. 97 and `pub use self::small::SmallRng;` at l. 106 with **no `cfg` attribute**,
+  where `rand-0.9.5/src/rngs/mod.rs` has `#[cfg(feature = "small_rng")]` on both
+  (l. 87, l. 102). The same file also exports `Xoshiro128PlusPlus` and
+  `Xoshiro256PlusPlus` ungated. So `SmallRng` is compiled in at 0.10.2 **more**
+  unconditionally than at 0.9.5, not less.
+  **Verification: (b) source** — `rand-0.10.2/Cargo.toml` `[features]` l. 58-74 (no
+  `small_rng` key) and `rand-0.10.2/src/rngs/mod.rs` l. 97-110 read in full; **(a)
+  executed** — `cargo tree -e features -i rand@0.10.2` resolves `alloc`, `default`,
+  `getrandom`, `std`, `std_rng`, `sys_rng`, `thread_rng`.
+
+  So across the three majors — and this table, not any sentence about a feature, is the
+  form the fact may be stated in:
+
+  | | `rand` 0.8.8 | `rand` 0.9.5 | `rand` 0.10.2 |
+  |---|---|---|---|
+  | `StdRng` | in the build | in the build | in the build |
+  | `SmallRng` | not in the build | **in the build** (default feature) | **in the build**, ungated |
+  | `ThreadRng` | not in the build | in the build | in the build |
+  | Xoshiro128/256++ | — | — | in the build, ungated |
 * `StdRng` *is* present, and ziffle uses it deliberately and correctly for
   *deterministic public constants only* — the Pedersen generators and the 52 open-deck
   points, each seeded from a fixed SHA-256 of a public label. That is a
@@ -1372,8 +1467,12 @@ rule 3 exists.** The first pass replaced *"the `rand` crate is absent"* with
 stated over the whole build, still false at `rand 0.9.5`. Any document restating this
 section carries the *discipline* and the test that enforces it, never an absence:
 `PROTOCOL.md` §4.4 and `THREAT_MODEL.md` A7 must therefore drop "`SmallRng` is absent"
-in every form, and `research/CRYPTO_LIBS.md` §7.3's 0.8-only check must gain the 0.9.5
-line above. **No security property of this project may be stated as the absence of
+in every form, and `research/CRYPTO_LIBS.md`'s 0.8-only check must gain the 0.9.5 line
+above. **Done in the research note, 2026-08-28:** that check has been replaced by
+`CRYPTO_LIBS.md` §1.2.1, which carries the integrated picture including the 0.10.2
+ungated export, and §1.2.2, which carries the discipline and the test; its §7.3.4
+tabulates every remaining absence claim in that file against `Cargo.lock` and
+`cargo tree`. **No security property of this project may be stated as the absence of
 something from the dependency tree** (`DECISIONS.md` D-009 rule 3).
 
 **The enforceable discipline, in the words of the document that owns the integrated
@@ -1441,14 +1540,23 @@ combine:       seed = h("p2p-poker v1 rng-beacon", [ r_1, …, r_n ])
    reveal is accepted. The ordering is enforced by the state machine and by
    `previous_event_hash`, not by wall-clock timing.
 5. Failing to reveal after committing is a protocol failure attributable to that peer,
-   handled exactly like a missing decryption share (§2.10). It is *not* an opportunity
-   to re-randomise: the seed is computed over the committed set, and a non-revealer is
-   excluded and named, never allowed to force a re-run.
+   handled exactly like a missing decryption share (§2.10): the table setup **stops
+   neutrally** — no chips are at stake yet, since this beacon runs once per table in
+   the setup chain and before any hand — and the peer that did not reveal is named in
+   the transcript as a record. Under **D-010** nothing further follows: it is not
+   unseated, not block-listed and not penalised. It is *not* an opportunity to
+   re-randomise either: a non-revealer must never be able to force a re-run that
+   resamples the draw, and the rule that closes that is point 4's — every commitment is
+   chained before any reveal is accepted — not a sanction.
 
-Point 5 matters. A "last revealer" who can abort and force a fresh beacon gets to
+Point 5 matters. A "last revealer" who can stall and force a fresh beacon gets to
 resample the seat draw. Because this beacon decides only seating and the initial
-button — never cards — the value of that attack is small, but the rule closes it
-anyway.
+button — never cards — the value of that attack is small; and because the commit set is
+fixed in the chain before any reveal is seen, a re-run starts from the same committed
+values rather than from a free hand. Note honestly what is *not* closed: a peer that
+withholds its reveal denies the table its beacon, and under D-010 that costs it
+nothing. That is the same liveness/DoS trade as §2.10, at a point in the session where
+no chips are committed, so it is strictly cheaper than the in-hand case.
 
 `ziffle` provides none of this; it is ours (§5.2 item 3), and it is a plain hash
 commitment over a library hash, so §6 and §36 are satisfied.
@@ -1491,8 +1599,9 @@ independently reproduced in `probe-cryptodoc` as `[2] … None`.
    itself, i.e. from our own `Verified<MaskedDeck<52>>`. Never against a `MaskedCard`
    handed to us on the wire.
 3. Publish a token **only** for an index that is due (§2.7, §2.8), and **never for
-   one's own hole index before `SHOWDOWN_REVEAL`**. Both are protocol violations,
-   attributed to the sender.
+   one's own hole index before `SHOWDOWN_REVEAL`**. Both are protocol violations: the
+   receiver **rejects** the token, which is the enforcement, and names the sender in
+   the transcript, which under **D-010** is a record with no automatic consequence.
 4. Tokens are carried inside the signed CBOR envelope, bound to
    `(table_id, hand_id, street, card_index)`, because the DLEQ itself does not bind
    them (§6.4 item 2).
@@ -1647,21 +1756,30 @@ scoped `deny.toml` ignore is now required unconditionally, not only when `dcbor`
 present, and the ignore comment must say so. `cargo audit` still exits 0; `cargo deny
 check advisories` treats unmaintained as a failure without the ignore.
 
-**Finding 2, changing `CRYPTO_LIBS.md` §7.3.** That document's `rand` row reads *"crate
-not in the tree at all"*, which is stale: `rand` re-enters through `ark-std 0.5.0`
+**Finding 2, changing `CRYPTO_LIBS.md` §7.3.** That document's `rand` row read *"crate
+not in the tree at all"*, which was stale: `rand` re-enters through `ark-std 0.5.0`
 (§7.2). The advisory was never evaluated against the version actually pulled in. The
-corrected row, which `CRYPTO_LIBS.md` §7.3 now carries verbatim:
+correction that was issued read:
 
 > `rand` — RUSTSEC-2026-0097 — **in the runtime tree at 0.8.8 via `ark-std 0.5.0`.
 > `informational = "unsound"`, patched at `>= 0.8.6`, so the pinned version is
 > patched. The unsound path requires `rand::thread_rng` inside a custom `log`
 > implementation, which does not occur here.**
 
+**That correction was itself too narrow**, in the same way and for the same reason as
+the `SmallRng` one: `rand` is in the runtime tree at **three** majors, not one, and only
+one of the three arrives through `ark-std`. `CRYPTO_LIBS.md` §7.3.1 now carries the
+three-major row, and its §1.2.1 carries the feature picture. The advisory conclusion is
+unchanged — `0.8.8 >= 0.8.6`, `0.9.5 >= 0.9.3`, `0.10.2 >= 0.10.1`, so every resolved
+version clears a patch line — but it clears it *three times over*, and each one has to
+be re-checked after a `cargo update` rather than filed away.
+
 **Verification: (c) registry** — the local advisory database,
 `~/.cargo/advisory-db/crates/rand/RUSTSEC-2026-0097.md`: `informational = "unsound"`,
-`patched = [">= 0.10.1", "< 0.10.0, >= 0.9.3", "< 0.9.0, >= 0.8.6"]`, and
-`0.8.8 >= 0.8.6`. `rand_chacha 0.3.1` and `rand_core 0.6.4` enter with it and are added
-to `CRYPTO_LIBS.md` §10's version list.
+`patched = [">= 0.10.1", "< 0.10.0, >= 0.9.3", "< 0.9.0, >= 0.8.6"]`. **(a) executed** —
+`cargo tree --edges normal -i rand@{0.8.8,0.9.5,0.10.2}` at the repository root.
+`rand_chacha 0.3.1` and `rand_core 0.6.4` enter with 0.8.8 and are in
+`CRYPTO_LIBS.md` §10's version list.
 
 Note what this does *not* say: the advisory being benign here is a fact about our usage,
 not a structural guarantee. §7 is enforced by the §12 item 6 lint (OQ-8), not by the
@@ -1861,10 +1979,14 @@ and a bespoke SHA-256 transcript rather than merlin raises the stakes.
 proof valid under one sub-argument's challenges and invalid under the other's.
 
 **OQ-3 — Is our `ctx` binding sufficient against every replay?**
-The canonical form is settled: `ctx = h("p2p-poker v1 deck-ctx", [u16_be(
-protocol_version), table_id, session_id, u64_be(hand_id), u64_be(sequence),
-u8(shuffle_round), sender_public_key])`, normative in `PROTOCOL.md` §4.5 and reproduced
-in §6.4. **What is not settled is whether that binding is sufficient**, which is a
+The canonical form is settled: seven fields, hashed with the length-prefixed
+domain-separated constructor under `"p2p-poker v1 deck-ctx"`, normative in
+`PROTOCOL.md` §4.5 and reproduced **once**, in §6.4. *(An inline reflowed restatement
+used to sit here and had already drifted — it had lost the `[ … ]` brackets around
+`u8(shuffle_round)`. It is deleted rather than repaired: one reproduction of a
+byte-exact construction is a cross-reference, two are a divergence waiting to happen,
+and this document already owns nothing of `ctx` but the copy in §6.4.)* **What is not
+settled is whether that binding is sufficient**, which is a
 different question and stays open. It is only as strong as our own construction, and
 `ctx` is *our* bug to make, not ziffle's. In particular the DLEQ challenge does not bind
 card index or street, so token replay within a hand is prevented by our envelope alone.
@@ -1914,20 +2036,26 @@ complaint or if OQ-1's review results in a fork anyway.
 `rand 0.9.5` and `rand 0.10.2` enter through other libp2p subtrees
 (`research/INTEGRATION.md` §2, re-verified in §9). This contradicts
 `CRYPTO_LIBS.md` §1.2's plan to enforce §7 through the dependency graph, and no
-dependency choice open to us restores that plan. `SmallRng` does **not** stay out: an
-earlier form of this row claimed the feature was "not enabled anywhere in the
-workspace", which is false at `rand 0.9.5`, where `small_rng` is a **default** feature
-that `igd-next` and `yamux` take (§7.2, D-009 rule 3). `StdRng` is in the build at all
-three majors and is used by ziffle only for nothing-up-my-sleeve constants. The
-structural guarantee is gone and cannot be recovered.
+dependency choice open to us restores that plan. `SmallRng` does **not** stay out, and
+saying so has now taken three attempts: an earlier form of this row claimed the feature
+was "not enabled anywhere in the workspace", which is false at `rand 0.9.5`, where
+`small_rng` is a **default** feature that `igd-next` and `yamux` take; and the
+replacement risked implying it was therefore confined to 0.9.5, which is false at
+`rand 0.10.2`, where `SmallRng` is exported with **no feature gate at all** (§7.2,
+D-009 rule 3). `StdRng` is in the build at all three majors and is used by ziffle only
+for nothing-up-my-sleeve constants. The structural guarantee is gone and cannot be
+recovered, and no narrowing of the absence recovers any part of it.
 *Settled, and the risk is now residual rather than open:* the source scan in
 `src/security/rng.rs`
 (`tests::our_own_code_uses_no_generator_but_the_os_one`) fails the build if any file
 under `src/` mentions `StdRng`, `SmallRng`, `thread_rng`, `from_seed`, `seed_from_u64`
 or `rand::rngs`, and it was verified to bite by injecting a violation (§7.2, §12
-item 6). What remains open is only its reach: the scan is textual and covers this
-crate's own sources, so it catches a use, not an obfuscation, and it says nothing about
-the vendored ziffle, which is reviewed under OQ-1 instead.
+item 6). What remains open is only its reach, and there are now three known limits
+rather than two: the scan is textual, so it catches a use and not an obfuscation; it
+covers this crate's own sources and says nothing about the vendored ziffle, which is
+reviewed under OQ-1 instead; and its deny-list does not yet name `Xoshiro128PlusPlus`
+or `Xoshiro256PlusPlus`, which `rand 0.10.2` also exports ungated. The third is two
+lines of fix and is carried as item 7 of `research/CRYPTO_LIBS.md` §11.
 
 **OQ-9 — RUSTSEC-2024-0436 is now a runtime-tree finding.**
 `paste 1.0.15` (unmaintained) arrives through `ark-ff 0.5.0`, not only through the
@@ -1959,10 +2087,21 @@ like cryptography problems and are not:
   different humans. That needs an identity or reputation layer this project does not
   have.
 * **Denial of service, including the abort attack of §2.10.** A silent player always
-  forces a hand to abort. Detected and — when the required voter set has `|V| >= 2` —
-  attributed, never prevented. When `|V| < 2` it is detected and **not** attributed,
-  and the stacks are restored (§2.10, D-007, D-008, OQ-A). The scope is `|V|`, not the
-  seat count.
+  forces a hand to abort. Detected, never prevented — and under **D-010** never
+  punished: the abort is neutral, stacks return to their start-of-hand values, and the
+  attribution is a record with no automatic consequence. Whether the failing peer is
+  *named* still depends on `|V|` (named when a certificate can form at `|V| >= 2`, not
+  named at `|V| < 2`, where the hand ends on the `hand_deadline_ms` timer instead), and
+  the scope is `|V|`, never the seat count. What no longer depends on `|V|` is the chip
+  outcome: it is restoration in both cases.
+* **Escaping a losing pot by going silent — the rage-quit escape.** This is *not*
+  solved, at any table size, and D-010 reopened it deliberately. A player about to lose
+  a big pot can stop publishing tokens and get their chips back. The alternative,
+  forfeiture, was measured over four adversarial passes and repeatedly took chips from
+  *honest* peers instead; that is the worse failure, so this one is accepted and
+  recorded rather than hidden (`SPEC_CS.md` §18, D-010's cost section). The only
+  mitigations are social: a visible, permanent transcript record, a per-identity abort
+  count in the lobby, and a user's own decision not to sit with a repeat aborter.
 * **Traffic analysis**, made materially worse by relaying (D-001): a relay operator
   learns who talks to whom, when, and how much.
 * **Nothing above is fixed by making the cryptography stronger.** They belong in
@@ -1994,7 +2133,12 @@ and `PROTOCOL.md` §9.6 carries the same sentence for its own list.
 4. Run shuffle proving and verification on a worker thread (§6.5, spec §33).
 5. Reject, and attribute, any reveal token that is early, for an index not due at the
    current stage, or published by a seat for its own hole index before
-   `SHOWDOWN_REVEAL` (§2.7, §2.8).
+   `SHOWDOWN_REVEAL` (§2.7, §2.8). **Rejection is the enforcement; attribution is a
+   transcript record with no automatic consequence.** No code path may take a chip
+   from, or unseat, the attributed peer (D-010). An implementation that computes a
+   forfeiture or an eviction from any proof, certificate or attribution in this
+   document is wrong, and the adversarial suite should assert the neutrality directly:
+   after any abort, every stack equals its start-of-hand value.
 6. **Done** — the ban on `StdRng`, `SmallRng`, `thread_rng`, `from_seed`,
    `seed_from_u64` and `rand::rngs` in our own crates (OQ-8) is enforced by
    `src/security/rng.rs`, whose test
@@ -2006,7 +2150,10 @@ and `PROTOCOL.md` §9.6 carries the same sentence for its own list.
    from `research/INTEGRATION.md` §2: *"Our own code draws cryptographic randomness
    only from `getrandom::SysRng`."* It is scoped to our own crates because the tree
    carries three `rand` majors and always will, with `SmallRng` compiled in at
-   `rand 0.9.5` — the absence is not available to be asserted (D-009 rule 3).
+   `rand 0.9.5` (a default feature) **and at `rand 0.10.2` (ungated)** — the absence is
+   not available to be asserted at any width (D-009 rule 3). The deny-list should gain
+   `Xoshiro128PlusPlus` and `Xoshiro256PlusPlus`, which 0.10.2 exports ungated
+   alongside `SmallRng` and which the current list does not name (OQ-8).
    **Verification: (a) executed** — the test passes clean, and was verified to fail on
    an injected violation (§7.2).
 7. Deserialise every arkworks wire object with `Validate::Yes`, and impose an explicit
@@ -2081,6 +2228,10 @@ ark-std-0.5.0/Cargo.toml          rand 0.8 with std_rng, default-features = fals
 rand-0.8.8/Cargo.toml             small_rng is a separate, unenabled feature -- at 0.8 only
 rand-0.9.5/Cargo.toml             l. 66-72: small_rng and thread_rng are DEFAULT features
 rand-0.10.2/Cargo.toml            l. 58-74: no small_rng feature exists at 0.10
+rand-0.10.2/src/rngs/mod.rs       l. 97-110: SmallRng and both Xoshiro types exported
+                                  UNGATED -- the feature is gone because the type is
+                                  no longer optional, not because the type is gone
+rand-0.9.5/src/rngs/mod.rs        l. 87, 102: #[cfg(feature = "small_rng")] on both
 igd-next-0.16.2/Cargo.toml        l. 148: rand "0.9.0", defaults taken -> small_rng on
 yamux-0.13.10/Cargo.toml          l. 57:  rand "0.9.0", defaults taken -> small_rng on
 hickory-proto-0.25.2/Cargo.toml   l. 318: rand "0.9", default-features = false
@@ -2096,9 +2247,9 @@ libp2p-autonat-0.15.0/Cargo.toml         `[dependencies.rand] version = "0.8"` (
 
 | Document | Direction and content |
 |---|---|
-| `THREAT_MODEL.md` | **carries from here:** §11's OQ list; the §11 "does not solve" list; the abort attack of §2.10 with its DoS trade from D-005 and its unattributed `|V| < 2` form; relay metadata exposure from D-001; the §9.1/§9.2 supply-chain findings. **This document points at it for:** the §25 cheater-to-test map (`THREAT_MODEL.md` §5.5) and the deviation register (`THREAT_MODEL.md` §9.1), which own those two lists |
+| `THREAT_MODEL.md` | **carries from here:** §11's OQ list; the §11 "does not solve" list; the abort attack of §2.10 in its **D-010** form — the abort is neutral, stacks are restored whatever `|V|` is, attribution is evidence with no automatic consequence, and the **rage-quit escape is reopened and unsolved**; the `|V|`-scoped question of whether a peer is *named* (never of what it pays); relay metadata exposure from D-001; the §9.1/§9.2 supply-chain findings. **This document points at it for:** the §25 cheater-to-test map (`THREAT_MODEL.md` §5.5) and the deviation register (`THREAT_MODEL.md` §9.1), which own those two lists |
 | `PROTOCOL.md` | **owns, and this document reproduces:** the `ctx` construction (`PROTOCOL.md` §4.5, reproduced in §6.4); the dealing map (`PROTOCOL.md` §4.5, reproduced in §2.4); the domain-string register (`PROTOCOL.md` §2.8); the `DOMAIN_EVENT` signature prefix bytes (`PROTOCOL.md` §13). **Carries from here:** the signed envelope fields that must bind proofs and tokens; the entitlement and street-gating rules (§2.7, §2.8); the five-part `RNG_COMMIT` binding (§7.3); the `rand`/`SmallRng`/`StdRng` correction (§7.2), which under **D-009 rule 3** is a *discipline plus a test*, never an absence. **Owns and this document deliberately does not restate:** the equivocation predicate and its anti-replay slot key (`PROTOCOL.md` §5.2, §5.3). §6.4 and §7.1 name equivocation and defer — *"The exact predicate is `PROTOCOL.md` §5.2's and is not restated here"* — so **D-009 rule 1**'s move of the subject seat into the slot key for `TIMEOUT_VOTE` needs no mirror edit here, and the `ctx` block of §6.4 is unaffected by it: `ctx` binds seven fields for a *deck proof*, and a `TIMEOUT_VOTE` carries no deck proof and no `ctx`. The two are separately domain-separated at `PROTOCOL.md` §2.8 — `"p2p-poker v1 deck-ctx"` against `"p2p-poker v1 timeout-cert"` — so a change inside one cannot reach the other |
-| `STATE_MACHINE.md` | **carries from here:** the per-hand sequence of §2.9, including the collective form of `HAND_INIT` / `HAND_COMPLETE`; the absent-seat states and abort path (D-005), and its unattributed `|V| < 2` form (D-007, D-008 — the scope is the required voter set, never the seat count); deadlines as explicit state, never a wall-clock read inside the engine (D-006) |
+| `STATE_MACHINE.md` | **carries from here:** the per-hand sequence of §2.9, including the collective form of `HAND_INIT` / `HAND_COMPLETE`; the absent-seat states and abort path (D-005's requirement that the game continues and the absent seat is blinded off, which D-010 leaves untouched); the **neutral** abort of **D-010** — one chip rule for every abort, stacks restored to their start-of-hand values, no `AbortRecord` consumer that moves a chip or unseats a peer, and no eviction transition at all; the `|V| < 2` form in which the abort additionally names nobody (D-007, D-008 — the scope is the required voter set, never the seat count); deadlines as explicit state, never a wall-clock read inside the engine (D-006) |
 | `NETWORK_STACK.md` | **carries from here:** the corrected per-circuit **bidirectional** byte budget of §6.5 — `2 × 8 979 = 17 958 B` per hand per circuit, both directions counted against one 131 072 B cap, giving ~7 hands shuffle-only and ~5 with the event stream, against which the **120 s duration limit is still the binding one** (D-001) — and hand traffic never crossing the lobby topic. The earlier "per circuit **per direction**" form of this row, and its ~14 hands, are withdrawn: `max_circuit_bytes` is one counter for both directions (§6.5, `NETWORK_STACK.md` §16.1). **This document points at it for:** the normative D-002 relay configuration (`NETWORK_STACK.md` §9.6) and the transport-side dependency register (`NETWORK_STACK.md` §5.1) |
 
 ---
@@ -2108,6 +2259,58 @@ libp2p-autonat-0.15.0/Cargo.toml         `[dependencies.rand] version = "0.8"` (
 Recorded per the editing rule: the rulings of `docs/research/PHASE0_FIXPLAN.md` were
 applied as written, and where a ruling looks wrong it is noted here rather than
 silently deviated from. Four notes.
+
+**0. D-010 supersedes the chip rule that notes 1 and 4 below were written around, and
+this document was cut down rather than patched.** `DECISIONS.md` **D-010** replaces
+D-005's forfeiture arithmetic with a neutral abort, and removes automated attribution
+consequences and the eviction path outright. Notes 1 and 4 are kept unedited, because
+`DECISIONS.md`'s convention is that a superseded record is superseded and never edited
+away — but every forfeiture sentence they argue about is now gone from the body of this
+document. What changed here, and what did not:
+
+* **Deleted.** *"the absent player's committed chips are forfeited and distributed to
+  the remaining players in proportion to their own contributions"* (§2.10), and with it
+  the whole two-branch chip rule that made `|V| >= 2` and `|V| < 2` pay differently.
+  There is now one chip rule for every abort from every cause: restoration.
+* **Weakened, deliberately.** Every *"rejected and attributed"* now says what
+  attribution is — a signed line in the transcript — and says explicitly that nothing
+  acts on it. §11's DoS bullet lost *"attributed"* as though attribution were a
+  sanction, and gained a separate bullet stating the reopened rage-quit escape as an
+  unsolved limitation.
+* **Kept, and this is the part worth defending.** The `|V|` scoping of D-008 stays,
+  even though a collapsed voter set can no longer win anybody's chips. It now protects
+  a smaller thing — the integrity of a *name* in the transcript — but the transcript is
+  the entire remaining sanction under D-010, so letting one peer manufacture a false
+  attribution would hollow out the only mitigation left. Deleting the floor because the
+  prize shrank would have been the wrong deletion.
+* **Untouched.** Every cryptographic claim in §2 to §10. D-010 is a rule about
+  consequences, and this document's cryptography never had any: an invalid proof was
+  always rejected by verification, and rejection is what protects a card. Not one
+  `Verification:` line changed, and no security property was strengthened to
+  compensate — §11's OQ list is exactly as it was.
+
+D-010's accepted cost is stated in §2.10 and again in §11, per `SPEC_CS.md` §18: a
+losing player can stall and get their chips back, that is worse for fairness and better
+for safety, and it is not solved.
+
+**Two confirmations the pass owed, both re-run over the whole file rather than
+recalled.**
+
+* **No `n`-scoped rule survives (D-008 point 4).** Every gate on the certificate
+  machinery in the body reads `|V|`: §2.8 item 2, §2.9's sequence line, §2.10's four
+  bullets, §5.2 item 8 and §11's DoS bullet. The only remaining occurrences of `n = 2`
+  and `n >= 3` are inside notes 1 and 4 below, which are the superseded historical
+  record of how the scoping was fixed, and note 1 already carries the addendum saying
+  D-008 generalised it. `n` elsewhere in this document means the number of parties to
+  the cryptography (§2.1) or the deck size — never a rule's scope.
+* **No below-floor certificate has an effect anywhere (D-009 rule 2).** §2.10 is the
+  only place one is described and it denies the effect in full: not chained, not
+  evidence, no `AbortRecord`, terminates nothing, silently ignored at every table size
+  and for `kind = Crypto` as much as for anything else. §2.8 item 2, §2.9, §5.2 item 8
+  and §11 were re-read and none of them grants one. Under D-010 there is also nothing
+  left for such a certificate to *win* — it can no longer take a chip even in
+  principle — but the floor is kept anyway, because a false name in the transcript is
+  now the only harm left and the floor is what prevents it.
 
 **1. A-1's "No other change" to this document is too narrow, and I went slightly
 beyond it.** A-1 instructs this document to add *"at `n >= 3`; heads-up the deadline is
@@ -2172,6 +2375,19 @@ were applied as written and not re-derived. What they changed here:
   it: `src/security/rng.rs` and its source scan, verified to fail on an injected
   violation. No claim was strengthened; one was replaced by a weaker claim with a test
   behind it.
+
+  *Addendum, 2026-08-28 — it happened a **third** time, and the third one was caught
+  before it was written down.* Having established that `SmallRng` is in the build at
+  `rand 0.9.5`, the natural next sentence is *"and `rand 0.10.2` has no `small_rng`
+  feature at all"* — which is true of the feature and false of the type. Reading
+  `rand-0.10.2/src/rngs/mod.rs` rather than only its `Cargo.toml` settles it: `mod
+  small;` (l. 97) and `pub use self::small::SmallRng;` (l. 106) carry **no `cfg`
+  attribute**, where `rand-0.9.5` gates both. The feature disappeared because the type
+  became unconditional. §7.2 now states the three majors as a table rather than as a
+  sentence, because a table cannot be quoted half-way; OQ-8 and §12 item 6 carry the
+  same, and `research/CRYPTO_LIBS.md` §1.2.1 is the research-side home. The lesson D-009
+  rule 3 draws is confirmed a third time: **a manifest is not a build, and a feature is
+  not a type.**
 * **Rule 2 — a below-floor certificate is inert everywhere** (finding M1). §2.10 said
   *"Such a certificate therefore has no effect: the abort … names nobody"* — asserting
   in one sentence both that nothing happens and that an abort happens. The two are now

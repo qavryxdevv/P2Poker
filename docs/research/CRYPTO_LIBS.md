@@ -18,6 +18,19 @@
 > is a direct dependency of `p2p-poker`.** See §1.2, §7.3 and §10. The
 > discipline behind the claim survives. The absence does not, and must not
 > be restated anywhere.
+>
+> **The same correction, narrowed and therefore made twice more.** Replacing
+> "`rand` is absent" with "`small_rng` is not enabled on `rand 0.8.8`" only
+> shrank the false claim: `SmallRng` **is** compiled in, at `rand 0.9.5`
+> where `small_rng` is a **default** feature, and at `rand 0.10.2` where it
+> is exported with no feature gate at all. §1.2.1 now carries the integrated
+> picture and §1.2.2 the discipline that replaces it. Under `DECISIONS.md`
+> **D-009 rule 3**, no security property of this project may be stated as
+> the absence of something from the dependency tree — at any width.
+>
+> **Every remaining absence claim in this document has been re-checked against
+> `Cargo.lock` and `cargo tree` and the results are tabulated in §7.3.4.** Do
+> not add a new one without adding a row there.
 
 Phase 0 research. Binding spec sections: 6, 7, 12, 21, 28.
 
@@ -61,6 +74,8 @@ docs.rs and recollection were used only as leads, never as evidence.
 |---|---|
 | OS CSPRNG | `getrandom::SysRng` — **`OsRng` no longer exists** in rand 0.10 / rand_core 0.10 |
 | `rand` crate | *Probe:* dropped entirely. *Integrated:* **present at 0.8.8, 0.9.5 and 0.10.2**, plus `rand = "0.8"` as a direct dependency. RUSTSEC-2026-0097 does not bite — but because all three are patched versions, not because the crate is gone (§1.2, §7.3) |
+| `SmallRng` / `StdRng` | **Both compiled in and neither removable.** `StdRng` at all three majors; `SmallRng` at 0.9.5 (a **default** feature that `igd-next` and `yamux` take) and at 0.10.2 (exported ungated — the feature no longer exists). Spec §7 is enforced by the source scan in `src/security/rng.rs`, verified to bite, **never** by an absence (§1.2.1, §1.2.2, D-009 rule 3) |
+| Absence claims | All re-checked against `Cargo.lock` and `cargo tree`; one was false (`paste` is a **runtime** dependency, not dev-only). Table in §7.3.4 |
 | Protocol hash | **BLAKE3** for our own hashes; `sha2` stays because Ed25519 mandates SHA-512 |
 | Signatures | `ed25519-dalek` 3.0.0, **`verify_strict` only** |
 | Canonical bytes | **`minicbor` 2.3.0, `#[cbor(array)]` only, no maps, no floats**, plus a re-encode gate |
@@ -153,7 +168,9 @@ PRNG. That much is unchanged. What changed is how the rule is enforced.
 **Probe result — true of `probe-crypto-final`, and only of it.** Dropping `rand`:
 
 - removes `ThreadRng`, `StdRng` and `SmallRng` from the tree, so spec §7's prohibition is
-  enforced by the dependency graph rather than by reviewer discipline;
+  enforced by the dependency graph rather than by reviewer discipline — **this clause is
+  the one that must never be lifted out of this probe context; in the integrated tree it
+  is false, see §1.2.1 and §1.2.2**;
 - removes **RUSTSEC-2026-0097** (unsoundness in `rand::rng()` with a custom `log` logger,
   patched in ≥ 0.10.1, but simply absent if the crate is absent);
 - drops `chacha20` and friends from the non-AEAD path.
@@ -168,8 +185,13 @@ the tree at three majors, all of them compiled, and none of them removable:
 | Version | Reached through | Features actually enabled |
 |---|---|---|
 | 0.8.8 | **direct dependency of `p2p-poker`**; also `ark-std` 0.5.0 (via `ziffle`), `libp2p-autonat` 0.15.0, `libp2p-core` 0.43.2 | `alloc`, `getrandom`, `libc`, `rand_chacha`, `std`, `std_rng` |
-| 0.9.5 | `hickory-proto` / `hickory-resolver` (libp2p `dns`), `igd-next` (libp2p `upnp`), `yamux` | — |
-| 0.10.2 | `quinn-proto` (libp2p `quic`), `rs_poker` 5.0.0 | `alloc`, `getrandom`, `std`, `std_rng`, `sys_rng`, `thread_rng` |
+| 0.9.5 | `hickory-proto` / `hickory-resolver` (libp2p `dns`), `igd-next` (libp2p `upnp`), `yamux` | `alloc`, `default`, `os_rng`, **`small_rng`**, `std`, `std_rng`, `thread_rng` |
+| 0.10.2 | `quinn-proto` (libp2p `quic`), `rs_poker` 5.0.0 | `alloc`, `default`, `getrandom`, `std`, `std_rng`, `sys_rng`, `thread_rng` |
+
+The 0.9.5 row's feature column was blank in an earlier revision, and the blank is what
+let the `SmallRng` absence claim survive. It is filled in and cross-checked in §1.2.1,
+which is where the consequence — `SmallRng` is in the build, at two majors — is worked
+out.
 
 `rand_chacha` follows at 0.3.1 (under `rand` 0.8.8) and 0.9.0 (under `rand` 0.9.5);
 `rand_core` at 0.6.4, 0.9.5 and 0.10.1.
@@ -184,26 +206,170 @@ v2 behaviours are generic over an RNG defaulting to `rand_core` 0.6's `OsRng` �
 `pub struct Behaviour<R = OsRng>` — and `rand` 0.8 is where we get that type from.
 **Verification:** (b) source.
 
-Two things about what is *compiled*, which the crate list alone does not tell you:
+#### 1.2.1 What is actually compiled — the integrated picture, not one major's manifest
 
-- `small_rng` is **not** enabled on `rand` 0.8.8, so `SmallRng` is not in the build at
-  that major. `std_rng` **is** enabled — it is a default feature of `rand` 0.8 — so
-  `StdRng` and `rand_chacha` 0.3.1 are. **Verification:** (b) source,
-  `rand-0.8.8/Cargo.toml` `[features]`: `default = ["std", "std_rng"]`,
-  `std_rng = ["rand_chacha"]`, and `small_rng = []` is not named by any of them.
-- `thread_rng` **is** enabled on `rand` 0.10.2, by `quinn-proto`. `rand`'s own `log`
-  feature is not, and 0.10.2 is past the RUSTSEC-2026-0097 patch line anyway (§7.3.1).
+> **This block replaces a check that covered `rand 0.8.8` and nothing else.** The
+> earlier text read *"`small_rng` is **not** enabled on `rand` 0.8.8, so `SmallRng` is
+> not in the build at that major"*, with the 0.8-only evidence beside it. Read as
+> written it is true; read as it was used — as licence to say `SmallRng` is out of the
+> build — it is **false**. This is the **third** document to have needed exactly this
+> correction, after `PROTOCOL.md` §4.4 and `THREAT_MODEL.md` A7, and it is the reason
+> `DECISIONS.md` **D-009 rule 3** exists. The whole build is the unit of analysis. One
+> consumer's manifest is not.
+
+**`SmallRng` is compiled in, and no choice available to this project removes it.**
+
+`rand 0.9.5` lists `small_rng` among its **default** features:
+
+```toml
+# rand-0.9.5/Cargo.toml, l. 64-72 and l. 81
+[features]
+default   = ["std", "std_rng", "os_rng", "small_rng", "thread_rng"]
+small_rng = []
+```
+
+and four dependencies take `rand` at that major, all of them reached through libp2p
+features this project turns on:
+
+```
+$ cargo tree --edges normal -i rand@0.9.5
+rand v0.9.5
+├── hickory-proto v0.25.2
+│   └── hickory-resolver v0.25.2
+│       └── libp2p-dns v0.44.0
+│           └── libp2p v0.56.0
+│               └── p2p-poker v0.1.0
+├── hickory-resolver v0.25.2 (*)
+├── igd-next v0.16.2
+│   └── libp2p-upnp v0.5.0
+│       └── libp2p v0.56.0 (*)
+└── yamux v0.13.10
+    └── libp2p-yamux v0.47.0
+        └── libp2p v0.56.0 (*)
+```
+
+Two of the four take `rand` with its **default** feature set —
+`igd-next-0.16.2/Cargo.toml` l. 148-149 and `yamux-0.13.10/Cargo.toml` l. 57-58, both a
+bare `[dependencies.rand] version = "0.9.0"` with no `default-features` key — and cargo
+unifies features **additively** across the graph, so their `default` turns `small_rng`
+on for the single `rand 0.9.5` every consumer shares. The two hickory crates *do* pass
+`default-features = false` (`hickory-proto-0.25.2/Cargo.toml` l. 318-324,
+`hickory-resolver-0.25.2/Cargo.toml` l. 217-220) and that **suppresses nothing** —
+which is precisely why an absence argued from one consumer's manifest does not survive
+integration. The resolved feature set confirms it:
+
+```
+$ cargo tree --edges features -i rand@0.9.5
+rand feature "alloc"  "default"  "os_rng"  "small_rng"  "std"  "std_rng"  "thread_rng"
+```
+
+Removing `SmallRng` would mean dropping libp2p's `dns`, `upnp` and `yamux` features.
+`yamux` is a stream multiplexer the transport needs; `dns` and `upnp` are the subject of
+a separate open decision in `DECISIONS.md` and are not free to drop for this reason.
+
+**`rand 0.10.2` has no `small_rng` feature — and that is not an absence either.** The
+feature was removed because the type stopped being optional. `SmallRng` is exported
+there **unconditionally, with no `cfg` gate at all**, alongside two more
+non-cryptographic generators:
+
+```rust
+// rand-0.10.2/src/rngs/mod.rs, l. 97-110 — note which lines carry a #[cfg] and which do not
+mod small;
+mod xoshiro128plusplus;
+mod xoshiro256plusplus;
+
+#[cfg(feature = "std_rng")]
+mod std;
+
+pub use self::small::SmallRng;
+pub use xoshiro128plusplus::Xoshiro128PlusPlus;
+pub use xoshiro256plusplus::Xoshiro256PlusPlus;
+```
+
+against `rand-0.9.5/src/rngs/mod.rs` l. 87 and l. 102, where both the `mod` and the
+`pub use` sit behind `#[cfg(feature = "small_rng")]`. So `SmallRng` is in the build at
+**two** of the three majors, and at 0.10.2 it is not even feature-reachable to argue
+about. Any future statement of the form *"`rand 0.10` has no `small_rng` feature"* must
+carry this sentence with it, or it becomes the fourth false absence.
+
+**Only `rand 0.8.8` genuinely lacks it, and that is a fact about one major, never about
+the build.** `rand-0.8.8/Cargo.toml` `[features]`: `default = ["std", "std_rng"]`,
+`std_rng = ["rand_chacha"]`, and `small_rng = []` is named by neither, which
+`cargo tree --edges features -i rand@0.8.8` confirms — it resolves exactly `alloc`,
+`default`, `getrandom`, `libc`, `rand_chacha`, `std`, `std_rng`.
+
+**Summary across the three majors, which is the only form this fact may be stated in:**
+
+| | `rand` 0.8.8 | `rand` 0.9.5 | `rand` 0.10.2 |
+|---|---|---|---|
+| `StdRng` | in the build (`std_rng`) | in the build (`std_rng`) | in the build (`std_rng`) |
+| `SmallRng` | **not** in the build | **in the build** (`small_rng`, a default) | **in the build**, ungated — no feature exists |
+| `ThreadRng` | not in the build | in the build (`thread_rng`) | in the build (`thread_rng`, via `quinn-proto`) |
+| Xoshiro128/256++ | — | — | in the build, ungated |
+
+**Verification:** (a) executed at the repository root, 2026-08-28 —
+`cargo tree --edges normal -i rand@0.9.5` (output quoted verbatim above) and
+`cargo tree --edges features -i rand@{0.8.8,0.9.5,0.10.2}`; (b) source — the five
+`Cargo.toml` files and the two `rngs/mod.rs` files cited inline, read under
+`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`.
+
+**`rand`'s own `log` feature is not enabled** at any major, and all three are past the
+RUSTSEC-2026-0097 patch line regardless (§7.3.1).
+
+#### 1.2.2 The enforceable discipline, and the test that enforces it
+
+Since the dependency graph does not enforce spec §7 and **cannot be made to**, our own
+code does, mechanically. The rule is about the only thing we control:
+
+> Our own code draws cryptographic randomness only from `getrandom::SysRng`.
+> `rand`'s `SmallRng`, `StdRng` and any self-seeded generator are never used
+> for keys, masking factors, permutations or commitments.
+
+`src/security/rng.rs` is the single source of cryptographic randomness in the crate —
+`pub fn fill(dest: &mut [u8]) -> Result<(), getrandom::Error>` over
+`getrandom::SysRng` — and its test
+`tests::our_own_code_uses_no_generator_but_the_os_one` (l. 103) walks every `.rs` file
+under `src/` on every test run and fails the build on `SmallRng`, `StdRng`,
+`thread_rng`, `from_seed`, `seed_from_u64` or `rand::rngs`. `rng.rs` is the one exempt
+file, because it must name the identifiers in order to forbid them.
+
+**The gate was verified to bite**, by injecting a violation into an unrelated module and
+observing the failure, then removing it and observing the pass — a gate never seen to
+fail is not a gate (D-009 rule 3):
+
+```
+SPEC_CS.md section 7 forbids these generators for cryptographic use;
+draw from security::rng::fill instead:
+  poker\actions.rs:8: SmallRng
+test result: FAILED. 0 passed; 1 failed
+```
+
+and with the violation removed,
+`cargo test --lib security::rng -- --test-threads=19` gives
+`test security::rng::tests::our_own_code_uses_no_generator_but_the_os_one ... ok`,
+`test result: ok. 3 passed; 0 failed`.
+
+Known limits of the gate, stated rather than papered over: it is **textual**, so it
+catches a use and not an obfuscation; it covers **this crate's own sources** and says
+nothing about the vendored `ziffle` (reviewed separately under `CRYPTOGRAPHY.md` OQ-1,
+which notes ziffle uses `StdRng` deliberately and correctly for nothing-up-my-sleeve
+public constants); and its deny-list does **not** currently name `Xoshiro128PlusPlus` or
+`Xoshiro256PlusPlus`, which `rand 0.10.2` exports ungated. Adding those two identifiers
+costs one line each and closes the gap this section found.
 
 > **Spec deviation to record.** Spec §7 names `OsRng`. We implement the requirement
 > (OS CSPRNG, never a self-seeded or non-cryptographic generator) under its current
 > name `getrandom::SysRng`.
 >
 > **The prohibition on `SmallRng` and `StdRng` is no longer satisfied structurally.**
-> `StdRng` is compiled into the binary through `rand` 0.8's default features. The rule
-> is now a reviewable boundary rather than an impossibility: all of our own randomness
-> is routed through one module, `src/security/rng.rs`, which exists precisely to make
-> that boundary explicit. Do not write "enforced by the dependency graph" anywhere
-> again — it is not true, and it is the kind of sentence that stops people looking.
+> `StdRng` is compiled into the binary at all three `rand` majors, and `SmallRng` at
+> two of the three. The rule is now a reviewable boundary rather than an
+> impossibility: all of our own randomness is routed through one module,
+> `src/security/rng.rs`, which exists precisely to make that boundary explicit. Do not
+> write "enforced by the dependency graph" anywhere again — it is not true, and it is
+> the kind of sentence that stops people looking. **And do not restate the prohibition
+> as any absence, however narrowed:** state the discipline above and cite the test
+> (D-009 rule 3).
 
 ---
 
@@ -548,18 +714,43 @@ paste 1.0.15 — unmaintained advisory detected
 
 `cargo audit` reports it as an allowed warning and still exits 0; `cargo deny` treats it as
 a failure. It is *informational/unmaintained*, not a vulnerability, and it is a
-compile-time proc-macro helper in a **dev-dependency** — it ships in no release binary.
+compile-time proc-macro helper — it ships in no release binary.
 **Verification:** (a) executed — `cargo deny check advisories` on `probe-crypto-final`
 with the dev-dependency present.
 
-Resolution: scope the ignore narrowly rather than globally, and revisit if `dcbor` drops
-`paste`:
+> **Correction: `paste` is not dev-only in the integrated tree.** This subsection was
+> written when the only route to `paste` was the optional `dcbor` **dev**-dependency. In
+> the repository it is a **runtime** dependency and arrives whether or not `dcbor` is
+> ever added:
+>
+> ```
+> $ cargo tree --edges normal -i paste@1.0.15
+> paste v1.0.15 (proc-macro)
+> └── ark-ff v0.5.0
+>     ├── ark-ec v0.5.0
+>     │   ├── ark-secp256k1 v0.5.0
+>     │   │   └── ziffle v0.1.0
+>     │   │       └── p2p-poker v0.1.0
+> ```
+>
+> **Verification:** (a) executed at the repository root, 2026-08-28. The *risk* is
+> unchanged — a proc macro runs at build time and is in no shipped binary — but the
+> *justification* for the ignore is a different one, and an ignore comment that says
+> "dev-dependency only" would be false in the repository's `deny.toml`. §7.3.2 and
+> `CRYPTOGRAPHY.md` §9.2 finding 1 are the authorities. The corrected comment is in the
+> block below.
+
+Resolution: scope the ignore narrowly rather than globally, and revisit if `ark-ff`
+drops `paste`:
 
 ```toml
 # deny.toml
 [advisories]
 ignore = [
-    # dcbor -> paste, dev-dependency only (differential CBOR oracle), never in a shipped binary
+    # paste 1.0.15, unmaintained (RUSTSEC-2024-0436). RUNTIME tree, not dev-only:
+    # ark-ff <- ark-{ec,poly,secp256k1} <- ziffle. Build-time proc macro, so it is in
+    # no shipped binary. The optional dcbor dev-dependency reaches it too, but is not
+    # why the ignore is needed. See sections 4.4 and 7.3.2.
     "RUSTSEC-2024-0436",
 ]
 ```
@@ -996,7 +1187,7 @@ root (**(a)**):
 | `ed25519-dalek` | 2.2.0, **3.0.0** | RUSTSEC-2022-0093 | No — `patched >= 2`; both resolved majors are past it |
 | `curve25519-dalek` | 4.1.3, **5.0.0** | RUSTSEC-2024-0344 | No — `patched >= 4.1.3`; both resolved versions are at or past it |
 | `sha2` | 0.10.9, **0.11.0** | RUSTSEC-2021-0100 | No — `patched >= 0.9.8` |
-| `rand` | **0.8.8, 0.9.5, 0.10.2** | RUSTSEC-2026-0097 | No — **but not because the crate is absent.** All three resolved versions are past a patch line |
+| `rand` | **0.8.8, 0.9.5, 0.10.2** | RUSTSEC-2026-0097 | No — **but not because the crate is absent.** All three resolved versions are past a patch line. What each major actually compiles — `StdRng` at all three, `SmallRng` at 0.9.5 and 0.10.2 — is §1.2.1's table, and no row of it may be restated as an absence |
 | `rand_chacha` | 0.3.1, 0.9.0 | none | — |
 | `rand_core` | 0.6.4, 0.9.5, **0.10.1** | none | — |
 | `getrandom` | 0.2.17, 0.3.4, **0.4.3** | none | — |
@@ -1125,6 +1316,39 @@ has been re-resolved since (its mtime is later than that document's), so the tre
 drifted by one crate. The finding is unaffected — but re-run the command before
 quoting either number, rather than copying it from here.
 
+#### 7.3.4 Every absence claim in this document, re-checked
+
+Three claims of the form *"X is not in the tree"* have already proved false — B-1, B-3
+and M3 — so the rest were not trusted either. Each one was found by sweeping this file
+for absence language and then checked against `Cargo.lock` and `cargo tree`, at the
+repository root, on 2026-08-28. `cargo tree --edges normal` answers *compiled*;
+`Cargo.lock` answers *resolved*; §7.3.3 explains why they differ and why only the first
+is a security statement.
+
+| Claim, and where it appears | Verdict | Evidence |
+|---|---|---|
+| `serde_cbor` absent (§7.3.1, §10) | **holds** | no `name = "serde_cbor"` in `Cargo.lock` |
+| `k256` absent (§2.3, §7.3.1, §10) | **holds** | not in `Cargo.lock`. `libp2p-identity` *can* want `k256` (§8), but only under its `secp256k1` feature, which is off |
+| `ciborium` absent (§7.3.1, §10) | **holds** | not in `Cargo.lock` |
+| `keyring` absent (§6.5, §7.3.1, §10) | **holds** | not in `Cargo.lock` |
+| `dcbor` absent (§4.4, §7.3.1, §10) | **holds** — it is a *proposed* dev-dependency, still not added | not in `Cargo.lock` |
+| `OsRng` gone from `rand` 0.10 / `rand_core` 0.10 (§0, §1) | **holds**, and is version-scoped correctly | `grep -r OsRng rand-0.10.2/src/` returns nothing; `rand_core-0.10.1` has the identifier only inside a doc comment in `src/utils.rs`, and no `os_rng` feature. Note `rand 0.9.5` **does** have `os_rng` and it **is** enabled — the claim is safe only because it names 0.10 |
+| `chacha20poly1305 0.10.1` locked but **not compiled** (§7.3.1, §10) | **holds** | `cargo tree --edges normal -i chacha20poly1305@0.10.1` prints `warning: nothing to print.`; only `--target all` reveals the `snow` ← `libp2p-noise` edge |
+| `r-efi` never built for Windows or Linux (§7.4) | **holds**, with one correction | `cargo tree --edges normal -i r-efi@5.3.0` and `@6.0.0` both print `warning: nothing to print.`; under `--target all`, `r-efi v6.0.0 ← getrandom v0.4.3`. The correction: `Cargo.lock` carries **two** versions, 5.3.0 and 6.0.0, and §7.4's row names neither |
+| `paste` reaches us only as a `dcbor` **dev**-dependency (§4.4, and the ignore comment in §7.4) | **FALSE** | `cargo tree --edges normal -i paste@1.0.15` → `paste ← ark-ff 0.5.0 ← ark-{ec,poly,secp256k1} ← ziffle ← p2p-poker`. Runtime. Corrected in §4.4 and in both `deny.toml` blocks; §7.3.2 had already found it and the comment had not been updated |
+| `small_rng` not enabled, so `SmallRng` is out of the build (former §1.2) | **FALSE**, and this is the third repetition of the pattern | §1.2.1. Default feature at `rand 0.9.5`; exported ungated at `rand 0.10.2` |
+| "No `rand` at any depth" (§10, probe block) | **holds of the probe only**, and is already labelled | the following paragraph in §10 says so; `rand` is at three majors in the repository |
+| `hickory-proto` drops out if libp2p's `dns` feature is removed (§7.3.3) | **not re-run here** — conditional, and `INTEGRATION.md` §3 owns it | it is a claim about a build we do not ship, so it is a design option, not a status |
+| 426 compiled / 612 in `Cargo.lock` (§7.3.3, §10) | **holds today** | re-counted: `cargo tree --edges normal` unique `name v version` = 426; `grep -c '^name = ' Cargo.lock` = 612. §7.3.3 is right that these must be re-run rather than quoted |
+
+Two things a later reader should take from this table rather than from any single row.
+First, **every absence that held is a fact about a crate we never adopted, or about a
+target we never build** — the cheap kind. Every absence that *failed* was one somebody
+wanted to lean on as a security property, which is the expensive kind, and is exactly
+what D-009 rule 3 is aimed at. Second, `cargo audit` cannot settle any of these: it
+reads the lockfile and has no feature or target awareness (§7.3.3), so a row above that
+says "locked but not compiled" is invisible to it in both directions.
+
 ### 7.4 Licences requiring an explicit `cargo-deny` allow-list
 
 `cargo deny list` over the final tree found these beyond the usual MIT/Apache-2.0:
@@ -1138,7 +1362,7 @@ quoting either number, rather than copying it from here.
 | BSD-1-Clause | `fiat-crypto` |
 | Unicode-3.0 | `unicode-ident` |
 | Apache-2.0 WITH LLVM-exception | `blake3` |
-| LGPL-2.1-or-later | `r-efi` (also MIT/Apache; **UEFI target only, never compiled on Windows or Linux**) |
+| LGPL-2.1-or-later | `r-efi` **5.3.0 and 6.0.0** (also MIT/Apache; **UEFI target only** — `cargo tree --edges normal -i r-efi@…` prints `warning: nothing to print.` for both, and only `--target all` shows the `getrandom 0.4.3` edge, §7.3.4) |
 
 All are permissive and compatible with an open-source client. **BlueOak-1.0.0 is the one to
 watch** — it is uncommon enough that a default `cargo-deny` licence policy will reject it,
@@ -1160,7 +1384,9 @@ multiple-versions = "warn"   # see section 8
 [advisories]
 yanked = "deny"
 ignore = [
-    # dcbor -> paste, dev-dependency only (differential CBOR oracle); see section 4.4
+    # paste 1.0.15, unmaintained (RUSTSEC-2024-0436). RUNTIME tree, not dev-only:
+    # ark-ff <- ark-{ec,poly,secp256k1} <- ziffle. Build-time proc macro, in no
+    # shipped binary. See sections 4.4 and 7.3.2.
     "RUSTSEC-2024-0436",
 ]
 ```
@@ -1383,3 +1609,12 @@ the check still proves there is the part that matters — that the bytes came fr
 6. **Enforce the CBOR rules mechanically** if possible — a test that reflects over every
    signed type and fails on `HashMap`, floats, or a missing `#[cbor(array)]` is worth more
    than a review checklist.
+7. **Add `Xoshiro128PlusPlus` and `Xoshiro256PlusPlus` to the deny-list in
+   `src/security/rng.rs`.** `rand 0.10.2` exports both ungated (§1.2.1), so they are as
+   reachable from our code as `SmallRng` is and the existing scan does not name them.
+   Two lines in the `forbidden` array, and the gate is already proven to bite.
+8. **Re-run the §7.3.4 absence table after every `cargo update` or feature change.**
+   Every row is a `cargo tree` result, not a design fact; three rows in this document's
+   history flipped from true to false without anybody re-checking, and one of them
+   (`paste`) stayed wrong in a `deny.toml` comment for a whole revision after §7.3.2
+   had found it.
