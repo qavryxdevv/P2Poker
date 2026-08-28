@@ -6,10 +6,13 @@ Specification of the transport and discovery layer of `p2p-poker`.
 (Mainline DHT discovery + GossipSub lobby). No implementation exists yet.
 
 **Authority order.** `docs/SPEC_CS.md` is the specification and wins over
-everything here. `docs/DECISIONS.md` (D-001 … D-007) is binding owner decision and
+everything here. `docs/DECISIONS.md` (D-001 … D-008) is binding owner decision and
 outranks the research documents and any preference of this document. **D-007
-corrects D-006** and wins over it: at two seats an action deadline is advisory and
-a fold-effect timeout certificate is forbidden (§8.4, §15). The research
+corrects D-006, and D-008 generalises D-007**; both win over D-006. An action
+deadline is advisory and a fold-effect timeout certificate is forbidden whenever
+the required voter set `V` (`PROTOCOL.md` §8.3) has fewer than two members. That
+is always the case at two seats and is reachable at any seat count, which is why
+every such rule is scoped on `|V|` and **never on `n`** (§8.4, §15). The research
 notes under `docs/research/` are the evidence base:
 `LIBP2P.md`, `MAINLINE_DHT.md`, `NAT_AND_DISCOVERY.md` are the three this document
 is built on; `MENTAL_POKER.md` is used only for measured per-hand byte counts.
@@ -100,8 +103,10 @@ layer must **not**:
 3. decide that a player is absent, has timed out, has folded, or has forfeited.
    Transport-level connection loss is a **hint** the layers above may consider; the
    verdict is the D-006 timeout certificate, which is an application event signed
-   by the other active players — and at two seats there is no such verdict at all,
-   because D-007 makes the heads-up deadline advisory (§8.4). The prohibition is
+   by the required voter set `V` — and whenever `|V| < 2` there is no such verdict
+   at all, because D-008 leaves the deadline advisory there (§8.4). At two seats
+   that is always so (D-007); at larger tables it is reachable too, which is why
+   the test is `|V| < 2` and never `n = 2`. The prohibition is
    unchanged either way: the transport must not supply a verdict the layer above
    does not have;
 4. reorder, deduplicate, filter, merge or "repair" application events on the basis
@@ -1198,15 +1203,21 @@ the same terms as a directly received one.
   protocol, never from the transport.
 * **Connection loss is a hint, not a verdict.** When a table stream drops, the
   network layer reports the fact and nothing more. Whether that seat is absent is
-  decided above, by the D-006 timeout certificate signed by the other still-active
-  players — **which at two seats is a single player, so D-007 makes it advisory;
-  the transport layer's behaviour is unchanged either way**. At `n = 2` a
-  heads-up action deadline is a UI countdown that produces no signed state
-  transition at all (D-007 point 1, `PROTOCOL.md` §8.3), and the transport must
-  not invent one to fill the gap. At `n ≥ 3` an action timeout is an auto
-  check/fold and never an abort, and no timeout of any kind ends the tournament or
-  the cash game. Only a client that is gone or withholding decryption shares
-  reaches the D-005 abort path. The transport must not shortcut any of that.
+  decided above, by the D-006 timeout certificate signed by the **required voter
+  set `V`** (`PROTOCOL.md` §8.3) — **and whenever `|V| < 2` that certificate has
+  no effect, so D-008 leaves the deadline advisory and no verdict is produced at
+  all; the transport layer's behaviour is unchanged either way**. At two seats
+  `|V| = 1` always, so a heads-up action deadline is a UI countdown that produces
+  no signed state transition at all (D-007 point 1, `PROTOCOL.md` §8.3), and the
+  transport must not invent one to fill the gap. At larger tables `|V|` can fall
+  below two as well, once earlier completed certificates have attributed seats,
+  so the rule is scoped on `|V|` and **never on `n`**: `n` is the quantity an
+  attacker cannot shrink and `|V|` is the one it can (D-008). Where `|V| >= 2` an
+  action timeout is an auto check/fold and never an abort, and no timeout of any
+  kind ends the tournament or the cash game. Only a client that is gone or
+  withholding decryption shares reaches the D-005 abort path. The transport must
+  not shortcut any of that, and nothing in this layer may key any behaviour on the
+  seat count.
 
 ---
 
@@ -1315,27 +1326,57 @@ exactly like any other disconnect, per D-005/D-006).
 
 | Role | Who can serve it | Limits |
 |---|---|---|
-| **Rendezvous for a hole punch** — carry the DCUtR coordination, then get out of the way | any public relay, including the many public kubo nodes that enable `Swarm.RelayService` by default | the defaults are *sized for exactly this*: `max_circuit_duration` 2 min, `max_circuit_bytes` 128 KiB, `reservation_duration` 1 h, `max_reservations` 128, `max_circuits` 16, `max_circuits_per_peer` 4 — identical in kubo and in `rust-libp2p` |
-| **Carrying a whole session** when DCUtR fails on both ends | only a relay whose operator raised its own limits — i.e. a D-002 volunteer poker client | the **2-minute `max_circuit_duration`** is what makes a public relay unusable for a session, not the byte cap. A session lasts far longer than two minutes, so a public IPFS relay **will** reset the connection mid-hand, which is an *engineered abort attack against ourselves* under `SPEC_CS.md` §19. |
+| **Rendezvous for a hole punch** — carry the DCUtR coordination, then get out of the way | any public relay, including the many public kubo nodes that enable `Swarm.RelayService` by default | the defaults are *sized for exactly this*: `max_circuit_duration` 2 min, `max_circuit_bytes` 128 KiB **as a bidirectional total for the whole circuit** (§16.1), `reservation_duration` 1 h, `max_reservations` 128, `max_circuits` 16, `max_circuits_per_peer` 4 — the *values* are identical in kubo and in `rust-libp2p`; on the byte accounting the two documentations disagree, see the caveat below |
+| **Carrying a whole session** when DCUtR fails on both ends | only a relay whose operator raised its own limits — i.e. a D-002 volunteer poker client | the **2-minute `max_circuit_duration`** is what breaks first: a session lasts far longer than two minutes, so a public IPFS relay **will** reset the connection mid-hand, which is an *engineered abort attack against ourselves* under `SPEC_CS.md` §19. The byte cap does not rescue the case either — bidirectional, it is spent after roughly five to seven hands (§16.1) — but the duration is what a reader should expect to hit. |
 
-**The byte arithmetic, corrected.** An earlier revision of this row compared
-*table-wide* shuffle traffic (~18 KB heads-up, ~54 KB six-handed) against
-`max_circuit_bytes`, which is a **per-circuit** cap. A table is a full mesh
-(§8.2), so one circuit connects exactly one pair and carries only that peer's own
-step and proof:
+**The byte arithmetic, corrected twice.** The first correction: an earlier
+revision of this row compared *table-wide* shuffle traffic (~18 KB heads-up,
+~54 KB six-handed) against `max_circuit_bytes`, which is a **per-circuit** cap. A
+table is a full mesh (§8.2), so one circuit connects exactly one pair and carries
+only those two peers' own steps and proofs. The second correction is the
+*direction*, and it halves the budget: **`max_circuit_bytes` is not per
+direction.** `libp2p-relay 0.21.1` relays a circuit with a single `CopyFuture`
+holding one `bytes_sent: u64`, and **both** `forward_data` calls — src→dst and
+dst→src — increment that one counter before it is compared against the cap. The
+crate's own quickcheck asserts the failure condition as `a.len() + b.len() >
+max_circuit_bytes`, i.e. the two directions summed. The cap is therefore a
+**bidirectional total for the whole circuit**, and every figure below is computed
+on that basis:
 
 | Quantity | Value | Basis |
 |---|---:|---|
 | `ShuffleProof<52>` + `MaskedDeck<52>`, one shuffler | 8 979 B | 5 547 + 3 432, measured [RESEARCH `MENTAL_POKER.md` §5.1] |
-| Shuffle traffic over **one circuit**, **one direction**, per hand | **8 979 B** | that peer's own step and proof; **independent of `n`** |
-| Hands per direction against a 131 072 B public-relay budget, shuffle only | **~14** | 131 072 / 8 979 |
-| The same including the signed event stream | **~10 hands** | order-of-magnitude only; measure under OQ-7 |
-| A relayed peer's **total** per-hand outbound at an `n`-seat table | `(n−1) × 8 979 B` | 44 895 B at six seats — a bandwidth figure, spread over `n−1` separate budgets, **never** a single cap |
+| Shuffle traffic over **one circuit**, **both directions together**, per hand | **17 958 B** | `2 × 8 979`; each of the two peers on that circuit sends its own step and proof once, and one counter sees both. **Independent of `n`** |
+| Hands against a 131 072 B public-relay budget, shuffle only | **~7** | 131 072 / 17 958 = 7.3 |
+| The same including the signed event stream | **~5 hands** | order-of-magnitude only; measure under OQ-7 |
+| A relayed peer's **total** per-hand outbound at an `n`-seat table | `(n−1) × 8 979 B` | 44 895 B at six seats — a bandwidth figure, spread over `n−1` separate circuits and therefore `n−1` separate budgets, **never** a single cap |
 | The binding public-relay limit | **`max_circuit_duration` = 120 s**, not the byte cap | a session lasts far longer than two minutes |
 
-So the public-relay byte budget is *comfortable* for several hands and the
-duration is what breaks; the failure mode is unchanged but the reason in the
-earlier text was wrong.
+So the public-relay byte budget is **half** what an earlier revision of this
+document claimed — roughly five to seven hands, not ten to fourteen — and the
+duration is still what breaks first, since a 120 s circuit expires long before
+the fifth hand. The failure mode is unchanged; the reason in the earliest text
+was wrong, and the "per direction" arithmetic that replaced it was wrong too
+(§16.1).
+
+**This strengthens the two-role split of D-001's addendum; it does not weaken
+it.** That split rests on a public relay's defaults being sized for a hole-punch
+coordination and nothing more. Halving the effective byte budget removes the last
+reading under which a public relay might have carried a short session by
+accident: at 131 072 B bidirectional, one circuit is out of budget after about
+seven hands even if the duration limit were lifted, so *neither* default leaves
+room for a session. A relay that carries a whole session is still only a D-002
+volunteer with raised limits, and the two roles stay exactly as far apart as the
+table above says.
+
+**One caveat about third-party relays.** kubo's `docs/config.md` describes its
+equivalent `ConnectionDataLimit` as applying "in each direction". Either the Go
+and Rust implementations genuinely differ here or that wording is loose; the Go
+source has not been read for this document, so it is not settled. It costs us
+nothing either way: our own D-002 relay is `rust-libp2p`, so the Rust accounting
+binds us, and for a third-party relay the stricter reading — one bidirectional
+budget — is the safe assumption, because assuming the looser one and being wrong
+drops a circuit mid-hand.
 
 Two further facts to reconcile, because the research documents differ in emphasis
 and D-001 outranks:
@@ -1367,9 +1408,13 @@ one, because we have a better source that costs nothing and is self-healing:
 The client **must read the `Limit` the relay returns** rather than assume:
 `relay::client::Event::{ReservationReqAccepted, OutboundCircuitEstablished,
 InboundCircuitEstablished}` all carry `limit: Option<Limit>` with public
-`duration()` / `data_in_bytes()` accessors. A circuit whose advertised limits
-cannot carry a hand must not be used to seat a player; refuse with an honest
-message instead of starting a hand that will drop mid-street.
+`duration()` / `data_in_bytes()` accessors. **`data_in_bytes()` is the same
+bidirectional total**: the relay fills the wire field from its own
+`max_circuit_bytes` (`src/protocol/inbound_hop.rs:83,136`) and `Limit` copies it
+verbatim (`src/protocol.rs:41,49,58`), so the number a relay returns must be
+compared against both directions summed, never against one. A circuit whose
+advertised limits cannot carry a hand must not be used to seat a player; refuse
+with an honest message instead of starting a hand that will drop mid-street.
 
 A reservation is a **lease, not a state**: expect periodic
 `ReservationReqAccepted { renewal: true, .. }` and treat its absence as loss of
@@ -1391,7 +1436,13 @@ Several relay **server** `Event` variants (`ReservationReqAcceptFailed`,
 `CircuitReqAcceptFailed`) are `#[deprecated]` upstream — build no logic on them.
 
 > Verification: [SOURCE] `libp2p-relay-0.21.1/src/protocol.rs:31-36,39-52`,
-> `src/behaviour.rs` (`impl Default for Config`), `src/priv_client/transport.rs:266-300`;
+> `src/behaviour.rs:163` (`impl Default for Config`, `max_circuit_bytes: 1 << 17`),
+> `src/priv_client/transport.rs:266-300`; **the bidirectional accounting** in
+> `src/copy_future.rs:41-48` (one `bytes_sent: u64` on `CopyFuture`), `:78` (the
+> single comparison), `:88-95` and `:97-104` (both `forward_data` calls increment
+> that one counter), and `:241` (the crate's own quickcheck asserting
+> `a.len() + b.len() > max_circuit_bytes`); the returned `Limit` in
+> `src/protocol/inbound_hop.rs:83,136` and `src/protocol.rs:41,49,58`.
 > [COMPILED+RUN] the multiaddr round trips in `LIBP2P.md` §4; [RESEARCH] D-001
 > addendum for the kubo defaults, `MENTAL_POKER.md` §5.1 for the per-hand bytes.
 
@@ -1407,8 +1458,9 @@ disclosure in plain language: strangers' poker traffic will cross the user's
 connection, at the user's bandwidth cost. The disclosure must state the ceilings
 **in concrete terms**, because the raised limits below are large and a user who
 agrees to "help relay" is agreeing to these numbers: *up to 128 circuits open at
-the same time, each allowed to carry up to 1 GiB and to stay open for up to an hour,
-and up to 64 peers holding a reservation through you.*
+the same time, each allowed to carry up to 1 GiB — counted in both directions
+together, §16.1 — and to stay open for up to an hour, and up to 64 peers holding a
+reservation through you.*
 Slot and bandwidth ceilings are user-visible and user-settable, and the network
 status panel shows how many peers are currently being relayed.
 
@@ -1534,11 +1586,12 @@ relayed. So the ACL is **not a security boundary**; it is a *scope limiter*. Wha
 actually bounds abuse is the resource ceiling — total reservations, per-peer
 circuits, per-peer and global byte and bandwidth caps, and the default rate
 limiters (1 reservation per peer per 2 min, 1 per IP per min) which stay in place
-alongside our closures. The user-visible setting must say this honestly: "relay
+alongside our own `PokerPeersOnly`. The user-visible setting must say this
+honestly: "relay
 only for this application" means "only for peers claiming to run this application".
 
-**A race that must be handled.** The admission closure runs when the reservation
-request arrives, and it can arrive before `identify` has completed on that
+**A race that must be handled.** `PokerPeersOnly::try_next` runs when the
+reservation request arrives, and it can arrive before `identify` has completed on that
 connection, in which case an honest peer is denied. And a denied reservation is not
 retried for us: on a reservation error the client handler sets its reservation
 state back to `None` and forwards the error to the transport listener, which does
@@ -1558,7 +1611,7 @@ D-004 requires the lobby to be visible **even if every client is behind NAT**.
 | **0** | Mainline DHT lookup and announce | outbound UDP only; the DHT is millions of publicly reachable BitTorrent nodes we only ever talk to outbound, and storing nodes record the source address they actually saw. `Dht::client()` participates without serving. | *knowing other players exist and where they appear from* — survives an all-NAT world unconditionally |
 | **1** | **Mutual dialling** | both peers announce and both call `get_peers`, so both learn the other's external address at roughly the same time; both dial, and the outbound packets open each NAT mapping. **No relay, no coordination server** — the DHT delivered the information symmetrically. Needs endpoint-independent mapping on at least one side, and the announced port to be the *external* QUIC port (§4.4). | a direct connection, with nothing but the DHT |
 | **2** | DCUtR over a public relay | a relay for the coordination only; public relays are adequate and free here | a direct connection when blind mutual dialling does not converge |
-| **3** | **Lobby gossip over a public relay** | a public relay's 128 KiB / 2 min budget — ample for a few hundred bytes per table ad, and the 2-minute reset is survivable because the client simply reconnects | **lobby visibility with no punch succeeding anywhere.** This is the floor under D-003 and what makes the requirement unconditional |
+| **3** | **Lobby gossip over a public relay** | a public relay's 128 KiB / 2 min budget — the 128 KiB is a bidirectional total (§16.1), which is still ample for a few hundred bytes per table ad, and the 2-minute reset is survivable because the client simply reconnects | **lobby visibility with no punch succeeding anywhere.** This is the floor under D-003 and what makes the requirement unconditional |
 | **4** | A D-002 relay with raised limits | a volunteering publicly reachable poker client | *playing a hand* when both players are unreachable and no punch worked |
 
 Layer 1 was directly supported by measurement on the development machine: one local
@@ -1688,9 +1741,11 @@ Rules:
 
 ### 10.4 What these TTLs do **not** govern
 
-A *seated* player's absence. That is D-005/D-006/D-007 protocol state — absent
-seat, auto check/fold, timeout certificate, hand abort with signed attribution, and
-at two seats none of that machinery at all (§8.4) — decided
+A *seated* player's absence. That is D-005/D-006/D-007/D-008 protocol state —
+absent seat, auto check/fold, timeout certificate, hand abort with signed
+attribution, and none of that machinery at all wherever the required voter set has
+fewer than two members, which is always so at two seats and reachable at any seat
+count (D-008, §8.4) — decided
 above this layer by signed events, never by a network timer. The lobby TTLs govern
 only *lobby visibility*: whether a table and a player still appear in the list.
 Conflating the two would let a network hiccup fold a hand, which §1.2 rule 3
@@ -1898,11 +1953,14 @@ network.
     a configuration the MVP cannot ship would test something nobody can run.
 
     Two consequences of that choice must be stated rather than discovered later:
-    at two seats the deadline machinery does not apply at all (D-007, §8.4), so
-    the acceptance test exercises the transport in exactly the mode where a stalled
-    peer has no in-protocol remedy; and a two-seat full mesh is one circuit, which
-    is the least demanding case for §9.5's relay arithmetic and therefore proves
-    the least about it.
+    at two seats the required voter set has exactly one member, so `|V| < 2` and
+    the deadline machinery does not apply at all (D-007, D-008, §8.4), and the
+    acceptance test therefore exercises the transport in exactly the mode where a
+    stalled peer has no in-protocol remedy; and a two-seat full mesh is one
+    circuit, which is the least demanding case for §9.5's relay arithmetic in
+    *circuit count* and therefore proves the least about it — though not in bytes
+    per circuit, because under §16.1's bidirectional accounting every circuit
+    carries the same `2 × 8 979 B` of shuffle per hand at every table size.
 
 ---
 
@@ -1916,7 +1974,7 @@ network.
 | **OQ-4** | Ship libp2p Kademlia after all, if Phase 8 measures poor lobby connectivity from the DHT alone? Costs a second eclipse surface. | §5.7 | 8 |
 | **OQ-5** | `TopicScoreParams` values for both lobby topics. Defaults leave the per-topic terms — including the invalid-message penalty a `Reject` feeds — at zero. Requires measured message rates and mesh sizes; badly tuned scoring graylists honest peers. | §6.7 | 8 |
 | **OQ-6** | How often does the relay admission race actually deny an honest peer (reservation request arriving before `identify` completes)? A denial closes the circuit listener with no automatic retry, so our own `listen_on` backoff must cover it. | §9.6 | 7 |
-| **OQ-7** | What is the real per-hand byte count over **one** relayed circuit, per direction, measured against the `Limit` a real relay actually returns? The estimate is ~8 979 B of shuffle plus the signed event stream, order ~10 KB per hand, against a 131 072 B public-relay budget — comfortable, so the binding public-relay limit is the 120 s `max_circuit_duration` and not the byte cap (§9.5). The measurement is what gives the "refuse to seat rather than start a hand that will drop" rule a number. | §9.5 | 5 → 8 |
+| **OQ-7** | What is the real per-hand byte count over **one** relayed circuit **counting both directions together**, measured against the `Limit` a real relay actually returns? `max_circuit_bytes` is a single bidirectional counter per circuit (§16.1), so a measurement that records one direction and doubles the headroom is wrong by a factor of two — measure the sum, and compare it against `Limit::data_in_bytes()`, which is the same bidirectional figure. The estimate is `2 × 8 979 = 17 958 B` of shuffle plus the signed event stream, order ~20 KB per hand per circuit, against a 131 072 B public-relay budget — roughly five to seven hands, so the binding public-relay limit is still the 120 s `max_circuit_duration` and not the byte cap (§9.5). The measurement is what gives the "refuse to seat rather than start a hand that will drop" rule a number. | §9.5 | 5 → 8 |
 | **OQ-8** | What fraction of real peers does AutoNAT v2 confirm as publicly reachable? This sizes the D-002 volunteer relay pool, which is the project's real single point of failure. | §9.6, §12.8 | 8 |
 | **OQ-9** | Upstream `mainline`: `announce_peer_detailed` returning `PutOutcome { stored_at }`, or `pub use` of the `*RequestArguments` structs, so the GUI's DHT health indicator has a real number instead of a `get_peers`-and-count workaround. Hold a local patch if needed sooner. | §2.1 step 5 | 8 |
 | **OQ-10** | Licence for the project. Unrelated to this document but still open in `DECISIONS.md`. | publication | — |
@@ -1967,27 +2025,34 @@ parameters beside it genuinely are local: a denser mesh costs only its owner.
 | Decision | Sections |
 |---|---|
 | **D-001** relays permitted; costs documented; two roles never blurred | §9.5, §9.7, §12.7, §12.8 |
-| **D-002** publicly reachable client volunteers as relay, off by default, admission via the rate-limiter closures; open question settled | §9.6 |
+| **D-002** publicly reachable client volunteers as relay, off by default, admission via a **named type implementing `libp2p::relay::RateLimiter`** — the trait is re-exported at the crate root (`libp2p-relay-0.21.1/src/lib.rs:42`), the type holds the live admitted-peer set, and it is installed into **both** `reservation_rate_limiters` and `circuit_src_rate_limiters`; open question settled | §9.6 |
 | **D-003** global lobby visibility is the acceptance criterion; the bridge is the load-bearing step; announce `Some(external_quic_port)` | §2, §4, §4.4, §12.12 |
 | **D-004** lobby visible even if every client is behind NAT; four layers; symmetric-both-ends stated | §9.7, §9.3, §12.1 |
 | **D-005** absent seat, mid-hand abort, forfeiture — **not** a transport concern | §1.2 rule 3, §8.4, §10.4 |
-| **D-006** action timeout is auto check/fold, never an abort; timeout certificate; no timeout ends the game — **as corrected by D-007** | §1.2 rule 3, §8.4, §10.4 |
-| **D-007** corrects D-006: at `n = 2` the action deadline is advisory, a fold-effect timeout certificate is forbidden, and no document may claim the certificate protects a two-seat table. The transport layer's behaviour is unchanged — connection loss stays a hint at every table size — and the transport must not invent a substitute verdict | §8.4, §1.2 rule 3, §10.4, §12.12 |
+| **D-006** action timeout is auto check/fold, never an abort; timeout certificate; no timeout ends the game — **as corrected by D-007 and generalised by D-008** | §1.2 rule 3, §8.4, §10.4 |
+| **D-007** corrects D-006: at two seats the action deadline is advisory, a fold-effect timeout certificate is forbidden, and no document may claim the certificate protects a two-seat table. The transport layer's behaviour is unchanged — connection loss stays a hint at every table size — and the transport must not invent a substitute verdict | §8.4, §1.2 rule 3, §10.4, §12.12 |
+| **D-008** generalises D-007: every rule that weakens, disables or gates the timeout certificate is scoped on the **size of the required voter set `V`** and **never on `n`**, the seat count. A certificate whose required voter set has fewer than two members has no effect; a seat leaves `V` only once a completed, valid certificate names it, so being voted against is not exclusion. This layer states no rule scoped on `n`, and the transport's own behaviour is unchanged at every size of `V` | §8.4, §1.2 rule 3, §10.4, §12.12 |
 
 ---
 
 ## 16. Objections to the fix plan
 
-`PHASE0_FIXPLAN.md` is applied as written throughout this document. One ruling is
-applied under objection, recorded here so the corpus stays consistent and the
-disagreement is visible rather than silently resolved in one file.
+`PHASE0_FIXPLAN.md` is applied as written throughout this document. One ruling was
+applied under objection; the objection was **upheld** in `PHASE1_VERIFY.md` (N1,
+and the assessment of this section in Part 3.5), and the corrected numbers are now
+carried in §9.5, §9.7 layer 3 and OQ-7. The record stays here because the
+superseded figure was quoted by four documents and a reader who meets it elsewhere
+needs to find out where it went.
 
 ### 16.1 A-8 — `max_circuit_bytes` is per circuit, but **not** per direction
 
-**The ruling.** A-8 states that *"`max_circuit_bytes` is per circuit and per
-direction"*, and derives from that a public-relay budget of ~14 hands per
-direction (131 072 / 8 979). §9.5 above carries those numbers verbatim, as
-instructed.
+**Status: objection upheld, correction applied.** §9.5 no longer carries the
+per-direction figure. What follows is the record of why.
+
+**The ruling.** A-8 stated that *"`max_circuit_bytes` is per circuit and per
+direction"*, and derived from that a public-relay budget of ~14 hands per
+direction (131 072 / 8 979). An earlier revision of §9.5 carried those numbers
+verbatim, as instructed.
 
 **The objection.** The "per direction" half does not hold in
 `libp2p-relay 0.21.1`. A circuit is relayed by a single `CopyFuture` holding one
@@ -2001,25 +2066,41 @@ let src_status = match forward_data(&mut this.src, &mut this.dst, cx) { … this
 let dst_status = match forward_data(&mut this.dst, &mut this.src, cx) { … this.bytes_sent += i … };
 ```
 
+The crate's own quickcheck states the same thing from the outside: on the
+`"Max circuit bytes reached."` error it asserts
+`a.len() + b.len() > max_circuit_bytes as usize` (`src/copy_future.rs:241`) —
+the two directions summed against one cap.
+
 The cap is therefore per circuit and **bidirectional**. A-8's citation
 (`src/behaviour.rs`, `impl Default for Config`; `src/behaviour/handler.rs`)
 establishes the default value and that the value is handed to each circuit; it
 does not reach the accounting, which lives in `src/copy_future.rs`.
 
-**What changes if the objection is upheld.** Over one relayed circuit between two
-seats, each seat sends its own step and proof once per hand, so the circuit
+**What changed when the objection was upheld.** Over one relayed circuit between
+two seats, each seat sends its own step and proof once per hand, so the circuit
 carries `2 × 8 979 = 17 958 B` of shuffle per hand, not 8 979 B. The
-public-relay budget is then **~7 hands**, not ~14, and the "including the signed
-event stream" figure roughly halves with it. Every other number in A-8 is
-unaffected: `8 979 B` per shuffler is correct, `(n−1) × 8 979 B` as a relayed
-peer's total per-hand outbound is correct, and — decisively — **the ruling's
-conclusion is correct either way**: at 7 hands as at 14, the byte cap is not what
-binds, and the 120 s `max_circuit_duration` still is. The correction changes a
-comfort margin, not a design decision.
+public-relay budget is **~7 hands**, not ~14, and the "including the signed
+event stream" figure halved with it, from ~10 hands to ~5. Every other number in
+A-8 is unaffected: `8 979 B` per shuffler is correct, and `(n−1) × 8 979 B` as a
+relayed peer's total per-hand outbound is correct — that figure is spread over
+`n−1` circuits, so the halving does not touch it. Decisively, **the ruling's
+conclusion survives**: at 7 hands as at 14, the byte cap is not what binds, and
+the 120 s `max_circuit_duration` still is. The correction changes a comfort
+margin, not a design decision — and it changes it in the direction that
+*strengthens* D-001's addendum, since a public relay is now short of budget on
+both of its defaults rather than only on one (§9.5).
 
-**Why it is still worth recording.** OQ-7 asks for this number to be measured
-against a real relay's returned `Limit`. Whoever runs that measurement will read
-the accounting as per-direction, measure one direction, and conclude there is
-twice the headroom there is. `SPEC_CS.md` §36 forbids carrying a claim stronger
-than its evidence, and "per direction" is one such claim, small as its
-consequence is here.
+**Why it was worth recording.** OQ-7 asks for this number to be measured against
+a real relay's returned `Limit`. Whoever runs that measurement would have read
+the accounting as per-direction, measured one direction, and concluded there was
+twice the headroom there is; OQ-7 is now stated as a bidirectional measurement
+for exactly that reason. `SPEC_CS.md` §36 forbids carrying a claim stronger than
+its evidence, and "per direction" was one such claim, small as its consequence is
+here.
+
+**The one place the question is not settled.** kubo's `docs/config.md` describes
+`ConnectionDataLimit` as applying "in each direction". Either the Go and Rust
+implementations differ or that wording is loose; the Go source has not been read
+for this document and no claim is made about it. Our own relay is Rust, so the
+Rust behaviour binds us; against a third-party relay the stricter reading is
+assumed (§9.5).

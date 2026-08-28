@@ -1,5 +1,24 @@
 # CRYPTO_LIBS.md — general cryptographic and serialisation dependency set
 
+> ## Read this first: the dependency block below was verified in ISOLATION
+>
+> Every result in this document was produced in a standalone probe crate
+> (`probe-crypto-final`) containing **only** the crates recommended here. It
+> was never compiled alongside `libp2p`, `mainline`, `ziffle` or `eframe`.
+>
+> **`docs/research/INTEGRATION.md` holds the combined result and outranks
+> this document wherever the two disagree.** The isolated results are kept,
+> because they were true of the probe; each one the integrated tree changes
+> is now labelled *Probe* and paired with the *Integrated* reality beside it.
+>
+> The largest correction, because it was stated as an absence and absences
+> get copied into manifests: this document claimed `rand` had been **dropped
+> entirely** and was absent "at any depth". In the integrated tree **`rand`
+> is present at three majors — 0.8.8, 0.9.5 and 0.10.2 — and `rand = "0.8"`
+> is a direct dependency of `p2p-poker`.** See §1.2, §7.3 and §10. The
+> discipline behind the claim survives. The absence does not, and must not
+> be restated anywhere.
+
 Phase 0 research. Binding spec sections: 6, 7, 12, 21, 28.
 
 Scope: everything **except** the mental-poker / verifiable-shuffle protocol itself,
@@ -41,14 +60,14 @@ docs.rs and recollection were used only as leads, never as evidence.
 | Decision | Outcome |
 |---|---|
 | OS CSPRNG | `getrandom::SysRng` — **`OsRng` no longer exists** in rand 0.10 / rand_core 0.10 |
-| `rand` crate | **Dropped entirely.** Not needed, and dropping it removes RUSTSEC-2026-0097 from the tree |
+| `rand` crate | *Probe:* dropped entirely. *Integrated:* **present at 0.8.8, 0.9.5 and 0.10.2**, plus `rand = "0.8"` as a direct dependency. RUSTSEC-2026-0097 does not bite — but because all three are patched versions, not because the crate is gone (§1.2, §7.3) |
 | Protocol hash | **BLAKE3** for our own hashes; `sha2` stays because Ed25519 mandates SHA-512 |
 | Signatures | `ed25519-dalek` 3.0.0, **`verify_strict` only** |
 | Canonical bytes | **`minicbor` 2.3.0, `#[cbor(array)]` only, no maps, no floats**, plus a re-encode gate |
 | Deterministic CBOR out of the box | **Only `dcbor` fully implements RFC 8949 §4.2. `ciborium`, `cbor4ii` and `serde_cbor` do not.** |
 | Secret storage | One file format, two key slots: Argon2id passphrase (portable) + DPAPI (Windows convenience) |
 | `cargo-deny` | 0.20.2. Clean on the runtime set; the optional `dcbor` dev-dep needs one scoped ignore |
-| `cargo-audit` | Installs **only with `--locked`** — 0.22.2. Runs clean |
+| `cargo-audit` | Installs **only with `--locked`** — 0.22.2. *Probe:* clean. *Integrated:* **2 vulnerabilities, 2 warnings**, all of them in `hickory-proto`, `lru` and `paste` — none in this document's set (§7.3.2) |
 | Could not build | Nothing in the recommended set. Two candidates were rejected on evidence (below) |
 
 ---
@@ -120,11 +139,18 @@ getrandom = { version = "0.4.3", default-features = false, features = ["std", "s
 **Verification:** (b) source — `getrandom-0.4.3/Cargo.toml` `[features]` lists
 `sys_rng = ["dep:rand_core"]`. (a) compiled.
 
-### 1.2 Recommendation: do not depend on `rand` at all
+### 1.2 Recommendation: draw randomness only from `getrandom::SysRng`
+
+> **This section was rewritten.** Its earlier title was "do not depend on `rand`
+> at all", and that recommendation **cannot be met in the integrated tree**. See
+> `INTEGRATION.md` §2, which is the authority. What survives is the discipline,
+> which is what spec §7 actually asks for.
 
 The `rand` crate buys us `RngExt` (`random_range`, shuffling, distributions). We must not
 use any of it: a poker shuffle is produced by the mental-poker protocol, not by a local
-PRNG. Dropping `rand`:
+PRNG. That much is unchanged. What changed is how the rule is enforced.
+
+**Probe result — true of `probe-crypto-final`, and only of it.** Dropping `rand`:
 
 - removes `ThreadRng`, `StdRng` and `SmallRng` from the tree, so spec §7's prohibition is
   enforced by the dependency graph rather than by reviewer discipline;
@@ -136,9 +162,48 @@ PRNG. Dropping `rand`:
 `cargo tree -i rand` returns
 `error: package ID specification 'rand' did not match any packages`.
 
+**Integrated result — true of the repository root, and what binds.** `rand` is in
+the tree at three majors, all of them compiled, and none of them removable:
+
+| Version | Reached through | Features actually enabled |
+|---|---|---|
+| 0.8.8 | **direct dependency of `p2p-poker`**; also `ark-std` 0.5.0 (via `ziffle`), `libp2p-autonat` 0.15.0, `libp2p-core` 0.43.2 | `alloc`, `getrandom`, `libc`, `rand_chacha`, `std`, `std_rng` |
+| 0.9.5 | `hickory-proto` / `hickory-resolver` (libp2p `dns`), `igd-next` (libp2p `upnp`), `yamux` | — |
+| 0.10.2 | `quinn-proto` (libp2p `quic`), `rs_poker` 5.0.0 | `alloc`, `getrandom`, `std`, `std_rng`, `sys_rng`, `thread_rng` |
+
+`rand_chacha` follows at 0.3.1 (under `rand` 0.8.8) and 0.9.0 (under `rand` 0.9.5);
+`rand_core` at 0.6.4, 0.9.5 and 0.10.1.
+
+**Verification:** (a) executed at the repository root —
+`cargo tree --edges normal -i rand@0.8.8` (and `@0.9.5`, `@0.10.2`) for provenance,
+`cargo tree --edges features -i rand@<version>` for the feature columns.
+
+The direct `rand = "0.8"` is not an accident and not ours to delete: `libp2p-autonat`'s
+v2 behaviours are generic over an RNG defaulting to `rand_core` 0.6's `OsRng` —
+`libp2p-autonat-0.15.0/src/v2/client/behaviour.rs:60` declares
+`pub struct Behaviour<R = OsRng>` — and `rand` 0.8 is where we get that type from.
+**Verification:** (b) source.
+
+Two things about what is *compiled*, which the crate list alone does not tell you:
+
+- `small_rng` is **not** enabled on `rand` 0.8.8, so `SmallRng` is not in the build at
+  that major. `std_rng` **is** enabled — it is a default feature of `rand` 0.8 — so
+  `StdRng` and `rand_chacha` 0.3.1 are. **Verification:** (b) source,
+  `rand-0.8.8/Cargo.toml` `[features]`: `default = ["std", "std_rng"]`,
+  `std_rng = ["rand_chacha"]`, and `small_rng = []` is not named by any of them.
+- `thread_rng` **is** enabled on `rand` 0.10.2, by `quinn-proto`. `rand`'s own `log`
+  feature is not, and 0.10.2 is past the RUSTSEC-2026-0097 patch line anyway (§7.3.1).
+
 > **Spec deviation to record.** Spec §7 names `OsRng`. We implement the requirement
 > (OS CSPRNG, never a self-seeded or non-cryptographic generator) under its current
-> name `getrandom::SysRng`. The prohibition on `SmallRng` is satisfied structurally.
+> name `getrandom::SysRng`.
+>
+> **The prohibition on `SmallRng` and `StdRng` is no longer satisfied structurally.**
+> `StdRng` is compiled into the binary through `rand` 0.8's default features. The rule
+> is now a reviewable boundary rather than an impossibility: all of our own randomness
+> is routed through one module, `src/security/rng.rs`, which exists precisely to make
+> that boundary explicit. Do not write "enforced by the dependency graph" anywhere
+> again — it is not true, and it is the kind of sentence that stops people looking.
 
 ---
 
@@ -909,21 +974,156 @@ $ cargo audit
 
 **Verification:** (a) both the failure and the fix are literal terminal output.
 
+*That clean run is the **probe's** lockfile — 52 crates.* The integrated repository
+resolves 612 and does **not** exit 0. See §7.3.2.
+
 **Document `--locked` in the contributor README and use it in CI.** Anyone following the
 obvious instructions on this toolchain will otherwise hit the same wall.
 
-### 7.3 Advisory status of the recommended set
+### 7.3 Advisory status
 
-Queried against the RustSec advisory-db (**(c)**, `github.com/rustsec/advisory-db`):
+Two different questions, two different answers. Keeping them apart is the whole point
+of this section.
 
-| Crate | Advisories | Affects our pin? |
-|---|---|---|
-| `ed25519-dalek` | RUSTSEC-2022-0093 | No — `patched >= 2`, we use 3.0.0 |
-| `curve25519-dalek` | RUSTSEC-2024-0344 | No — `patched >= 4.1.3`, we use 5.0.0 |
-| `sha2` | RUSTSEC-2021-0100 | No — `patched >= 0.9.8`, we use 0.11.0 |
-| `rand` | RUSTSEC-2026-0097 | **Crate not in the tree at all** |
-| `serde_cbor` | RUSTSEC-2019-0025, RUSTSEC-2021-0127 | **Rejected, not used** |
-| `getrandom`, `rand_core`, `k256`, `blake3`, `zeroize`, `subtle`, `minicbor`, `ciborium`, `cbor4ii`, `argon2`, `chacha20poly1305`, `keyring`, `dcbor` | none | — |
+#### 7.3.1 The recommended set, queried crate by crate
+
+Queried against the RustSec advisory-db (**(c)**, `github.com/rustsec/advisory-db`),
+and re-checked against the versions `Cargo.lock` actually resolves at the repository
+root (**(a)**):
+
+| Crate | Resolved in `Cargo.lock` | Advisories | Affects us? |
+|---|---|---|---|
+| `ed25519-dalek` | 2.2.0, **3.0.0** | RUSTSEC-2022-0093 | No — `patched >= 2`; both resolved majors are past it |
+| `curve25519-dalek` | 4.1.3, **5.0.0** | RUSTSEC-2024-0344 | No — `patched >= 4.1.3`; both resolved versions are at or past it |
+| `sha2` | 0.10.9, **0.11.0** | RUSTSEC-2021-0100 | No — `patched >= 0.9.8` |
+| `rand` | **0.8.8, 0.9.5, 0.10.2** | RUSTSEC-2026-0097 | No — **but not because the crate is absent.** All three resolved versions are past a patch line |
+| `rand_chacha` | 0.3.1, 0.9.0 | none | — |
+| `rand_core` | 0.6.4, 0.9.5, **0.10.1** | none | — |
+| `getrandom` | 0.2.17, 0.3.4, **0.4.3** | none | — |
+| `serde_cbor` | **absent** | RUSTSEC-2019-0025, RUSTSEC-2021-0127 | Rejected, and confirmed not in the lockfile |
+| `k256`, `ciborium`, `keyring`, `dcbor` | **absent** | none / n.a. | Never adopted; confirmed not in the lockfile |
+| `blake3` 1.8.7, `zeroize` 1.9.0, `subtle` 2.6.1, `minicbor` 2.3.0, `argon2` 0.6.0, `chacha20poly1305` 0.11.0 | as pinned | none | — |
+
+Bold marks the version this document pins; the others are what libp2p, arkworks and
+the DHT bring with them (`INTEGRATION.md` §2 explains why the duplicates are not a
+defect).
+
+**The `rand` row is a correction.** An earlier revision of this table said
+"**Crate not in the tree at all**". That was true of `probe-crypto-final` and is
+**false of the integrated tree**. The conclusion happens to survive, but on a weaker
+and more fragile basis: the advisory's `[versions] patched` field reads
+
+```toml
+patched = [">= 0.10.1", "< 0.10.0, >= 0.9.3", "< 0.9.0, >= 0.8.6"]
+```
+
+and 0.8.8 ≥ 0.8.6, 0.9.5 ≥ 0.9.3, 0.10.2 ≥ 0.10.1. Every one of the three clears a
+patch line by a small margin. An absence cannot regress; a patched version can. This
+row must therefore be re-checked after every `cargo update`, not filed away as
+structurally impossible.
+
+**Verification:** (b) source —
+`~/.cargo/advisory-db/crates/rand/RUSTSEC-2026-0097.md`, quoted above
+verbatim; (a) executed — `Cargo.lock` at the repository root, and
+`cargo tree --edges normal` for what is compiled.
+
+Two further notes the advisory scan does not raise but a reader of this table should
+have:
+
+- `chacha20poly1305` also appears in `Cargo.lock` at **0.10.1** (via `snow` ←
+  `libp2p-noise`), but it is **not compiled** on this host target:
+  `cargo tree --edges normal -i chacha20poly1305@0.10.1` prints
+  `warning: nothing to print.`, and only `--target all` reveals the edge. It carries
+  no advisory either way. It is a clean illustration of §7.3.3.
+- `cbor4ii` **is** in the integrated tree at 0.3.3, pulled in by
+  `libp2p-request-response`'s `cbor` feature. §4.2 and §4.3 rejected it as *our*
+  canonical encoder and that still holds — but "not used by us" is now the accurate
+  phrasing, not "not present".
+
+#### 7.3.2 `cargo audit` on the integrated repository — **not clean**
+
+Run at the repository root, `cargo-audit-audit 0.22.2`, advisory-db as of 2026-08-28:
+
+```
+$ cargo audit
+    Fetching advisory database from `https://github.com/RustSec/advisory-db.git`
+      Loaded 1226 security advisories (from ~\.cargo\advisory-db)
+    Updating crates.io index
+    Scanning Cargo.lock for vulnerabilities (612 crate dependencies)
+
+Crate:     hickory-proto
+Version:   0.25.2
+Title:     NSEC3 closest-encloser proof validation enters unbounded loop on cross-zone responses
+Date:      2026-05-01
+ID:        RUSTSEC-2026-0118
+Solution:  No fixed upgrade is available!
+
+Crate:     hickory-proto
+Version:   0.25.2
+Title:     CPU exhaustion during message encoding due to O(n²) name compression
+Date:      2026-05-01
+ID:        RUSTSEC-2026-0119
+Solution:  Upgrade to >=0.26.1
+
+Crate:     paste
+Version:   1.0.15
+Warning:   unmaintained
+ID:        RUSTSEC-2024-0436
+
+Crate:     lru
+Version:   0.16.4
+Warning:   unsound
+Title:     Potential use-after-free due to lack of panic safety in `LruCache::pop()`
+ID:        RUSTSEC-2026-0253
+
+error: 2 vulnerabilities found!
+warning: 2 allowed warnings found
+```
+
+**Verification:** (a) literal terminal output, elided only in the `URL:` lines.
+
+None of the four is in this document's set. `hickory-proto` arrives with libp2p's
+`dns` feature and `lru` with `mainline`.
+
+`paste` is the one whose story this document got wrong in a second way: §4.4 treats it
+as a `dcbor` **dev**-dependency, to be silenced with a scoped `ignore`. In the integrated
+tree it is a **runtime** proc-macro dependency —
+`cargo tree --edges normal -i paste@1.0.15` gives
+`paste ← ark-ff 0.5.0 ← ark-ec/ark-poly/ark-secp256k1 ← ziffle ← p2p-poker` — and it is
+there whether or not `dcbor` is ever added. The scoped ignore in §4.4 is therefore no
+longer "dev-only", and that is a different risk decision from the one §4.4 recorded.
+It is unmaintained, not vulnerable, so nothing is on fire; but the justification has to
+be rewritten before it is used. **Verification:** (a) executed.
+
+**The provenance of all four, the decision to keep the `dns` feature, and the
+Mainline-only alternative that would remove both hickory advisories are recorded in
+`INTEGRATION.md` §3, which is the authority for them.** Do not re-litigate them here.
+
+#### 7.3.3 `cargo audit` reads the lockfile, so it is feature-blind
+
+`cargo audit` scans `Cargo.lock`, not the build graph, and a lockfile records the
+union of the resolved graph's optional dependencies regardless of which features are
+switched on. `INTEGRATION.md` §3 measured this directly: with libp2p's `dns` feature
+removed, `hickory-proto` is no longer compiled at all —
+`cargo tree --edges normal -i hickory-proto` prints `warning: nothing to print.` —
+and yet `cargo audit` still reports both hickory advisories. The
+`chacha20poly1305` 0.10.1 case in §7.3.1 is the same effect on the target axis.
+
+Two consequences, and they cut in opposite directions:
+
+- **A clean `cargo audit` is not evidence that a vulnerable crate is out of the
+  binary, and a dirty one is not evidence that it is in.** It has no feature
+  awareness at all.
+- `cargo tree --edges normal -i <crate>` is the tool that answers what is actually
+  compiled. Spec §28 asks for a security status per dependency, and "flagged by
+  audit but not compiled" is a different status from "compiled and vulnerable".
+
+Note the gap in the header line itself: **612 crate dependencies scanned**, against
+**426** crates actually compiled (`cargo tree --edges normal`, unique name+version
+pairs). `INTEGRATION.md` §3 records 611 and §1 records 425 for its own run; `Cargo.lock`
+has been re-resolved since (its mtime is later than that document's), so the tree has
+drifted by one crate. The finding is unaffected — but re-run the command before
+quoting either number, rather than copying it from here.
 
 ### 7.4 Licences requiring an explicit `cargo-deny` allow-list
 
@@ -969,6 +1169,11 @@ ignore = [
 
 ## 8. Cross-layer warning: duplicate crate versions are coming
 
+> **This section was a prediction, and it has since been measured.**
+> `INTEGRATION.md` §2 lists the duplicates that actually resolved and explains why
+> they are not a defect. Where it and this section differ, it wins. The prediction
+> is kept because it was substantially right and the reasoning still applies.
+
 Not a blocker, but the integration agent must know. Verified via crates.io dependency
 endpoints (**(c)**):
 
@@ -976,7 +1181,7 @@ endpoints (**(c)**):
 |---|---|
 | `libp2p-identity` (used by libp2p 0.56) | `ed25519-dalek ^2.1`, `k256 ^0.13.4`, `sha2 ^0.10.8`, `rand ^0.8`, `zeroize ^1.8` |
 | `ziffle` 0.1.0 (mental-poker candidate) | `ark-*` 0.5, `sha2 ^0.10.9`, `zeroize ^1.8.2` |
-| **This document** | `ed25519-dalek 3.0`, `sha2 0.11`, no `rand` |
+| **This document** | `ed25519-dalek 3.0`, `sha2 0.11`, `rand_core 0.10` — *and, as originally written, "no `rand`"; see §1.2, that part did not survive integration* |
 
 Cargo will therefore link **two copies of `ed25519-dalek`** (2.x and 3.x), **two of `sha2`**
 (0.10 and 0.11), and pull `rand 0.8` back in through libp2p. That compiles — the versions
@@ -991,6 +1196,11 @@ are semver-incompatible so they coexist — but three consequences must be handl
 3. `rand 0.8` returns via libp2p, so RUSTSEC-2026-0097 must be re-checked at integration
    time. It does not affect 0.8 (`affected.functions` lists `rand::thread_rng` for
    `>= 0.7.0, < 0.10.0` with `patched >= 0.8.6`), but confirm the resolved version is ≥ 0.8.6.
+
+   **Re-checked, and the prediction was too narrow.** `rand` came back at *three*
+   majors, not one: 0.8.8 (≥ 0.8.6, clear), 0.9.5 (≥ 0.9.3, clear) and 0.10.2
+   (≥ 0.10.1, clear). It is also a **direct** dependency of `p2p-poker`, not only a
+   transitive one. §1.2 has the provenance table and §7.3.1 the advisory arithmetic.
 
 Set `multiple-versions = "warn"` rather than `"deny"` in `deny.toml`, or the build will fail
 on a condition we cannot fix without forking libp2p.
@@ -1019,8 +1229,14 @@ One tooling install failed and was fixed: `cargo-audit` needs `--locked` (§7.2)
 
 ## 10. The dependency block
 
+> **Do not copy this block blind any more.** The workspace `Cargo.toml` now exists at
+> the repository root, it already carries every line below, and **it is the
+> authoritative manifest** — this section is a record of what the probe compiled,
+> reconciled against it. If the two ever differ, `Cargo.toml` and `INTEGRATION.md`
+> are right and this is stale.
+
 Compiled **together in one probe crate** (`probe-crypto-final`), which then ran all eight
-checks successfully. Copy this verbatim into the workspace `Cargo.toml`.
+checks successfully.
 
 ```toml
 [dependencies]
@@ -1036,10 +1252,17 @@ blake3 = { version = "1.8.7",  default-features = false, features = ["std"] }
 
 # --- OS CSPRNG ------------------------------------------------------------
 # NOTE: `OsRng` no longer exists. The OS source is `getrandom::SysRng`.
-# The `rand` crate is deliberately ABSENT: it would reintroduce SmallRng/StdRng,
-# which spec section 7 forbids, and RUSTSEC-2026-0097.
+# Our own code draws cryptographic randomness ONLY from `getrandom::SysRng`,
+# through src/security/rng.rs. Spec section 7 forbids SmallRng, StdRng and any
+# self-seeded generator; that is a reviewable boundary, NOT an absence -
+# see CRYPTO_LIBS.md section 1.2.
 rand_core = { version = "0.10.1", default-features = false }
 getrandom = { version = "0.4.3",  default-features = false, features = ["std", "sys_rng"] }
+
+# Present only because libp2p-autonat needs rand_core 0.6's OsRng. Our own
+# code must never draw cryptographic randomness from it - spec section 7
+# forbids SmallRng and self-seeded generators. See CRYPTO_LIBS.md section 1.2.
+rand = "0.8"
 
 # --- secret hygiene -------------------------------------------------------
 zeroize = { version = "1.9.0",  default-features = false, features = ["alloc", "derive"] }
@@ -1064,14 +1287,21 @@ windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "
 dcbor = "0.25.2"
 ```
 
-Resolved tree: **41 runtime crates** (`cargo tree --edges normal`), 61 counting build-
+**Probe tree:** **41 runtime crates** (`cargo tree --edges normal`), 61 counting build-
 and dev-dependencies. No `rand` at any depth. `cargo audit` exits 0; `cargo deny check
 advisories bans sources` is clean for the runtime set and needs the one `RUSTSEC-2024-0436`
 ignore once the `dcbor` dev-dependency is added (§4.4).
 **Verification:** (a) `cargo tree`, `cargo audit` and `cargo deny` executed on
-`probe-crypto-final` with exactly the block above.
+`probe-crypto-final` with exactly the block above, minus the `rand = "0.8"` line, which
+the probe did not have.
 
-### Locked versions
+**Integrated tree:** **426 crates compiled**, **612 recorded in `Cargo.lock`**, `rand`
+present at three majors, and `cargo audit` exits **1** with two vulnerabilities that
+belong to libp2p's DNS stack and to `mainline` (§7.3.2, `INTEGRATION.md` §1 and §3).
+The sentence "No `rand` at any depth" above is a property of the probe and of nothing
+else.
+
+### Locked versions — the probe
 
 ```
 argon2 0.6.0            curve25519-dalek 5.0.0   minicbor 2.3.0      signature 3.0.0
@@ -1079,6 +1309,38 @@ blake3 1.8.7            ed25519 3.0.0            rand_core 0.10.1    subtle 2.6.
 chacha20poly1305 0.11.0 ed25519-dalek 3.0.0      sha2 0.11.0         windows-sys 0.61.2
                         getrandom 0.4.3          zeroize 1.9.0
 ```
+
+### Locked versions — the integrated tree
+
+What the repository's `Cargo.lock` actually resolves for the crates this document
+governs. **Bold** is the version pinned above; the rest arrive with libp2p, arkworks,
+`mainline` or `rs_poker`. The `rand` family was missing from the probe list entirely
+and is spelled out here because that omission is what made §7.3 wrong.
+
+| Crate | Versions in `Cargo.lock` |
+|---|---|
+| `rand` | 0.8.8, 0.9.5, 0.10.2 — *none of them in the probe* |
+| `rand_chacha` | 0.3.1, 0.9.0 — *neither in the probe* |
+| `rand_core` | 0.6.4, 0.9.5, **0.10.1** |
+| `getrandom` | 0.2.17, 0.3.4, **0.4.3** |
+| `ed25519-dalek` | 2.2.0, **3.0.0** |
+| `ed25519` | 2.2.3, **3.0.0** |
+| `curve25519-dalek` | 4.1.3, **5.0.0** |
+| `signature` | 2.2.0, **3.0.0** |
+| `sha2` | 0.10.9, **0.11.0** |
+| `digest` | 0.10.7, 0.11.3 |
+| `chacha20poly1305` | 0.10.1 (locked, not compiled — §7.3.1), **0.11.0** |
+| `cbor4ii` | 0.3.3 — *present via libp2p, not used by us* |
+| `windows-sys` | 0.52.0, 0.59.0, 0.60.2, **0.61.2** |
+| `argon2` | **0.6.0** |
+| `blake3` | **1.8.7** |
+| `minicbor` | **2.3.0** |
+| `subtle` | **2.6.1** |
+| `zeroize` | **1.9.0** |
+| `serde_cbor`, `k256`, `ciborium`, `keyring`, `dcbor` | absent |
+
+**Verification:** (a) read from `Cargo.lock` at the repository root; the
+compiled-versus-locked distinction cross-checked with `cargo tree --edges normal`.
 
 ### Final probe output
 
@@ -1095,13 +1357,21 @@ chacha20poly1305 0.11.0 ed25519-dalek 3.0.0      sha2 0.11.0         windows-sys
 FINAL PROBE: ALL CHECKS PASSED
 ```
 
+Line `[1]`'s parenthetical is literal probe output and is left as it was printed. It
+was true of the probe. In the integrated tree the `rand` crate **is** in the tree; what
+the check still proves there is the part that matters — that the bytes came from
+`getrandom::SysRng`.
+
 ---
 
 ## 11. Open items for later phases
 
 1. **Verify the Linux 0600 path on an actual Linux host.** Never compiled here (§6.5).
-2. **Re-run `cargo audit` / `cargo deny` after libp2p and the mental-poker crate land** —
-   the duplicate-version situation in §8 changes the tree materially.
+2. ~~**Re-run `cargo audit` / `cargo deny` after libp2p and the mental-poker crate land**~~
+   — **done.** `cargo audit` was re-run on the integrated tree; the result is in §7.3.2
+   and it is not clean. `cargo deny` on the integrated tree has **not** been re-run and
+   remains open: §8's `multiple-versions = "warn"` advice now has to cover the `rand`,
+   `rand_core`, `rand_chacha`, `getrandom`, `digest` and `windows-sys` families as well.
 3. **The mental-poker layer may override the curve and the hash.** If its proof system
    mandates secp256k1 (as `ziffle`'s arkworks dependency suggests) or a specific
    Fiat–Shamir hash, that mandate wins for those bytes. This document governs the general

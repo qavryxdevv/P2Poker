@@ -447,8 +447,10 @@ token for the river index during the pre-flop betting round. Our rules:
    keyboard still cooperates cryptographically, so the board opens on schedule, the
    showdown works, and the hand plays to the end. The only thing missing is a betting
    decision, and the answer to that is an auto check/fold via a timeout certificate
-   **at `n >= 3`; heads-up the deadline is advisory (D-007)** — never an abort, and
-   never anything that ends the tournament.
+   **when the required voter set `V` (`PROTOCOL.md` §8.3) has at least two members;
+   when `|V| < 2` the deadline is advisory (D-007, D-008)** — never an abort, and
+   never anything that ends the tournament. The scope is `|V|`, never the seat count
+   `n`: see §2.10.
 3. **There are no burn cards.** Indices `2m+5 … 51` are never opened and a reveal token
    for any of them is a protocol violation, attributed to its sender.
 
@@ -470,8 +472,8 @@ DEAL_PRIVATE         broadcast: each dealt-in seat emits one message carrying it
                      per sender, one message per sender, one collective stage
                                                                         (131 B per token)
   ↓
-betting …            auto check/fold on a timeout certificate at n >= 3 (D-006);
-                     heads-up the deadline is advisory (D-007)
+betting …            auto check/fold on a timeout certificate when |V| >= 2 (D-006);
+                     when |V| < 2 the deadline is advisory (D-007, D-008)
 FLOP_REVEAL          tokens for 3 indices, broadcast
 betting … TURN_REVEAL … betting … RIVER_REVEAL … betting …
   ↓
@@ -515,23 +517,33 @@ Per **D-005** and `SPEC_CS.md` §19:
 * If the hand can still be decided without opening anything — everyone else folds to
   one player — it completes normally. No tokens are needed, so a player who quits to
   escape a loss does not escape if the others simply fold.
-* Otherwise the hand **aborts**. At `n >= 3` the abort carries a signed record naming
-  the peer that failed to publish; the absent player's committed chips are forfeited and
+* Otherwise the hand **aborts**. When the required voter set `V` (`PROTOCOL.md` §8.3)
+  has at least two members, the abort carries a signed record naming the peer that
+  failed to publish; the absent player's committed chips are forfeited and
   distributed to the remaining players in proportion to their own contributions.
   Restoring stacks would hand every player a free escape from a losing pot, which is an
   in-protocol exploit available to anyone; forfeiture closes it, at the cost of a
   documented DoS incentive that the threat model classifies as out of scope, not solved.
-  The deadline machinery that carries this is a certificate signed by every other
-  dealt-in seat, and it exists **at `n >= 3`; heads-up the deadline is advisory
-  (D-007)**.
-* **At `n = 2` there is no attribution and no forfeiture.** Two peers with no trusted
-  clock and no third party cannot agree that a deadline passed, so a heads-up abort for
-  a missing cryptographic contribution names nobody (`attributed = []`) and restores
-  both stacks to their start-of-hand values. This reopens the rage-quit escape D-005
-  closes at larger tables: a heads-up player can escape a losing pot by going silent.
-  It is recorded as an unfixed limitation, not solved, and the choice between
-  restoration and forfeiture at two seats is escalated as the fix plan's OQ-A
+  The deadline machinery that carries this is a certificate signed by **every member of
+  `V`**, and it has effect only **when `|V| >= 2` (D-007, D-008)**.
+* **When `|V| < 2` there is no attribution and no forfeiture.** A certificate whose
+  required voter set has fewer than two members rests on one peer's unilateral
+  assertion that a deadline passed — or, at `|V| = 0`, on nobody at all — and no peer
+  can check that assertion: there is no trusted clock and no third party. Such a
+  certificate therefore has no effect: the
+  abort for a missing cryptographic contribution names nobody (`attributed = []`) and
+  restores stacks to their start-of-hand values. This reopens the rage-quit escape
+  D-005 closes when `|V| >= 2`: a player facing a single-member voter set can escape a
+  losing pot by going silent. It is recorded as an unfixed limitation, not solved, and
+  the choice between restoration and forfeiture in that case is escalated as OQ-A
   (`PROTOCOL.md` §12, `THREAT_MODEL.md` §9.2).
+* **The scope is `|V|`, never the seat count `n` (D-008).** Heads-up is the case where
+  `|V| = 1` always — the voter set is the one opponent — but it is not the only one.
+  `V` is the dealt-in seats minus the subject minus every seat a *completed, valid*
+  certificate has already named, so at a larger table enough completed attributions
+  reduce `|V|` to one and the same rule applies there. Being voted against is not
+  exclusion, which is what stops `V` being collapsed by assertion. Any rule in this
+  corpus still written on `n` is a defect.
 * From the **next** hand the absent seat is simply not in `apk` (§2.1). Nothing waits
   for it.
 
@@ -539,12 +551,13 @@ Per **D-005** and `SPEC_CS.md` §19:
 ElGamal with Feldman or Pedersen VSS, so a quorum can finish without the missing
 player. We do **not** do this: with `t < n`, any `t` colluding players can decrypt
 *every* hole card at the table. That is precisely the trade `SPEC_CS.md` §19 forbids
-and it breaks the §35 main invariant. n-of-n stands; abort and attribute.
+and it breaks the §35 main invariant. n-of-n stands; abort, and attribute where
+`|V| >= 2` allows it.
 
 Recorded honestly: **a malicious player can always force a hand to abort by going
-silent.** It cannot steal cards, and at `n >= 3` it cannot steal chips either — it
-forfeits its own. At `n = 2` it recovers its own commitment, so going silent is a free
-escape from a losing pot; that is the unfixed limitation above. In both cases the
+silent.** It cannot steal cards, and when `|V| >= 2` it cannot steal chips either — it
+forfeits its own. When `|V| < 2` it recovers its own commitment, so going silent is a
+free escape from a losing pot; that is the unfixed limitation above. In both cases the
 mitigations are social (visible attribution where attribution exists, repeated-abort
 reputation), not cryptographic.
 
@@ -680,7 +693,7 @@ serialising. None of it invents a primitive.
 | 5 | **Street gating and index entitlement checks** on reveal tokens (§2.7, §2.8) | Policy: *when*, and *for which index*, a legitimate library operation may be applied. It adds no primitive; it constrains one |
 | 6 | **The signed, hash-chained event envelope** (§12/§13 of the spec) | Deterministic CBOR + Ed25519 + BLAKE3, all library primitives, composed in the standard way: length-prefixed, domain-separated, `previous_event_hash` chained. The signature prefix is `p2p-poker/v1/event`, defined byte-for-byte in `PROTOCOL.md` §13; this document does not restate it |
 | 7 | **The `DeckCrypto` trait boundary** (§9) | A Rust trait. No cryptographic content at all; it exists so ziffle can be swapped |
-| 8 | **Timeout certificates** (D-006) | `k`-of-`k` Ed25519 signatures over a canonical CBOR body naming seat, sequence and `previous_event_hash`. A multi-signature by concatenation, not an aggregate signature scheme — no new algebra |
+| 8 | **Timeout certificates** (D-006) | `\|V\|`-of-`\|V\|` Ed25519 signatures — one from every member of the required voter set `V` (`PROTOCOL.md` §8.3) — over a canonical CBOR body naming seat, sequence and `previous_event_hash`. A multi-signature by concatenation, not an aggregate signature scheme — no new algebra. D-008's floor `\|V\| >= 2` is a protocol rule and not a cryptographic one: one signature is a perfectly valid multi-signature over one key, so nothing in this row rejects it and nothing here may be scoped on the seat count `n` |
 | 9 | **The profile key-slot file format** (§10) | An envelope around library AEAD and library KDF. The AEAD's associated data binds the header, so no slot can be stripped or swapped |
 
 **Nothing in this table defines a cipher, a hash function, an RNG, a zero-knowledge
@@ -1024,26 +1037,56 @@ with that term included; they are a lower bound until Phase 8 measures.
 1. **`SPEC_CS.md` §33: proving and verifying must run on a worker thread.** At ~100 ms
    per proof this would visibly freeze a GUI event loop. Results reach the UI thread as
    messages.
-2. **Bandwidth interacts with D-001, per circuit and per direction.** A relay's
-   `max_circuit_bytes` is a **per-circuit, per-direction** budget, and a table is a
-   full mesh, so one circuit connects exactly one pair. Comparing table-wide traffic
-   against it is an arithmetic error, and the earlier form of this paragraph — *"so a
-   public relay carries on the order of two six-handed hands before it resets"* — made
-   exactly that error and is deleted. The corrected figures:
+2. **Bandwidth interacts with D-001, per circuit and over both directions together.**
+   A relay's `max_circuit_bytes` is a **per-circuit budget counted across both
+   directions at once**, and a table is a full mesh, so one circuit connects exactly
+   one pair of seats. Two errors have been made here and both are recorded rather than
+   quietly overwritten. The first was comparing *table-wide* traffic against a
+   per-circuit cap — *"so a public relay carries on the order of two six-handed hands
+   before it resets"* — which is deleted. Its replacement called the cap "per circuit
+   **and per direction**", and that is false too: `libp2p-relay 0.21.1` relays a
+   circuit with a single `CopyFuture` that holds one `bytes_sent: u64`, and **both**
+   `forward_data` calls — src→dst and dst→src — increment that same counter before it
+   is compared against `max_circuit_bytes`. The default 131 072 B is therefore 128 KiB
+   of **combined** traffic, not 128 KiB each way, and every figure derived from it
+   halves.
+   **Verification: (b) source** — `libp2p-relay-0.21.1/src/copy_future.rs`: the single
+   `bytes_sent: u64` field on `CopyFuture` at line 47, the guard
+   `if this.max_circuit_bytes > 0 && this.bytes_sent > this.max_circuit_bytes` at line
+   78, and the two `forward_data` calls — src→dst at line 88, dst→src at line 98 — each
+   followed by `this.bytes_sent += i` (lines 92 and 102) into that one counter. There
+   is no second counter and no per-direction accounting anywhere in the file. A-8's own
+   citations (`src/behaviour.rs`, `impl Default for Config`; `src/behaviour/handler.rs`)
+   establish the default value and its delivery to each circuit; they do not reach the
+   accounting. The recorded objection is `NETWORK_STACK.md` §16.1 and §15 note 3 below.
+
+   The corrected figures, derived from this document's own measured proof sizes:
 
    | Quantity | Value | Basis |
    |---|---:|---|
    | `ShuffleProof<52>` + `MaskedDeck<52>`, one shuffler | 8 979 B | 5 547 + 3 432, measured — the size table at the head of this section |
-   | Shuffle traffic over **one circuit**, **one direction**, per hand | **8 979 B** | that peer's own step and proof; **independent of `n`** |
-   | Hands per direction against a 131 072 B public-relay budget, shuffle only | **~14** | 131 072 / 8 979 |
-   | The same including the signed event stream | **~10 hands** | order-of-magnitude; measure under `THREAT_MODEL.md` OQ12 |
-   | A relayed peer's **total** per-hand outbound at an `n`-seat table | `(n-1) × 8 979 B` | 44 895 B at six seats — a bandwidth figure, spread over `n-1` separate budgets, never a single cap |
+   | Shuffle traffic over **one circuit**, **both directions together**, per hand | **17 958 B** | the circuit joins two seats and each of them shuffles once per hand, sending its own step and proof the other way: `2 × 8 979`. **Independent of `n`** |
+   | Hands per circuit against a 131 072 B public-relay budget, shuffle only | **~7** | `131 072 / 17 958 = 7.30`; seven hands cost `7 × 17 958 = 125 706 B`, eight cost `143 664 B` and exceed the cap |
+   | The same including the signed event stream | **~5 hands** | order-of-magnitude, **not measured**. The withdrawn per-direction estimate was ~10 hands, i.e. `131 072 / 10 ≈ 13 107 B` of traffic per seat per hand once the event stream is added to the 8 979 B of shuffle. The same allowance counted both ways gives `2 × 13 107 = 26 214 B` per circuit per hand and `131 072 / 26 214 = 5.0` hands. `THREAT_MODEL.md` OQ12 must measure this **bidirectionally**; measured one way it reports twice the headroom that exists |
+   | A relayed peer's **total** per-hand outbound at an `n`-seat table | `(n-1) × 8 979 B` | 44 895 B at six seats — a bandwidth figure, spread over `n-1` separate circuits each with its own budget, never a single cap |
    | The binding public-relay limit | **`max_circuit_duration = 120 s`**, not the byte cap | a session lasts far longer than two minutes |
 
-   So the byte cap is comfortable and **duration, not bytes, is the binding public-relay
-   limit**: a public circuit expires after two minutes regardless of how little has
-   crossed it. That is still concrete evidence for D-002's split — public relays are
-   fine as hole-punch rendezvous and cannot carry a session — but for the right reason.
+   So **duration, not bytes, is the binding public-relay limit**, and it stays binding
+   at 7 hands as it was at the withdrawn 14: the byte cap would have to be reached
+   inside 120 s, which means seven hands in two minutes, under 17 s per hand including
+   every human betting decision. A public circuit expires long before that. That is
+   still concrete evidence for D-002's split — public relays are fine as hole-punch
+   rendezvous and cannot carry a session — but for the right reason, and with half the
+   margin previously claimed.
+
+   **Third-party relays: assume the stricter reading.** kubo's `docs/config.md`
+   describes its equivalent `ConnectionDataLimit` as applying "in each direction".
+   Either the Go and the Rust implementations differ or that wording is loose; this has
+   not been checked in the Go source. Our own relay is the Rust one, so the Rust
+   accounting above is what binds us, and for a third-party relay of unknown
+   implementation the bidirectional reading is the safe assumption because it is the
+   smaller budget.
+
    The D-002 relay configuration itself is transport-local and is stated once, in
    `NETWORK_STACK.md` §9.6. Note also that a `ShuffleProof<52>` plus deck is 8 979
    bytes, comfortably under GossipSub's 64 KiB `max_transmit_size` — but hand traffic
@@ -1168,11 +1211,23 @@ ziffle brings `rand` back**: `ark-std 0.5.0` depends on `rand 0.8` with feature
 `ark-std-0.5.0/Cargo.toml` `[dependencies.rand] version = "0.8", features =
 ["std_rng"], default-features = false`.
 
+**And it is not only ziffle.** In the integrated workspace `libp2p-autonat 0.15.0`
+depends on `rand 0.8` directly, so `rand 0.8.8` would be in the tree even if the deck
+library were removed, and `rand 0.9.5` and `rand 0.10.2` are there as well.
+`docs/research/INTEGRATION.md` §2 is the authority on the integrated tree and records
+all three majors; §9's register above reproduces the provenance. The recommendation
+`CRYPTO_LIBS.md` §1.2 makes is therefore not merely unmet, it is **unreachable**: no
+choice available to this project removes `rand` from the build.
+
 Two mitigating facts and one required action:
 
 * `SmallRng` is **not** compiled in: it lives behind rand 0.8's separate `small_rng`
-  feature, which ark-std does not enable. **Verification: (b) source** —
-  `rand-0.8.8/Cargo.toml` `[features]`, `small_rng = []`.
+  feature, which nothing in the workspace enables. **Verification: (b) source** —
+  `rand-0.8.8/Cargo.toml` `[features]`, `small_rng = []`; **(a) executed** —
+  `cargo tree -e features -i rand@0.8.8` in the integrated workspace resolves exactly
+  `alloc`, `default`, `getrandom`, `libc`, `rand_chacha`, `std`, `std_rng`. This is now
+  checked across *every* consumer of `rand 0.8.8`, not only ark-std, because
+  `libp2p-autonat` is a second one.
 * `StdRng` *is* present, and ziffle uses it deliberately and correctly for
   *deterministic public constants only* — the Pedersen generators and the 52 open-deck
   points, each seeded from a fixed SHA-256 of a public label. That is a
@@ -1190,6 +1245,17 @@ dependency graph. That claim is false — see the `cargo tree` output above — 
 were corrected to the text of this section. `SPEC_CS.md` §7 is enforced by the CI lint
 of §12 item 6, **not** by the dependency graph, and no document may claim a structural
 guarantee. The residual risk is OQ-8.
+
+**The enforceable discipline, in the words of the document that owns the integrated
+tree.** `docs/research/INTEGRATION.md` §2, quoted rather than paraphrased so the two
+cannot drift:
+
+> Our own code draws cryptographic randomness only from `getrandom::SysRng`.
+> `rand`'s `SmallRng`, `StdRng` and any self-seeded generator are never used
+> for keys, masking factors, permutations or commitments.
+
+That is what §12 item 6's lint must check, and it is a rule about *our* code, which is
+the only thing we control — the tree contains three `rand` majors and will keep them.
 
 ### 7.3 The commit/reveal beacon — where it *is* needed
 
@@ -1382,7 +1448,7 @@ or build-only tooling.
 | `ark-secp256k1` | 0.5.0 | the secp256k1 curve instance | `github.com/arkworks-rs/algebra` | MIT OR Apache-2.0 | no advisory; not audited |
 | `ark-serialize` | 0.5.0 | canonical point/scalar serialisation | `github.com/arkworks-rs/algebra` | MIT OR Apache-2.0 | hostile input not fuzzed — OQ-5 |
 | `ark-std` | 0.5.0 | `no_std` shims; the crate that reintroduces `rand` | `github.com/arkworks-rs/std` | `MIT/Apache-2.0` (deprecated SPDX form; needs a `deny.toml` clarification) | no advisory; not audited |
-| `rand` | 0.8.8 | transitively required by `ark-std` with feature `std_rng`; **not** a source of protocol randomness | `github.com/rust-random/rand` | MIT OR Apache-2.0 | RUSTSEC-2026-0097 — see the finding below; patched at this version |
+| `rand` | 0.8.8 | transitively required by `ark-std` with feature `std_rng`, and independently by `libp2p-autonat 0.15.0`; **not** a source of protocol randomness | `github.com/rust-random/rand` | MIT OR Apache-2.0 | RUSTSEC-2026-0097 — see the finding below; patched at this version |
 | `rand_chacha` | 0.3.1 | backs `StdRng` inside `rand 0.8` | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no advisory |
 | `rand_core` | 0.6.4 | the `RngCore` trait our OS-CSPRNG adapter implements (§7.2) | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no advisory; coexists with `rand_core 0.10` — see the duplicate-versions note below |
 | `blake3` | 1.8.7 | transcript hash, `state_hash`, RNG commitments, `ctx` | `github.com/BLAKE3-team/BLAKE3` | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | **no public third-party audit** — OQ-6 |
@@ -1399,6 +1465,21 @@ or build-only tooling.
 **Verification: (b) source** — every `repository`, `license` and version cell was read
 from the crate's own `Cargo.toml` under
 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`.
+
+**What this table's `rand` row does not cover, and where the authority is.** The row
+above is the `rand 0.8` line only. `docs/research/INTEGRATION.md` §2 is the authority on
+what the *integrated* tree contains, and it records **three `rand` majors at once —
+0.8.8, 0.9.5 and 0.10.2 — pulled in by `libp2p-autonat` and by the arkworks crates
+under `ziffle`**. Re-verified here against the workspace `Cargo.lock` and
+`cargo tree --edges normal -i`: `0.8.8` has two independent parents, `ark-std 0.5.0`
+under ziffle and `libp2p-autonat 0.15.0` (which declares `rand = "0.8"` directly in its
+`Cargo.toml`), so dropping ziffle would *not* remove it; `0.9.5` arrives via
+`hickory-proto`/`hickory-resolver` (`libp2p-dns`), `igd-next` (`libp2p-upnp`) and
+`yamux`; `0.10.2` via `quinn-proto` (`libp2p-quic`) and `rs_poker`.
+**Verification: (a) executed** — `cargo tree --edges normal -i rand@0.8.8`,
+`@0.9.5`, `@0.10.2`; **(b) source** — `libp2p-autonat-0.15.0/Cargo.toml`
+`[dependencies.rand] version = "0.8"`. No claim of a structural guarantee follows from
+any of this; the enforceable discipline is §7.2's, quoted there from INTEGRATION.md §2.
 
 **The two unaudited, semver-unstable entries in the whole client are `ziffle 0.1.0` and
 `libp2p-stream 0.4.0-alpha`** (the latter on the transport side, `NETWORK_STACK.md`
@@ -1695,10 +1776,14 @@ highest-leverage optimisation available. *What would settle it:* nothing needs
 settling for the prototype; revisit only if hand-startup latency becomes a real
 complaint or if OQ-1's review results in a fork anyway.
 
-**OQ-8 — `rand 0.8` re-enters the dependency tree via ark-std.**
-This contradicts `CRYPTO_LIBS.md` §1.2's plan to enforce §7 through the dependency
-graph. `SmallRng` stays out (feature not enabled) and `StdRng` is used only for
-nothing-up-my-sleeve constants, but the structural guarantee is gone.
+**OQ-8 — `rand` is in the dependency tree at three majors, and cannot be removed.**
+`rand 0.8.8` enters through both `ark-std` (under ziffle) and `libp2p-autonat`;
+`rand 0.9.5` and `rand 0.10.2` enter through other libp2p subtrees
+(`research/INTEGRATION.md` §2, re-verified in §9). This contradicts
+`CRYPTO_LIBS.md` §1.2's plan to enforce §7 through the dependency graph, and no
+dependency choice open to us restores that plan. `SmallRng` stays out (feature not
+enabled anywhere in the workspace) and `StdRng` is used only for nothing-up-my-sleeve
+constants, but the structural guarantee is gone.
 *What would settle it:* a CI lint that fails on `StdRng`/`SmallRng`/`thread_rng`/
 `from_seed`/`test_rng` in our own crates. Until that lint exists, §7 is enforced by
 review discipline alone.
@@ -1733,9 +1818,10 @@ like cryptography problems and are not:
   different humans. That needs an identity or reputation layer this project does not
   have.
 * **Denial of service, including the abort attack of §2.10.** A silent player always
-  forces a hand to abort. Detected and — at `n >= 3` — attributed, never prevented. At
-  `n = 2` it is detected and **not** attributed, and the stacks are restored (§2.10,
-  D-007, fix-plan OQ-A).
+  forces a hand to abort. Detected and — when the required voter set has `|V| >= 2` —
+  attributed, never prevented. When `|V| < 2` it is detected and **not** attributed,
+  and the stacks are restored (§2.10, D-007, D-008, OQ-A). The scope is `|V|`, not the
+  seat count.
 * **Traffic analysis**, made materially worse by relaying (D-001): a relay operator
   learns who talks to whom, when, and how much.
 * **Nothing above is fixed by making the cryptography stronger.** They belong in
@@ -1749,7 +1835,13 @@ Numbered so `PROTOCOL.md`, `STATE_MACHINE.md` and the test suites can reference 
 
 **Every change to anything enumerated in this section is a security-critical change
 under `SPEC_CS.md` §31 and requires a reproducing regression test to land first. See
-`docs/CONTRIBUTING.md`.**
+`docs/CONTRIBUTING.md`**, which owns `SPEC_CS.md` §31 in full — small logical commits;
+no deletion or rewrite of large parts of a working implementation without written
+justification; and the load-bearing rule restated above, that **a regression test
+reproducing the problem must land before any security-critical change**. That rule is
+repeated here rather than only linked, so that this list stays usable if the pointer
+ever breaks; `docs/CONTRIBUTING.md` is where the process it belongs to is specified,
+and `PROTOCOL.md` §9.6 carries the same sentence for its own list.
 
 1. Vendor `ziffle 0.1.0` at `vendor/ziffle/`, `[patch.crates.io]`, `Cargo.lock`
    committed. Complete the OQ-1 review before the mental-poker layer is considered
@@ -1763,7 +1855,10 @@ under `SPEC_CS.md` §31 and requires a reproducing regression test to land first
    current stage, or published by a seat for its own hole index before
    `SHOWDOWN_REVEAL` (§2.7, §2.8).
 6. Add a CI lint banning `StdRng`, `SmallRng`, `thread_rng`, `from_seed` and
-   `test_rng` in our own crates (OQ-8).
+   `test_rng` in our own crates (OQ-8). What it enforces is the discipline quoted in
+   §7.2 from `research/INTEGRATION.md` §2: *"Our own code draws cryptographic
+   randomness only from `getrandom::SysRng`."* The lint is scoped to our own crates
+   because the tree carries three `rand` majors and always will.
 7. Deserialise every arkworks wire object with `Validate::Yes`, and impose an explicit
    maximum frame size at the transport boundary (OQ-5).
 8. Port the research probes into `tests/adversarial/` as permanent regression tests:
@@ -1835,6 +1930,8 @@ ark-ec-0.5.0/src/models/short_weierstrass/group.rs   the point-sampling routine
 ark-std-0.5.0/Cargo.toml          rand 0.8 with std_rng, default-features = false
 rand-0.8.8/Cargo.toml             small_rng is a separate, unenabled feature
 getrandom-0.4.3/src/lib.rs, src/sys_rng.rs           fill(), SysRng
+libp2p-relay-0.21.1/src/copy_future.rs   one bytes_sent counter, both directions (§6.5)
+libp2p-autonat-0.15.0/Cargo.toml         `[dependencies.rand] version = "0.8"` (§9)
 ```
 
 ---
@@ -1843,10 +1940,10 @@ getrandom-0.4.3/src/lib.rs, src/sys_rng.rs           fill(), SysRng
 
 | Document | Direction and content |
 |---|---|
-| `THREAT_MODEL.md` | **carries from here:** §11's OQ list; the §11 "does not solve" list; the abort attack of §2.10 with its DoS trade from D-005 and its unattributed heads-up form; relay metadata exposure from D-001; the §9.1/§9.2 supply-chain findings. **This document points at it for:** the §25 cheater-to-test map (`THREAT_MODEL.md` §5.5) and the deviation register (`THREAT_MODEL.md` §9.1), which own those two lists |
+| `THREAT_MODEL.md` | **carries from here:** §11's OQ list; the §11 "does not solve" list; the abort attack of §2.10 with its DoS trade from D-005 and its unattributed `|V| < 2` form; relay metadata exposure from D-001; the §9.1/§9.2 supply-chain findings. **This document points at it for:** the §25 cheater-to-test map (`THREAT_MODEL.md` §5.5) and the deviation register (`THREAT_MODEL.md` §9.1), which own those two lists |
 | `PROTOCOL.md` | **owns, and this document reproduces:** the `ctx` construction (`PROTOCOL.md` §4.5, reproduced in §6.4); the dealing map (`PROTOCOL.md` §4.5, reproduced in §2.4); the domain-string register (`PROTOCOL.md` §2.8); the `DOMAIN_EVENT` signature prefix bytes (`PROTOCOL.md` §13). **Carries from here:** the signed envelope fields that must bind proofs and tokens; the entitlement and street-gating rules (§2.7, §2.8); the five-part `RNG_COMMIT` binding (§7.3); the `rand`/`SmallRng`/`StdRng` correction (§7.2) |
-| `STATE_MACHINE.md` | **carries from here:** the per-hand sequence of §2.9, including the collective form of `HAND_INIT` / `HAND_COMPLETE`; the absent-seat states and abort path (D-005), and its unattributed heads-up form (D-007); deadlines as explicit state, never a wall-clock read inside the engine (D-006) |
-| `NETWORK_STACK.md` | **carries from here:** the corrected per-circuit, per-direction byte budget of §6.5 — 8 979 B per hand per circuit per direction, against which the 128 KiB public-relay cap is comfortable and the **120 s duration limit is the binding one** (D-001) — and hand traffic never crossing the lobby topic. **This document points at it for:** the normative D-002 relay configuration (`NETWORK_STACK.md` §9.6) and the transport-side dependency register (`NETWORK_STACK.md` §5.1) |
+| `STATE_MACHINE.md` | **carries from here:** the per-hand sequence of §2.9, including the collective form of `HAND_INIT` / `HAND_COMPLETE`; the absent-seat states and abort path (D-005), and its unattributed `|V| < 2` form (D-007, D-008 — the scope is the required voter set, never the seat count); deadlines as explicit state, never a wall-clock read inside the engine (D-006) |
+| `NETWORK_STACK.md` | **carries from here:** the corrected per-circuit **bidirectional** byte budget of §6.5 — `2 × 8 979 = 17 958 B` per hand per circuit, both directions counted against one 131 072 B cap, giving ~7 hands shuffle-only and ~5 with the event stream, against which the **120 s duration limit is still the binding one** (D-001) — and hand traffic never crossing the lobby topic. The earlier "per circuit **per direction**" form of this row, and its ~14 hands, are withdrawn: `max_circuit_bytes` is one counter for both directions (§6.5, `NETWORK_STACK.md` §16.1). **This document points at it for:** the normative D-002 relay configuration (`NETWORK_STACK.md` §9.6) and the transport-side dependency register (`NETWORK_STACK.md` §5.1) |
 
 ---
 
@@ -1854,7 +1951,7 @@ getrandom-0.4.3/src/lib.rs, src/sys_rng.rs           fill(), SysRng
 
 Recorded per the editing rule: the rulings of `docs/research/PHASE0_FIXPLAN.md` were
 applied as written, and where a ruling looks wrong it is noted here rather than
-silently deviated from. Two notes, both narrow.
+silently deviated from. Three notes.
 
 **1. A-1's "No other change" to this document is too narrow, and I went slightly
 beyond it.** A-1 instructs this document to add *"at `n >= 3`; heads-up the deadline is
@@ -1868,6 +1965,13 @@ asserting exactly what A-3's edit to `THREAT_MODEL.md` X8 deletes. I therefore a
 heads-up case to §2.10 and qualified §11's bullet, citing §0.3 and OQ-A. No claim was
 strengthened; two were weakened.
 
+*Superseded in scope, not in substance.* **D-008** has since generalised the scoping
+from the seat count to the size of the required voter set: every rule that weakens,
+disables or gates the certificate now reads `|V| < 2` where it read `n = 2`. §2.8,
+§2.9, §2.10, §5.2 item 8 and §11 are written on `|V|` accordingly. The qualification
+this note argued for is unchanged — it simply now covers the cases at `n >= 3` where
+`|V|` has fallen to one, which is the hole D-008 exists to close.
+
 **2. A-8's per-document instruction and A-8's own normative table disagree, and I
 followed the table.** The instruction says to keep the `n × (5547 + 3432)` figure and
 relabel it *"total per-hand outbound for one peer, spread over `n-1` circuits"*. The
@@ -1875,8 +1979,23 @@ plan's normative table gives that same quantity as `(n-1) × 8 979 B` — 44 895
 seats, not 53 874 B. `n × 8 979` counts all `n` shufflers' objects and is the
 **table-wide** aggregate, which is precisely the figure whose comparison against a
 per-circuit cap produced the original error. Relabelling it as a per-peer figure would
-reintroduce the defect with a new name. §6.5 therefore carries the table verbatim and
-uses `(n-1) × 8 979 B` for a peer's own outbound and `8 979 B` per circuit per
-direction; the decomposition `5 547 + 3 432 = 8 979` is kept as the per-shuffler object
-size it actually is.
-```
+reintroduce the defect with a new name. §6.5 therefore uses `(n-1) × 8 979 B` for a
+peer's own outbound; the decomposition `5 547 + 3 432 = 8 979` is kept as the
+per-shuffler object size it actually is. The table's *other* half — "per circuit per
+direction" — did not survive verification either; see note 3.
+
+**3. A-8's "per circuit and per direction" is false, and the per-circuit figures in
+§6.5 are recomputed on the bidirectional total.** This is the one place where a ruling
+was not applied as written, because the crate contradicts it. `libp2p-relay 0.21.1`
+counts a circuit's traffic in a single `bytes_sent: u64` on `CopyFuture`, incremented
+by both `forward_data` calls before the comparison against `max_circuit_bytes`
+(`src/copy_future.rs:47, 78, 88, 92, 98, 102`) — so the 131 072 B default is a
+combined-traffic cap, not a per-direction one. `NETWORK_STACK.md` §16.1 raised this
+objection independently and is right. Applying it: the circuit between two seats
+carries `2 × 8 979 = 17 958 B` of shuffle per hand, the public-relay budget is
+`131 072 / 17 958 ≈ 7` hands rather than ~14, and the "including the event stream"
+figure halves from ~10 to ~5. The ruling's **decision** is untouched — duration binds
+either way, and the D-002 split stands — so what changed is a comfort margin and a
+number that four documents had begun to quote. `THREAT_MODEL.md` OQ12 must now be
+stated as a bidirectional measurement; measured one way it would report twice the
+headroom that exists, which is exactly how a withdrawn claim comes back.

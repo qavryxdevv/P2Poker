@@ -65,7 +65,7 @@ tokio   = { version = "1", features = ["rt-multi-thread", "macros", "time", "syn
 futures = "0.3"
 # Present only because libp2p-autonat needs rand_core 0.6's OsRng. Our own
 # code must never draw cryptographic randomness from it - spec section 7
-# forbids SmallRng and self-seeded generators. See CRYPTO_LIBS.md section 3.
+# forbids SmallRng and self-seeded generators. See CRYPTO_LIBS.md section 1.2.
 rand = "0.8"
 
 [target.'cfg(windows)'.dependencies]

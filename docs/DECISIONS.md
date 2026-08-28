@@ -780,6 +780,108 @@ replaying the transcript.
 
 ---
 
+---
+
+## D-009 — Three systemic rules, from defects that kept coming back
+
+**Date:** 2026-08-28
+**Status:** accepted
+**Source:** Phase 1 verification pass 2, findings M1, M2 and M3
+**Reinforces:** D-008
+
+Three separate review passes each found a *worse* defect than the pass before.
+Two of the three were the same defect wearing a different message name. These
+rules exist so the class stops recurring, rather than being patched a fourth
+time.
+
+### Rule 1 — mandatory honest behaviour may never satisfy the equivocation predicate
+
+The same defect has now appeared three times: **A-4** (lobby and join traffic),
+**N4** (`DISPUTE`), and **M2** (`TIMEOUT_VOTE`). In each case the anti-replay
+slot key was too coarse, so an honest peer doing what the protocol *requires*
+signed two different bodies into one slot — which is exactly the predicate that
+proves equivocation. The consequence is not cosmetic: M2 ends with an honest
+voter's chips forfeited under D-005 and their key on a block list, for
+following the rules.
+
+M2's shape is worth stating, because it is the sharpest. `TIMEOUT_VOTE` carries
+`sequence = subject_sequence` and `event_class = 1`, with the subject in the
+body, while the anti-replay index is `(stage, seat, event_class)` — capacity
+one. The protocol then specifies two simultaneous subjects as *normal*. An
+honest voter voting against both signs two bodies in one slot, and manufactures
+evidence against itself.
+
+**The rule.** The slot key of the equivocation predicate must include every
+field that legitimately varies for a given signer at a given stage. For
+`TIMEOUT_VOTE` that means the subject seat is part of the key, not part of the
+body only. More generally:
+
+> No sequence of actions that the protocol requires of an honest peer may
+> produce a valid `EquivocationProof` against that peer.
+
+This is a property every message type must be checked against **before** it is
+added, and the check belongs in the adversarial suite as a standing test, not
+in a document. `SPEC_CS.md` section 25 already requires a `CheaterEquivocation`
+peer; the mirror test — that an *honest* peer never generates a proof against
+itself under any legal interleaving — is the one that catches this class.
+
+### Rule 2 — a below-floor certificate is inert everywhere, with no exceptions
+
+D-008 point 2 said a certificate with `|V| < 2` has no effect. **M1** shows the
+corpus did not carry that through: `PROTOCOL.md` has such a certificate as
+"inert, not chained, the hand does not end here", while `STATE_MACHINE.md`
+accepts it and produces an `AbortRecord`. `THREAT_MODEL.md` holds both sides.
+
+This is consensus-critical — it is the engine's accept predicate for an event a
+modified client can emit at will, and the two documents give opposite answers.
+It also quietly reopens the escape D-005 closed: a losing heads-up player gets a
+one-message, on-demand hand void with stacks restored.
+
+**The rule.** `PROTOCOL.md`'s reading wins. A certificate below the floor is
+inert in every document and at every table size: not chained, not evidence, no
+terminating effect, no `AbortRecord`, no forfeiture. It is silently ignored.
+Any transition, guard or invariant that gives one an effect is a defect,
+including for `kind = Crypto` and for the hand deadline.
+
+Liveness is not owed here. `SPEC_CS.md` section 19 already ranks security above
+finishing a hand conveniently, and D-007 already accepts that a heads-up
+deadline cannot be enforced at all.
+
+### Rule 3 — state the discipline we can enforce, never an absence we cannot
+
+**M3**: the claim "`SmallRng` is not compiled in" is false. `rand 0.9.5` lists
+`small_rng` among its **default** features, and four dependencies take `rand`
+with defaults — `hickory-proto`, `hickory-resolver`, `igd-next` and `yamux`,
+reached through libp2p's `dns`, `upnp` and `yamux`. Verified by reading
+`rand-0.9.5/Cargo.toml` and `cargo tree --edges normal -i rand@0.9.5`.
+
+This is the third time a claimed *absence* in the dependency tree has turned
+out false: B-1, B-3, and now M3. The pattern is that an absence verified in an
+isolated probe does not survive integration, and nobody re-checks it.
+
+**The rule.** No security property of this project may be stated as the absence
+of something from the dependency tree. State the discipline our own code
+follows, and enforce it mechanically.
+
+Done, for this case: `src/security/rng.rs` documents that `SmallRng` **is** in
+the binary and cannot be removed, and
+`tests::our_own_code_uses_no_generator_but_the_os_one` scans this crate's own
+sources on every test run and fails the build on `SmallRng`, `StdRng`,
+`thread_rng`, `from_seed`, `seed_from_u64` or `rand::rngs`. The gate was
+verified to bite by injecting a violation:
+
+```
+SPEC_CS.md section 7 forbids these generators for cryptographic use;
+draw from security::rng::fill instead:
+  poker\actions.rs:8: SmallRng
+test result: FAILED. 0 passed; 1 failed
+```
+
+and to pass again once the violation was removed. A gate that has never been
+seen to fail is not a gate.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |
