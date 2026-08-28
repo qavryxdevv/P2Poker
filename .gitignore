@@ -1,0 +1,15 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local player profile: identity keys, settings, hand history.
+# The client is portable, so the profile lives next to the binary -
+# it must never be committed.
+/profile/
+/dist/
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
