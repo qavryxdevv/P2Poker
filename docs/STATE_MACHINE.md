@@ -127,39 +127,75 @@ decision ever exists.
 
 ### 2.3 `TableConfig` — frozen before the first card
 
-Every field comes from the signed table advertisement (`SPEC_CS.md` §4), so all participants
-agreed on it before any cryptographic material existed. It never changes during the table's life.
+Twenty of its twenty-three fields come from the signed table advertisement (`SPEC_CS.md` §4, whose
+wire form is `PROTOCOL.md` §7.2's `LOBBY_TABLE_AD`, and each of the twenty carries its `n(k)` field
+number below), so all participants agreed on them before any cryptographic material existed. None
+of the twenty-three changes during the table's life. The three that are not advertised are named
+rather than left to inference: `protocol_version` and `table_id` come from the envelope and from
+`GENESIS(0)` (`PROTOCOL.md` §3.1), and `auto_action_limit` is `PROTOCOL.md` §13's
+`MAX_CONSECUTIVE_AUTO_ACTIONS`, two-sided by being a constant rather than by being advertised.
 
 ```rust
 pub struct TableConfig {
     pub protocol_version:        u16,
     pub table_id:                TableId,
-    pub preset_id:               PresetId,        // RatedSngPokerthV1 | Custom
-    pub game:                    Game,            // Nlhe
-    pub mode:                    Mode,            // TournamentSngPlayMoney | CashPlayMoney
-    pub seats:                   u8,              // 2..=10
-    pub min_players_to_start:    u8,              // <= seats
-    pub start_stack:             Chips,
-    pub first_small_blind:       Chips,
-    pub ante:                    Chips,           // 0 in RATED_SNG_POKERTH_V1
-    pub blind_raise_mode:        BlindRaiseMode,  // DoubleEveryNHands
-    pub blind_raise_every_hands: u32,             // 11
-    pub small_blind_cap:         Chips,           // seats * start_stack / 2
-    pub button_rule:             ButtonRule,      // DeadButton
-    pub odd_chip_rule:           OddChipRule,     // FirstSeatLeftOfButton
-    pub showdown_policy:         ShowdownPolicy,  // see §7.7 — OPEN QUESTION
-    pub action_timeout_ms:       u32,             // 20_000
-    pub action_timeout_grace_ms: u32,             //  5_000
-    pub hand_deadline_ms:        u32,             // >= HAND_DEADLINE_FLOOR(seats), PROTOCOL.md §8.2
-                                                  // — not a constant; 3_300_000 at the §13 preset
-    pub join_deadline_ms:        u32,             // 120_000
-    pub hand_delay_ms:           u32,             // 7_000 — DISPLAY ONLY, see §8.3
-    pub auto_action_limit:       u8,              // consecutive auto-actions -> SittingOut (D-006 §4)
+    pub preset_id:               PresetId,        // n(2)  — §7.2 rule 3's closed two-value enum
+    pub game:                    Game,            // n(0)  Nlhe
+    pub mode:                    Mode,            // n(1)  TournamentSngPlayMoney | CashPlayMoney
+    pub seats:                   u8,              // n(11) max_players, NEVER the seated count
+    pub min_players_to_start:    u8,              // n(12)
+    pub start_stack:             Chips,           // n(9)
+    pub first_small_blind:       Chips,           // n(13) BlindSchedule n(2)
+    pub ante:                    Chips,           // n(6)
+    pub blind_raise_mode:        BlindRaiseMode,  // n(13) BlindSchedule n(0)
+    pub blind_raise_every_hands: u32,             // n(13) BlindSchedule n(1)
+    pub small_blind_cap:         Chips,           // n(13) BlindSchedule n(3)
+    pub button_rule:             ButtonRule,      // n(20)
+    pub odd_chip_rule:           OddChipRule,     // n(21)
+    pub showdown_policy:         ShowdownPolicy,  // n(22) — see §7.7, OPEN QUESTION
+    pub action_timeout_ms:       u32,             // n(14)
+    pub action_grace_ms:         u32,             // n(15) — §7.2's name; a consensus constant
+    pub crypto_step_timeout_ms:  u32,             // n(16) — every DeadlineKind::Crypto duration
+    pub hand_deadline_ms:        u32,             // n(17) — derived bound, never a constant:
+                                                  //       >= HAND_DEADLINE_MIN(seats), PROTOCOL.md
+                                                  //       §8.2, and <= n(17)'s cap
+    pub join_deadline_ms:        u32,             // n(18)
+    pub hand_delay_ms:           u32,             // n(19) — DISPLAY ONLY, see §8.3
+    pub auto_action_limit:       u8,              // NOT an advert field: PROTOCOL.md §13's
+                                                  // MAX_CONSECUTIVE_AUTO_ACTIONS (D-006 §4)
 }
 ```
 
+**No value is written down in this struct, only field numbers (D-011 rule 2).** The numbers
+themselves live in `PROTOCOL.md` §13 for `RATED_SNG_POKERTH_V1` and in `PROTOCOL.md` §7.2's field
+table for the per-field ranges every `CUSTOM` table is admitted under. Seven of these lines carried
+the preset's value as a comment until this pass; `G7-S1` is what a second copy of a preset value
+does in a document nothing can test it against, and a comment drifts exactly as a listing does.
+
+**Two fields changed here, and both were `G7-S2`.** `action_timeout_grace_ms` is renamed
+`action_grace_ms`, which is the name `PROTOCOL.md` §7.2, §8.2 and §13 all use — it was the only
+site in the corpus carrying the other name, and §13 requires that no value have two names.
+`crypto_step_timeout_ms` is **added**: it was in no `TableConfig`, yet `n(16)` is a signed advert
+field and a part of `table_params_hash`, `DeadlineKind::Crypto` is armed by eleven transitions
+whose duration comes from it (§2.6), and §9.4 enforces a bound whose largest term is a multiple of
+it. The engine document armed a timer with no source and enforced a bound it could not compute.
+
+**`TableConfig` is a projection of the advertisement, not the advertisement.** It holds the twenty
+advertised parameters `step` reads and nothing else from the payload. `n(3) table_name`,
+`n(7) min_buyin`, `n(8) max_buyin`,
+`n(10) players`, `n(23) password_required`, `n(24) deck_suite`, `n(25) founder_app_key`,
+`n(26) founder_peer_id`, `n(27)` and `n(28)` are absent because no transition reads them; they
+belong to the lobby and join layers. Three of those — `n(7)`, `n(8)` and `n(24)` — are nevertheless
+parts of `table_params_hash`, so **`table_params_hash` is computed over the advertisement and never
+over this struct** (`PROTOCOL.md` §3.1's box, twenty-five parts in a fixed order). A peer that
+reconstructs the hash from `TableConfig` derives a different value from every conforming peer, and
+since the hash is in `GENESIS(0)` and in `PLAYER_LIST` it can then join no table at all.
+
 `hand_delay_ms` is deliberately **not** an engine input. It is a presentation delay so a human
-can see the result; the protocol never waits for it. See §8.3.
+can see the result; the protocol never waits for it. See §8.3. It is in this struct because
+`PROTOCOL.md` §8.2 makes it a **term** in two durations the engine's own config must be able to
+supply — the hand-boundary `next_deadline_ms` and `HAND_DEADLINE_FLOOR(n)` — which is a budget,
+not a wait (§2.6, §8.3).
 
 `SPEC_CS.md` §4 permits a table founder to replace the preset with custom parameters. The engine
 therefore validates the config before leaving `Seating` and refuses to start a table whose config
@@ -382,7 +418,8 @@ pub struct Deadline {                 // a DESCRIPTION, not a timestamp
     pub subject:     SeatIdx,
     pub sequence:    u64,             // the sequence this deadline is attached to
     pub parent_hash: Hash,            // the event the deadline chains from
-    pub duration_ms: u32,             // from config; the engine never adds it to anything
+    pub duration_ms: u32,             // from config, by the box at the end of this section;
+                                      // the engine never adds it to anything
 }
 
 pub enum DeadlineKind { Action, Crypto }
@@ -720,7 +757,8 @@ and T62 cannot fire on it at all. That is also why the freeze needs `hand_id >= 
 which no record names.
 
 **The two memories forget differently, and both errors point the same way.** The wire's record is an
-LRU of `MAX_RETAINED_HAND_RECORDS = 4 096` hands; this field is one `u64` that forgets nothing. An
+LRU of `MAX_RETAINED_HAND_RECORDS` hands (`PROTOCOL.md` §13 owns the figure); this field is one
+`u64` that forgets nothing. An
 evicted hand answers *"not solitary"* and its late events are dropped — a missed detection, which
 `PROTOCOL.md` §3.2 states and bounds — while the floor can only ever admit more. Neither error can
 produce a freeze on the *wrong* hand. Two memories whose errors point in opposite directions is the
@@ -737,6 +775,37 @@ records the first solitary hand however the regime was entered, and the per-hand
 advertisement that the **lobby layer** runs its formation timer from (`PROTOCOL.md` §4.3). No
 `Deadline` value is ever built from it and `step` never reads it; it is carried so that every peer
 agrees on the number the layer above is using, and so that §9.4's config validation can bound it.
+
+**Where `Deadline.duration_ms` comes from — one source per stage kind, and this is `G7-S2`.**
+`PROTOCOL.md` §8.2 owns `next_deadline_ms` and its three rows; no value of theirs is restated here.
+What this document owes, and did not have, is the mapping from those rows to the `TableConfig`
+fields the engine hands the scheduler, because `duration_ms` was documented as *"from config"* and
+one of the two fields it needs was not in `TableConfig` at all:
+
+| The stage the deadline covers | `kind` | `duration_ms` |
+|---|---|---|
+| a betting action | `Action` | `config.action_timeout_ms + config.action_grace_ms` |
+| any cryptographic contribution, and a `STATE_HASH` / `STATE_ACK` round | `Crypto` | `config.crypto_step_timeout_ms` |
+| the hand boundary — the `HAND_INIT` that follows `hand_delay_ms` | `Crypto` | `config.hand_delay_ms + config.crypto_step_timeout_ms` |
+
+**Three sources, two `DeadlineKind`s, and the third row is deliberately not a third kind.**
+`PROTOCOL.md` §4.8 defines two deadline kinds and the wire carries `next_deadline_ms` as a number,
+so a boundary deadline is a `Crypto` deadline whose duration includes the display delay a peer is
+*allowed* to spend before publishing `HAND_INIT` (§8.3). Adding a third `DeadlineKind` here would
+put a value on the wire §4.8 has no code for.
+
+**Every arming site now has a source, and the third row has none because the engine does not arm
+it.** §5.2 arms `Action` at four sites — T26, T29, T31, T37 — and `Crypto` at eleven — T2, T7,
+T10, T14, T18, T19, T32, T33, T38, T39 and §5.3's `|dealt_in| >= 2` branch, which is the arming
+that follows hand init on both the T10 and the T47 path. All fifteen take one of the first two
+rows. **The boundary row belongs to the layer that also runs `hand_deadline_ms`** (§8.2's second
+timer): the stage it covers is `HAND_INIT` itself, and no transition of this document is executing
+while that stage is open. The engine's obligation for it is exactly to *carry the two fields*, which
+is why `hand_delay_ms` is in `TableConfig` despite being display-only (§2.3, §8.3).
+
+`config.hand_deadline_ms` is the other field no `Deadline` is built from: like `join_deadline_ms` it
+is carried so that every peer agrees on the number the layer above is using, and so that §9.4 can
+bound it. `step` reads neither.
 
 ### 2.7 `SPEC_CS.md` §11 conformance table
 
@@ -1122,7 +1191,7 @@ belonging to a hand that is over, and applying it is precisely what must not hap
 > events, so a replayed — not forged, merely re-sent — agreeing checkpoint-8 `STATE_HASH` re-enters
 > its sender into `A` once per hand, and that at a receiver which had narrowed that seat out the
 > next stage 0 was then **required** of a seat that would not sign and stalled for
-> `hand_deadline_ms`, once per hand, for the 4 096 hands §5.3 of that document retains a record
+> `hand_deadline_ms`, once per hand, for the `MAX_RETAINED_HAND_RECORDS` hands §5.3 of that document retains a record
 > for, with no key needed. `PROTOCOL.md` §4.9 has landed the fix and it is not duplicate
 > suppression: **`A` no longer enlarges a required emitter set at all.** `R(HAND_INIT, m+1)` is
 > `P(m)`; `A` widens that stage's **accepted** emitter set; and an extra accepted copy completes no
@@ -1623,7 +1692,7 @@ deleting T46's marking as *"a stall that repeats every hand"*. That is not what 
 Marking a seat `Absent` never removed it from `HAND_INIT`'s required emitter set — the set named
 absent and sitting-out seats in its *inclusion* clause — so the stall was never bounded by anything:
 T46 restores every stack, so no seat busts, so no §9.3 condition can fire, so the table repeated an
-identical ten-minute hand forever. **The table made no progress at all, and no participant could
+identical hand of one `hand_deadline_ms` forever. **The table made no progress at all, and no participant could
 end it.** Every statement of that cost in this document is rewritten rather than annotated.
 
 **The tenth pass, against `P1`, `N-1e`, `N-5e` and `P7`, added one transition and no invariant, and
@@ -2163,10 +2232,11 @@ did not end at all, now end here, and they are the whole of the list:
 
 In all four the hand ends with nobody named and every seat receiving exactly its own
 `committed_hand` back (I27). What it costs is the wait: `hand_deadline_ms` is **not a constant** —
-it is a per-table parameter bounded below by `HAND_DEADLINE_FLOOR(n)` (`PROTOCOL.md` §8.2, `G4-P3`),
-and it is 3 300 000 ms in `RATED_SNG_POKERTH_V1` against `action_timeout_ms` = 20 000 and a crypto
-step of the same order, so a stalled hand takes tens of minutes to end rather than seconds — under
-the preset, fifty-five. `PROTOCOL.md` §8.3 records that
+it is a per-table parameter bounded below by `HAND_DEADLINE_MIN(n)` (`PROTOCOL.md` §8.2, `G4-P3`,
+`G5-Q6`), and that bound already budgets a whole legal hand of human action time plus one reopening,
+so a stalled hand takes tens of minutes to end rather than seconds at **every** configuration a
+conforming joiner will accept. The figure for any one table is the founder's advertised `n(17)` and
+appears in this document nowhere (D-011 rule 2). `PROTOCOL.md` §8.3 records that
 trade in the same words and prefers it to an effect one signature could manufacture; this document
 does not re-derive it. After T46 the next hand begins automatically (T47): **no timeout of any kind
 ends the tournament or the cash game** (§8.1, D-006 §5).
@@ -2208,11 +2278,13 @@ the same reason. Nothing here is a default and there is nothing left for an impl
 **Where T57 is not admissible, and what covers those phases instead.** Phases 1–3 have no live
 hand — `hand_id == 0`, no `HAND_INIT`, and `GENESIS(1)` not yet derivable — so T57's guard cannot
 hold there whatever a timer says, and a stall there is **T4's**. Hand 1's `hand_deadline_ms` window
-does open at `TABLE_READY` and therefore spans phases 2–3 (§8.2), but `join_deadline_ms` is
-120 000 ms against a `hand_deadline_ms` that can never legally be below `HAND_DEADLINE_FLOOR(n)` —
-1 017 000 ms at two seats, the smallest legal value at any seat count (`PROTOCOL.md` §8.2) — so T4
-always reaches those phases first, and it does so at **every** conforming configuration rather than
-only at the preset. **`Settling` *is* in
+does open at `TABLE_READY` and therefore spans phases 2–3 (§8.2), and **nothing there depends on
+which of the two timers is shorter**: `n(17)` and `n(18)` are independent advertised parameters with
+independent caps (`PROTOCOL.md` §7.2), so a conforming advert may order them either way. If the
+hand-deadline timer expires first, the `HandDeadlineAbort` it produces meets no admissible row —
+T57 needs a live hand and T61 needs `HandComplete` or `Diverged` with `hand_id > 0`, and phases 2–3
+are neither — so it is a `Rejection` that changes nothing and **T4 still closes the table**. The
+exit is T4's on both orderings (§8.2, §12.1.1 rows 2 and 3). **`Settling` *is* in
 scope, and that is new in this revision**: it waits for the `HAND_COMPLETE` stage (T45), a seat can
 go silent between the last reveal and its own copy of that stage, and hand `k`'s deadline is still
 running there because `TERMINAL(k)` is exactly what has not been fixed. `HandAborted`,
@@ -2238,8 +2310,8 @@ make that safe rather than a new race:
   `start_stack_this_hand`, so the timer decides nothing about chips that the phase had not already
   decided. The `Fault{StateDivergence}` record T54 would write already exists: T50 wrote it on
   entry, and T57 retains it.
-* The race the exclusion feared is bounded by the numbers. `hand_deadline_ms` is never below
-  `HAND_DEADLINE_FLOOR(n)` — 1 017 000 ms at its smallest, two seats (`PROTOCOL.md` §8.2) — against
+* The race the exclusion feared is bounded by the floor rather than by a figure.
+  `hand_deadline_ms` is never below `HAND_DEADLINE_MIN(n)` (`PROTOCOL.md` §8.2), against
   a reconciliation that exchanges a handful of missing events over an already-open mesh; a genuine
   reconciliation finishes inside it by orders of magnitude, and inside the floor, so the margin does
   not depend on what the founder advertised above it. A reconciliation that does not is the
@@ -2449,7 +2521,7 @@ blind, takes no card and joins no `deck.participants`.
 | T60 | `Diverged` | `StateHash` | `round >= 1` ∧ the reconciliation-round stage is complete ∧ two distinct `state_hash` values remain in it ∧ **two distinct `transcript_head` values remain in it** — `PROTOCOL.md` §6.3 case (b), a peer is missing events it cannot obtain | `HandAborted` | `Fault{StateDivergence}` (already present from T50); `AbortRecord{kind: UnobtainableEvents, attributed: []}` (`cause = 1`, `cert_hash = None`); **`table_faulted` unchanged** — case (b) does **not** fault the table; **restoration** (§8.6, I27) |
 | T62 | any phase except `TableClosed` | `SolitaryDivergence` | **`solitary_at(e.hand_id)`** (§2.6) — the monotone floor, under `PROTOCOL.md` §4.0 step 10b's retained record, which is what decides that the hand the event names *was* dealt with `\|P(k-1)\| == 1` and what makes the event exist at all; §2.6's lemma is that the floor never rejects a hand the record admits, and I33(a) asserts it (N4). **The test is in the past tense and that is the whole of it**: the event's `hand_id`, never the receiver's current phase or current hand (K-9; `PROTOCOL.md` §4.0's staleness step is what delivers it) | **`Diverged`** | freeze, **identically to T50** and by the same reading of `PROTOCOL.md` §6.3 step 1: no `RequestOpen`, no `ArmDeadline`, no chip movement, no stage completed, no pot awarded, no §9.3 end condition evaluated; **the hand deadline is not disarmed**, so T57 and T61 keep their scope; `Fault{SolitaryDivergence}` recording `e.seat` and `e.event_hash` as the evidence; **`solitary_contradicted := true`**. The offending event itself is **not applied and not counted into `signed_this_hand`** (`PROTOCOL.md` §4.0 step 12a), so `P` does not grow from it |
 | T63 | `TableClosed` | `SolitaryDivergence` | same guard as T62 | `TableClosed` — **unchanged, and this is the one event class for which this phase is not absorbing** | `Fault{SolitaryDivergence}`; **`solitary_contradicted := true`**; **`settlement.tournament_winner := None`** — the result is *retracted*, because the only thing this peer computed after the contradiction it had not yet received was a tournament won against a seat that was signing against it. No chip moves, no phase changes, nothing reopens, and **`TableClosed` is still absorbing for every other event type** — I13's cell is where that hole is named |
-| T64 | any phase in which a hand is live — 4–15, and 20 when a hand is live | `CheatProven` | `hand_id > 0` ∧ (`tier == SelfContained` ∨ (`tier == StateDependent` ∧ `judged_at_checkpoint == Some(n)` ∧ **`agreed_checkpoint(hand_id)` is `Some(c)` with `c.number >= n`** — §2.6's three-slot accessor, and the change from *"checkpoint `n` of this hand reached `agreed.is_some()`"* is `P1`: checkpoints of one hand supersede one another in the store, so the exact-`n` form was unreadable for every `n` below the live checkpoint and this guard could not be discharged at all. `c.number >= n` is **not** a weakening, because `transcript_head` is in `PublicTableState` (`PROTOCOL.md` §6.1) and chains through every earlier stage, so an agreed checkpoint at `n' >= n` of the same hand is agreement over a prefix that contains checkpoint `n`'s stage. `c.required` is what carries §4.9's *"the emitter set contained both the accused and this receiver"*, and **`src/security/validation.rs` witnesses that clause and this row's `c.number >= n` clause as well** — `AgreedCheckpoint` carries `emitters`, `hand_id` and `number`, `covering` is its only constructor and refuses with `AccusedNotAnEmitter` and `ReceiverNotAnEmitter`, and `Tier2Finding::new` refuses with `CheckpointTooEarly` unless `against.number() >= fixed_at_checkpoint`. So the whole tier-2 precondition is **enforced by construction rather than described**, and a caller holding only a local view has nothing to pass. The sentence that stood here said the type *"cannot witness"* the emitter clause; it was false when `P6` landed and is false twice over now that the position half has landed as well (`G6-R3`; the position half was `Q2`, and `Q2` is closed by the same type))) ∧ `status[subject] != Removed` | `HandAborted` | **the hand is voided, neutrally and by the existing mechanism**: `AbortRecord{kind: ProvenCheat, attributed: [subject], owed: [], observed_by: ∅}`, restoration follows at T46 (§8.6, I27), so no chip crosses between seats; `Fault{ProvenCheat}` carrying `tier` and `evidence_hash`; **`status[subject] := Removed`**; `dealt_in[subject] := false`; `deck.participants -= {subject}`; `signed_this_hand -= {subject}`; `certified_subjects -= {subject}`; if `player_to_act == Some(subject)` then `None`. **The information window is driven by the `Fault` record and needs no new effect** — and it is a **required addition to `SPEC_CS.md` §22, not an element §22 contains**: §22's GUI tree ends at *protocol/security status* and lists no anti-cheat window, so this row records the requirement and does not cite it as existing (N8; `THREAT_MODEL.md` §9.2 and `DECISIONS.md`'s open list carry it, and the spec is the owner's document and is not edited from here). What the engine owes is unchanged either way: `Effect::Fault(FaultRecord)` is already declared *"for the reputation counter and the GUI"* (§4.2), and the record carries the subject, the tier and the evidence hash, which is exactly the three things D-014 says the window must name. **The window must also say the hand was voided and that no chips changed hands** (D-014), and that is not a claim the GUI makes on its own — it is I27, asserted after the T46 this row leads to, so nobody reads a void as a loss |
+| T64 | any phase in which a hand is live — 4–15, and 20 when a hand is live | `CheatProven` | `hand_id > 0` ∧ (`tier == SelfContained` ∨ (`tier == StateDependent` ∧ `judged_at_checkpoint == Some(n)` ∧ **`agreed_checkpoint(hand_id)` is `Some(c)` with `c.number >= n`** — §2.6's three-slot accessor, and the change from *"checkpoint `n` of this hand reached `agreed.is_some()`"* is `P1`: checkpoints of one hand supersede one another in the store, so the exact-`n` form was unreadable for every `n` below the live checkpoint and this guard could not be discharged at all. `c.number >= n` is **not** a weakening, because `transcript_head` is in `PublicTableState` (`PROTOCOL.md` §6.1) and chains through every earlier stage, so an agreed checkpoint at `n' >= n` of the same hand is agreement over a prefix that contains checkpoint `n`'s stage. `c.required` is what carries §4.9's *"the emitter set contained both the accused and this receiver"*, and **`src/security/validation.rs` witnesses that clause and this row's `c.number >= n` clause as well** — `AgreedCheckpoint` carries `emitters`, `hand_id` and `number`, `covering` is its only constructor and refuses with `AccusedNotAnEmitter` and `ReceiverNotAnEmitter`, and `Tier2Finding::new` refuses with `CheckpointTooEarly` unless `against.number() >= fixed_at_checkpoint`. So the whole tier-2 precondition is **enforced by construction rather than described**, and a caller holding only a local view has nothing to pass. The sentence that stood here said the type *"cannot witness"* the emitter clause; it was false when `P6` landed and is false twice over now that the position half has landed as well (`G6-R3`; the position half was `Q2`, and `Q2` is closed by the same type; and since `G7-S8` `PROTOCOL.md` §4.10's tier-2 row states the precondition in the **same unit as this guard** — it read *at or before the offending event's `sequence`*, which neither this guard nor `src/security/validation.rs` evaluates, so `CheckpointState.sequence` is kept for §4.1's `round` derivation and for nothing else))) ∧ `status[subject] != Removed` | `HandAborted` | **the hand is voided, neutrally and by the existing mechanism**: `AbortRecord{kind: ProvenCheat, attributed: [subject], owed: [], observed_by: ∅}`, restoration follows at T46 (§8.6, I27), so no chip crosses between seats; `Fault{ProvenCheat}` carrying `tier` and `evidence_hash`; **`status[subject] := Removed`**; `dealt_in[subject] := false`; `deck.participants -= {subject}`; `signed_this_hand -= {subject}`; `certified_subjects -= {subject}`; if `player_to_act == Some(subject)` then `None`. **The information window is driven by the `Fault` record and needs no new effect** — and it is a **required addition to `SPEC_CS.md` §22, not an element §22 contains**: §22's GUI tree ends at *protocol/security status* and lists no anti-cheat window, so this row records the requirement and does not cite it as existing (N8; `THREAT_MODEL.md` §9.2 and `DECISIONS.md`'s open list carry it, and the spec is the owner's document and is not edited from here). What the engine owes is unchanged either way: `Effect::Fault(FaultRecord)` is already declared *"for the reputation counter and the GUI"* (§4.2), and the record carries the subject, the tier and the evidence hash, which is exactly the three things D-014 says the window must name. **The window must also say the hand was voided and that no chips changed hands** (D-014), and that is not a claim the GUI makes on its own — it is I27, asserted after the T46 this row leads to, so nobody reads a void as a loss |
 | T65 | `HandComplete` \| `Paused` \| `Diverged` when no hand is live | `CheatProven` | as T64 | unchanged | the same removal side effects as T64 **minus the abort**: there is no live hand to void, so no `AbortRecord` and no restoration — `Fault{ProvenCheat}`, `status[subject] := Removed`, the four set removals, and the same `Effect::Fault` the window is built from. The seat is skipped from the next hand init onward by §5.3 step 4, which already reads `status == Active`. **The window here says the removal and *not* a void**, because there was no hand to void — a removal at a boundary costs the table nothing at all |
 | T66 | `Seating` \| `AwaitingSeatRngCommit` \| `AwaitingSeatRngReveal` | `CheatProven` | `hand_id == 0` | unchanged | `Fault{ProvenCheat}` and **nothing else — no seat is removed** (see the box below). The beacon stalls to **T4** exactly as it did before D-014, no chips exist to conserve (`ledger_in == 0`), and the table never starts |
 | T67 | any phase except `TableClosed` | `Readmitted` | `hand_id > 0` ∧ the seat is occupied ∧ `status[e.seat] ∉ {Removed, Empty}` | **unchanged** | `readmit ∪= {e.seat}` and **nothing else**. **This is `N-5e`, as `P2-e` reshapes it, and it is deliberately the smallest row in the table**: it moves no chip, changes no phase, completes no stage, evaluates no end condition, and the set it writes is read at exactly one place, §5.3 step 4, and cleared at step 8. **Since `P2` the set it writes reaches no guard at all** — not `dealt_in`, not `solitary_since`, not §9.3 — because `A` widens hand `m+1`'s **accepted** emitter set and never its required one; §5.3 step 4 hands the set to the protocol layer and derives nothing from it. That is what makes this row's replay behaviour inert: a re-sent stale event writes a seat that is already in the set, and the set now has no effect that repeats. The `Removed` conjunct is D-014's one-way exit (I34) — a set a removed seat could re-enter by any route is the re-entry T59 was closed to make impossible, and `PROTOCOL.md` §4.9's `A` is such a route unless this guard excludes it, which is the one thing this row adds to §4.9's rule rather than restating it. The phase exclusion is `TableClosed` and only that: a readmission after the table has closed readmits nobody to anything, and the phase's one non-absorbing event is T63's, which is a retraction and not an admission |
@@ -2537,7 +2609,7 @@ blind, takes no card and joins no `deck.participants`.
 > the reconciliation round admits an out-of-set copy, exactly as round 0 does.** The question is
 > whether `PROTOCOL.md` §4.9's checkpoint-8 admission — *"accepted, compared and retained from any
 > occupied roster seat"* — extends to the **reconciliation rounds** of that checkpoint, `sequence`
-> `8 192 + 2r`. `DECISIONS.md` records both answers as safe and names the state that is not: the
+> `BOUNDARY_CHECKPOINT_BASE + 2r`. `DECISIONS.md` records both answers as safe and names the state that is not: the
 > exit described and unreachable. **The choice is *admit*, and the reason is that the round is the
 > same stage.** §4.9 admits the out-of-set copy at round 0 because *"its body is a claim about who
 > the participants are"*, and a reconciliation round re-derives that same body over that same
@@ -2902,9 +2974,9 @@ Pure, no events, no clock. In this exact order:
    > sequence of them. Under the deleted union that seat became a **required** emitter of hand
    > `m+1`'s stage 0 at this receiver and at no other, stage 0 stalled to the full hand deadline —
    > which is one signed constant per table and **not** a function of the seat count: what §8.2
-   > scales is its *floor*, `HAND_DEADLINE_FLOOR(n)`, so the stall is at least 1 017 000 ms at two
-   > seats and at least 2 297 000 ms at ten, and 3 300 000 ms at the §13 preset — and it repeated **once
-   > per hand for the 4 096 hands `PROTOCOL.md` §5.3 retains a record for**. The wire deleted the
+   > scales is its *floor*, `HAND_DEADLINE_FLOOR(n)`, so the stall is at least that floor at every
+   > seat count and is the founder's advertised `n(17)` in fact — and it repeated **once
+   > per hand for the `MAX_RETAINED_HAND_RECORDS` hands `PROTOCOL.md` §5.3 retains a record for**. The wire deleted the
    > union in the pass before this one; the engine still held it, so the amplifier still had its
    > input and the two halves of one peer disagreed about who must speak before stage 0 completes.
    >
@@ -3577,12 +3649,17 @@ window for hand 1 opens at `TABLE_READY`, which is before the seat-order beacon,
 live hand, and before T10 there is none — `hand_id == 0`, no `HAND_INIT`, and `GENESIS(1)` is not
 even derivable, since it contains `roster_hash(1)` and the seat indices come from the beacon
 (`PROTOCOL.md` §3.1). A stall in phases 2–3 is **T4's**, and the numbers make that reachable first:
-`join_deadline_ms` is 120 000 ms against a `hand_deadline_ms` that no conforming table may advertise
-below `HAND_DEADLINE_FLOOR(n)` — 1 017 000 ms at two seats, and larger at every larger `n`
-(`PROTOCOL.md` §8.2, §9.4 rule 2a) — so T4 fires long before hand 1's window closes and hand 1
-always opens with at least 897 000 ms of its window left. **The margin is now derived from the floor
-rather than from a preset figure**, so it holds at every configuration a joiner will accept instead
-of only at the one §13 ships.
+`join_deadline_ms` and `hand_deadline_ms` are independent advertised parameters — `n(18)` and
+`n(17)`, with independent caps (`PROTOCOL.md` §7.2) — so a conforming advert may order them either
+way, and **the coverage of phases 2–3 neither does nor may depend on the ordering**. Whichever
+expires first, the exit is T4's: a `HandDeadlineAbort` arriving in phases 1–3 satisfies no
+transition in this document, since T57 requires a live hand and T61 requires `HandComplete` or
+`Diverged` with `hand_id > 0`, so it is a `Rejection` and the table still closes at
+`join_deadline_ms`. **The sentence that stood here computed a margin from the preset's
+`join_deadline_ms` and from `HAND_DEADLINE_FLOOR(2)`** and concluded that T4 always fires first; the
+arithmetic held for `RATED_SNG_POKERTH_V1` and the conclusion was false for a `CUSTOM` table that
+advertises a long join window — which is the only kind the MVP ships (§9.5). The margin is deleted
+rather than repaired, because the exit never needed it.
 
 For hands `k ≥ 2` the window opens at `TERMINAL(k−1)` and the engine's phase across the interval
 containing `HAND_INIT` is `AwaitingKeySetup` — both T10 and T47 run hand init and land there —
@@ -3591,10 +3668,13 @@ stall does, with no new transition and no new event. That closes the gap R-1 nam
 that `HAND_INIT` can fail to complete when peers hold different accepted T58 events and derive
 different `ledger_delta`, and under the old start point nothing covered it from hand 2 onward.
 
-### 8.3 `hand_delay_sec` is not engine state
+### 8.3 `hand_delay_ms` is not engine state
 
-`RATED_SNG_POKERTH_V1` carries `hand_delay_sec = 7` from PokerTH's config default. It is a
-**display** delay so a human can see the result. The protocol does not wait for it, and nothing in
+`n(19) hand_delay_ms` is a **display** delay so a human can see the result. Its preset value is
+`PROTOCOL.md` §13's and is not repeated here, and the name is `PROTOCOL.md` §7.2's: the
+`hand_delay_sec` that stood in this heading and in the two sentences below it was one value under a
+second name in a second unit, which is the shape `hand_deadline_sec = 600` survived in (`G7-S1`).
+The protocol does not wait for it, and nothing in
 this document ever will: making a display delay an engine state would reintroduce a clock. A GUI
 still animating hand `h` simply lags behind a state that has already advanced; that is a rendering
 concern.
@@ -3603,12 +3683,19 @@ concern.
 chain"* — is corrected rather than annotated (K-3).** It is now true only where hand `h` ended at
 T46. Where it ended at T45, T47 additionally waits for hand `h`'s boundary checkpoint to complete
 (§5.2's checkpoint-8 box), and under total silence the phase is left by T61 instead. **That is not
-`hand_delay_sec` under another name and must not be implemented as a delay**: the wait is on a
+`hand_delay_ms` under another name and must not be implemented as a delay**: the wait is on a
 collective stage of chain content, it ends the moment the last required copy arrives — which on a
-healthy table is one round trip, far inside the seven seconds a GUI is animating anyway — and its
+healthy table is one round trip, far inside the display delay a GUI is animating anyway — and its
 fallback is a timer the protocol layer already runs (`PROTOCOL.md` §8.2). Peers may still publish
 hand `h+1`'s key setup immediately; what they may not do is treat the boundary as having passed
 before the stage says so, because that is the comparison the checkpoint exists to make.
+
+**`hand_delay_ms` is a term in two durations, and that is not a contradiction with the heading.**
+`PROTOCOL.md` §8.2 budgets `hand_delay_ms + crypto_step_timeout_ms` for the hand-boundary stage and
+carries `hand_delay_ms` in `HAND_DEADLINE_FLOOR(n)`. Budgeting for a delay a peer is *permitted* to
+take is not taking it: no transition here waits, and §2.6's box is where the two durations that read
+the field are written down. That is also why the field is in `TableConfig` (§2.3) despite `step`
+never reading it.
 
 ### 8.4 The timeout certificate (D-006, as corrected by D-007 and generalised by D-008)
 
@@ -3706,7 +3793,7 @@ Three things were wrong with the carve-out, and D-010 has narrowed only the firs
 **(1) It is an effect one signature can manufacture**: a losing heads-up player got a one-message,
 on-demand hand void, instead of having to stall the hand for the full `hand_deadline_ms` — visible,
 attributable and costly to itself. Under D-010 both the carve-out and T57 restore stacks, so what
-the carve-out would now buy is speed and deniability rather than chips; the ten-minute stall is
+the carve-out would now buy is speed and deniability rather than chips; the `hand_deadline_ms` stall is
 still the price this document charges, because paying it is what makes the escape *visible*, which
 is the only mitigation D-010 leaves.
 **(2) The accepted certificate is a chained event naming its subject**, so it is a transcript
@@ -3723,7 +3810,7 @@ What replaces it is not a gap. A hand that can no longer proceed ends at `hand_d
 and **T57** — the certificate-free carrier the previous revision recorded in §13 as missing, and
 respecified in §4.1 as a witness-independent terminal stage so that it can actually fire (P3). The
 chip arithmetic is identical to the deleted branch's; what changes is the trigger and the wait,
-3 300 000 ms instead of the crypto step's 30 000 ms under `RATED_SNG_POKERTH_V1`. **The rage-quit
+one `hand_deadline_ms` instead of one `crypto_step_timeout_ms`. **The rage-quit
 escape is now open everywhere, not only below the floor**, because D-010 makes every abort neutral;
 that is D-010's stated and accepted cost, it is recorded in §8.6, §8.7 and §12, and the below-floor
 chip question — whether an unfinishable hand restores or forfeits — is **closed by it** (§11).
@@ -4034,8 +4121,8 @@ is what makes `GENESIS(k+1)` derivable from `GENESIS(k)` alone (`PROTOCOL.md` §
 revision said the cost was *"a stall that repeats every hand"*, and read that as slow. It was not
 slow, it was **frozen**: nothing removed the silent seat from `HAND_INIT`'s required emitter set,
 T46 restores every stack so no seat could ever bust, and §9.3's end conditions all read a stack, a
-fault or an empty table — so none of them could fire. The table repeated one identical ten-minute
-hand, forever, and no participant had an action that changed it (`PLAYER_SIT_OUT` and
+fault or an empty table — so none of them could fire. The table repeated one identical hand of one
+`hand_deadline_ms`, forever, and no participant had an action that changed it (`PLAYER_SIT_OUT` and
 `PLAYER_LEAVE` are single-writer by the seat itself, so the only human who could sit the silent
 seat out was the silent one). That was J2 and it is corrected here rather than annotated.
 
@@ -4126,7 +4213,7 @@ What varies between the paths is only the **price in time and visibility**, and 
 keeping straight because it is the whole of the remaining deterrent:
 
 * **On the `hand_deadline_ms` path (T57)** the quitter must stall for the full deadline — never less
-  than `HAND_DEADLINE_FLOOR(n)` (`PROTOCOL.md` §8.2), and 3 300 000 ms under the preset — and the
+  than `HAND_DEADLINE_MIN(n)` (`PROTOCOL.md` §8.2) — and the
   stall, the stage it stalled at and the abort are all in the transcript.
 * **On a certificate path at `|V| >= 2`** the hand ends sooner and the quitter is *named* in
   `attributed`. It is named and nothing more: since H1 the naming no longer marks the seat `Absent`
@@ -4150,48 +4237,64 @@ money that visible count is the whole penalty, and `SPEC_CS.md` §18 forbids cla
 
 ### 9.1 `RATED_SNG_POKERTH_V1`
 
-From `POKER_RULES.md` Part B, derived from PokerTH's `GAME_TYPE_RANKING` constants (which its
-`ServerGame::CheckSettings` *enforces*, making them the strongest available evidence of what the
-rated preset means):
+**The preset's values are `PROTOCOL.md` §13's, and they are not written down here — `G7-S1` and
+`G7-S5`.** §13 is the single normative home for every two-sided constant in the corpus: a client is
+built from it, and a `LOBBY_TABLE_AD` claiming the name `"RATED_SNG_POKERTH_V1"` is checked against
+it field by field by `PROTOCOL.md` §7.2 rule 3, which makes the name a claim about exactly those
+values. The provenance is `POKER_RULES.md` Part B — PokerTH's `GAME_TYPE_RANKING` constants, which
+its `ServerGame::CheckSettings` enforces, plus the `[OUR CHOICE]` values that have no PokerTH
+analogue — and it is recorded in §13 beside the values it justifies.
 
-```
-preset_id                = "RATED_SNG_POKERTH_V1"
-game                     = NLHE
-mode                     = TOURNAMENT_SNG_PLAY_MONEY
-seats                    = 10
-min_players_to_start     = 10          [OUR CHOICE] — PokerTH autostarts when full
-start_stack              = 10000
-first_small_blind        = 50
-big_blind                = 2 * small_blind
-ante                     = 0           PokerTH has no ante concept at all
-blind_raise_mode         = DOUBLE_EVERY_N_HANDS
-blind_raise_every_hands  = 11
-small_blind_cap          = 50000       = seats * start_stack / 2
-password                 = none
-button_rule              = DEAD_BUTTON               [OUR CHOICE] TDA 32, not PokerTH
-odd_chip_rule            = FIRST_SEAT_LEFT_OF_BUTTON TDA 20-A
-action_timeout_sec       = 20
-action_timeout_grace_sec = 5           [OUR CHOICE] PokerTH uses 2 on a trusted clock
-hand_delay_sec           = 7           display only (§8.3)
-hand_deadline_sec        = 600         [OUR CHOICE] no PokerTH analogue
-join_deadline_sec        = 120         [OUR CHOICE] no PokerTH analogue
-payouts                  = none (finishing place only)
-```
+**What stood here was a second listing of twenty-one values, and it had drifted.** It was written
+in seconds where §13 is in milliseconds, it omitted `crypto_step_timeout_ms` entirely while §9.4
+enforced a bound whose largest term is a multiple of it (`G7-S2`), and it carried
+`hand_deadline_sec = 600` — a figure `PROTOCOL.md` §8.2 had already shown to be below
+`HAND_DEADLINE_FLOOR(10)`, and below that floor's *action* term taken alone. A client built from
+this section would have aborted **every** hand at T57 with `cause = 1` and `attributed = []`, and
+it could not have joined a §13 client's table either, since `hand_deadline_ms` is a part of
+`table_params_hash` (`PROTOCOL.md` §3.1).
 
-`action_timeout_grace_sec` is a **consensus constant, not a UX detail**: every peer times out
-independently with no shared clock, so all peers must use the identical value or they will
-disagree about whether a deadline expired. It is part of the signed advertisement.
+**The listing is deleted rather than corrected, and the reason is the whole lesson of `G7-S1`.**
+A second copy of a preset value cannot be tested: the healthy-table walk passes at `600 000` too,
+because what that figure cannot pay for is the *human* action term and not the protocol's, so no
+timing check in this corpus would ever have named it. A corrected digit buys a copy that drifts
+again at the next change; a citation buys one place to change. The same treatment is applied to
+every other numeric restatement of a table parameter in this document, found by grep over the
+whole file rather than by a section list — a section list is what let this one survive the
+`G4-P3-e` sweep.
+
+What this document says about the preset is all of the following, and no number is in it:
+
+* the fields the engine reads are §2.3's `TableConfig`, each carrying its `LOBBY_TABLE_AD` field
+  number;
+* `hand_delay_ms` is display-only and is not an engine input (§8.3);
+* `hand_deadline_ms` is a per-table parameter and never a constant, bounded below by
+  `HAND_DEADLINE_MIN(seats)` and above by `n(17)`'s cap (`PROTOCOL.md` §8.2, §7.2), and §9.4 is
+  where this engine checks it;
+* `action_grace_ms` is a **consensus constant, not a UX detail**: every peer times out
+  independently with no shared clock, so all peers must use the identical value or they will
+  disagree about whether a deadline expired. It is part of the signed advertisement (`n(15)`) and a
+  part of `table_params_hash`;
+* the preset is not playable by the MVP, which is §9.5.
 
 ### 9.2 Blind level — derived, never incremented
 
 ```
-level(h)        = 1 + (h - 1) / 11                       // integer division, h from 1
-small_blind(h)  = min(50 * 2^(level(h) - 1), 50_000)
+e               = config.blind_raise_every_hands
+level(h)        = 1 + (h - 1) / e                        // integer division, h from 1
+small_blind(h)  = min(config.first_small_blind * 2^(level(h) - 1), config.small_blind_cap)
 big_blind(h)    = 2 * small_blind(h)
 ```
 
-Level 1 covers hands 1–11, level 2 hands 12–22, and so on; level 11 would be 51 200 and is clamped
-to the cap. The cap uses the *starting* player count, so it is a constant for the whole tournament.
+**Three config fields and no literals (D-011 rule 2).** The form that stood here wrote the preset's
+`11`, `50` and `50_000` into the formula, which made it a fourth copy of three values
+`PROTOCOL.md` §13 owns and made it silently wrong for every `CUSTOM` table — the only kind the MVP
+ships (§9.5). Level 1 covers hands `1 .. e`, level 2 hands `e+1 .. 2e`, and so on, until the
+doubling passes `small_blind_cap` and is clamped there for the rest of the tournament.
+`blind_raise_every_hands >= 1` is what makes the division defined and §9.4 is where the engine
+checks it. `RATED_SNG_POKERTH_V1` derives its cap from the *starting* player count (`PROTOCOL.md`
+§13); a `CUSTOM` table advertises the cap directly. Either way it is a signed parameter and
+nothing recomputes it as seats bust, so it is a constant for the whole tournament.
 
 `level`, `small_blind` and `big_blind` are cached in the state for cheap access, but they are
 **computed from `hand_id`** at every hand init and asserted against the closed form (invariant
@@ -4363,36 +4466,69 @@ agree before the first card exists. The engine validates the config before leavi
 refuses to start otherwise:
 
 ```
-2 <= seats <= 10
-2 <= min_players_to_start <= seats
-first_small_blind >= 1
+every range in PROTOCOL.md §7.2's field table, over the same fields
+                                                       // §7.2 rule 2, by reference
+hand_deadline_ms >= HAND_DEADLINE_MIN(seats)           // §7.2 rule 2a, the same predicate over the
+                                                       // same fields; PROTOCOL.md §8.2 owns the
+                                                       // formula and no part of it is restated
+                                                       // here (D-011 rule 2). The upper half of
+                                                       // the bound is n(17)'s cap, §7.2's table
 start_stack >= 2 * (2 * first_small_blind + ante)      // at least one full orbit
 small_blind_cap >= first_small_blind
-blind_raise_every_hands >= 1
-action_timeout_ms >= 5_000                             // PokerTH's non-LAN floor
-hand_deadline_ms  >= HAND_DEADLINE_FLOOR(seats)        // PROTOCOL.md §8.2 owns the formula and it
-                                                       // is not restated here (D-011 rule 2); the
-                                                       // upper half of the bound is n(17)'s cap,
-                                                       // PROTOCOL.md §9.4 rule 2a
+blind_raise_every_hands >= 1                           // §9.2's divisor
 ante <= first_small_blind
-showdown_policy is one this build implements            // Q-01, §7.7, §11
+showdown_policy is one this build implements           // Q-01, §7.7, §11
 ```
+
+**The first two entries are `PROTOCOL.md` §7.2's admission check by reference; the last five are
+this engine's and are in no other document.** Four literal range lines stood here —
+`2 <= seats <= 10`, `2 <= min_players_to_start <= seats`, `first_small_blind >= 1` and
+`action_timeout_ms >= 5_000` — every one a copy of a range §7.2's field table already carries, and
+each is deleted rather than kept in sync: a bound written in two documents is a bound that
+disagrees with itself on the pass nobody sweeps, which is `G7-S1` stated as a rule. `n(11)`,
+`n(12)` and `n(14)` carried their ranges all along; `first_small_blind` is the one that became
+safe to delete only in this pass, because `G7-S3` made §7.2 rule 2 enforce
+`small_blind == blind_schedule.first_small_blind` and `n(4)` carries the `>= 1` — without that
+identity the engine would have been deleting a check on a field the joiner never bounded.
+
+The five that remain are conditions §7.2 does **not** carry, each about whether a hand can be
+*played* rather than whether an advert is well formed — one full orbit of chips, a cap at or above
+the first blind, a defined divisor for §9.2, an ante inside the small blind, and a showdown policy
+this build has code for. **One of the five is a check the owner's table should carry and does
+not**: `n(13) BlindSchedule`'s `every_n_hands` is a `u16` with no stated lower bound, so a
+conforming advert may carry `0`, which makes §9.2's `level(h)` a division by zero at every peer
+that computes it. This line refuses such a table at the engine, and the missing range belongs to
+`PROTOCOL.md` §7.2; it is reported for that owner's list under D-013 rather than fixed from here.
 
 A config that fails goes to `TableClosed` and is never played. There is no repair path — repairing
 a signed advertisement locally would mean two peers playing different games.
 
-**The deadline line is `G4-P3-e` and the old form was not stale but wrong.** It read
-`hand_deadline_ms >= 10 * action_timeout_ms`, which at the preset's `action_timeout_ms` is
-`200 000` — below `HAND_DEADLINE_FLOOR(n)` at **every** seat count, and not marginally: the floor is
-1 017 000 at two seats and 2 297 000 at ten, over five and over eleven times the threshold this line
-enforced. The check therefore admitted exactly the configurations `PROTOCOL.md` §8.2 proves
-unplayable: a legal no-re-raise hand cannot finish inside them, so every hand ends at T57 with
-`cause = 1` and `attributed = []`, and no seat is ever named for it. **`seats` here is
-`max_players`, never the live seated count** — §8.2 requires that, because `hand_deadline_ms` is
-two-sided and a floor derived from a count that moves during the table's life is not a constant
-every peer holds identically. The engine's check and the joiner's advert check (§9.4 rule 2a) are
-now the same predicate over the same fields, which is what makes a table this engine agrees to start
-one a conforming joiner agrees to enter.
+**The deadline line is `G4-P3-e`, and this pass moves it a second time — `Q6` and `G7-S4`.** Two
+earlier forms were wrong in the same direction. `hand_deadline_ms >= 10 * action_timeout_ms` was a
+multiple of the wrong term and sat below `HAND_DEADLINE_FLOOR(n)` at every seat count, so it
+admitted exactly the configurations `PROTOCOL.md` §8.2 proves unplayable: a legal no-re-raise hand
+cannot finish inside them, every hand ends at T57 with `cause = 1` and `attributed = []`, and no
+seat is ever named for it. The form that replaced it, `>= HAND_DEADLINE_FLOOR(seats)`, was right
+about the term and one `REOPENING_COST` short of the bound the joiner applies: `G5-Q6` raised §7.2
+rule 2a to `HAND_DEADLINE_MIN(n)` and this line did not follow, so **between the floor and the
+admitted minimum this engine started tables that every conforming joiner refuses** — a founder
+whose own client plays a table nobody may enter, and a table on which the first re-raise reaches the
+abort `P3` exists to prevent. The right-hand side is now `HAND_DEADLINE_MIN(seats)`.
+
+**`seats` here is `max_players`, never the live seated count** — §8.2 requires that, because
+`hand_deadline_ms` is two-sided and a bound derived from a count that moves during the table's life
+is not a constant every peer holds identically. It is `n(11)`, and §2.3's field says so.
+
+**The sameness claim is now true, and it is a derivation rather than an assertion (`G7-S4`).** What
+stood here said the engine's check and the joiner's were *"the same predicate over the same fields"*
+and cited *"§9.4 rule 2a"*. Both halves were false: the predicates differed by one
+`REOPENING_COST(n)`, and `PROTOCOL.md` §9.4 is *Collection bounds* and contains no numbered rule at
+all — the joiner's rules are §7.2's, and citing §9.4 for them is `G6-R7`. They are the same
+predicate now because this line does not **state** the bound: it names `HAND_DEADLINE_MIN`, which
+`PROTOCOL.md` §8.2 defines and §7.2 rule 2a applies, over `seats = n(11)` and the four other advert
+fields the formula reads. There is nothing here left to drift from, which is the only form of *the
+same predicate* that survives a pass nobody sweeps — and it is what makes a table this engine agrees
+to start one a conforming joiner agrees to enter.
 
 ### 9.5 `SPEC_CS.md` §32 — heads-up first
 
@@ -4454,13 +4590,15 @@ critical path even though no certificate ever is. Four consequences for the test
   shrank. Asserting only that a well-formed certificate is *accepted* at `n >= 3` would pass while
   N3 was live, so that test proves nothing about this.
 
-**`RATED_SNG_POKERTH_V1` is fully specified in §9.1 and is not playable by the MVP.** It pins
-`seats = 10` and `min_players_to_start = 10`, while `SPEC_CS.md` §32 requires two-player heads-up
+**`RATED_SNG_POKERTH_V1` is fully specified in `PROTOCOL.md` §13 — there and in no other document,
+which is `G7-S5` — and is not playable by the MVP.** It pins `seats` and `min_players_to_start`
+both at `MAX_SEATS`, while `SPEC_CS.md` §32 requires two-player heads-up
 as the first supported mode and §1.3 scopes the MVP at `nlhe/2-6`. The MVP ships `CUSTOM` tables;
 `RATED_SNG_POKERTH_V1` becomes playable when `nlhe/7-10` lands. The Phase 8 acceptance test
 therefore uses a **`CUSTOM` two-seat table** (`NETWORK_STACK.md` §12.12, D-003/D-004), and a reader
 who takes the preset as the MVP's acceptance configuration will build the wrong test.
-`PROTOCOL.md` §13 carries the same statement under its preset block.
+`PROTOCOL.md` §13 carries the same statement under its preset block, and since this pass §9.1
+carries no values of its own for it to disagree with.
 
 The 3–6 player extension adds no new phase and no new transition. It changes only the guards that
 count seats — plus T34, which starts existing once a hand has `|V| >= 2`. That is the concrete sense in which this machine
@@ -4721,8 +4859,8 @@ Per `SPEC_CS.md` §18 and its closing paragraph, and per §36's instruction not 
   who goes silent mid-hand, cannot be punished inside the protocol there: **every** certificate is
   inert below the floor, of either kind, so the action deadline is a UI countdown that produces no
   signed transition and the crypto deadline produces nothing at all. The hand still ends — at
-  `hand_deadline_ms` — never below `HAND_DEADLINE_FLOOR(n)` (`PROTOCOL.md` §8.2) and 3 300 000 ms
-  under the preset — with nobody attributed and stacks restored
+  `hand_deadline_ms` — never below `HAND_DEADLINE_MIN(n)` (`PROTOCOL.md` §8.2) — with nobody
+  attributed and stacks restored
   (T57) — but nothing about it is a punishment. Heads-up is the common case — `|V|` is 1 in every
   heads-up hand, and heads-up is the first shipped mode (§9.5), so this is the regime the MVP
   actually runs in — but the statement is scoped on `|V|` and **not** on the seat count, because
@@ -4741,7 +4879,7 @@ Per `SPEC_CS.md` §18 and its closing paragraph, and per §36's instruction not 
   got wrong in the other direction.** It said "a stall costs `hand_deadline_ms` per hand and can be
   repeated every hand", which reads as a bound on grief and was not one: nothing removed the silent
   seat from `HAND_INIT`'s required emitter set, T46 restores every stack so nothing could bust, and
-  no §9.3 condition could fire — **the table repeated one identical ten-minute hand forever, and no
+  no §9.3 condition could fire — **the table repeated one identical hand of one `hand_deadline_ms` forever, and no
   participant had an action that could end it**, because `PLAYER_SIT_OUT` and `PLAYER_LEAVE` are
   single-writer by the seat itself, so the only human who could sit the silent seat out was the
   silent one. That was J2. Under **D-013** the corrected statement is:
@@ -4754,8 +4892,8 @@ Per `SPEC_CS.md` §18 and its closing paragraph, and per §36's instruction not 
   > end conditions become reachable and the table ends.**
 
   The cost of one vanished seat is therefore **one `hand_deadline_ms` if it vanished at a hand
-  boundary, two if it vanished mid-hand** — 10 or 20 minutes under the preset — and nothing after
-  that. §12.1 derives it and gives the bust bound. **K-3 adds a third case and no time**: a seat
+  boundary, two if it vanished mid-hand** — one or two whole deadlines, whatever the founder
+  advertised — and nothing after that. §12.1 derives it and gives the bust bound. **K-3 adds a third case and no time**: a seat
   that vanishes after emitting the hand's `HAND_COMPLETE` copy stalls the boundary checkpoint
   instead of the next hand, for the same one `hand_deadline_ms` it always cost, and T61 closes it
   (§12.1.2). The worst case over all three is still two, because a boundary can only be gated after
@@ -5041,6 +5179,29 @@ above and once more: both rows need an event, and this table's subject is what h
 ever arrives. The *Changed by* column below carries all
 five rulings, and the re-derivation is a check against them, not a rewrite:
 
+**`G7-S1`, `G7-S2`, `G7-S4` and `Q6` change no exit either, and one of them removes an argument two
+rows were leaning on.** All four are about durations and about where they are written down, and a
+duration cannot be an exit: every entry in the *Exit under total silence* column is a transition,
+and the timer that fires it belongs to the protocol layer (§8.2). Three of the four touch nothing
+here — §9.1's second listing of the preset is deleted, `crypto_step_timeout_ms` gives the eleven
+`ArmDeadline{Crypto}` sites the source they were already assumed to have (§2.6), and §9.4's
+validator moves from `HAND_DEADLINE_FLOOR(seats)` to `HAND_DEADLINE_MIN(seats)`, which changes which
+configurations reach phase 1 at all and not what any phase does once it is reached.
+
+**The fourth is rows 2, 3 and the last row 20, and there the argument was wrong although the exit
+was right.** §5.2 and §8.2 both justified T4's coverage of phases 2–3 by computing that the preset's
+`join_deadline_ms` expires before hand 1's `hand_deadline_ms` window — true under
+`RATED_SNG_POKERTH_V1` and **false** for a `CUSTOM` table that advertises a long join window, since
+`n(17)` and `n(18)` are independent parameters with independent caps (`PROTOCOL.md` §7.2) and
+`CUSTOM` is the only kind the MVP ships. The exit never needed the ordering: a `HandDeadlineAbort`
+arriving in phases 1–3 satisfies **no** row of §5.2 — T57 requires a live hand, T61 requires
+`HandComplete` or `Diverged` with `hand_id > 0` — so it is a `Rejection`, and T4 closes the table on
+its own timer whichever expires first. Those three rows are unconditional now where they rested on a
+preset figure before, which is a strengthening and not a change of exit. It is also the answer to
+the fifth check below, run against this pass: the thing this pass removed is a *number*, and the
+consumers of a number are arguments, not guards — so the sweep's obligation was to find every
+argument that had quietly become load-bearing on one, and rows 2 and 3 are where one had.
+
 | # | Phase | Exit under D-013, K-3 and K-9 | Changed by D-013 / K-3 / K-9 / L7 / D-014? |
 |---:|---|---|---|
 | 1 | `Seating` | **T4**, local lobby timer → `TableClosed` | no. D-013's base case (the required set for hand 1 is the signers of `TABLE_READY`) is fixed *in* this phase and read at T10. **D-014 adds nothing here and that is deliberate (T66)**: no removal is available in the setup chain, so this exit is untouched |
@@ -5118,7 +5279,7 @@ The fourth is:
 > **A detection must not be undone by the mechanism that ends the hand it detected in.** Every
 > terminus in this table is a timer, and every timer leads through `HandAborted` and `HandComplete`
 > back to a table that deals again. A freeze whose only purpose is to stop a peer from playing on
-> is therefore, by default, a ten-minute pause — and a peer that resumes into the same regime meets
+> is therefore, by default, a pause of one `hand_deadline_ms` — and a peer that resumes into the same regime meets
 > the same contradiction and freezes again, forever, while every row above passes. That is J2's
 > fixed point wearing a detection's clothes, and **§9.3 condition 0.6 and I33(c) are what discharge
 > it.** The obligation generalises past K-9: any future rule that stops a peer must name what stops
@@ -5152,7 +5313,7 @@ more, and saying what changed costs three lines.** `PROTOCOL.md` §4.9's readmis
 cleared at every hand init while §4.0 step 10a is skipped for stale-hand events, so a **replayed**
 — not forged — agreeing checkpoint-8 `STATE_HASH` re-enters its sender into `A` once per hand. When
 `A` enlarged a **required** emitter set that made the next stage 0 stall for `hand_deadline_ms`,
-once per hand, for the 4 096 hands the retained record admits — on such a trace every number below
+once per hand, for the `MAX_RETAINED_HAND_RECORDS` hands the retained record admits — on such a trace every number below
 was wrong and the table made no progress at all, which is D-013's own fixed point restored by the
 fix that kept D-013's promise. **`A` no longer enlarges a required set on either side**: §4.9
 widens the *accepted* emitter set of one stage and §5.3 steps 4 and 8 read `signed_this_hand`
@@ -5168,19 +5329,18 @@ participation:
 * **Silent from a hand boundary** — the client is already gone when hand `k` begins. It signed
   nothing in hand `k`; hand `k` stalls at `HAND_INIT` and aborts at `hand_deadline_ms`. Hand `k+1`
   skips it. **One stalled hand: one `hand_deadline_ms`, which heads-up is at least
-  `HAND_DEADLINE_FLOOR(2) = 1 017 000` ms and is whatever the founder advertised above it
-  (`PROTOCOL.md` §8.2).**
+  `HAND_DEADLINE_MIN(2)` and is whatever the founder advertised above it (`PROTOCOL.md` §8.2).**
 * **Silent mid-hand** — it signed `HAND_INIT(k)`, then stopped. Hand `k` stalls at whatever stage
   it reached and aborts. Hand `k+1` still requires it, because it *did* sign a chained event during
   hand `k`; hand `k+1` stalls at `HAND_INIT` and aborts. Hand `k+2` skips it. **Two stalled hands:
-  two `hand_deadline_ms`, at least 2 034 000 ms heads-up.** D-013's own summary says "exactly one hand"; that is the first case, and the
+  two `hand_deadline_ms`, so at least twice `HAND_DEADLINE_MIN(2)` heads-up.** D-013's own summary says "exactly one hand"; that is the first case, and the
   second costs one more. It is recorded rather than rounded away, and it is worth one directed test
   (§10, I31).
 * **Silent after the hand completed** — it signed hand `k`'s `HAND_COMPLETE` copy and then stopped,
   which is the case checkpoint 8's gate newly exposes. Hand `k` does **not** stall; the boundary
   does, because `P(k)` contains the seat. T61 fires at `hand_deadline_ms` and runs hand init for
   `k+1`, so the boundary that follows is ungated (I32(c)) and hand `k+2` skips the seat.
-  **One stalled boundary: one `hand_deadline_ms`, at least 1 017 000 ms heads-up** — the same one `hand_deadline_ms` this case cost before the
+  **One stalled boundary: one `hand_deadline_ms`, at least `HAND_DEADLINE_MIN(2)` heads-up** — the same one `hand_deadline_ms` this case cost before the
   gate existed, when it was spent on hand `k+1` stalling at `HAND_INIT` instead. The gate moved
   where the wait happens; it did not add one.
 
@@ -5194,12 +5354,15 @@ worst case over all three cases is **two `hand_deadline_ms`, exactly as D-013 pu
 **Then the table plays.** Every hand from that point completes among the seats that are there, at
 whatever speed they play. The skipped seat drains: heads-up under `RATED_SNG_POKERTH_V1` it posts
 one blind per hand, alternating SB and BB, so it loses `3 × small_blind(h)` every two hands, with
-`small_blind` doubling every eleven hands (§9.2). Against a 10 000 starting stack that is 825 chips
-over level 1, 1 650 over level 2, 3 300 over level 3 — 5 775 after 33 hands — and the remaining
-4 225 inside level 4 at 600 a hand. **It busts at about hand 40**, and §9.3 condition 1 then closes
-the table with the remaining player as the winner. Each of those hands is a `|dealt_in| == 1` drain
-hand: no key setup, no shuffle, no reveal, straight to `Settling` (§5.3 step 9), so the wall-clock
-cost is `hand_delay_sec` — 7 seconds — plus one round trip. **About five minutes.**
+`small_blind` doubling every `blind_raise_every_hands` hands (§9.2). **Worked against
+`PROTOCOL.md` §13's starting stack and blind schedule — and holding only against those, since every
+figure in this paragraph is derived from them rather than being a parameter of its own** — that is
+825 chips over level 1, 1 650 over level 2, 3 300 over level 3 (5 775 after 33 hands) and the
+remaining 4 225 inside level 4 at 600 a hand. **It busts at about hand 40**, and §9.3 condition 1
+then closes the table with the remaining player as the winner. Each of those hands is a
+`|dealt_in| == 1` drain hand: no key setup, no shuffle, no reveal, straight to `Settling` (§5.3
+step 9), so the wall-clock cost is one `hand_delay_ms` plus one round trip. **About five minutes at
+§13's value.**
 
 **Each of those forty hands now places checkpoint 8, and the gate on it costs nothing there
 (K-3).** A drain hand ends at T45, so its boundary is gated; the set it is gated on is
@@ -5212,9 +5375,10 @@ at the first hand on which the two differ, instead of both playing to a private 
 result is compared before `TableClosed` rather than after it.
 
 So the whole cost of an opponent vanishing at a heads-up MVP table is **one or two `hand_deadline_ms`
-of stall — about 17 or 34 minutes at the heads-up floor, and proportionately more at any table whose
-founder advertised above it — then about five minutes of drain, then the tournament ends.** The
-drain figure is `hand_delay_sec` times forty and is untouched by `G4-P3`; only the stall scales with
+of stall — tens of minutes at the heads-up admitted minimum under §13's timings, and proportionately
+more at any table whose founder advertised above it — then about five minutes of drain, then the
+tournament ends.** The
+drain figure is `hand_delay_ms` times forty and is untouched by `G4-P3`; only the stall scales with
 the deadline. At larger tables the other seats play
 real poker throughout and only the vanished seat's chips move to them.
 
@@ -5740,8 +5904,8 @@ added by it).**
     reads are deleted: step 4 derives `dealt_in` from `signed_this_hand` alone, step 8 writes
     `solitary_since` on `|signed_this_hand| == 1`. **The measured consequence of holding it was
     two blockers at once**: a replayed stale `PLAYER_SIT_IN` or agreeing checkpoint-8 `STATE_HASH`
-    — no key, once per hand, valid for 4 096 hands — made `n(8) dealt_in` differ from every peer
-    and stalled stage 0 for up to 3 300 000 ms per hand; and because `|admitted| = 2` at exactly
+    — no key, once per hand, valid for `MAX_RETAINED_HAND_RECORDS` hands — made `n(8) dealt_in` differ from every peer
+    and stalled stage 0 for a whole `hand_deadline_ms` per hand; and because `|admitted| = 2` at exactly
     the peer K-1 is about, `solitary_since` was never written and **T62 and T63 were dead for the
     whole episode**, restoring the solitary tournament win through the engine after the wire had
     closed it. `readmit` and **T67** are kept, in no guard, for one reason: T67's

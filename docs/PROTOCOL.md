@@ -1504,8 +1504,10 @@ through a chained event (D-012), a silent seat emits none, so nothing can ever
 change its status and a set defined on it contains that seat **forever**. D-013
 records what that cost — stage stalls, the hand deadline expires, every stack
 restored by §4.10, next hand byte-identical, nothing ever busts, no end condition
-can fire. One `hand_deadline_ms` per iteration — since `P3` a figure that scales
-with the seat count and is 38 minutes at ten seats, not ten — unbounded. **A required emitter set defined
+can fire. One `hand_deadline_ms` per iteration — since `G4-P3` a per-table figure
+bounded below by a floor that scales with the seat count (§8.2), which §13 sets at
+3 300 000 ms for the rated preset's ten seats: **fifty-five minutes** per iteration,
+not the ten this sentence claimed for four passes (`G7-S7`) — unbounded. **A required emitter set defined
 on a seat's status is a defect in this document**, §2.9 is the sweep that says
 there are none left, and §4.11's *Emitter* column is where a new one would be
 visible.
@@ -3808,7 +3810,23 @@ receiver's own state**:
 | `2`, `3` | `n(3) evidence` verifies — the failing `SHUFFLE_PROOF` or reveal proof carries its own disproof | accept at once |
 | `4` | it is itself in the §6.3 case (c) terminus | **buffer, do not reject** |
 | `6`, tier 1 (D-014) | `n(3) evidence` carries exactly one `SignedEvent` signed by the seat named in `n(1) attributed`, and **this receiver's own** run of §4.0 over that event returns a tier-1 illegality — a signature that does not verify, a non-canonical encoding, a malformed message, an out-of-range field, a failed shuffle / decryption-share / key-ownership proof, a deck that is not a permutation, a signer who is not a party to this table. **The list is closed and every member is decidable from the offending event's own bytes**; *a parent that does not exist* stood here and is deleted, because it is decidable only against this receiver's own store (§4.0's box, `THREAT_MODEL.md` §5.1) | accept at once |
-| `6`, tier 2 (D-014) | as above, **and** this receiver holds a completed `STATE_ACK` stage for a checkpoint of the same chain at or before the offending event's `sequence`, whose emitter set contained both the accused and this receiver, **and** the event is illegal against the `PublicTableState` that checkpoint fixed | reject |
+| `6`, tier 2 (D-014) | as above, **and** this receiver holds a completed `STATE_ACK` stage for a checkpoint of the same chain **whose §6.2 checkpoint number is at or after the number of the checkpoint the illegality was fixed at** (`G7-S8`; the clause read *at or before the offending event's `sequence`*, and the box below says why the number replaces it), whose emitter set contained both the accused and this receiver, **and** the event is illegal against the `PublicTableState` that checkpoint fixed | reject |
+
+**The tier-2 precondition is stated in the checkpoint number, not in a `sequence` — `G7-S8`.**
+The clause that stood in that row named *"a checkpoint of the same chain at or before the offending
+event's `sequence`"*, and no path evaluates it: `STATE_MACHINE.md`'s T64 guard compares
+`c.number >= n`, and `src/security/validation.rs` builds `AgreedCheckpoint` from `emitters`,
+`hand_id` and `number` and refuses a `Tier2Finding` with `CheckpointTooEarly` unless
+`against.number() >= fixed_at_checkpoint`. One precondition written in two units is D-011 rule 1's
+shape, and the two units are not equivalent: *at or before the offending event* is satisfied by
+checkpoint 1 of the chain, which fixes almost no state and decides almost no illegality. What a
+receiver needs is **agreement over the checkpoint the illegality was fixed at, or a later one of the
+same chain**, and later is not a weakening — `transcript_head` is in `PublicTableState` (§6.1) and
+chains through every earlier stage, so agreement at `n' >= n` is agreement over a prefix containing
+checkpoint `n`'s stage. That the judging checkpoint precedes the offending event is not a separate
+test on the store: it is the row's last conjunct, since an event cannot be illegal against a
+`PublicTableState` that already contains it. The checkpoint's own `sequence` keeps the purpose it
+has — §4.1's `round` derivation — and stops being asked to carry a precondition as well.
 
 **Why the two uncertified `cause = 1` paths are one row, and not two (H4).** They
 stood here as two rows, and a receiver could not tell which of them it was
@@ -5574,12 +5592,12 @@ unambiguous before the first card exists.
 | `n(1) mode` | `u16` | `1` = `CASH_PLAY_MONEY`, `2` = `TOURNAMENT_SNG_PLAY_MONEY` |
 | `n(2) preset_id` | `bytes` | **a closed two-value enum in version 1: `"RATED_SNG_POKERTH_V1"` or `"CUSTOM"`, and nothing else.** Any other byte string — including a name a client recognises from its own source — is rejected by rule 3 below. This is `G6-R6`; the ≤ 32 B ASCII bound remains as the parse limit and is no longer the admission rule |
 | `n(3) table_name` | `bytes` | ≤ 64 B UTF-8, no control characters; display only |
-| `n(4) small_blind` | `u64` | ≥ 1 |
+| `n(4) small_blind` | `u64` | ≥ 1, **and `== n(13) first_small_blind`** — this is a separate part of `table_params_hash` from the schedule's, and it is the level-1 blind because an advertised table has dealt no hand: it is withdrawn when it starts (§7.3 `reason = 1`) and rule 7 discards a re-broadcast whose parameters changed (`G7-S3`) |
 | `n(5) big_blind` | `u64` | `== 2 * small_blind` |
 | `n(6) ante` | `u64` | `0` in version 1 |
-| `n(7) min_buyin` | `u64` | ≥ `big_blind` |
-| `n(8) max_buyin` | `u64` | ≥ `min_buyin` |
-| `n(9) start_stack` | `u64` | tournament modes only; `0` for cash |
+| `n(7) min_buyin` | `u64` | ≥ `big_blind`, **and `== n(9) start_stack` in a tournament mode** (`G7-S3`) |
+| `n(8) max_buyin` | `u64` | ≥ `min_buyin`, **and `== n(9) start_stack` in a tournament mode** (`G7-S3`) |
+| `n(9) start_stack` | `u64` | tournament modes only; `0` for cash. In a tournament every entrant receives this stack, so the buy-in **is** the stack and `n(7) == n(8) == n(9)`; without that rule the two buy-in fields are free parts of `table_params_hash` that a named configuration has to pin one at a time, which is how `G7-S3` happened |
 | `n(10) players` | `u8` | currently seated, ≤ `max_players`; advisory |
 | `n(11) max_players` | `u8` | `2 ≤ max_players ≤ 10` [RULES B1] |
 | `n(12) min_players_to_start` | `u8` | `2 ≤ … ≤ max_players` |
@@ -5602,12 +5620,14 @@ unambiguous before the first card exists.
 
 `BlindSchedule` = `#[cbor(array)] { n(0) mode: u16, n(1) every_n_hands: u16,
 n(2) first_small_blind: u64, n(3) small_blind_cap: u64 }` with `mode = 1` meaning
-`DOUBLE_EVERY_N_HANDS`. For `RATED_SNG_POKERTH_V1` the values are
-`every_n_hands = 11`, `first_small_blind = 50`, `small_blind_cap = 50_000`, so
-`small_blind(h) = min(50 · 2^(⌊(h-1)/11⌋), 50_000)` and `big_blind = 2 · small_blind`,
-with `seats = 10`, `start_stack = 10_000`, `ante = 0`. Every one of those numbers
-is enforced by PokerTH's own rated-game settings check, which is the strongest
-available evidence of what "the rated preset" means. [RULES B1, B2, B4]
+`DOUBLE_EVERY_N_HANDS`, under which
+`small_blind(h) = min(first_small_blind · 2^(⌊(h-1)/every_n_hands⌋), small_blind_cap)`
+and `big_blind = 2 · small_blind`. **`RATED_SNG_POKERTH_V1`'s values for these and
+for every other part are §13's and are not restated here** (D-011 rule 2, and
+`G7-S3`: this paragraph carried a third copy of four of them, one of which called
+`n(11)` *"seats"*). Every one of §13's rated numbers is enforced by PokerTH's own
+rated-game settings check, which is the strongest available evidence of what "the
+rated preset" means. [RULES B1, B2, B4]
 
 *Receiver must validate, before the advert is shown to a user or stored:*
 
@@ -5622,7 +5642,8 @@ available evidence of what "the rated preset" means. [RULES B1, B2, B4]
    `table_public_key`; the envelope carries the unchained sentinels of §2.3;
 2. every numeric range above, including `big_blind == 2 * small_blind`,
    `min_buyin ≤ max_buyin`, `2 ≤ max_players ≤ 10`,
-   `min_players_to_start ≤ max_players`;
+   `min_players_to_start ≤ max_players`, **`small_blind == blind_schedule.first_small_blind`**,
+   and, in a tournament mode, **`min_buyin == max_buyin == start_stack`** (`G7-S3`);
 2a. **the whole-hand deadline admitted minimum of §8.2 — `P3` and `G5-Q6`, and it is
    the one range check in this list that is a *derived* bound rather than a
    literal.** `n(17) hand_deadline_ms >= HAND_DEADLINE_MIN(n(11))`, computed from
@@ -5954,6 +5975,7 @@ off-by-one an implementer has to re-derive. At the §13 preset —
 | 2 | 810 000 | 200 000 | **1 017 000** | 600 000 — **below** |
 | 4 | 930 000 | 400 000 | **1 337 000** | 600 000 — **below** |
 | 6 | 1 050 000 | 600 000 | **1 657 000** | 600 000 — **below** |
+| 8 | 1 170 000 | 800 000 | **1 977 000** | 600 000 — **below** |
 | 10 | 1 290 000 | 1 000 000 | **2 297 000** | 600 000 — **below** |
 
 The preset was below its own floor **at every seat count**, including the two the
@@ -6012,6 +6034,7 @@ formula.
 | 2 | 1 017 000 | 25 000 | **1 042 000** |
 | 4 | 1 337 000 | 75 000 | **1 412 000** |
 | 6 | 1 657 000 | 125 000 | **1 782 000** |
+| 8 | 1 977 000 | 175 000 | **2 152 000** |
 | 10 | 2 297 000 | 225 000 | **2 522 000** |
 
 The §13 preset's `3 300 000` clears the ten-seat minimum by 778 000 ms and its
@@ -6182,7 +6205,7 @@ unilateral assertion take another's chips is a positive-gain attack on an honest
 player, so a liveness loss is preferred to a theft. There is no theft left to
 prefer against. What a below-floor certificate would still buy is a **one-message,
 on-demand hand void**, manufacturable by a single signature at any moment — which
-is strictly better for an attacker than waiting ten minutes for the same outcome,
+is strictly better for an attacker than waiting out `hand_deadline_ms` for the same outcome,
 and which D-009 rule 2 forbids on its own terms. The floor stands, for a smaller
 and more honest reason than it used to have. The disposition question this paragraph
 used to defer to a letter is **closed**: D-010 decided restoration, for the MVP,
@@ -6753,7 +6776,7 @@ outcome is.
 | two byte encodings of one event | the canonicality gate of §2.5, run before the signature | `THREAT_MODEL.md` |
 | malformed or oversized frames | the caps of §9 and the fuzzing obligations of §9.6 | `THREAT_MODEL.md` |
 | stalling a hand to force an abort | `hand_deadline_ms` from `TERMINAL(k-1)` (§8.2) and the terminal stage of §4.10 | `THREAT_MODEL.md` X8 |
-| **a founder advertising a deadline every legal hand exceeds** — free, needs no message and no key, and reaches the abort path that attributes nobody | §7.2 rule 2a: the joiner derives `HAND_DEADLINE_MIN(n(11))` from the advert's own fields and **refuses the table** before a seat is taken (§8.2, `P3`, `G5-Q6`) | filed for `THREAT_MODEL.md` in `DECISIONS.md`'s open list |
+| **a founder advertising a deadline every legal hand exceeds** — `hand_deadline_ms` is a **signed table parameter the founder chooses**, so a founder who wants every hand at their table to abort neutrally needs no attack at all: they advertise a small number. Free, no message, no key, no coalition, and it reaches the one abort path that attributes nobody | §7.2 rule 2a **and nothing else**: the joiner derives `HAND_DEADLINE_MIN(n(11))` from the advert's own fields and **refuses the table** before a seat is taken (§8.2, `G4-P3`, `G5-Q6`). There is no second line of defence, because by the time a seat is taken the value is inside `table_params_hash` and every peer holds it | owed to `THREAT_MODEL.md` §5.2; filed as **`G4-P3-e`** in `DECISIONS.md`'s open list (third point) |
 | **replaying a signed, *agreeing* checkpoint-8 `STATE_HASH` to re-enlarge a required emitter set once per hand** — also free, also no key, valid for the 4 096 hands §5.3 retains a record for | §4.9: the readmission set widens an **accepted** emitter set and never a required one, so only a seat's own **current-chain** signature can grow `R` (§4.4, §3.2, `P2`) | `THREAT_MODEL.md` X8, same family |
 | faulting a table with a false `state_hash` | §6.3 case (c) and §6.4 | `THREAT_MODEL.md` X29 |
 | a provably illegal message — bad signature, non-canonical encoding, out-of-range field, failed proof, illegal action against an agreed checkpoint | the `DISPUTE { kind = 3 }` carrier and the two-tier removal rule of §4.9, `HAND_ABORT cause = 6` (§4.10), and the re-entry bar on `PLAYER_SIT_IN` (§4.10) | `DECISIONS.md` D-014 |
@@ -7069,9 +7092,11 @@ starting stack, every entrant getting an equal stack, so `n(7) = n(8) = n(9)` �
 §7.2 rule 2 now enforces that in tournament modes rather than leaving it to be
 restated per configuration. The remedy for the class is the indexing: a named
 configuration is audited by diffing its block against §3.1's twenty-five parts,
-and a part with no line is visible at a glance. The parts that carry no line here
-are the ones §7.2 admits **one** legal value for in version 1 — they are pinned by
-the range itself and are shown above with that noted, rather than left out.
+and a part with no line is visible at a glance. **Every part carries a line**,
+including the ones §7.2 admits a single legal value for in version 1: those are
+pinned by the range itself and are marked *sole legal value* rather than omitted,
+because a part left out to save a line is indistinguishable from a part nobody
+thought about — which is the whole of this finding.
 
 **`n(4) small_blind` is the level-1 blind and cannot be anything else.** It is a
 distinct part from `n(13.2) first_small_blind`, so a configuration that pins only
@@ -7089,7 +7114,8 @@ reproduced here**, and neither are their values at each seat count: §8.2's two
 tables are the only ones in the corpus. This section carried a second copy of both
 the formulae and the table until this pass, which is a value no test validates
 sitting in two places — the shape that produced `G6-R1` and `G7-S1`, and the reason
-`n = 8` had to be added in three places instead of one. What §13 owes an
+`G7-S6`'s missing `n = 8` row would otherwise have had to be added in three places
+rather than the two §8.2 owns. What §13 owes an
 implementer here is the pointer and nothing else, because there is no longer a
 number to find: the deadline is the founder's, bounded below by §8.2's derivation
 and above by `n(17)`'s cap.
@@ -7125,37 +7151,45 @@ reachability analysis, and the Phase 8 acceptance test for D-003/D-004 uses a
 
 The `CUSTOM` two-seat table the sentence above names is the only table the MVP
 can actually play, so its values are written down here. **They are a reference
-configuration and not a `preset_id`.** `HEADS_UP_PLAY_MONEY_V1` exists in
-`src/poker/tournament.rs` as a source constant; version 1 has **no such preset**
-and §7.2 rule 3 admits exactly two `preset_id` values, so a table built from these
-values advertises `preset_id = "CUSTOM"` and carries every number below in its own
-advert fields.
+configuration and not a `preset_id`.** The constant behind it lives in
+`src/poker/tournament.rs`; version 1 has **no such preset** and §7.2 rule 3 admits
+exactly two `preset_id` values, so a table built from these values advertises
+`preset_id = "CUSTOM"` and carries every number below in its own advert fields.
 
 ```
-the heads-up reference configuration — advertised as CUSTOM:
-  mode                          = 2  (TOURNAMENT_SNG_PLAY_MONEY)
-  max_players                   = 2
-  min_players_to_start          = 2
-  start_stack                   = 10 000       (= min_buyin = max_buyin)
-  first_small_blind             = 50
-  big_blind                     = 2 * small_blind
-  ante                          = 0
-  blind_raise                   = DOUBLE_EVERY_N_HANDS, every 11 hands
-  small_blind_cap               = 10 000
-  button_rule                   = DEAD_BUTTON
-  odd_chip_rule                 = FIRST_SEAT_LEFT_OF_BUTTON
-  showdown_policy               = MANDATORY_REVEAL       (pending Q-01)
-  action_timeout_ms             = 20 000
-  action_grace_ms               = 5 000
-  crypto_step_timeout_ms        = 30 000
-  hand_delay_ms                 = 7 000
-  hand_deadline_ms              = 1 200 000
-  join_deadline_ms              = 120 000
-  password                      = none
+the heads-up reference configuration — advertised as CUSTOM.
+All twenty-five parts of table_params_hash (§3.1), in that box's order:
+  n(0)    game                  = 1     NLHE                  sole legal value §7.2
+  n(1)    mode                  = 2     TOURNAMENT_SNG_PLAY_MONEY
+  n(2)    preset_id             = "CUSTOM"
+  n(4)    small_blind           = 50                          == n(13.2)
+  n(5)    big_blind             = 100                         == 2 * n(4), §7.2
+  n(6)    ante                  = 0                           sole legal value §7.2
+  n(7)    min_buyin             = 10 000                      == n(9)
+  n(8)    max_buyin             = 10 000                      == n(9)
+  n(9)    start_stack           = 10 000
+  n(11)   max_players           = 2
+  n(12)   min_players_to_start  = 2
+  n(13.0) blind_schedule.mode   = 1     DOUBLE_EVERY_N_HANDS  sole legal value §7.2
+  n(13.1) every_n_hands         = 11
+  n(13.2) first_small_blind     = 50
+  n(13.3) small_blind_cap       = 10 000                      = n(11)*n(9)/2
+  n(14)   action_timeout_ms     = 20 000
+  n(15)   action_grace_ms       = 5 000
+  n(16)   crypto_step_timeout_ms = 30 000
+  n(17)   hand_deadline_ms      = 1 200 000
+  n(18)   join_deadline_ms      = 120 000
+  n(19)   hand_delay_ms         = 7 000
+  n(20)   button_rule           = 1     DEAD_BUTTON           sole legal value §7.2
+  n(21)   odd_chip_rule         = 1     FIRST_SEAT_LEFT_OF_BUTTON  sole legal value §7.2
+  n(22)   showdown_policy       = 1     MANDATORY_REVEAL      (pending Q-01)
+  n(24)   deck_suite            = "bs-bg12-secp256k1/1"       sole legal value §7.2
+  not a part of table_params_hash: n(23) password_required = false (no password)
 ```
 
 **Why these numbers, since values written down have to be justified whether or not
-a name carries them.** Everything but the last two lines is the rated preset's,
+a name carries them.** Every part except `n(11)`, `n(12)`, `n(13.3)` and `n(17)`
+is the rated preset's,
 unchanged, because nothing about two seats makes 50/100 blinds, a 10 000 stack, a
 zero ante or an eleven-hand level the wrong choice — the rated values already carry
 [RULES B1–B5] and copying them is cheaper than inventing a second provenance.
@@ -7196,6 +7230,38 @@ name, and two clients whose "heads-up table" differs by one field see the
 difference **before** a seat is taken (§7.2 rules 2, 2a and 7) rather than
 discovering it as a failure to join. The name may go on staying in the source, in
 a test fixture and in a UI menu; what it may not do is travel on the wire.
+
+**What the code must carry for a two-seat table, now that this is a reference
+configuration rather than a preset — `G7-S9`, and it is larger than `G6-R6`'s two
+lines.** `G6-R6`'s two lines have landed: `src/poker/tournament.rs` renamed the
+constant to `HEADS_UP_CUSTOM_2P`, its `id` is `"CUSTOM"`, and the doc comment that
+claimed two clients agree on the table *by its name* is gone. What replaces the
+name is a **complete advert**, and that is the part the code does not have yet.
+A `Preset` carries **fourteen** of §3.1's twenty-five parts. The eleven it does not
+carry are `n(0) game`, `n(1) mode`, `n(4) small_blind`, `n(5) big_blind`,
+`n(7) min_buyin`, `n(8) max_buyin`, `n(13.0) blind_schedule.mode`,
+`n(20) button_rule`, `n(21) odd_chip_rule`, `n(22) showdown_policy` and
+`n(24) deck_suite` — and every one of them is hashed, so a client that defaults
+any of them while building the advert computes a `table_params_hash` no other
+client reproduces. That is `G7-S3` in the code rather than in a document, and it
+is the same defect wearing the same disguise: a **missing** field reads as an
+omission, never as a contradiction. Three things follow, and none is a value:
+
+* **The advert type owns the twenty-five parts, not `Preset`.** `Preset` may stay
+  as the convenience that fills the fourteen it knows; the eleven above have to be
+  filled explicitly at the one place a `LOBBY_TABLE_AD` payload is built, and the
+  fields §7.2 admits exactly one legal value for are *still* filled explicitly,
+  because a part that nobody writes is a part nobody notices is wrong.
+* **`n(2)` is typed, not spelt.** `Preset::id` is a `&'static str` today, so a
+  third preset name is representable and §7.2 rule 3 rejects it only at a
+  receiver. `src/protocol/constants.rs` already carries the closed enum
+  (`PresetId::RatedSngPokerthV1`, `PresetId::Custom`); `id` should be that type, so
+  the rule the wire enforces is the rule the type enforces and no client of ours
+  can emit a name a conforming joiner will reject.
+* **Units are part of the hash.** `Preset` stores `*_sec`; every timing part is
+  hashed as `u32_be(…_ms)`. The ×1000 is not a display detail — a client that
+  hashes seconds sits at a different table from one that hashes milliseconds, with
+  no message and no error to say so.
 
 **Retired constants.** `LOBBY_MAX_MESSAGE`, `TABLE_MAX_FRAME`,
 `SNAPSHOT_MAX_REQUEST` and `SNAPSHOT_MAX_RESPONSE` are renamed as listed at the
@@ -7286,8 +7352,9 @@ below the floor and the hand ends instead on §8.4's `hand_deadline_ms` path.
 The *outcome* is unchanged in every respect that touches chips: `cause = 1`,
 `attributed = []`, `cert_hash = None`, stacks restored to their start-of-hand
 values. What changes is the trigger and the wait — `hand_deadline_ms` rather than
-`crypto_step_timeout_ms`, ten minutes rather than thirty seconds under
-`RATED_SNG_POKERTH_V1`. Two visible consequences: §4.10's `attributed = []` table
+`crypto_step_timeout_ms` — **fifty-five minutes** rather than thirty seconds under
+`RATED_SNG_POKERTH_V1` (§13; this said *ten minutes* until `G7-S7`, against the
+600 000 ms `G4-P3` retired). Two visible consequences: §4.10's `attributed = []` table
 has three cases collapsed to two, since the old "`cause = 1` at `n = 2`" row was
 the `n`-scoped statement of a case that is now `|V| < 2` and reaches the same
 disposition through the hand-deadline row; and `STATE_MACHINE.md` needs no

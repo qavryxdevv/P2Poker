@@ -31,7 +31,7 @@ pub struct Preset {
     /// Ceiling on the small blind: half of all the chips in the tournament.
     pub small_blind_cap: Chips,
     pub action_timeout_sec: u32,
-    pub action_timeout_grace_sec: u32,
+    pub action_grace_sec: u32,
     /// How long one cryptographic step of a hand may take.
     ///
     /// Feeds [`Preset::hand_deadline_floor_ms`], where it is by far the largest
@@ -42,6 +42,56 @@ pub struct Preset {
     pub hand_deadline_sec: u32,
     pub join_deadline_sec: u32,
 }
+
+/// Why a table configuration was refused.
+///
+/// Every variant is a value an advert may legally carry on the wire, so each
+/// one is a network condition rather than an internal bug.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigError {
+    SeatsOutOfRange(u8),
+    MinPlayersOutOfRange(u8),
+    /// `raise_every_hands == 0`, which divides by zero at every peer.
+    RaiseIntervalZero,
+    BlindZero,
+    CapBelowFirstBlind,
+    /// Nobody could post two orbits of blinds, so the table cannot be played.
+    StackTooSmallForBlinds,
+    /// Below the admitted minimum, so hands abort on legal play.
+    DeadlineBelowMinimum { advertised: u64, minimum: u64 },
+    DeadlineAboveCap(u64),
+}
+
+impl core::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ConfigError::SeatsOutOfRange(n) => write!(f, "{n} seats is outside 2..=10"),
+            ConfigError::MinPlayersOutOfRange(n) => {
+                write!(f, "a start threshold of {n} is not playable")
+            }
+            ConfigError::RaiseIntervalZero => {
+                write!(f, "a blind raise interval of zero cannot be computed")
+            }
+            ConfigError::BlindZero => write!(f, "a small blind of zero is not a game"),
+            ConfigError::CapBelowFirstBlind => {
+                write!(f, "the blind cap is below the first blind")
+            }
+            ConfigError::StackTooSmallForBlinds => {
+                write!(f, "the starting stack cannot cover two orbits of blinds")
+            }
+            ConfigError::DeadlineBelowMinimum { advertised, minimum } => write!(
+                f,
+                "a hand deadline of {advertised} ms is below the {minimum} ms minimum, \
+                 so hands would abort on legal play"
+            ),
+            ConfigError::DeadlineAboveCap(ms) => {
+                write!(f, "a hand deadline of {ms} ms is above the cap")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// PokerTH's rated Sit-and-Go, `GAME_TYPE_RANKING`.
 ///
@@ -75,7 +125,7 @@ pub const RATED_SNG_POKERTH_V1: Preset = Preset {
     raise_every_hands: 11,
     small_blind_cap: 50_000,
     action_timeout_sec: 20,
-    action_timeout_grace_sec: 5,
+    action_grace_sec: 5,
     crypto_step_timeout_sec: 30,
     hand_delay_sec: 7,
     // Normative in `PROTOCOL.md` §13. The floor at ten seats is 2 297 000 ms,
@@ -114,7 +164,7 @@ pub const HEADS_UP_CUSTOM_2P: Preset = Preset {
     raise_every_hands: 11,
     small_blind_cap: 10_000, // seats * start_stack / 2
     action_timeout_sec: 20,
-    action_timeout_grace_sec: 5,
+    action_grace_sec: 5,
     crypto_step_timeout_sec: 30,
     hand_delay_sec: 7,
     // 1 017 s is the floor at two seats.
@@ -139,8 +189,14 @@ impl Preset {
     /// `lastHandBlindsRaised` starting at 1, so the first raise lands on hand
     /// 12 and each level is exactly `raise_every_hands` long
     /// (`src/engine/game.cpp:286-291`, `:51-52`).
+    ///
+    /// `raise_every_hands == 0` cannot divide, and an advert may carry it: the
+    /// wire format gives the field no lower bound. It is treated as "never
+    /// raise" here so a malformed advert that reached the engine cannot panic
+    /// every peer at once — but the real defence is [`Preset::validate`],
+    /// which refuses such an advert before a seat is ever taken.
     pub const fn level(&self, hand: u32) -> u32 {
-        if hand == 0 {
+        if hand == 0 || self.raise_every_hands == 0 {
             return 1;
         }
         1 + (hand - 1) / self.raise_every_hands
@@ -193,7 +249,7 @@ impl Preset {
         let delay = self.hand_delay_sec as u64 * 1_000;
         let crypto = (2 * n + 23) * (self.crypto_step_timeout_sec as u64 * 1_000);
         let action = 4 * n
-            * ((self.action_timeout_sec as u64 + self.action_timeout_grace_sec as u64) * 1_000);
+            * ((self.action_timeout_sec as u64 + self.action_grace_sec as u64) * 1_000);
         delay + crypto + action
     }
 
@@ -214,8 +270,68 @@ impl Preset {
             return 0;
         }
         let per_reopening =
-            (n - 1) * ((self.action_timeout_sec as u64 + self.action_timeout_grace_sec as u64) * 1_000);
+            (n - 1) * ((self.action_timeout_sec as u64 + self.action_grace_sec as u64) * 1_000);
         (deadline - floor) / per_reopening
+    }
+
+    /// Check a configuration before a seat is taken.
+    ///
+    /// A table's parameters arrive in a **signed advert chosen by its
+    /// founder**, so every one of them is attacker-chosen and none may be
+    /// trusted. A founder needs no attack to make a table where nothing can be
+    /// won or where every peer crashes at the same moment — only a small
+    /// number, or a zero.
+    ///
+    /// The check belongs to the joiner and runs before the advert is shown or
+    /// stored. A client must **not** join and then substitute its own value:
+    /// two peers running different table parameters disagree about what
+    /// happened, which is worse than not playing.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(2..=10).contains(&self.seats) {
+            return Err(ConfigError::SeatsOutOfRange(self.seats));
+        }
+        if self.min_players_to_start > self.seats || self.min_players_to_start < 2 {
+            return Err(ConfigError::MinPlayersOutOfRange(self.min_players_to_start));
+        }
+        if self.raise_every_hands == 0 {
+            // Division by zero in `level`, at every peer, deterministically.
+            return Err(ConfigError::RaiseIntervalZero);
+        }
+        if self.first_small_blind == 0 {
+            return Err(ConfigError::BlindZero);
+        }
+        if self.small_blind_cap < self.first_small_blind {
+            return Err(ConfigError::CapBelowFirstBlind);
+        }
+        if self.start_stack < 2 * (2 * self.first_small_blind + self.ante) {
+            return Err(ConfigError::StackTooSmallForBlinds);
+        }
+
+        let deadline_ms = self.hand_deadline_sec as u64 * 1_000;
+        let minimum = self.hand_deadline_min_ms();
+        if deadline_ms < minimum {
+            return Err(ConfigError::DeadlineBelowMinimum { advertised: deadline_ms, minimum });
+        }
+        if deadline_ms > crate::protocol::constants::HAND_DEADLINE_CAP_MS {
+            return Err(ConfigError::DeadlineAboveCap(deadline_ms));
+        }
+        Ok(())
+    }
+
+    /// The **admitted** minimum whole-hand deadline: the floor plus one
+    /// reopening raise.
+    ///
+    /// Between the floor and this, a table buys the walk and no reopening at
+    /// all, so the very first re-raise reaches the same abort the floor exists
+    /// to prevent.
+    pub const fn hand_deadline_min_ms(&self) -> u64 {
+        crate::protocol::constants::hand_deadline_min_ms(
+            self.seats,
+            self.action_timeout_sec as u64 * 1_000,
+            self.action_grace_sec as u64 * 1_000,
+            self.crypto_step_timeout_sec as u64 * 1_000,
+            self.hand_delay_sec as u64 * 1_000,
+        )
     }
 
     /// Total chips in play, which never changes in a tournament.
@@ -374,19 +490,70 @@ mod tests {
         }
     }
 
-    /// Every preset this project ships must satisfy its own floor, or a joiner
-    /// following the spec refuses the table it advertises.
+    /// Every configuration this project ships must pass the check a conforming
+    /// joiner runs, which is the **admitted minimum** and not the floor.
+    ///
+    /// Asserting the floor was too weak: a configuration in the gap between the
+    /// floor and the minimum passed this test and would be refused by every
+    /// other client, which is the worst of both - it looks correct here and
+    /// cannot find a table anywhere.
     #[test]
-    fn every_shipped_preset_meets_its_own_floor() {
+    fn every_shipped_configuration_passes_the_joiners_check() {
         for p in [RATED_SNG_POKERTH_V1, HEADS_UP_CUSTOM_2P] {
+            assert_eq!(p.validate(), Ok(()), "{} is refused by its own check", p.id);
             let deadline_ms = p.hand_deadline_sec as u64 * 1_000;
             assert!(
-                deadline_ms >= p.hand_deadline_floor_ms(),
-                "{} advertises {} ms against a floor of {} ms",
+                deadline_ms >= p.hand_deadline_min_ms(),
+                "{} advertises {} ms against an admitted minimum of {} ms",
                 p.id,
                 deadline_ms,
-                p.hand_deadline_floor_ms()
+                p.hand_deadline_min_ms()
             );
+        }
+    }
+
+    /// The panic an advert could cause at every peer at once. A conforming
+    /// advert may carry `every_n_hands = 0`, since the wire format gives the
+    /// field no lower bound.
+    #[test]
+    fn a_zero_raise_interval_is_refused_and_cannot_divide() {
+        let bad = Preset { raise_every_hands: 0, ..RATED_SNG_POKERTH_V1 };
+        assert_eq!(bad.validate(), Err(ConfigError::RaiseIntervalZero));
+        // And if one ever reached the engine anyway, it must not panic.
+        for hand in [0u32, 1, 12, u32::MAX] {
+            assert_eq!(bad.level(hand), 1, "never raising is the safe reading");
+            assert_eq!(bad.small_blind(hand), bad.first_small_blind);
+        }
+    }
+
+    /// A founder needs no attack to make a table where nothing can be won -
+    /// only a small number - so every one of these is refused before a seat is
+    /// taken rather than discovered mid-hand.
+    #[test]
+    fn a_founders_hostile_advert_is_refused_before_a_seat_is_taken() {
+        let base = RATED_SNG_POKERTH_V1;
+        let cases: [(Preset, ConfigError); 6] = [
+            (Preset { seats: 1, ..base }, ConfigError::SeatsOutOfRange(1)),
+            (Preset { seats: 11, ..base }, ConfigError::SeatsOutOfRange(11)),
+            (Preset { first_small_blind: 0, ..base }, ConfigError::BlindZero),
+            (
+                Preset { small_blind_cap: 10, ..base },
+                ConfigError::CapBelowFirstBlind,
+            ),
+            (
+                Preset { start_stack: 10, ..base },
+                ConfigError::StackTooSmallForBlinds,
+            ),
+            (
+                Preset { hand_deadline_sec: 600, ..base },
+                ConfigError::DeadlineBelowMinimum {
+                    advertised: 600_000,
+                    minimum: base.hand_deadline_min_ms(),
+                },
+            ),
+        ];
+        for (p, expected) in cases {
+            assert_eq!(p.validate(), Err(expected), "this advert must be refused");
         }
     }
 
