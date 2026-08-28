@@ -309,10 +309,332 @@ impl fmt::Display for EventType {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// The envelope (`PROTOCOL.md` §2.3)
+// ---------------------------------------------------------------------------
+
+/// Thirty-two zero bytes: the sentinel an unchained event carries where a
+/// chained one carries a table id or a parent hash.
+pub const ZERO32: [u8; 32] = [0u8; 32];
+
+/// The `hand_id` an unchained event carries.
+pub const UNCHAINED_HAND_ID: u64 = u64::MAX;
+
+/// The protocol version this build speaks.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// What is signed and hashed (`PROTOCOL.md` §2.3).
+///
+/// The field numbering is the wire format. This is `SPEC_CS.md` §12's required
+/// list plus the two discriminators `chain_scope` and `event_class`, and the
+/// spec's single "timestamp/deadline information" is split in two because the
+/// halves have opposite trust properties: `emitted_at_unix_ms` comes from a
+/// clock nobody shares and is advisory, while `next_deadline_ms` is normative.
+#[derive(Clone, Debug, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct EventBody {
+    #[n(0)]
+    pub protocol_version: u16,
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub table_id: [u8; 32],
+    #[n(2)]
+    pub hand_id: u64,
+    #[n(3)]
+    pub sequence: u64,
+    #[cbor(n(4), with = "minicbor::bytes")]
+    pub sender_public_key: [u8; 32],
+    #[n(5)]
+    pub event_type: u16,
+    /// Canonical CBOR of the per-type payload: the third nesting level, gated
+    /// independently of this one.
+    #[cbor(n(6), with = "minicbor::bytes")]
+    pub payload: Vec<u8>,
+    #[cbor(n(7), with = "minicbor::bytes")]
+    pub previous_event_hash: [u8; 32],
+    /// **Advisory only.** From a clock nobody shares; never a rule input.
+    #[n(8)]
+    pub emitted_at_unix_ms: u64,
+    /// **Normative.**
+    #[n(9)]
+    pub next_deadline_ms: u32,
+    /// `1` = occupies a stage slot, `0` = unchained.
+    #[n(10)]
+    pub chain_scope: u8,
+    /// `0` ordinary, `1` `TIMEOUT_VOTE`, `2` `TIMEOUT_CERT`.
+    #[n(11)]
+    pub event_class: u8,
+}
+
+/// What travels on the wire (`PROTOCOL.md` §2.3).
+///
+/// The body is carried as opaque bytes rather than as a nested struct on
+/// purpose: a signature covers bytes, so a verifier must see exactly the bytes
+/// the signer signed and never a re-encoding of a decoded value.
+#[derive(Clone, Debug, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct SignedEvent {
+    #[cbor(n(0), with = "minicbor::bytes")]
+    pub body: Vec<u8>,
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub signature: [u8; 64],
+}
+
+/// Why an envelope was rejected, before anything looked at its payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvelopeError {
+    /// A version this build does not speak.
+    WrongVersion(u16),
+    /// `event_type` is not in the catalogue.
+    UnknownType(UnknownEventType),
+    /// `chain_scope` disagrees with the catalogue for this type.
+    ChainScopeMismatch { declared: u8, expected: u8 },
+    /// An unchained event carried something other than the sentinels.
+    UnchainedSentinelViolated(&'static str),
+    /// `event_class` is not 0, 1 or 2.
+    BadEventClass(u8),
+    /// `event_class` does not match the type carrying it.
+    EventClassMismatch { declared: u8, expected: u8 },
+}
+
+impl fmt::Display for EnvelopeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EnvelopeError::WrongVersion(v) => write!(f, "protocol version {v} is not spoken here"),
+            EnvelopeError::UnknownType(e) => write!(f, "{e}"),
+            EnvelopeError::ChainScopeMismatch { declared, expected } => {
+                write!(f, "chain_scope {declared} but this type is {expected}")
+            }
+            EnvelopeError::UnchainedSentinelViolated(field) => {
+                write!(f, "unchained event carried a non-sentinel {field}")
+            }
+            EnvelopeError::BadEventClass(c) => write!(f, "event_class {c} is not 0, 1 or 2"),
+            EnvelopeError::EventClassMismatch { declared, expected } => {
+                write!(f, "event_class {declared} but this type is {expected}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EnvelopeError {}
+
+impl EventBody {
+    /// The event type, if the catalogue has it.
+    pub fn typed(&self) -> Result<EventType, UnknownEventType> {
+        EventType::try_from(self.event_type)
+    }
+
+    /// The class an event type must declare.
+    pub const fn expected_class(t: EventType) -> u8 {
+        match t {
+            EventType::TimeoutVote => 1,
+            EventType::TimeoutCert => 2,
+            _ => 0,
+        }
+    }
+
+    /// Check the envelope against the catalogue, before the payload is parsed
+    /// and before any signature is checked.
+    ///
+    /// An unchained event must carry the sentinels of §2.3, because the table
+    /// it concerns is named **in the payload** and never in the envelope. A
+    /// receiver that indexed on the envelope's `table_id` would be indexing on
+    /// an attacker-chosen value.
+    pub fn check_envelope(&self) -> Result<EventType, EnvelopeError> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(EnvelopeError::WrongVersion(self.protocol_version));
+        }
+        let t = self.typed().map_err(EnvelopeError::UnknownType)?;
+
+        let expected_scope = t.chain_scope();
+        if self.chain_scope != expected_scope {
+            return Err(EnvelopeError::ChainScopeMismatch {
+                declared: self.chain_scope,
+                expected: expected_scope,
+            });
+        }
+
+        if self.event_class > 2 {
+            return Err(EnvelopeError::BadEventClass(self.event_class));
+        }
+        let expected_class = Self::expected_class(t);
+        if self.event_class != expected_class {
+            return Err(EnvelopeError::EventClassMismatch {
+                declared: self.event_class,
+                expected: expected_class,
+            });
+        }
+
+        if self.chain_scope == 0 {
+            if self.table_id != ZERO32 {
+                return Err(EnvelopeError::UnchainedSentinelViolated("table_id"));
+            }
+            if self.hand_id != UNCHAINED_HAND_ID {
+                return Err(EnvelopeError::UnchainedSentinelViolated("hand_id"));
+            }
+            if self.previous_event_hash != ZERO32 {
+                return Err(EnvelopeError::UnchainedSentinelViolated("previous_event_hash"));
+            }
+            if self.sequence != 0 {
+                return Err(EnvelopeError::UnchainedSentinelViolated("sequence"));
+            }
+        }
+
+        Ok(t)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+
+    fn chained_body(t: EventType) -> EventBody {
+        EventBody {
+            protocol_version: PROTOCOL_VERSION,
+            table_id: [3u8; 32],
+            hand_id: 7,
+            sequence: 12,
+            sender_public_key: [4u8; 32],
+            event_type: t.code(),
+            payload: vec![1, 2, 3],
+            previous_event_hash: [5u8; 32],
+            emitted_at_unix_ms: 1_700_000_000_000,
+            next_deadline_ms: 20_000,
+            chain_scope: t.chain_scope(),
+            event_class: EventBody::expected_class(t),
+        }
+    }
+
+    fn unchained_body(t: EventType) -> EventBody {
+        EventBody {
+            protocol_version: PROTOCOL_VERSION,
+            table_id: ZERO32,
+            hand_id: UNCHAINED_HAND_ID,
+            sequence: 0,
+            sender_public_key: [4u8; 32],
+            event_type: t.code(),
+            payload: vec![1, 2, 3],
+            previous_event_hash: ZERO32,
+            emitted_at_unix_ms: 1_700_000_000_000,
+            next_deadline_ms: 0,
+            chain_scope: 0,
+            event_class: 0,
+        }
+    }
+
+    #[test]
+    fn an_envelope_round_trips_through_canonical_bytes() {
+        use crate::protocol::serialization::{from_canonical, to_canonical};
+        let body = chained_body(EventType::ActionBet);
+        let bytes = to_canonical(&body).unwrap();
+        let back: EventBody = from_canonical(&bytes, 8192).unwrap();
+        assert_eq!(back, body);
+    }
+
+    #[test]
+    fn a_signed_event_round_trips() {
+        use crate::protocol::serialization::{from_canonical, to_canonical};
+        let event = SignedEvent { body: vec![9; 40], signature: [1u8; 64] };
+        let bytes = to_canonical(&event).unwrap();
+        let back: SignedEvent = from_canonical(&bytes, 8192).unwrap();
+        assert_eq!(back, event);
+    }
+
+    #[test]
+    fn a_well_formed_envelope_passes_for_every_event_type() {
+        for t in EventType::ALL {
+            let body = if t.chain_scope() == 0 { unchained_body(t) } else { chained_body(t) };
+            assert_eq!(body.check_envelope(), Ok(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn a_version_this_build_does_not_speak_is_rejected() {
+        let mut body = chained_body(EventType::ActionFold);
+        body.protocol_version = 2;
+        assert_eq!(body.check_envelope(), Err(EnvelopeError::WrongVersion(2)));
+    }
+
+    #[test]
+    fn a_declared_chain_scope_that_contradicts_the_catalogue_is_rejected() {
+        let mut body = unchained_body(EventType::Hello);
+        body.chain_scope = 1;
+        assert_eq!(
+            body.check_envelope(),
+            Err(EnvelopeError::ChainScopeMismatch { declared: 1, expected: 0 })
+        );
+    }
+
+    /// The sentinels matter because an unchained event names the table it
+    /// concerns in its payload. A receiver that indexed on the envelope's
+    /// `table_id` would be indexing on an attacker-chosen value.
+    #[test]
+    fn an_unchained_event_must_carry_the_sentinels() {
+        let cases: [(&str, fn(&mut EventBody)); 4] = [
+            ("table_id", |b| b.table_id = [1u8; 32]),
+            ("hand_id", |b| b.hand_id = 0),
+            ("previous_event_hash", |b| b.previous_event_hash = [1u8; 32]),
+            ("sequence", |b| b.sequence = 1),
+        ];
+        for (field, break_it) in cases {
+            let mut body = unchained_body(EventType::LobbyTableAd);
+            break_it(&mut body);
+            assert_eq!(
+                body.check_envelope(),
+                Err(EnvelopeError::UnchainedSentinelViolated(field)),
+                "a bad {field} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn dispute_is_unchained_and_carries_the_sentinels_too() {
+        let good = unchained_body(EventType::Dispute);
+        assert_eq!(good.check_envelope(), Ok(EventType::Dispute));
+
+        let mut bad = unchained_body(EventType::Dispute);
+        bad.sequence = 5;
+        assert!(bad.check_envelope().is_err(), "even DISPUTE gets no sequence");
+    }
+
+    #[test]
+    fn event_class_must_match_the_type_that_carries_it() {
+        let mut body = chained_body(EventType::ActionCall);
+        body.event_class = 1;
+        assert_eq!(
+            body.check_envelope(),
+            Err(EnvelopeError::EventClassMismatch { declared: 1, expected: 0 })
+        );
+
+        let mut vote = chained_body(EventType::TimeoutVote);
+        assert_eq!(vote.event_class, 1, "a vote declares class 1");
+        vote.event_class = 0;
+        assert_eq!(
+            vote.check_envelope(),
+            Err(EnvelopeError::EventClassMismatch { declared: 0, expected: 1 })
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_event_class_is_rejected() {
+        for class in [3u8, 4, 255] {
+            let mut body = chained_body(EventType::ActionCheck);
+            body.event_class = class;
+            assert_eq!(body.check_envelope(), Err(EnvelopeError::BadEventClass(class)));
+        }
+    }
+
+    #[test]
+    fn an_uncatalogued_type_is_rejected_at_the_envelope() {
+        let mut body = chained_body(EventType::ActionCheck);
+        body.event_type = 0x1234;
+        assert_eq!(
+            body.check_envelope(),
+            Err(EnvelopeError::UnknownType(UnknownEventType::Unknown(0x1234)))
+        );
+    }
 
     #[test]
     fn the_catalogue_has_exactly_thirty_nine_types() {

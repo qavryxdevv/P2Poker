@@ -742,7 +742,9 @@ defect.
 | `state_hash` §6.1 | clean after the `absent` deletion — enumeration 3 |
 | `password_proof` §4.3 | clean, and it enters no chain |
 
-**2. The collective emitter sets.** Nine, and this is where J2 lived. The finding
+**2. The collective emitter sets.** Nine rows, ten sets since checkpoint 8 split
+`STATE_HASH`'s row across `P(k-1)`, `P(0)` and `P(k)` (§4.9), and this is where J2
+lived. The finding
 is not that one set was wrong; it is that **the class had never been enumerated**.
 §3.2 defined the stage kind and its `R`, §4 instantiated each one, and no document
 in seven passes asked what removes a seat from an `R`.
@@ -756,7 +758,7 @@ in seven passes asked what removes a seat from an `R`.
 | `DECK_INIT`, `DECK_COMMIT`, `DEAL_PRIVATE`, `BOARD_REVEAL` | `dealt_in` | unchanged in form; **`dealt_in` is a subset of `P(k-1)`, now normative** (§4.4). Without that containment the stall moves from `HAND_INIT` to `DECK_INIT` and nothing else changes |
 | `SHOWDOWN_REVEAL` / `SHOWDOWN_MUCK` | the required-to-show set | unchanged — a function of the betting sequence and the rules, every input chained |
 | `TIMEOUT_CERT` | `V(subject)`, inductive over completed certificates | unchanged — clean, and clean because D-008 already fixed the version that was not |
-| `STATE_HASH`, `STATE_ACK` | "all present seats" | **changed** — `P(k-1)`, and `P(0)` at checkpoint 1 (§4.9) |
+| `STATE_HASH`, `STATE_ACK` | "all present seats" | **changed** — `P(k-1)`, `P(0)` at checkpoint 1, and **`P(k)` at checkpoint 8** (§4.9). Checkpoint 8's is the one `R` in the document that is not `P(k-1)` or a subset of it, and it is the one stage whose *accepted* set is wider than its *required* set: an out-of-set `STATE_HASH` there is compared rather than rejected, which is `L3`'s disposition and is what stops two peers whose `P` has forked from never colliding |
 | `HAND_ABORT` | none — witness-independent terminal | unchanged |
 
 **Four sets changed, and every one of them was defined on a status word.** The
@@ -769,14 +771,21 @@ the corpus: `protocol_version`, `table_id`, `hand_id`, `checkpoint`, `roster`,
 `button_position`, `sb_position`, `bb_seat`, `level`, `small_blind`, `big_blind`,
 `ante`, `street`, `board`, `committed_this_round`, `committed_this_hand`,
 `current_bet`, `last_full_raise`, `player_to_act`, `pots`, `deck_commitment`,
-`ledger_in`, `ledger_out`, `transcript_head`, and the `Vec<bool>` flag vectors.
-All clean, and three are worth naming. `level`, `small_blind` and `big_blind` are
+`ledger_in`, `ledger_out`, `transcript_head`, `signed_this_hand`, and the
+`Vec<bool>` flag vectors.
+All clean, and four are worth naming. `level`, `small_blind` and `big_blind` are
 **derived from `hand_id` in closed form** rather than incremented, which is the
 single most common place a poker protocol admits a per-receiver quantity and which
 this document closed before the rule existed. `transcript_head` is the `stage_hash`
 of the last completed stage, and every checkpoint is itself a collective stage, so
 every emitter has completed the same prefix. And the flag vector **was five and is
-now four**: `absent` is deleted (§6.1, J5).
+now four**: `absent` is deleted (§6.1, J5). `signed_this_hand` is the fourth worth
+naming and is **new here (L2)**: it is a `Vec<bool>` by seat like the four flags
+and is emphatically not a fifth one — it is `P(k)` (§3.2), whose per-receiver
+residual is `Q-10`'s and is named rather than removed, exactly as the correction
+below records. It is in the struct **because** that residual exists: hashing it is
+what makes two peers who hold different `P` collide at checkpoint 8 (§4.9) instead
+of forking in silence.
 
 **One thing this sweep asserted and got wrong, corrected here rather than left
 standing (K1).** It read: *"No 'who is connected', 'who was heard', or
@@ -1142,9 +1151,17 @@ the table.
 > Write `P(k)` for that set: the seats that signed at least one `chain_scope = 1`
 > event, accepted by this receiver, **in chain `k`** — every stage of chain `k`,
 > plus chain `k`'s hand boundary window, whose chain, `hand_id`, `sequence`,
-> parent and total order §4.10 defines (this is the closure of `Q-09`). `P(0)` is
+> parent and total order §4.10 defines (this is the closure of `Q-09`), plus
+> chain `k`'s **boundary checkpoint**, whose same four quantities §4.9 defines.
+> `P(0)` is
 > the set of seats that signed `TABLE_READY`. Every `R` in §4 is `P(k-1)`, or a
-> subset of it fixed by chained content.
+> subset of it fixed by chained content, **with exactly one exception, named here
+> so the reader does not have to find it: the boundary checkpoint of §4.9, whose
+> `R` is `P(k)` because it is the stage that publishes what `P(k)` is.** A stage
+> that compares the participation set cannot be required of the set it replaces.
+> The exception is safe for the reason §4.9's box gives — every member of `P(k)`
+> demonstrated itself by signing during hand `k`, and the exit if one stops
+> afterwards is a timer and never a peer.
 >
 > **A peer's own emission counts into its own `P`, and this is stated because it
 > was not (K1).** "Accepted by this receiver" includes the events this receiver
@@ -1262,17 +1279,24 @@ the solitary-stage rule below.
 
 **The solitary-stage rule — normative, and this is the disposition of K1.**
 
-> A peer is in the **solitary regime** for hand `k` when the required emitter set
-> of a collective stage of that hand is `{self}` and contains no other seat.
-> Dealing such a hand is permitted: a table whose other seats are genuinely gone
-> must drain them, or a tournament never ends and D-013 buys nothing.
+> A peer **was in the solitary regime for hand `k`** when the required emitter set
+> of a collective stage of hand `k` was `{self}` and contained no other seat.
+> **The test is a property of the hand the event names, not of the phase the
+> receiver is in when the event arrives**, and it is answered from that hand's
+> retained record (§5.3) for as long as the record is kept. Dealing such a hand is
+> permitted: a table whose other seats are genuinely gone must drain them, or a
+> tournament never ends and D-013 buys nothing.
 >
-> **While in the solitary regime, a chained event of hand `k` from a seat outside
-> `P(k-1)` that reaches §4.0 step 12 is not a rejection. It is a state divergence,
-> and the receiver enters §6.3 at step 1: it freezes, completes no stage, awards
-> no pot, and evaluates no end condition.** The one exempt type is
-> `0x0804 PLAYER_SIT_IN` (§4.10), which is the message a seat outside `P` exists
-> to be able to send.
+> **A chained event of hand `k` from a seat outside `P(k-1)`, arriving at a peer
+> that was in the solitary regime for hand `k`, is not a rejection. It is a state
+> divergence, and the receiver enters §6.3 at step 1: it freezes, completes no
+> stage, awards no pot, and evaluates no end condition.** It reaches that
+> disposition through §4.0 step 12a, by way of step 12 while hand `k` is live and
+> by way of **step 10b** once hand `k` is finished. **Two cases are exempt** and
+> are handled ordinarily: `0x0804 PLAYER_SIT_IN` (§4.10), the message a seat
+> outside `P` exists to be able to send, and a **checkpoint-8 `STATE_HASH`**
+> (§4.9), which is compared rather than frozen on — and which reaches the same
+> freeze through the ordinary divergence route whenever the comparison disagrees.
 
 **Why this is the disposition, and what it costs.** In the solitary regime this
 peer's belief is *no other seat is participating in hand `k`*. A verifying,
@@ -1284,6 +1308,26 @@ we disagree. A peer that is genuinely alone receives nothing and drains normally
 so the drain path is untouched and costs nothing. A peer that is not genuinely
 alone receives the contradiction **on its first solitary hand**, because the peer
 that did not narrow is still emitting.
+
+**That last sentence is true about the emitter and says nothing about the
+receiver, and the receiver is the half the rule is written on. This paragraph was
+half an argument and the missing half was `L4`.** The contradiction is emitted on
+the first solitary hand; it *arrives* one network delay later, at a peer that has
+by then computed several more hands, because a solitary hand has no stage that
+waits for anybody and `hand_delay_ms` is not an engine input — it is a
+presentation delay and *"the protocol never waits for it"* (`STATE_MACHINE.md`
+§2). §8.3's hand-boundary row budgets `hand_delay_ms + crypto_step_timeout_ms`
+for the boundary, which is an upper bound on how long a peer may wait and not an
+instruction to wait at all; nothing in this document paces a hand. Under the
+rule as first written — present tense, scoped to the receiver's current hand — the
+event was dropped for being late and K1's trace ran to completion unchanged: both
+peers drain, both reach §9.3's end condition, both privately win the tournament.
+The rule is now anchored on §5.3's retained record and answered in the past tense,
+so it fires **on the first contradicting event to arrive at all, whenever it
+arrives**, and §4.0 step 10b is the step that carries it. **The rule made §4.0's
+treatment of a chained event naming a past hand consensus-critical, which it had
+never been**, and that is stated here because the previous revision of this
+paragraph named its dependants and named only the ones inside this document.
 
 Without it, K1's trace runs: one dropped `HAND_INIT` copy, both peers derive
 different `P`, each rejects the other's copy, each narrows to `{self}`, each
@@ -1323,10 +1367,33 @@ alone — and buys it without paying for it on the path where they do not.
 **What now depends on this rule, and must be checked with it.** §3.1's frozen
 roster deliberately routes a boundary-window disagreement into a **stalled stage
 0** rather than into a forked genesis, and a stalled stage 0 is the one place `P`
-narrows; §4.10's boundary window closes per-receiver for the same reason. Both
-are safe **because** a narrowed `P` can no longer complete a hand in silence. An
-editor who deletes or weakens the solitary-stage rule reopens §3.1 and §4.10 in
-the same edit, and the failure it reopens is J1's, not K1's.
+narrows; §4.10's boundary window closes per-receiver for the same reason; and
+§4.9's checkpoint-8 box routes an out-of-set `STATE_HASH` that races
+`HAND_INIT(k+1)` onto the same stall. All three are safe **because** a narrowed
+`P` can no longer complete a hand in silence. An editor who deletes or weakens the
+solitary-stage rule reopens §3.1, §4.9 and §4.10 in the same edit, and the failure
+it reopens is J1's, not K1's.
+
+**And what this rule now depends on, which is the half the previous revision did
+not write down.** Three rules, and the first two are in other sections of this
+document rather than in this one, which is where the last four passes have found
+the worst defect each time:
+
+1. **§4.0 step 10b**, the evaluation of a chained event naming a finished hand.
+   Without it the trigger cannot fire, because the trigger's own event is late by
+   construction. That is `L4`, and it is checked: step 10b runs before step 11, in
+   every phase, on every chained event, and routes to step 12a.
+2. **§5.3's retained record.** The regime test is answered from it, so a hand
+   whose record has been evicted answers *"not solitary"* and the event is dropped
+   as it was before. That is a bound and it is stated with its cost: the record is
+   LRU-capped at `MAX_RETAINED_HAND_RECORDS` hands, and K1's own trace lands the
+   contradiction within one network delay of the first solitary hand, so eviction
+   reaches only a contradiction that has been in flight for thousands of hands —
+   which is the bidirectional partition this rule already concedes it cannot see.
+3. **§6.1's `signed_this_hand`.** It is what makes the checkpoint-8 exemption a
+   refinement rather than a hole: without it, two peers whose `P` has forked can
+   agree at checkpoint 8, and the one message that could separate "alone" from
+   "wrong" separates nothing.
 
 A status field could not do the job, and the circularity is the whole reason: a
 seat's status changes only
@@ -1661,12 +1728,43 @@ before the signature so two encodings of one event cannot both be accepted.
 | 9 | `verify_strict(sender_public_key, TO_BE_SIGNED, signature)` | **protocol violation**, attributable |
 | 10 | `chain_scope` matches the `event_type`'s entry in §4.11, and if `chain_scope == 0` the envelope carries the sentinels of §2.3 exactly | drop |
 | 10a | Anti-replay: for a chained event, look up **`slot(E)` exactly as §5.2.1 defines it** — this step reproduces no part of that tuple and reads it whole; for an unchained event, the per-type rule in §5.2.1's box | violation or duplicate-drop |
+| 10b | **Stale hand — normative, and this is the disposition of `L4`.** If the envelope's `hand_id` names a hand this receiver has **completed**, a chained event is *not* dropped for arriving late. It is evaluated against that hand's **retained record** (§5.3): if the record says this receiver **was** in the solitary regime for that hand (§3.2, past tense) and `sender_seat` is outside the recorded `P`, and the type is neither of the two exempt cases, it routes to step 12a; if it is a checkpoint-8 `STATE_HASH` (§4.9) it is compared against the retained checkpoint-8 `state_hash`, and a mismatch routes to §6.3 step 1; otherwise it is dropped as out of stage, exactly as before. It is **never applied**, never enters a `stage_hash`, never counts into any `P`, and never reaches step 13 | freeze, compare, or drop |
 | 11 | Decode the payload struct, canonicality gate, per-field range checks | violation |
-| 12 | Stage legality: is this `event_type` from this seat expected at this `sequence`? **And the stage-contribution rule: a seat that has already contributed to a stage may not contribute to it again under a different `event_type`** — the one exception is the terminal `HAND_ABORT` of §4.10, which by construction lands at a stage its emitter has usually already contributed to, and which is also one of the two events exempt from step 10a's chain-position rule (§4.10; the other is a boundary event, whose parent is `TERMINAL(k)`). **And the solitary-stage rule (§3.2): if this receiver is in the solitary regime for this hand and the sender is outside `P(k-1)`, the event is a state divergence and not a rejection — see step 12a** | violation |
-| 12a | **Solitary-regime divergence (§3.2, K1).** Reached only when step 12 says so. The event is *not* rejected, *not* applied, and *not* counted into any `P`: the receiver enters §6.3 step 1 and freezes. The one exempt type is `0x0804 PLAYER_SIT_IN`, which falls through to ordinary step 12 handling | **freeze; §6.3** |
+| 12 | Stage legality: is this `event_type` from this seat expected at this `sequence`? **And the stage-contribution rule: a seat that has already contributed to a stage may not contribute to it again under a different `event_type`** — the one exception is the terminal `HAND_ABORT` of §4.10, which by construction lands at a stage its emitter has usually already contributed to, and which is also one of the two events exempt from step 10a's chain-position rule (§4.10; the other is a boundary event, whose parent is `TERMINAL(k)`). **And the solitary-stage rule (§3.2): if this receiver was in the solitary regime for the hand this event names and the sender is outside `P(k-1)`, the event is a state divergence and not a rejection — see step 12a.** And **an out-of-set checkpoint-8 `STATE_HASH` is not an out-of-stage event**: §4.9's box widens the accepted set at that one stage and this step must not reject it | violation |
+| 12a | **Solitary-regime divergence (§3.2, K1).** Reached when step 12 says so, **and when step 10b says so for a hand already finished** — the second route is what makes the rule able to fire at all (`L4`). The event is *not* rejected, *not* applied, and *not* counted into any `P`: the receiver enters §6.3 step 1 and freezes. **Two cases are exempt** and fall through to ordinary handling: `0x0804 PLAYER_SIT_IN` (§4.10), the one message a seat outside `P` exists to be able to send, and a **checkpoint-8 `STATE_HASH`** (§4.9), which is compared instead — and which freezes anyway, through T50, whenever the comparison disagrees | **freeze; §6.3** |
 | 13 | Semantic legality: the poker engine re-validates the action from scratch | violation |
 | 14 | Cryptographic proof verification (shuffle proof ≈ 42 ms, DLEQ ≈ 0.1 ms) | violation, `INVALID_SHUFFLE_PROOF` |
 | 15 | Apply to state | — |
+
+**Step 10b is new in this pass and it is the step K1's fix could not fire
+without.** Before that fix, §4.0 was a validation pipeline in which every failure
+mode was *drop*, and dropping a late event cost nothing, because a late event of a
+finished hand carries no information a finished hand needs. The solitary-stage
+rule inverts that for exactly one class: **a late chained event from a seat
+outside `P` is the only wire evidence that distinguishes "I am alone" from "I am
+wrong"**, and every other step of this pipeline would have discarded it before
+step 12 for the ordinary reason that it is late. Nothing paces a solitary hand —
+every collective stage of it has `R = {self}` and completes in the step that emits
+it, and `hand_delay_ms` is a presentation delay that the protocol never waits for
+(`STATE_MACHINE.md` §2; §8.3's boundary row budgets for it as a ceiling, not as a
+wait) — so a solitary peer traverses a hand in microseconds and the contradicting
+copy reliably arrives naming a hand that peer has finished. The trigger is
+therefore anchored on a **record** rather than on a live phase.
+
+**It runs on every incoming chained event, in every phase, at every table, and a
+document that makes a phase absorbing against it has reopened K1.** That includes
+a table the engine has closed: the fortieth drain hand of a silent fork is
+followed by a tournament-end condition, and a rule that stops evaluating
+contradictions at that point loses the race it exists to win. Verification here is
+cheap and reaches nothing — the event is never applied — so there is no phase in
+which refusing to run this step buys anything. The engine half of that statement,
+and which phase holds the freeze, is `STATE_MACHINE.md`'s (D-011 rule 1).
+
+**Its cost is one memory bound and §5.3 is the section that owns it.** The record
+is three quantities and a hash per finished hand, LRU-capped; nothing else about
+the pipeline changes. The step sits **before** step 11, so the
+cheap-before-expensive ordering is untouched: it reads only envelope fields that
+steps 1–10a have already validated, and it costs a map lookup.
 
 Steps 1–8 are pure parsing and cost microseconds. Step 9 is one Ed25519
 verification, and **no figure for it has been measured** — signature-verification
@@ -2040,20 +2138,34 @@ The earlier two-part `h(..., [r_i, salt_i])` is deleted: it bound neither the
 table, nor the session, nor the committer, so a commitment could be lifted from
 one table into another (C-2).
 
-`CRYPTOGRAPHY.md` §7.3 reproduces both constructions in full and its own
-ownership sentence points the other way — *"this five-part binding is the
-canonical one; the two-part form that `PROTOCOL.md` §4.4 previously carried …
-**was corrected to match this section**"*. The two copies are byte-identical
-today, which is exactly the condition D-011 rule 1 was adopted for after five
-passes of copies drifting, and it is settled here in the direction the rest of the
-corpus already runs: these are **wire** values — they are the payload of `0x0301`
-and `0x0302` and a receiver check is written against them in this section — and
+**`K-6` is closed and this paragraph is rewritten in the past tense, which is the
+disposition of `L6`.** `CRYPTOGRAPHY.md` §7.3 **used to** reproduce both
+constructions in full with an ownership sentence pointing the other way — *"this
+five-part binding is the canonical one; the two-part form that `PROTOCOL.md` §4.4
+previously carried … **was corrected to match this section**"*. The two copies were
+byte-identical, which is exactly the condition D-011 rule 1 was adopted for after
+five passes of copies drifting, and it was settled in the direction the rest of the
+corpus runs: these are **wire** values — they are the payload of `0x0301` and
+`0x0302` and a receiver check is written against them in this section — and
 `CRYPTOGRAPHY.md` §6.4's `ctx` blocks were deleted under the same rule in the H7
-sweep. §7.3 keeps what only it can say: the binding, hiding, ordering and
+sweep. **The owner has since made that edit.** §7.3's two code blocks and its
+"corrected to match this section" sentence are deleted, and it now reads
+*"`PROTOCOL.md` §4.4 owns `commitment_i` and `seed`, and this section owns the
+argument for why they are shaped that way"* — the direction this section asked
+for. What §7.3 keeps is what only it can say: the binding, hiding, ordering and
 anti-regrind arguments, its recorded `SPEC_CS.md` §16 deviation, and its D-012
-check. It keeps no construction. That edit belongs to `CRYPTOGRAPHY.md`'s owner
-and is recorded as **K-6** in `DECISIONS.md`'s open list rather than made here
-(D-013's process rule).
+check. It keeps no construction.
+
+**The tense is the point, and it is why this is a rewrite rather than a deletion.**
+A paragraph that reports another document's defect must not be left standing after
+that document has fixed it: the next editor reads it as a live finding and either
+re-files it or re-makes the fix. That is `J-4` and `J-5` in the other direction and
+this is its third iteration — the first in which the stale report was **this**
+document's about `CRYPTOGRAPHY.md` rather than the reverse. `CRYPTOGRAPHY.md` §0
+states the general rule in the words this pass adopts: *"a claim that was false
+when made and is true now must not be left reading as evidence that the check was
+once run."* The history is kept, in the past tense, because it is the argument for
+why the ownership is where it is.
 
 `r_i` and `salt_i` are each 32 bytes from `getrandom::SysRng`. `OsRng` no longer
 exists in the current `rand` / `rand_core` line; the OS source is
@@ -2757,8 +2869,11 @@ Codes `0x0700`–`0x07FF`. Semantics in §6.
 `n(1) state_hash: bytes[32]`, `n(2) transcript_head: bytes[32]`.
 
 **Its required emitter set is `P(k-1)`, the same set as `HAND_INIT`'s** (§3.2,
-§4.4), at every checkpoint of hand `k`; at checkpoint 1, which sits in the setup
-chain, it is `P(0)`, the `TABLE_READY` signers. `STATE_ACK`'s set is the set of the
+§4.4), at checkpoints `2` to `7` of hand `k`; at checkpoint 1, which sits in the
+setup chain, it is `P(0)`, the `TABLE_READY` signers; and at **checkpoint 8**, the
+boundary checkpoint, it is `P(k)` — the box below states that exception, states
+why the set has to be the later one, and states the wider set the checkpoint-8
+stage is *compared* over. `STATE_ACK`'s set is the set of the
 `STATE_HASH` stage it confirms, and a reconciliation round's is the set of the
 checkpoint it re-derives — which the box below already says. **The phrase "all
 present seats", which stood in §4.11's cells for both types, is deleted: "present"
@@ -2805,6 +2920,152 @@ stage changes no predicate at all.
 checkpoint: u16`, `n(1) agreed_state_hash: bytes[32]`, `n(2) checkpoint_hash:
 bytes[32]` where `checkpoint_hash` is the `stage_hash` of the `STATE_HASH` stage.
 
+---
+
+#### Checkpoint 8, the boundary checkpoint — normative, and this is the wire half of `K-3` (L1, L3)
+
+`STATE_MACHINE.md` §5.2 places **checkpoint `8`** at every hand boundary, on every
+hand and on both terminal paths, emitting it the moment `TERMINAL(k)` is fixed at
+this peer — as a side effect of T45 on the settled path and of T46 on the aborted
+one — and gates T47 on it on the settled path only. §6.2 row 8 carries it. It
+arrived here with **no chain position at all**, which is `Q-09` a second time on a
+second message, and on the message K-3's own fix newly made load-bearing:
+`hand_id` and `sequence` are inside `TO_BE_SIGNED` (§2.4) and are two of §5.2.1's
+eight slot-key components that §4.0 step 10a reads whole, so two implementations
+that place this stage differently produce **different signed bytes for one intent**
+and cannot look each other's copies up. This box gives it the same quantities
+§4.10's box gave the hand boundary window, in the same shape and for the same
+reason.
+
+> **Chain.** A checkpoint-8 `STATE_HASH`, its `STATE_ACK`, and every
+> reconciliation round of it belong to **chain `k`**, the hand that has just
+> ended, and carry `hand_id = k`. Not chain `k+1`: what they publish is hand `k`'s
+> boundary state including `P(k)`, and `HAND_INIT(k+1)` — chain `k+1`'s stage 0 —
+> derives its required emitter set and its `n(8) dealt_in` from `P(k)`. A
+> checkpoint placed in chain `k+1` would be chained from a `GENESIS(k+1)` whose
+> own first stage is a consumer of the value the checkpoint exists to compare, and
+> it would sit **after** the event it is meant to be checked before.
+>
+> **Parent.** `previous_event_hash = TERMINAL(k)`, for every emitter and whatever
+> the order of arrival — `stage_hash` of the `HAND_COMPLETE` stage on the settled
+> path, `ABORT_TERMINAL(k)` on the aborted path (§3.1). Both are agreed by every
+> peer by construction, and on the aborted path there is **no other value in
+> existence**, because the terminal `HAND_ABORT` has no `stage_hash` at all
+> (§3.2). Equivalently, §3.2's rule extended a second time:
+> `stage_hash(BOUNDARY_CHECKPOINT_BASE - 1) := TERMINAL(k)`, beside
+> `stage_hash(BOUNDARY_SEQUENCE_BASE - 1) := TERMINAL(k)` and
+> `stage_hash(-1) = GENESIS(hand_id)`.
+>
+> **`sequence`.** The `STATE_HASH` stage is at `sequence =
+> BOUNDARY_CHECKPOINT_BASE` and its `STATE_ACK` stage at
+> `BOUNDARY_CHECKPOINT_BASE + 1`, where `BOUNDARY_CHECKPOINT_BASE = 8 192` (§13).
+> Reconciliation round `r` of this checkpoint (the reconciliation box above) takes
+> `BOUNDARY_CHECKPOINT_BASE + 2r` for its `STATE_HASH` and `+ 2r + 1` for its
+> `STATE_ACK`, the pair kept together so a round's acknowledgement can never land
+> on the next round's hash. **`1 <= r <= 7`**: the band is the sixteen values
+> `8 192 … 8 207`, and a checkpoint-8 event at a `sequence` outside the band is a
+> stage violation at §4.0 step 12.
+>
+> **Why the base is above the boundary window and not below it.** Every value in
+> the band is disjoint from every ordinary stage index, which
+> `MAX_STAGES_PER_HAND = 2 048` bounds at 2 047, and from the hand boundary window
+> at `4 096 … 4 105` (§4.10, §13). A reconciliation round extends **upwards**, by
+> `+2r`, so a base below the window would let a disputed boundary checkpoint walk
+> into the window's reserved slots and collide with a seat's `PLAYER_SIT_IN`. That
+> is the constraint §5.2.1's key imposes on this fix and it is why the number is
+> 8 192.
+>
+> **Total order.** One stage, one `sequence`, one copy per seat; §3.2's collective
+> `stage_hash` enumerates `R` in ascending seat index, so no tie-break is needed
+> and none is defined. The `STATE_ACK` stage follows at the next `sequence` and
+> never precedes it.
+>
+> **Required emitter set.** `P(k)` **as it stands at the moment `TERMINAL(k)` is
+> fixed at this peer** — the seats that signed at least one accepted chained event
+> of chain `k` (§3.2) up to that point. The snapshot is what removes the
+> circularity: a checkpoint-8 `STATE_HASH` is itself a chain-`k` event and adds its
+> sender to `P(k)`, so a set read after the stage opened would grow with its own
+> contributions and never be complete. A seat that joins `P(k)` by an out-of-set
+> copy is in `P(k)` for hand `k+1` and is **not** retroactively a required emitter
+> here. **This is the one required emitter set in
+> this document that is `P(k)` rather than `P(k-1)` or a subset of it, and §3.2's
+> sentence is amended to name it as the exception.** It is the stage whose whole
+> job is to publish what `P(k)` is, so requiring it of `P(k-1)` would compare the
+> boundary against the set the boundary replaces. Liveness is unaffected: every
+> member of `P(k)` demonstrated itself by signing during hand `k`, and the exit
+> when one of them stops between `HAND_COMPLETE` and here is a **timer**, T61, on
+> hand `k+1`'s `hand_deadline_ms`, which §8.2 already starts at `TERMINAL(k)` — no
+> new timer and no new message. `STATE_ACK`'s set is that same set, as at every
+> checkpoint.
+>
+> **The comparison is not scoped on that set — this is the disposition of `L3`.**
+> A checkpoint-8 `STATE_HASH` naming `hand_id = k` is **accepted, compared and
+> retained from any occupied roster seat**, in `P(k)` or not. An out-of-set copy
+> is **not** a stage violation and §4.0 step 12 must not reject it. It cannot
+> complete the stage and cannot block it: completion is `heard ⊇ P(k)` and nothing
+> else, so an extra copy neither advances the gate T47 reads nor holds it open. It
+> occupies its own slot — §5.2.1's key contains `sender_public_key`, so capacity
+> is one per seat at this `sequence` — and the admission therefore adds at most
+> `MAX_SEATS` slots per hand, which §5.3 counts.
+>
+> **`STATE_ACK` is not widened, and neither is any other checkpoint.** A
+> `STATE_ACK` asserts that this peer saw the complete required set and that every
+> member of it agreed; a seat outside the set has not seen the set and has nothing
+> to assert. A checkpoint-8 `STATE_ACK` from a seat outside `P(k)`, and a
+> `STATE_HASH` from a seat outside the required set at checkpoints `1`–`7`, are
+> rejected under §4.0 step 12 like any other out-of-stage chained event.
+>
+> **Close.** The checkpoint-8 window for hand `k` closes at this receiver's
+> acceptance of a complete `HAND_INIT(k+1)` stage — the same condition, at the
+> same event, that closes the hand boundary window (§4.10). A checkpoint-8 event
+> for hand `k` arriving after that is a **stale-hand** event: §4.0 step 10b
+> compares it against the retained record and never applies it.
+
+**Why the accepted set is wider than the required set, and why this is the only
+place in the document where the two differ.** Every other collective stage rejects
+an out-of-set emitter because an out-of-set body could only be noise — the seat is
+not entitled to the choice the stage carries, or is not a member of the set the
+body is derived over. Checkpoint 8 is the exception because **its body is a claim
+about who the participants are**, and the seat whose participation is in question
+is exactly the seat whose copy the strict rule throws away. Two peers that have
+each concluded the other is not a required emitter — K1's fixed point, where both
+hold `P(k) = {self}` — would under the strict rule reject the one message that
+proves the other is there. `STATE_MACHINE.md` §5.2 states the engine half in terms
+(*"T49 and T50 are **not** scoped on that set … that is deliberate and it is the
+whole value of the checkpoint"*); this box is the wire half, and without it that
+sentence describes an event no conforming receiver accepts and both of K-3's
+payoffs are void.
+
+**What the admission does not buy, stated because that is the part that could be
+over-claimed.** Accepting an out-of-set copy adds its sender to **this receiver's**
+`P(k)` under §3.2, and `P(k)` is hand `k+1`'s required emitter set — so a copy
+that arrives at one peer before its `HAND_INIT(k+1)` and at another peer after it
+leaves two peers holding two `P(k)` values. That is a per-receiver quantity and it
+is not removed here; it is **routed**, onto exactly the path §4.10 routes a
+boundary-window disagreement onto. The two peers derive different `n(8) dealt_in`,
+reject each other's `HAND_INIT(k+1)` copy, and **stage 0 stalls** — loud, disposed
+of by §8, with both peers still holding the same `GENESIS(k+1)`. The close
+condition above is what bounds the window in which that race can happen, and it is
+the same condition as the boundary window's, deliberately, so an implementer has
+one rule to write and not two.
+
+**A checkpoint-8 `STATE_HASH` from a seat outside `P` is the second case exempt
+from §3.2's solitary-stage rule, and the exemption is safe only because §6.1
+hashes `signed_this_hand`.** A solitary peer that froze on this message would
+fault the table on the one message that can tell it whether it is alone or merely
+wrong — and it would fault it in **both** cases, including the case where the two
+peers agree. With `signed_this_hand` inside `state_hash` (§6.1), agreement at
+checkpoint 8 is agreement about the participation set itself, so two peers whose
+`P` has forked **cannot** agree here: the comparison separates the two situations
+§3.2 says a solitary peer cannot otherwise tell apart, and it separates them
+without freezing the case where nothing is wrong — the out-of-set copy agrees, its
+sender joins `P`, and the next hand is not solitary. Take `signed_this_hand` back
+out of §6.1 and this exemption becomes a hole in the solitary-stage rule rather
+than a refinement of it. **The two edits are one fix and an editor who deletes
+either has reopened K1 by way of the other.**
+
+---
+
 **`0x0703 DISPUTE`** — may be emitted by any participant at any time on the table
 mesh, and is the only message that is legal outside its stage.
 
@@ -2819,7 +3080,7 @@ be occupied twice.
 
 | Field | Type | Limit / rule |
 |---|---|---|
-| `n(0) kind` | `u16` | see §6.3 |
+| `n(0) kind` | `u16` | the register below |
 | `n(1) accused` | `Option<bytes[32]>` | app public key, when the kind names one |
 | `n(2) at_sequence` | `u64` | the stage the dispute is *about*; it does not place the dispute anywhere |
 | `n(3) evidence` | `Vec<bytes>` | ≤ 4 entries, each a complete `SignedEvent`, each ≤ `MAX_EMBEDDED_EVENT` = 32 768 B |
@@ -2830,6 +3091,110 @@ be occupied twice.
 `n(5)` and `n(6)` are appended rather than placed first because §2.2 rule 5 makes
 field indices append-only; `JOIN_REQUEST`'s `n(8) table_id` was added the same way
 for the same reason.
+
+**The `kind` register, and it is closed.** Three values, and a `kind` outside them
+is dropped at §4.0 step 11 like any other out-of-range field:
+
+| `kind` | Name | Carries | Defined in |
+|---|---|---|---|
+| `1` | `STATE_DIVERGENCE` | this peer's own `STATE_HASH` for the disputed checkpoint | §6.3 step 2 |
+| `2` | `EQUIVOCATION` | an `EquivocationProof` (§5.2) | §5.2 |
+| `3` | `CHEAT_EVIDENCE` | **exactly one** `SignedEvent`, signed by the seat named in `n(1) accused`, which the emitter holds to be provably illegal under **D-014** | the box below |
+
+`kind = 2` is written as `EQUIVOCATION` in §5.2 and carried no number until this
+pass; assigning one is not a change of meaning and §5.2's object is untouched.
+`kind = 3` is new with D-014. The transcript exchange of §6.3 step 3 has no `kind`
+because it is not a dispute, and no request message for it is defined here.
+
+#### `kind = 3 CHEAT_EVIDENCE` — the wire form of a D-014 finding
+
+**`DECISIONS.md` D-014 is the decision and is not restated here; what this section
+owes is the messages** (D-011 rule 1). D-014 removes from the table a player who
+sends a **provably illegal** message, voids the hand that message attacked, and
+lets play continue; its safety rests on evidence being **self-authenticating** —
+*a message signed by the accused, whose illegality any peer can decide alone, from
+that message plus state the peers provably share* — and on two tiers, the second
+of which is state-dependent and waits for a checkpoint. Those are D-014's terms.
+The wire consequences are these:
+
+> **The evidence is one `SignedEvent` and it travels in a `DISPUTE`.** A D-014
+> finding is published as `DISPUTE { kind = 3, accused = the offender's app public
+> key, at_sequence = the offending event's `sequence`, evidence = [ that one
+> complete `SignedEvent` ], table_id, hand_id }`. **Exactly one entry**, not up to
+> four: a finding that needs a second event to be decidable is not
+> self-authenticating and is not a D-014 finding. No new message type is added and
+> none is needed — `DISPUTE` is already unchained, already legal at any time,
+> already de-duplicated by `event_hash`, and already capped at
+> `MAX_DISPUTES_PER_SENDER_PER_HAND = 8` per sender per hand.
+>
+> **Why the carrier has to be unchained.** Half of D-014's tier 1 is events this
+> protocol never accepts into a chain — a signature that does not verify (§4.0
+> step 9), a non-canonical encoding (§2.5), a field out of range (§4.0 step 11), a
+> parent that does not exist. Those events reach only the peers they were sent to,
+> so a chained carrier would need the offender's cooperation to place, and a
+> receiver that never saw the offending message would never learn of it. The
+> `DISPUTE` is what puts the bytes in front of every peer; **it is not what makes
+> the removal true**, and §4.9's own rule stands unchanged and is what keeps this
+> safe: *a dispute is not itself evidence of anything — it is a carrier.* Every
+> receiver re-runs the illegality check against the embedded event itself.
+>
+> **There is no removal message, and none may be added.** A removal is **derived
+> by each peer from the evidence**, which is the whole of what makes it automatable
+> where an accusation is not: no vote, no quorum, no timing, no per-receiver
+> judgement. It reaches canonical state at exactly one place — **`HAND_INIT(k+1)`'s
+> collective, byte-identical body** (§4.4), whose `n(8) dealt_in` excludes a
+> removed seat and whose `n(11) ledger_delta` is recomputed by every receiver. Two
+> peers that disagree about a removal therefore reject each other's `HAND_INIT`
+> copy and **stage 0 stalls** — loud, disposed of by §8, and held back from
+> becoming a silent fork by §3.2's solitary-stage rule. That is the same
+> disposition §4.10's boundary window and §4.9's checkpoint-8 admission take, for
+> the same reason, and it is chosen over a dedicated event because a collective
+> stage that could not complete without the offender's own copy would hand the
+> offender a veto over its own removal.
+>
+> **A removed seat may not re-enter, and this document is where a receiver
+> enforces it.** `0x0804 PLAYER_SIT_IN` from a seat removed under D-014 is
+> rejected under §4.0 step 12; so is every other chained event from it. D-014's
+> exit is one-way, unlike a seat that merely went silent, and §4.10's widened
+> `PLAYER_SIT_IN` legality condition is amended to say so. The seat keeps its row
+> in `roster_hash` and its stack for the life of the table (§3.1) — chip
+> conservation is not negotiable and a removal must not change the chip total —
+> and what happens to that stack afterwards is `STATE_MACHINE.md`'s.
+>
+> **Tier 2 is judged against a checkpoint both peers signed — normative.** A
+> tier-2 finding is one that is illegal only against game state: an out-of-turn
+> action, a raise below the minimum, a bet larger than the stack, a showdown claim
+> that contradicts the board. Such a finding **removes** its subject only when this
+> receiver holds a **completed `STATE_ACK` stage** for a checkpoint of the same
+> chain whose `sequence` is at or before the offending event's, and whose emitter
+> set contained **both the accused and this receiver**, and the offending event is
+> illegal against the `PublicTableState` that checkpoint fixed. Before such a
+> checkpoint exists, a tier-2 finding **voids the hand and removes nobody**
+> (`cause = 6`, §4.10). Tier 1 needs no checkpoint and never did: its illegality
+> is decidable from the offending message alone.
+>
+> **Why the `STATE_ACK` and not the `STATE_HASH`.** The `STATE_HASH` stage is one
+> peer's claim about the state; the `STATE_ACK` stage is the chained *"we all
+> agreed here"* point §6.2 exists to produce, and the accused's own signature is in
+> it. Judging a tier-2 finding against anything weaker would let a peer whose state
+> has drifted — K1's divergence is exactly such a drift — see an honest player's
+> perfectly legal action as illegal and remove it. That is the failure mode D-010
+> closed, arriving by a new road, and the checkpoint precondition is the whole of
+> what keeps it shut.
+
+**What this makes load-bearing, stated in advance for once.** D-014 turns **the
+correctness of every validator in §4.0 steps 11 and 13** into a consensus rule: a
+validator that is too strict now removes an honest player rather than merely
+rejecting a message, and two implementations that differ by one range check
+disagree about the roster. `DECISIONS.md` D-014's own shipping gate is the mirror
+of that — *for every legal action an honest client can emit, under every legal
+interleaving, no honest peer is ever evictable* — and it is a gate on the feature,
+not on this specification. What this document can do about it, and does, is keep
+the removal's inputs to two: **a signature that verifies under the accused's key**,
+and, for tier 2 only, **a checkpoint the accused signed**. Nothing else is read.
+`n(1) attributed` in particular is **not** read: the removal is derived from the
+signature on the evidence, never from any field naming a culprit, so D-010 point 2
+survives D-014 unamended.
 
 **Anti-replay, since the envelope's `sequence` is a sentinel.** A `DISPUTE` is
 de-duplicated by `event_hash` within its `(sender_public_key, table_id, hand_id)`
@@ -2972,6 +3337,8 @@ receiver's own state**:
 | `1`, uncertified path (`attributed = []`, `cert_hash = None`) — the hand-deadline path and §6.3 case (b) are **one row**, see below | its **own** `hand_deadline_ms` has expired (§8.2), **or** it has itself reached §6.3 case (b) | **buffer, do not reject** |
 | `2`, `3` | `n(3) evidence` verifies — the failing `SHUFFLE_PROOF` or reveal proof carries its own disproof | accept at once |
 | `4` | it is itself in the §6.3 case (c) terminus | **buffer, do not reject** |
+| `6`, tier 1 (D-014) | `n(3) evidence` carries exactly one `SignedEvent` signed by the seat named in `n(1) attributed`, and **this receiver's own** run of §4.0 over that event returns a tier-1 illegality — a signature that does not verify, a non-canonical encoding, an out-of-range field, a failed proof, a parent that does not exist | accept at once |
+| `6`, tier 2 (D-014) | as above, **and** this receiver holds a completed `STATE_ACK` stage for a checkpoint of the same chain at or before the offending event's `sequence`, whose emitter set contained both the accused and this receiver, **and** the event is illegal against the `PublicTableState` that checkpoint fixed | reject |
 
 **Why the two uncertified `cause = 1` paths are one row, and not two (H4).** They
 stood here as two rows, and a receiver could not tell which of them it was
@@ -3042,14 +3409,14 @@ resolved without a vote, a timer or a tie-break.
 
 | Field | Type | Limit / rule |
 |---|---|---|
-| `n(0) cause` | `u16` | `1` failure to publish a required cryptographic contribution; `2` invalid shuffle proof; `3` invalid reveal proof; `4` unresolvable state divergence. **Value `5` (equivocation proven) is deleted** — see §5.2's ordering rule and the note below. Every surviving value is a function of chained content that the ordering buffer can place, which is what makes two honest peers derive one body |
+| `n(0) cause` | `u16` | `1` failure to publish a required cryptographic contribution; `2` invalid shuffle proof; `3` invalid reveal proof; `4` unresolvable state divergence; `6` **anti-cheat void (D-014)** — a party emitted a provably illegal message and the hand it attacked is voided. **Value `5` (equivocation proven) is deleted and its code point is not reused**, which is why D-014's value is `6` and not `5` — see §5.2's ordering rule and the note below. Every surviving value is a function of chained content that the ordering buffer can place, which is what makes two honest peers derive one body |
 | `n(1) attributed` | `Vec<bytes[32]>` | ≤ `MAX_SEATS` app public keys, ascending by encoded bytes; may be empty. It carries the certified subject on `cause = 1`'s certified-subject path, the shuffler for `cause = 2`, the revealer for `cause = 3`, and is **empty** on `cause = 1`'s uncertified path — the gate's single `attributed = []`, `cert_hash = None` row, which spans both the hand-deadline expiry and §6.3 case (b) — and for `cause = 4`. **Evidence only — nothing in this document reads it to move a chip or to remove a player (D-010)** |
 | `n(2) cert_hash` | `Option<bytes[32]>` | `event_hash` of the `TIMEOUT_CERT`. Required for `cause = 1` **when a certificate with an effect exists**, which is the certified-subject path and only that; `None` on every `attributed = []` path, where unanimity was by construction never reached and no certificate can exist |
 | `n(3) evidence` | `Vec<bytes>` | ≤ 2 `SignedEvent`s, each ≤ `MAX_EMBEDDED_EVENT` = 32 768 B; required for `cause` 2 and 3, which are the two causes a single chained event proves on its own |
 | `n(4) deltas` | `Vec<i64>` | **all zeroes, always (D-010).** An abort moves no chips, so there is no per-seat delta to carry; the field is a vector of `0` of length `\|occupied seats\|`. It is kept rather than removed so that `HAND_ABORT` and `HAND_COMPLETE` stay directly comparable to a verifier, and so that "the deltas sum to zero" stays one receiver check across both terminal messages rather than two |
 | `n(5) final_stacks` | `Vec<u64>` | **the start-of-hand stacks, always (D-010)** — that is, `stack_at_hand_start[s]` for every occupied seat ascending, exactly the values already bound into `roster_hash(k)` and hence into `GENESIS(k)`. Every peer holds them from the genesis of the hand, so this field is a function of agreed state and two honest peers cannot derive it differently |
 
-*Receiver must validate:* the `cause` is one of the four defined values; **the
+*Receiver must validate:* the `cause` is one of the five defined values; **the
 acceptance gate above passes** — the trigger for that cause is present in this
 receiver's own state, and where the gate says *buffer* the event is held, not
 rejected; `cert_hash` is present exactly on the certified-subject path and `None`
@@ -3122,10 +3489,25 @@ adjudicator:
 | `2` invalid shuffle proof | a `SHUFFLE_PROOF` failed verification (§4.0 step 14, `INVALID_SHUFFLE_PROOF`) | the shuffler |
 | `3` invalid reveal proof | a Chaum–Pedersen DLEQ failed at `DEAL_PRIVATE`, `BOARD_REVEAL` or `SHOWDOWN_REVEAL` — the hand aborts here rather than stalling into a deadline (`CRYPTOGRAPHY.md` §8 rule 1) | the revealer |
 | `4` unresolvable divergence | §6.3 case (c): transcripts byte-identical after reconciliation and derived states still differ | **empty, always** |
+| `6` anti-cheat void (D-014) | a `DISPUTE { kind = 3 }` carried a `SignedEvent` this receiver independently found illegal under D-014 (§4.9), or this receiver found one itself | the offender, and **still evidence only** — the removal is derived from the signature on the evidence, never from this field (D-010 point 2) |
 
-Three of the four paths therefore carry `attributed = []`, which is no longer
+Three of the five paths therefore carry `attributed = []`, which is no longer
 worth a table of exceptions: an abort that names nobody and an abort that names
-someone have identical effects.
+someone have identical effects **on the chips**, which is the only thing
+`attributed` was ever read for and is now read for nowhere.
+
+**`cause = 6` is the one cause a seat's removal follows, and it does not follow
+from this message.** The abort voids the hand — stacks restored to their
+start-of-hand values, `n(4) deltas` all zeroes, `n(5) final_stacks` the
+start-of-hand stacks, exactly like every other abort under D-010, which is why
+D-014 point 1 says *"nothing new is needed"* for the chip disposition. Whether the
+offender is also **removed** is decided by each receiver from the evidence and the
+tier (§4.9's box), and it takes effect through `HAND_INIT(k+1)`'s collective body.
+A `cause = 6` abort whose tier-2 checkpoint precondition is not met at this
+receiver is a void with **no** removal, and that is D-014's own rule, not a
+weakening of it. The table is **not** faulted: `cause = 4` remains the one cause
+after which no further hand is dealt, and a removal exists precisely so that play
+can continue without the removed player.
 
 **§6.3 case (b) is now well formed, and it is the third `attributed = []` path
 (P6).** §6.3 specified it as `cause = 1` with `attributed = []` and no
@@ -3144,7 +3526,11 @@ withholding is specified here, and none is claimed.
 
 `cause = 4` remains the one cause that **faults the table** — no further hand is
 dealt (§6.4). That is a liveness consequence, not a chip consequence, and it is
-the only asymmetry left between the four causes.
+the only asymmetry left between the causes that is about the **table**. The one
+asymmetry that is about a **player** is `cause = 6`'s, and it is D-014's rather
+than this field's: the removal follows from the evidence, not from the `cause`
+value, which is why a `cause = 6` abort whose tier-2 precondition is unmet at a
+receiver is an ordinary neutral abort at that receiver.
 
 **A hand abort never ends the tournament or the cash game.** Per D-006 point 5,
 the next hand begins immediately afterwards, automatically, from
@@ -3212,7 +3598,12 @@ message whose chain position this document declined to specify.
 > low seat first, at every receiver, without a tie-break.
 >
 > **One per seat per boundary.** A seat may emit at most one boundary event for
-> hand `k`; a second, of any type, is a stage violation under §4.0 step 12.
+> hand `k`; a second, of any type, is a stage violation under §4.0 step 12. **That
+> rule, and not the stage count, is what bounds the window**: `sequence` values at
+> or above `BOUNDARY_SEQUENCE_BASE` are exempt from §5.3's `MAX_STAGES_PER_HAND`
+> abort, which counts stage indices below it (`L5`, §5.3, §13). Without the
+> exemption a receiver that range-checks `sequence < MAX_STAGES_PER_HAND` rejects
+> every event this box defines.
 >
 > **Close.** The window for hand `k` closes at this receiver's acceptance of a
 > complete `HAND_INIT(k+1)` stage. A boundary event for hand `k` arriving after
@@ -3278,12 +3669,16 @@ above: `hand_id = k`, `sequence = BOUNDARY_SEQUENCE_BASE + seat`, parent
 `TERMINAL(k)`. No fields beyond the envelope. Takes effect from the next
 `HAND_INIT`, never mid-hand.
 
-**It is the one type exempt from §3.2's solitary-stage rule**, and the exemption
-is not incidental: a seat outside `P` may emit this and nothing else, so a
-solitary peer that treated it as a contradiction would fault the table on the
-message whose whole purpose is to end the solitude. Every other chained type from
-a seat outside `P(k-1)`, received while this peer is in the solitary regime, is a
-divergence under §4.0 step 12a.
+**It is one of the two cases exempt from §3.2's solitary-stage rule**, and the
+exemption is not incidental: a solitary peer that treated it as a contradiction
+would fault the table on the message whose whole purpose is to end the solitude.
+The other exempt case is a checkpoint-8 `STATE_HASH` from a seat outside `P(k)`,
+which §4.9's box admits and has compared rather than frozen on — the sentence that
+stood here, *"a seat outside `P` may emit this and nothing else"*, was true when
+written and is no longer, and it is corrected rather than left standing. Every
+other chained type from a seat outside `P(k-1)`, naming a hand this peer was
+solitary for, is a divergence under §4.0 step 12a whether it arrives during that
+hand or after it (step 10b).
 
 **Its legality condition is widened by D-013, and this is the whole of re-entry
 (J2).** It read *"legal only from a seat currently sitting out"*, which under the
@@ -3291,10 +3686,18 @@ old status-based emitter set was the only way a seat could be outside one. It no
 reads:
 
 > Legal from **any occupied seat with a non-zero stack that is not a required
-> emitter of the next hand** — that is, any occupied seat outside `P(k)` (§3.2),
-> whether it is outside because it sat itself out with `PLAYER_SIT_OUT` or because
-> it went silent for a hand. A copy from a seat already in `P(k)` decides nothing
-> and is rejected as an out-of-stage chained event under §4.0.
+> emitter of the next hand and has not been removed under D-014** — that is, any
+> occupied seat outside `P(k)` (§3.2), whether it is outside because it sat itself
+> out with `PLAYER_SIT_OUT` or because it went silent for a hand. A copy from a
+> seat already in `P(k)` decides nothing and is rejected as an out-of-stage chained
+> event under §4.0.
+>
+> **The D-014 clause is the one-way half of that decision and this is where a
+> receiver enforces it** (§4.9). A seat removed for a provably illegal message is
+> outside `P` like a silent seat and unlike a silent seat it may not come back:
+> every chained event from it is rejected, this one included. That is the only
+> asymmetry between the two, and it is deliberate — a silent seat proved nothing
+> about itself, a removed seat proved something with its own signature.
 
 **A seat rejoins by signing a chained event, which requires it to be alive.** That
 is the entire test and there is no other route: no certificate, no vote, no
@@ -3381,8 +3784,8 @@ means it does not and never can be.
 | `0x0505` | `ACTION_FOLD` | table mesh | 1 | single | `player_to_act` |
 | `0x0601` | `TIMEOUT_VOTE` | table mesh | 1 (`event_class = 1`, keyed also on `subject_seat`) | — | required voters |
 | `0x0602` | `TIMEOUT_CERT` | table mesh | 1 (`event_class = 2`, keyed also on `subject_digest`) | collective | required voters |
-| `0x0701` | `STATE_HASH` | table mesh | 1 | collective | `P(k-1)`; `P(0)` at checkpoint 1 — §4.9 |
-| `0x0702` | `STATE_ACK` | table mesh | 1 | collective | the set of the `STATE_HASH` stage it confirms — §4.9 |
+| `0x0701` | `STATE_HASH` | table mesh | 1 | collective | required of `P(k-1)` at checkpoints 2–7; `P(0)` at checkpoint 1; **`P(k)` at checkpoint 8, and there accepted and compared from any occupied seat, in-set or not** — §4.9 |
+| `0x0702` | `STATE_ACK` | table mesh | 1 | collective | the set of the `STATE_HASH` stage it confirms, at every checkpoint including 8 — §4.9 |
 | `0x0703` | `DISPUTE` | table mesh | **0** | out-of-stage | any participant |
 | `0x0801` | `HAND_COMPLETE` | table mesh | 1 | collective | the set that emitted `HAND_INIT`, `P(k-1)` — §4.10 |
 | `0x0802` | `HAND_ABORT` | table mesh | 1 | **witness-independent terminal** | any seat of the `HAND_INIT` set; no required set (§3.2, §4.10) |
@@ -3442,8 +3845,8 @@ when some key component changes with it.
 | 26–30 | `ACTION_CHECK`, `ACTION_CALL`, `ACTION_BET`, `ACTION_RAISE`, `ACTION_FOLD` | one per turn, single-writer | `event_type`, if a seat claims two actions for one turn | **Clean.** Same change as row 25 and the same price: two *different* action types at one `sequence` are a stage violation, not a proof; two bodies of the **same** type — two `ACTION_RAISE` with different amounts — are still an equivocation (§5.2.1) |
 | 31 | `TIMEOUT_VOTE` | one per subject per stage; two simultaneous subjects are **normal** (§8.4) | `subject_seat` | **Clean since M2**, by the subject axis in the key |
 | 32 | `TIMEOUT_CERT` | one per `subject_digest` per stage | `subject_digest` | **Clean since M2**, by the subject axis. Its one variable field `n(1) votes` is pinned by the receiver check of §4.8 |
-| 33 | `STATE_HASH` | one per checkpoint, **plus one per reconciliation round** — a required re-emission with *changed* content, the only one in the corpus | `sequence`, and only because §4.9 gives each reconciliation round `s_ckpt + r` | **Clean since P1, and clean by that rule alone.** Not by the stage rule: an editor who deletes §4.9's normative box reopens P1 the same day |
-| 34 | `STATE_ACK` | one per checkpoint and one per reconciliation round | `sequence`, same rule | **Clean since P1**, same reason |
+| 33 | `STATE_HASH` | one per checkpoint, **plus one per reconciliation round** — a required re-emission with *changed* content, the only one in the corpus — plus, at **checkpoint 8**, one from a seat outside the required set, which §4.9 admits | `sequence`, and only because §4.9 gives each reconciliation round its own — `s_ckpt + r` inside a hand, `BOUNDARY_CHECKPOINT_BASE + 2r` at checkpoint 8 | **Clean since P1, and clean by that rule alone.** Not by the stage rule: an editor who deletes §4.9's normative boxes reopens P1 the same day. The checkpoint-8 admission does not touch this verdict — the key contains `sender_public_key`, so an out-of-set emitter fills **its own** slot at that `sequence` and one honest peer still emits one body per slot |
+| 34 | `STATE_ACK` | one per checkpoint and one per reconciliation round; **not** widened at checkpoint 8 | `sequence`, same rule | **Clean since P1**, same reason |
 | 35 | `HAND_COMPLETE` | one derived copy per seat of `P(k-1)`, at a fresh `sequence` — the last stage completed, so nothing occupies it | — | **Clean** |
 | 36 | `HAND_ABORT` | **one per emitter per hand**, at the stalled stage's own `sequence`, where the emitter has usually already contributed | `event_type` — against the contribution it shares a `(sequence, class)` with | **Clean since G1, and only because `event_type` is in the key (§5.2.1, D-011 rule 2).** This row is the reason the key was rewritten. Under the seven-tuple it read FAILS: the abort collided with its own emitter's contribution, was rejected at §4.0 step 10a, and was a verifying proof against an honest peer |
 | 37 | `PLAYER_SIT_OUT` | **at most one per seat per boundary window**, at `sequence = BOUNDARY_SEQUENCE_BASE + seat` in chain `k`, parent `TERMINAL(k)` — §4.10 | — | **Clean since M4, and now clean for a stated reason (K2).** The seat's own reserved `sequence` gives it capacity one by construction; a second boundary event of any type from that seat is a stage violation at step 12, and where the type differs it is two slots, so it is a rejection and never a proof |
@@ -3854,8 +4257,13 @@ answer to G2, and it is stated as a plain negative because that is what it is.**
 > `AbortRecord`. Whether it is forwarded beyond the table is Q-05.
 >
 > **There is no wire representation for an equivocation-caused abort and none
-> will be added.** §4.10's `cause` enumeration is `1`–`4`; value `5` is deleted
-> and the code point is not reused. An engine alphabet containing an
+> will be added.** §4.10's `cause` enumeration is `1`–`4` and `6`; value `5` is
+> deleted and the code point is not reused. **D-014's `cause = 6` is not a route
+> back in**, and the reason is the distinction D-014 rests on: an
+> `EquivocationProof` shows that a key signed two conflicting things and does not
+> show which one was real, so it is an accusation and not a self-authenticating
+> illegality — `DECISIONS.md` D-014 excludes it by name (*"no removal on an
+> equivocation proof, whose predicate has failed five times"*). An engine alphabet containing an
 > `AbortKind::Equivocation`, or a transition producing one, names an outcome no
 > legal `HAND_ABORT` can carry, and is a defect in that document.
 
@@ -3906,7 +4314,15 @@ derivation; this section defines no key of its own.
   fills the second entry at most once, in the hand's last stage. A third
   `class = 0` type at one `(stage, seat)` is rejected by step 12 before it
   reaches this structure, so no additional cap is needed here and none is
-  imposed. Sparse rather than dense for the same reason as the classes below: a
+  imposed. **Two reserved bands sit above `MAX_STAGES_PER_HAND` and both are
+  counted here (`L5`):** the hand boundary window at `4 096 … 4 105` (§4.10) and
+  the boundary checkpoint's band at `8 192 … 8 207` (§4.9). The window admits at
+  most one event per seat per hand and the band at most one `STATE_HASH` and one
+  `STATE_ACK` per seat per round over at most eight rounds, so occupancy is
+  `MAX_STAGES_PER_HAND × MAX_SEATS × 2` **plus `MAX_SEATS` for the window plus
+  `16 × MAX_SEATS` for the band** — 170 further entries per hand at
+  `MAX_SEATS = 10`, against 40 960. The bound stated here before this pass was
+  computed over indices below 2 048 only and was short by exactly those entries. Sparse rather than dense for the same reason as the classes below: a
   dense `u16` axis would be 65 536 cells per `(stage, seat)` for a pair.
 * **`event_class` 1 and 2.** A per-stage map keyed by `(seat, subject_seat)` for
   votes and `(seat, subject_digest)` for certificates, **allocated only for a
@@ -3930,10 +4346,54 @@ structures*, not by a component of any one index. The separation is the axis.
   (§4.9). `DISPUTE` is unchained, so it has no slot in the array above and needs
   its own bound; without one, the one message type that is legal at any time
   would be the one unbounded allocation in the section.
-* A hand exceeding `MAX_STAGES_PER_HAND` aborts with `cause = 4`.
-* Finished hands keep only `TERMINAL(k)` and the terminal body — the
-  `HAND_COMPLETE` body, or the accepted `HAND_ABORT` copy — in memory;
-  the full transcript is written to the profile directory and dropped from RAM.
+* A hand exceeding `MAX_STAGES_PER_HAND` aborts with `cause = 4`. **The two
+  reserved bands are exempt from that abort and this is normative (`L5`):** the
+  count is of stage indices **below** `BOUNDARY_SEQUENCE_BASE`, and a `sequence`
+  in `4 096 … 4 105` or `8 192 … 8 207` is checked against §4.10's and §4.9's own
+  rules instead — one boundary event per seat, one checkpoint-8 pair per seat per
+  round, `r <= 7` — which bound those bands by construction and much more tightly
+  than a stage count would. Without the exemption an implementer who range-checks
+  `sequence < MAX_STAGES_PER_HAND` rejects **every** boundary event and every
+  boundary checkpoint, which is `Q-09`'s closure and `K-3`'s closure both undone
+  by a comparison.
+* Finished hands keep only `TERMINAL(k)`, the terminal body — the `HAND_COMPLETE`
+  body, or the accepted `HAND_ABORT` copy — and the **retained hand record**
+  below, in memory; the full transcript is written to the profile directory and
+  dropped from RAM.
+* **The retained hand record — normative, and this is the memory half of `L4`.**
+  For each finished hand, this receiver keeps four quantities and nothing else:
+
+  ```
+  RetainedHand  { hand_id: u64,
+                  was_solitary: bool,        // §3.2's regime test, answered in the past tense
+                  p: SeatSet,                // P(hand_id) as this receiver derived it
+                  checkpoint8_state_hash: bytes[32] }   // §4.9, this peer's own value
+  ```
+
+  It is read by §4.0 step 10b and by nothing else, it is never an input to a hash
+  or to a stage, and it is a pure function of the events this receiver accepted —
+  no clock, no timer, no arrival fact. **It exists because K1's contradicting
+  event is late by construction** (§3.2): a solitary hand self-completes every
+  stage, so the copy that proves this peer is not alone reliably names a hand this
+  peer has finished, and without a record to evaluate it against the only
+  available reading of §4.0 step 12 is *"not expected at this `sequence`"*, which
+  is a drop, which is precisely what §3.2 says that event must not be.
+
+  **Bound:** an LRU of `MAX_RETAINED_HAND_RECORDS = 4 096` hands, at 56 bytes each
+  — under 256 KB, against a `MAX_STAGES_PER_HAND` map that is two orders larger.
+  A hand whose record has been evicted answers *"not solitary"* and its late
+  events are dropped as they were before this pass; §3.2 states what that costs
+  and why it is not K1's case.
+
+  **What making a stale-hand event evaluable does not reopen, checked because the
+  last four passes were caught on exactly this question.** §5.2's equivocation
+  predicate is unaffected, because a step-10b event is never applied and never
+  enters a `stage_hash`. The `event_class = 0` map above is unaffected, because
+  the record is not that map and is not indexed by `slot(E)`. §4.0's
+  cheap-before-expensive ordering is unaffected, because step 10b sits before step
+  11 and reads only envelope fields. The one thing it opens is a memory bound, and
+  it is bounded in the paragraph above, in the section that already owns that
+  discipline.
 * The lobby keeps at most `MAX_TRACKED_TABLES = 4096` `(table_id, last_timestamp)`
   pairs in an LRU, and at most `MAX_TRACKED_PRESENCE = 8192` peers.
 
@@ -3965,6 +4425,40 @@ state_hash = h("p2p-poker v1 state", [ canonical_cbor(PublicTableState) ])
 | `deck_commitment` | `final_deck_hash` from `DECK_COMMIT`, or 32 zero bytes before it |
 | `ledger_in`, `ledger_out` | `u64` each; the running totals of accepted buy-ins and of removed stacks (§4.4's `ledger_delta`). They are inside `state_hash` because otherwise two peers could disagree about the ledger and never detect it (C-9) |
 | `transcript_head` | `stage_hash` of the last completed stage |
+| `signed_this_hand` | `Vec<bool>` by seat ascending: `true` where that seat signed at least one chained event of this hand that this peer accepted. It is `P(k)` (§3.2) as a vector, and it is **appended last** so the field order stays append-only (§2.2 rule 5) |
+
+**`signed_this_hand` is in this struct because checkpoint 8 is worth little
+without it, and that is the wire half of `K-3` (L2).** `STATE_MACHINE.md` §5.2
+places checkpoint 8 at every hand boundary and says in terms what it needs from
+here: *"until it is there, checkpoint 8 compares a hand boundary and not the
+participation set … and misses the input K-1 is actually about."* Every other
+quantity the boundary checkpoint covers — the stacks, the button, the level, the
+ledger — is a function of the previous boundary and is already bound into
+`GENESIS(k)`, so two honest peers cannot hold it differently without having
+already rejected each other's `HAND_INIT`. **The participation set is the one
+input to hand `k+1` that two honest peers can hold differently and never notice**
+(§3.2's `Q-10` residual), and putting it in `state_hash` is what turns it from a
+quantity each peer reads alone into one they compare. It is what §4.9's
+checkpoint-8 box means by *"its body is a claim about who the participants are"*,
+and it is what makes that box's out-of-set admission safe rather than a hole in
+§3.2's solitary-stage rule.
+
+**It is not a fifth status vector and must not be read as one.** `absent` was
+deleted two paragraphs below because nothing set it; this vector is set by exactly
+one rule, *this peer accepted an event of hand `k` signed by that seat*, which is
+a fact about the accepted chain and not an observation about a connection. It has
+no local signal an implementer could wire it to, which is the trap `absent` was.
+The engine maintains it under the same name and the same rule (`STATE_MACHINE.md`
+§2.8, §5.3 step 4) and neither document restates the other's derivation (D-011
+rule 1).
+
+**Adding it is a wire change on the same footing as the `absent` deletion below.**
+`PROTOCOL_MAJOR = 1` has not shipped and no peer is emitting this struct, so it is
+a revision of version 1's definition rather than a break; it must land before the
+first release, and after that the same edit would need a major bump (§10.2). It
+changes `state_hash` for every peer at every checkpoint, which is why
+`src/protocol/messages.rs` must not write `PublicTableState` before this field is
+in it.
 
 Card code: suits clubs = 0, diamonds = 1, hearts = 2, spades = 3; rank index
 2 → 0 … A → 12; `code = rank_index * 4 + suit_index`, so `0 ≤ code ≤ 51`. This is
@@ -4030,7 +4524,7 @@ hashed here, and that none may be re-added.
 `STATE_HASH` is emitted as a collective stage, followed immediately by a
 `STATE_ACK` collective stage, at these points and no others — plus, when a
 divergence is being resolved, the **reconciliation stage** of §4.9 and §6.3 step
-3, which re-derives one of these seven and carries its `checkpoint` number rather
+3, which re-derives one of these eight and carries its `checkpoint` number rather
 than a number of its own:
 
 | `checkpoint` | When |
@@ -4042,6 +4536,22 @@ than a number of its own:
 | `5` | after the turn betting round closes |
 | `6` | after the river betting round closes |
 | `7` | immediately before `SHOWDOWN_REVEAL` |
+| `8` | **the boundary checkpoint** — the moment `TERMINAL(k)` is fixed at this peer, on **every** hand and on both terminal paths. Its chain, parent, `sequence`, total order, required emitter set and the wider set it is *compared* over are §4.9's checkpoint-8 box; what it covers is `STATE_MACHINE.md` §5.2's |
+
+**Row 8 is new and it is the wire half of `K-3` (L2).** The table read `1`–`7`
+under the words *"at these points and no others"*, which made a conforming
+receiver reject the one checkpoint `STATE_MACHINE.md` §5.2 requires of every hand,
+and the cost of that rejection was not "a missing comparison": T47's settled-path
+gate never discharges, so **T61 fires at `hand_deadline_ms` after every settled
+hand** — `600 000 ms` every two hands on a table where nothing is wrong, which is
+D-013's own fixed point re-created by the fix for the defect D-013's fixed point
+left behind. Checkpoints `2`–`7` all need a `DECK_COMMIT` or a betting round, so
+**two hand shapes place none of them**: a drain hand, which `STATE_MACHINE.md`
+§5.3 step 9 sends straight to `Settling`, and a hand that stalled at `HAND_INIT`
+and aborted. Those two shapes are D-013's steady state — about forty consecutive
+drain hands against a silent opponent (`STATE_MACHINE.md` §12.1.2) — and the
+tournament result itself sat at the end of them, never checkpointed. Row 8 places
+a comparison on every hand of every shape, including the last one.
 
 **No checkpoint is placed after a hole card has been opened to anyone but its
 owner.** The rule is about *public* opening and is stated that way rather than in
@@ -4067,10 +4577,40 @@ only its own hand. That is the property the rule protects, and knowing one's own
 two cards does not threaten it: every seat has that knowledge, symmetrically, from
 `DEAL_PRIVATE` onwards.
 
+**Checkpoint 8 sits after the showdown and is the one checkpoint that rule does
+not reach, and the reason is that it has nothing left to pull.** Every other
+checkpoint is inside a live hand, so faulting the table at it voids **that** hand
+and returns the attacker's commitment — that is the whole shape of the exploit
+§6.4 and X29 carry. Checkpoint 8 is emitted only once `TERMINAL(k)` is fixed, and
+on the settled path `TERMINAL(k)` is the `stage_hash` of a **collective**
+`HAND_COMPLETE` stage: every seat of `P(k-1)` recomputed every pot, every delta
+and every final stack and signed a byte-identical copy, and a mismatching copy was
+rejected at the stage (§4.10). Hand `k`'s settlement is therefore already agreed,
+already chained and already final when the checkpoint opens, and a peer that
+publishes a false `state_hash` for it cannot reopen it — it can only fault the
+table for the hands that have not happened, at the cost of its own equity in them,
+with no pot recovered. **Which hand the resulting abort disposes of, and how a
+boundary divergence is settled without double-restoring hand `k`'s commitments, is
+`STATE_MACHINE.md`'s** (D-011 rule 1, T50/T54/T61): what this section is normative
+about is that hand `k` is not among the hands it can reach.
+
+The one thing checkpoint 8 does place after the cards are public is a comparison
+of the **boundary** state, and that state contains no card: §6.1's `board` is a
+public vector and no hole card, reveal token or deck secret enters `state_hash` at
+all (§3.4). So the rule's *stated* property — no card opens while peers disagree —
+is untouched by row 8, because row 8 opens nothing and is placed when there is
+nothing left to open.
+
 `HAND_COMPLETE` needs no checkpoint of its own, because it is now a collective
 derived stage (§3.2, §4.10): every receiver recomputes every field, and a
 mismatching copy is rejected at the stage rather than caught later at a
-checkpoint.
+checkpoint. **Row 8 is not that checkpoint and does not reopen the question.** It
+is not a comparison of the settlement — that comparison is the stage — but of the
+one boundary quantity `HAND_COMPLETE`'s collectivity cannot police:
+`signed_this_hand` (§6.1), which is not a field of `HAND_COMPLETE` and which two
+peers that have each stopped expecting the other never exchange at all. That is
+also why row 8 is placed on the aborted path, where there is no `HAND_COMPLETE`
+stage to recompute anything.
 
 `STATE_HASH` publishes each peer's own computed hash. `STATE_ACK` then confirms
 that this peer saw the complete set and that every member of it agreed — giving a
@@ -4079,8 +4619,22 @@ two-stage form matters: a peer that publishes a matching `STATE_HASH` but then
 refuses to `STATE_ACK` is stalling, and is handled by §8 rather than by ambiguity.
 
 A `BOARD_REVEAL` stage runs only after the preceding street's `STATE_ACK` stage
-completes. That is what guarantees no card opens while peers disagree about the
-state.
+completes, **where one was placed**. That is what guarantees no card opens while
+peers disagree about the state.
+
+**The three words are `L9` and they are not a softening.** Without them the gate
+is unsatisfiable on the **all-in run-out** — `STATE_MACHINE.md` T38's path, where
+every remaining seat is all in and the betting phase for a street is skipped. A
+skipped betting round closes no round, so rows `4`–`6` place no checkpoint, so
+there is no preceding `STATE_ACK` for the turn's or the river's `BOARD_REVEAL` to
+follow and neither street can open. That is a deadlock on one of the two most
+common hand shapes in no-limit hold'em, reached by two honest peers doing exactly
+what this document says. The gate as amended reads: a `BOARD_REVEAL` may not run
+while a checkpoint that **was** placed for the preceding street is unacknowledged;
+where no checkpoint was placed there is nothing to wait for, and nothing is
+weakened, because the property the rule protects is *no card opens while peers
+disagree about the state* and a street that placed no checkpoint produced no
+disagreement to be waiting on.
 
 ### 6.3 Divergence: the resolution procedure
 
@@ -4092,21 +4646,41 @@ values at one checkpoint, it stops accepting and stops emitting hand events. No
 card opens, no action is applied, no chips move. Silently continuing is what §15
 forbids.
 
-**There is a second entry condition and it is normative (K1).** A peer in the
-**solitary regime** (§3.2) — every collective stage of this hand required of
-`{self}` alone — freezes here on receipt of any chained event of this hand from a
-seat outside `P(k-1)`, other than `0x0804 PLAYER_SIT_IN`, that reaches §4.0 step
-12. There is no checkpoint on that path to compare hashes at: a hand with one
-participant reaches no `DECK_COMMIT` and no betting round, so §6.2 places none
-(that is `K-3` in `DECISIONS.md`'s open list, and it is why this trigger cannot
-be left to the checkpoint route). The event **is** the divergence: it is another
-seat's signature on the proposition that it is participating in a hand this peer
-believes it is playing alone. **The freeze is unilateral and complete on its own**
-— it needs no reply, no quorum and no reconciliation, and it holds even if the
-contradicting peer never speaks again. Steps 2 to 4 then run as written and may
-recover the hand; if they cannot, case (b) or case (c) disposes of it. What the
-freeze guarantees regardless is that this peer completes no stage alone, awards no
-pot, and reaches no §9.3 end condition while another seat is signing against it.
+**There is a second entry condition and it is normative (K1).** A peer that
+**was** in the **solitary regime** for hand `k` (§3.2) — every collective stage of
+that hand required of `{self}` alone — freezes here on receipt of any chained
+event of hand `k` from a seat outside `P(k-1)`, other than the two exempt cases
+§3.2 names, that reaches §4.0 step 12 or step 12 by way of step 10b. The event
+**is** the divergence: it is another seat's signature on the proposition that it
+is participating in a hand this peer believes it played alone. **The freeze is
+unilateral and complete on its own** — it needs no reply, no quorum and no
+reconciliation, and it holds even if the contradicting peer never speaks again.
+Steps 2 to 4 then run as written and may recover the hand; if they cannot, case
+(b) or case (c) disposes of it. What the freeze guarantees regardless is that this
+peer completes no stage alone, awards no pot, and reaches no §9.3 end condition
+while another seat is signing against it.
+
+**Both halves of that sentence changed in this pass and both changes matter.**
+The condition read *"a peer in the solitary regime … any chained event of this
+hand"*, present tense on the receiver's own current hand, and a solitary hand is
+traversed in microseconds because every stage of it self-completes, so the
+contradicting copy reliably arrived at a receiver that had moved on and was
+dropped for being late (`L4`). It is now a property of **the hand the event
+names**, answered from §5.3's retained record by §4.0 step 10b, and it fires
+whenever the event arrives. And the justification this paragraph carried — *"there
+is no checkpoint on that path to compare hashes at … that is `K-3`"* — is
+**withdrawn**: §6.2 row 8 now places the boundary checkpoint on every hand
+including a drain hand and an aborted one, so the checkpoint route exists.
+
+**The two triggers are complementary and neither replaces the other, which is why
+both are kept.** Checkpoint 8 compares only what actually arrives: a genuinely
+solitary peer's checkpoint-8 stage has `required = P(k) = {self}`, so it completes
+alone and compares nothing, and the comparison happens only if the other peer's
+copy reaches it — which §4.9's box makes admissible and which the freeze does not
+need. The solitary-stage rule fires on the **first** contradicting chained event
+of any type, and is the only one of the two that fires on an event the receiver
+cannot compare at all. Checkpoint 8 is the route that heals a table where the two
+peers agree; the freeze is the route that stops one where they do not.
 
 **Which phase the engine is in while frozen, and which transitions carry
 steps 2–4, is `STATE_MACHINE.md`'s** (D-011 rule 1); the sentence that named the
@@ -5347,15 +5921,23 @@ outcome is.
 | malformed or oversized frames | the caps of §9 and the fuzzing obligations of §9.6 | `THREAT_MODEL.md` |
 | stalling a hand to force an abort | `hand_deadline_ms` from `TERMINAL(k-1)` (§8.2) and the terminal stage of §4.10 | `THREAT_MODEL.md` X8 |
 | faulting a table with a false `state_hash` | §6.3 case (c) and §6.4 | `THREAT_MODEL.md` X29 |
+| a provably illegal message — bad signature, non-canonical encoding, out-of-range field, failed proof, illegal action against an agreed checkpoint | the `DISPUTE { kind = 3 }` carrier and the two-tier removal rule of §4.9, `HAND_ABORT cause = 6` (§4.10), and the re-entry bar on `PLAYER_SIT_IN` (§4.10) | `DECISIONS.md` D-014 |
+| two peers privately playing on as if the other were gone | the boundary checkpoint of §4.9 and §6.2 row 8, compared over a set wider than the one it is required of, with `signed_this_hand` inside `state_hash` (§6.1); and §3.2's solitary-stage rule, fired by §4.0 step 10b | `DECISIONS.md` K-1 |
 
 **Three statements of this document's own limits, kept here because they are
 about the wire and not about the threat model:**
 
-* **A mechanism above is a *check*, never a *sanction*.** Every row ends in a
-  rejection, a buffered event or a signed record. No row ends in a chip moving, a
-  seat being taken or a key being blocked (D-010, D-011 rule 3). A reader who
-  reads the left column as a list of things that are punished has read the wrong
-  document.
+* **A mechanism above is a *check*, never a *sanction* — with exactly one
+  exception, which D-014 created and which is stated here rather than hidden in
+  it.** Every other row ends in a rejection, a buffered event or a signed record.
+  **No row ends in a chip moving or a key being blocked**, and that is unchanged:
+  D-010 point 3 and D-011 rule 3 stand in full. The one row that ends in a seat
+  being taken is D-014's, and it is admissible for the reason D-014 gives and for
+  no other — the evidence is a message **signed by the accused** whose illegality
+  every peer decides alone, so there is no vote, no quorum, no timing and no
+  per-receiver judgement in it, which are the four things that produced every
+  defect D-010 closed. A reader who reads the rest of the left column as a list of
+  things that are punished has still read the wrong document.
 * **§11's old bullet list is where the rage-quit escape was disclosed**, and the
   disclosure is not weakened by moving it: `THREAT_MODEL.md` §8 limitation 4 and
   X8 carry it in full, in the terms `SPEC_CS.md` §18 requires, and §4.10 states
@@ -5382,8 +5964,8 @@ about the wire and not about the threat model:**
 | **Q-06** | Should the per-hand transcript be persisted in full to the profile directory by default? It is the only artefact behind §6.3 case (c)'s diagnostic claim — the transcript is necessary for it, and, pending **OQ-A**, not sufficient — and it is small (~20 KB heads-up, ~60 KB six-handed). But it is also a permanent record of every hand every opponent played, which has its own privacy cost. | `storage/`, `THREAT_MODEL.md` | project owner |
 | **Q-07** | On `HAND_ABORT cause = 4` (unresolvable divergence) the chips are restored, because no peer can be attributed, so any single peer has a free escape from a losing pot at the price of the table (§6.4). The alternatives — forfeiting an unnamed party's commitment, or settling from the last `STATE_ACK`-agreed checkpoint — each need a numbered decision and neither is adopted here. D-010 decides the first half **against** for the MVP; what stays open is whether settling from the last agreed checkpoint is worth building. Formerly this document's `OQ-D` (R-2). | §6.4, `STATE_MACHINE.md` | project owner |
 | **Q-08** | Should a required voter be obliged to publish a signed `ACTION_SEEN { sequence, event_hash }` before it may vote, so that vote-and-seen are two events by one key in one slot and a lying voter becomes provable (§8.3)? A design change with a cost in messages and latency; not adopted. Formerly this document's `OQ-C` (R-2). | §8.3, §8.4 | project owner |
-| **Q-09** | **CLOSED (K2).** *Which chain does a hand-boundary single-writer event belong to, and at what `sequence`?* **Answer, in §4.10's boundary-window box:** chain `k`, `hand_id = k`, `sequence = BOUNDARY_SEQUENCE_BASE + sender_seat`, `previous_event_hash = TERMINAL(k)` for every event of the window, total order ascending seat index, one event per seat per boundary, window closing at this receiver's acceptance of a complete `HAND_INIT(k+1)`. The grade this row carried — *"a placement decision, not a wire change"* — **was wrong**: `hand_id` and `sequence` are inside `TO_BE_SIGNED` (§2.4) and in the slot key (§5.2.1), so two placements are two signed byte strings for one intent. Chain `k+1` is refused because a boundary event would then chain from a `GENESIS(k+1)` that a `PLAYER_LEAVE` is an input to. | — | closed in this pass |
-| **Q-10** | **What ratifies a contribution to the stage that stalled?** For every stage that completed, `P(k)` (§3.2) is exactly `stage_hash` membership and two peers holding the same prefix agree by construction. For the one stage that stalled — the reason the hand aborted — no `stage_hash` exists, so "seat `s` contributed there" is strictly *who was heard*, the quantity P3 refused. **Named default, adopted in §3.2: a contribution to the stalled stage counts; a terminal `HAND_ABORT` and a `PLAYER_LEAVE` never do; and a peer's own emission does (K1's sub-question, answered).** It cannot simply be excluded: a hand that stalls at `HAND_INIT` completes no stage, so excluding it empties the next hand's set. **The claim that the residual was "loud rather than silent" is withdrawn and was K1**: it costs a hand at the deadline on the *first* iteration and a permanent silent fork on the second, because both peers then narrow to `{self}` and every collective stage self-completes. What replaces it is not a ratification but a detection — §3.2's **solitary-stage rule**, which makes a peer whose `P` has narrowed to itself freeze on the first contradicting event instead of playing on. `Q-10` itself stays open: nothing ratifies the stalled stage, and no construction can, because agreeing it needs a collective step at the point collectivity failed. Same question as `STATE_MACHINE.md` **Q8**, which filed it here; referenced, never redefined there. | §3.2, §4.4 | project owner |
+| **Q-09** | **CLOSED (K2), and closed a second time in this pass for a second message (L1).** *Which chain does an event that sits between two hands belong to, and at what `sequence`?* It was asked of the hand-boundary single-writer events and answered for them; **checkpoint 8** arrived at the same position from `STATE_MACHINE.md` with the same four quantities undefined, and §4.9's checkpoint-8 box answers it in the same shape — chain `k`, `hand_id = k`, parent `TERMINAL(k)`, `sequence` in the reserved band `BOUNDARY_CHECKPOINT_BASE … +15`, total order by the collective stage rule. **The reusable finding is that the position between `TERMINAL(k)` and `HAND_INIT(k+1)` needs a rule per message that occupies it, not one rule**, and the next message placed there will need a third. **Answer for the boundary events, in §4.10's boundary-window box:** chain `k`, `hand_id = k`, `sequence = BOUNDARY_SEQUENCE_BASE + sender_seat`, `previous_event_hash = TERMINAL(k)` for every event of the window, total order ascending seat index, one event per seat per boundary, window closing at this receiver's acceptance of a complete `HAND_INIT(k+1)`. The grade this row carried — *"a placement decision, not a wire change"* — **was wrong**: `hand_id` and `sequence` are inside `TO_BE_SIGNED` (§2.4) and in the slot key (§5.2.1), so two placements are two signed byte strings for one intent. Chain `k+1` is refused because a boundary event would then chain from a `GENESIS(k+1)` that a `PLAYER_LEAVE` is an input to. | — | closed in this pass |
+| **Q-10** | **What ratifies a contribution to the stage that stalled?** For every stage that completed, `P(k)` (§3.2) is exactly `stage_hash` membership and two peers holding the same prefix agree by construction. For the one stage that stalled — the reason the hand aborted — no `stage_hash` exists, so "seat `s` contributed there" is strictly *who was heard*, the quantity P3 refused. **Named default, adopted in §3.2: a contribution to the stalled stage counts; a terminal `HAND_ABORT` and a `PLAYER_LEAVE` never do; and a peer's own emission does (K1's sub-question, answered).** It cannot simply be excluded: a hand that stalls at `HAND_INIT` completes no stage, so excluding it empties the next hand's set. **The claim that the residual was "loud rather than silent" is withdrawn and was K1**: it costs a hand at the deadline on the *first* iteration and a permanent silent fork on the second, because both peers then narrow to `{self}` and every collective stage self-completes. What replaces it is not a ratification but a detection — §3.2's **solitary-stage rule**, which makes a peer whose `P` has narrowed to itself freeze on the first contradicting event instead of playing on. **That rule could not fire as first written and now can (L4):** its trigger is a property of the hand the event names, answered from §5.3's retained record at §4.0 step 10b, because a solitary hand completes in microseconds and the contradicting event is late by construction. A second detection route was added with it: §6.2's checkpoint 8, compared over a wider set than it is required of (§4.9), with `signed_this_hand` inside `state_hash` (§6.1) so that agreement there is agreement about `P` itself. `Q-10` itself stays open: nothing ratifies the stalled stage, and no construction can, because agreeing it needs a collective step at the point collectivity failed. Same question as `STATE_MACHINE.md` **Q8**, which filed it here; referenced, never redefined there. | §3.2, §4.4 | project owner |
 
 ### The corpus-wide open questions — `DECISIONS.md`'s letters, adopted (R-2)
 
@@ -5544,8 +6126,24 @@ MAX_STAGES_PER_HAND             = 2 048
 BOUNDARY_SEQUENCE_BASE          = 4 096         (§4.10's hand boundary window;
   a boundary event of chain k carries sequence = BOUNDARY_SEQUENCE_BASE + seat,
   so the window occupies 4 096 .. 4 105 and is disjoint from every stage index,
-  which MAX_STAGES_PER_HAND bounds at 2 047. No other chained type may carry a
-  sequence >= BOUNDARY_SEQUENCE_BASE.)
+  which MAX_STAGES_PER_HAND bounds at 2 047. Only §4.9's boundary checkpoint may
+  carry a sequence >= BOUNDARY_SEQUENCE_BASE besides these; no other chained type
+  may.)
+BOUNDARY_CHECKPOINT_BASE        = 8 192         (§4.9's checkpoint-8 box;
+  checkpoint 8 of chain k is a STATE_HASH stage at BOUNDARY_CHECKPOINT_BASE and a
+  STATE_ACK stage at +1, with reconciliation round r at +2r and +2r+1, 1 <= r <= 7,
+  so the band is the sixteen values 8 192 .. 8 207. It sits ABOVE the boundary
+  window because a reconciliation round extends upwards and must never reach the
+  window's reserved per-seat slots.)
+MAX_RETAINED_HAND_RECORDS       = 4 096         (§5.3's retained hand record, the
+  per-hand (hand_id, was_solitary, P, checkpoint8_state_hash) tuple §4.0 step 10b
+  evaluates a stale-hand event against. LRU; ~56 B each.)
+
+Both reserved bands are EXEMPT from the MAX_STAGES_PER_HAND abort of §5.3: that
+count is of stage indices below BOUNDARY_SEQUENCE_BASE, and each band is bounded
+by its own rule instead — one boundary event per seat, one checkpoint-8 pair per
+seat per round. An implementer who range-checks sequence < MAX_STAGES_PER_HAND
+rejects every boundary event and every boundary checkpoint.
 MAX_CBOR_NESTING_DEPTH          = 8
 MAX_DISPUTES_PER_SENDER_PER_HAND = 8            (DISPUTE is unchained; §4.9, §5.3)
 
@@ -5999,7 +6597,14 @@ answer — a heads-up table whose opponent leaves would pause for ever, nobody w
 bust, and no end condition could fire, which is D-013's own fixed point reached
 from the other side. What is adopted is the **solitary-stage rule**: a peer whose
 required emitter set is `{self}` alone may deal, but a chained event of that hand
-from a seat outside `P(k-1)` freezes it. **The cost is a stopped table where there
+from a seat outside `P(k-1)` freezes it. **Amended in this pass (`L4`):** the rule
+is a property of the hand the event *names*, answered in the past tense from
+§5.3's retained record by §4.0 step 10b, because a solitary hand self-completes
+every stage and the contradicting copy therefore arrives naming a hand the
+receiver has already finished. As first written the rule was scoped to the
+receiver's current hand and could not fire at all. Two cases are exempt —
+`PLAYER_SIT_IN`, and a checkpoint-8 `STATE_HASH`, which is compared instead
+(§4.9). **The cost is a stopped table where there
 would have been a completed one**, on every path where two live peers disagree
 about `P`; `SPEC_CS.md` §19 ranks that above a silent fork and this document takes
 the ranking. **The residual, which is not closed:** under a bidirectional

@@ -165,6 +165,51 @@ does not restate either. Four consequences bind the classifications below.
    path where it narrows (**X36**). X36 is the first row this document has ever
    had to place in the bucket §5.4 previously said no row occupied.
 
+**D-014 outranks D-013, and it is the first decision in this series that gives a
+payoff *back* rather than deleting one.** Its rule: **a player who sends a
+provably illegal message is removed from the table, the attacked hand is voided,
+play continues without them, and an information window names the anti-cheat.** It
+narrows D-010 point 3, which banned automated peer removal wholesale after four
+passes in which every severe defect ended with an honest peer's chips forfeited.
+The narrowing turns on one distinction and this document is bound by it:
+
+> **Evidence is self-authenticating when it is a message signed by the accused,
+> whose illegality any peer can decide alone, from that message plus state the
+> peers provably share.**
+
+Four consequences bind the classifications below, and the fourth is a new risk
+rather than a re-classification.
+
+1. **Every row whose worst case was "the message is rejected" now has a second
+   worst case, and it is the attacker's seat.** That is the whole of the
+   improvement and it is real: the D&A bucket's name has meant *detected and
+   named* since D-010, never *detected and answered*, and for the tier-1 subset
+   it now means detected, named and **answered**. §5.1's D&A definition carries
+   the qualification and §5.3's rows carry the split.
+2. **The improvement stops exactly at D-010's boundary and the boundary is the
+   evidence, not the severity.** No removal on a timeout, a missing publication,
+   an `EquivocationProof`, an `attributed` field, a vote, a certificate, or any
+   quorum. So **row 16 (equivocation), X7, X10, X30, X31 and X32 are untouched**
+   — the six rows a reader would expect this decision to fix are the six it
+   deliberately does not, because each of them turns on a judgement two honest
+   peers can reach differently, which is what produced every defect D-010 closed.
+3. **Tier 2 waits for a checkpoint.** Illegality decidable only against game
+   state — an out-of-turn action, a raise below the minimum, a bet larger than
+   the stack — is safe to act on **only** once the state it is judged against is
+   fixed by a checkpoint both peers have signed. Before that point the violation
+   is recorded and the hand is voided, and nobody is removed.
+4. **The decision creates a risk of its own and it is catalogued as X37 rather
+   than as a caveat inside another row.** *A validator that is too strict now
+   ejects honest players rather than merely rejecting a message.* Every previous
+   pass's worst defect landed on the path the previous fix newly made
+   load-bearing; the path this fix makes load-bearing is **the correctness of
+   every validator in the corpus**, which was never consensus-critical against a
+   *person* before. And the corpus contains a live example of how an honest
+   player's legal action comes to look illegal: **K-1**, two honest peers holding
+   different `P` and therefore different `dealt_in`, in which each peer's
+   perfectly legal `HAND_INIT` is wrong at the other. That is why tier 2 exists
+   and why its checkpoint precondition is a precondition rather than advice.
+
 Read the catalogue in §5 with all of that in front of you. **Two payoffs have
 been deleted from the design, and every row that turned on either is
 re-classified.** The first was chips: every row whose payoff was chips taken
@@ -957,7 +1002,7 @@ addressed in §6 or §7.
 | Bucket | Meaning |
 |---|---|
 | **CP** — cryptographically prevented | Under assumptions A1–A7 (and the specific ones named in the row), the adversary cannot construct a message that both achieves the goal and is accepted by an honest client. The adversary's only option is to be rejected. This includes attacks that are *structurally excluded*, i.e. for which no message in the protocol's grammar could express the attack. |
-| **D&A** — detected and attributed | The adversary *can* emit the message. Every honest client rejects it, the state does not advance, and the misbehaviour is bound to a specific application key by a signature, so the evidence is transferable to third parties. **Under D-010 the second half of the name is narrower than it sounds and must be read narrowly:** attribution puts a signed name in the transcript and nothing follows from it automatically — no forfeiture, no block list, no unseating. D&A means *detected and named*, never *detected and answered*. **D-011 rule 3 is what makes the "no block list" half true at every layer rather than only in this document**: until it landed, `NETWORK_STACK.md` still called `block_peer` on an `EquivocationProof` in two places and `STATE_MACHINE.md` still unseated a seat on a self-contained proof in one, so a row classified D&A here could still cost the *accused* — honest or not — its connections. That gap is closed, and the honest reading of every D&A row is now uniform: rejection, a name in the transcript, and nothing else. |
+| **D&A** — detected and attributed | The adversary *can* emit the message. Every honest client rejects it, the state does not advance, and the misbehaviour is bound to a specific application key by a signature, so the evidence is transferable to third parties. **Under D-010 the second half of the name is narrower than it sounds and must be read narrowly:** attribution puts a signed name in the transcript and nothing follows from it automatically — no forfeiture, no block list, no unseating. D&A means *detected and named*, never *detected and answered*. **D-011 rule 3 is what makes the "no block list" half true at every layer rather than only in this document**: until it landed, `NETWORK_STACK.md` still called `block_peer` on an `EquivocationProof` in two places and `STATE_MACHINE.md` still unseated a seat on a self-contained proof in one, so a row classified D&A here could still cost the *accused* — honest or not — its connections. That gap is closed, and the honest reading of every D&A row is now uniform: rejection, a name in the transcript, and nothing else. **D-014 splits that uniformity in two and the split is by evidence, not by severity.** Where the rejected message is **tier-1 self-authenticating** — a signature that does not verify, a non-canonical encoding, a malformed message or out-of-range field, a failed shuffle / decryption-share / key-ownership proof, a deck that gains or loses a card, a chain parent that does not exist, a signer who is not a party to the table — the sender **loses its seat**: the hand is voided neutrally, the seat is dead and blinded off, and the exit is one-way (`STATE_MACHINE.md` T64, T65, I34). Where the rejected message is **tier-2 state-dependent**, the same is true **only** once the state it was judged against is fixed by a checkpoint both peers signed; before that, D-010's reading stands unchanged — rejection, a name, and nothing else. Where the "evidence" is a timeout, a certificate, a vote, an `attributed` field or an `EquivocationProof`, D-010's reading stands **permanently**, and a row that reads a removal into any of those has rebuilt the forfeiture D-010 deleted. A reader classifying a new row must therefore answer one question before reaching for D&A's stronger half: *can two honest receivers of this evidence disagree about the verdict?* If yes, there is no removal, whatever the attack costs. |
 | **DNA** — detected but not attributable | The divergence or conflict is detected, and play stops, but the transcript does not establish *who* was at fault. **Two different situations share this bucket, and X33 was the first of the second kind:** either an adversary is present and the design cannot name them (X10, X22, X29), or **there is no adversary at all** and the design has produced a divergence between honest peers (X33, X34, X35). Both are "detected, nobody named"; only the first is somebody escaping a name. The second kind is now three of the six DNA rows, which is the shape of the last three review passes and not a coincidence: the defects this corpus produces are no longer attacks. |
 | **NP&ND** — not prevented and not detected | The divergence happens, nothing rejects it, no invariant fires, no deadline expires, no proof forms, and **no peer ever learns that it happened**. Each peer's own view stays internally consistent and self-verifying, so there is no moment at which anything could be reported to a human. This is the **worst bucket in the scheme** — worse than V, which at least leaves a record somebody can read, and worse than OOS, which makes no claim rather than a false one. §5.4 said for four passes that no row occupied it. **X36 occupies it**, and the honest consequence is that this document may no longer offer "every divergence is at least detected" as a property of the design. A row leaves this bucket only by a fix that makes the divergence observable, not by a fix that makes it rarer. |
 | **V** — visible, not prevented | The attack **succeeds**. Nothing rejects it, nothing in the protocol acts against the attacker, and no proof changes the outcome. What the design delivers is a signed, permanent record that it happened, and a per-identity count of it in the lobby. This is the weakest non-OOS bucket in the scheme, and `SPEC_CS.md` §18 forbids describing a row in it as anything more than visible. It is distinguished from OOS only in that the attack runs *through the poker protocol* and the protocol therefore sees and records it. |
@@ -1020,9 +1065,40 @@ review named in A3 finds a soundness gap, rows 1–4 fall out of CP entirely.
 
 **§17 catalogue counts: CP 11 · D&A 7 · DNA 0 · OOS 1 · total 19.**
 
+**Re-classified by D-014, and the movement is inside the cells rather than between
+buckets.** No row above changes bucket — CP is a claim about what an adversary can
+*construct* and D-014 constructs nothing, and D&A is a claim about detection and
+attribution, both of which already held. What changes is the **worst case at the
+end of the row**, which is the sentence D-010 shrank to *"a wasted hand"* and which
+for the tier-1 subset is now *"a wasted hand and the attacker's seat"*. It is
+tabulated rather than written into eleven cells, because the reader who needs it is
+checking a **boundary**, and a boundary is only checkable if both sides are visible:
+
+| §17 row | Tier under D-014 | Worst case for the attacker, after D-014 |
+|---|---|---|
+| 1, 2, 3 — fake / duplicate / removed card | **1** (a deck that gains, loses or duplicates a card across a shuffle) | CP unchanged; the message was already unconstructible, and if one is nevertheless emitted the emitter **loses its seat** |
+| 4(a) — an invalid shuffle | **1** (failed shuffle proof) | as above. `STATE_MACHINE.md` T21 already aborted the hand and named the shuffler; the removal is what is added |
+| 12 — changing an already-signed action | **1** (signature does not verify) | CP unchanged; **loses its seat** |
+| 13 — replay of old actions | **1** (chain parent does not exist at the replayed position) | CP unchanged; **loses its seat** |
+| 15 — impersonation | **1** (signer is not a party to this table) | CP unchanged; **loses its seat** |
+| 17 — malformed packets | **1** (malformed message, out-of-range field, non-canonical encoding) | D&A becomes **detected, named and answered**: the sender **loses its seat**. The residual in that row is untouched — an unfuzzed crypto deserialiser is a remote panic, and a peer that panics never reaches the validator that would remove anybody |
+| 18 — oversized packets | **none** | unchanged, and deliberately: an over-cap frame is dropped **before decoding**, so there is no signed message to judge and no accused. The response is volume-keyed, which D-011 rule 3 requires it to stay |
+| 7 — reading the board early | **2** (which street it is, is state) | removal **only** after the checkpoint that fixed the street. Before it: rejection and a name, as before |
+| 8 — illegal poker action | **2** | as above, judged against the checkpoint that closed the previous betting round |
+| 9, 10 — fake stack, fake pot | **2** | as above |
+| 11 — action out of order | **2** (`player_to_act` is a function of state) | as above |
+| 16 — equivocation | **neither** | **unchanged, and this is the row that shows where the boundary is.** An `EquivocationProof` is not a message the accused signed asserting something illegal; it is a *predicate over two* messages, and that predicate has failed five times, twice against honest peers following the rules (X31, X32). D-014 excludes it by name. The worst case stays a wasted hand |
+
+**The pattern in that table is the useful part.** Every tier-1 row is one the
+cryptography or the encoder already answered, and every tier-2 row is one the
+*engine* answers — which is why tier 2 needs the checkpoint and tier 1 does not, and
+why the rows D-010 was written about (16, and X7, X10, X30, X31, X32 below) are in
+neither column. D-014 hardens the cases that were already hard and leaves the soft
+ones exactly as soft as they were.
+
 ### 5.3 Protocol-level attacks not named in §17
 
-These fall out of the research notes and of D-001 to D-011. They are catalogued
+These fall out of the research notes and of D-001 to **D-014**. They are catalogued
 with the same scheme because omitting them would make the §17 table look more
 complete than the system is.
 
@@ -1110,7 +1186,8 @@ did. A review that works makes the proportion classified as prevented fall.
 | X33 | **The fix that unfroze the hand made an agreed quantity per-receiver, and a line elsewhere read it into the next hand.** An opponent goes quiet, the hand ends by the terminal abort X32's fix made reachable — and two honest peers accept *different copies* of that abort, because the certificate path carries a name and the hand-deadline path carries none, with no precedence rule between them. A transition elsewhere then set a seat's status from the accepted copy's `attributed` field, so the next hand's `dealt_in` and `bb_seat` differ between honest peers, its collective stage never completes, and **the table never plays again** | **DNA** | **This row records a defect the corpus was carrying, and the lesson is a third shape to add to the two D-011 named.** D-011's two shapes were *a copy that drifted* and *a consequence that made an attack worth mounting*. Neither appears here. What appears is: **the defect is on the path the previous fix newly made load-bearing.** X32's fix — a witness-independent terminal stage — is what unfroze eleven phases, and it is the same fix that made "which copy of the abort did this peer accept" a per-receiver fact for the first time. The line that read `attributed` was *correct* while every completing peer necessarily held the same body. It stopped being correct the moment the terminus stopped requiring a witness, and nothing in the change touched the line that broke.<br><br>**Why it is worse than a stalled hand, which is the reason it is catalogued rather than noted.** X7 and X32 cost one hand. This costs the table permanently and silently: nothing is invalid, no signature fails, no proof forms, and each peer's own view is internally consistent. The two peers simply disagree about who is dealt in, so the collective stage that opens the next hand can never gather byte-identical bodies, and the failure surfaces as a table that hangs at hand `k+1` with no error to report. Stacks and the terminal value still agree, which is what makes it hard to see — the divergence is confined to two fields nobody hashes into anything that would mismatch first.<br><br>**Attacker capability required: none beyond silence**, which X7 already concedes to everyone at zero cost. The attacker does not choose which copy anybody accepts and does not need to; the fork is a property of the specification, not of anything the attacker sends. That is also why it is **DNA and not D&A**: the outcome is plainly *detected* — the table stops dead and the disagreement is visible in each peer's own `dealt_in` — but there is nobody to attribute it to. Both honest peers followed the protocol, and the peer that went silent did nothing that a network partition would not have done.<br><br>**The mitigation is D-012, and it is a rule about inputs rather than a new mechanism.** *No canonical state — nothing entering a state hash, a roster hash, a chained event body or the next hand's genesis — may be derived from a quantity that can differ between honest receivers. Canonical state changes only through a chained event that every participant has accepted; everything else is a local view.* Applied here it deletes the derivation rather than repairing it: a seat's status changes only through a chained event, and an abort's `attributed` field is evidence, which under **D-010** already has no automatic consequence — so reading a status from it was never going to be right. The same rule removed `seat_flags` from `roster_hash`, the other route by which a per-receiver status could have reached the genesis. `STATE_MACHINE.md` T46 and Q7 carry the transition half; `PROTOCOL.md` §4.10 already forbade it in terms — *"no receiver may derive a seat's state from it"* — and the defect was that one document said so while another did it.<br><br>**What it costs to fix — and this cell stated that cost wrongly, which is X34.** It read: *"Nothing now marks a seat `Absent` automatically. A seat that goes silent is dealt in again every hand and stalls each one until the hand deadline, until a human sits it out or leaves. That is a real liveness cost, paid deliberately."* Two things in that sentence were false and the third was unreachable. D-012's deletion cost **nothing at all** — marking a seat `Absent` never removed it from `HAND_INIT`'s required emitter set, so the liveness this row believed it was spending had already been gone for every pass — the stall was not a repetition but a **fixed point**, since every stack is restored on abort so no seat busts and no end condition fires, and the escape *"until a human sits it out or leaves"* had the silent seat as its grammatical subject, because `PLAYER_SIT_OUT` and `PLAYER_LEAVE` are single-writer by the seat itself. The mitigation for **that** is **D-013**, and it is X34's row.<br><br>**Residual.** D-012 closes the derivation, not the silence behind it — that is X7 — and the permanent liveness loss it was believed to have caused is X34. |
 | X34 | **The table makes no progress, ever, and every peer's view of it is valid.** A seat goes silent. Nothing marks it absent — D-012 forbade the derivation that used to — so it stays a seat like any other, it is dealt in, being dealt in makes it a **required emitter** of the next hand's opening collective stage, it emits nothing, the stage stalls to the hand deadline, the hand aborts, and under **D-010** every stack is restored *including the silent seat's*. The next hand begins from the state the last one began from, bit for bit. No seat can bust, so no end condition can fire, so nothing terminates it | **DNA** | **This row is the correction of a cost, and that is why it is catalogued rather than footnoted.** X33's cell, and the D-012 preamble, priced D-012's fix as *“a silent seat is dealt in every hand and stalls each one to the hand deadline until a human acts”* — a slow table, paid deliberately. Three things in that sentence were wrong, and each is worse than the last. **First**, marking a seat absent never removed it from the required emitter set in the first place, because that set is defined to include occupied seats that are absent or sitting out; so the liveness D-012 believed it was spending had already been gone for every prior pass, and the deletion cost nothing at all. **Second**, the repetition is not a repetition, it is a **fixed point**: restoration on abort is total under D-010, so stacks never move, so no seat ever busts, so `\|dealt_in\|` never falls and no tournament-end condition is reachable. The table does not play slowly. It does not play. **Third**, the escape clause had the *silent* seat as its grammatical subject — `PLAYER_SIT_OUT` and `PLAYER_LEAVE` are single-writer by the seat itself — so “until a human acts” named the one party who by hypothesis is not there. There is no operator, no majority and no third party with a lever on this state.<br><br>**Attacker capability required: none beyond silence**, which X7 concedes to everyone at zero cost, and which is indistinguishable from a partition or a closed laptop. **DNA rather than V**: the stall is plainly detected — every peer watches the same stage fail to complete, at the same index, every ten minutes — and there is nobody to attribute it to, because the seat that went quiet did nothing a dead network would not have done. It is the second kind of DNA §5.1 names, like X33: the design has no name to offer rather than a culprit escaping one.<br><br>**The mitigation is D-013, and it removes the question rather than answering it.** *Liveness is inherited from the chain, not from a seat's status*: a seat is required to emit in hand `k+1` only if it signed at least one chained event during hand `k`, and for the first hand the required set is the signers of `TABLE_READY`. `PROTOCOL.md` §3.2 owns the set and its notation and this cell does not restate either. The circularity D-012 left is what this cuts — a status may change only through a chained event, and a silent seat emits nothing, so under D-012 nothing could ever change its status and it was required forever. Asking about participation instead of status has no such loop, because participation is a function of the accepted chain.<br><br>**What it costs, stated as a cost.** A silent seat stalls exactly one hand — the one it went silent in — and is skipped thereafter; it keeps its seat and its stack and the blinds eat it, which is D-005 unchanged; it now genuinely busts, so the tournament can end. It rejoins by signing a chained event, which requires it to be alive, and **nothing else can put it back** — §7.3(b) said otherwise for four passes and is corrected. No certificate, vote, proof or attribution is involved, deliberately: this is not the D-006 to D-008 machinery, which D-010 made inert and `OQ-F` still questions.<br><br>**Residual, and it is the whole of the next two rows.** D-013 anchors the required set on two things it did not previously depend on — the genesis the set is derived from (**X35**) and the accepted chain prefix the set is computed over (**X36**) — and both were per-receiver quantities when it landed. That is D-012's third shape applied to D-012's own successor, on the pass immediately after it, which is the strongest evidence this catalogue holds for the shape being real. |
 | X35 | **Two honest players who join thirty seconds apart cannot verify each other's `TABLE_READY`, and the table never forms.** The founder's table advertisement is re-broadcast periodically and each re-broadcast must carry a strictly greater timestamp, so *which re-broadcast reached a joiner* changes the bytes that joiner hashes. That hash entered the table's genesis, and therefore its session identifier and every proof context derived from it, so two joiners who saw different re-broadcasts of the **same table** derived different genesis values. Every signature each of them produced was valid — against its own genesis, and no other | **DNA** | **No attacker, and no unusual timing.** Thirty seconds is a normal gap between two people clicking join on the same lobby row; the re-broadcast interval is the only quantity that has to elapse. The founder is honest, both joiners are honest, no message is dropped, modified or replayed, and the failure is total: the table cannot reach its first hand at all. This is the same class as X33 and X34 — canonical state derived from a quantity that differs between honest receivers, **D-012's rule** — and it is the third instance found in three consecutive passes, which is the argument for the rule being general rather than three patches.<br><br>**Why it went unseen for as long as it did, which is the part worth carrying.** The field was **carried and never checked**. `TABLE_READY` transported it, no receiver rule compared it against anything, and the divergence surfaced only downstream as a signature that would not verify — with nothing to point at the cause. A field that is hashed into the genesis but validated nowhere gives an implementer no failing assertion to read, only a table that will not start.<br><br>**DNA, and by the second of §5.1's two routes.** The failure is loudly detected — verification fails at every peer, immediately — and there is nobody to name, because both parties are honest and the divergence is a property of the specification. What the bucket records here is that the design had no name to offer, not that a culprit escaped one.<br><br>**The attacker-bearing half of the same field, catalogued here rather than as its own row.** Because nothing checked the value, nothing forbade the founder **re-signing a later advertisement with different table parameters** — a different blind schedule, a different starting stack — and forking the table between early and late joiners deliberately. That variant is D&A-shaped and would ordinarily earn its own row; it does not get one because it is not separately mitigable. One change closes both, and splitting them would imply two fixes exist.<br><br>**The mitigation is D-013's J1 rule.** The advertisement hash is removed from the genesis, the session identifier and the proof context, and replaced by a hash over the **agreed table parameters** and nothing else — the construction, its domain and its exact part list are `PROTOCOL.md` §3.1's and are not reproduced here (D-011 rule 1). Every joiner sees the same parameters whichever re-broadcast reached them, because the parameters are what they agreed to and the timestamp is not. The malicious-founder half closes as a side effect and, more to the point, stops being carried-and-ignored: a changed parameter now changes the hash, and the value is **checked** at the three sites `PROTOCOL.md` names.<br><br>**Residual.** The construction excludes the two time fields **by name** rather than by a general rule about mutable fields, so a future field added to the advertisement that varies per broadcast would re-open this row exactly. That is an implementation obligation in the class of A12 and A14, not a property of A1–A7, and it is the standing reason this row is not simply struck. |
-| X36 | **Both peers finish the tournament alone, and each one's client tells its player it won.** The set that decides who must emit in the next hand is agreed between honest peers on every path where it does nothing, and per-receiver on the one path where it narrows — a hand that ended in an abort. Two peers that once disagree about who is dealt in each reject the other's copy of the next hand's opening event, so from that hand on each holds a set containing only itself; every collective stage is then self-completing; each plays out the drain path alone, busts the opponent it can no longer hear, and reaches a genuine tournament-won condition naming itself. **One dropped frame is enough.** No signature fails, no invariant fires, no deadline expires, no equivocation predicate matches, and chip conservation holds — separately and correctly — on both sides of the fork | **NP&ND** | **This row is why the NP&ND bucket exists, and the classification is the finding.** Every other row in this catalogue ends with somebody knowing something went wrong. This one does not. Each peer's chain is internally consistent, self-verifying and complete; each terminates normally; and the only object that would expose the disagreement — a cross-peer comparison at a checkpoint — is not placed on the hands this failure runs through, because a hand with one dealt-in seat reaches settlement without a deck commitment or a betting round, and those are what the checkpoint list is keyed on (`PROTOCOL.md` §6.2). **The tournament result itself is not checkpointed.** So the promise the divergence-recovery machinery makes — that the next checkpoint shows two differing values and the reconciliation runs — has no next checkpoint in the one regime where it is needed, and the regime is not exotic: a silent opponent produces on the order of forty consecutive such hands.<br><br>**Attacker capability required: none.** Not silence, not a Sybil, not a modified client — one lost frame at one stage of one aborted hand. The two peers are honest throughout and each behaves exactly as specified.<br><br>**Why the argument that was offered does not hold, since the same inversion could be made again.** The set is justified by the claim that the terminal stage of a chain is witness-independent, *so* two peers that reach it accepted the same prefix. That **inverts** the property. Witness-independence was introduced precisely so that peers holding **different** prefixes can still reach the terminus — that is what unfroze the stalled hand in the first place — so reaching it together is evidence of nothing about the prefixes. The narrowing path is the abort path, and the abort path is exactly where the prefixes may differ: the set is agreed where it is inert and per-receiver where it acts. **This is D-012's third shape for the third consecutive pass**, and this time on the fix that closed the second.<br><br>**A second undefined quantity decides which of two failures occurs**, and it is undefined in both owning documents, each deferring to the other: whether a peer's own emission counts toward its own participation record. If it counts, the outcome is this row. If it does not, the outcome is a table that pauses instead — bad, but observable. An implementer choosing by taste picks between a visible stall and a silent double winner.<br><br>**Mitigation: none. This row is open, and it is a blocker.** It is `DECISIONS.md` **K-1**, and the choice belongs to the owner rather than to any document's editor, because both candidate fixes give something up: ratify the stalled stage, which trades this failure for a stall that has to be lived with; or floor the required set at two members, which keeps tables alive and makes the last two seats mutually hostage. **`DECISIONS.md` K-3 is the cheaper half and is independent of that choice**: place a checkpoint after any hand that placed no other, and the fork stops being silent — it becomes a faulted table, which moves this row from **NP&ND to DNA** without deciding anything. That is the shape of fix this bucket asks for: not a lower probability, an observable failure.<br><br>**Until then, this document may not claim that every divergence between honest peers is at least detected.** §9.3's standing caution carries that retraction, and §5.4's sentence that no row occupies the worst bucket is withdrawn. |
+| X36 | **Both peers finish the tournament alone, and each one's client tells its player it won.** The set that decides who must emit in the next hand is agreed between honest peers on every path where it does nothing, and per-receiver on the one path where it narrows — a hand that ended in an abort. Two peers that once disagree about who is dealt in each reject the other's copy of the next hand's opening event, so from that hand on each holds a set containing only itself; every collective stage is then self-completing; each plays out the drain path alone, busts the opponent it can no longer hear, and reaches a genuine tournament-won condition naming itself. **One dropped frame is enough.** No signature fails, no invariant fires, no deadline expires, no equivocation predicate matches, and chip conservation holds — separately and correctly — on both sides of the fork | **DNA / NP&ND** by case (see the disposition at the end of this cell) | **This row is why the NP&ND bucket exists, and the classification is the finding.** Every other row in this catalogue ends with somebody knowing something went wrong. This one does not. Each peer's chain is internally consistent, self-verifying and complete; each terminates normally; and the only object that would expose the disagreement — a cross-peer comparison at a checkpoint — is not placed on the hands this failure runs through, because a hand with one dealt-in seat reaches settlement without a deck commitment or a betting round, and those are what the checkpoint list is keyed on (`PROTOCOL.md` §6.2). **The tournament result itself is not checkpointed.** So the promise the divergence-recovery machinery makes — that the next checkpoint shows two differing values and the reconciliation runs — has no next checkpoint in the one regime where it is needed, and the regime is not exotic: a silent opponent produces on the order of forty consecutive such hands.<br><br>**Attacker capability required: none.** Not silence, not a Sybil, not a modified client — one lost frame at one stage of one aborted hand. The two peers are honest throughout and each behaves exactly as specified.<br><br>**Why the argument that was offered does not hold, since the same inversion could be made again.** The set is justified by the claim that the terminal stage of a chain is witness-independent, *so* two peers that reach it accepted the same prefix. That **inverts** the property. Witness-independence was introduced precisely so that peers holding **different** prefixes can still reach the terminus — that is what unfroze the stalled hand in the first place — so reaching it together is evidence of nothing about the prefixes. The narrowing path is the abort path, and the abort path is exactly where the prefixes may differ: the set is agreed where it is inert and per-receiver where it acts. **This is D-012's third shape for the third consecutive pass**, and this time on the fix that closed the second.<br><br>**A second undefined quantity decides which of two failures occurs**, and it is undefined in both owning documents, each deferring to the other: whether a peer's own emission counts toward its own participation record. If it counts, the outcome is this row. If it does not, the outcome is a table that pauses instead — bad, but observable. An implementer choosing by taste picks between a visible stall and a silent double winner.<br><br>**Mitigation: none. This row is open, and it is a blocker.** It is `DECISIONS.md` **K-1**, and the choice belongs to the owner rather than to any document's editor, because both candidate fixes give something up: ratify the stalled stage, which trades this failure for a stall that has to be lived with; or floor the required set at two members, which keeps tables alive and makes the last two seats mutually hostage. **`DECISIONS.md` K-3 is the cheaper half and is independent of that choice**: place a checkpoint after any hand that placed no other, and the fork stops being silent — it becomes a faulted table, which moves this row from **NP&ND to DNA** without deciding anything. That is the shape of fix this bucket asks for: not a lower probability, an observable failure.<br><br>**Until then, this document may not claim that every divergence between honest peers is at least detected.** §9.3's standing caution carries that retraction, and §5.4's sentence that no row occupies the worst bucket is withdrawn.<br><br>**DISPOSITION — K-1 and K-3 are both decided, and this row splits rather than moves whole.** The paragraphs above are kept as the record of the finding; what follows is the answer. **K-3 landed**: every hand now places checkpoint 8 at its boundary, including a drain hand, so the regime that had nothing comparable in forty consecutive hands now emits forty comparable values (`STATE_MACHINE.md` I32). **K-1 landed, and by detection rather than by prevention**: neither candidate fix in the paragraph above was taken. Flooring the set at two members was rejected because it deletes the drain — nobody busts, no end condition fires, and the last two seats are mutually hostage, which is the same fixed point from the other side. What was adopted is the **solitary-stage rule** (`PROTOCOL.md` §3.2; engine half `STATE_MACHINE.md` T62, T63, §9.3 condition 0.6, I33): a peer whose required emitter set has narrowed to one member may still deal, but a chained event of that hand from a seat outside the set is a **state divergence and not a rejection** — it freezes, completes no stage, awards no pot and evaluates no end condition, and the table then closes rather than thawing back into the same regime. **And the sub-question the paragraph above says is undefined in both documents is answered**: a peer's own emission **does** count into its own participation record, so the outcome is this row's and not a pause — which is why the rule had to be a detection.<br><br>**The two cases the split names.** **(a) K-1's own trace — one dropped frame, both peers transmitting throughout — is now DNA.** The peer that did not narrow keeps emitting; its first chained event of the first solitary hand reaches the peer that did, and that peer freezes on it. The failure is detected, play stops, and nobody is named — which is DNA's definition and its second kind, an honest divergence with no adversary in it. The detection is **unilateral**: it needs no reply, no quorum and no cooperation from the peer that is still emitting, so it holds even if that peer never speaks again. **(b) A *bidirectional* partition remains NP&ND**, and it is stated rather than folded into (a): if neither peer hears the other for the whole drain, both drain, both finish, and no contradiction reaches either. That residual is what D-013's drain does under a partition **however the set is defined**, it is indistinguishable at both peers from the case the drain exists for, and there is no wire evidence to separate them because by construction no wire carries anything. It is not a consequence of this row's defect and no repair of this row removes it.<br><br>**So the sentence this document owes is narrower than the one it withdrew, and narrower than "fixed".** It may now claim that a divergence between honest peers is detected **wherever either peer is still transmitting**, and it may not claim it under a total bidirectional partition. `Q-10` in `PROTOCOL.md` stays open and is labelled there as unclosable by ratification: agreeing who contributed to the stage that stalled needs a collective step at exactly the point collectivity failed. |
+| X37 | **An honest player is ejected from the table by the anti-cheat, for an action that was legal when they took it.** D-014 removes a player who sends a provably illegal message: the hand is voided, the seat is dead and blinded off, and **the exit is one-way** (`STATE_MACHINE.md` T64, T65, I34). The attack — and the accident — is to make an honest player's legal message *look* illegal at somebody else's validator. It needs no forged signature and no modified client on the victim's side: it needs the accuser's view of the game state to differ from the victim's at the moment of judgement, which is a thing this corpus has produced **without any adversary at all** in four consecutive passes (X33, X34, X35, X36) | **DNA**, and the bucket is the finding | **This is the risk D-014 creates in its own right, and it is why that decision has two tiers rather than one.** D-010 banned automated eviction after four passes in which every severe defect ended the same way — an honest peer's chips forfeited and its key blocked, for following the protocol; the *forfeit* counts across those reports were 6, 5, 14 and 12. D-014 does not re-open that: it removes nobody on a timeout, a vote, a certificate, an `attributed` field or an equivocation predicate, and each of those is a judgement two honest peers can reach differently. What it **does** do is make the correctness of every validator load-bearing against a *person* for the first time: before D-014 a validator that was too strict rejected a message, and after it, the same validator ejects a player.<br><br>**How an honest legal action comes to look illegal, concretely, and it is not hypothetical.** Take **K-1**: two honest peers hold different required emitter sets after one dropped frame, therefore different `dealt_in`, therefore different `bb_seat` and different blind positions. Every action the victim takes is legal against the victim's state and out of turn against the accuser's. Under a tier-2 removal with no precondition, the peer whose state drifted ejects the peer whose state is right — and neither can tell which is which, because that is precisely what a divergence is. **A divergence like K-1 is the mechanism, and the mechanism already exists in the corpus.**<br><br>**Mitigation, and it is a precondition rather than a mitigation.** D-014's **tier 2**: illegality decidable only against game state — out of turn, below the minimum raise, larger than the stack, a showdown claim contradicting the board — may produce a removal **only** once the accused's message is judged against state fixed by a **checkpoint both peers have signed**. Before that point the violation is recorded and the hand is voided, and **nobody is removed**. That is exactly the K-1 case defused: a checkpoint both peers signed is a state they agreed on, so a divergence that arose after it is bounded by the events since it, and a divergence that arose before it cannot have been signed by both. `STATE_MACHINE.md` T64's guard carries the precondition as a conjunct — `judged_at_checkpoint == Some(n)` and checkpoint `n` reached agreement — rather than as prose, which is what makes it testable.<br><br>**What is not mitigated, stated rather than hidden.** Tier 1 needs no checkpoint and correctly needs none — a signature that does not verify, a non-canonical encoding, a failed shuffle proof are decidable from the message alone, and an honest peer cannot be framed by one without forging its signature. **But "tier 1" is a claim about a *validator*, not about a message.** A validator with a bug — a canonicalisation rule read one way here and another way there, an encoder that emits a form the decoder rejects, a proof verifier stricter than the prover — turns an honest message into tier-1 evidence, and tier 1 has no checkpoint to wait for. **`DECISIONS.md` C-1 to C-3 are three live instances of exactly that class**: the shipped `src/protocol/` signs a digest where §2.4 signs a domain-prefixed body, and its domain register matches §2.8 in **no** string. Two implementations disagreeing that way would each remove the other on sight, and each would be right by its own rules. That is why the gate below blocks shipping.<br><br>**The gate D-014 names, and this row is where this document records it: under every legal interleaving, no honest peer is ever evictable.** For every legal action an honest client can emit, under every legal interleaving of the protocol, no `CheatProven` may be producible against it. It is the **mirror** of `SPEC_CS.md` §25's cheater list — §25 asks that every named cheat be caught, and this asks that nothing else be — and it is the same shape as D-009 rule 1's mirror test, which was written after a rule was re-derived wrongly five times. It is `DECISIONS.md` **D-014-2**, §5.5 is where it is mapped beside the eleven §25 peers, and it **blocks shipping the feature, not writing it**. A removal mechanism whose mirror test has not been run is a mechanism whose failure mode is the one D-010 spent four passes deleting. |
 
 **Extended catalogue counts: CP 6 · D&A 8 · DNA 6 · NP&ND 1 (X36) · V 1 (X8) ·
 OOS 12 · split D&A/DNA 1 (X7) · total 35.**
@@ -1147,12 +1224,13 @@ resolve to a deletion rather than to a different attack.
 |---|---:|---:|---:|
 | Cryptographically prevented (CP) | 11 | 6 | **17** |
 | Detected and attributed (D&A) | 7 | 8 | **15** |
-| Detected but not attributable (DNA) | 0 | 6 | **6** |
+| Detected but not attributable (DNA) | 0 | 7 | **7** |
 | Split D&A / DNA by case (X7) | 0 | 1 | **1** |
+| **Split DNA / NP&ND by case (X36)** | 0 | 1 | **1** |
 | **Visible, not prevented (V)** | 0 | 1 | **1** |
-| **Not prevented and not detected (NP&ND)** | 0 | 1 | **1** |
+| **Not prevented and not detected (NP&ND)** | 0 | 0 | **0** |
 | Out of scope (OOS) | 1 | 12 | **13** |
-| **Total** | **19** | **35** | **54** |
+| **Total** | **19** | **36** | **55** |
 
 Counted after the Phase 0 review corrections: X11 removed from CP, X29 added to
 DNA, X7 reclassified from D&A to the split row. Then after the Phase 1
@@ -1179,7 +1257,22 @@ single movement this table has recorded: **X34 to DNA** — the corrected cost o
 D-012's fix, a table that makes no progress ever, closed by D-013; **X35 to
 DNA** — a genesis derived from a per-receiver lobby view, closed by D-013's J1
 rule; and **X36 to a bucket that did not exist**, taking the extended catalogue
-from 32 to 35 and the combined total from 51 to 54. **D-011 rule 3 moved no row into a different bucket at all**, and that is
+from 32 to 35 and the combined total from 51 to 54. Then this pass, under **D-014** and the
+dispositions of K-1, K-3 and K-9: **X37 added to DNA** — an honest player ejected by an anti-cheat
+whose validator is too strict, which is D-014's own new risk and not an attack the design inherited
+— taking the extended catalogue from 35 to **36** and the combined total from 54 to **55**; and
+**X36 split rather than moved**, from NP&ND to **DNA / NP&ND by case**, because the solitary-stage
+rule detects K-1's own trace — one dropped frame, both peers still transmitting — while the
+bidirectional-partition residual is genuinely undetected and no repair of X36 removes it. **The
+NP&ND column is at zero again and the sentence that no row occupies it is *not* restored**: a row
+half-occupies it, the half is named in X36's cell, and a bucket that is empty by a split is not the
+same claim as a bucket that is empty because nothing reaches it. Two further notes on the counts.
+**D-014 moved no row between buckets**, which is the honest way to report it: it adds a payoff
+under four D&A and CP labels without changing any label, exactly as D-011 rule 3 removed one. And
+**X37 is the first row this catalogue has ever carried whose attacker is the design's own defence**
+— every other row is something the design must survive, and this one is something the design does.
+Recording it as a row rather than as a caveat inside D-014 is the same discipline that gave X8 the
+V bucket rather than a footnote. **D-011 rule 3 moved no row into a different bucket at all**, and that is
 the honest way to report it: it deleted a payoff that four rows carried, which
 shrinks the worst case underneath four labels without changing any label. One
 row counts in exactly one line of this table; X7 has its own line because its
@@ -1188,7 +1281,10 @@ forcing it into either bucket would overstate one case.
 
 None of X30 to X36 makes the system safer than it was believed
 to be: all seven are defects that successive review passes found in the corpus
-itself, each worse or more reachable than the one before, and each is counted here
+itself, and **X37 is the eighth and the first that a decision created on
+purpose** — it is the price of D-014 rather than a mistake in it, which is why it
+is catalogued at the moment the decision lands instead of at the pass that would
+otherwise have found it, each worse or more reachable than the one before, and each is counted here
 as an attack the design has to answer rather than as a feature. The pattern the
 counts do not show is that the first three are two failures wearing three faces —
 a rule scoped on a quantity the attacker controls (X30), and a slot key coarser
@@ -1226,12 +1322,18 @@ Read the CP column with A3 and A4 in mind. Rows 1–4 of the §17 table — four
 seventeen CP entries, and the four that matter most to the integrity of the deck —
 rest on the soundness of an unaudited 1779-line implementation of Bayer–Groth. If
 that review fails, those four move to **NP&ND**, the worst bucket in the scheme.
-**That bucket is no longer empty, and the sentence that stood here — that no row
-occupies it — is withdrawn rather than reworded.** X36 occupies it. The two cases
-must not be read as the same, and the difference runs the wrong way for comfort:
-rows 1–4 would fall into NP&ND *if an assumption fails*, whereas **X36 is there
-now, under the assumptions exactly as stated, and needs no attacker to get
-there**.
+**That bucket was occupied by X36 and the sentence that no row occupies it was
+withdrawn; it is still withdrawn, and the reason has changed rather than
+disappeared.** X36's split leaves the bucket at zero rows and **half** a row: the
+case in which either peer is still transmitting is now detected (DNA), and the
+case of a total bidirectional partition is not, and is not repairable by anything
+this row could do. The two cases must not be read as the same, and the difference
+runs the wrong way for comfort: rows 1–4 would fall into NP&ND *if an assumption
+fails*, whereas **X36's residual is there now, under the assumptions exactly as
+stated, and needs no attacker to get there**. What may be claimed after this pass
+is the narrower sentence X36's cell states: a divergence between honest peers is
+detected **wherever either peer is still transmitting**. What may not be claimed
+is the sentence that was withdrawn.
 
 ### 5.5 The `SPEC_CS.md` §25 malicious peers, mapped to rows and tests
 
@@ -1261,6 +1363,50 @@ a test failure.
 | `CheaterReadOpponentCard` | §5.2 row 6; G1 | `tests/adversarial/hole_card_secrecy.rs` | **CP** — a coalition of `n-1` holding every message it legitimately received cannot output the victim's hole cards. *Inherits A1.* |
 | `CheaterFutureBoard` | §5.2 row 7; X3; G2 | `tests/adversarial/street_gating.rs` | **CP** for opening a future street's index; **D&A** for the attempt — an early reveal token opens nothing and is rejected and attributed. *Inherits A1, A10.* |
 | `CheaterDisconnect` | X7, X8, X30, X32, X33, X34, X36; §7 | `tests/adversarial/disconnect.rs` | **D&A with one silent seat where `\|V(subject)\| >= 2`; DNA with two or more silent seats; DNA wherever `\|V\| < 2`, which at `n = 2` is always** — matching X7's split class. The test must cover all three cases, and under **D-010** the chip assertion is now the same on all three and is the strongest one available: **no chips move and every stack is bit-identical to its start-of-hand value**, whatever the cause and whoever is attributed. The `\|V\| < 2` abort additionally carries `attributed = []` (`PROTOCOL.md` §8.4). A test that asserts forfeiture on any branch is testing a mechanism this version does not have. It must also cover **X30**, because D-008's floor is only as real as the check that enforces it: a client emitting `TIMEOUT_VOTE`s against several seats must **not** thereby shrink `V` — exclusion requires a completed, valid certificate — and a certificate assembled with `\|V\| < 2` must have no effect at **any** seat count, not merely at two. "No effect" is to be asserted at its strongest (D-009 rule 2): the certificate is not chained, produces no `AbortRecord`, moves no chips **and does not end the hand** — the test must show the hand still running afterwards and ending only when `hand_deadline_ms` expires. Under D-010 the reason for that last assertion is narrower than it was and the test comment must say so: the escape it protects is **not** closed any more (X8 is V), so what the assertion buys is that the escape costs the full deadline of visible stalling rather than one signature, and that no chained event names a victim on the strength of one peer's word (§7.3(c)). **And it must assert the liveness half of X32 on the shipped configuration**: with one seat silent at a collective stage and the hand deadline expired, the terminal abort emitted by a seat that already contributed to that stage is **accepted**, the hand ends, and the next hand begins. A disconnect suite that only checks chip outcomes passes on a table that can never start another hand.<br><br>**And it must assert X33's D-012 property, which the X32 assertion above does not reach.** Drive the two abort paths that can end one hand differently — a certificate that names a peer, and the hand deadline that names nobody — and assert that **every peer's next-hand `dealt_in` and `bb_seat` are identical** and that hand `k+1` actually completes its opening collective stage. The failing version of this test passes every chip assertion, every terminal-value assertion and the X32 liveness assertion, and then hangs at hand `k+1`; that is what makes X33 worth its own assertion rather than a comment. Assert it directly at the source too: **no code path reads a seat's status out of an `AbortRecord`**, for `attributed` or for any other field. **Three cases added by D-013, and the last of them is the one this test cannot currently express.** The disconnect suite must show that a silent seat stalls **exactly one** hand and is skipped from the next — not stalled repeatedly, which is **X34**, the fixed point D-012 left behind and D-013 removed; that such a seat is blinded off until it **busts**, since that is what lets a tournament with a silent seat end at all; and that it comes back **only** by signing a chained event, never by reconnecting a socket, which is §7.3(b) as corrected. The third is **X36** and it is open: a test can produce the fork — drop one frame at a stalled stage on an aborted hand — but there is no assertion available that fails, because both peers are internally consistent and no checkpoint compares them. The honest form is a **cross-peer** assertion the harness makes from outside the protocol, comparing the two peers' tournament results directly and failing if they disagree, marked as testing a defect rather than a property until `DECISIONS.md` K-1 is decided. A suite that only asserts each peer's own consistency passes this fork, which is exactly how it survived a gate. |
+
+**What D-014 adds to the *Asserted outcome* column, stated once for the whole table
+rather than in eleven cells.** Every outcome above still holds unchanged; each row
+gains a second assertion where D-014's tiers reach it, and §5.2's re-classification
+table is the mapping. `CheaterDuplicateAce`, `CheaterReplaceCard`,
+`CheaterInvalidShuffle` and `CheaterReplayAction` are **tier 1** — the test must now
+also assert that the emitter's seat is `Removed`, that the hand was voided with no
+chip crossing seats, and that no route back in exists (`STATE_MACHINE.md` I34).
+`CheaterIllegalRaise`, `CheaterFakeStack` and `CheaterFutureBoard`'s attempt half
+are **tier 2** — the test must assert **both** halves: a removal *after* the
+governing checkpoint agreed, and **no removal before it**, which is the half that
+catches X37. `CheaterEquivocation` gains nothing and the test must assert that it
+gains nothing: D-014 excludes an equivocation predicate by name, and a harness that
+removes a seat there has reproduced X31 with a new trigger. `CheaterPredictableRNG`,
+`CheaterReadOpponentCard` and `CheaterDisconnect` are outside both tiers —
+statistical, information-theoretic and liveness claims respectively, none of them a
+message whose illegality any peer can decide alone.
+
+**The mirror of this table, which D-014 makes a gate rather than a nicety.** Every
+row above asks *"is this named cheat caught?"* D-014 adds the opposite question and
+makes it blocking, because the answer to it is what stands between an anti-cheat
+and X37:
+
+> **For every legal action an honest client can emit, under every legal
+> interleaving, no honest peer is ever evictable.** No `CheatProven`
+> (`STATE_MACHINE.md` T64, T65) may be producible against a client that followed
+> the protocol.
+
+It is `DECISIONS.md` **D-014-2**, its planned home is
+`tests/adversarial/no_honest_eviction.rs`, and it **blocks shipping the removal
+feature, not writing it**. Three properties make it a different test from anything
+above rather than a re-run of them. It is **universally quantified over honest
+behaviour**, so it cannot be discharged by a `proptest` over legal play that
+happens to pass — the generator must enumerate the interleavings, including the
+ones only a dropped frame produces. It must be run **across two independent
+implementations wherever two exist**, because a tier-1 disagreement between two
+correct-by-their-own-rules validators is the failure mode X37 names and a
+self-consistent single implementation cannot see it — `DECISIONS.md` **C-1 to C-3**
+are three live instances waiting in `src/protocol/`. And it must cover **tier 2 at
+the boundary**: an action that is legal against the last agreed checkpoint and
+illegal against a state that drifted after it must produce no removal, which is
+the K-1 shape and is the precondition's whole purpose. This is the same shape as
+D-009 rule 1's mirror test, and that one was written only after the rule it guards
+had been re-derived wrongly five times.
 
 **The two mandatory standalone tests of `SPEC_CS.md` §25**, which are not tied to a
 named cheater implementation:
@@ -2284,13 +2430,32 @@ carried exactly **one** occurrence of `D-013`. The coverage signature was
 available the whole time and nobody read it, which is the argument for the count
 being reported rather than the sweep being asserted.
 
+**The coverage signature for this pass, reported rather than asserted, because that
+is what the last one is about.** This document carries **27** occurrences of
+`D-013`, **22** of `D-012` and — before this pass — **zero** of `D-014`, which is the
+same signature K-4 was found by, one decision later and in the same file. It is
+reported here rather than in a commit message because a count in a document can be
+re-run by the next reviewer and a claim that a sweep happened cannot. **The same
+check applied outward, since D-012's process rule is corpus-wide and a finding
+correctly assigned across an owner boundary is a finding nobody owns:**
+`CONTRIBUTING.md` and `DEPENDENCIES.md` carry dated sweep records that stop at
+D-012 and **zero** occurrences of D-013 or D-014, while both cite the rule that
+every decision sweep covers every document. That is not this document's to fix and
+is filed as **L8** against those two; one row each recording *"no change, and here
+is why"* discharges it, and leaving a record that reads *"swept against D-009 to
+D-012"* two decisions later is precisely what J-5 is about.
+
 | # | Question, in `DECISIONS.md`'s wording | Where this document depends on it |
 |---|---|---|
 | **OQ-A** | *"A named, versioned reference engine, since several sections claim disputes are 'deterministically adjudicable by any third party running the reference engine' and no such engine is defined (review N2). Interim answer: withdraw the claim; the engine is defined when the crate has a tagged release."* | X29's third bound, which is **evidence preservation, not recourse**, until this is answered; §9.1.2 limitation 5; the withdrawn "deterministically adjudicable offline" claim wherever it appeared |
 | **OQ-D** | *"A dispute path that does not require the accused peer's signature — circular at every table size, not only heads-up (D-007 point 4, review A-1). Interim answer under D-010: a dispute that cannot resolve ends the hand neutrally, so the circularity costs a hand rather than a stalemate."* | X7; §7.3(c). Formerly this document's `OQ-B` |
 | **OQ-F** | *"Whether `TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` should still be produced in the MVP now that D-010 gives them no effect, or be deferred wholesale until the machinery is sound. Producing them keeps the transcript adjudicable later; deferring them removes four passes' worth of surface."* | X10, X30, X31, X32 and the `CheaterEquivocation` / `CheaterDisconnect` rows of §5.5 all describe machinery this letter asks whether to build at all. It changes what ships rather than what is true, so no classification here turns on it |
 | **OQ-E** | **Blocking.** How is a timeout certificate constructed when two or more seats are simultaneously unresponsive, and whom does it attribute? `signers == participants \ {subject}` is unachievable, and attributing every non-voting seat punishes honest seats behind a partition. The interim behaviour is to abort with no attribution and no chip movement, which lets two colluding seats void a hand for free. Blocking for Phase 4. | X7 (DNA case); §7.3(c). **This letter is this document's own**, referenced by `PROTOCOL.md` Q-02 and `STATE_MACHINE.md` Q3 and defined nowhere else |
-| **K-1** | **Blocking, and this document's heaviest open item.** *“The required emitter set is a per-receiver quantity on the one path where it narrows, and its payoff is a silent permanent fork.”* The set is agreed between honest peers exactly where it is inert and per-receiver exactly where it acts — a stalled stage on an aborted hand — and the argument offered for it inverts the witness-independence property it rests on. Owner decision needed: ratify the stalled stage, or floor the set at two members. A second quantity, whether a peer's own emission counts toward its own participation record, is undefined in both owning documents and decides which of two failures occurs. | **X36**, the only **NP&ND** row in the catalogue, and the reason §9.3 carries a seventh qualification. This document cannot classify the row any higher until the decision is taken, and cannot claim that honest divergence is always detected while it stands. `DECISIONS.md` **K-3** would move it from NP&ND to DNA without deciding K-1, by checkpointing a hand that placed no other checkpoint. |
+| **D-014-1** | **Open, and this document's row is discharged in this pass while the corpus's is not.** *"Integrate D-014 across the corpus: the two evidence tiers, the checkpoint precondition for tier 2, the one-way exit, the dead seat blinded off, and the information window. Touches all five specification documents."* | §5.1's D&A definition, §5.2's re-classification table, §5.3's **X37**, §5.5's tier column and the mirror gate. What this document does **not** own and must not be read as settling: the wire representation of a removed seat — `PROTOCOL.md` §6.1's `PublicTableState` hashes `sitting_out` and no longer hashes `absent`, so a `Removed` seat is canonical per-seat state that **no vector hashes**, and two peers that disagree about a removal would agree on every hashed vector. That is filed as `D-014-3` |
+| **D-014-2** | **Blocking for shipping the removal, and it is this document's gate.** *"The mirror test D-014 requires: under every legal interleaving, no honest peer is evictable."* | **X37**, whose whole content is what happens if this is not run, and §5.5's mirror block, where it is specified as a test. Nothing here classifies the removal feature as safe until it passes; X37 is DNA today and stays DNA |
+| **D-014-3** | **New in this pass, opened by D-014's own integration.** How does a removal reach canonical state? D-014's safety argument is that every honest peer reaches the same verdict from data it already holds — true of the **verdict** and not of the **holding**: whether the offending message reached this peer is per-receiver, and a seat's status is canonical state (D-012, `STATE_MACHINE.md` I30). So the *evidence* must itself be chained, which needs a message type, a stage, a chain position, and an answer for a peer that never received the offending message. **Owner: `PROTOCOL.md`.** | X37's mechanism half. Until it is answered, a removal derived from a locally observed fact is a D-012 violation wearing D-014's name, and this document classifies nothing on the assumption that it will be answered one way rather than another |
+| **K-1** | **CLOSED since this row was written, and the row is kept for the trail rather than as an open item.** The disposition is detection, not prevention: `PROTOCOL.md` §3.2's **solitary-stage rule**, with the engine half at `STATE_MACHINE.md` T62, T63, §9.3 condition 0.6 and I33. The sub-question this row calls undefined is answered — a peer's own emission **does** count toward its own participation record — and `DECISIONS.md` **K-3** landed too, so every hand now places a checkpoint. **X36 is split rather than moved** (DNA where either peer is still transmitting, NP&ND under a total bidirectional partition) and §5.4 records it as a split. The sentence this document may now make is the narrow one in X36's cell, and the wide one it withdrew stays withdrawn. | **X36**, and §9.3's standing caution, which is corrected in the same pass |
+| **K-1 (as it stood)** | **Blocking, and this document's heaviest open item.** *“The required emitter set is a per-receiver quantity on the one path where it narrows, and its payoff is a silent permanent fork.”* The set is agreed between honest peers exactly where it is inert and per-receiver exactly where it acts — a stalled stage on an aborted hand — and the argument offered for it inverts the witness-independence property it rests on. Owner decision needed: ratify the stalled stage, or floor the set at two members. A second quantity, whether a peer's own emission counts toward its own participation record, is undefined in both owning documents and decides which of two failures occurs. | **X36**, the only **NP&ND** row in the catalogue, and the reason §9.3 carries a seventh qualification. This document cannot classify the row any higher until the decision is taken, and cannot claim that honest divergence is always detected while it stands. `DECISIONS.md` **K-3** would move it from NP&ND to DNA without deciding K-1, by checkpointing a hand that placed no other checkpoint. |
 
 **The mapping from this document's former labels, recorded once so an old
 cross-reference can still be followed, and not to be maintained:**
@@ -2358,8 +2523,8 @@ getting it accepted at all is X32.
 
 ### 9.3 The standing caution
 
-This document classifies **17 of 54** catalogued attacks as cryptographically
-prevented. That number is meaningful only alongside seven qualifications, and it
+This document classifies **17 of 55** catalogued attacks as cryptographically
+prevented. That number is meaningful only alongside eight qualifications, and it
 must never be quoted without them:
 
 1. Four of those seventeen — the deck-integrity rows — rest on **A3 and A4, which
@@ -2398,17 +2563,38 @@ must never be quoted without them:
    it may not be described as bounded, deterred or expensive. `SPEC_CS.md` §18
    requires exactly this distinction to be drawn: some cheating is prevented, some
    is detected, and this one is merely visible.
-7. **One divergence is neither prevented, nor detected, nor out of reach, and it
-   needs no attacker: X36.** Two honest peers fork, each finishes the tournament
-   alone, and each client tells its player it won. Nothing rejects it, no
-   invariant fires, no proof forms, and — the part that makes this the heaviest
-   qualification on the list — **no peer ever learns that it happened**, so
-   there is no moment at which anything could be shown to a human. Qualifications
-   1 to 6 all restrict what *prevented* means; this one restricts what *detected*
-   means, and it is the reason §5.1 gained the NP&ND bucket. It is open, it is a
-   blocker, and it is `DECISIONS.md` **K-1**. While it stands, **no claim in this
-   document that divergence is always at least detected is true**, and any such
-   claim found in a future revision is a defect in that revision.
+7. **One divergence was neither prevented, nor detected, nor out of reach, and it
+   needed no attacker: X36.** Two honest peers fork, each finishes the tournament
+   alone, and each client tells its player it won. Qualifications 1 to 6 all
+   restrict what *prevented* means; this one restricts what *detected* means, and
+   it is the reason §5.1 gained the NP&ND bucket. **`DECISIONS.md` K-1 is now
+   decided and the qualification narrows rather than lifts.** The solitary-stage
+   rule makes the fork's own trace — one dropped frame, both peers still
+   transmitting — **detected**: the peer that narrowed freezes on the first
+   contradicting event, unilaterally, and the table closes rather than reaching a
+   private "tournament won". So the sentence this document may now make is
+   *divergence between honest peers is detected wherever either peer is still
+   transmitting*. **The sentence it withdrew stays withdrawn**, because a total
+   bidirectional partition still ends in two peers each draining the other with no
+   wire evidence separating that from the case the drain exists for, and no repair
+   of X36 removes it — it is what the drain does under a partition however the
+   required set is defined. Any revision that restores the unqualified claim, in
+   either direction, is a defect in that revision.
+8. **One risk in this catalogue is created by the design's own defence, and it is
+   the newest: X37.** D-014 removes a player who sends a provably illegal message,
+   which makes **the correctness of every validator** load-bearing against a
+   *person* rather than against a message. A validator that is too strict now
+   ejects an honest player, and this corpus has produced state divergences between
+   honest peers — K-1 among them — in four consecutive passes, which is exactly
+   how an honest player's legal action comes to look illegal. The mitigation is a
+   **precondition**, not a caveat: a tier-2 removal requires the accused's message
+   to be judged against state fixed by a checkpoint both peers signed. Tier 1
+   needs no checkpoint and correctly needs none, but "tier 1" is a claim about a
+   validator and not about a message, and `DECISIONS.md` C-1 to C-3 are three live
+   validator disagreements in the shipped `src/protocol/`. **The gate is D-014-2**
+   — under every legal interleaving, no honest peer is evictable — it is the
+   mirror of `SPEC_CS.md` §25's cheater list, and until it is run the removal
+   feature may not be described as safe here or anywhere.
 
 The count fell from 18 to 17 in the Phase 0 review: X11 claimed the race between a
 late action and a timeout certificate was structurally excluded, and that claim was
@@ -2418,12 +2604,22 @@ The denominator has since risen seven times for the same reason in the other
 direction: X30 to X36 are attacks the corpus was carrying without
 knowing it, and adding them enlarges the total rather than the CP column. The
 proportion classified as prevented falls when a review works — it has fallen from
-18/47 to 17/54 across seven passes, and **not one of those passes made anything
+18/47 to 17/55 across eight passes, and **not one of those passes made anything
 cryptographically preventable that was not preventable before**. The last three
-additions needed no attacker at all.
+additions before X37 needed no attacker at all; **X37 needs no attacker either, and
+it is the first whose cause is a decision this project took on purpose.**
 
-**Neither D-010, nor D-011, nor D-012, nor D-013 moved the CP column at all, and
-that is the point worth making about all four.** Removing automated forfeiture, then removing
+**Neither D-010, nor D-011, nor D-012, nor D-013, nor D-014 moved the CP column at
+all, and that is the point worth making about all five.** D-014 is the first to
+give a payoff back rather than delete one — a tier-1 attacker now loses its seat —
+and it still moved no row into CP, because what an adversary can *construct* is
+unchanged by what happens to it afterwards. What it changed is the **worst case at
+the end of a row**, which is where D-010 and D-011 rule 3 did their work too, in
+the other direction. The three decisions should be read as one movement measured
+three times: **the payoff at the end of a D&A row is the thing this corpus keeps
+getting wrong**, first by making it too large (forfeiture, eviction on a predicate
+that failed five times), then by deleting it entirely, and now by restoring the
+part of it that rests on a message the accused signed. Removing automated forfeiture, then removing
 automated eviction from every layer, did not make one attack cryptographically
 preventable. D-010 made five attacks worthless and one attack free. D-011
 rule 3 made four more worth less without moving a single label, and D-011 rule 2

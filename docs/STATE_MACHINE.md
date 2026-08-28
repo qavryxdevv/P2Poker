@@ -191,9 +191,34 @@ pub enum SeatStatus {
     Leaving,     // announced PLAYER_LEAVE at a hand boundary (T58). Not dealt in, posts
                  // nothing; removed and its stack taken off the table at the next hand
                  // init (§5.3 step 0), which is where ledger_out moves.
+    Removed,     // D-014: removed for cause on self-authenticating evidence (T64, T65).
+                 // Pays blinds/antes and takes no cards, exactly as Absent was specified
+                 // to; unlike every other variant it is ONE-WAY (I34).
     Busted,      // stack == 0, eliminated, position retained for the dead button
 }
 ```
+
+**`Removed` is new and it is D-014's, and it is the first status in this enum that is absorbing.**
+D-014 point 3 says a removed seat's *"seat becomes dead and its stack is blinded off, precisely as
+D-005 treats an absent seat, until the stack is gone"*, and point 4 says the exit is one-way. Both
+halves need a variant of their own: `Absent` is unreachable by construction (below) and would
+anyway be re-enterable through T59, `SittingOut` is the seat's own declaration about itself and is
+re-enterable by the same transition, and `Leaving` posts nothing and empties the seat at the next
+hand init — which would take the stack off the table and change `ledger_out`, the one thing D-014
+point 3 exists to prevent. So `Removed` behaves like `Absent` for the blinds (§5.3 steps 6–7) and
+like nothing else for re-entry: **T59 refuses it, and no transition assigns any other status to a
+seat that holds it** (I34).
+
+**Two things this variant owes and does not have, and both are `PROTOCOL.md`'s (D-011 rule 1).**
+First, a **wire representation**: `PROTOCOL.md` §6.1's `PublicTableState` carries `sitting_out` and
+no longer carries `absent`, so `Removed` is canonical per-seat state that **no vector hashes**. Two
+peers that disagree about a removal would therefore agree on every hashed vector — a removed seat
+posts the same blinds and holds the same stack as an `Active` one that folds every hand — and the
+disagreement would surface late and indirectly, through `pots.eligible`, or not at all. Second, the
+**provenance**: I30(a) requires a status to move only through an event every participant accepted
+as chain content, so the *evidence* must be chained, not merely received. Both are filed as
+`D-014-3` in `DECISIONS.md`'s open list, and §5.2's D-014 box states what this document does in the
+meantime.
 
 `Leaving` exists because a departure is **announced** at one hand boundary and **applied** at the
 next hand init: `PROTOCOL.md` §4.4 makes `HAND_INIT`'s `ledger_delta` the one place either ledger
@@ -307,6 +332,15 @@ pub struct TableState {
                                         // step 4 has read it. It is the liveness gate: §5.3
                                         // step 4 and PROTOCOL.md §4.4's required emitter set
 
+    // ---- the solitary regime (PROTOCOL.md §3.2, K-1 / K-9) -----------------
+    pub solitary_since:      Option<u64>,  // the FIRST hand_id this peer dealt with
+                                           // |P(k-1)| == 1; None once P has grown again.
+                                           // The regime is contiguous, so this one u64
+                                           // answers "was I solitary for hand k?" for every
+                                           // finished hand, in the past tense (§5.3 step 9)
+    pub solitary_contradicted: bool,       // T62/T63 set it; only T53 clears it; §9.3
+                                           // condition 0.6 reads it
+
     // ---- the open checkpoint (PROTOCOL.md §6.2) ----------------------------
     pub checkpoint:          Option<CheckpointState>,   // the checkpoint currently open, if any
 
@@ -375,6 +409,30 @@ because both peers derive it from the same completed reconciliation stage, so it
 `STATE_HASH` like any other field. Nothing else in the corpus faults a table: `cause = 1`,
 `2` and `3` all leave it playing, which is what "no timeout ends the tournament" means (§8.1,
 D-006 §5).
+
+**`solitary_since` and `solitary_contradicted` are new, they are the engine half of
+`PROTOCOL.md` §3.2's solitary-stage rule (K-9), and neither is hashed.** Like `checkpoint`,
+`signed_this_hand` and `certified_subjects` they are **not** fields of `PublicTableState`
+(`PROTOCOL.md` §6.1) and this document does not ask for one. That is deliberate and it is the
+answer to the objection an implementer will raise first: *"is a per-receiver freeze not exactly
+what D-012 forbids?"* It is not, and the distinction is the one D-012 itself draws. D-012 forbids
+canonical state being **derived** from a quantity honest receivers can differ on, because such a
+state forks the chain. Whether the contradicting event reached *this* peer is such a quantity — and
+what it produces here is a peer that **emits nothing, completes no stage and writes no chained
+event**. `Diverged` is already entered per-receiver at T50 on exactly the same footing, and
+`faults` is already a per-receiver record. Detection state that stops a peer is a different object
+from canonical state that binds every peer, and the corpus already contains the class; what it did
+not contain, before this pass, was the sentence saying so.
+
+**Why one `u64` is enough, and why the alternative was refused.** The obvious construction is a
+retained per-hand map — `(hand_id, was_solitary, P(hand_id))`, LRU-capped — and it is not needed,
+because **the solitary regime is contiguous**. It begins at the hand init where `|P(k-1)|` first
+equals 1 and it ends at the hand init after `P` has grown; and `P` can only grow, inside the
+regime, through a `0x0804 PLAYER_SIT_IN`, because every other chained event from a seat outside
+`P(k-1)` is the freeze rather than an acceptance (§3.2, §4.0 step 12a). So the set of hands this
+peer dealt solitary is an interval, `solitary_since ..= hand_id`, and the past-tense test T62's
+guard needs is an integer comparison against it. No map, no cap, no eviction policy, and therefore
+no memory bound to argue about and nothing for I22 to catch.
 
 `config.join_deadline_ms` stays in `TableConfig` because it is a signed parameter of the
 advertisement that the **lobby layer** runs its formation timer from (`PROTOCOL.md` §4.3). No
@@ -657,6 +715,13 @@ pub enum Event {
     HandDeadlineAbort  { hand_id: u64, stalled_sequence: u64, parent_hash: Hash },
     FormationAbandoned { },
 
+    // ---- the solitary-stage rule (PROTOCOL.md §3.2, §4.0 step 12a, §6.3 step 1) ----
+    SolitaryDivergence { hand_id: u64, seat: SeatIdx, event_hash: Hash },
+
+    // ---- proven cheating, removal for cause (D-014) ----
+    CheatProven { subject: SeatIdx, tier: CheatTier, evidence_hash: Hash,
+                  judged_at_checkpoint: Option<u16> },
+
     // ---- SPEC_CS.md §15 checkpoint and dispute path (PROTOCOL.md §6) ----
     StateHash  { seat: SeatIdx, checkpoint: u16, sequence: u64, state_hash: Hash },
     StateAck   { seat: SeatIdx, checkpoint: u16, agreed: Hash, checkpoint_hash: Hash },
@@ -670,7 +735,54 @@ pub enum Event {
 }
 
 pub enum DisputeKind { StateHashMismatch, MissingEvent, Equivocation }
+
+pub enum CheatTier { SelfContained, StateDependent }   // D-014's tier 1 and tier 2
 ```
+
+**`SolitaryDivergence` is the carrier K-9 records as missing, and it is the same kind of variant as
+`HandDeadlineAbort` and `FormationAbandoned`: a situation the wire decides and the engine
+consumes.** `PROTOCOL.md` §4.0 step 12a is where the situation is decided — a chained event of a
+hand this peer dealt solitary, from a seat outside `P(k-1)`, other than `0x0804 PLAYER_SIT_IN` —
+and §4.0 step 12a's disposition is that the event is *"not rejected, not applied, and not counted
+into any `P`"*. The engine therefore never sees the offending event itself, which is the point: it
+could be of any of thirty-nine types, and applying it is precisely what must not happen. What
+reaches `step` is the fact, with the hand it names, the seat that signed it, and its `event_hash`
+so the evidence is in the transcript record.
+
+> **What this document needs from `PROTOCOL.md`, stated as a dependency and not as a request
+> (K-9, and the reason this pass coordinates the two halves).** T62's guard is written in the
+> **past tense** — *the hand the event names*, not the hand this peer is currently in — and it is
+> useless unless §4.0 delivers the event that far. §4.0's pipeline drops a chained event naming a
+> hand this receiver has finished, for the ordinary and previously harmless reason that it is late,
+> and a solitary hand is `|dealt_in| == 1`: it self-completes every stage and passes through
+> `Settling` and `HandComplete` at the speed of local computation, because `hand_delay_ms` is
+> deliberately not an engine input (§8.3). **The contradicting event therefore arrives, in the
+> normal case, after the hand it contradicts has closed.** `PROTOCOL.md` is adding the staleness
+> step this pass — a chained event whose `hand_id` names a completed hand is evaluated rather than
+> dropped, and §3.2's regime test stated in the past tense. **If that step lands anywhere after
+> §4.0 step 12, or is scoped on the receiver's current `hand_id`, T62 is unreachable and K-9 is not
+> discharged** — the rule would be correct and never fire, which is exactly the shape the Phase 3
+> gate found. The engine side is written to the past-tense reading and asserts it in I33(a); an
+> editor who changes the wire side to the present tense must delete T62 in the same edit and say
+> what replaces it.
+
+**`CheatProven` is D-014's carrier, and it is an *accepted chained event*, not a local verdict.**
+This is the whole of the difference between D-014 and D-010's forfeiture, and it is the rule the
+removal newly makes load-bearing rather than a restatement of the decision. D-014's safety argument
+is that *"every honest peer reaches the same verdict from data it already holds"* — true of the
+**verdict** and not of the **holding**: whether the offending message reached this peer is a
+per-receiver fact, and `status` is canonical state that enters `state_hash` (I30). A peer that
+removes a seat on a message a second honest peer never received has forked the table, and it has
+forked it in the one direction D-012 exists to forbid. So the engine takes the removal from a
+chained event carrying the evidence, exactly as it takes an abort from a terminal `HAND_ABORT`, and
+**`judged_at_checkpoint` is D-014's tier-2 precondition made checkable**: it is `Some(n)` for a
+`StateDependent` tier and names the checkpoint whose agreed state the accused's message was judged
+against, and `None` for `SelfContained`, which needs none. The wire half — which message type
+carries it, which stage it occupies, its chain position, and how a peer that never received the
+offending message obtains it — is `PROTOCOL.md`'s and is filed as **D-014-3**. Until it lands, this
+document specifies the transitions and an implementation has no event to feed them, which is the
+honest state to leave it in: the alternative is an engine that removes seats on a locally observed
+fact, and that is the defect, not the feature.
 
 `StateHash`, `StateAck` and `Dispute` are the engine's side of `PROTOCOL.md` §6.3's four-step
 divergence procedure; without them the engine could not represent a terminal state the protocol
@@ -916,13 +1028,13 @@ reproduce the identical final state — that is a property test (I22).
 
 ### 5.1 The 20 phases
 
-**The counts, stated once here and referenced elsewhere: 20 phases, 57 live transitions, 32
+**The counts, stated once here and referenced elsewhere: 20 phases, 62 live transitions, 34
 invariants (§10).**
 
-**The transition numbering runs T1–T61 and four numbers are retired, so 61 minus 4 is 57 and the
+**The transition numbering runs T1–T66 and four numbers are retired, so 66 minus 4 is 62 and the
 gap is explained rather than an omission.** A number is retired when its row is deleted, and it is
 never reused, because four documents cross-reference transition numbers by number and silently
-renumbering them is worse than a gap. Anyone counting `| T` rows in §5.2 should find 56; anyone
+renumbering them is worse than a gap. Anyone counting `| T` rows in §5.2 should find 62; anyone
 looking for one of these four should find this table and stop looking.
 
 | Retired | Was | Deleted by | Why |
@@ -1028,6 +1140,42 @@ the invariants from 31 to **32**:
   K-3: §12.1's walk asks whether each hand ends, and a hand that ends with nothing comparable
   emitted passes it.
 
+The eighth pass, against `DECISIONS.md` **K-9**, **L7** and **D-014**, takes the transitions from
+57 to **62** and the invariants from 32 to **34**:
+
+* **T62 and T63 are added (K-9).** They are the engine half of `PROTOCOL.md` §3.2's solitary-stage
+  rule, which §5.3 step 9 previously had no phase for and no transition that consumed. **No new
+  phase**: the target is `Diverged`, which is what §6.3 step 1's freeze already is, and §6.3's
+  second entry condition says so in terms. **Two rows because there are two outcomes** — the rule
+  established when T60 was added — and the second outcome is the one the count would otherwise
+  hide: **`TableClosed` stops being absorbing for exactly this one event class** (T63). It has to,
+  or the rule loses a race it cannot afford: the contradicting event arrives after a solitary hand
+  has closed, forty of those hands close in about five minutes (§12.1.2), and a peer that reached
+  `TableClosed` first would reject the only evidence that its "tournament won" was one half of a
+  fork.
+* **T64, T65 and T66 are added (D-014).** A removal for cause voids the hand and takes the offender
+  out of every set at once. Three rows, because the disposition differs by what is live: a hand
+  (T64, which voids it), a boundary (T65, which does not), and **the setup chain (T66, which
+  removes nobody)** — the roster's seat vector is frozen at `TABLE_READY` (`PROTOCOL.md` §3.1), so
+  a removal there would fork the genesis, and the beacon still stalls to T4 exactly as G4 and P4
+  left it. That is D-014 checked against the two rulings it looks like it reopens, and it does not
+  reopen them.
+* **§9.3 condition 2 is restated on one predicate (L7)** and **condition 0.6 is added**; no
+  transition changes. **T59's `Paused` exit was K-7's mirror of the same defect and was fixed a
+  pass earlier**, which is why L7 was found: two predicates for one question survive in pairs.
+* **I33 and I34 are added** — the solitary freeze's own assertion, and the one-way exit D-014
+  point 4 requires.
+
+**And it records the one thing D-014 changes that no transition shows.** D-010 point 3 forbade
+automated peer removal after four passes in which every severe defect ended with an honest peer's
+chips forfeited; D-014 narrows that ban to its sound core and hands this document a status that is
+**absorbing**. Every other status in §2.4 is recoverable, and every previous defect in this
+document's removal machinery — T8, T11, T12, T55 — was a removal that could not be undone by the
+peer it was wrong about. `Removed` is that same object, and what makes it admissible this time is
+not that the engine is more careful but that the evidence is a message the accused **signed**. If
+the removal is ever driven by anything else — a timer, a vote, a certificate, an `attributed`
+field, a locally observed fact — it is the D-010 defect again and the variant must go with it.
+
 **And it corrects the record, which matters more than the edit.** D-012 recorded the cost of
 deleting T46's marking as *"a stall that repeats every hand"*. That is not what the machine did.
 Marking a seat `Absent` never removed it from `HAND_INIT`'s required emitter set — the set named
@@ -1057,7 +1205,7 @@ pub enum Phase {
                                //  which a seat-state event is legal (§5.2, T58/T59, T61)
     17 HandAborted,            //  SPEC_CS.md §19 / D-005; settles neutrally (D-010, §8.6)
     18 Paused,                 //  §5.3 step 4 would deal fewer than two seats in
-    19 TableClosed,            //  terminal, absorbing
+    19 TableClosed,            //  terminal, and absorbing for every event except one (T63)
     20 Diverged,               //  SPEC_CS.md §15 / PROTOCOL.md §6.3 — a freeze, not a terminal
 }
 ```
@@ -1066,6 +1214,19 @@ pub enum Phase {
 **any** phase the moment two distinct `state_hash` values exist for one checkpoint, and it is a
 **freeze**: no card opens, no action applies, no chips move (`PROTOCOL.md` §6.3 step 1). It is not
 terminal — transcript reconciliation can return the table to the phase it held at the checkpoint.
+
+**Since K-9 it has a second entry condition and it is not a checkpoint comparison** (`PROTOCOL.md`
+§6.3 step 1's second paragraph, §3.2's solitary-stage rule): a peer that dealt a hand with
+`|P(k-1)| == 1` and then receives a chained event of that hand from a seat outside `P(k-1)` freezes
+here, on **T62**, with no second `state_hash` involved. That is one phase serving two triggers, and
+it is one phase on purpose: what §6.3 step 1 specifies is the *freeze* — no card, no action, no
+chip, no stage completed — and both triggers want exactly it. The disposition afterwards is also
+§6.3's, steps 2 to 4, which are already T52, T53, T54 and T60. What the second trigger adds is a
+latch, `solitary_contradicted` (§2.6), because the two triggers differ in one respect that matters:
+a checkpoint divergence that times out costs the table a hand and the table plays on, whereas a
+**solitary** divergence that times out would deal another solitary hand, freeze again on the next
+contradicting event, and repeat every `hand_deadline_ms` forever — J2's fixed point, one link
+further out. §9.3 condition 0.6 is where the latch is read and where that loop is cut.
 
 **Nine** of the twenty — 2, 3, 4, 5, 6, 8, 10, 12 and 14 — are cryptographic waits, and one
 (15) computes the result and then waits for the terminal stage that records it. **Since K-3 one
@@ -1613,8 +1774,8 @@ between two hands. Every reachable `Diverged` has an exit.
 
 | # | State | Trigger | Guard | Next | Side effects |
 |---|---|---|---|---|---|
-| T58 | `HandComplete` \| `Paused` | `PlayerLeft` | seat occupied ∧ `status != Leaving` | unchanged | `status := Leaving`. **No chip moves and neither ledger counter changes here**: the seat is removed and `ledger_out` incremented at the next **hand init** (§5.3 step 0), which T47 runs before §9.3's end conditions are evaluated, so a table every seat has left is empty by the time condition 0 looks at it |
-| T59 | `HandComplete` \| `Paused` | `PlayerSitsOut` / `PlayerSitsIn` | seat occupied ∧ `status ∈ {Active, SittingOut, Absent}` — a seat may sit back in from `Absent`, which is D-006 §4's "sit back in at a hand boundary" | unchanged, **except** `Paused` + `PlayerSitsIn` when **§5.3 step 4's own predicate, evaluated on the state this transition leaves behind, would yield `\|dealt_in\| ≥ 2`** → `AwaitingKeySetup` | `status := SittingOut` / `Active`, effective immediately because no hand is live; on the `Paused` exit, **hand init** (§5.3) |
+| T58 | `HandComplete` \| `Paused` | `PlayerLeft` | seat occupied ∧ `status ∉ {Leaving, Removed}` — **`Removed` is excluded and it is not a detail (D-014, I34)**: `Leaving` empties the seat at the next hand init and moves `ledger_out` by the stack it takes off the table, so without this conjunct a removed player leaves voluntarily one boundary later and walks off with the chips D-014 point 3 exists to blind off | unchanged | `status := Leaving`. **No chip moves and neither ledger counter changes here**: the seat is removed and `ledger_out` incremented at the next **hand init** (§5.3 step 0), which T47 runs before §9.3's end conditions are evaluated, so a table every seat has left is empty by the time condition 0 looks at it |
+| T59 | `HandComplete` \| `Paused` | `PlayerSitsOut` / `PlayerSitsIn` | seat occupied ∧ `status ∈ {Active, SittingOut, Absent}` — a seat may sit back in from `Absent`, which is D-006 §4's "sit back in at a hand boundary". **`Removed` is not in the set and never will be (D-014 point 4, I34)**: this is the transition the one-way exit is one-way *against*, and it is the only place in this table a removed seat could otherwise have re-entered | unchanged, **except** `Paused` + `PlayerSitsIn` when **§5.3 step 4's own predicate, evaluated on the state this transition leaves behind, would yield `\|dealt_in\| ≥ 2`** → `AwaitingKeySetup` | `status := SittingOut` / `Active`, effective immediately because no hand is live; on the `Paused` exit, **hand init** (§5.3) |
 
 **T59's `Paused` exit stops asking whether a seat is *willing* and asks §5.3 step 4 instead
 (K-7).** The guard read *"at least two seats are again **willing** and have chips"*, where
@@ -1764,6 +1925,105 @@ blind, takes no card and joins no `deck.participants`.
 | T53 | `Diverged` | `StateHash` | `round >= 1` ∧ the reconciliation-round stage for the disputed checkpoint is complete over its required signer set ∧ every value in it agrees | the phase held at the checkpoint | resume; nothing was opened and no chips moved while frozen; the hand deadline keeps running |
 | T54 | `Diverged` | `StateHash` | `round >= 1` ∧ the reconciliation-round stage is complete ∧ two distinct `state_hash` values remain in it ∧ **every `transcript_head` in it is equal** — `PROTOCOL.md` §6.3 case (c), byte-identical transcripts and still-different derived states | `HandAborted` | `Fault{StateDivergence}` (already present from T50); `AbortRecord{kind: StateDivergence, attributed: []}` (`cause = 4`); **`table_faulted := true`** — `PROTOCOL.md` §6.4 closes the table, and §9.3 condition 0.5 is where that is applied; **restoration** (§8.6, I27) |
 | T60 | `Diverged` | `StateHash` | `round >= 1` ∧ the reconciliation-round stage is complete ∧ two distinct `state_hash` values remain in it ∧ **two distinct `transcript_head` values remain in it** — `PROTOCOL.md` §6.3 case (b), a peer is missing events it cannot obtain | `HandAborted` | `Fault{StateDivergence}` (already present from T50); `AbortRecord{kind: UnobtainableEvents, attributed: []}` (`cause = 1`, `cert_hash = None`); **`table_faulted` unchanged** — case (b) does **not** fault the table; **restoration** (§8.6, I27) |
+| T62 | any phase except `TableClosed` | `SolitaryDivergence` | **`solitary_since == Some(j)` ∧ `j <= e.hand_id <= hand_id`** — this peer dealt the hand the event names with `\|P(k-1)\| == 1`. **The test is in the past tense and that is the whole of it**: the event's `hand_id`, never the receiver's current phase or current hand (K-9; `PROTOCOL.md` §4.0's staleness step is what delivers it) | **`Diverged`** | freeze, **identically to T50** and by the same reading of `PROTOCOL.md` §6.3 step 1: no `RequestOpen`, no `ArmDeadline`, no chip movement, no stage completed, no pot awarded, no §9.3 end condition evaluated; **the hand deadline is not disarmed**, so T57 and T61 keep their scope; `Fault{SolitaryDivergence}` recording `e.seat` and `e.event_hash` as the evidence; **`solitary_contradicted := true`**. The offending event itself is **not applied and not counted into `signed_this_hand`** (`PROTOCOL.md` §4.0 step 12a), so `P` does not grow from it |
+| T63 | `TableClosed` | `SolitaryDivergence` | same guard as T62 | `TableClosed` — **unchanged, and this is the one event class for which this phase is not absorbing** | `Fault{SolitaryDivergence}`; **`solitary_contradicted := true`**; **`settlement.tournament_winner := None`** — the result is *retracted*, because the only thing this peer computed after the contradiction it had not yet received was a tournament won against a seat that was signing against it. No chip moves, no phase changes, nothing reopens, and **`TableClosed` is still absorbing for every other event type** — I13's cell is where that hole is named |
+| T64 | any phase in which a hand is live — 4–15, and 20 when a hand is live | `CheatProven` | `hand_id > 0` ∧ (`tier == SelfContained` ∨ (`tier == StateDependent` ∧ `judged_at_checkpoint == Some(n)` ∧ checkpoint `n` of this hand reached `agreed.is_some()`)) ∧ `status[subject] != Removed` | `HandAborted` | **the hand is voided, neutrally and by the existing mechanism**: `AbortRecord{kind: ProvenCheat, attributed: [subject], owed: [], observed_by: ∅}`, restoration follows at T46 (§8.6, I27), so no chip crosses between seats; `Fault{ProvenCheat}` carrying `tier` and `evidence_hash`; **`status[subject] := Removed`**; `dealt_in[subject] := false`; `deck.participants -= {subject}`; `signed_this_hand -= {subject}`; `certified_subjects -= {subject}`; if `player_to_act == Some(subject)` then `None`. **`SPEC_CS.md` §22's information window is driven by the `Fault` record and needs no new effect**: `Effect::Fault(FaultRecord)` is already declared *"for the reputation counter and the GUI"* (§4.2), and the record carries the subject, the tier and the evidence hash, which is exactly the three things D-014 says the window must name. **The window must also say the hand was voided and that no chips changed hands** (D-014), and that is not a claim the GUI makes on its own — it is I27, asserted after the T46 this row leads to, so nobody reads a void as a loss |
+| T65 | `HandComplete` \| `Paused` \| `Diverged` when no hand is live | `CheatProven` | as T64 | unchanged | the same removal side effects as T64 **minus the abort**: there is no live hand to void, so no `AbortRecord` and no restoration — `Fault{ProvenCheat}`, `status[subject] := Removed`, the four set removals, and the same `Effect::Fault` the window is built from. The seat is skipped from the next hand init onward by §5.3 step 4, which already reads `status == Active`. **The window here says the removal and *not* a void**, because there was no hand to void — a removal at a boundary costs the table nothing at all |
+| T66 | `Seating` \| `AwaitingSeatRngCommit` \| `AwaitingSeatRngReveal` | `CheatProven` | `hand_id == 0` | unchanged | `Fault{ProvenCheat}` and **nothing else — no seat is removed** (see the box below). The beacon stalls to **T4** exactly as it did before D-014, no chips exist to conserve (`ledger_in == 0`), and the table never starts |
+
+> **The solitary regime in the engine — normative, and this is the engine half of `PROTOCOL.md`
+> §3.2 (K-9).** `PROTOCOL.md` owns the wire half, the required emitter set `P(k)` and its
+> notation; this section owns the phase, the transition and what leaves it, and restates neither
+> (D-011 rule 1).
+>
+> **Which peer, and which hand.** This peer is in the **solitary regime** for hand `k` when the
+> value of `signed_this_hand` that §5.3 step 4 read at hand `k`'s init — `P(k-1)`, the required
+> emitter set of every collective stage of hand `k` — has exactly one member. It is entered at
+> hand init and recorded there as `solitary_since`; it is left at the first hand init at which
+> `|P(k-1)| > 1`, which inside the regime can only follow an accepted `0x0804 PLAYER_SIT_IN`.
+>
+> **Why `|P(k-1)| == 1` is the test and not "`P(k-1) == {me}`", which is what §3.2 says.** `step`
+> is pure over `TableState`, and `TableState` has no `me`: the seat index of the local peer lives
+> in `LocalView` (§2.9), which `step` may not read, and reading it would break I22 and make every
+> peer's derivation of its own state a different function. The two forms are nevertheless the same
+> predicate here, and the reason is K-1's answered sub-question: **a peer's own emission counts
+> into its own `signed_this_hand`**, and this peer emits its own `HAND_INIT` copy at every hand
+> init (T47 and T61 both publish it), so `self ∈ signed_this_hand` from the first step of every
+> hand. A one-member set therefore has the local seat as its member, necessarily. That is the
+> whole reason a rule written about *self* is expressible in a state type that has no self, and it
+> is worth checking rather than believing: if a future edit ever lets a peer skip its own
+> `HAND_INIT` copy, this guard silently starts naming somebody else and T62 fires on the wrong
+> hands.
+>
+> **What the freeze is.** `Diverged`, on **T62**, with the T50 body: nothing opens, nothing
+> applies, no chip moves, no collective stage completes, no pot is awarded and §9.3 is not
+> evaluated. **That is the whole point**, and it is the property §3.2 buys with it — a peer that
+> has narrowed to one member may not finish a tournament in silence while another seat is signing
+> against it.
+>
+> **What releases it, and there are exactly four exits.** (1) **T53** — the reconciliation stage
+> for the last checkpoint completes carrying one value: the divergence was real and is repaired,
+> play resumes at the phase held, and T53 **clears `solitary_contradicted`**. It is the only thing
+> that clears it. Note that this exit exists *because of K-3*: a solitary hand now places
+> checkpoint 8 (T45, T46), so there is a stage for the reconciliation round of `PROTOCOL.md` §4.9
+> to chain from. Before K-3 there was none, and §3.2 and §6.3 still say so — *"There is no
+> checkpoint on that path to compare hashes at"* — which is stale by one pass and is filed as a
+> cross-owner item. (2) **T54** — case (c), which already faults the table. (3) **T60** — case
+> (b). (4) **T57** or **T61**, the timers, if nothing reconciles. Exits 2, 3 and 4 all reach
+> `HandComplete` through T46, where **§9.3 condition 0.6** reads the latch and closes the table.
+>
+> **Why the latch, and it is the check this fix owes rather than an extra.** Exits 3 and 4 leave
+> the table playable by design — case (b) *"costs the table a hand, not the table"* (§9.3
+> condition 0.5's note), and a hand-deadline abort never faults anything. Applied to a solitary
+> divergence that is wrong, and wrong in the shape this document has now been caught by four
+> times: the table plays on, deals another solitary hand, meets the next contradicting event,
+> freezes again, times out again, **every `hand_deadline_ms`, forever**. Every phase would have an
+> exit, every hand would end, and the table would make no progress — J2's fixed point exactly, on
+> the path K-1's fix newly made load-bearing. The latch is what makes the freeze terminal unless
+> something actually reconciles, and `SPEC_CS.md` §19's ranking is what licenses it: *"Security má
+> přednost před pohodlným dokončením handy."*
+>
+> **What it does not do.** It does not touch the drain. A peer that is genuinely alone receives no
+> contradicting event, T62 never fires, and §12.1.2's forty drain hands and their ending are
+> unchanged — which is the property §3.2 insists on, because deleting the drain is what the
+> rejected alternative did.
+
+> **D-014's removal, and the two rulings it looks like it reopens but does not.**
+>
+> **It does not reopen G4 or P4.** T11 stopped unseating a seat whose RNG opening does not match
+> its commitment, and T8 and T12 were deleted, both under D-010 point 3. A commitment mismatch is
+> *exactly* D-014 tier 1 — two messages the accused signed, decidable from those messages alone —
+> so the narrowing D-014 makes would put the unseating back. **T66 is the row that refuses it, and
+> the reason is not D-010 at all**: `PROTOCOL.md` §3.1 freezes the seat vector of `roster_hash(k)`
+> at `TABLE_READY` for the life of the table (K-2), the beacon is in the setup chain **after**
+> `TABLE_READY`, and `GENESIS(k)` is a function of `roster_hash(k)`. Removing a seat there does not
+> punish anybody — it **forks the genesis**. The cost of refusing is nil: no `HAND_INIT` has
+> happened, `ledger_in` is `0`, no card exists, and T4 closes the table with nobody named (§12.1
+> row 1). D-014 buys nothing before hand 1 because there is nothing yet to protect.
+>
+> **It does not reopen D-010, and the boundary is the evidence and not the severity.** No removal
+> on a timeout, on a missing publication, on an `EquivocationProof`, on `attributed`, on a vote or
+> on a certificate — D-014 says so and this table obeys it: every one of T15, T16, T21, T22, T27,
+> T34, T41, T44, T48, T54, T57, T60 and T61 keeps exactly the disposition it had, and **not one of
+> them gains a removal**. `CheatProven` is a separate event with a separate row, and if an
+> implementation ever derives it from the trigger of any of those rows it has rebuilt D-010's
+> forfeiture with a new name.
+>
+> **Why the offender's chips stay on the table.** D-014 point 3: the seat is dead and the stack is
+> blinded off until it is gone. That is not leniency, it is **I1**. `ledger_in − ledger_out` is the
+> right-hand side of the ledger identity, `ledger_out` moves only in hand init step 0 and only for
+> a seat that announced `PLAYER_LEAVE` (I28), and taking a removed seat's stack off the table would
+> move the left-hand side without moving the right. So the removal moves **no chips at all** — T64
+> and T65 are the only rows in this table that change a `status` and move nothing — and the stack
+> drains through steps 6 and 7 exactly as a silent seat's does, busts at step 2 in a bounded number
+> of hands, and §9.3 condition 1 fires normally (§12.1.1's decreasing measure, unchanged).
+>
+> **Why the offender leaves every set at once, and what it costs.** Under **D-013** the offender
+> would drop out of `P` anyway the moment it stopped signing, and out of `dealt_in` at the boundary
+> after that — one or two hands (§12.1.2). T64 takes **the same exit, at once and for cause**, so
+> nothing new is being invented about what a non-participating seat is; what is new is only the
+> *timing* and the fact that it is not reversible. The cost is one hand voided, which is what an
+> abort already costs.
 
 **T53 and T54 are triggered by an event, not by a phrase.** Their Trigger column previously read
 "transcript reconciliation completes, derived states now agree / still differ", which is a
@@ -1959,10 +2219,26 @@ Pure, no events, no clock. In this exact order:
    `button_pos := old sb_pos`; then apply the TDA 34-B heads-up adjustment if exactly two seats
    remain with chips.
 4. `dealt_in[s] := (status == Active ∧ s ∈ signed_this_hand)` for every seat with `stack > 0`.
-   `SittingOut`, `Absent` and `Busted` seats get `dealt_in = false` (D-005, D-006 §4), **and so does
-   a seat that signed nothing in the hand just ended (D-013, J2).** `signed_this_hand` still holds
-   hand `k`'s set at this point; step 8 clears it, which is why these two steps are in this order
-   and not the other.
+   `SittingOut`, `Absent`, `Removed` and `Busted` seats get `dealt_in = false` (D-005, D-006 §4,
+   D-014), **and so does a seat that signed nothing in the hand just ended (D-013, J2).**
+   `signed_this_hand` still holds hand `k`'s set at this point; step 8 clears it, which is why
+   these two steps are in this order and not the other.
+
+   **Two sentences K-1's fix owes this step, one each, and neither is a new rule (K-9).**
+   **(i) A peer's own emissions count into its own `signed_this_hand`.** `step` adds
+   `sender_seat` on every event it accepts as content of the current hand, and it does not
+   special-case the local seat — so this peer is in its own set from its own `HAND_INIT` copy
+   onward, every hand. `PROTOCOL.md` §3.2 settles it on the wire side by reductio: the base case
+   is *the signers of `TABLE_READY`*, and under the other reading a peer is never in its own `P`
+   and therefore never a permitted emitter of the `HAND_INIT` it is required to emit. The engine
+   agrees by construction rather than by a clause, and §5.2's solitary box is where the
+   consequence is used.
+   **(ii) A `PLAYER_LEAVE` enters no `P`.** It is accepted at a boundary (T58) and it adds nothing
+   to `signed_this_hand`; the alternative would make every announced departure a required emitter
+   of the hand after it, which is the frozen table D-013 exists to remove, reached through the one
+   message whose whole meaning is that the sender is going. `PLAYER_SIT_OUT` and `PLAYER_SIT_IN`
+   are **not** covered by this exclusion and do count — a seat that sits back in is demonstrating
+   participation, and that is D-013's entire readmission rule.
 
    **On the first hand (T10) the set is the signers of `TABLE_READY`**, which is D-013's base case;
    the engine reaches it without a special case, because `TABLE_READY` is the collective stage that
@@ -2014,9 +2290,16 @@ Pure, no events, no clock. In this exact order:
    **Hand init is the only place it is cleared, so the set spans the boundary window and a paused
    table (K-3b, K-7).** Between two hand inits it means *"every seat heard from since the last hand
    init"*, which includes the checkpoint-8 `STATE_HASH` copies of §5.2's box, the seat-state events
-   T58 and T59 accept, and everything accepted while the table sat in `Paused`. That is what gives
-   a returning seat a way back in without a vote or a human (D-013), and it is what T59's `Paused`
-   exit reads.
+   T59 accepts, and everything accepted while the table sat in `Paused`. That is what gives a
+   returning seat a way back in without a vote or a human (D-013), and it is what T59's `Paused`
+   exit reads. **The one seat-state event excluded is `PlayerLeft` (T58)** — step 4(ii) — and the
+   sentence that stood here named T58 and T59 together, which was wrong on T58's half.
+
+   **`solitary_since` is maintained here, in the same step and from the same read (K-9).** After
+   step 4 has read `signed_this_hand` and before this step clears it: if `|signed_this_hand| == 1`
+   then `solitary_since := solitary_since.or(Some(hand_id))`, else `solitary_since := None`. That
+   is the entire bookkeeping, it is one comparison on a set the step already holds, and §2.6 is
+   where the argument for why one `u64` suffices lives.
 9. Branch:
    * `|dealt_in| == 0` → `Paused` (no blinds are posted; step 6 and 7 are skipped);
    * `|dealt_in| == 1` → the single dealt-in seat wins every posted blind and ante with no cards
@@ -2030,12 +2313,42 @@ Pure, no events, no clock. In this exact order:
      this path that is the only comparison of state two peers ever make;
    * `|dealt_in| ≥ 2` → `AwaitingKeySetup`, `RequestKeySetup`, `ArmDeadline{Crypto}`.
 
+   **The branch K-9 is about, and it is the drain branch read with `P` instead of `dealt_in`.**
+   `|dealt_in| == 1` is *not* the solitary regime and the two must not be collapsed: `dealt_in` is
+   who takes cards, `P(k-1)` is who must emit, `dealt_in ⊆ P(k-1)`, and a table with one dealt-in
+   seat and three sitting-out seats that are all still signing is a perfectly ordinary drain hand
+   with four required emitters and nothing solitary about it. The regime is `|P(k-1)| == 1`, it is
+   recorded at step 8, and **it does not change this branch at all**: a solitary peer still deals,
+   still goes straight to `Settling`, still places checkpoint 8 at T45. That is `PROTOCOL.md`
+   §3.2's ruling and the reason for it — *"a table whose other seats are genuinely gone must drain
+   them, or a tournament never ends and D-013 buys nothing"* — and the rejected alternative,
+   flooring `|P|` at 2, is what would have changed it. What the regime adds is not a branch here
+   but a **transition that can fire later**: T62, on a chained event of a hand this peer dealt
+   solitary from a seat outside `P(k-1)`. Nothing in this step is conditional on it.
+
+   **What K-9 found missing was exactly that transition, and this is the sentence that used to be
+   wrong by omission.** Before this pass, `|dealt_in| == 1 → Settling` was the whole of the
+   solitary path in the engine, `grep -c solitary` over this document returned **0**, and
+   `PROTOCOL.md` §3.2 was carrying a normative rule with no phase to reach and no row to consume
+   it. `Diverged` is the phase, T62 is the row, and §5.2's solitary box is where they are stated.
+
 **Where `signed_this_hand` is accumulated.** Not in any transition row, because it is not any one
 transition's business: `step` adds `sender_seat` to it on **every** event it accepts as content of
-the current hand, before consulting §5.2's table. A `Rejection` adds nothing — a rejected event is
-not chain content, and admitting one would let a peer buy a seat's participation by sending it
-garbage. `HAND_INIT`'s own copies count, which is why a seat that vanishes mid-hand costs a second
-hand rather than one (§12.1).
+the current hand, before consulting §5.2's table, **with exactly three exclusions and no others**.
+A `Rejection` adds nothing — a rejected event is not chain content, and admitting one would let a
+peer buy a seat's participation by sending it garbage. A **terminal `HAND_ABORT`** adds nothing
+(I31(c)): it enters no `stage_hash`, and two honest peers routinely accept copies signed by
+different seats, so counting its signer would put the liveness gate back on a per-receiver quantity
+and is a D-012 violation. A **`PlayerLeft`** adds nothing (step 4(ii)). And a seat whose `status`
+is `Removed` is never added at all (D-014): the removal takes it out of every set at once, and a
+set it could re-enter by signing would be a re-entry route T59 was closed to make impossible.
+`HAND_INIT`'s own copies count, which is why a seat that vanishes mid-hand costs a second hand
+rather than one (§12.1). **A `SolitaryDivergence` adds nothing either, and that one is not an
+exclusion but a consequence**: the offending event is never accepted as chain content — `PROTOCOL.md`
+§4.0 step 12a says it is *"not rejected, not applied, and not counted into any `P`"* — so `step`
+never sees a `sender_seat` for it and there is nothing to exclude. If it did count, the
+contradicting seat would join `P`, the next hand would not be solitary, and the rule would disarm
+itself on the first event it fired on.
 
 ### 5.4 Opening and resetting a betting round
 
@@ -2828,7 +3141,8 @@ pub struct AbortRecord {
     pub kind:               AbortKind,   // NoKey | InvalidShuffleProof | NoShuffle |
                                          // NoDealTokens | NoBoardTokens | NoShowdownToken |
                                          // InvalidRevealProof | HandDeadline |
-                                         // UnobtainableEvents | StateDivergence
+                                         // UnobtainableEvents | StateDivergence |
+                                         // ProvenCheat (D-014, T64)
     pub attributed:         Vec<SeatIdx>,
     pub owed:               Vec<(SeatIdx, Requirement)>,  // exactly what each seat failed to produce
     pub observed_by:        SeatSet,                      // certificate signers
@@ -2855,6 +3169,33 @@ with no `cause` is a defect.
 | `BadKeyProof` | T15 | **no exact value — see below** | the seat | — (`n(3) evidence` carries the failing `DECK_INIT`) |
 | `InvalidRevealProof` | T48 | `3` | the seat and the index | — (same) |
 | `StateDivergence` | T54 | `4` | `[]` | `None` |
+| `ProvenCheat` | T64 | **see below** | `[subject]` | `None` (— `n(3) evidence` carries the message the subject signed) |
+
+**`ProvenCheat` is the second kind whose `cause` is not exactly defined, and it is named here for
+the same reason `BadKeyProof` is (D-014).** §4.10's enumeration is `1` failure to publish, `2`
+invalid shuffle proof, `3` invalid reveal proof, `4` divergence. Where the evidence *is* a failing
+shuffle or reveal proof the mapping is exact — `2` and `3`, and those two aborts already exist as
+T21 and T48, which is why D-014 adds no abort path for them and only adds the removal. Where it is
+a bad signature, a non-canonical encoding, an out-of-range field or a post-checkpoint illegal
+action, none of the four fits by its label. **`cause = 4` is specifically wrong** and is worth
+saying: §6.4 makes `4` close the table (§9.3 condition 0.5), and a D-014 removal leaves the table
+**playing** — that is the whole difference between removing a cheat and faulting a table.
+**Named default the engine builds on:** `cause = 2` with the offending message in `n(3) evidence`,
+on §4.10's own grouping of `2` and `3` as *"the two causes a single chained event proves on its
+own"* — which is D-014's tier-1 definition written a decision early. Whether §4.10 widens `2` or
+adds a value is `PROTOCOL.md`'s, and it is part of **D-014-3**. Until then a reader must not infer
+from `cause = 2` that a shuffle was involved, and this is now the second row that carries that
+warning.
+
+**Attribution here is not the `attributed` field H1 was about, and the distinction is the whole of
+why D-014 is admissible where D-010 was not.** `attributed` on a certificate-borne or
+deadline-borne abort is a per-receiver record of *who was heard*, which is why D-012 forbids
+deriving a `status` from it and why T46's marking was deleted. `attributed` on a `ProvenCheat` is
+the signer of a message in `n(3) evidence` that every peer holding the abort also holds. The field
+is the same field; the quantity behind it is not. **The test that separates them is one question:
+can two honest receivers of the same abort body disagree about the name?** For `NoKey` they can.
+For `ProvenCheat` they cannot, because the name is recoverable from the evidence in the body — and
+that is exactly the property D-014 calls self-authenticating.
 
 `UnobtainableEvents` is new in this revision and is `PROTOCOL.md` §6.3 case (b): the transcripts
 still differ after reconciliation because one peer cannot obtain events every holder refuses to
@@ -3118,8 +3459,8 @@ rejected or replayed event and a derived value cannot.
 
 ### 9.3 End conditions
 
-Evaluated at T47, **after hand init step 0 has applied the announced seat exits**
-(§5.3), in this order:
+Evaluated at T47, **after hand init has run** (§5.3) — step 0 has applied the announced seat exits,
+step 2 has marked the busts and step 4 has computed `dealt_in` — in this order:
 
 0. **Table empty** — no seat is occupied. → `TableClosed`. This is the case "every seat has left":
    each departure was announced by T58 and applied in step 0, so by the time the conditions are
@@ -3135,15 +3476,63 @@ Evaluated at T47, **after hand init step 0 has applied the announced seat exits*
    reconciliation with byte-identical transcripts, which is a client-disagreement bug or a lie,
    never a slow peer. It is numbered `0.5` rather than renumbering `1`–`4`, on the same rule that
    retired transition numbers 8, 12, 55 and 56.
+0.6. **Solitary divergence not reconciled** — `solitary_contradicted` (§2.6) is set. →
+   `TableClosed`. **This condition is new and it is what stops K-9's freeze from being undone by
+   the timer that exists to unfreeze phases.** T62 froze this peer because another seat signed a
+   chained event of a hand this peer dealt believing itself the only required emitter; T57 or T61
+   then ends that hand on the deadline, T46 restores, and without this condition T47 would deal
+   the next one — solitary again, contradicted again, ten minutes again, forever. Only **T53**
+   clears the latch, and T53 means the reconciliation stage completed carrying one value, i.e. the
+   two peers now hold the same state and the seat that contradicted this one is back in `P`.
+   It is numbered `0.6` on the rule that numbered `0.5` and retired transition numbers 8, 12, 55
+   and 56. It does **not** set `table_faulted`: that flag is T54's alone and means
+   `PROTOCOL.md` §6.4's `cause = 4`, which this is not.
 1. **Tournament won** — exactly one seat has `stack > 0`. Append the remaining seats to
    `finish_order`, set `settlement.tournament_winner`, → `TableClosed`.
-2. **Nobody willing** — `|{s : status == Active ∧ stack > 0}| == 0` → `Paused`.
-3. **One willing, others with chips** — the drain case of §5.3 step 9 applies and the hand is
-   played as an uncontested blind steal.
-4. Otherwise → `AwaitingKeySetup` for hand `hand_id + 1`.
+2. **Nobody dealt in** — `|dealt_in| == 0` → `Paused`. **This is §5.3 step 9's own first branch and
+   not a second predicate for the same question (L7).** What stood here read
+   `|{s : status == Active ∧ stack > 0}| == 0`, a status-computed progress path three lines from a
+   participation-computed one, and it is the mirror of the defect **K-7** deleted from T59's
+   `Paused` exit one pass earlier. It was inert — the old condition strictly implies the new one,
+   so the table paused either way — and *"inert because one predicate happens to imply the other"*
+   is precisely what K-7's own argument refuses as a defence: the fix is not to replace one word
+   with another, it is to stop having two predicates. The new form is also **weaker on purpose**:
+   a table of three `Active` seats with chips that have all stopped signing now pauses at this
+   condition instead of dealing a hand that step 9 would have paused anyway one branch later.
+3. **One seat dealt in, others with chips** — `|dealt_in| == 1`, the drain case of §5.3 step 9, and
+   the hand is played as an uncontested blind steal.
+4. Otherwise — `|dealt_in| ≥ 2` → `AwaitingKeySetup` for hand `hand_id + 1`.
+
+**Conditions 2, 3 and 4 are now one predicate read three ways, and that is the whole of L7's
+fix.** They are §5.3 step 9's three branches, in step 9's order, on step 9's quantity; this section
+adds nothing to them and no longer contradicts them anywhere. Conditions 0, 0.5, 0.6 and 1 are
+different in kind — they are about the *table*, not about who is dealt into the next hand — and
+they are evaluated first, which is what keeps condition 1 (tournament won, exactly one seat with
+chips) from being pre-empted by condition 3's drain branch when that seat is the only one left.
+**The ordering matters and it did not change**: hand init runs first, so step 2 has marked the
+busts and step 4 has computed `dealt_in` before any condition here is read.
+
+**What this fix newly makes load-bearing, checked rather than assumed.** The way *into* `Paused`
+and the way *out* of it now read the same predicate: condition 2 is `|dealt_in| == 0`, and T59's
+exit is *"§5.3 step 4's own predicate, evaluated on the state this transition leaves behind, would
+yield `|dealt_in| ≥ 2`"* since K-7. Before this pass they were two different predicates on two
+different quantities, and the gap between them — `Active` seats with chips that had stopped
+signing — was a table that could leave `Paused` for a drain hand it should not have been dealt.
+§12.1's row 18 is where that is discharged and it is unchanged, because neither predicate is an
+exit under total silence.
 
 No timeout, disconnect or abort reaches condition 1 (D-006 §5). A tournament ends only when one
 player holds every chip, or when every seat has left, which is condition 0.
+
+**And no timeout reaches condition 0.6 either, which is the check `SPEC_CS.md` §4 and D-006 §5
+require of every new closing condition.** The latch is set by **T62** and **T63** only, whose
+trigger is another seat's signature on a chained event, and it is cleared by T53. A timer decides
+*when* a frozen table reaches T47 — T57 or T61, as it always has — but no timer can set the latch
+and no timer can close a table that has not been contradicted by a signed event from another seat.
+The two closing conditions this document has added since D-010 therefore rest on the same kind of
+artefact: 0.5 on a completed reconciliation stage (T54), 0.6 on a chained event this peer accepted
+as canonical for a hand it dealt. Neither rests on silence, and adding one that did would be the
+defect D-006 §5 names.
 
 **Condition 1 is now reached through the boundary gate, and that is what checkpoints the tournament
 result (K-3).** These conditions are evaluated at T47, and on the settled path T47 does not fire
@@ -3231,7 +3620,7 @@ a signed advertisement locally would mean two peers playing different games.
 
 ### 9.5 `SPEC_CS.md` §32 — heads-up first
 
-All 20 phases and all 57 live transitions (§5.1) are reachable with `seats = 2` **except**:
+All 20 phases and all 62 live transitions (§5.1) are reachable with `seats = 2` **except**:
 
 * the multi-pot form of `build_pots` (§7.5) and the odd-chip distribution over more than two
   winners (§7.6), both of which require three distinct commitment levels or three tied winners;
@@ -3242,6 +3631,11 @@ All 20 phases and all 57 live transitions (§5.1) are reachable with `seats = 2`
   inert at `|V| = 1`, so no certificate-borne abort is reachable heads-up either. **T57 is
   reachable and is the only *mid-hand* abort path a heads-up stall takes; since K-3 the boundary
   has one of its own, T61, and it too reads no certificate and no voter set.**
+
+**T62 and T63 are reachable heads-up and are the *only* configuration in which K-1's trace is the
+normal case rather than a corner one**, which is the opposite of the pattern above: `|P|` narrows
+to one member soonest at two seats, so the solitary regime is a heads-up regime first. T64, T65 and
+T66 read no voter set and no seat count and are reachable at every table size, including two.
 
 The heads-up-specific rules — button-is-small-blind, inverted post-flop order, TDA 34-B button
 adjustment — are exercised *only* heads-up, so both branches need explicit tests from the start
@@ -3302,7 +3696,7 @@ count seats — plus T34, which starts existing once a hand has `|V| >= 2`. That
 
 `SPEC_CS.md` §26 requires `proptest`/`quickcheck` invariants. Each is a predicate over
 `TableState` (and, where noted, over a `(state, event, state')` triple), asserted after **every**
-transition including rejected ones. **32 invariants**, I1–I32 with no gaps (§5.1).
+transition including rejected ones. **34 invariants**, I1–I34 with no gaps (§5.1).
 
 The nine §26 named invariants map to I1, I10, I9, I15, I6, I8, I7, I12 and I21 respectively; the
 eight of `POKER_RULES.md` A0 map to I1, I6, I10, I9, I4, I8, I7 and I14.
@@ -3321,7 +3715,7 @@ eight of `POKER_RULES.md` A0 map to I1, I6, I10, I9, I4, I8, I7 and I14.
 | **I10** | Card uniqueness | the multiset `board ∪ ⋃_s revealed_hole[s]` contains no duplicate, and every element is in `0..=51` |
 | **I11** | Index discipline | `deck.opened.keys() ⊆ deal_map.all_indices()`, and each index appears at most once |
 | **I12** | Street monotonicity | `street` never decreases, and advances only `PreFlop→Flop→Turn→River`; no street is skipped |
-| **I13** | Phase discipline | every `(phase, phase')` pair appears in the §5.2 table; there is no other edge. **A row whose State column is a scope rather than one phase — T4, T48, T49, T50, T51, T57, T58, T59, T61 — is read as instantiated at every phase in that scope**, so `(any live phase, HandAborted)` on `HandDeadlineAbort` (T57) — **`(Diverged, HandAborted)` included, which is P5's liveness exit** — `(HandComplete, HandAborted)` and `(Diverged, HandAborted)` on the same event where no hand is live (T61, K-3's boundary exit), and `(Seating \| AwaitingSeatRngCommit \| AwaitingSeatRngReveal \| Diverged, TableClosed)` on `FormationAbandoned` (T4) are *in* the table and are not rejections. I13 constrains edges, not the width of a row, and it is **not** a soundness check on the event that took an edge: it cannot tell a justly produced artefact from a manufactured one, and no invariant in §10 can. The two rows this clause used to name, T55 and T56, are deleted (G2) and the numbers are retired |
+| **I13** | Phase discipline | every `(phase, phase')` pair appears in the §5.2 table; there is no other edge. **A row whose State column is a scope rather than one phase — T4, T48, T49, T50, T51, T57, T58, T59, T61, T62, T64, T65, T66 — is read as instantiated at every phase in that scope**, so `(any live phase, HandAborted)` on `HandDeadlineAbort` (T57) — **`(Diverged, HandAborted)` included, which is P5's liveness exit** — `(HandComplete, HandAborted)` and `(Diverged, HandAborted)` on the same event where no hand is live (T61, K-3's boundary exit), and `(Seating \| AwaitingSeatRngCommit \| AwaitingSeatRngReveal \| Diverged, TableClosed)` on `FormationAbandoned` (T4) are *in* the table and are not rejections. I13 constrains edges, not the width of a row, and it is **not** a soundness check on the event that took an edge: it cannot tell a justly produced artefact from a manufactured one, and no invariant in §10 can. The two rows this clause used to name, T55 and T56, are deleted (G2) and the numbers are retired. **Three edges are new in this pass and one of them changes what this invariant is usually read as saying.** `(any phase except TableClosed, Diverged)` on `SolitaryDivergence` (T62) and `(any live-hand phase, HandAborted)` / `(HandComplete \| Paused \| Diverged-no-hand-live, unchanged)` on `CheatProven` (T64, T65) are ordinary widenings. **`(TableClosed, TableClosed)` on `SolitaryDivergence` (T63) is not**: `TableClosed` was described in §5.1 as absorbing, and it is now absorbing for thirty-eight of the thirty-nine event types and not for the thirty-ninth. That is a deliberate hole and I13 is where a reader will look for it, so it is named here rather than left to be discovered: the alternative — a `Rejection`, which I21 requires to leave the state bit-identical — would mean a peer that reached `TableClosed` first keeps a "tournament won" it computed alone against a seat that was signing against it, and discards the only evidence that says so. That evidence arrives late by construction, because a solitary hand self-completes at the speed of local computation and forty of them close in about five minutes (§12.1.2) |
 | **I14** | `player_to_act` validity | `player_to_act.is_some() ⇔ phase ∈ Betting*`; and when some, that seat is `dealt_in ∧ ¬folded ∧ ¬all_in` |
 | **I15** | Never bet more than the stack | every accepted action moves `≤ stack[p]`; `∀ accepted Bet/Raise(t): t ≤ committed_round[p] + stack[p]` |
 | **I16** | `current_bet` definition | `current_bet == max_s committed_round[s]` during a betting round, **except** pre-flop where it is the nominal `BB` (A1.1 rule 3) |
@@ -3341,6 +3735,8 @@ eight of `POKER_RULES.md` A0 map to I1, I6, I10, I9, I4, I8, I7 and I14.
 | **I30** | **Seat status is agreed, and moves only through a chained event** (D-012, H1) | Three parts. **(a) Provenance.** `status[s]` changes only in a transition whose input is an event every participant accepted as chain content: T1/T2 (`Empty → Active` in `Seating`), T3 (`→ Empty`, before any chips exist), T58 (`→ Leaving`), T59 (`→ SittingOut` / `→ Active`), T34's `auto_action_limit` marking applied at the next hand boundary (§8.5), and hand init steps 0 and 2 — `Leaving → Empty` and `stack == 0 → Busted` — which run at T10 and T47, T45 having already marked the busts of the hand it settled. Every one of those is a pure function of state fixed at a hand boundary or of an event every participant accepted as chain content. **That list is exhaustive; a status assignment anywhere else is a defect**, and `Absent` appears nowhere in it, which is H1's edit seen from the invariant side. **(b) No derivation from a per-receiver quantity.** No transition derives a `status` from `abort.attributed`, from `abort.owed`, from `observed_by`, from a `Fault` record, from `deck.tokens`, or from any other value two honest receivers can hold differently — which is the whole of D-012 applied to this field, and which is why T46's `status := Absent` is deleted (§5.2, §8.6). **(c) Cross-peer agreement at a hand boundary.** Two peers that have accepted the same event prefix hold the **identical `status` vector** in `HandComplete`, hence identical `dealt_in` and `bb_seat` from §5.3 for hand `k+1`. **The clause that used to follow — "hence a `HAND_INIT` collective stage that completes" — is deleted as false (J3).** Agreement on the body makes the stage *completable*; completing it additionally requires every member of the required emitter set to emit, which is a liveness property and is outside this invariant's scope — §12.1 is where it is discharged and D-013 is what makes it discharge. The two are worth keeping apart: identical `dealt_in` at every peer is perfectly consistent with a stage that never completes, and before D-013 that was the *normal* case rather than an edge one, so the deleted clause was not merely imprecise — it was the sentence that hid J2 for two passes, and because it carried a test instruction, a harness asserting it passed on every trace where the stage completed and was never run against the trace where it did not. An invariant that is unfalsifiable exactly where the defect lives is worse than no invariant. This is the engine's half of `PROTOCOL.md` §6.1's rule that `sitting_out` and `absent` — which are in `PublicTableState` and therefore in every `state_hash` — *“must be a deterministic function of accepted chained events”*; §6.1 defers **which** events set them to this document, and (a) is that list. Because the two vectors are hashed, a violation surfaces twice: loudly at the next checkpoint as a `state_hash` mismatch (T50, `Diverged`), and — if the abort came after the last checkpoint of the hand, which is the H1 interleaving — as a `HAND_INIT` stage that never completes. (c) is the part no invariant asserted before, and **that absence was the H1 defect**: the fork it would have caught sat one link downstream of `TERMINAL(k)`, in a field §12.1's walk does not look at because the hand it belongs to does end. Assert (a) and (b) after every transition in the single-peer harness; assert (c) in the multi-peer harness at every `HandComplete`, and generate it directly rather than by random play — the interleaving needs one peer to complete the terminal stage on a certificate-borne abort while another completes it on T57's, which legal play produces only when a message is dropped. **Assert (c) as byte-identity of the two peers' derived `HAND_INIT` bodies**, not as stage completion: that is what (c) actually establishes, it is checkable in a harness, and it is strictly stronger evidence about H1 than a claim about completion |
 | **I31** | **Participation is chain-derived, per hand, and is the liveness gate** (D-013, J2) | Four parts. **(a) Provenance.** `signed_this_hand` gains a seat **only** when this peer accepts an event of the current hand signed by that seat, and loses every member exactly once per hand, at §5.3 step 8. A `Rejection` adds nothing (I21 already requires the post-state to be bit-identical, and this field is part of it). No timer, no connection state, no heartbeat, no `observed_by` and no field of an abort ever writes it. **(b) It gates `dealt_in`, and nothing else gates it.** After every hand init, `dealt_in[s] ⇒ status[s] == Active ∧ stack[s] > 0 ∧ s ∈ signed_this_hand-as-of-the-previous-hand`, and no transition sets `dealt_in` outside hand init. This is the invariant form of §5.3 step 4 and it is what makes the skip checkable rather than argued. **(c) The terminal abort is excluded, and this is the part an implementer will get wrong.** A terminal `HAND_ABORT` enters no `stage_hash` (`PROTOCOL.md` §3.2), the stage it closes is witness-independent, and two honest peers routinely accept copies signed by different seats — so **counting a terminal `HAND_ABORT`'s signer as participation is a per-receiver derivation and a D-012 violation**, and it would put the whole liveness gate back on the quantity H1 was about. Assert directly: accept a terminal `HAND_ABORT` and require `signed_this_hand` unchanged. **(d) Cross-peer agreement.** Two peers that have accepted the same event prefix hold the identical `signed_this_hand`, hence identical `dealt_in` for hand `k+1`. Where the stage completed this holds by construction, since the set is exactly `stage_hash` membership; the residual case — a contribution to the stage that *stalled*, which no `stage_hash` ratifies — is **Q8** and is `PROTOCOL.md`'s to close. Assert (a), (b) and (c) after every transition in the single-peer harness; assert (d) in the multi-peer harness at every `HandComplete`, together with I30(c) and by the same byte-identity check on the derived `HAND_INIT` bodies |
 | **I32** | **Every hand places a checkpoint, and the boundary gate is discharged by a timer and never by a peer** (K-3) | Three parts. **(a) Coverage.** For every `hand_id` the engine reaches `HandComplete` for, `checkpoint` is `Some` with `number == 8` on entry, on **both** the T45 and the T46 path, and this peer published its own `STATE_HASH` body for it. There is no hand — drain hand, hand that stalled at `HAND_INIT`, hand aborted at T57, or hand that reconciled through T53 — after which nothing comparable was emitted. This is the assertion whose absence *was* K-3, and it is the one §12.1's walk structurally cannot make: that walk asks whether each hand **ends**, and a hand that ends with nothing emitted passes it. **(b) The gate is one-sided.** T47 is blocked on `checkpoint.heard ⊇ checkpoint.required` only where the phase was entered from **T45**; entered from **T46** the gate is absent, so `HandComplete` after an aborted hand is left with no external input, exactly as it was before this pass. Assert directly: reach `HandComplete` by both routes with a required emitter silent, and require the abort route to advance and only the settled route to wait. **(c) No two gated boundaries in a row.** T61 runs hand init before leaving for `HandAborted`, so the boundary that follows a T61 firing is reached through T46 and is ungated by (b). Assert over a trace, not over a state: no two consecutive `HandComplete` entries are both gated. That is the whole termination argument for phase 16 and it is worth a machine check rather than a reading, because the failure it excludes — a boundary that stalls, times out, and stalls again on the same set — is precisely the fixed point J2 was, one link further out. |
+| **I33** | **A solitary peer completes nothing after it has been contradicted** (K-9, `PROTOCOL.md` §3.2) | Four parts. **(a) The regime record is exact and past-tense.** `solitary_since == Some(j)` iff hand `j` was the first hand this peer dealt with `\|signed_this_hand\| == 1` as read at §5.3 step 4 and no hand init since has read a larger set; it is `None` otherwise; and it is written **only** at §5.3 step 8. Assert directly that for every hand `k` in `j ..= hand_id` the set that step 4 read had one member, and for `j - 1` it did not — that interval property is what lets one `u64` replace a retained per-hand map, and if it ever fails the guard on T62 starts naming the wrong hands. **(b) The freeze is complete.** After T62 or T63, and for as long as `solitary_contradicted` holds: no `stage_hash` is completed, no `settlement.award` changes, `Σ stack` is unchanged, `deck.opened` gains no entry, and no `Effect::Publish` is produced. This is the assertion `PROTOCOL.md` §3.2's guarantee reduces to — *"completes no stage, awards no pot, and evaluates no end condition"* — and it is the only one of the four a single-peer harness can check on its own. **(c) The latch is one-way except through reconciliation.** `solitary_contradicted` is set by T62 and T63, is cleared by **T53 and by nothing else**, and while it is set §9.3 reaches condition 0.6 before conditions 1 to 4. Assert over a trace: no trace contains two `HandComplete` entries with the latch set and a hand dealt between them. **That is the anti-fixed-point clause and it is the reason the invariant exists** — the failure it excludes is a table that freezes, times out, thaws, deals another solitary hand and freezes again every `hand_deadline_ms`, which is J2's shape on the path K-1's fix newly made load-bearing, and every row of §12.1 passes while it happens. **(d) The drain is untouched.** On a trace in which no `SolitaryDivergence` arrives, the state is bit-identical to the same trace run against the pre-K-9 engine. Assert it by construction: `solitary_since` is read by exactly one guard. This is a **multi-peer** invariant in parts (b) and (c) and the directed case is the one below. |
+| **I34** | **A removed seat never re-enters, and removing it moves no chips** (D-014) | Three parts. **(a) Absorbing.** `status[s] == Removed` implies `status'[s] == Removed` after every transition, without exception — T59 excludes it from its guard set, T58 excludes it, hand init steps 0 and 2 do not reach it, and §8.5's `auto_action_limit` marking does not apply to a seat that is not `dealt_in`. It is the only status in §2.4 with this property, and it is the property D-014 point 4 asks for. Assert directly by enumeration over the transition table, not by random play: the whole content of the clause is that **no** row assigns anything else. **(b) It is out of every set at once.** After T64 or T65: `s ∉ deck.participants`, `s ∉ signed_this_hand`, `s ∉ certified_subjects`, `dealt_in[s] == false`, `player_to_act != Some(s)`, and `dealt_in[s]` is false after every subsequent hand init. **`step` never adds a `Removed` seat back to `signed_this_hand`** — that is the one place the set could otherwise let it back in, since §5.3 accumulates on every accepted event. **(c) The chips are covered by I1 and by nothing new.** T64 and T65 change a `status` and move **no chips at all**: neither `ledger_in` nor `ledger_out` moves (I28 — they move only in hand init step 0, and only for a `Leaving` seat), the stack stays on the table and drains through §5.3 steps 6–7, and the hand T64 voids is restored by T46 like every other abort (I27). So `Σ stack + Σ committed_hand == ledger_in − ledger_out` holds across a removal with no term of it changing, which is **I1** — the invariant D-014 point 3 is written to preserve, and the reason the offender's chips are blinded off rather than confiscated. Assert I1 immediately before and after every `CheatProven` and require both sides equal and *unchanged*. |
 
 **I1 in full.** The old form — `total_chips = players_at_start × start_stack`, constant for the
 table's whole life — is **false in cash mode**, where a seat may buy in or cash out at a hand
@@ -3427,6 +3823,33 @@ than a second one:
   Finally, force the gate to stall: let a seat emit its `HAND_COMPLETE` copy and then stop, and
   assert **T61** fires at `hand_deadline_ms`, that the next boundary is ungated, and that the trace
   contains no two consecutive gated boundaries (I32(c)).
+* **I33** against K-1's own trace, and it is **multi-peer** and cannot be anything else, because
+  the defect is two peers each of which is internally consistent. Two seats; drop exactly one
+  `HAND_INIT` copy at hand `k` so the two peers derive different `dealt_in`; let both peers narrow
+  to `P = {self}`; run the drain. Assert that the first chained event of a solitary hand that
+  reaches the other peer produces **T62** and not a `Rejection`, that the receiving peer completes
+  no stage and awards no pot afterwards (I33(b)), and that **neither peer ever reaches §9.3
+  condition 1**. Then run the tail of it: let the contradicting event arrive only after the
+  receiving peer has reached `TableClosed`, and assert **T63** fires there and
+  `settlement.tournament_winner` is retracted — that ordering is the normal one, not the corner
+  case, so a harness that only delivers the event mid-drain tests the easy half. Then run the
+  anti-fixed-point case, which is the one worth writing first: after T62, hold both peers silent,
+  let the deadline fire, and assert the table reaches `TableClosed` through §9.3 condition 0.6
+  rather than dealing hand `k+1` — a harness that stops at "the phase was left" passes the
+  freeze-thaw loop I33(c) exists to exclude. Finally assert I33(d): the same forty-hand drain with
+  **no** contradicting event is bit-identical to the pre-K-9 engine's.
+* **I34** against D-014, and the important half of it is the negative one. Remove a seat at a
+  boundary (T65) and then try every route back in: `PlayerSitsIn` (T59), `PlayerLeft` (T58),
+  signing a chained event of the next hand, and a checkpoint-8 `STATE_HASH` — assert `status` is
+  still `Removed`, `signed_this_hand` does not contain it, and it is `¬dealt_in` at every
+  subsequent hand init. Assert I1 across the removal with **both sides unchanged**, and assert the
+  removed seat's stack strictly decreases every orbit and it busts, so §9.3 condition 1 is still
+  reachable. And run the mirror D-014 makes the gate on the whole feature: **for every legal action
+  an honest client can emit, under every legal interleaving, no `CheatProven` is producible against
+  it.** That is `DECISIONS.md` **D-014-2**, it is the mirror of `SPEC_CS.md` §25's cheater list, and
+  it blocks shipping the feature rather than writing it — a validator that is too strict now ejects
+  an honest player rather than rejecting a message, and `THREAT_MODEL.md` carries the risk in its
+  own right.
 
 ---
 
@@ -3442,7 +3865,7 @@ guess what the engine does while a question is open, only know that the behaviou
 | Q3 | **Hand-deadline certificate signers when several seats are simultaneously unresponsive.** `V(subject)` is unachievable with two seats gone. A certificate naming a *set* of subjects is **not** adopted; neither is attributing every non-voting seat; and neither is **excluding** a seat from `V` for being the subject of an older unmet deadline, which D-008 deletes because it let `V` be shrunk by assertion. **Interim rule (§8.4), implemented and numbered: T57**, and since P3 it is a rule that can actually fire — the terminal stage is witness-independent (§4.1), so it does not wait for the seat whose silence caused it. The hand ends at `hand_deadline_ms` with `attributed = []` and no chip movement (I27). **D-010 shrinks what is left open:** attributing somebody would now put a name in the transcript rather than chips in a stack, so this no longer decides who pays, only what the record says. It is kept open because a later version may give attribution teeth again and the artefact has to be right before it does. Carried as **OQ-E** and blocking for Phase 4. | `PROTOCOL.md` Q-02, `THREAT_MODEL.md` §9.2 |
 | Q5 | **Rebuys, add-ons and late registration.** Out of scope for the MVP and absent from `RATED_SNG_POKERTH_V1`, but they would change §5.3 and §9.3 and should be designed for rather than retrofitted. **Named default: not supported.** No config parameter selects them, §9.3's end conditions do not admit a re-entry, and §9.3's end conditions do not admit a re-entry, and since P8 hand init step 0 has no seat-entry clause at all (Q6). | `DECISIONS.md` |
 | **Q6** | **May a seat be added after `Seating`?** Cash mode's whole difference from tournament mode is that `ledger_in` can move again, and nothing in the corpus can move it: there is no `PLAYER_SEAT` message in `PROTOCOL.md` §4.10 or §4.11, no hand-boundary stage for one, and `Event::PlayerSeated` is consumed only by T1 and T2 in `Seating` (P8). **Named default, implemented: not supported.** A cash table forms in `Seating` and thereafter only loses seats; §5.3 step 0 has no seat-entry clause and §9.4 no longer describes one; I1's right-hand side is non-increasing after the first hand in both modes. Adding it needs a message type, a stage kind under §3.2's principle, and a `HandComplete \| Paused × PlayerSeated` row — in that order, and not before a mode that needs it ships. | `PROTOCOL.md` §4.10/§4.11, `DECISIONS.md` |
-| **Q8** | **What ratifies a contribution to the stage that stalled?** D-013 gates both `HAND_INIT`'s required emitter set and `dealt_in` on *"seat `s` signed at least one chained event during hand `k`"*. For every stage that **completed**, that set is exactly `stage_hash` membership (`PROTOCOL.md` §3.2) and two peers holding the same prefix agree on it by construction. For the **one stage that stalled** — the reason the hand aborted — no `stage_hash` exists, so "seat `s` contributed there" is, strictly, *who was heard*, which is the quantity P3 refused when it built the terminal stage. It cannot simply be excluded: a hand that stalls at `HAND_INIT` completes no stage at all, so excluding it makes the next hand's set empty and the table `Paused` (§5.3 step 9) instead of playing. **Named default, implemented: a contribution to the stalled stage counts**, and the terminal `HAND_ABORT` does **not** (I31(c)) — that one exclusion is not optional, because the abort enters no `stage_hash` and its copies are routinely signed by different seats at different peers. The residual is bounded and loud rather than silent: two peers that disagree derive different `n(8) dealt_in`, each rejects the other's `HAND_INIT` copy, the stage does not complete and the hand aborts at the deadline — a hand lost and recoverable through §6.3's event request, not a chain fork. Closing it properly is a wire question — what ratifies a partial stage — and it is `PROTOCOL.md`'s. **Since K-3 the loudness has a second and better site**: `signed_this_hand` is inside checkpoint 8 (§5.2's box), so a disagreement about it is compared at the boundary of *every* hand, including the hands on which `HAND_INIT` self-completes because each peer believes the other is not required — which is `DECISIONS.md` **K-1**'s shape and the one interleaving the mutual-rejection argument above does not cover. The residual is unchanged and still `PROTOCOL.md`'s to close; what changed is that its failure mode is now detected rather than merely argued to be self-limiting. | `PROTOCOL.md` §3.2, §4.4, `DECISIONS.md` |
+| **Q8** | **What ratifies a contribution to the stage that stalled?** D-013 gates both `HAND_INIT`'s required emitter set and `dealt_in` on *"seat `s` signed at least one chained event during hand `k`"*. For every stage that **completed**, that set is exactly `stage_hash` membership (`PROTOCOL.md` §3.2) and two peers holding the same prefix agree on it by construction. For the **one stage that stalled** — the reason the hand aborted — no `stage_hash` exists, so "seat `s` contributed there" is, strictly, *who was heard*, which is the quantity P3 refused when it built the terminal stage. It cannot simply be excluded: a hand that stalls at `HAND_INIT` completes no stage at all, so excluding it makes the next hand's set empty and the table `Paused` (§5.3 step 9) instead of playing. **Named default, implemented: a contribution to the stalled stage counts**, and the terminal `HAND_ABORT` does **not** (I31(c)) — that one exclusion is not optional, because the abort enters no `stage_hash` and its copies are routinely signed by different seats at different peers. The residual is bounded and loud rather than silent: two peers that disagree derive different `n(8) dealt_in`, each rejects the other's `HAND_INIT` copy, the stage does not complete and the hand aborts at the deadline — a hand lost and recoverable through §6.3's event request, not a chain fork. Closing it properly is a wire question — what ratifies a partial stage — and it is `PROTOCOL.md`'s. **Since K-3 the loudness has a second and better site**: `signed_this_hand` is inside checkpoint 8 (§5.2's box), so a disagreement about it is compared at the boundary of *every* hand, including the hands on which `HAND_INIT` self-completes because each peer believes the other is not required — which is `DECISIONS.md` **K-1**'s shape and the one interleaving the mutual-rejection argument above does not cover. The residual is unchanged and still `PROTOCOL.md`'s to close; what changed is that its failure mode is now detected rather than merely argued to be self-limiting. **Since K-1 the sub-question this row used to carry is answered and the claim of loudness above is corrected.** *"Bounded and loud rather than silent"* was **false**: run the mutual-rejection argument twice and both peers narrow to `{self}`, after which every collective stage self-completes and neither needs the other again — one lost hand is the first step of a permanent silent fork, not the whole cost. What replaces the claim is not a ratification but a detection, `PROTOCOL.md` §3.2's **solitary-stage rule**, whose engine half is §5.2's solitary box, T62, T63, §9.3 condition 0.6 and I33. And the sub-question is settled: **a peer's own emission counts into its own `signed_this_hand`** (§5.3 step 4(i)), and **a `PLAYER_LEAVE` counts into no `P`** (step 4(ii)). `Q8` itself stays open, is the same question as `PROTOCOL.md`'s `Q-10`, and is now labelled there as unclosable by ratification: agreeing the stalled stage needs a collective step at the point collectivity failed. | `PROTOCOL.md` §3.2, §4.4, `DECISIONS.md` |
 | **Q-01** | **Is `showdown_policy = TDA_MUCK` offered at all?** This is `PROTOCOL.md` Q-01 seen from the engine, and it is listed here because §12 of that document names the engine's showdown path as what turns on it. It is *not* a second copy of Q1 above: Q1 asks which resolution the corpus should adopt, Q-01 asks whether the config value ships. **Named default, so no implementer has to guess what a build does with a value it does not implement:** §9.4's config validation is the gate, and a build validates `showdown_policy` against what it actually implements — a table whose value it does not implement **goes to `TableClosed` and is never played**, exactly as any other failing config parameter does, with no repair path. The MVP implements `MandatoryReveal` only, so an MVP client refuses a `TDA_MUCK` table rather than playing it with T43 silently missing. The value stays in the type (§7.7) and T43 stays specified. | `PROTOCOL.md` Q-01, `DECISIONS.md` |
 
 **A note on the letters, because two of the rows below carry labels that have since moved (R-2).**
@@ -3652,10 +4075,10 @@ The phase numbers are this document's own (§5.1): **17 is `HandAborted` and 18 
 | 16 | `HandComplete`, entered from **T45** | **T61** `HandDeadlineAbort`, naming hand `k+1`. T47 is gated here on checkpoint 8 completing over `P(k)`, so under total silence it is T61 that fires — a timer, not a peer | `hand_deadline_ms` from `TERMINAL(k)`, which `PROTOCOL.md` §8.2 already starts there | `HandAborted` → T46 → `HandComplete` **entered from T46**, which is the row above and is ungated (I32(c)) |
 | 17 | `HandAborted` | **T46**, derived `AbortSettle`, guard `—`. No external input | immediately | `HandComplete` |
 | 18 | `Paused` | **idles, and that is correct**: no hand is live, no chips are committed, no deadline is armed, `Σ committed_hand == 0`. Left by T59 on a `PlayerSitsIn`, under §5.3 step 4's own predicate since K-7. A `Paused` table every seat has left **stays** `Paused` — §9.3 is evaluated only at T47 and T47 does not run from here — which is idle, not frozen, and is corrected wording rather than a new exit | — | nothing is owed to anybody; a client closes the window |
-| 19 | `TableClosed` | absorbing. Every event is a `Rejection` | — | — |
-| 20 | `Diverged`, hand live | **T57** — the hand deadline is **not** disarmed on entry (T50) and phase 20 is in T57's scope | `hand_deadline_ms` from `TERMINAL(k−1)`, still running | `HandAborted`; `table_faulted` **unchanged**, so the table plays on |
-| 20 | `Diverged`, no hand started | **T4**, guard `hand_id == 0 ∧ ledger_in == 0` — reachable because checkpoint 1 sits after `TABLE_READY` and before any `HAND_INIT` | `join_deadline_ms` | `TableClosed` |
-| 20 | `Diverged`, no hand live, `hand_id > 0` | **T61** — reachable since K-3, because checkpoint 8 sits at a hand boundary, so T50 can freeze the table where neither T4's guard (`hand_id == 0`) nor T57's (a live hand) holds | `hand_deadline_ms` from `TERMINAL(k)` | `HandAborted`; `table_faulted` **unchanged** (`cause = 1`, `PROTOCOL.md` §6.4), so the table plays on |
+| 19 | `TableClosed` | terminal; nothing is owed and no exit is needed. **Since K-9 it is absorbing for thirty-eight event types and not for `SolitaryDivergence`** (T63), whose Next is `TableClosed` again — so the phase acquires a self-edge and **no** exit, and this row's obligation is unchanged | — | — |
+| 20 | `Diverged`, hand live | **T57** — the hand deadline is **not** disarmed on entry (T50, T62) and phase 20 is in T57's scope | `hand_deadline_ms` from `TERMINAL(k−1)`, still running | `HandAborted`; `table_faulted` **unchanged**. **Where the entry was T62, `solitary_contradicted` is set and §9.3 condition 0.6 closes the table two transitions later (K-9)**; where it was T50 the table plays on, as before |
+| 20 | `Diverged`, no hand started | **T4**, guard `hand_id == 0 ∧ ledger_in == 0` — reachable because checkpoint 1 sits after `TABLE_READY` and before any `HAND_INIT`. **T62 cannot reach this row**: `solitary_since` is written only at hand init, so the solitary freeze needs `hand_id ≥ 1` | `join_deadline_ms` | `TableClosed` |
+| 20 | `Diverged`, no hand live, `hand_id > 0` | **T61** — reachable since K-3, because checkpoint 8 sits at a hand boundary, so T50 can freeze the table where neither T4's guard (`hand_id == 0`) nor T57's (a live hand) holds. **Since K-9 this is also the row T62 lands in most of the time**, because a solitary hand self-completes and the contradicting event arrives after it has closed | `hand_deadline_ms` from `TERMINAL(k)` | `HandAborted`; then `table_faulted` **unchanged** (`cause = 1`, `PROTOCOL.md` §6.4) and the table plays on **unless** `solitary_contradicted`, in which case §9.3 condition 0.6 gives `TableClosed` |
 
 **Five things the table asserts that a reader should check rather than take on trust.**
 
@@ -3744,7 +4167,7 @@ hands makes progress is a separate question, and it is answered in the two block
 
 ---
 
-#### 12.1.1 Progress under D-013 and K-3 — the twenty phases re-derived, and the exit for each
+#### 12.1.1 Progress under D-013, K-3, K-9, L7 and D-014 — the twenty phases re-derived, and the exit for each
 
 **D-013 changed no exit.** It narrows `dealt_in` at §5.3 step 4 and narrows `PROTOCOL.md` §4.4's
 required emitter set on the same predicate, and neither is read by T4, T45, T46, T47 or T57.
@@ -3752,15 +4175,29 @@ required emitter set on the same predicate, and neither is read by T4, T45, T46,
 **K-3 changes exactly one, and adds one transition to carry it.** `HandComplete` acquires a gate on
 the settled path, so T47 stops being that phase's silent exit there, and **T61** — the hand-boundary
 counterpart of T57 — becomes it. Nineteen of the twenty rows are untouched; phase 16 splits by
-entry, and phase 20 gains the boundary case T50 can now reach. The *Changed by* column below carries
-both rulings, and the re-derivation is a check against them, not a rewrite:
+entry, and phase 20 gains the boundary case T50 can now reach.
 
-| # | Phase | Exit under D-013 and K-3 | Changed by D-013 / K-3? |
+**K-9, L7 and D-014 change no exit at all, and the reason is worth stating before the table rather
+than discovered in it.** All five new transitions — T62, T63, T64, T65, T66 — are triggered by an
+**event**, and this table's whole subject is what happens when no event ever arrives again. An
+event-triggered row can never be an entry in the *Exit under total silence* column, so it cannot
+displace one; the check it owes instead is the other one, and it is discharged in the table's
+right-hand column: **does it lead anywhere that has an exit?** T62 and T63's target, `Diverged` and
+`TableClosed`, are both already in the table. T64's target, `HandAborted`, is row 17. T65 and T66
+change no phase. L7 changes a condition inside T47, not T47.
+
+**What does change is two destinations, and one of them is the point of the pass.** §9.3 gains
+condition 0.6, so the `Diverged` rows' *Terminates in* column now branches on
+`solitary_contradicted`; and `TableClosed` acquires a self-edge (T63) without acquiring an exit,
+which leaves row 19's obligation exactly where it was. The *Changed by* column below carries all
+five rulings, and the re-derivation is a check against them, not a rewrite:
+
+| # | Phase | Exit under D-013, K-3 and K-9 | Changed by D-013 / K-3 / K-9 / L7 / D-014? |
 |---:|---|---|---|
-| 1 | `Seating` | **T4**, local lobby timer → `TableClosed` | no. D-013's base case (the required set for hand 1 is the signers of `TABLE_READY`) is fixed *in* this phase and read at T10 |
+| 1 | `Seating` | **T4**, local lobby timer → `TableClosed` | no. D-013's base case (the required set for hand 1 is the signers of `TABLE_READY`) is fixed *in* this phase and read at T10. **D-014 adds nothing here and that is deliberate (T66)**: no removal is available in the setup chain, so this exit is untouched |
 | 2 | `AwaitingSeatRngCommit` | **T4**, guard `hand_id == 0 ∧ ledger_in == 0` → `TableClosed` | no |
-| 3 | `AwaitingSeatRngReveal` | **T4**, same → `TableClosed` | no |
-| 4 | `AwaitingKeySetup` (**includes a `HAND_INIT` that never completes**) | **T57** → `HandAborted` | **the exit is the same; what it leads back to is not.** This is the phase J2 lived in: the stage stalled here every hand, forever. Now it stalls at most twice for one silent seat, and hand `k+2` onward completes here in a round trip |
+| 3 | `AwaitingSeatRngReveal` | **T4**, same → `TableClosed` | no. **This is the row D-014 looks like it reopens.** A commitment mismatch is tier-1 evidence, so the narrowing would put T11's deleted unseating back; **T66 refuses it**, because `roster_hash(k)`'s seat vector is frozen at `TABLE_READY` (`PROTOCOL.md` §3.1) and removing a seat here forks the genesis rather than punishing anybody. The beacon still stalls to T4, G4 and P4 stand, and nothing is lost: `ledger_in == 0`, so there are no chips to protect |
+| 4 | `AwaitingKeySetup` (**includes a `HAND_INIT` that never completes**) | **T57** → `HandAborted` | **the exit is the same; what it leads back to is not.** This is the phase J2 lived in: the stage stalled here every hand, forever. Now it stalls at most twice for one silent seat, and hand `k+2` onward completes here in a round trip. **K-9 and D-014 change nothing here**: T62 and T64 are in this phase's scope, but both need an event, and a phase whose silent exit is a timer cannot lose it to a row that needs somebody to speak |
 | 5 | `AwaitingShuffle` | **T57** → `HandAborted` | no. A skipped seat is not in `deck.participants` (I20), so it is not in `shuffle_order` and cannot stall the chain |
 | 6 | `AwaitingDeal` | **T57** → `HandAborted` | no; same reason — it is owed no reveal token |
 | 7 | `BettingPreFlop` | **T57** → `HandAborted` | no. It is `¬dealt_in`, so it is never `player_to_act` (I14) |
@@ -3771,22 +4208,45 @@ both rulings, and the re-derivation is a check against them, not a rewrite:
 | 12 | `AwaitingRiverReveal` | **T57** → `HandAborted` | no |
 | 13 | `BettingRiver` | **T57** → `HandAborted` | no |
 | 14 | `AwaitingShowdownReveal` | **T57** → `HandAborted` | no |
-| 15 | `Settling` | **T57** → `HandAborted`, no award applied | no. `HAND_COMPLETE`'s required set narrows with the same predicate, so a seat that stopped signing last hand does not hold this stage open either |
-| 16 | `HandComplete`, entered from **T46** | **T47**, derived, immediate → `AwaitingKeySetup` \| `Paused` \| `TableClosed` | **§9.3's conditions become reachable (D-013).** Condition 1 needs exactly one seat with chips, and until D-013 no stack could ever change on a stalled table. Now the skipped seat's stack strictly decreases every orbit. **K-3 leaves this entry ungated on purpose**: `P(k)` after an aborted hand contains the seat whose silence ended it |
+| 15 | `Settling` | **T57** → `HandAborted`, no award applied | no. `HAND_COMPLETE`'s required set narrows with the same predicate, so a seat that stopped signing last hand does not hold this stage open either. **This is the phase a solitary hand passes through** (§5.3 step 9 sends `\|dealt_in\| == 1` straight here) and K-9 does **not** change that: the drain is preserved deliberately, `PROTOCOL.md` §3.2 refuses the alternative that would have deleted it, and the freeze is a later transition on a later event, not a branch taken here |
+| 16 | `HandComplete`, entered from **T46** | **T47**, derived, immediate → `AwaitingKeySetup` \| `Paused` \| `TableClosed` | **K-9 and L7 change the branch, not the exit.** T47 still fires immediately and still needs no external input; what it decides has one more condition before it (0.6, the solitary latch → `TableClosed`) and one restated on `\|dealt_in\|` (2, L7). Both are inside T47's guard-and-branch, so the *Fires after* column still reads *immediately* and the row is still discharged by a derived event and never by a peer. And: **§9.3's conditions become reachable (D-013).** Condition 1 needs exactly one seat with chips, and until D-013 no stack could ever change on a stalled table. Now the skipped seat's stack strictly decreases every orbit. **K-3 leaves this entry ungated on purpose**: `P(k)` after an aborted hand contains the seat whose silence ended it |
 | 16 | `HandComplete`, entered from **T45** | **T61** `HandDeadlineAbort` for hand `k+1` → `HandAborted` → T46 → the ungated entry above | **new with K-3, and it is the one exit this pass changed.** T47 is gated on checkpoint 8 completing over `P(k)`, so it is no longer the silent exit; T61 is, on hand `k+1`'s `hand_deadline_ms`, which §8.2 already starts at `TERMINAL(k)`. The gate is what gives T58 and T59 a window (K-3b) and what puts a tournament result through a comparison before `TableClosed` |
 | 17 | `HandAborted` | **T46**, derived, immediate → `HandComplete` | no |
-| 18 | `Paused` | idles; left by T59 when §5.3 step 4's predicate would deal two or more seats in; nothing is owed to anybody | **one new way in under D-013, and it is correct.** If *every* seat stops signing, hand `k+1`'s `dealt_in` is empty and §5.3 step 9 goes to `Paused` — an abandoned table that idles instead of burning ten minutes a hand forever. It is not a new exit and it owes nobody anything. **K-7 changes the way *out***: the guard was a second predicate that disagreed with step 4 and could leave `Paused` for a drain hand; it is step 4's own predicate now |
-| 19 | `TableClosed` | absorbing; every event is a `Rejection` | no |
-| 20 | `Diverged`, hand live | **T57** — the hand deadline is not disarmed at T50 → `HandAborted`, `table_faulted` unchanged | no |
-| 20 | `Diverged`, no hand live, `hand_id > 0` | **T61** → `HandAborted`, `table_faulted` unchanged (`cause = 1`) | **new with K-3, and it is the hole the fix would otherwise have opened.** Checkpoint 8 sits at a boundary, so T50 can now freeze the table where no hand is live and `hand_id > 0` — a state in which neither T4's guard nor T57's holds. T61's second scope is that state |
-| 20 | `Diverged`, no hand started | **T4**, guard `hand_id == 0 ∧ ledger_in == 0` → `TableClosed` | no |
+| 18 | `Paused` | idles; left by T59 when §5.3 step 4's predicate would deal two or more seats in; nothing is owed to anybody | **one new way in under D-013, and it is correct.** If *every* seat stops signing, hand `k+1`'s `dealt_in` is empty and §5.3 step 9 goes to `Paused` — an abandoned table that idles instead of burning ten minutes a hand forever. It is not a new exit and it owes nobody anything. **K-7 changed the way *out*** and **L7 now changes the way *in* to match**: §9.3 condition 2 read `\|{s : status == Active ∧ stack > 0}\| == 0`, a second predicate for the question step 9 already answers, and it is now `\|dealt_in\| == 0`. Entry and exit finally read one quantity. No exit moves — neither predicate is an exit under total silence, which is why the defect was inert and why it survived K-7's own sweep |
+| 19 | `TableClosed` | terminal; no exit is owed | **K-9 changes what "absorbing" means here without changing this row.** T63 gives the phase a self-edge on `SolitaryDivergence` — the result is retracted, the latch is set, no chip moves, no phase changes — so every other event is still a `Rejection` and the phase still owes no exit. It is recorded because §5.1 called the phase absorbing without qualification and a reader checking this table against that word must find the qualification somewhere |
+| 20 | `Diverged`, hand live | **T57** → `HandAborted` | **new with K-9: the entry, not the exit.** T62 is a second way into this phase and the hand deadline is not disarmed on it either, so T57 covers it unchanged. What differs is downstream: `table_faulted` is still unchanged, but where the entry was T62 the latch is set and §9.3 condition 0.6 closes the table at the boundary this abort reaches. That is the difference between a checkpoint divergence, which costs a hand, and a solitary divergence, which must cost the table or repeat forever |
+| 20 | `Diverged`, no hand live, `hand_id > 0` | **T61** → `HandAborted` | **new with K-3, extended by K-9, and this is the row the solitary freeze usually lands in.** K-3 opened it: checkpoint 8 sits at a boundary, so T50 can freeze the table where neither T4's guard nor T57's holds. K-9 makes it the common case rather than the corner one — a solitary hand self-completes, so the contradicting event almost always arrives after that hand closed and finds the peer at a boundary. `table_faulted` unchanged (`cause = 1`); `TableClosed` follows through condition 0.6 when the latch is set |
+| 20 | `Diverged`, no hand started | **T4**, guard `hand_id == 0 ∧ ledger_in == 0` → `TableClosed` | no. **T62 cannot reach this row**, because `solitary_since` is written only at §5.3 step 8 and therefore requires `hand_id ≥ 1`; the row's guard and the freeze's precondition are disjoint by construction rather than by inspection |
 
 **None of the twenty-one rows' exits reads `signed_this_hand`, `dealt_in`, a status, a certificate
-or `|V|`** — which is the same property note 2 above asserts, checked again against both new
-predicates. `checkpoint.required` **is** `signed_this_hand`, and that is not a counter-example: T47
-is not an exit under total silence on the path where it reads the set, which is exactly why the row
-for that path names T61 instead. A seat that stops signing cannot hold a phase open, it cannot hold
-the *table* open, and — this pass's obligation — it cannot hold the *boundary* open either.
+or `|V|`** — which is the same property note 2 above asserts, checked again against every new
+predicate. Three near-counter-examples, all of them clean, and each is worth one line because a
+reader will find them before finding the reasoning. `checkpoint.required` **is**
+`signed_this_hand`: not a counter-example, because T47 is not an exit under total silence on the
+path where it reads the set, which is exactly why the row for that path names T61 instead. **§9.3
+condition 2 now reads `dealt_in` (L7)**: not a counter-example, because §9.3 decides where T47
+*goes*, not whether it fires, and a branch destination that reads a participation set cannot hold a
+phase open — the previous form of the condition read a status and was no safer, only less
+consistent. **§9.3 condition 0.6 reads `solitary_contradicted` (K-9)**: not a counter-example for
+the same reason, and it is the one entry in this whole table whose effect is to make a phase
+*stop* rather than continue — it removes destinations, it adds no wait. A seat that stops signing
+cannot hold a phase open, it cannot hold the *table* open, it cannot hold the *boundary* open, and
+it cannot — this pass's check — hold the **freeze** open either: T62's target has the same exits it
+had before T62 existed.
+
+**A fourth obligation, written down beside the other three, because K-9 is the first fix that could
+have failed it.** Termination asks whether a phase can be left; progress asks whether the sequence
+of hands advances; I32 asks whether anything was said that two peers could disagree about out loud.
+The fourth is:
+
+> **A detection must not be undone by the mechanism that ends the hand it detected in.** Every
+> terminus in this table is a timer, and every timer leads through `HandAborted` and `HandComplete`
+> back to a table that deals again. A freeze whose only purpose is to stop a peer from playing on
+> is therefore, by default, a ten-minute pause — and a peer that resumes into the same regime meets
+> the same contradiction and freezes again, forever, while every row above passes. That is J2's
+> fixed point wearing a detection's clothes, and **§9.3 condition 0.6 and I33(c) are what discharge
+> it.** The obligation generalises past K-9: any future rule that stops a peer must name what stops
+> it *staying* stopped, or it buys one hand and gives it back.
 
 **The three intervals, and that they now have no gap between them.** T4 covers the setup chain, from
 `JOIN_ACCEPT` to hand 1; T57 covers a live hand, from `HAND_INIT(k)`'s stage to `TERMINAL(k)`; T61
@@ -3852,6 +4312,24 @@ result is compared before `TableClosed` rather than after it.
 So the whole cost of an opponent vanishing at a heads-up MVP table is **10 or 20 minutes of stall,
 then about five minutes of drain, then the tournament ends.** At larger tables the other seats play
 real poker throughout and only the vanished seat's chips move to them.
+
+**K-9 does not change that number, and the reason is the one §3.2 insists on.** The freeze fires
+only on an event that arrives, and an opponent that has genuinely vanished sends none: T62 never
+runs, the forty drain hands run exactly as derived above, and the tournament ends in about five
+minutes. **Where the opponent has *not* vanished — K-1's trace, one dropped `HAND_INIT` copy and
+both peers still transmitting — the number changes completely and is meant to:** the first
+contradicting event freezes this peer, one `hand_deadline_ms` passes, and §9.3 condition 0.6 closes
+the table. **One stalled hand and a closed table instead of five minutes and a false winner**, and
+`SPEC_CS.md` §19's ranking is the authority for preferring it. The two cases are separated by wire
+evidence and by nothing else, which is the whole design of the rule: a peer that is alone hears
+nothing and finishes, a peer that is wrong hears the contradiction and stops.
+
+**D-014's cost is one voided hand, and it does not touch this bound either.** A removed seat is a
+seat that has stopped participating, which is the case §12.1.2 already measures; the difference is
+that it stops at the removal instead of one or two hands later, so a removal strictly *shortens*
+the interval this section bounds. Its stack drains on the same schedule and busts at the same
+place, because it posts the same blinds — that is I34(c) and it is why the chips are blinded off
+rather than taken.
 
 **What is still not claimed.** This is a bound on one seat going silent and staying silent. It is
 not a bound against an adversary that keeps *sending*: a peer that stalls to the deadline, returns
@@ -4220,8 +4698,9 @@ and leave two declared events that no row consumes.
     tests" is corrected to **seven** (it listed six before I30 was added), and the I7/I8 test
     construction is rewritten to build its non-participating seat through T59, since `Absent` is no
     longer reachable.
-    **The numbers in this item are the fifth pass's and have since moved** — 57 live transitions
-    with T61 and 32 invariants with I32, both stated in §5.1 and §10 and carried by item 37 below.
+    **The numbers in this item are the fifth pass's and have since moved twice** — first to 57 live
+    transitions with T61 and 32 invariants with I32, then to **62 live transitions** with T62–T66
+    and **34 invariants** with I33 and I34, all stated in §5.1 and §10.
     The item is left standing as the record of the reconciliation, not as a current count; §5.1's
     "stated once here" rule means this paragraph was never the place to read one.
 
