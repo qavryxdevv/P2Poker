@@ -49,6 +49,11 @@ minicbor  = { version = "2.3.0",  default-features = false, features = ["std", "
 argon2           = { version = "0.6.0",  default-features = false, features = ["alloc", "zeroize"] }
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 
+# --- poker rules: docs/research/POKER_RULES.md ---------------------------
+# 7-card evaluator, behind our own facade. Pinned exactly: 5.1.0 does not build
+# on stable rustc 1.95.0 (POKER_RULES.md A2, a verified negative result).
+rs_poker = { version = "=5.0.0", default-features = false }
+
 # --- gui: docs/research/GUI_STACK.md --------------------------------------
 eframe      = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
 egui_extras = { version = "0.36.1", features = ["image"] }

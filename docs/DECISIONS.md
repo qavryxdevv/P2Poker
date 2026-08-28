@@ -183,24 +183,54 @@ would be running an **open relay for the entire libp2p world**, IPFS traffic
 included, on the user's line. That is not what was agreed to.
 
 **The usable hook is `Config::reservation_rate_limiters` and
-`Config::circuit_src_rate_limiters`.** Their element type sits in a
-`pub(crate)` module and so cannot be named from outside, but the crate carries
-a blanket implementation
+`Config::circuit_src_rate_limiters`.**
+
+> **Correction, 2026-08-28.** An earlier version of this decision said the
+> element type "sits in a `pub(crate)` module and so cannot be named from
+> outside", and recommended coercing a closure through the crate's blanket
+> `impl<T: FnMut(..)> RateLimiter for T`. **That was wrong**, and the Phase 0
+> review (finding B-2) caught it. The module is `pub(crate)`, but the trait is
+> re-exported at the crate root:
+>
+> ```rust
+> // libp2p-relay-0.21.1/src/lib.rs:42
+> pub use behaviour::{rate_limiter::RateLimiter, Behaviour, CircuitId, Config, Event, StatusCode};
+> ```
+>
+> so `libp2p::relay::RateLimiter` is nameable and implementable. The error came
+> from reading `behaviour.rs` and not checking `lib.rs` for re-exports. The
+> closure route did compile, so nothing built on the wrong reason - but the
+> right construction is better, because admission control needs shared mutable
+> state and a closure would have to capture it awkwardly.
+
+Admission control is therefore a **named type** implementing the trait, holding
+the live set of peers the lobby has seen:
 
 ```rust
-impl<T: FnMut(PeerId, &Multiaddr, Instant) -> bool + Send> RateLimiter for T
+struct PokerPeersOnly { known: Arc<Mutex<HashSet<PeerId>>> }
+
+impl libp2p::relay::RateLimiter for PokerPeersOnly {
+    fn try_next(&mut self, peer: PeerId, _addr: &Multiaddr, _now: web_time::Instant) -> bool {
+        self.known.lock().map(|k| k.contains(&peer)).unwrap_or(false)
+    }
+}
 ```
 
-so a closure coerces into the vector without ever naming the trait. Verified by
-compiling exactly that: the probe pushed a per-`PeerId` closure and the printed
-config shows three reservation limiters instead of the default two. Note the
-third parameter is `web_time::Instant`, so a `web-time = "1"` dependency is
-needed to write the closure's signature.
+Verified by compiling and running exactly this against `libp2p 0.56.0`:
 
-That closure is our admission control: it sees the `PeerId` and the
-`Multiaddr` of whoever asks, and returns false for anyone who is not one of
-ours. Both vectors must be gated — one governs who may reserve a slot to become
-reachable through us, the other who may open a circuit through us.
+```
+stranger admitted: false
+our peer admitted: true
+reservation limiters: 3, circuit limiters: 3
+```
+
+Both vectors must be gated - one governs who may reserve a slot to become
+reachable through us, the other who may open a circuit through us. The third
+parameter is `web_time::Instant`, so a `web-time = "1"` dependency is needed to
+write the signature.
+
+It sees the `PeerId` and the `Multiaddr` of whoever asks, and refuses
+anyone who is not one of ours.
 
 ### Required behaviour
 
@@ -612,10 +642,86 @@ enters only as a signed event.
 
 ---
 
+---
+
+## D-007 — Heads-up action deadlines are advisory; D-006's certificate does not work at two seats
+
+**Date:** 2026-08-28
+**Status:** accepted, and it records a limitation rather than a solution
+**Corrects:** D-006
+**Source:** Phase 0 adversarial review, finding A-1
+
+### What D-006 got wrong
+
+D-006 said a timeout takes effect through a certificate signed by "every other
+still-active player", and claimed unanimity both prevents one peer from
+stealing the action and settles the race against a late action.
+
+At a two-seat table the set "every other dealt-in seat" has **exactly one
+member: the opponent.** Unanimity and "one peer asserting time is up" are the
+same sentence heads-up. And `SPEC_CS.md` section 32 mandates heads-up as the
+*first* implemented mode, so the flaw sits precisely where the project starts.
+
+The concrete attack: Alice faces a bet and is deciding. Mallory, running a
+modified client, signs a timeout vote against Alice, assembles a complete
+certificate from her own single signature, and folds Alice's hand. Alice's real
+action arrives but is not equivocation - a different signer produced it - so no
+evidence exists against Mallory. Alice disputes; the dispute path resolves
+through the same certificate machinery, which requires Mallory's signature.
+She does not sign, and the dispute cannot resolve. The hand deadline has the
+same single-signer requirement and never fires either.
+
+So heads-up, a modified opponent can fold any hand at will and make every
+dispute unresolvable. That is not the bounded "auto check/fold" D-006 described.
+
+### The underlying result, stated plainly
+
+Two peers, with no trusted clock and no third party, cannot agree that a
+deadline passed. Any rule strong enough to punish a stalling opponent is also
+strong enough for a malicious opponent to invoke against an honest one. There
+is no arrangement of signatures that gives both:
+
+- protection against an opponent who folds your hand by declaring a false
+  timeout, and
+- protection against an opponent who stalls to void a hand they are losing.
+
+This is not an implementation gap to be closed later. It is a property of the
+setting, and `SPEC_CS.md` sections 18 and 36 require saying so rather than
+inventing a construction that appears to solve it.
+
+### The decision
+
+1. **At two seats, an action deadline is advisory.** The UI counts it down; no
+   signed state transition follows from it. Fold-effect timeout certificates
+   are forbidden at `n = 2`.
+2. The remedy against a stalling heads-up opponent is to leave the table. The
+   transcript shows whose action was missing, which is socially attributable
+   and feeds reputation, but it is not cryptographically enforceable against a
+   determined opponent, and no document may claim otherwise.
+3. At `n >= 3` the certificate stands, but `THREAT_MODEL.md` must describe the
+   requirement honestly as **all other dealt-in seats**, never as "a malicious
+   majority" - the latter reads as though several colluders were needed when
+   the real bar is one at `n = 2` and two at `n = 3`.
+4. The dispute path may **not** be defined in terms of the certificate
+   machinery when the accused peer is a required signer of that certificate.
+   That is circular at every table size, not only heads-up. Replacing it is an
+   OPEN QUESTION, listed below, and it blocks nothing in Phase 2 because the
+   engine takes the certificate as an input event either way.
+
+### Consequence for the plan
+
+Play money makes this tolerable: the worst case is a wasted hand against
+somebody running a modified client, and they are visible in the transcript.
+For real money it would not be tolerable, which is one more reason the spec's
+play-money-first sequencing is right.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |
 |---|---|---|
 | — | Open-source licence for the project (MIT / Apache-2.0 / dual / GPL-3.0 / AGPL-3.0) | Nothing yet; needed before publication |
 | — | Relay admission: `identify` protocol name, or lobby presence (see D-002) | `NETWORK_STACK.md` |
+| — | A dispute path that does not require the accused peer's signature (D-007 point 4, review A-1) | `PROTOCOL.md` |
 | — | Drop the libp2p `dns` and `kad` features and run all discovery through Mainline DHT, including relay volunteers under a second infohash? Removes both hickory advisories and ~12 crates from the build; costs access to the public relay commons, which thins D-004's floor. See `research/INTEGRATION.md` section 3. | Nothing yet |

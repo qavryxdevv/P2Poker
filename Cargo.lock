@@ -3891,6 +3891,7 @@ dependencies = [
  "minicbor",
  "rand 0.8.8",
  "rand_core 0.10.1",
+ "rs_poker",
  "rust-embed",
  "sha2 0.11.0",
  "subtle",
@@ -4575,6 +4576,16 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rs_poker"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8839d3a0d7de65f98ae31ed2bf0a6a77ebc2f35483fd87b131717d3bcb112696"
+dependencies = [
+ "rand 0.10.2",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

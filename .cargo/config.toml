@@ -1,0 +1,10 @@
+# Build and test parallelism for this machine: 24 cores, 19 given to cargo so
+# the box stays usable and so a runaway job cannot starve everything else.
+[build]
+jobs = 19
+
+# `cargo test` still defaults to one thread per core for the test harness
+# itself; pass --test-threads=19 (see xtask / the test script) to hold the same
+# ceiling there.
+[term]
+quiet = false
