@@ -6,8 +6,10 @@ Specification of the transport and discovery layer of `p2p-poker`.
 (Mainline DHT discovery + GossipSub lobby). No implementation exists yet.
 
 **Authority order.** `docs/SPEC_CS.md` is the specification and wins over
-everything here. `docs/DECISIONS.md` (D-001 … D-006) is binding owner decision and
-outranks the research documents and any preference of this document. The research
+everything here. `docs/DECISIONS.md` (D-001 … D-007) is binding owner decision and
+outranks the research documents and any preference of this document. **D-007
+corrects D-006** and wins over it: at two seats an action deadline is advisory and
+a fold-effect timeout certificate is forbidden (§8.4, §15). The research
 notes under `docs/research/` are the evidence base:
 `LIBP2P.md`, `MAINLINE_DHT.md`, `NAT_AND_DISCOVERY.md` are the three this document
 is built on; `MENTAL_POKER.md` is used only for measured per-hand byte counts.
@@ -36,6 +38,13 @@ is written as **OPEN QUESTION** and carried to §13 rather than guessed
 ---
 
 ## 1. Layers, and the rule that constrains all of them
+
+**Module this document governs** (`SPEC_CS.md` §23, interim mapping pending
+`docs/ARCHITECTURE.md` in Phase 2): `src/net/` — `dht.rs`, `swarm.rs`, `lobby.rs`,
+`streams.rs` — plus the `InMemoryTransport` of §1.3, which sits behind the same
+upward trait. The other four specification documents name their own modules in
+their own §1; the separation of transport, poker engine and cryptographic deck
+that `SPEC_CS.md` §23 requires is the separation between those five mappings.
 
 ### 1.1 The stack
 
@@ -91,7 +100,10 @@ layer must **not**:
 3. decide that a player is absent, has timed out, has folded, or has forfeited.
    Transport-level connection loss is a **hint** the layers above may consider; the
    verdict is the D-006 timeout certificate, which is an application event signed
-   by the other active players;
+   by the other active players — and at two seats there is no such verdict at all,
+   because D-007 makes the heads-up deadline advisory (§8.4). The prohibition is
+   unchanged either way: the transport must not supply a verdict the layer above
+   does not have;
 4. reorder, deduplicate, filter, merge or "repair" application events on the basis
    of anything other than the bytes' own signatures and size caps. Ordering is the
    hash chain's job (`SPEC_CS.md` §13);
@@ -126,6 +138,99 @@ hand-written KRPC client (`MAINLINE_DHT.md` §6 sizes that escape hatch at
 
 > Verification: [RESEARCH] `LIBP2P.md` §7 (alpha containment),
 > `MAINLINE_DHT.md` §6, §8.
+
+#### 1.3.1 The upward trait, specified
+
+This is the whole surface the layers above `net/` may use. **Nothing
+libp2p-typed may appear above this trait** — no `Multiaddr`, no `SwarmEvent`, no
+`StreamProtocol`, no `libp2p::PeerId`. `PeerId` above the boundary is our own
+newtype over the 32-byte Ed25519 public key material that the libp2p handshake
+proved, and the libp2p implementation converts at the boundary.
+
+```rust
+/// The complete transport surface. Implemented by the libp2p stack (§5–§11)
+/// and by `InMemoryTransport` (§1.3.2), and by nothing else.
+trait Transport {
+    /// Deliver `bytes` to `peer`. Returns as soon as the bytes are queued;
+    /// success is NOT a delivery receipt, and the caller must never treat it
+    /// as one (§1.2 prohibition 3).
+    fn send(&self, peer: PeerId, bytes: Bytes) -> Result<(), SendError>;
+
+    /// The single event stream. Ordering is per-peer FIFO and nothing more:
+    /// events from two different peers may interleave arbitrarily.
+    fn events(&self) -> impl Stream<Item = TransportEvent>;
+
+    /// A fact about a socket, never a fact about a player.
+    fn connection_state(&self, peer: PeerId) -> ConnectionState;
+}
+
+enum ConnectionState { Direct, Relayed, Down }
+
+enum TransportEvent {
+    Connected    { peer: PeerId, state: ConnectionState },
+    Disconnected { peer: PeerId },
+    Message      { peer: PeerId, bytes: Bytes },
+    ListenerClosed { reason: ListenerCloseReason },
+}
+```
+
+Three rules that make the trait the boundary rather than a formality:
+
+* `Message` carries **bytes**, never a decoded event. Decoding, canonicality and
+  signature verification are the protocol layer's (`PROTOCOL.md` §4.0).
+* `Disconnected` is a hint. It is never an input to a poker decision
+  (§1.2 prohibition 3, §8.4, §10.4).
+* `ListenerClosed` exists because a relay reservation denial closes a circuit
+  listener with no automatic retry (§9.6); the layer above must be able to see it
+  and re-issue `listen_on` with backoff.
+
+#### 1.3.2 `InMemoryTransport` (`SPEC_CS.md` §24), specified
+
+`SPEC_CS.md` §24 requires a simulated network that implements the same trait and
+runs the whole poker and cryptographic stack with no DHT and no libp2p. It is the
+only vehicle for §25's adversarial suite, and it is **not deferred**: the
+in-memory path is the only one exercised before Phase 7 (§12), so an unspecified
+harness blocks Phases 3–6.
+
+**(i) A seeded, deterministic scheduler.** Determinism is a requirement, not a
+nicety: `STATE_MACHINE.md` I22 asserts replay determinism, and an
+under-determined harness produces flaky adversarial tests that get muted rather
+than fixed. Concretely — one `u64` seed per run, printed in the failure output
+and sufficient to reproduce the run byte-for-byte; a single logical clock advanced
+only by the scheduler, never by wall time; every scheduling decision (which queued
+message is delivered next, which injection fires) drawn from that seed; and no
+use of thread scheduling, `Instant::now`, or any OS entropy source anywhere in
+the harness.
+
+**(ii) The eight injection modes `SPEC_CS.md` §24 names**, each parameterised and
+each reproducible from the seed:
+
+| Mode | What it does |
+|---|---|
+| delay | holds a message for a bounded number of logical ticks |
+| duplicate | delivers a message twice, at different ticks |
+| packet loss | drops a message entirely |
+| reordered events | delivers a peer's messages out of the order it sent them |
+| disconnect | emits `Disconnected` and drops subsequent sends to that peer |
+| reconnect | emits `Connected` again, with a chosen `ConnectionState` |
+| malicious packets | delivers arbitrary attacker-chosen bytes as a `Message`, including truncated, over-cap, non-canonical CBOR and invalid-signature bodies |
+| conflicting messages | see (iii) |
+
+**(iii) How a conflicting message is injected**, since it is the one mode with a
+protocol meaning. The harness must be able to hand **two different
+`SignedEvent`s for one
+`(sender, table_id, hand_id, sequence, event_class)`** to two different
+receivers — which is exactly the input the `EquivocationProof` predicate of
+`PROTOCOL.md` §5.2 is defined over. The harness therefore needs the sender's
+application signing key, because both copies must carry valid signatures; a test
+that injects an invalidly signed second copy tests the signature check, not the
+equivocation predicate, and the two must not be confused. Both copies carry
+`chain_scope = 1`; the predicate is not defined over unchained traffic and the
+harness must not attempt to produce a "conflict" there (§6.4, §7.4).
+
+**(iv) The acceptance bar of `SPEC_CS.md` §24:** thousands of hands run
+automatically, with no DHT and no libp2p process involved, each run reproducible
+from its seed, and every `THREAT_MODEL.md` §5.5 cheater exercised against it.
 
 ---
 
@@ -256,8 +361,10 @@ $ printf '%s' 'p2p-poker/mainline-relay/v1' | sha256sum | cut -c1-40
 
 ### 3.4 Distribution and integrity
 
-* Both constants live in one shared constants module together with the protocol
-  names, topic names and size caps (§14). They are `const`, compiled in.
+* Both constants, and both derivation strings, are two-sided and are therefore
+  defined in **`PROTOCOL.md` §13** together with the protocol names, topic names
+  and size caps; §14 of this document no longer restates them. They are `const`,
+  compiled in.
 * A release build has **no** way to override them. A `--testnet <string>` flag may
   derive a *different* pair from a different derivation string for integration
   testing; when it is active the GUI must display a prominent, permanent "TESTNET"
@@ -509,6 +616,47 @@ There is **no `connection-limits` cargo feature** — `libp2p-connection-limits`
 > Verification: [RESEARCH+COMPILED] `LIBP2P.md` §1, §8, including the reproduced
 > resolver error.
 
+#### 5.1.1 Dependency register — the transport side (`SPEC_CS.md` §28)
+
+`SPEC_CS.md` §28 requires a register with six columns for every crate the client
+links. The permanent home is **`docs/DEPENDENCIES.md`**, generated from
+`cargo metadata` and checked in CI so it cannot drift; until that document exists,
+this section carries the transport side and `CRYPTOGRAPHY.md` §9 carries the
+cryptographic side. **Neither is complete on its own**, and both are hand-written
+and therefore subject to exactly the drift that `PHASE0_REVIEW.md` B-3 found.
+
+| Crate | Version | Purpose | Repository | Licence | Security status |
+|---|---|---|---|---|---|
+| `libp2p` (umbrella) | `0.56.0` | transport, encryption, NAT traversal, gossip, relay | `github.com/libp2p/rust-libp2p` | MIT | RUSTSEC-2022-0084 (resource-management DoS) patched at `>= 0.45.1`; pinned version is patched |
+| `libp2p-core` | `0.43.2` | transport traits, upgrades | as above | MIT | RUSTSEC-2019-0004 patched `>= 0.8.1`, RUSTSEC-2022-0009 patched `>= 0.31.1`; both far below the pinned version |
+| `libp2p-identity` | `0.2.14` | `PeerId`, `Keypair` | as above | MIT | no advisory in the local advisory database |
+| `libp2p-swarm` `0.47.1`, `libp2p-swarm-derive` `0.35.1` | — | swarm driver, `#[derive(NetworkBehaviour)]` | as above | MIT | as above |
+| `libp2p-quic` `0.13.1`, `libp2p-tcp` `0.44.1`, `libp2p-dns` `0.44.0` | — | base transports (§5.3) | as above | MIT | as above |
+| `libp2p-noise` `0.46.1`, `libp2p-tls` `0.6.2`, `libp2p-yamux` `0.47.0` | — | security and muxer upgrades (mandatory for relay, §5.3) | as above | MIT | as above |
+| `libp2p-gossipsub` | `0.49.5` | lobby topics (§6) | as above | MIT | as above |
+| `libp2p-identify` `0.47.0`, `libp2p-ping` `0.47.0` | — | address candidates, liveness (§5.5) | as above | MIT | as above |
+| `libp2p-autonat` `0.15.0`, `libp2p-dcutr` `0.14.1`, `libp2p-relay` `0.21.1` | — | reachability, hole punching, relay (§9) | as above | MIT | as above |
+| `libp2p-request-response` | `0.29.0` | snapshot RPC (§7), join RPC (§8.4) | as above | MIT | as above |
+| `libp2p-mdns` `0.48.0`, `libp2p-upnp` `0.5.0` | — | LAN discovery (§9.8), IGD mapping (§9.9) | as above | MIT | as above |
+| `libp2p-connection-limits` `0.6.0`, `libp2p-memory-connection-limits` `0.5.0`, `libp2p-allow-block-list` `0.6.0` | — | resource limits and blocklist (§11) | as above | MIT | as above |
+| **`libp2p-stream`** | **`0.4.0-alpha`** | per-table streams (§8.1) | as above | MIT | **unaudited and semver-exempt.** An alpha crate carries no stability guarantee; contained behind the §1.3 trait so replacing it is a one-file change |
+| `mainline` | `=8.0.0` | Mainline DHT client (§3, §4, §11.4) | `github.com/pubky/mainline` | MIT | no advisory in the local advisory database; version-pinned with `=` because §11.4 depends on internals (`RequestFilter`, adaptive server mode) that are not semver-stable in practice |
+| `web-time` | `1` | `Instant` in the `RateLimiter` signature (§9.6) | `github.com/daxpedda/web-time` | MIT OR Apache-2.0 | no advisory in the local advisory database |
+
+The two entries a reader must not skip are **`libp2p-stream 0.4.0-alpha`** here
+and **`ziffle 0.1.0`** in `CRYPTOGRAPHY.md` §9: those are the corpus's two
+unaudited, semver-unstable dependencies, and they are flagged explicitly in both
+places.
+
+> Verification: [SOURCE] `license` and `repository` fields read from each crate's
+> own `Cargo.toml` under
+> `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`;
+> advisories read from the local RustSec advisory database under
+> `~/.cargo/advisory-db/crates/`. **No `cargo audit` run has been performed
+> against the assembled transport tree** — the tree does not exist yet, there is
+> no `Cargo.lock`, and the statements above are per-crate lookups, not a tree
+> audit. The tree audit is `docs/DEPENDENCIES.md`'s CI job (D-2), Phase 7.
+
 ### 5.2 Features
 
 ```toml
@@ -752,17 +900,29 @@ signature will be the *founder's*. Validation looks at the application signature
 For every received lobby message, in this order, before anything is forwarded:
 
 1. size cap (§6.5) — over-size is rejected at the transport by
-   `max_transmit_size`; the application re-checks its own per-type cap;
+   `max_transmit_size`; the application re-checks its own per-type cap, which for
+   a lobby chat message is `LOBBY_CHAT_MAX` and for an advert is `TABLE_AD_MAX`;
 2. deterministic CBOR decode into the declared schema; any trailing bytes,
    non-canonical encoding, unknown required field, or collection over its cap is a
    parse failure (`SPEC_CS.md` §16, §27);
 3. `protocol_version` matches;
-4. application signature verifies against the declared public key;
-5. for a table ad, the signing key **is** the ad's `table_public_key`;
-6. `timestamp` is not more than a small skew allowance in the future;
+4. **the envelope is unchained.** `chain_scope == 0`, and `table_id`, `hand_id`
+   and `sequence` carry the unchained sentinels of `PROTOCOL.md` §2.3/§2.4 —
+   `table_id = ZERO32`, `hand_id = 0xFFFF_FFFF_FFFF_FFFF`,
+   `previous_event_hash = ZERO32`, `sequence = 0`. Anything else on a lobby topic
+   is rejected. Every lobby message type is unchained
+   (`LOBBY_TABLE_AD`, `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE`,
+   `LOBBY_CHAT`), so a chained envelope arriving here is either a bug or an
+   attempt to make lobby traffic collide with the chain namespace that
+   `PROTOCOL.md` §5.2's equivocation predicate is defined over. The table an
+   advert concerns is named in its **payload** and by
+   `sender_public_key == table_public_key`, never in the envelope;
+5. application signature verifies against the declared public key;
+6. for a table ad, the signing key **is** the ad's `table_public_key`;
+7. `timestamp` is not more than a small skew allowance in the future;
    `expires_at > timestamp` and `expires_at` is not more than ~5 minutes ahead of
    local time (otherwise a malicious peer pins a table in every lobby forever);
-7. per-peer, per-type rate budget not exceeded (§6.6).
+8. per-peer, per-type rate budget not exceeded (§6.6).
 
 Then:
 
@@ -778,13 +938,14 @@ gossipsub.report_message_validation_result(&message_id, &propagation_source, acc
 
 ### 6.5 Size caps
 
-| Message | Application cap | Note |
-|---|---|---|
-| `LOBBY_TABLE_AD` | 1 024 B | the fields in `SPEC_CS.md` §4 plus a custom-parameter block and a 64-byte signature fit comfortably |
-| `LOBBY_TABLE_REMOVE` | 256 B | |
-| presence heartbeat | 256 B | |
-| lobby chat message | 2 048 B | |
-| any lobby message | **8 192 B** hard ceiling | anything larger is a protocol error regardless of type |
+| Message | Constant | Application cap | Note |
+|---|---|---|---|
+| `LOBBY_TABLE_AD` | `TABLE_AD_MAX` | 1 024 B | **payload** cap. The fields of `SPEC_CS.md` §4 plus a custom-parameter block total under 500 B at worst case, so this is over 2× headroom |
+| a **complete signed** `LOBBY_TABLE_AD` | `TABLE_AD_SIGNED_MAX` | **1 536 B** | payload (≤ 1 024) + envelope + the 64-byte signature. This is the cap applied wherever a whole signed advert is **forwarded or embedded** rather than freshly parsed: the snapshot elements of §7.3, and `JOIN_ACCEPT`'s `advert_event` (`PROTOCOL.md` §4.3). The two caps bound different objects, and conflating them is what produced the 2 560 / 1 024 conflict `PHASE0_REVIEW.md` C-1 found |
+| `LOBBY_TABLE_REMOVE` | — | 256 B | |
+| presence heartbeat | — | 256 B | |
+| lobby chat message | `LOBBY_CHAT_MAX` | 2 048 B | payload cap. The message type is `PROTOCOL.md` §4/§7's `0x0106 LOBBY_CHAT`; its `display_name` ≤ 32 B and `text` ≤ 512 B are display-only strings under `PROTOCOL.md` §9.4's string rules |
+| any lobby message | `LOBBY_MSG_MAX` | **8 192 B** hard ceiling | anything larger is a protocol error regardless of type |
 
 The 8 KiB application ceiling sits far below the 64 KiB transport ceiling, so the
 transport limit is a backstop and never the operative limit. A lobby snapshot does
@@ -805,9 +966,11 @@ Per remote `PeerId`, token buckets refilled continuously:
 Exceeding a budget produces `Ignore` for the excess (not `Reject` — the message may
 be perfectly valid, we simply refuse to spend on it), and repeated excess
 downgrades the peer locally: stop dialling it, then disconnect. Proven protocol
-violations (an invalid signature on a message the peer originated, or equivocation
-per `SPEC_CS.md` §14) go further and land the peer in
-`allow_block_list::Behaviour<BlockedPeers>` via `block_peer`.
+violations (an invalid signature on a message the peer originated, or an
+`EquivocationProof` in the `PROTOCOL.md` §5.2 sense — two conflicting **chained**
+events, `SPEC_CS.md` §14) go further and land the peer in
+`allow_block_list::Behaviour<BlockedPeers>` via `block_peer`. The lobby founder
+contradiction of §7.4 is **not** such a proof and never reaches `block_peer`.
 
 ### 6.7 Peer scoring — honest status
 
@@ -849,8 +1012,8 @@ addressed to one peer, not broadcast.
 
 ```rust
 let codec = request_response::cbor::codec::Codec::<SnapshotRequest, SnapshotResponse>::default()
-    .set_request_size_maximum(4 * 1024)
-    .set_response_size_maximum(256 * 1024);
+    .set_request_size_maximum(1024)              // SNAPSHOT_REQ_MAX
+    .set_response_size_maximum(256 * 1024);      // SNAPSHOT_RESP_MAX = 262 144
 let snapshot = request_response::Behaviour::with_codec(
     codec,
     [(StreamProtocol::new("/p2p-poker/lobby-snapshot/1"), request_response::ProtocolSupport::Full)],
@@ -862,7 +1025,10 @@ let snapshot = request_response::Behaviour::with_codec(
 
 The size caps are **mandatory overrides**: the codec defaults are 1 MiB request /
 10 MiB response [SOURCE `libp2p-request-response-0.29.0/src/cbor.rs:78`], far too
-generous for a lobby snapshot and a free memory-exhaustion lever.
+generous for a lobby snapshot and a free memory-exhaustion lever. The request
+payload is ~45 B and capped at 128 B by `PROTOCOL.md` §9.3, so 1 024 B is envelope
+headroom and nothing more; slack in a request cap is DoS surface, not safety
+margin.
 
 > Verification: [COMPILED+RUN] exactly this construction, for both the snapshot and
 > the join protocol, in `probe-netstack`; [SOURCE] `with_codec` at
@@ -886,8 +1052,12 @@ generous for a lobby snapshot and a free memory-exhaustion lever.
 `SnapshotResponse { protocol_version, ads: Vec<Vec<u8>> }` where each element is a
 complete, independently signed `LOBBY_TABLE_AD` **exactly as it was gossiped** —
 the responder forwards the original signed bytes and never re-serialises,
-re-signs or summarises them. Caps: at most 256 ads, at most 256 KiB total, each ad
-subject to the same 1 024 B cap as on gossip.
+re-signs or summarises them. Caps: at most **128** ads (`SNAPSHOT_MAX_ADS`), at
+most **262 144 B** total (`SNAPSHOT_RESP_MAX`), each ad's **payload** ≤ 1 024 B
+(`TABLE_AD_MAX`) and each **complete signed** ad ≤ 1 536 B
+(`TABLE_AD_SIGNED_MAX`). The count and the total are chosen together:
+`128 × 1 536 = 196 608 B`, which leaves room for the array and envelope overhead
+inside 262 144 B.
 
 A snapshot carries **no game state**, no hand history, no player secrets, no
 cryptographic material. It is a set of table advertisements and nothing else.
@@ -902,12 +1072,17 @@ cryptographic material. It is a set of table advertisements and nothing else.
 3. **Per `table_id`, keep the validly signed ad with the highest `timestamp`.** An
    ad with a lower `timestamp` for a `table_id` we already hold is discarded, which
    also blunts replay of stale ads (`SPEC_CS.md` §14).
-4. **Two different validly signed ads with the same `(table_id, sequence/timestamp)`
-   from the same `table_public_key` is equivocation** (`SPEC_CS.md` §14). Both are
-   retained as evidence, the table is marked `EQUIVOCATION`, it is never joinable,
-   and the evidence pair is surfaced to the user and to the peer set. This is the
-   one place where "two peers disagree" is meaningful — and even then the meaning
-   comes from the *founder's own two signatures*, not from the peers.
+4. **Two different validly signed adverts from the same `table_public_key` with
+   the same `timestamp_unix_ms` and different bodies are a founder
+   contradiction.** The table is marked `EQUIVOCATION`, both are retained as
+   evidence, and it is never joinable. This is **not** an `EquivocationProof` in
+   the `PROTOCOL.md` §5.2 sense — lobby messages are unchained
+   (`chain_scope = 0`, §6.4), and §5.2's predicate is defined only over chained
+   events — and it **must not be called one**. It is a local lobby-hygiene rule
+   with no chip and no blocklist consequence beyond refusing the table; in
+   particular it does not feed `block_peer` (§11.5) and it does not attribute
+   anything under D-005. The meaning it does have comes from the *founder's own
+   two signatures*, not from any count of peers.
 5. **An ad signed by any key other than its `table_public_key` is discarded.**
 6. Local eviction then proceeds by §10.3 (relative freshness), not by what a
    snapshot said.
@@ -993,20 +1168,30 @@ the same terms as a directly received one.
 | Channel | Why not |
 |---|---|
 | **Mainline DHT** | it stores 6 bytes of `IP:port`, is world-readable and unauthenticated, and has no confidentiality of any kind. `SPEC_CS.md` §1 forbids it outright. |
-| **GossipSub lobby topic** | it is world-readable by every client in the lobby, which would publish table traffic to non-participants, and a hand's shuffle traffic (18 KB heads-up, 54 KB six-handed [RESEARCH `MENTAL_POKER.md` §5.1]) would flood a topic sized for 1 KiB ads. |
+| **GossipSub lobby topic** | it is world-readable by every client in the lobby, which would publish table traffic to non-participants, and a hand's **table-wide** shuffle traffic (18 KB heads-up, 54 KB six-handed [RESEARCH `MENTAL_POKER.md` §5.1]) would flood a topic sized for 1 KiB ads. The table-wide figure is the right one here, because a broadcast topic carries every seat's traffic to everyone; it is the wrong one against a per-circuit relay cap, which is the error §9.5 corrects. |
 | **A relay, as an authority** | permitted as a byte pipe (D-001) and never as a participant: it holds no key share, sees no plaintext, arbitrates nothing. |
 
 ### 8.4 Framing, admission and membership
 
 * **Join** goes over `request-response` on `/p2p-poker/join/1`
-  (`JOIN_REQUEST` / `JOIN_ACCEPT`, `SPEC_CS.md` §16), 16 KiB caps both ways,
-  20 s timeout.
+  (`JOIN_REQUEST` / `JOIN_ACCEPT` / `JOIN_REJECT`, `SPEC_CS.md` §16),
+  **`JOIN_REQ_MAX` = 4 096 B request and `JOIN_RESP_MAX` = 16 384 B response**,
+  20 s timeout. The two are deliberately asymmetric: `JOIN_REQUEST`'s payload cap
+  is 512 B (`PROTOCOL.md` §9.3) so 4 096 B is envelope headroom only, while
+  `JOIN_ACCEPT` embeds a complete signed advert (≤ `TABLE_AD_SIGNED_MAX` = 1 536 B)
+  plus a ten-entry roster and needs the room. `PLAYER_LIST` and `TABLE_READY` do
+  **not** travel on this RPC — see `PROTOCOL.md` §4.3.
 * **Framing on the table stream is ours**, not the transport's: `u32` big-endian
-  length prefix followed by a deterministic-CBOR body. Max frame **131 072 bytes**
-  (128 KiB). Justification from measured payloads: `ShuffleProof<52>` is 5 547 B and
-  `MaskedDeck<52>` is 3 432 B [RESEARCH `MENTAL_POKER.md` §5.1], so 128 KiB is a
-  ~15× headroom over the largest real message and still a hard bound for the fuzzer
-  (`SPEC_CS.md` §27).
+  length prefix followed by a deterministic-CBOR body. Max frame
+  **`TABLE_FRAME_MAX` = 262 144 bytes** (256 KiB). The binding case is **not** the
+  shuffle: it is `DISPUTE`, whose four evidence entries of `MAX_EMBEDDED_EVENT` =
+  32 768 B each plus envelope exceed 128 KiB on their own, and `HAND_ABORT`'s
+  80 000 B behind it (`PROTOCOL.md` §9.3). A 131 072 B frame cannot carry the
+  protocol's own evidence-bearing message, which is why the earlier 128 KiB
+  figure — sized against `ShuffleProof<52>` at 5 547 B and `MaskedDeck<52>` at
+  3 432 B [RESEARCH `MENTAL_POKER.md` §5.1] — was wrong: the shuffle objects are
+  an order of magnitude smaller than the binding case and never set this bound.
+  256 KiB remains a hard bound for the fuzzer (`SPEC_CS.md` §27).
 * **Membership gate.** A table stream from a `PeerId` that is not an admitted
   participant of that `table_id` is closed immediately, before any body is read.
   Membership comes from the signed `PLAYER_LIST` / `TABLE_READY` of the application
@@ -1014,10 +1199,14 @@ the same terms as a directly received one.
 * **Connection loss is a hint, not a verdict.** When a table stream drops, the
   network layer reports the fact and nothing more. Whether that seat is absent is
   decided above, by the D-006 timeout certificate signed by the other still-active
-  players; an action timeout is an auto check/fold and never an abort, and no
-  timeout of any kind ends the tournament or the cash game. Only a client that is
-  gone or withholding decryption shares reaches the D-005 abort path. The transport
-  must not shortcut any of that.
+  players — **which at two seats is a single player, so D-007 makes it advisory;
+  the transport layer's behaviour is unchanged either way**. At `n = 2` a
+  heads-up action deadline is a UI countdown that produces no signed state
+  transition at all (D-007 point 1, `PROTOCOL.md` §8.3), and the transport must
+  not invent one to fill the gap. At `n ≥ 3` an action timeout is an auto
+  check/fold and never an abort, and no timeout of any kind ends the tournament or
+  the cash game. Only a client that is gone or withholding decryption shares
+  reaches the D-005 abort path. The transport must not shortcut any of that.
 
 ---
 
@@ -1127,7 +1316,26 @@ exactly like any other disconnect, per D-005/D-006).
 | Role | Who can serve it | Limits |
 |---|---|---|
 | **Rendezvous for a hole punch** — carry the DCUtR coordination, then get out of the way | any public relay, including the many public kubo nodes that enable `Swarm.RelayService` by default | the defaults are *sized for exactly this*: `max_circuit_duration` 2 min, `max_circuit_bytes` 128 KiB, `reservation_duration` 1 h, `max_reservations` 128, `max_circuits` 16, `max_circuits_per_peer` 4 — identical in kubo and in `rust-libp2p` |
-| **Carrying a whole session** when DCUtR fails on both ends | only a relay whose operator raised its own limits — i.e. a D-002 volunteer poker client | 2 minutes and 128 KiB is **not one poker hand**: heads-up shuffle traffic alone is ~18 KB/hand and a session lasts far longer than two minutes. A public IPFS relay **will** reset the connection mid-hand, which is an *engineered abort attack against ourselves* under `SPEC_CS.md` §19. |
+| **Carrying a whole session** when DCUtR fails on both ends | only a relay whose operator raised its own limits — i.e. a D-002 volunteer poker client | the **2-minute `max_circuit_duration`** is what makes a public relay unusable for a session, not the byte cap. A session lasts far longer than two minutes, so a public IPFS relay **will** reset the connection mid-hand, which is an *engineered abort attack against ourselves* under `SPEC_CS.md` §19. |
+
+**The byte arithmetic, corrected.** An earlier revision of this row compared
+*table-wide* shuffle traffic (~18 KB heads-up, ~54 KB six-handed) against
+`max_circuit_bytes`, which is a **per-circuit** cap. A table is a full mesh
+(§8.2), so one circuit connects exactly one pair and carries only that peer's own
+step and proof:
+
+| Quantity | Value | Basis |
+|---|---:|---|
+| `ShuffleProof<52>` + `MaskedDeck<52>`, one shuffler | 8 979 B | 5 547 + 3 432, measured [RESEARCH `MENTAL_POKER.md` §5.1] |
+| Shuffle traffic over **one circuit**, **one direction**, per hand | **8 979 B** | that peer's own step and proof; **independent of `n`** |
+| Hands per direction against a 131 072 B public-relay budget, shuffle only | **~14** | 131 072 / 8 979 |
+| The same including the signed event stream | **~10 hands** | order-of-magnitude only; measure under OQ-7 |
+| A relayed peer's **total** per-hand outbound at an `n`-seat table | `(n−1) × 8 979 B` | 44 895 B at six seats — a bandwidth figure, spread over `n−1` separate budgets, **never** a single cap |
+| The binding public-relay limit | **`max_circuit_duration` = 120 s**, not the byte cap | a session lasts far longer than two minutes |
+
+So the public-relay byte budget is *comfortable* for several hands and the
+duration is what breaks; the failure mode is unchanged but the reason in the
+earlier text was wrong.
 
 Two further facts to reconcile, because the research documents differ in emphasis
 and D-001 outranks:
@@ -1196,9 +1404,13 @@ unlimited relay without the project operating infrastructure.
 
 **Off by default.** Enabled only by an explicit, visible setting, with a first-run
 disclosure in plain language: strangers' poker traffic will cross the user's
-connection, at the user's bandwidth cost. Slot and bandwidth ceilings are
-user-visible and user-settable, and the network status panel shows how many peers
-are currently being relayed.
+connection, at the user's bandwidth cost. The disclosure must state the ceilings
+**in concrete terms**, because the raised limits below are large and a user who
+agrees to "help relay" is agreeing to these numbers: *up to 128 circuits open at
+the same time, each allowed to carry up to 1 GiB and to stay open for up to an hour,
+and up to 64 peers holding a reservation through you.*
+Slot and bandwidth ceilings are user-visible and user-settable, and the network
+status panel shows how many peers are currently being relayed.
 
 **The trap: Circuit Relay v2 is not protocol-selective.** `HOP_PROTOCOL_NAME` and
 `STOP_PROTOCOL_NAME` are compile-time constants
@@ -1208,39 +1420,81 @@ there is no application ACL hook. Left alone, enabling the server makes the user
 **open relay for the entire libp2p network**, IPFS traffic included.
 
 **The usable hook** is `Config::reservation_rate_limiters` and
-`Config::circuit_src_rate_limiters`. Their element type lives in a `pub(crate)`
-module and cannot be named from outside, but the crate carries a blanket
-implementation
+`Config::circuit_src_rate_limiters`. The module `behaviour::rate_limiter` is
+`pub(crate)`, but the trait itself is **re-exported at the crate root**
+(`libp2p-relay-0.21.1/src/lib.rs:42`), so `libp2p::relay::RateLimiter` is a public,
+nameable, implementable trait:
 
 ```rust
-impl<T: FnMut(PeerId, &Multiaddr, Instant) -> bool + Send> RateLimiter for T
+pub trait RateLimiter: Send {
+    fn try_next(&mut self, peer: PeerId, addr: &Multiaddr, now: Instant) -> bool;
+}
 ```
 
-so a closure coerces into the vector without naming the trait. The third parameter
-is `web_time::Instant`, so a `web-time = "1"` dependency is needed just to write
-the signature. **Both** vectors must be gated: one governs who may reserve a slot
-to become reachable through us, the other who may open a circuit through us.
+The crate also carries a blanket implementation
+`impl<T: FnMut(PeerId, &Multiaddr, Instant) -> bool + Send> RateLimiter for T`
+(`src/behaviour/rate_limiter.rs:56`), so a closure would coerce — but **a named
+type is used instead**, per D-002's 2026-08-28 correction: admission control holds
+shared mutable state (the admitted-peer set, each peer's tier, and that peer's
+live-circuit count), and a closure would have to capture all of it awkwardly. The
+earlier justification for the closure — that the trait could not be named from
+outside — was simply false, and it is the false *reason*, not the working code,
+that these documents were carrying.
+
+The third parameter is `web_time::Instant`, so a `web-time = "1"` dependency is
+needed just to write the signature. **Both** vectors must be gated: one governs
+who may reserve a slot to become reachable through us, the other who may open a
+circuit through us.
 
 ```rust
+struct PokerPeersOnly {
+    known: Arc<Mutex<HashSet<PeerId>>>,   // + tier and live-circuit counts per peer
+}
+
+impl libp2p::relay::RateLimiter for PokerPeersOnly {
+    fn try_next(&mut self, peer: PeerId, _addr: &Multiaddr, _now: web_time::Instant) -> bool { … }
+}
+
 let mut relay_cfg = relay::Config {
-    max_circuit_duration: Duration::from_secs(3600),
-    max_circuit_bytes:    1 << 30,
-    max_reservations:     64,
+    max_circuit_duration:      Duration::from_secs(3600),
+    max_circuit_bytes:         1 << 30,        // 1 GiB
+    max_reservations:          64,
+    max_reservations_per_peer: 4,              // crate default
+    reservation_duration:      Duration::from_secs(3600),   // crate default
+    max_circuits:              128,
+    max_circuits_per_peer:     9,              // = MAX_SEATS − 1
     ..Default::default()
 };
-let admitted = admitted_peers.clone();          // Arc<Mutex<HashSet<PeerId>>>
-relay_cfg.reservation_rate_limiters.push(Box::new(
-    move |peer: PeerId, _addr: &Multiaddr, _now: web_time::Instant| -> bool {
-        admitted.lock().map(|s| s.contains(&peer)).unwrap_or(false)
-    },
-));
-// …and the same for relay_cfg.circuit_src_rate_limiters
+relay_cfg.reservation_rate_limiters.push(Box::new(PokerPeersOnly::new(&admitted)));
+relay_cfg.circuit_src_rate_limiters.push(Box::new(PokerPeersOnly::new(&admitted)));
 ```
 
-> Verification: [COMPILED+RUN] exactly this, in `probe-netstack`: both vectors
-> receive a closure over a shared admitted-peer set, `relay::Behaviour::new` accepts
-> the config, and the swarm builds and runs. D-002 independently verified the raised
-> limits print back correctly.
+**Every scalar field is stated, so no other document restates a subset.** The
+`..Default::default()` therefore fills exactly two things — the crate's own
+per-peer and per-IP rate-limiter vectors — and that is deliberate: our
+`PokerPeersOnly` is pushed *alongside* them, never in place of them. Two of the
+stated fields are corrections rather than choices:
+
+* **`max_circuits_per_peer = 9` is forced.** A relayed peer at a ten-seat table
+  needs one circuit per table-mate (§8.2 full mesh, `MAX_SEATS − 1`). The crate
+  default of 4 refuses the fifth, so the D-002 relay as previously written could
+  not carry the case it exists for.
+* **`max_circuits = 128`** lets one volunteer serve roughly 14 relayed peers at
+  full tables (128 / 9), which is the number the consent disclosure above is about.
+
+> Verification: [SOURCE] `libp2p-relay-0.21.1/src/lib.rs:42` (the `RateLimiter`
+> re-export), `src/behaviour/rate_limiter.rs:38` (the trait), `:56` (the blanket
+> impl), `src/behaviour.rs:124-166` (`impl Default for Config`, giving
+> `max_reservations 128`, `max_reservations_per_peer 4`, `reservation_duration`
+> 1 h, `max_circuits 16`, `max_circuits_per_peer 4`, `max_circuit_duration` 2 min,
+> `max_circuit_bytes: 1 << 17`), `src/behaviour/handler.rs:415-450` (the limits
+> handed to each circuit). [COMPILED+RUN] `probe-netstack` builds a `relay::Config`
+> with both rate-limiter vectors populated over a shared admitted-peer set,
+> `relay::Behaviour::new` accepts it, and the swarm builds and runs. D-002
+> independently verified the raised limits print back correctly. **The probe used
+> the closure form; the named-type form above has not itself been compiled** —
+> it is the same trait and the blanket impl proves the signature, but that is an
+> inference, and Phase 7 must compile it.
 
 #### Settling the open decision: relay admission
 
@@ -1250,14 +1504,22 @@ it: admit by **`identify` protocol name**, or by **lobby presence**?
 **Decision: admit by `identify` protocol name, with escalation by lobby presence.**
 
 * **Tier A — admitted.** The peer's `identify` response lists `/p2p-poker/1`. It
-  gets a reservation and circuits under conservative per-peer limits
-  (`max_circuits_per_peer` 2, and a per-peer byte ceiling well below the global
-  one).
+  gets a reservation and is refused a **third** concurrent live circuit, plus a
+  per-peer byte ceiling well below the global one.
 * **Tier B — escalated.** The peer has additionally been seen publishing a
   validly-signed lobby message, or is a participant of a table we are also in. It
-  gets the full raised limits.
+  gets the full raised limits, up to 9 concurrent live circuits.
 * **Everyone else is refused**, which keeps generic IPFS traffic off the user's
   line — the thing D-002 actually requires.
+
+**The per-tier circuit ceiling is not a `Config` field.** `max_circuits_per_peer`
+is a single global number and is pinned at 9 above, because a Tier B peer at a
+ten-seat table needs all nine. The 2-versus-9 distinction is therefore enforced
+**inside the `PokerPeersOnly` implementation of `libp2p::relay::RateLimiter`**,
+which sees the requesting `PeerId` and can count that peer's live circuits: Tier A
+is refused beyond 2, Tier B beyond 9. A reader must not think the `Config` field
+does it — the `Config` cannot express a per-tier ceiling at all, and assuming it
+can is how a Tier A stranger ends up with nine circuits.
 
 Why not lobby presence alone: it is **circular** for exactly the user D-002 exists
 to help. A brand-new client behind CGNAT cannot appear in the lobby until it has
@@ -1400,9 +1662,18 @@ in Phase 8 and shorten the interval if the real figure is materially under 45 mi
 
 Rules:
 
-* On expiry, drop the entry locally. **No `TABLE_CLOSE` is required.**
+* On expiry, drop the entry locally. **TTL expiry is the only cleanup path.**
   `LOBBY_TABLE_REMOVE` is an optimisation for the polite case and never a
-  precondition for cleanup.
+  precondition for cleanup, and no `TABLE_CLOSE` is required.
+* **No peer may revoke another peer's advert.** A `LOBBY_TABLE_REMOVE` is
+  accepted only when it is signed by the advert's own `table_public_key`; a
+  removal signed by anything else is discarded exactly like any other
+  wrongly-signed lobby message (§6.4 step 6). This is what makes the abandoned-
+  formation case of `PROTOCOL.md` §4.3 safe: when a founder disappears before
+  `TABLE_READY` completes, nobody holds the table key, so nobody can revoke the
+  advert — and nobody needs to. It leaves every lobby by `AD_TTL_MS` (90 s) with
+  no cooperation from anybody, and a client holding a `JOIN_ACCEPT` for a table
+  whose advert has expired must stop displaying that table as joinable.
 * The signed `expires_at` is what the lobby honours — never a peer's word that a
   table is gone.
 * **Clock skew is an attack surface.** Use *relative* freshness — age since local
@@ -1417,8 +1688,9 @@ Rules:
 
 ### 10.4 What these TTLs do **not** govern
 
-A *seated* player's absence. That is D-005/D-006 protocol state — absent seat,
-auto check/fold, timeout certificate, hand abort with signed attribution — decided
+A *seated* player's absence. That is D-005/D-006/D-007 protocol state — absent
+seat, auto check/fold, timeout certificate, hand abort with signed attribution, and
+at two seats none of that machinery at all (§8.4) — decided
 above this layer by signed events, never by a network timer. The lobby TTLs govern
 only *lobby visibility*: whether a table and a player still appear in the list.
 Conflating the two would let a network hiccup fold a hand, which §1.2 rule 3
@@ -1466,16 +1738,25 @@ exists during a DCUtR upgrade, and no more.
 
 ### 11.3 Message size caps
 
-| Where | Cap | Source of the number |
-|---|---|---|
-| GossipSub transmit/receive | 65 536 B | crate default, pinned as a protocol constant (§6.2) |
-| Any lobby message (application) | 8 192 B | §6.5 |
-| `LOBBY_TABLE_AD` | 1 024 B | §6.5 |
-| Snapshot request | 4 096 B | §7.1 |
-| Snapshot response | 262 144 B, ≤256 ads | §7.1, overriding the 10 MiB codec default |
-| Join request / response | 16 384 B each | §8.4 |
-| Table stream frame | 131 072 B | ~15× the largest measured payload (§8.4) |
-| Relay control protocol | 4 096 B | `MAX_MESSAGE_SIZE` in `libp2p-relay` [SOURCE] |
+Every value here is normative in **`PROTOCOL.md` §13** and is reproduced, not
+defined, in this table. Where the two ever differ, `PROTOCOL.md` §13 is right and
+this table is stale.
+
+| Where | Constant | Cap | Source of the number |
+|---|---|---|---|
+| GossipSub transmit/receive | `GOSSIP_MAX_TRANSMIT` | 65 536 B | crate default, pinned as a protocol constant (§6.2) |
+| Any lobby message (application) | `LOBBY_MSG_MAX` | 8 192 B | §6.5 |
+| `LOBBY_TABLE_AD` payload | `TABLE_AD_MAX` | 1 024 B | §6.5 |
+| A complete signed advert, forwarded or embedded | `TABLE_AD_SIGNED_MAX` | 1 536 B | §6.5, §7.3 |
+| Lobby chat payload | `LOBBY_CHAT_MAX` | 2 048 B | §6.5 |
+| Snapshot request | `SNAPSHOT_REQ_MAX` | 1 024 B | §7.1 |
+| Snapshot response | `SNAPSHOT_RESP_MAX` | 262 144 B, ≤ 128 ads | §7.1, §7.3, overriding the 10 MiB codec default |
+| Ads in one snapshot | `SNAPSHOT_MAX_ADS` | 128 | §7.3; `128 × 1 536 = 196 608 B` is what makes the response cap fit |
+| Join request | `JOIN_REQ_MAX` | 4 096 B | §8.4 |
+| Join response | `JOIN_RESP_MAX` | 16 384 B | §8.4 |
+| Table stream frame | `TABLE_FRAME_MAX` | 262 144 B | sized by `DISPUTE`, not by the shuffle (§8.4) |
+| One embedded evidence element | `MAX_EMBEDDED_EVENT` | 32 768 B | `PROTOCOL.md` §9.3 (`DISPUTE`, `HAND_ABORT`) |
+| Relay control protocol | — | 4 096 B | `MAX_MESSAGE_SIZE`, [SOURCE] `libp2p-relay-0.21.1/src/protocol.rs:36`; the crate's own constant, not ours |
 
 Every one of these parsers is a fuzz target (`SPEC_CS.md` §27): no input may crash,
 allocate unboundedly, read out of bounds, or bypass schema validation. Collections
@@ -1542,9 +1823,12 @@ regression test.
 
 `libp2p::allow_block_list::Behaviour<BlockedPeers>` with `block_peer(PeerId)` for
 peers with a **proven** protocol violation: an invalid signature on a message they
-originated, or equivocation evidence (`SPEC_CS.md` §14). Blocking is local, is
-persisted in the profile, and is never applied on suspicion or on rate-limit
-overrun alone — the milder responses of §6.6 come first.
+originated, or an `EquivocationProof` as `PROTOCOL.md` §5.2 defines it — two
+conflicting **chained** events under one key (`SPEC_CS.md` §14). Unchained lobby
+and join traffic is outside that predicate and can never produce such a proof, so
+the §7.4 founder contradiction refuses the table and stops there. Blocking is
+local, is persisted in the profile, and is never applied on suspicion or on
+rate-limit overrun alone — the milder responses of §6.6 come first.
 
 ---
 
@@ -1559,6 +1843,13 @@ shuffle proofs; card secrecy; board reveal timing; poker rule legality; pot and
 side-pot arithmetic; showdown; who won; the hash-chain transcript; replay and
 equivocation detection; the disconnect/abort handling of D-005 and the timeout
 certificate of D-006. The network layer carries the bytes and nothing else.
+
+**Nothing above is exercised over libp2p before Phase 7.** Every one of Phases
+3–6 runs the poker and cryptographic stack on the `InMemoryTransport` of §1.3.2
+and on nothing else, so an unspecified or under-determined harness does not merely
+delay testing — it **blocks Phases 3–6**, and it is the only place
+`SPEC_CS.md` §25's eleven malicious peers can be run at all before there is a
+network.
 
 **Not solved by anybody, and the honest list:**
 
@@ -1598,6 +1889,21 @@ certificate of D-006. The network layer carries the bytes and nothing else.
     the D-002 relay disabled — is Phase 8 work and is the criterion this design is
     judged by. It has **not** been passed yet.
 
+    **The acceptance test runs on a `CUSTOM` two-seat table**, not on
+    `RATED_SNG_POKERTH_V1`. That preset is fully specified but pins `seats = 10`
+    and `min_players_to_start = 10`, while `SPEC_CS.md` §32 requires two-player
+    heads-up as the first supported mode and §1.3 scopes the MVP at `nlhe/2-6`; it
+    is therefore **not playable by the MVP** and becomes playable when `nlhe/7-10`
+    lands (`PROTOCOL.md` §13, `STATE_MACHINE.md` §9.5). Judging D-003 and D-004 by
+    a configuration the MVP cannot ship would test something nobody can run.
+
+    Two consequences of that choice must be stated rather than discovered later:
+    at two seats the deadline machinery does not apply at all (D-007, §8.4), so
+    the acceptance test exercises the transport in exactly the mode where a stalled
+    peer has no in-protocol remedy; and a two-seat full mesh is one circuit, which
+    is the least demanding case for §9.5's relay arithmetic and therefore proves
+    the least about it.
+
 ---
 
 ## 13. Open questions carried forward
@@ -1610,45 +1916,49 @@ certificate of D-006. The network layer carries the bytes and nothing else.
 | **OQ-4** | Ship libp2p Kademlia after all, if Phase 8 measures poor lobby connectivity from the DHT alone? Costs a second eclipse surface. | §5.7 | 8 |
 | **OQ-5** | `TopicScoreParams` values for both lobby topics. Defaults leave the per-topic terms — including the invalid-message penalty a `Reject` feeds — at zero. Requires measured message rates and mesh sizes; badly tuned scoring graylists honest peers. | §6.7 | 8 |
 | **OQ-6** | How often does the relay admission race actually deny an honest peer (reservation request arriving before `identify` completes)? A denial closes the circuit listener with no automatic retry, so our own `listen_on` backoff must cover it. | §9.6 | 7 |
-| **OQ-7** | Real per-hand byte count over a relayed circuit, checked against the `Limit` real relays hand back, so the "refuse to seat rather than start a hand that will drop" rule has a number. | §9.5 | 5 → 8 |
+| **OQ-7** | What is the real per-hand byte count over **one** relayed circuit, per direction, measured against the `Limit` a real relay actually returns? The estimate is ~8 979 B of shuffle plus the signed event stream, order ~10 KB per hand, against a 131 072 B public-relay budget — comfortable, so the binding public-relay limit is the 120 s `max_circuit_duration` and not the byte cap (§9.5). The measurement is what gives the "refuse to seat rather than start a hand that will drop" rule a number. | §9.5 | 5 → 8 |
 | **OQ-8** | What fraction of real peers does AutoNAT v2 confirm as publicly reachable? This sizes the D-002 volunteer relay pool, which is the project's real single point of failure. | §9.6, §12.8 | 8 |
 | **OQ-9** | Upstream `mainline`: `announce_peer_detailed` returning `PutOutcome { stored_at }`, or `pub use` of the `*RequestArguments` structs, so the GUI's DHT health indicator has a real number instead of a `get_peers`-and-count workaround. Hold a local patch if needed sooner. | §2.1 step 5 | 8 |
 | **OQ-10** | Licence for the project. Unrelated to this document but still open in `DECISIONS.md`. | publication | — |
 
 ---
 
-## 14. Constants (the shared constants module)
+## 14. Constants
 
-Changing any value in this table is a **protocol-version change**, not a tuning
-knob, because both sides must agree.
+**Every two-sided constant is defined in `PROTOCOL.md` §13 and is not restated
+here. Changing any of them is a protocol-version change.** That includes every
+value this section used to carry: `PROTOCOL_VERSION`, the protocol and topic
+strings, the two derivation strings and their infohashes, and every size, TTL and
+interval that both sides must agree on. The names in `PROTOCOL.md` §13 are the
+names a Rust `constants` module carries, and no value has two names anywhere in
+the corpus. Earlier revisions of this document and of `PROTOCOL.md` gave several
+of these values two different names and two different numbers; that is
+`PHASE0_REVIEW.md` C-1, and one home is the fix.
 
-| Constant | Value |
-|---|---|
-| `PROTOCOL_VERSION` | `1` |
-| `LOBBY_DERIVATION_STRING` | `"p2p-poker/mainline-lobby/v1"` |
-| `LOBBY_INFOHASH` | `fd7c0d69433e32e425db3ca2b7d7718928739f01` |
-| `RELAY_DERIVATION_STRING` | `"p2p-poker/mainline-relay/v1"` |
-| `RELAY_INFOHASH` | `9c18d8c80f69de3aa079b2ef519bc4bbb67e1cc1` |
-| `IDENTIFY_PROTOCOL` | `/p2p-poker/1` |
-| `LOBBY_TOPIC` | `/p2p-poker/lobby/1` |
-| `LOBBY_CHAT_TOPIC` | `/p2p-poker/lobby-chat/1` |
-| `SNAPSHOT_PROTOCOL` | `/p2p-poker/lobby-snapshot/1` |
-| `JOIN_PROTOCOL` | `/p2p-poker/join/1` |
-| `TABLE_PROTOCOL` | `/p2p-poker/table/1` |
-| `GOSSIP_MAX_TRANSMIT` | `65536` |
-| `LOBBY_MSG_MAX` | `8192` |
-| `TABLE_AD_MAX` | `1024` |
-| `SNAPSHOT_REQ_MAX` / `SNAPSHOT_RESP_MAX` | `4096` / `262144` |
-| `SNAPSHOT_MAX_ADS` | `256` |
-| `JOIN_REQ_MAX` / `JOIN_RESP_MAX` | `16384` / `16384` |
-| `TABLE_FRAME_MAX` | `131072` |
-| `REANNOUNCE_INTERVAL` | `600 s` |
-| `TABLE_AD_TTL` / `TABLE_AD_REBROADCAST` | `90 s` / `30 s` |
-| `PRESENCE_TTL` / `PRESENCE_HEARTBEAT` | `120 s` / `40 s` |
-| `MAX_FUTURE_EXPIRES_AT` | `300 s` |
-| `IDLE_CONNECTION_TIMEOUT` | `60 s` |
-| `SNAPSHOT_PEERS` (K) | `4` |
-| `MDNS_QUERY_INTERVAL` | `15 s` |
+What remains here is the genuinely **local** tuning — values a peer may change
+without breaking interoperability, because no other peer parses or depends on
+them.
+
+| Local constant | Value | Where |
+|---|---|---|
+| GossipSub `mesh_n` / `mesh_n_low` / `mesh_n_high` / `mesh_outbound_min` | 8 / 6 / 12 / 3 | §6.2 |
+| GossipSub `heartbeat_interval` | 1 s | §6.2 |
+| GossipSub `duplicate_cache_time` | 120 s | §6.2 — must exceed the 30 s ad re-broadcast interval with margin |
+| GossipSub `flood_publish` | `false` | §6.2 |
+| Per-peer lobby rate budgets (ads, presence, chat, bytes) | §6.6's table | §6.6 |
+| DHT candidates dialled per cycle | ≤ 64 | §11.2 |
+| Concurrent dials from DHT hints | ≤ 8 | §11.2 |
+| Per-address dial timeout | 10 s | §11.2 |
+| Dials to the same `/24` per cycle | ≤ 4 | §11.2 |
+| Bootstrap retry backoff | 2 s, 5 s, 15 s, 60 s, then 5 min | §2.1 step 4, §11.2 |
+| `connection_limits` (pending in/out, established in/out, total, per peer) | 32 / 64 / 128 / 128 / 192 / 2 | §11.1 |
+| `memory_connection_limits` share of system memory | 0.25 | §11.1 |
+| Relay `Config` (D-002 volunteer) | §9.6's block | §9.6 — local, because a relay's limits are its operator's choice; a client reads the `Limit` the relay actually returns rather than assuming |
+
+A note on the boundary, because it is not obvious in one case: `GOSSIP_MAX_TRANSMIT`
+*looks* like local tuning and is not. A peer configured at 64 KiB rejects a larger
+frame outright, so the value is two-sided and lives in `PROTOCOL.md` §13. The mesh
+parameters beside it genuinely are local: a denser mesh costs only its owner.
 
 ---
 
@@ -1661,4 +1971,55 @@ knob, because both sides must agree.
 | **D-003** global lobby visibility is the acceptance criterion; the bridge is the load-bearing step; announce `Some(external_quic_port)` | §2, §4, §4.4, §12.12 |
 | **D-004** lobby visible even if every client is behind NAT; four layers; symmetric-both-ends stated | §9.7, §9.3, §12.1 |
 | **D-005** absent seat, mid-hand abort, forfeiture — **not** a transport concern | §1.2 rule 3, §8.4, §10.4 |
-| **D-006** action timeout is auto check/fold, never an abort; timeout certificate; no timeout ends the game | §1.2 rule 3, §8.4, §10.4 |
+| **D-006** action timeout is auto check/fold, never an abort; timeout certificate; no timeout ends the game — **as corrected by D-007** | §1.2 rule 3, §8.4, §10.4 |
+| **D-007** corrects D-006: at `n = 2` the action deadline is advisory, a fold-effect timeout certificate is forbidden, and no document may claim the certificate protects a two-seat table. The transport layer's behaviour is unchanged — connection loss stays a hint at every table size — and the transport must not invent a substitute verdict | §8.4, §1.2 rule 3, §10.4, §12.12 |
+
+---
+
+## 16. Objections to the fix plan
+
+`PHASE0_FIXPLAN.md` is applied as written throughout this document. One ruling is
+applied under objection, recorded here so the corpus stays consistent and the
+disagreement is visible rather than silently resolved in one file.
+
+### 16.1 A-8 — `max_circuit_bytes` is per circuit, but **not** per direction
+
+**The ruling.** A-8 states that *"`max_circuit_bytes` is per circuit and per
+direction"*, and derives from that a public-relay budget of ~14 hands per
+direction (131 072 / 8 979). §9.5 above carries those numbers verbatim, as
+instructed.
+
+**The objection.** The "per direction" half does not hold in
+`libp2p-relay 0.21.1`. A circuit is relayed by a single `CopyFuture` holding one
+`bytes_sent: u64` counter, and **both** directions increment that one counter
+before it is compared against the cap:
+
+```rust
+// src/copy_future.rs:41-48, 78, 88-104
+if this.max_circuit_bytes > 0 && this.bytes_sent > this.max_circuit_bytes { … }
+let src_status = match forward_data(&mut this.src, &mut this.dst, cx) { … this.bytes_sent += i … };
+let dst_status = match forward_data(&mut this.dst, &mut this.src, cx) { … this.bytes_sent += i … };
+```
+
+The cap is therefore per circuit and **bidirectional**. A-8's citation
+(`src/behaviour.rs`, `impl Default for Config`; `src/behaviour/handler.rs`)
+establishes the default value and that the value is handed to each circuit; it
+does not reach the accounting, which lives in `src/copy_future.rs`.
+
+**What changes if the objection is upheld.** Over one relayed circuit between two
+seats, each seat sends its own step and proof once per hand, so the circuit
+carries `2 × 8 979 = 17 958 B` of shuffle per hand, not 8 979 B. The
+public-relay budget is then **~7 hands**, not ~14, and the "including the signed
+event stream" figure roughly halves with it. Every other number in A-8 is
+unaffected: `8 979 B` per shuffler is correct, `(n−1) × 8 979 B` as a relayed
+peer's total per-hand outbound is correct, and — decisively — **the ruling's
+conclusion is correct either way**: at 7 hands as at 14, the byte cap is not what
+binds, and the 120 s `max_circuit_duration` still is. The correction changes a
+comfort margin, not a design decision.
+
+**Why it is still worth recording.** OQ-7 asks for this number to be measured
+against a real relay's returned `Limit`. Whoever runs that measurement will read
+the accounting as per-direction, measure one direction, and conclude there is
+twice the headroom there is. `SPEC_CS.md` §36 forbids carrying a claim stronger
+than its evidence, and "per direction" is one such claim, small as its
+consequence is here.

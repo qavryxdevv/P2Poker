@@ -1,7 +1,10 @@
 # PROTOCOL.md — the versioned wire protocol
 
 Phase 1 output. Binding spec sections: `SPEC_CS.md` §4, §12, §13, §14, §15, §16,
-§17, §20, §27. Binding owner decisions: `DECISIONS.md` D-001 … D-006.
+§17, §20, §27. Binding owner decisions: `DECISIONS.md` D-001 … D-007. **D-007
+corrects D-006 and wins over it**: at two seats an action deadline is advisory, a
+fold-effect timeout certificate is forbidden, and no claim in this document may
+say the certificate protects a two-seat table.
 
 This document specifies the bytes on the wire. It does not specify the poker
 rules (`docs/POKER_RULES.md` research output, later `docs/STATE_MACHINE.md`), the
@@ -41,6 +44,12 @@ what it merely detects and attributes, and what it cannot touch at all.
 
 ## 1. Version, negotiation and the shape of the wire
 
+**The module this document governs** (`SPEC_CS.md` §23, interim mapping until
+`docs/ARCHITECTURE.md` exists at the start of Phase 2): `src/protocol/` —
+`messages.rs`, `serialization.rs`, `signatures.rs`, `transcript.rs`. Nothing in
+this document is implemented inside `src/net/`, `src/poker/` or
+`src/mental_poker/`; that separation is §23's binding requirement.
+
 ### 1.1 Versioning model
 
 There are two version numbers and they do different jobs.
@@ -50,14 +59,20 @@ There are two version numbers and they do different jobs.
 | `PROTOCOL_MAJOR` | compile-time constant, `1` | libp2p protocol name strings, GossipSub topic string | wire-format epoch. Two peers with different majors cannot negotiate anything; they never meet, because the protocol strings differ. |
 | `protocol_version` | `u16`, currently `1` | every signed envelope, every table advertisement | the exact rule set and encoding in force for this session. Must equal the value pinned by the table advertisement for every event of that table. |
 
-For `PROTOCOL_MAJOR = 1` the strings are, exactly:
+For `PROTOCOL_MAJOR = 1` there are **six** strings, exactly:
 
 ```
 identify protocol             /p2p-poker/1
 GossipSub lobby topic         /p2p-poker/lobby/1        (IdentTopic, not Sha256Topic)
+GossipSub lobby chat topic    /p2p-poker/lobby-chat/1   (IdentTopic; see §7.7)
 lobby snapshot RPC            /p2p-poker/lobby-snapshot/1
+join RPC                      /p2p-poker/join/1
 table event stream            /p2p-poker/table/1
 ```
+
+`/p2p-poker/join/1` is new: the join exchange is a one-shot request-response RPC,
+not table-stream traffic (C-7 of `docs/research/PHASE0_FIXPLAN.md`; see §1.4 and
+§4.3). `/p2p-poker/lobby-chat/1` carries `SPEC_CS.md` §22's lobby chat (§7.7).
 
 `IdentTopic` and `Sha256Topic` both exist in `libp2p-gossipsub` 0.49.5; `IdentTopic`
 sends the topic string in the clear, which is correct here because the string is
@@ -117,8 +132,16 @@ at first use:
 * `capabilities` = the intersection of the two advertised sets.
 
 Both `HELLO` and `CAPABILITIES` use the same signed envelope as everything else
-(§2), with `table_id = 32 × 0x00`, `hand_id = 0`, `previous_event_hash = 32 ×
-0x00`, and `sequence` a per-connection counter starting at 0.
+(§2), but they are **unchained** events: `chain_scope = 0`, `event_class = 0`,
+`table_id = ZERO32`, `hand_id = 0xFFFF_FFFF_FFFF_FFFF`,
+`previous_event_hash = ZERO32`, `sequence = 0` (§2.3). They occupy no stage slot
+in any chain and can never take part in an `EquivocationProof` (§5.2).
+
+Their anti-replay is therefore not the envelope's `sequence`. It is the
+`connection_nonce` binding plus a per-connection counter held in the stream's own
+state machine: `HELLO` exactly once per side per stream and before anything else,
+`CAPABILITIES` exactly once per side and only after both `HELLO`s. A second
+message of either type on one stream closes the stream.
 
 **A `CAPABILITIES` exchange authorises nothing about a table.** Joining a table
 is a separate, table-scoped handshake (§4.3). A connection may carry several
@@ -146,15 +169,30 @@ A table session requires that every seated participant advertise
 
 ### 1.4 Framing and transport mapping
 
-Three channels carry protocol messages, and each message type is legal on exactly
+Five channels carry protocol messages, and each message type is legal on exactly
 one of them. A message arriving on the wrong channel is dropped and its sender
 is rate-limited; it is not processed.
 
 | Channel | libp2p mechanism | Framing |
 |---|---|---|
 | **Lobby broadcast** | GossipSub on `/p2p-poker/lobby/1`, `MessageAuthenticity::Signed` + `ValidationMode::Strict`, `validate_messages()` on [LIBP2P §6] | one `SignedEvent` per GossipSub message, no extra framing |
-| **Lobby RPC** | `request_response::cbor::Behaviour` on `/p2p-poker/lobby-snapshot/1` [LIBP2P §7] | codec's own framing; `set_request_size_maximum` / `set_response_size_maximum` set per §9 |
+| **Lobby chat broadcast** | GossipSub on `/p2p-poker/lobby-chat/1`, same settings (§7.7) | one `SignedEvent` per GossipSub message |
+| **Lobby RPC** | `request_response::cbor::Behaviour` on `/p2p-poker/lobby-snapshot/1` [LIBP2P §7] | codec's own framing; `SNAPSHOT_REQ_MAX` / `SNAPSHOT_RESP_MAX` per §13 |
+| **Join RPC** | `request_response::cbor::Behaviour` on `/p2p-poker/join/1` [LIBP2P §7] | codec's own framing; `JOIN_REQ_MAX` / `JOIN_RESP_MAX` per §13; 20 s timeout |
 | **Table mesh** | `libp2p-stream` 0.4.0-alpha on `/p2p-poker/table/1` [LIBP2P §7] | `u32` big-endian length prefix, then exactly that many bytes of `SignedEvent`. Nothing else. |
+
+**Which message is legal on which channel.** This is a table rather than prose so
+that adding a channel or a message type cannot leave it stale. §4.11 repeats it
+per message code.
+
+| Message | Channel |
+|---|---|
+| `HELLO`, `CAPABILITIES` | table mesh (`/p2p-poker/table/1`), before anything else on that stream |
+| `LOBBY_TABLE_AD`, `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE` | lobby broadcast |
+| `LOBBY_CHAT` | lobby chat broadcast |
+| `LOBBY_SNAPSHOT_REQUEST`, `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC |
+| `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT` | join RPC |
+| everything else (`PLAYER_LIST`, `TABLE_READY`, and all of groups 3–8) | table mesh |
 
 The table stream is long-lived and bidirectional; both sides push. That is why it
 is `libp2p-stream` and not `request-response`, which cannot express server push.
@@ -274,23 +312,53 @@ SignedEvent                  #[cbor(array)]        <- what is on the wire
   n(1) signature  : bytes[64]
 
 EventBody                    #[cbor(array)]        <- what is signed and hashed
-  n(0) protocol_version    : u16
-  n(1) table_id            : bytes[32]
-  n(2) hand_id             : u64
-  n(3) sequence            : u64
-  n(4) sender_public_key   : bytes[32]
-  n(5) event_type          : u16
-  n(6) payload             : bytes                 canonical CBOR of the per-type payload
-  n(7) previous_event_hash : bytes[32]
-  n(8) emitted_at_unix_ms  : u64                   ADVISORY ONLY, see 2.6
-  n(9) next_deadline_ms    : u32                   NORMATIVE, see §8
+  n(0)  protocol_version    : u16
+  n(1)  table_id            : bytes[32]
+  n(2)  hand_id             : u64
+  n(3)  sequence            : u64
+  n(4)  sender_public_key   : bytes[32]
+  n(5)  event_type          : u16
+  n(6)  payload             : bytes                canonical CBOR of the per-type payload
+  n(7)  previous_event_hash : bytes[32]
+  n(8)  emitted_at_unix_ms  : u64                  ADVISORY ONLY, see 2.6
+  n(9)  next_deadline_ms    : u32                  NORMATIVE, see §8
+  n(10) chain_scope         : u8                   1 = chained, 0 = unchained
+  n(11) event_class         : u8                   0 = ordinary, 1 = TIMEOUT_VOTE,
+                                                   2 = TIMEOUT_CERT
 
 <payload>                    #[cbor(array)]        <- one struct per event_type
 ```
 
-This is exactly the field list `SPEC_CS.md` §12 requires. `timestamp/deadline
-information` is split into the two fields `n(8)` and `n(9)` because they have
-opposite trust properties (§2.6, §8).
+This is the field list `SPEC_CS.md` §12 requires, plus the two discriminators
+`n(10)` and `n(11)`. `timestamp/deadline information` is split into the two
+fields `n(8)` and `n(9)` because they have opposite trust properties (§2.6, §8).
+
+**`chain_scope` and `event_class`, exactly.**
+
+| Field | Type | Values |
+|---|---|---|
+| `chain_scope` | `u8` | `1` = the event occupies a stage slot in a hand chain or in the setup chain; `0` = unchained (handshake, join, lobby) |
+| `event_class` | `u8` | `0` = ordinary chain event; `1` = `TIMEOUT_VOTE`; `2` = `TIMEOUT_CERT`. Meaningless and always `0` when `chain_scope == 0`. |
+
+An **unchained** event (`chain_scope = 0`) must carry `table_id = ZERO32`,
+`hand_id = 0xFFFF_FFFF_FFFF_FFFF`, `previous_event_hash = ZERO32`,
+`sequence = 0`. The table it concerns, where it concerns one, is named **in the
+payload**, never in the envelope. A receiver rejects an unchained event carrying
+anything else in those four fields.
+
+Unchained message types, exhaustively: `HELLO`, `CAPABILITIES`, `JOIN_REQUEST`,
+`JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST`, `LOBBY_TABLE_AD`,
+`LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE`, `LOBBY_SNAPSHOT_REQUEST`,
+`LOBBY_SNAPSHOT_RESPONSE`, `LOBBY_CHAT`. Everything else is chained.
+
+The two fields exist for one reason each, and both are load-bearing:
+`chain_scope` keeps the equivocation predicate of §5.2 off traffic that has no
+stage slot, and `event_class` gives a `TIMEOUT_VOTE` its own slot so that a voter
+at a collective stage does not equivocate against its own contribution (§4.8).
+Neither is optional.
+
+Field indices are append-only forever (§2.2 rule 5), so `n(10)` and `n(11)` sit
+after `next_deadline_ms` rather than beside the fields they are related to.
 
 The signature cannot live inside the bytes it signs, hence the two-level split
 between `SignedEvent` and `EventBody`. `EventBody` is transported as an opaque
@@ -318,17 +386,25 @@ pub struct EventBody {
     #[cbor(n(7), with = "minicbor::bytes")] pub previous_event_hash: [u8; 32],
     #[n(8)] pub emitted_at_unix_ms: u64,
     #[n(9)] pub next_deadline_ms: u32,
+    #[n(10)] pub chain_scope: u8,
+    #[n(11)] pub event_class: u8,
 }
 ```
 
 ### 2.4 The exact byte string that is signed
 
 ```
-TO_BE_SIGNED = DOMAIN_EVENT || u32_be(len(body_bytes)) || body_bytes
+DOMAIN_EVENT = "p2p-poker/v1/event" NUL-padded to 24 bytes
 
-DOMAIN_EVENT = the 24 ASCII bytes  "p2p-poker/v1/event\0\0\0\0\0\0"
-               (the literal text "p2p-poker/v1/event" padded with NUL to 24 bytes)
+hex: 70 32 70 2d 70 6f 6b 65 72 2f 76 31 2f 65 76 65 6e 74 00 00 00 00 00 00
+     |<---------- 18 ASCII bytes ---------->|<---- 6 NUL ---->|
+
+TO_BE_SIGNED = DOMAIN_EVENT || u32_be(len(body_bytes)) || body_bytes
 ```
+
+The same 24 hex bytes are printed in §13. They are the normative value; the
+separators are slashes, **not** the spaces used by the `derive_key` domain
+strings of §2.8, and the difference is deliberate — see §2.8's first table row.
 
 `body_bytes` is the canonical CBOR encoding of `EventBody`. The length prefix is
 redundant given a fixed-length domain tag but costs four bytes and removes any
@@ -482,7 +558,7 @@ change; changing or removing one is a major change.
 
 | Domain string | Used for |
 |---|---|
-| `p2p-poker v1 event` | the 24-byte `DOMAIN_EVENT` signature prefix (§2.4) — a literal prefix, not this hasher |
+| `p2p-poker/v1/event` | the 24-byte `DOMAIN_EVENT` signature prefix (§2.4). **This is a literal prefix, not a `derive_key` domain**, which is why its separators differ from every other row in this table. Its exact bytes are in §2.4 and §13. |
 | `p2p-poker v1 transcript` | `event_hash` (§3.2) |
 | `p2p-poker v1 stage` | `stage_hash` (§3.2) |
 | `p2p-poker v1 genesis` | the genesis hash of each chain (§3.1) |
@@ -497,6 +573,19 @@ change; changing or removing one is a major change.
 | `p2p-poker v1 table-id` | reserved; see §4.1 — `table_id` is currently the table public key itself |
 | `p2p-poker v1 advert` | reserved; unused in version 1. `advert_hash` is everywhere the `event_hash` of the `LOBBY_TABLE_AD`, never a separate digest. |
 | `p2p-poker v1 timeout-cert` | the certificate subject digest (§8.3) |
+
+**This register is the single register for the whole corpus.** A document that
+needs a domain string takes it from here; a document that invents one has a bug.
+
+**Retired, never valid.** These strings appeared in drafts of other documents and
+are not domain strings of this protocol. A receiver that ever sees a hash
+constructed under one of them is looking at a non-conforming implementation.
+
+| Retired string | Where it appeared | Replaced by |
+|---|---|---|
+| `p2p-poker v1 rng-seed` | `CRYPTOGRAPHY.md` §7.3 | `p2p-poker v1 rng-beacon` |
+| `p2p-poker/seat-beacon/v1` | `STATE_MACHINE.md` §7.9 | `p2p-poker v1 rng-beacon` |
+| `p2p-poker v1 event` (spaces) | this document's own §2.8 table | `p2p-poker/v1/event`, and it is a literal prefix, not a `derive_key` domain (§2.4, B-4) |
 
 ---
 
@@ -555,8 +644,27 @@ is shared by every event of the same stage.
 Each stage has a *type* and a *required emitter set*, both of which every peer
 derives deterministically from the state after the previous stage. Two shapes:
 
+**The stage-kind principle, normative.** Which shape a stage takes is not a free
+choice and is not decided per message type by taste:
+
+> **A stage whose body is a pure function of the state before it is *collective*.
+> A stage whose body carries a choice its emitter is entitled to make is
+> *single-writer*.**
+
+The reason is `SPEC_CS.md` §4: a single writer over a derived body holds a veto
+over a transition that the spec requires to be automatic and deterministic, which
+makes that writer an authority. A collective derived stage costs `n` copies of a
+small message instead of one and removes the veto. That is the trade and it is
+taken. Any future message type is classified by this rule and by nothing else.
+
+Applying it: `HAND_INIT`, `HAND_COMPLETE`, `HAND_ABORT` and `TIMEOUT_CERT` are
+**collective**, because every field of each is derived. `SHUFFLE_STEP`,
+`SHUFFLE_PROOF`, every `ACTION_*`, and the voluntary `PLAYER_SIT_OUT` /
+`PLAYER_SIT_IN` / `PLAYER_LEAVE` are single-writer, because the permutation, the
+betting decision and the seat decision are genuine choices.
+
 **Single-writer stage.** Exactly one seat may emit exactly one event. Examples:
-`HAND_INIT`, every `ACTION_*`, `SHUFFLE_STEP`, `SHUFFLE_PROOF`, `HAND_COMPLETE`.
+every `ACTION_*`, `SHUFFLE_STEP`, `SHUFFLE_PROOF`, `PLAYER_SIT_OUT`.
 
 ```
 stage_hash(s) = h("p2p-poker v1 stage",
@@ -565,7 +673,8 @@ stage_hash(s) = h("p2p-poker v1 stage",
 
 **Collective stage.** A fixed set `R` of seats each emit exactly one event, and
 the stage is complete only when every seat in `R` has been heard. Examples:
-`RNG_COMMIT`, `DECK_INIT`, `DEAL_PRIVATE`, `BOARD_REVEAL`, `STATE_HASH`.
+`TABLE_READY`, `RNG_COMMIT`, `HAND_INIT`, `DECK_INIT`, `DEAL_PRIVATE`,
+`BOARD_REVEAL`, `STATE_HASH`, `TIMEOUT_CERT`, `HAND_COMPLETE`, `HAND_ABORT`.
 
 ```
 stage_hash(s) = h("p2p-poker v1 stage",
@@ -576,6 +685,13 @@ stage_hash(s) = h("p2p-poker v1 stage",
 
 Every event of stage `s` carries `previous_event_hash = stage_hash(s-1)`, and
 `stage_hash(-1) = GENESIS(hand_id)`.
+
+**Which events enter a `stage_hash`.** `stage_hash(s)` is computed over the
+events of `event_class = 0` when the stage closes normally, and over the
+certificates of `event_class = 2` when the stage closes by certificate (§8.3).
+Votes (`event_class = 1`) never enter a `stage_hash`; they are carried inside the
+certificate. A stage therefore has exactly one closing form in the chain, even
+though a vote and a real event may both exist for the same `sequence`.
 
 ```
 event_hash = h("p2p-poker v1 transcript", [ body_bytes ])
@@ -589,8 +705,12 @@ means that cannot fork the chain; two signatures over one body are one event.
 **Why collective stages exist.** The alternative — a strictly linear single-writer
 chain everywhere — would serialise phases that are naturally parallel. Six-handed,
 the reveal traffic alone (`DEAL_PRIVATE` plus three `BOARD_REVEAL` streets) would
-become 24 extra serial round trips, roughly 1.2 s of pure latency at a 100 ms RTT,
-on top of the ~420 ms of measured crypto [MENTAL §5.1]. Collective stages cost
+become 24 extra serial round trips — **an estimated** ~1.2 s of pure latency **at
+an assumed 100 ms RTT**, on top of the ~420 ms of measured crypto [MENTAL §5.1].
+The latency half of that figure is an estimate, not a measurement; no
+two-network test has been run, and `CRYPTOGRAPHY.md` §6.5 holds the measurement
+plan and the phase in which each of `SPEC_CS.md` §33's targets is measured.
+Collective stages cost
 nothing in determinism — the required set and the ordering rule are both fixed
 functions of state — and they let the whole phase complete in one round trip.
 
@@ -655,6 +775,12 @@ So the rule that keeps hole cards private is exactly one counting rule:
 > contain at most `n-1` reveal tokens.**
 
 Everything follows from it.
+
+This counting rule is the **only** basis on which hole-card privacy is claimed,
+and `DEAL_PRIVATE` is a broadcast (§4.6). `CRYPTOGRAPHY.md` §2.7 and §2.9
+described it as point-to-point and rested privacy on "the other seats receive no
+token at all"; that reason is false under the shipped design and was corrected to
+match this section (C-4). Nothing here changed.
 
 * **Hole cards.** For seat `P`'s hole card at index `i`, `DEAL_PRIVATE` publishes
   the tokens of all seats *except* `P`. That is `n-1` tokens: everyone can see
@@ -725,9 +851,14 @@ following, with no secret input:
    construction, the winners of each pot, the odd-chip distribution, and the final
    chip deltas of `HAND_COMPLETE`. Chip conservation
    (`sum(stacks) == total_chips_in_play`) holds at every step. [RULES A0, A7, A8]
-8. **Attribution of failure.** If the hand ended in `HAND_ABORT`, which seat
-   failed to publish which event at which stage, proved by the unanimous timeout
-   certificate.
+8. **Attribution of failure, where attribution exists.** If the hand ended in
+   `HAND_ABORT` with a non-empty `attributed` set, which seat failed to publish
+   which event at which stage, proved by the timeout certificate of every other
+   dealt-in seat. This is available for a **single** silent seat at `n >= 3`
+   only. At `n = 2` there is no attribution at all (§8.3, D-007), and when two or
+   more seats stop at once there is none either (§8.4, Q-02); in both cases the
+   abort carries `attributed = []` and the transcript shows what was expected and
+   not served without naming a culprit.
 
 All of this requires that somebody kept the transcript. Whether it is persisted
 to the profile directory by default is **OPEN QUESTION Q-06**; without
@@ -753,7 +884,7 @@ What a verifier **cannot** check, stated because §36 forbids smoothing this ove
 
 ## 4. The message catalogue
 
-38 message types. For each: its `event_type` code, its channel, who may emit it,
+39 message types. For each: its `event_type` code, its channel, who may emit it,
 who receives it, exactly when it is legal, its payload fields with types and
 limits, and what a receiver must check before acting.
 
@@ -775,7 +906,8 @@ before the signature so two encodings of one event cannot both be accepted.
 | 7 | `payload` length ≤ the per-type cap of §9 | drop |
 | 8 | Sender is a permitted emitter in this context (roster member for a table event; any peer for a lobby event) | drop |
 | 9 | `verify_strict(sender_public_key, TO_BE_SIGNED, signature)` | **protocol violation**, attributable |
-| 10 | Anti-replay: `table_id`, `hand_id`, `sequence`, `previous_event_hash` (§5.1) | violation or duplicate-drop |
+| 10 | `chain_scope` matches the `event_type`'s entry in §4.11, and if `chain_scope == 0` the envelope carries the sentinels of §2.3 exactly | drop |
+| 10a | Anti-replay: `table_id`, `hand_id`, `sequence`, `event_class`, `previous_event_hash` for a chained event; the per-type rule of §5.2 for an unchained one | violation or duplicate-drop |
 | 11 | Decode the payload struct, canonicality gate, per-field range checks | violation |
 | 12 | Stage legality: is this `event_type` from this seat expected at this `sequence`? | violation |
 | 13 | Semantic legality: the poker engine re-validates the action from scratch | violation |
@@ -783,7 +915,11 @@ before the signature so two encodings of one event cannot both be accepted.
 | 15 | Apply to state | — |
 
 Steps 1–8 are pure parsing and cost microseconds. Step 9 is one Ed25519
-verification. Step 14 is the only expensive one, at roughly 42 ms for a 52-card
+verification, and **no figure for it has been measured** — signature-verification
+throughput is one of `SPEC_CS.md` §33's seven profiling targets, it is scheduled
+for Phase 4, and the per-hand event count it must be multiplied by comes from §3.
+`CRYPTOGRAPHY.md` §6.5 carries the target table. Step 14 is the only step known
+to be expensive, at roughly 42 ms for a 52-card
 Bayer–Groth proof [MENTAL §5.1], and it is reached only for an event that is
 already signed by a roster member and expected at exactly this stage — so an
 outsider cannot make us verify a proof at all.
@@ -799,11 +935,14 @@ cargo feature. [LIBP2P §1]
 ### 4.1 `table_id`, and who has authority
 
 `table_id` is 32 bytes and **is** the table's Ed25519 public key,
-`table_public_key`. Consequences:
+`table_public_key`. It appears in the envelope of every **chained** event of that
+table; an unchained event carries the sentinel `ZERO32` there and names the table
+in its payload instead (§2.3). Consequences:
 
-* a `LOBBY_TABLE_AD` is self-authenticating: check its signature against
-  `sender_public_key` and check that `sender_public_key == table_id`. No lookup,
-  no trust-on-first-use;
+* a `LOBBY_TABLE_AD` is self-authenticating without needing the envelope's
+  `table_id` at all: check its signature against `sender_public_key`, and
+  `sender_public_key` **is** the `table_public_key`. No lookup, no
+  trust-on-first-use;
 * two tables cannot collide unless someone breaks Ed25519;
 * the table key is generated fresh per table from `getrandom::SysRng` and is
   discarded when the table closes.
@@ -829,7 +968,8 @@ Codes `0x0000`–`0x00FF`.
 
 *Direction:* each side of a newly opened `/p2p-poker/table/1` stream → the other.
 *Legal:* exactly once per stream, as the first message, from each side.
-*Envelope:* `table_id = ZERO32`, `hand_id = 0`, `sequence = 0`,
+*Envelope:* **unchained** — `chain_scope = 0`, `event_class = 0`,
+`table_id = ZERO32`, `hand_id = 0xFFFF_FFFF_FFFF_FFFF`, `sequence = 0`,
 `previous_event_hash = ZERO32`, `next_deadline_ms = HANDSHAKE_DEADLINE_MS`.
 
 | Field | Type | Limit / rule |
@@ -855,7 +995,10 @@ Failure closes the stream.
 
 *Direction:* both sides, after receiving the peer's `HELLO`.
 *Legal:* exactly once per stream, after our `HELLO` and the peer's.
-*Envelope:* `sequence = 1`.
+*Envelope:* the same unchained envelope as `HELLO` — `chain_scope = 0`,
+`event_class = 0`, `table_id = ZERO32`, `hand_id = 0xFFFF_FFFF_FFFF_FFFF`,
+`sequence = 0`, `previous_event_hash = ZERO32`. Ordering within the stream is
+enforced by the stream's own state machine, not by `sequence` (§1.2).
 
 | Field | Type | Limit / rule |
 |---|---|---|
@@ -868,10 +1011,22 @@ mismatch closes the connection — this is a bug or an attack, and there is no
 degraded mode. From here the connection is *established* and may carry table
 messages.
 
-### 4.3 Group 2 — table formation (channel: table stream)
+### 4.3 Group 2 — table formation (channel: join RPC, except `PLAYER_LIST` and `TABLE_READY`)
 
 Codes `0x0200`–`0x02FF`. Group 1 (lobby) is specified in §7 because it has its own
 transport, TTL and anti-spam rules.
+
+`JOIN_REQUEST`, `JOIN_ACCEPT` and `JOIN_REJECT` run over
+`request_response::cbor::Behaviour` on `/p2p-poker/join/1` (§1.4). Join is a
+one-shot RPC with a natural timeout and free size caps, and it avoids opening a
+table stream to a peer that has not been admitted. `PLAYER_LIST` stays on the
+table mesh, because it is a broadcast to already-admitted peers, and
+`TABLE_READY` stays a collective chained stage on the table mesh.
+
+All three join messages and `PLAYER_LIST` are **unchained** (§2.3):
+`chain_scope = 0`, `event_class = 0`, `table_id = ZERO32`,
+`hand_id = 0xFFFF_FFFF_FFFF_FFFF`, `previous_event_hash = ZERO32`,
+`sequence = 0`. The table each concerns is named in its payload.
 
 ---
 
@@ -880,9 +1035,11 @@ transport, TTL and anti-spam rules.
 *Direction:* a joining player → the table founder (the holder of `table_id`).
 *Legal:* on an established connection, when the referenced advertisement has not
 expired and the table has not reached `TABLE_READY`.
-*Envelope:* `table_id` = the target table, `hand_id = 0`,
-`previous_event_hash = ZERO32` (the setup chain's genesis is not yet fixed for a
-non-member), `sequence` = per-connection counter.
+*Envelope:* **unchained** — `chain_scope = 0`, `event_class = 0`,
+`table_id = ZERO32`, `hand_id = 0xFFFF_FFFF_FFFF_FFFF`, `sequence = 0`,
+`previous_event_hash = ZERO32`. The table being joined is named by the payload's
+`n(8) table_id`, never by the envelope, so that the join RPC occupies no stage
+slot and can never appear in an `EquivocationProof` (§5.2).
 
 | Field | Type | Limit / rule |
 |---|---|---|
@@ -893,7 +1050,8 @@ non-member), `sequence` = per-connection counter.
 | `n(4) requested_seat` | `Option<u8>` | `< max_players`, or absent for "any" |
 | `n(5) password_proof` | `Option<bytes[32]>` | present iff the advert has `password_required`; see below |
 | `n(6) buyin` | `u64` | within `[min_buyin, max_buyin]` of the advert |
-| `n(7) join_nonce` | `bytes[32]` | fresh |
+| `n(7) join_nonce` | `bytes[32]` | fresh; the anti-replay for this RPC, since the envelope's `sequence` is a sentinel |
+| `n(8) table_id` | `bytes[32]` | the table being joined; must equal the `table_public_key` of the advert named by `advert_hash` |
 
 `password_proof = h("p2p-poker v1 session", [ password_utf8, table_id,
 join_nonce ])`. This is a possession proof, not a secret transfer, and it is
@@ -902,7 +1060,8 @@ strength mechanism; a weak table password is guessable offline by anyone who see
 one proof, and the UI must say so.
 
 *Receiver must validate:* the advert hash names an advert this founder actually
-signed and which has not expired; `app_public_key == sender_public_key`;
+signed and which has not expired; `n(8) table_id` equals that advert's
+`table_public_key`; `app_public_key == sender_public_key`;
 `peer_id` matches the connection; the buy-in is in range; the seat is free; the
 password proof recomputes; this `app_public_key` is not already seated; the table
 is not full; `display_name` is well-formed UTF-8 (and is treated as untrusted
@@ -913,20 +1072,22 @@ display data forever — it is never an identifier).
 **`0x0202 JOIN_ACCEPT`**
 
 *Direction:* founder → joiner. Signed by the **table key**
-(`sender_public_key == table_id`).
+(`sender_public_key == table_public_key`; the envelope's `table_id` is the
+unchained sentinel `ZERO32`, so the table's identity here is the signing key).
 *Legal:* in response to a valid `JOIN_REQUEST`.
 
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) request_hash` | `bytes[32]` | `event_hash` of the `JOIN_REQUEST` |
 | `n(1) seat` | `u8` | `< max_players` |
-| `n(2) advert_event` | `bytes` | ≤ 2 560 B; the complete `SignedEvent` of the `LOBBY_TABLE_AD`, repeated verbatim so the joiner is not relying on a gossip copy and can re-verify the table key's signature itself |
+| `n(2) advert_event` | `bytes` | ≤ `TABLE_AD_SIGNED_MAX` = 1 536 B; the complete `SignedEvent` of the `LOBBY_TABLE_AD`, repeated verbatim so the joiner is not relying on a gossip copy and can re-verify the table key's signature itself |
 | `n(3) roster_so_far` | `Vec<SeatEntry>` | ≤ `MAX_SEATS` entries |
 
 `SeatEntry` = `#[cbor(array)] { n(0) seat: u8, n(1) app_public_key: bytes[32],
 n(2) peer_id: bytes(≤42), n(3) display_name: bytes(≤32), n(4) buyin: u64 }`.
 
-*Receiver must validate:* `sender_public_key == table_id`; the signature; that
+*Receiver must validate:* `sender_public_key` equals the `table_public_key` of
+the advert it asked to join; the signature; that
 `advert_event` passes §4.0 in full and its `event_hash` equals the `advert_hash`
 the joiner sent; that the seat is not already
 taken in `roster_so_far`; that the roster has no duplicate `app_public_key` and no
@@ -1014,11 +1175,36 @@ the same advertisement still get different `session_id`s, because the `HELLO`
 nonces feed the connections and the `join_nonce`s feed the join requests whose
 hashes are in the roster chain.
 
+**`session_id` is the object `SPEC_CS.md` §14 and §20 call the *session nonce*.**
+There is one name for it, `session_id`, and it is defined here. `session_nonce`
+is **not** a separate field, is not carried in any envelope or payload, and must
+not appear as a field name in any document of this corpus (C-2). Every event is
+bound to it transitively through `GENESIS(k)`, and the deck proofs are bound to
+it directly through `ctx` (§4.5).
+
+**If formation never completes.** If `TABLE_READY` has not completed within
+`join_deadline_ms` of the first `JOIN_ACCEPT` — the founder vanished, or too few
+players ever arrived — formation is abandoned. Every holder of a `JOIN_ACCEPT`
+discards it and its seat reservation; **no chips have moved, because a buy-in
+enters the ledger only at the first `HAND_INIT`** (§4.4's `ledger_delta`), and
+formation produces no chained event except `TABLE_READY`, which by definition has
+not happened. The advertisement is not revoked by anyone —
+`LOBBY_TABLE_REMOVE` requires the table key, which is exactly what is missing —
+and it disappears from every lobby by `AD_TTL_MS` with no cooperation from
+anybody. A client that holds a `JOIN_ACCEPT` for a table whose advert has expired
+must not display the table as joinable. `STATE_MACHINE.md` T4 reaches the same
+terminal state from the engine side; the engine's `TableClosed` and the lobby's
+TTL expiry are the same event seen from two layers.
+
 ### 4.4 Group 3 — hand setup and the deck (channel: table mesh)
 
 Codes `0x0300`–`0x03FF`.
 
-**Where `RNG_COMMIT` / `RNG_REVEAL` sit, and why.** `SPEC_CS.md` §16 lists them
+**Recorded spec deviation — where `RNG_COMMIT` / `RNG_REVEAL` sit, and why.**
+This is a deviation from a binding spec section and is recorded as such, in the
+same form `CRYPTOGRAPHY.md` §7.2 uses for the `OsRng` rename. The single
+deviation register for the corpus is `THREAT_MODEL.md` §9.1.1; this is entry 2 in
+it. `SPEC_CS.md` §16 lists them
 after `HAND_INIT`. They are placed in the **setup chain** instead, run exactly
 once per table, for seat assignment and the initial button position only. The
 reason is a Phase 0 finding: *the shuffle chain is already the per-hand
@@ -1041,15 +1227,28 @@ for the non-deck randomness, which is exactly what it is used for.
 
 | Field | Type | Limit / rule |
 |---|---|---|
-| `n(0) commitment` | `bytes[32]` | `h("p2p-poker v1 rng-commit", [r_i, salt_i])` |
+| `n(0) commitment` | `bytes[32]` | the canonical five-part commitment below |
+
+```
+commitment_i = h("p2p-poker v1 rng-commit",
+                 [ table_id, session_id, committer_app_public_key, r_i, salt_i ])
+```
+
+This is the canonical form for the whole corpus (C-2). The earlier two-part
+`h(..., [r_i, salt_i])` is deleted: it bound neither the table, nor the session,
+nor the committer, so a commitment could be lifted from one table into another.
 
 `r_i` and `salt_i` are each 32 bytes from `getrandom::SysRng`. `OsRng` no longer
 exists in the current `rand` / `rand_core` line; the OS source is
-`getrandom::SysRng`, and the `rand` crate is deliberately absent from the
-dependency tree so that `SmallRng` and `StdRng` are structurally unavailable —
-which is `SPEC_CS.md` §7's requirement enforced by the dependency graph rather
-than by reviewer discipline. [CRYPTO §1] This spec deviation (the API named in §7
-does not exist under that name) must also be recorded in `docs/CRYPTOGRAPHY.md`.
+`getrandom::SysRng`. **`rand 0.8.8` *is* in the runtime tree**, via
+`ark-std 0.5.0`, together with `rand_chacha 0.3.1` and `rand_core 0.6.4`.
+`SmallRng` is absent because rand 0.8's `small_rng` feature is not enabled;
+`StdRng` is present and is used by `ziffle` for deterministic
+nothing-up-my-sleeve public constants only. `SPEC_CS.md` §7 is therefore enforced
+by **the CI lint of `CRYPTOGRAPHY.md` §12 item 6**, not by the dependency graph —
+see `CRYPTOGRAPHY.md` §7.2 and its OQ-8. No structural guarantee is claimed here.
+[CRYPTO §1] The `OsRng` rename is deviation 1 in `THREAT_MODEL.md` §9.1.1's
+register and is recorded in `docs/CRYPTOGRAPHY.md` §7.2.
 
 *Receiver must validate:* exactly 32 bytes; exactly one commitment per seat; the
 stage is not already complete.
@@ -1068,16 +1267,23 @@ binding: no player sees any `r_j` while still able to change its own.
 | `n(0) r` | `bytes[32]` | |
 | `n(1) salt` | `bytes[32]` | |
 
-*Receiver must validate:* `h("p2p-poker v1 rng-commit", [r, salt])` equals the
-commitment this seat published at stage 1. A mismatch, or a failure to reveal, is
-a protocol violation attributed to that seat, and the table does not start.
+*Receiver must validate:* the five-part `commitment_i` of stage 1 recomputes from
+`(table_id, session_id, that seat's app public key, r, salt)` and equals the
+commitment that seat published. A mismatch, or a failure to reveal, is a protocol
+violation attributed to that seat, and the table does not start.
 
 ```
-beacon = h("p2p-poker v1 rng-beacon",
-           [ session_id, for each seat s ascending: r_s ])
+seed = h("p2p-poker v1 rng-beacon", [ r_1, …, r_n ])     ascending by seat index
 ```
 
-The beacon determines the seat permutation and the initial button position, by a
+This is the canonical combine for the whole corpus (C-2). The retired forms are
+`CRYPTOGRAPHY.md` §7.3's `p2p-poker v1 rng-seed` and `STATE_MACHINE.md` §7.9's
+unprefixed `BLAKE3("p2p-poker/seat-beacon/v1" ‖ …)`; both are listed as never
+valid in §2.8. The seed carries no `session_id` part of its own — each `r_s` is
+already bound to the session by its stage-1 commitment, and the beacon's own
+events are bound to `GENESIS(0)` by the chain.
+
+The seed determines the seat permutation and the initial button position, by a
 deterministic rule specified in `STATE_MACHINE.md`. Nothing else. It is not used
 for cards.
 
@@ -1085,10 +1291,13 @@ for cards.
 
 **`0x0303 HAND_INIT`**
 
-*Direction:* single-writer stage 0 of chain `hand_id = k`, `k ≥ 1`. The writer is
-the seat holding the **button position** if that seat is occupied and present;
-otherwise the first present seat clockwise from it. (The button position may be a
-dead, empty seat under the TDA dead-button rule. [RULES A1.3])
+*Direction:* **collective stage 0 of chain `hand_id = k`**, `k ≥ 1`. The required
+emitter set is every seat that will be `dealt_in`, plus every occupied seat that
+is absent or sitting out and therefore posts dead money. Each such seat computes
+the byte-identical body from the state after `TERMINAL(k-1)`, signs its own copy
+under its own application key, and emits it. There is no writer. (The button
+position may still be a dead, empty seat under the TDA dead-button rule.
+[RULES A1.3])
 *Legal:* immediately after `TERMINAL(k-1)`, with no human input. `SPEC_CS.md` §4
 requires the next hand to start automatically and deterministically, not to be
 "driven by whoever clicks first". [RULES A9]
@@ -1106,13 +1315,27 @@ requires the next hand to start automatically and deterministically, not to be
 | `n(8) dealt_in` | `Vec<u8>` | ≤ `MAX_SEATS`, ascending, unique; the cryptographic parties to this hand |
 | `n(9) stacks` | `Vec<u64>` | one per occupied seat, ascending by seat |
 | `n(10) roster_hash` | `bytes[32]` | `roster_hash(k)` |
+| `n(11) ledger_delta` | `Vec<(u8, i64)>` | ≤ `MAX_SEATS`, ascending by seat, unique; the per-seat ledger change applied at this hand boundary — positive for a buy-in, negative for a departing stack |
 
 **`HAND_INIT` announces nothing and decides nothing.** Every field is a pure
 function of `TERMINAL(k-1)` and the table parameters, so every receiver
-recomputes all of them and rejects the event if any field differs. The writer's
-only privilege is being the one who serialises the stage; it cannot choose the
-button, the level, or who is dealt in. A writer that emits a wrong `HAND_INIT`
-commits an attributable protocol violation.
+recomputes all of them and rejects a copy in which any field differs. This is
+exactly why the stage is collective and not single-writer (§3.2's stage-kind
+principle): a body with no choices in it must not give one seat a veto over the
+hand-to-hand transition that `SPEC_CS.md` §4 requires to be automatic. A seat
+that emits a wrong `HAND_INIT` commits an attributable protocol violation, and
+its copy simply does not complete the stage for it.
+
+`ledger_delta` is what makes the chip ledger verifiable. `ledger_in` is the sum
+of every accepted seat-entry's buy-in and `ledger_out` the sum of every accepted
+seat-exit's removed stack; both change **only** at a hand boundary and only
+through this field, both are inside `state_hash` (§6.1), and every receiver
+recomputes the vector from the accepted join and `PLAYER_LEAVE` events and
+rejects a copy that disagrees. This is what turns `STATE_MACHINE.md`'s I1 from
+"total chips are constant" — false in cash mode — into the ledger identity
+`Σ stack + Σ committed_hand == ledger_in − ledger_out` (C-9). A buy-in enters the
+ledger here and nowhere earlier, which is why abandoned table formation moves no
+chips (§4.3).
 
 `dealt_in` excludes absent and sitting-out seats per D-005: an absent seat keeps
 its stack, pays its blinds and antes as dead money, takes no cards, and is not a
@@ -1185,9 +1408,16 @@ failure, and a `DISPUTE` carrying the offending event is broadcast.
 **Cost, measured.** Proving a 52-card shuffle takes 94–111 ms and verifying takes
 37–43 ms in the recommended library, and the numbers are flat in the number of
 players because the deck is always 52 cards. A whole hand's own crypto work for
-one node is ~195 ms heads-up and ~420 ms six-handed. Hand start-up is therefore
-roughly `n × (100 ms + one-way latency)`: ~340 ms heads-up at 100 ms RTT, ~1.1 s
-six-handed. [MENTAL §5.1, §5.4]
+one node is ~195 ms heads-up and ~420 ms six-handed; those are measurements.
+
+**Hand start-up latency is an estimate, not a measurement.** Roughly
+`n × (100 ms + one-way latency)`: **an estimated ~340 ms heads-up and ~1.1 s
+six-handed, at an assumed 100 ms RTT.** No two-network test has been run
+(`NETWORK_STACK.md` §12.12), the figure is one of `SPEC_CS.md` §33's seven
+profiling targets, and `CRYPTOGRAPHY.md` §6.5 holds the target table and names
+Phase 8 as where it is measured. The estimate must also be revised upward for
+C-5: making `HAND_INIT` collective replaces one message with `n` and adds one
+collective round trip to hand start-up. [MENTAL §5.1, §5.4]
 
 ---
 
@@ -1220,15 +1450,42 @@ contexts. But that is only as strong as what we put in it, and getting it wrong
 is our bug, not the library's. [MENTAL §9, risk 3] It is:
 
 ```
-ctx = h("p2p-poker v1 deck-ctx",
-        [ u16_be(protocol_version), table_id, session_id,
-          u64_be(hand_id), u64_be(sequence), sender_public_key ])
+ctx = h("p2p-poker v1 deck-ctx", [
+          u16_be(protocol_version),   //  2 B
+          table_id,                   // 32 B  the table's Ed25519 public key
+          session_id,                 // 32 B  = SPEC_CS.md §14/§20 "session nonce"
+          u64_be(hand_id),            //  8 B
+          u64_be(sequence),           //  8 B  the chain stage index of the event carrying the proof
+          [ u8(shuffle_round) ],      //  1 B  0-based position of this shuffler in the chain;
+                                      //       0xFF for every ctx that is not a shuffle step
+          sender_public_key           // 32 B  the emitter's application Ed25519 key
+      ])
 ```
 
-Including `sequence` and `sender_public_key` means a proof is bound not only to
-the hand but to the exact stage and the exact shuffler. The adversarial suite must
-contain a test that replays a valid shuffle proof from hand `n` into hand `n+1`
-and asserts rejection, and another that replays seat 2's proof as seat 3's.
+where `h` is §2.8's constructor: `blake3::derive_key(domain, b"p2p-poker/v1")` as
+the key, then for each part an 8-byte big-endian length prefix followed by the
+part. The result is 32 bytes and is what is handed to the deck library. **The
+separator is the length prefix; no other separator, delimiter or padding
+exists.** Field order is exactly as listed and is part of the protocol.
+
+`shuffle_round = 0xFF` applies to the `ctx` used for `DECK_INIT` ownership proofs
+and for reveal-token DLEQ proofs; those are not shuffle-chain steps and must not
+share a `ctx` with one.
+
+**This is the normative construction for the whole corpus** and it supersedes
+`CRYPTOGRAPHY.md` §6.4's raw-concatenation form, which is deleted (C-2). Hashing
+rather than concatenating is what makes the input fixed-length and reuses the one
+audited length-prefixed, domain-separated hasher; `ziffle` hashes whatever it is
+given (`SHA-256(ctx)`), so a 32-byte input loses nothing. `CRYPTOGRAPHY.md` §6.4
+reproduces this block for the reader and does not own it.
+
+Including `sequence`, `shuffle_round` and `sender_public_key` means a proof is
+bound not only to the hand but to the exact stage, the exact position in the
+shuffle chain, and the exact shuffler. The adversarial suite must contain a test
+that replays a valid shuffle proof from hand `n` into hand `n+1` and asserts
+rejection, and another that replays seat 2's proof as seat 3's. Whether this
+binding is *sufficient* is a separate, still-open question — `CRYPTOGRAPHY.md`
+OQ-3 and `THREAT_MODEL.md` OQ3 — which this construction does not answer.
 
 **The deck-index → role map.** This must be fixed *before* the shuffle chain
 starts, or a malicious last shuffler could argue after the fact about which index
@@ -1255,7 +1512,16 @@ u8(i) || u8(role_code(i)) || u8(owner_seat_or_0xFF(i)) ])`.
 edge-sorting attacks; there are no physical cards here. A burn that is never
 opened is indistinguishable from an unused index, so burning is a no-op that only
 consumes indices and adds a place to get the map wrong. This is a deliberate
-departure from live procedure and is recorded as such.
+departure from live procedure, it is entry 3 in the deviation register of
+`THREAT_MODEL.md` §9.1.1, and it is not a free per-document choice: a burn costs
+a deck position, changes this map, and therefore changes `index_map_hash` inside
+`DECK_COMMIT`, so two conforming clients with different maps would produce a
+guaranteed `DECK_COMMIT` mismatch every hand — a manufactured §15 dispute that
+after §6.3 faults the table. `CRYPTOGRAPHY.md` §2.4 and §2.8 carried a burn
+layout and were corrected to reproduce this table (C-3). This section owns the
+map; no other document may restate it independently.
+
+The symbol for the dealt-in count is **`m`** in every document of this corpus.
 
 ### 4.6 Group 4 — dealing and revealing (channel: table mesh)
 
@@ -1301,6 +1567,15 @@ for those indices and, by §3.4, learns nothing.
 The word "private" in the message name is `SPEC_CS.md` §16's; the message itself
 is broadcast. What is private is the *result*, and it is private because one token
 is missing, not because the message was.
+
+**Broadcast is the canonical shape and this section owns it.** `CRYPTOGRAPHY.md`
+§2.7 and §2.9 specified point-to-point delivery to the card's owner and rested
+privacy on "the other seats receive no token at all"; that reason is false under
+the shipped design, and both sections were corrected to broadcast and to the
+counting argument of §3.4 (C-4). The consequences of broadcast are load-bearing:
+the transcript already holds `m-1` tokens per hole index, so a showdown is one
+message per revealing seat rather than a fresh round, and mucking is a policy
+question rather than a cryptographic one.
 
 ---
 
@@ -1443,10 +1718,18 @@ Codes `0x0600`–`0x06FF`. Full semantics in §8.
 | `n(4) deadline_ms` | `u32` | the `next_deadline_ms` carried by the parent stage's events |
 | `n(5) kind` | `u16` | `1` = action deadline, `2` = cryptographic-step deadline |
 
-The envelope's own `sequence` for a `TIMEOUT_VOTE` is `subject_sequence`, and its
-`previous_event_hash` is `parent_event_hash` — a vote occupies the same stage slot
-it is about. That is what makes a vote and an action mutually exclusive for one
-sender (§5.1): a peer physically cannot sign both without equivocating.
+*Envelope:* `sequence = subject_sequence`,
+`previous_event_hash = parent_event_hash`, `chain_scope = 1` and
+**`event_class = 1`**. The class puts the vote in its own slot, so a voter that
+has already emitted its own event at a collective stage `s` can vote about stage
+`s` without equivocating against itself. A vote *references* the stage it is
+about; it does not occupy it.
+
+**There is no mutual exclusion between a vote and an action, and none is
+claimed.** A `TIMEOUT_VOTE` is signed by the voter and the action it is about is
+signed by the subject: they are two events by two different keys and constitute
+no proof against anyone. After the `event_class` discriminator they are not even
+syntactically comparable, because they sit in different slots. See §5.2 and §8.3.
 
 *Receiver must validate:* the voter is in the required voter set for that subject
 (§8.3); `parent_event_hash` matches this receiver's own `stage_hash`;
@@ -1457,9 +1740,12 @@ for that stage from `subject_seat`.
 
 **`0x0602 TIMEOUT_CERT`**
 
-*Direction:* any voter → all, once it holds a unanimous set.
+*Direction:* **collective stage**; the required emitter set is `V(subject)`, the
+same set that had to vote. Each voter emits its own certificate.
 *Legal:* only when a `TIMEOUT_VOTE` has been collected from **every** seat in the
 required voter set.
+*Envelope:* `chain_scope = 1`, **`event_class = 2`**, `sequence` and
+`previous_event_hash` as for any event of the subject stage.
 
 | Field | Type | Limit / rule |
 |---|---|---|
@@ -1468,17 +1754,22 @@ required voter set.
 
 *Receiver must validate:* every embedded vote independently passes §4.0 steps
 2–11; all votes carry the same subject; the voter set is exactly the required set
-with no duplicates; `subject_digest` recomputes. The certificate is then the
-transcript event for that stage. `stage_hash` for a stage closed by a certificate
-uses the certificate's own `event_hash` as a single-writer stage.
+with no duplicates; `subject_digest` recomputes; the emitter is itself a member of
+`V(subject)`.
 
-Several peers may each assemble a certificate. They will contain the same votes
-in the same order, so their bodies differ only in `sender_public_key` and
-`emitted_at_unix_ms` — which means `event_hash` differs and the chain would fork.
-Resolution: **the certificate that closes the stage is the one from the lowest
-seat index that emitted a valid one within `CERT_SETTLE_MS`**, and every peer
-waits that long before chaining. This is a pure tie-break over a set every peer
-sees identically; it is not a leader.
+**The certificate stage is collective.** The required emitter set is `V(subject)`;
+each voter emits its own certificate carrying the same votes in the same order;
+`stage_hash` is the collective form of §3.2 over the events of `event_class = 2`.
+There is no timer, no tie-break and no assembler privilege. Certificate bodies
+differ only in `sender_public_key` and `emitted_at_unix_ms`, which no longer
+matters, because the collective `stage_hash` is taken over the whole set rather
+than over one chosen copy.
+
+This replaces the earlier rule, which had every peer wait `CERT_SETTLE_MS` and
+then chain the certificate from the lowest seat index that had emitted a valid
+one. That rule put a wall-clock read back inside the chain-building rule, which
+D-006 and §8.2 forbid; `CERT_SETTLE_MS` is deleted from §13, and Q-04 is closed
+by this ruling (§12).
 
 ### 4.9 Group 7 — synchronisation and disputes
 
@@ -1510,8 +1801,10 @@ Codes `0x0800`–`0x08FF`.
 
 **`0x0801 HAND_COMPLETE`**
 
-*Direction:* single-writer stage; the writer is the same seat that wrote
-`HAND_INIT`.
+*Direction:* **collective stage**, terminal for the hand; the required emitter set
+is the same set that emitted `HAND_INIT`. Every field is derived, so by §3.2's
+stage-kind principle there is no writer: each seat computes the byte-identical
+body, signs its own copy, and emits it.
 *Legal:* when the engine reports the hand decided.
 
 | Field | Type | Limit / rule |
@@ -1529,8 +1822,15 @@ n(3) odd_chips: Vec<u8> }`, all seat lists ascending and unique.
 *Receiver must validate:* every field recomputed from its own engine, including
 the pot layering, the eligible sets, the winners, and the clockwise-from-the-
 button odd-chip distribution [RULES A7, A8]; `sum(deltas) == 0`;
-`sum(final_stacks) == total_chips_in_play`. A mismatch is not accepted and goes to
-§6.
+`sum(final_stacks) + sum(committed_hand) == ledger_in − ledger_out` (C-9's ledger
+identity, which in tournament mode reduces to the old
+`sum(final_stacks) == total_chips_in_play`).
+
+**A mismatch is not accepted; the mismatching copy is rejected under §4.0 and the
+stage simply does not complete for that emitter. It does not open a §6
+divergence.** That is the point of making the stage collective: a peer that
+derives a different result is caught at the stage, by rejection, rather than
+later at a checkpoint by a divergence freeze.
 
 **A third-party evaluator's raw rank value must never appear here or in
 `STATE_HASH`.** The numeric encoding is an internal detail of one crate version;
@@ -1542,16 +1842,18 @@ deltas — is canonical. [RULES A′4]
 
 **`0x0802 HAND_ABORT`**
 
-*Direction:* single-writer stage, terminal for the hand.
+*Direction:* **collective stage**, terminal for the hand; the required emitter set
+is the same set that emitted `HAND_INIT`, minus any seat whose failure is the
+reason for the abort. Every field is derived, so there is no writer (§3.2).
 *Legal:* only when a `TIMEOUT_CERT` with `kind = 2` (cryptographic-step deadline)
 has closed a stage, or when the §6 divergence procedure demands it.
 
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) cause` | `u16` | `1` failure to publish a required cryptographic contribution; `2` invalid shuffle proof; `3` invalid reveal proof; `4` unresolvable state divergence; `5` equivocation proven |
-| `n(1) attributed` | `Vec<bytes[32]>` | ≤ `MAX_SEATS` app public keys, ascending by encoded bytes; may be empty **only** for `cause = 4` |
-| `n(2) cert_hash` | `Option<bytes[32]>` | `event_hash` of the `TIMEOUT_CERT`, required for `cause = 1` |
-| `n(3) evidence` | `Vec<bytes>` | ≤ 2 `SignedEvent`s, each ≤ 32 768 B; required for `cause` 2, 3, 5 |
+| `n(1) attributed` | `Vec<bytes[32]>` | ≤ `MAX_SEATS` app public keys, ascending by encoded bytes; may be empty for `cause = 4`, and for `cause = 1` in the two cases listed below |
+| `n(2) cert_hash` | `Option<bytes[32]>` | `event_hash` of the `TIMEOUT_CERT`; **required for `cause = 1`**, with the single exception of the §8.4 `hand_deadline_ms` path, where unanimity was never reached and no certificate exists |
+| `n(3) evidence` | `Vec<bytes>` | ≤ 2 `SignedEvent`s, each ≤ `MAX_EMBEDDED_EVENT` = 32 768 B; required for `cause` 2, 3, 5 |
 | `n(4) deltas` | `Vec<i64>` | must sum to 0 |
 | `n(5) final_stacks` | `Vec<u64>` | |
 
@@ -1570,10 +1872,28 @@ would collect it — and that is an out-of-protocol attack which the threat mode
 already places out of scope and which requires real capability against the
 victim's connection. D-005 takes that trade deliberately.
 
-`cause = 4` (unresolvable divergence) is the single exception where stacks are
-restored to their start-of-hand values, because no peer can be attributed and
-forfeiture would punish an unknown party. It is also the one cause that faults the
-table (§6.4).
+**When `attributed` is empty, nothing is forfeited.** An abort with
+`attributed = []` returns exactly `committed_hand[s]` to every seat `s` and moves
+no chips between seats. There are exactly three such cases and each is a
+consequence of a ruling that could not name a culprit honestly:
+
+| Case | Where |
+|---|---|
+| `cause = 4`, unresolvable state divergence | §6.3 case (c), §6.4. No peer can be attributed, and forfeiture would punish an unknown party. This is not "restoration is safe here" — see §6.4 and OQ-D. |
+| `cause = 1` at `n = 2` | §8.3. D-007 forbids a fold-effect certificate heads-up, and this plan extends the same reasoning to `kind = 2`: the hand must be able to end, but no attribution is possible with one voter, so the abort carries `attributed = []`. See OQ-A. |
+| `cause = 1` on the §8.4 `hand_deadline_ms` path | Two or more seats silent at once, unanimity unreachable. A seat that did not vote may be silent, partitioned or slow, and forfeiting against a partitioned honest seat is a positive-gain attack. See Q-02 and OQ-E. |
+
+`cause = 4` (unresolvable divergence) restores stacks to their start-of-hand
+values, and it is the one cause that faults the table (§6.4). **Restoration there
+is not safe; it is merely the only disposition every peer can agree on when
+nobody can be named**, and it is an unfixed in-protocol exploit rather than a
+closed one — see §6.4 as rewritten, `THREAT_MODEL.md` X29, and **OQ-D** (§12).
+
+`cause = 3` (invalid reveal proof) is reachable from the engine's
+`Fault{InvalidRevealProof}`: a failed Chaum–Pedersen DLEQ verification at
+`DEAL_PRIVATE`, `BOARD_REVEAL` or `SHOWDOWN_REVEAL` aborts the hand here rather
+than stalling it into a deadline (`STATE_MACHINE.md` §5.2 and §8.6,
+`CRYPTOGRAPHY.md` §8 rule 1).
 
 **A hand abort never ends the tournament or the cash game.** Per D-006 point 5,
 the next hand begins immediately afterwards, automatically. The only seats
@@ -1601,46 +1921,55 @@ anything can never be a precondition. [NAT §7.3]
 
 ### 4.11 Summary table
 
-| Code | Name | Channel | Stage kind | Emitter |
-|---|---|---|---|---|
-| `0x0001` | `HELLO` | table stream | — | each side of a connection |
-| `0x0002` | `CAPABILITIES` | table stream | — | each side of a connection |
-| `0x0101` | `LOBBY_TABLE_AD` | lobby broadcast | — | table key |
-| `0x0102` | `LOBBY_TABLE_REMOVE` | lobby broadcast | — | table key |
-| `0x0103` | `LOBBY_PLAYER_PRESENCE` | lobby broadcast | — | any peer |
-| `0x0104` | `LOBBY_SNAPSHOT_REQUEST` | lobby RPC | — | any peer |
-| `0x0105` | `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC | — | any peer |
-| `0x0201` | `JOIN_REQUEST` | table stream | — | joiner |
-| `0x0202` | `JOIN_ACCEPT` | table stream | — | table key |
-| `0x0203` | `JOIN_REJECT` | table stream | — | table key |
-| `0x0204` | `PLAYER_LIST` | table mesh | — | table key |
-| `0x0205` | `TABLE_READY` | table mesh | collective | all seats |
-| `0x0301` | `RNG_COMMIT` | table mesh | collective | all seats |
-| `0x0302` | `RNG_REVEAL` | table mesh | collective | all seats |
-| `0x0303` | `HAND_INIT` | table mesh | single | button seat |
-| `0x0304` | `DECK_INIT` | table mesh | collective | dealt-in seats |
-| `0x0305` | `SHUFFLE_STEP` | table mesh | single | shuffler `j` |
-| `0x0306` | `SHUFFLE_PROOF` | table mesh | single | shuffler `j` |
-| `0x0307` | `DECK_COMMIT` | table mesh | collective | dealt-in seats |
-| `0x0401` | `DEAL_PRIVATE` | table mesh | collective | dealt-in seats |
-| `0x0402` | `BOARD_REVEAL` | table mesh | collective | dealt-in seats |
-| `0x0403` | `SHOWDOWN_REVEAL` | table mesh | collective | showdown seats |
-| `0x0404` | `SHOWDOWN_MUCK` | table mesh | collective | showdown seats (policy-gated) |
-| `0x0501` | `ACTION_CHECK` | table mesh | single | `player_to_act` |
-| `0x0502` | `ACTION_CALL` | table mesh | single | `player_to_act` |
-| `0x0503` | `ACTION_BET` | table mesh | single | `player_to_act` |
-| `0x0504` | `ACTION_RAISE` | table mesh | single | `player_to_act` |
-| `0x0505` | `ACTION_FOLD` | table mesh | single | `player_to_act` |
-| `0x0601` | `TIMEOUT_VOTE` | table mesh | — | required voters |
-| `0x0602` | `TIMEOUT_CERT` | table mesh | single | lowest-seat assembler |
-| `0x0701` | `STATE_HASH` | table mesh | collective | all present seats |
-| `0x0702` | `STATE_ACK` | table mesh | collective | all present seats |
-| `0x0703` | `DISPUTE` | table mesh | out-of-stage | any participant |
-| `0x0801` | `HAND_COMPLETE` | table mesh | single | button seat |
-| `0x0802` | `HAND_ABORT` | table mesh | single | button seat |
-| `0x0803` | `PLAYER_SIT_OUT` | table mesh | single | the seat |
-| `0x0804` | `PLAYER_SIT_IN` | table mesh | single | the seat |
-| `0x0805` | `PLAYER_LEAVE` | table mesh | single | the seat |
+`chain_scope` is the envelope field of §2.3: `1` means the message occupies a
+stage slot in a chain and is subject to the equivocation predicate of §5.2, `0`
+means it does not and never can be.
+
+| Code | Name | Channel | `chain_scope` | Stage kind | Emitter |
+|---|---|---|---|---|---|
+| `0x0001` | `HELLO` | table mesh | 0 | — | each side of a connection |
+| `0x0002` | `CAPABILITIES` | table mesh | 0 | — | each side of a connection |
+| `0x0101` | `LOBBY_TABLE_AD` | lobby broadcast | 0 | — | table key |
+| `0x0102` | `LOBBY_TABLE_REMOVE` | lobby broadcast | 0 | — | table key |
+| `0x0103` | `LOBBY_PLAYER_PRESENCE` | lobby broadcast | 0 | — | any peer |
+| `0x0104` | `LOBBY_SNAPSHOT_REQUEST` | lobby RPC | 0 | — | any peer |
+| `0x0105` | `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC | 0 | — | any peer |
+| `0x0106` | `LOBBY_CHAT` | lobby chat broadcast | 0 | — | any peer |
+| `0x0201` | `JOIN_REQUEST` | join RPC | 0 | — | joiner |
+| `0x0202` | `JOIN_ACCEPT` | join RPC | 0 | — | table key |
+| `0x0203` | `JOIN_REJECT` | join RPC | 0 | — | table key |
+| `0x0204` | `PLAYER_LIST` | table mesh | 0 | — | table key |
+| `0x0205` | `TABLE_READY` | table mesh | 1 | collective | all seats |
+| `0x0301` | `RNG_COMMIT` | table mesh | 1 | collective | all seats |
+| `0x0302` | `RNG_REVEAL` | table mesh | 1 | collective | all seats |
+| `0x0303` | `HAND_INIT` | table mesh | 1 | collective | all present seats |
+| `0x0304` | `DECK_INIT` | table mesh | 1 | collective | dealt-in seats |
+| `0x0305` | `SHUFFLE_STEP` | table mesh | 1 | single | shuffler `j` |
+| `0x0306` | `SHUFFLE_PROOF` | table mesh | 1 | single | shuffler `j` |
+| `0x0307` | `DECK_COMMIT` | table mesh | 1 | collective | dealt-in seats |
+| `0x0401` | `DEAL_PRIVATE` | table mesh | 1 | collective | dealt-in seats |
+| `0x0402` | `BOARD_REVEAL` | table mesh | 1 | collective | dealt-in seats |
+| `0x0403` | `SHOWDOWN_REVEAL` | table mesh | 1 | collective | showdown seats |
+| `0x0404` | `SHOWDOWN_MUCK` | table mesh | 1 | collective | showdown seats (policy-gated) |
+| `0x0501` | `ACTION_CHECK` | table mesh | 1 | single | `player_to_act` |
+| `0x0502` | `ACTION_CALL` | table mesh | 1 | single | `player_to_act` |
+| `0x0503` | `ACTION_BET` | table mesh | 1 | single | `player_to_act` |
+| `0x0504` | `ACTION_RAISE` | table mesh | 1 | single | `player_to_act` |
+| `0x0505` | `ACTION_FOLD` | table mesh | 1 | single | `player_to_act` |
+| `0x0601` | `TIMEOUT_VOTE` | table mesh | 1 (`event_class = 1`) | — | required voters |
+| `0x0602` | `TIMEOUT_CERT` | table mesh | 1 (`event_class = 2`) | collective | required voters |
+| `0x0701` | `STATE_HASH` | table mesh | 1 | collective | all present seats |
+| `0x0702` | `STATE_ACK` | table mesh | 1 | collective | all present seats |
+| `0x0703` | `DISPUTE` | table mesh | 1 | out-of-stage | any participant |
+| `0x0801` | `HAND_COMPLETE` | table mesh | 1 | collective | all present seats |
+| `0x0802` | `HAND_ABORT` | table mesh | 1 | collective | all present seats |
+| `0x0803` | `PLAYER_SIT_OUT` | table mesh | 1 | single | the seat |
+| `0x0804` | `PLAYER_SIT_IN` | table mesh | 1 | single | the seat |
+| `0x0805` | `PLAYER_LEAVE` | table mesh | 1 | single | the seat |
+
+39 message types. Lobby chat is on `/p2p-poker/lobby-chat/1` and not on the lobby
+topic, so §1.4's "a message on the wrong channel is dropped" rule covers it like
+any other.
 
 Codes `0xF000`–`0xFFFF` are reserved for private and experimental use and are
 **never** accepted inside a table session, regardless of capability negotiation.
@@ -1654,10 +1983,10 @@ Codes `0xF000`–`0xFFFF` are reserved for private and experimental use and are
 | Attack (§14 / §17) | Stopped by | Mechanism |
 |---|---|---|
 | replay of an old signed message | `previous_event_hash` + `sequence` | a replayed event's `previous_event_hash` does not equal the current `stage_hash(s-1)`, because the chain has moved on |
-| duplicate message | `event_hash` set per stage | a byte-identical repeat is idempotent; a differing repeat at one `(sender, sequence)` is equivocation |
+| duplicate message | `event_hash` set per stage, **per `event_class`** | a byte-identical repeat is idempotent; a differing repeat at one `(sender, sequence, event_class)` is equivocation. The class matters: a seat's own contribution at stage `s` and its `TIMEOUT_VOTE` about stage `s` share a `sequence` and are not duplicates of one another |
 | out-of-order message | `sequence` = stage index | an event for stage `s+2` is buffered, never applied, until stage `s+1` completes |
 | message from another hand | `hand_id` **and** `previous_event_hash` | the chain of hand `k` cannot link to hand `k'` |
-| message from another table | `table_id` | and `table_id` is the table's public key, so it cannot be forged |
+| message from another table | `table_id` for chained events; the payload's table field for unchained ones | `table_id` is the table's public key, so it cannot be forged; an unchained message names its table in the payload and is bound to it by the signature over the whole body (§2.3) |
 | replay of a *shuffle proof* from another hand | the `ctx` binding (§4.5) | the proof itself will not verify under a different `ctx` |
 | replay of a *reveal token* onto another card | DLEQ proof binds the token to the ciphertext | verified empirically [MENTAL §4.1 T7b] |
 | replay of a lobby advertisement | `timestamp` monotonicity per `table_id`, plus `expires_at` | a lower `timestamp` for a known `table_id` is discarded [NAT §7.3] |
@@ -1670,31 +1999,52 @@ Codes `0xF000`–`0xFFFF` are reserved for private and experimental use and are
 
 ### 5.2 Equivocation, exactly
 
-**Definition.** Peer `K` equivocates when two `SignedEvent`s `E1 ≠ E2` exist such
-that both pass the canonicality gate, both verify under `K`'s public key with
-`verify_strict`, and their bodies agree on all four of
+**Definition, canonical for the whole corpus.** `THREAT_MODEL.md` G7 quotes it;
+no document restates it in its own words.
 
-```
-(protocol_version, table_id, hand_id, sequence)  and  sender_public_key == K
-```
+> Peer `K` equivocates when two `SignedEvent`s `E1 != E2` exist such that both
+> pass the canonicality gate, both verify under `K`'s public key with
+> `verify_strict`, both carry `chain_scope == 1`, their bodies agree on all six of
+>
+> ```
+> (protocol_version, table_id, hand_id, sequence, event_class, sender_public_key == K)
+> ```
+>
+> and `event_hash(E1) != event_hash(E2)`.
+>
+> Events with `chain_scope == 0` are outside this predicate entirely and can
+> never produce an `EquivocationProof`. Their anti-replay is per-type:
+> `timestamp_unix_ms` strict monotonicity per `table_id` for lobby adverts,
+> `list_serial` for `PLAYER_LIST`, `join_nonce` for the join RPC, and
+> `connection_nonce` plus a per-connection counter for the handshake.
 
-while `event_hash(E1) != event_hash(E2)`.
+This definition works because of the stage rule, **restricted to chained
+events**: a sender emits at most one event per stage per class, so
+`(sender, table_id, hand_id, sequence, event_class)` is a slot with capacity one
+for `chain_scope == 1`, and two distinct bodies in one slot is a contradiction the
+sender created and signed. Unchained traffic has no such slot — a `JOIN_REQUEST`,
+two successive honest lobby adverts and a `HELLO` all sit outside any chain — and
+applying the predicate there would manufacture false positives against honest
+peers. That is why `chain_scope` exists and why the sentinel envelope values of
+§2.3 are mandatory rather than cosmetic: the scope discriminator alone would
+still leave a `JOIN_REQUEST` carrying a real `table_id`, which is a collision
+waiting for a future chained message type.
 
-This definition works because of the stage rule: **a sender emits at most one
-event per stage.** `(sender, table_id, hand_id, sequence)` is therefore a slot
-with capacity one, and two distinct bodies in one slot is a contradiction the
-sender created and signed.
-
-It catches all three practical forms:
+It catches both practical forms:
 
 * two different actions claimed for the same turn ("I folded" to one peer, "I
   raised" to another);
 * the same action chained to two different parents — a deliberate fork —
-  because `previous_event_hash` is inside the body;
-* a `TIMEOUT_VOTE` and a real event for the same stage, because a vote occupies
-  the stage slot it is about (§4.8). This is what makes the D-006 race safe: a
-  peer that both accepted an action and voted that it timed out has equivocated
-  and is provably at fault.
+  because `previous_event_hash` is inside the body.
+
+**What it does not catch, and never did.** A `TIMEOUT_VOTE` and a real event for
+the same stage are **not** an equivocation. The vote is signed by the voter and
+the action is signed by the subject: they are two events by two different keys
+and constitute no proof against anyone. Since A-5 they are not even in the same
+slot, because a vote carries `event_class = 1` and the action `event_class = 0`.
+The earlier claim that this pair made the D-006 timeout race safe was false under
+this document's own predicate and is deleted; §8.3 states what actually settles
+the race.
 
 **The proof object.**
 
@@ -1710,10 +2060,11 @@ also broadcast on the lobby topic, so that peers who were never at the table hol
 durable evidence, is **OPEN QUESTION Q-05**.
 
 **Verification is self-contained.** A checker needs nothing but the two byte
-strings and Ed25519: gate both, verify both signatures under `accused`, check the
-four fields agree, check the two `event_hash`es differ. No table state, no
-transcript, no knowledge of the game. That is the property that makes it usable
-as evidence by anyone, forever.
+strings and Ed25519: gate both, verify both signatures under `accused`, check that
+both carry `chain_scope == 1`, check that `protocol_version`, `table_id`,
+`hand_id`, `sequence`, `event_class` and `sender_public_key` agree, check the two
+`event_hash`es differ. No table state, no transcript, no knowledge of the game.
+That is the property that makes it usable as evidence by anyone, forever.
 
 **What it proves, and what it does not.** It proves that the holder of that
 Ed25519 secret key produced two conflicting signed statements for one slot. It
@@ -1734,8 +2085,11 @@ claiming more.
 Anti-replay must not become a memory-exhaustion vector (`SPEC_CS.md` §17, §27).
 
 * Per table, per hand: one `Vec<Option<event_hash>>` indexed by
-  `(stage, seat)`, bounded by `MAX_STAGES_PER_HAND × MAX_SEATS`.
-  `MAX_STAGES_PER_HAND = 2048`; a legitimate hand uses well under 200.
+  `(stage, seat, event_class)`, bounded by
+  `MAX_STAGES_PER_HAND × MAX_SEATS × 3`. `MAX_STAGES_PER_HAND = 2048`; a
+  legitimate hand uses well under 200. The `event_class` axis is what lets a seat
+  hold both its own contribution at stage `s` and a `TIMEOUT_VOTE` about stage `s`
+  without either being treated as a duplicate of the other (§2.3, §5.2).
 * A hand exceeding `MAX_STAGES_PER_HAND` aborts with `cause = 4`.
 * Completed hands keep only `TERMINAL(k)` and the `HAND_COMPLETE` body in memory;
   the full transcript is written to the profile directory and dropped from RAM.
@@ -1768,6 +2122,7 @@ state_hash = h("p2p-poker v1 state", [ canonical_cbor(PublicTableState) ])
 | `player_to_act` | `Option<u8>` |
 | `pots` | derived `Vec<PotView { size, eligible }>` [RULES A7] |
 | `deck_commitment` | `final_deck_hash` from `DECK_COMMIT`, or 32 zero bytes before it |
+| `ledger_in`, `ledger_out` | `u64` each; the running totals of accepted buy-ins and of removed stacks (§4.4's `ledger_delta`). They are inside `state_hash` because otherwise two peers could disagree about the ledger and never detect it (C-9) |
 | `transcript_head` | `stage_hash` of the last completed stage |
 
 Card code: suits clubs = 0, diamonds = 1, hearts = 2, spades = 3; rank index
@@ -1802,7 +2157,20 @@ in the pot layering visible at the checkpoint instead of at the award.
 | `4` | after the flop betting round closes |
 | `5` | after the turn betting round closes |
 | `6` | after the river betting round closes |
-| `7` | immediately before `HAND_COMPLETE` |
+| `7` | immediately before `SHOWDOWN_REVEAL` |
+
+**No checkpoint is placed after any hole card has been opened.** A checkpoint
+after the cards are known is an abort trigger the loser can pull with full
+information: a peer that publishes a `state_hash` it did not derive forces the
+§6.3 case (c) path, and until this fix checkpoint 7 sat immediately before
+`HAND_COMPLETE`, which is after the showdown. Moving it before `SHOWDOWN_REVEAL`
+does not close the exploit — see §6.4 and X29 — but it forces the attacker to
+commit to burning the table while it still knows only its own hand.
+
+`HAND_COMPLETE` needs no checkpoint of its own, because it is now a collective
+derived stage (§3.2, §4.10): every receiver recomputes every field, and a
+mismatching copy is rejected at the stage rather than caught later at a
+checkpoint.
 
 `STATE_HASH` publishes each peer's own computed hash. `STATE_ACK` then confirms
 that this peer saw the complete set and that every member of it agreed — giving a
@@ -1822,7 +2190,9 @@ host. The procedure is:
 **Step 1 — freeze.** The moment any peer observes two distinct `state_hash`
 values at one checkpoint, it stops accepting and stops emitting hand events. No
 card opens, no action is applied, no chips move. Silently continuing is what §15
-forbids.
+forbids. This freeze is `STATE_MACHINE.md` §5.1's `Diverged` phase; the engine
+and this section describe the same machine, and steps 2–4 below are its
+transitions.
 
 **Step 2 — declare.** Every peer broadcasts `DISPUTE { kind = 1 STATE_DIVERGENCE,
 at_sequence = the checkpoint stage, evidence = its own STATE_HASH event }` and,
@@ -1843,70 +2213,84 @@ the equivocator. The equivocator's committed chips are forfeited per D-005. This
 is the attack case, and it is fully resolved with cryptographic evidence.
 
 **(b) The transcripts differ, but only because one peer is missing events it
-cannot obtain** — every holder refuses to serve them. Then those holders are
-failing to cooperate; the hand aborts with `cause = 1`, attributed to the peers
-that would not serve, via the §8 certificate machinery.
+cannot obtain** — every holder refuses to serve them. The hand aborts with
+`cause = 1` and `attributed = []`. The transcript records which peers were asked
+for which events and did not serve them, which is publicly readable but is **not
+adjudicable inside the protocol**, because any adjudication that requires the
+accused peer's signature is circular at every table size (D-007 point 4). A
+dispute path that does not require the accused peer's signature does not exist
+and is not designed here: **OQ-B** (§12).
 
 **(c) The transcripts are byte-identical after reconciliation, and derived states
-still differ.** This is not an attack that cryptography can adjudicate. It is
-either an implementation bug or a client deliberately lying about its own derived
-state. There is no signature that distinguishes those. The rule is:
+still differ.** No signature distinguishes an implementation bug from a client
+lying about its own derived state, and there is no observer-independent
+derivation at run time — every peer derives with its own engine, so "attribute
+whoever disagrees with the derivation" is a vote over the facts, which
+`SPEC_CS.md` §15 forbids. The hand therefore aborts with `cause = 4`,
+`attributed = []`, stacks restored, and the table is faulted (§6.4). No peer is
+removed and no peer is named. The evidence — the unanimous transcript plus every
+peer's signed `STATE_HASH` — is written to the profile directory and is **publicly
+adjudicable offline** by anyone who runs the reference engine over it, forever.
+Live adjudication is not available and is not claimed.
 
-> **Unanimity minus one.** If every peer except one derives the same
-> `state_hash` from the identical transcript, the odd peer out is removed from the
-> table. If the disagreement is not unanimous-minus-one — two or more peers
-> disagreeing, in any grouping — nobody is removed, the hand aborts with
-> `cause = 4`, stacks are restored to their start-of-hand values, and the table is
-> faulted (§6.4).
-
-This is **not** "majority rules over the facts", and the distinction is worth
-being precise about. Nobody is voting on what happened; the transcript already
-fixed that, unanimously and cryptographically. The rule is a *self-exclusion*
-rule: a peer whose engine cannot reproduce what every other peer's engine
-reproduces from identical, verified input is by definition running a different
-rule set, and a table cannot contain two rule sets. The removed peer's own client
-must display, prominently, that *it* disagreed with everyone — not that it was
-outvoted — because from its own point of view that is the accurate statement and
-it is very likely a bug in this software.
-
-**The attack this rule enables, stated rather than hidden.** `n-1` colluding
-players can falsely claim a divergent state hash, invoke this rule against one
-honest player, remove them, and take their committed chips under D-005's
-forfeiture. This is real. Three things bound it:
-
-1. It requires **every** other player at the table to collude. At `n = 2` it is
-   trivially available, which is why heads-up tables must treat case (c) as
-   `cause = 4` (fault, restore, no attribution) rather than applying
-   unanimity-minus-one — with two players, "unanimous minus one" is one player,
-   which is meaningless. **Unanimity-minus-one requires `n ≥ 3`.**
-2. It costs the coalition the whole table: the removed player publishes the
-   transcript, their own derivation, and every conspirator's signed `STATE_HASH`.
-   Any third party who runs the reference engine over that transcript gets the
-   right answer and can see who signed a wrong one. The protocol cannot adjudicate
-   it live, but it produces evidence that makes it **publicly adjudicable
-   offline**, by anyone, forever.
-3. It is a special case of the collusion class `SPEC_CS.md` §18 already places
-   outside what cryptography can solve.
-
-`THREAT_MODEL.md` must carry this as a named, unsolved attack. It is not
-solved here and this document does not claim it is.
+**This is the same disposition at every `n`.** An earlier draft of this section
+resolved case (c) by *unanimity minus one*: if every peer but one derived the same
+`state_hash`, the odd peer out was removed from the table. That rule is deleted.
+It bought nothing real — naming the culprit requires the observer-independent
+derivation that does not exist — and it cost an attack in which `n-1` colluders
+falsely claim a divergent state hash, evict one honest player and take their
+committed chips under D-005's forfeiture, available at `n = 3` with two
+colluders. One liar can now fault any table instead. That is a liveness and
+griefing cost and it is accepted in preference to an integrity cost: losing a
+table is recoverable, having your chips taken by a coalition is not.
+`THREAT_MODEL.md` X29 carries what remains as a named, unsolved attack.
 
 ### 6.4 A faulted table
 
-`cause = 4` faults the table: it is closed, no further hand is dealt, every stack
-is restored to its start-of-hand value, and the client writes a reproducible
-divergence report to the profile directory containing the full transcript, every
-peer's `STATE_HASH`, and its own derived `PublicTableState`. That report is the
-bug report. The UI must say plainly that the game ended because the participants
-could not agree, and must not guess at fault.
+`cause = 4` faults the table **at every `n`**: it is closed, no further hand is
+dealt, every stack is restored to its start-of-hand value, and the client writes a
+reproducible divergence report to the profile directory containing the full
+transcript, every peer's `STATE_HASH`, and its own derived `PublicTableState`.
+That report is the bug report, and it is also the offline adjudication material of
+§6.3 case (c). The UI must say plainly that the game ended because the
+participants could not agree, and must not guess at fault. The engine reaches this
+state from `STATE_MACHINE.md`'s `Diverged` phase with `Fault{StateDivergence}`,
+which is the one `AbortKind` settled by restoration rather than by the §8.6
+forfeiture formula.
 
-This is the one place where restoration is correct rather than exploitable,
-because reaching it requires a genuine engine disagreement among at least two
-peers and is not available on demand to a single player.
+**Restoration here is not safe; it is merely the only disposition every peer can
+agree on when nobody can be named.** A peer that publishes a false `state_hash` at
+a checkpoint can fault any table at any time and recover its own commitment. That
+is an in-protocol exploit, it is **not closed**, and `THREAT_MODEL.md` X29 carries
+it. Three things bound it and none of them removes it: it costs the attacker the
+table and, in a tournament, their own equity in it; checkpoint 7 sits before
+`SHOWDOWN_REVEAL` (§6.2), so the attacker must commit before learning whether it
+won; and the evidence is deterministically adjudicable offline by any third party
+running the reference engine over the unanimous transcript.
+
+The alternatives — forfeiting an unnamed party's commitment, or settling from the
+last `STATE_ACK`-agreed checkpoint — each need a numbered owner decision and
+neither is adopted here. **OQ-D** (§12).
 
 ---
 
 ## 7. The lobby protocol
+
+**Every message in this section is unchained**, stated once here rather than
+repeated per message type: `chain_scope = 0`, `event_class = 0`,
+`table_id = ZERO32`, `hand_id = 0xFFFF_FFFF_FFFF_FFFF`, `sequence = 0`,
+`previous_event_hash = ZERO32` (§2.3). None of them can take part in an
+`EquivocationProof` (§5.2), and their anti-replay is per-type — advert
+`timestamp_unix_ms` monotonicity per `table_id`, the snapshot `nonce`, the chat
+sender's own `timestamp_unix_ms`.
+
+Nothing is lost by zeroing the envelope's `table_id`: an advert's table identity
+is `sender_public_key == table_public_key`, which is stronger, and every other
+lobby message names the table it concerns in its payload.
+
+`NETWORK_STACK.md` §7.4's rule for two conflicting adverts from one table key is a
+**local lobby-hygiene rule, not an `EquivocationProof`**, precisely because lobby
+messages are unchained; that section was corrected to say so.
 
 ### 7.1 Topic and transport
 
@@ -1929,13 +2313,26 @@ peers and is not available on demand to a single player.
 * Mesh: `mesh_n = 8`, `mesh_n_low = 6`, `mesh_n_high = 12`,
   `mesh_outbound_min = 3`. The last raises the cost of an eclipse attack by
   inbound-only Sybils. [LIBP2P §6]
-* `max_transmit_size` = `LOBBY_MAX_MESSAGE` = 16384 bytes. **This is a two-sided
-  protocol constant, not a tuning knob**: a peer with a different value rejects our
-  frames. Changing it is a major-version change. [LIBP2P §6, open item 2]
+* `max_transmit_size` = `GOSSIP_MAX_TRANSMIT` = 65 536 bytes. **This is a
+  two-sided protocol constant, not a tuning knob**: a peer with a different value
+  rejects our frames. Changing it is a major-version change. [LIBP2P §6, open
+  item 2] The value is `libp2p-gossipsub` 0.49.5's own default
+  (`src/config.rs:244-246`), and pinning there maximises interoperability.
+* `GOSSIP_MAX_TRANSMIT` is the **transport** ceiling and is a backstop, never the
+  operative limit. The **application** ceiling for any lobby message of any type
+  is `LOBBY_MSG_MAX` = 8 192 bytes, and the per-message payload caps of §9.3 are
+  tighter still. Conflating the two is what produced the earlier
+  `LOBBY_MAX_MESSAGE = 16 384`, which is deleted.
+
+The lobby chat topic `/p2p-poker/lobby-chat/1` (§7.7) is a second `IdentTopic`
+with the same settings; it is separate so that a client can subscribe to tables
+without subscribing to chat.
 
 ### 7.2 `0x0101 LOBBY_TABLE_AD`
 
-Signed by the table key (`sender_public_key == table_id`). The payload carries
+Signed by the table key: `sender_public_key` **is** the `table_public_key`, and
+that is the advert's whole table identity — the envelope's `table_id` is the
+unchained sentinel `ZERO32` (head of §7). The payload carries
 `SPEC_CS.md` §4's field list plus the parameters the table needs to be
 unambiguous before the first card exists.
 
@@ -1982,7 +2379,8 @@ available evidence of what "the rated preset" means. [RULES B1, B2, B4]
 
 *Receiver must validate, before the advert is shown to a user or stored:*
 
-1. `sender_public_key == table_id` and `verify_strict` passes;
+1. `verify_strict` passes under `sender_public_key`, which is taken as the
+   `table_public_key`; the envelope carries the unchained sentinels of §2.3;
 2. every numeric range above, including `big_blind == 2 * small_blind`,
    `min_buyin ≤ max_buyin`, `2 ≤ max_players ≤ 10`,
    `min_players_to_start ≤ max_players`;
@@ -2047,8 +2445,9 @@ because a lobby with hundreds of tables would blow past any sane gossip frame.
 `n(1) since_unix_ms: u64` (0 for everything), `n(2) nonce: bytes[32]`.
 
 **`0x0105 LOBBY_SNAPSHOT_RESPONSE`** — `n(0) request_nonce: bytes[32]`,
-`n(1) adverts: Vec<bytes>` (≤ 128 entries, each a complete `SignedEvent` of a
-`LOBBY_TABLE_AD`, each ≤ 2 560 B), `n(2) truncated: bool`.
+`n(1) adverts: Vec<bytes>` (≤ `SNAPSHOT_MAX_ADS` = 128 entries, each a complete
+`SignedEvent` of a `LOBBY_TABLE_AD`, each ≤ `TABLE_AD_SIGNED_MAX` = 1 536 B),
+`n(2) truncated: bool`.
 
 The response is a container of independently signed adverts. **The responder is
 not trusted for anything.** Each embedded advert is validated by §7.2's full
@@ -2058,8 +2457,10 @@ client queries `SNAPSHOT_PEER_COUNT = 4` independent peers and takes the union,
 which makes omission by any single peer harmless. It can also send stale adverts,
 which the `expires_at` and freshness checks discard.
 
-Codec limits are set explicitly: `set_request_size_maximum(1024)` and
-`set_response_size_maximum(524_288)`. [LIBP2P §7]
+Codec limits are set explicitly: `set_request_size_maximum(SNAPSHOT_REQ_MAX)` =
+1 024 and `set_response_size_maximum(SNAPSHOT_RESP_MAX)` = 262 144. The response
+fits by construction: `128 × 1 536 = 196 608` B plus array and envelope overhead.
+[LIBP2P §7]
 
 ### 7.6 Anti-spam
 
@@ -2070,7 +2471,9 @@ The layers, cheapest first:
    category entirely.
 2. **Per-key rate limits**, enforced locally by every client:
    `MAX_ADS_PER_TABLE_KEY_PER_MIN = 4`, `MAX_ADS_PER_PEER_PER_MIN = 20`,
-   `MAX_PRESENCE_PER_PEER_PER_MIN = 4`. Exceeding a limit gets
+   `MAX_PRESENCE_PER_PEER_PER_MIN = 4`, and for `LOBBY_CHAT` **1 message per 2 s
+   with a burst of 5, per remote `PeerId`**, matching `NETWORK_STACK.md` §6.6.
+   Exceeding a limit gets
    `MessageAcceptance::Reject`, which applies the GossipSub P₄ score penalty to the
    forwarder as well.
 3. **Bounded caches** — `MAX_TRACKED_TABLES = 4096`, `MAX_TRACKED_PRESENCE = 8192`,
@@ -2097,6 +2500,36 @@ stranger re-announcing under a freshly generated random infohash within 24
 minutes — DHT crawling seen first-hand, not hypothesised. [DHT §7] That is a
 discovery-layer property, not a lobby-protocol one, but a reader of this document
 should not come away thinking the lobby is private.
+
+### 7.7 `0x0106 LOBBY_CHAT`
+
+`SPEC_CS.md` §22 requires a chat pane in the lobby, so the message type exists
+here rather than only in the transport document.
+
+*Channel:* lobby chat broadcast — GossipSub on
+`LOBBY_CHAT_TOPIC = /p2p-poker/lobby-chat/1`, not the lobby topic.
+*Signed by:* the sender's application key.
+*Envelope:* unchained, per the rule at the head of §7 (`chain_scope = 0`).
+
+| Field | Type | Limit / rule |
+|---|---|---|
+| `n(0) display_name` | `bytes` | ≤ 32 B UTF-8, §9.4 string rules |
+| `n(1) text` | `bytes` | ≤ 512 B UTF-8, §9.4 string rules |
+| `n(2) timestamp_unix_ms` | `u64` | advisory; strictly greater than this sender's previous, for anti-replay |
+
+Payload cap `LOBBY_CHAT_MAX = 2 048 B`.
+
+**Both string fields are display-only, never identifiers, never parsed, never
+inputs to a state transition, and must reject control characters
+`U+0000`–`U+001F`, `U+007F` and the bidi overrides `U+202A`–`U+202E`,
+`U+2066`–`U+2069`.** These are the §9.4 rules, restated at the message rather than
+inherited, because chat is the one message class that is pure attacker-controlled
+UTF-8 reaching a UI and is therefore the field most likely to be attacked.
+
+Chat carries **no security claim of any kind**. It is authenticated as coming from
+an application key and nothing more; impersonation by display name is trivial and
+expected, and a client must never present a chat line as evidence about who a
+player is.
 
 ---
 
@@ -2161,53 +2594,110 @@ every seat that has an outstanding contribution.
 
 **The engine contains no clock.** Time enters the state machine only as a signed
 `TIMEOUT_CERT`. `STATE_MACHINE.md` must carry the deadline as explicit state
-rather than as a wall-clock read inside the engine (D-006).
+rather than as a wall-clock read inside the engine (D-006). Since the certificate
+stage became collective (§4.8) this is true without exception: `CERT_SETTLE_MS`
+was the one wall-clock read left inside the chain-building rule and it is gone.
+
+**One residual, stated rather than hidden.** A stage can close two ways — by the
+subject's own event, or by certificates — and which one happened is chain content.
+Two peers agree on it only if at least one required voter is honest and refuses to
+vote after accepting the action. At `n >= 3` that is the honest-voter assumption
+already in force. At `n = 2` there is no such voter, and D-007's advisory rule
+applies, so the ambiguity cannot arise: no `kind = 1` certificate takes effect at
+all (§8.3).
 
 ### 8.3 The timeout certificate
 
 One peer asserting "time is up" cannot be enough — it would let anyone steal the
-action from a player who was about to act. A timeout takes effect only through a
-**unanimous** certificate.
+action from a player who was about to act. **The certificate is defined for
+`n >= 3`.** At `n = 2` the required voter set has exactly one member, which is the
+opponent, so unanimity is vacuous: "every other seat agrees" and "my opponent
+says so" are the same statement, and a modified client could fold any hand at
+will. D-007 settles this and is applied here verbatim.
 
-**Required voter set** `V(subject)`:
+**Required voter set** `V(subject)` is **every other dealt-in seat**, so
+`|V| = n - 1` where `n = |dealt_in|`:
 
-* for `kind = 1` (action deadline): every seat that is a cryptographic party to
-  the hand (`dealt_in`), minus the subject seat, minus any seat already attributed
-  by an earlier certificate in this hand. **Folded seats are included**, because a
-  folded seat still holds a key share and must remain responsive until the hand
-  ends; a folded seat that goes silent is itself a subject.
-* for `kind = 2` (cryptographic-step deadline): the same set.
+| dealt-in seats `n` | required voters |
+|---:|---:|
+| 2 | 1 |
+| 3 | 2 |
+| 10 | 9 |
 
-**Unanimity settles the race cleanly.** If the slow player's action arrives at any
-one voter first, that voter will not sign, no certificate forms, and the action
-stands. If no voter accepted an action, the certificate forms and the action is
-too late. There is no window in which both a valid action and a valid certificate
-exist for the same parent — and if a peer produces both, it has equivocated in the
-sense of §5.2 and that is provable from the two bodies alone.
+The set is the same for `kind = 1` (action deadline) and `kind = 2`
+(cryptographic-step deadline), minus any seat already attributed by an earlier
+certificate in this hand, and minus any seat excluded by §8.4. **Folded seats are
+included**, because a folded seat still holds a key share and must remain
+responsive until the hand ends; a folded seat that goes silent is itself a
+subject.
+
+**Normative — no `kind = 1` certificate at two seats.** `kind = 1` certificates
+are invalid at `n = 2` and must be rejected by every receiver. A heads-up action
+deadline is a UI countdown and produces no signed state transition (D-007
+point 1). Nothing is signed, nothing is chained, and no seat is auto-folded.
+
+**Normative — a `kind = 2` certificate at two seats attributes nobody.** At
+`n = 2` a `kind = 2` certificate is accepted **only** with `attributed = []`; one
+naming a subject is invalid. The hand still ends — liveness requires it, or a
+vanished opponent deadlocks the table forever — but it ends with no forfeiture and
+with stacks returned to their start-of-hand values. This reopens, at two seats
+only, the rage-quit escape D-005 closed, and that is stated as an unfixed
+limitation rather than hidden. The alternative — letting one peer's unilateral
+assertion take the other's chips — is a positive-gain attack on an honest player,
+and a liveness/fairness loss is preferred to a theft. The choice is escalated:
+**OQ-A** (§12), which needs a numbered owner decision before real money is ever
+considered.
+
+The review's other candidate — requiring the subject's own counter-signature — is
+rejected: a subject who is absent cannot counter-sign, so it converts every
+genuine timeout into a deadlock, and D-007 already recorded that no arrangement of
+signatures gives both properties. `SPEC_CS.md` §36 forbids inventing a
+construction here, so none is invented.
+
+**What settles the race between a late action and a certificate.** If at least one
+required voter is honest and saw the action, no certificate forms and the action
+stands. If every required voter is dishonest, or none saw the action, a
+certificate forms. **There is no artefact that settles the race when a voter lies
+about what it saw.** A `TIMEOUT_VOTE` and the action it is about are signed by
+different keys and sit in different `event_class` slots (§4.8, §5.2), so a peer
+that both accepted an action and voted that it timed out has not equivocated and
+nothing is provable from the two bodies. Whether a voter should be obliged to
+publish a signed `ACTION_SEEN` first, making a lying voter provable, is **OQ-C**
+(§12); it is a design change with a cost in messages and latency and it is not
+adopted.
 
 **Effect of a certificate:**
 
-* `kind = 1` → the engine applies **check** if nothing is owed and **fold** if
-  facing a bet. Never fold a hand that could check for free (D-006 point 1). The
-  betting round then continues among the remaining players, the street card opens,
-  and the hand plays out normally. Nothing aborts and nothing waits.
-* `kind = 2` → `HAND_ABORT` with `cause = 1`, attributed to `subject_seat`, chips
-  forfeited per D-005 (§4.10).
+* `kind = 1`, `n >= 3` → the engine applies **check** if nothing is owed and
+  **fold** if facing a bet. Never fold a hand that could check for free (D-006
+  point 1). The betting round then continues among the remaining players, the
+  street card opens, and the hand plays out normally. Nothing aborts and nothing
+  waits.
+* `kind = 1`, `n = 2` → does not exist.
+* `kind = 2`, `n >= 3` → `HAND_ABORT` with `cause = 1`, attributed to
+  `subject_seat`, chips forfeited per D-005 (§4.10).
+* `kind = 2`, `n = 2` → `HAND_ABORT` with `cause = 1`, `attributed = []`, stacks
+  restored (§4.10, OQ-A).
 
 After `MAX_CONSECUTIVE_AUTO_ACTIONS = 3` certificates against one seat, that seat
 is marked sitting out and enters the D-005 absent-seat state at the next hand
-boundary: it keeps its stack, pays its blinds and antes, takes no cards, and
-drains until it busts. The player can sit back in at a hand boundary with
-`PLAYER_SIT_IN` (D-006 point 4).
+boundary. This path exists only at `n >= 3`: at two seats there is no action
+timeout certificate, so `consecutive_auto_actions` never increments from a
+timeout and a heads-up seat is never marked sitting out by the deadline path. It
+can still sit out voluntarily. When the counter does fire, the seat keeps its
+stack, pays its blinds and antes, takes no cards, and drains until it busts. The
+player can sit back in at a hand boundary with `PLAYER_SIT_IN` (D-006 point 4).
 
 **A reading of D-006 that must be stated.** D-006 point 2 says the auto-action is
 "a real, signed protocol event in the transcript" and also that "every peer
 derives it identically from the same state". Those two pull in opposite
 directions, because the absent player cannot sign an action they did not take and
 nobody else may sign in their name. This document resolves it as: **the
-certificate is the signed transcript event, carrying `|V|` signatures; the
+certificate is the signed transcript event, carrying `|V| = n - 1` signatures; the
 check-or-fold is its deterministic effect, derived by every peer.** Both halves of
 D-006 point 2 are satisfied and nothing is signed on an absent player's behalf.
+This resolution applies at `n >= 3` only; at two seats D-007 supersedes D-006 and
+there is no auto-action event of any kind.
 
 ### 8.4 Simultaneous failures
 
@@ -2215,12 +2705,25 @@ If two seats become subjects at once, neither certificate can reach unanimity,
 because each required voter set contains the other subject.
 
 Rule: a seat already named as the subject of an outstanding, older unmet deadline
-is excluded from `V`. If unanimity still cannot be reached before
-`hand_deadline_ms` expires, the hand aborts with `cause = 1` and **every**
-non-voting seat is attributed.
+is excluded from `V`.
 
-D-006 did not settle simultaneous failure and this rule is this document's
-construction, not the owner's decision. It is **OPEN QUESTION Q-02**.
+If unanimity still cannot be reached before `hand_deadline_ms` expires, the hand
+aborts with `cause = 1`, `attributed = []`, `cert_hash = None`, and stacks
+restored. **Nobody is named**, because a seat that did not vote may be silent,
+partitioned or simply slow, and D-005 forfeiture against a partitioned honest seat
+is a positive-gain attack on that seat. An abort with `attributed == []` returns
+exactly `committed_hand[s]` to every seat `s` and moves no chips between seats
+(§4.10).
+
+**This is a safe default, not a solution.** It lets two colluding seats void a
+hand by going silent together, at no cost to either. The earlier rule — attribute
+*every* non-voting seat — is deleted, because it converted a partition into a
+confiscation.
+
+D-006 did not settle simultaneous failure, and neither does this. **OPEN QUESTION
+Q-02** stays open with the above as its written interim behaviour; the same
+question is `STATE_MACHINE.md` Q3 and is carried as blocking in
+`THREAT_MODEL.md` §9.2 (OQ-E).
 
 ### 8.5 How a timeout becomes evidence
 
@@ -2228,9 +2731,11 @@ The certificate is a permanent, self-contained artefact. A third party with the
 transcript can check, with no table state: every embedded vote's canonicality and
 signature; that the voters are exactly the required set derived from the
 transcript; that `parent_event_hash` is the correct `stage_hash`; and that
-`deadline_ms` matches the parent's `next_deadline_ms`. It therefore proves that
-every other party to the hand independently observed the subject fail to act
-within a deadline that the subject itself could compute.
+`deadline_ms` matches the parent's `next_deadline_ms`. At `n >= 3` it therefore
+proves that every other party to the hand independently observed the subject fail
+to act within a deadline that the subject itself could compute. **At `n = 2`
+"every other party" is one party, the certificate proves only that the opponent
+said so, and that is why §8.3 gives it no attribution and no chip effect.**
 
 What it does **not** prove: that the subject's client was malicious rather than
 disconnected, crashed, or DoSed. `SPEC_CS.md` §18 places denial of service outside
@@ -2258,14 +2763,27 @@ protocol constant.
 
 ### 9.2 Frame and channel limits
 
+Names and values are §13's; this table is the per-channel view of them.
+
 | Constant | Value | Notes |
 |---|---|---|
-| `LOBBY_MAX_MESSAGE` | 16 384 B | GossipSub `max_transmit_size`; two-sided constant |
-| `SNAPSHOT_MAX_REQUEST` | 1 024 B | `set_request_size_maximum` |
-| `SNAPSHOT_MAX_RESPONSE` | 524 288 B | `set_response_size_maximum` |
-| `TABLE_MAX_FRAME` | 262 144 B | `u32` length prefix on `/p2p-poker/table/1` |
+| `GOSSIP_MAX_TRANSMIT` | 65 536 B | GossipSub `max_transmit_size`; two-sided. The crate default, pinned there for interoperability |
+| `LOBBY_MSG_MAX` | 8 192 B | application ceiling for any lobby message of any type; the transport limit above is a backstop, never the operative limit |
+| `SNAPSHOT_REQ_MAX` | 1 024 B | `set_request_size_maximum` on `/p2p-poker/lobby-snapshot/1` |
+| `SNAPSHOT_RESP_MAX` | 262 144 B | `set_response_size_maximum`; fits `128 × 1 536 = 196 608` plus overhead |
+| `JOIN_REQ_MAX` | 4 096 B | `set_request_size_maximum` on `/p2p-poker/join/1`; `JOIN_REQUEST`'s own payload cap is 512 B, so this is envelope headroom only |
+| `JOIN_RESP_MAX` | 16 384 B | `set_response_size_maximum`; `JOIN_ACCEPT` embeds a whole advert (≤ 1 536 B) plus a ten-entry roster |
+| `TABLE_FRAME_MAX` | 262 144 B | `u32` length prefix on `/p2p-poker/table/1` |
+| `MAX_EMBEDDED_EVENT` | 32 768 B | per-element cap for an embedded `SignedEvent` in `DISPUTE` and `HAND_ABORT` |
+| `TABLE_AD_SIGNED_MAX` | 1 536 B | a complete `SignedEvent` of an advert, wherever one is embedded or forwarded |
 | `MAX_BODY` | frame − 128 B | `EventBody` bytes |
 | `MAX_PAYLOAD` | body − 256 B | per-type caps below are tighter and are the ones that apply |
+
+`TABLE_FRAME_MAX` is **not** sized by the shuffle objects. It is sized by
+`DISPUTE`, whose four evidence entries of `MAX_EMBEDDED_EVENT` each already exceed
+128 KiB, and by `HAND_ABORT`'s 80 000 B. A 131 072 B frame could not carry the
+protocol's own evidence-bearing message; the shuffle objects are an order of
+magnitude smaller and are not the binding case.
 
 A length prefix greater than the cap closes the stream immediately, without
 reading the body.
@@ -2276,11 +2794,12 @@ reading the body.
 |---|---|---|
 | `HELLO` | 1 024 | ~200 |
 | `CAPABILITIES` | 1 024 | ~150 |
-| `LOBBY_TABLE_AD` | 2 048 | ~350 |
+| `LOBBY_TABLE_AD` (`TABLE_AD_MAX`) | 1 024 | ~350; the 29 fields of §7.2 total under 500 B at worst case |
 | `LOBBY_TABLE_REMOVE` | 128 | ~50 |
 | `LOBBY_PLAYER_PRESENCE` | 512 | ~150 |
 | `LOBBY_SNAPSHOT_REQUEST` | 128 | ~45 |
-| `LOBBY_SNAPSHOT_RESPONSE` | 524 288 | ≤ 128 × ~500; the hard ceiling is 128 × 2 560 = 327 680 |
+| `LOBBY_SNAPSHOT_RESPONSE` | 262 144 | ≤ 128 × ~500; the hard ceiling is ≤ 128 × 1 536 = 196 608 |
+| `LOBBY_CHAT` | 2 048 | ~120 |
 | `JOIN_REQUEST` | 512 | ~180 |
 | `JOIN_ACCEPT` | 8 192 | ~1 800 |
 | `JOIN_REJECT` | 128 | ~45 |
@@ -2310,10 +2829,25 @@ reading the body.
 Typical sizes for the cryptographic objects are the measured `ziffle` 0.1.0
 encodings: `ShuffleProof<52>` 5 547 B, `MaskedDeck<52>` 3 432 B, `PublicKey` 33 B,
 `OwnershipProof` 65 B, `RevealToken` 33 B, `RevealTokenProof` 98 B. [MENTAL §5.1]
-Total shuffle traffic per hand is `n × 8 979` B — 18 KB heads-up, 54 KB six-handed
-— which is the number that makes the 128 KiB default relay budget of D-001 a real
-constraint for a whole session, and confirms that a public IPFS relay cannot carry
-one.
+
+**Relay budget arithmetic, corrected.** `max_circuit_bytes` is a **per-circuit,
+per-direction** cap, and a table is a full mesh, so one circuit connects exactly
+one pair. The earlier comparison of table-wide traffic against a per-circuit cap
+was wrong in kind, not only in magnitude.
+
+| Quantity | Value | Basis |
+|---|---:|---|
+| `ShuffleProof<52>` + `MaskedDeck<52>`, one shuffler | 8 979 B | 5 547 + 3 432, measured [MENTAL §5.1] |
+| Shuffle traffic over **one circuit**, **one direction**, per hand | **8 979 B** | that peer's own step and proof; **independent of `n`** |
+| Hands per direction against a 131 072 B public-relay budget, shuffle only | **~14** | 131 072 / 8 979 |
+| The same including the signed event stream | **~10 hands** | order-of-magnitude; to be measured |
+| A relayed peer's **total** per-hand outbound at an `n`-seat table | `(n-1) × 8 979 B` | 44 895 B at six seats — a bandwidth figure, spread over `n-1` separate budgets, never a single cap |
+| The binding public-relay limit | **`max_circuit_duration = 120 s`**, not the byte cap | a session lasts far longer than two minutes |
+
+So a public relay is unusable for a poker session, but the reason is the two-minute
+circuit **duration**, not the byte budget. The D-002 relay configuration that fixes
+both is transport-local and lives in `NETWORK_STACK.md` §9.6; it is not restated
+here.
 
 ### 9.4 Collection bounds
 
@@ -2331,16 +2865,18 @@ processed.
 | `RevealEntry` per message | 25 | `2 × MAX_SEATS + 5` |
 | `deck_index` | < 52 | |
 | votes in `TIMEOUT_CERT` | `MAX_SEATS - 1` = 9 | ascending by voter seat, unique |
-| `evidence` in `DISPUTE` | 4 | each ≤ 32 768 B |
+| `evidence` in `DISPUTE` | 4 | each ≤ `MAX_EMBEDDED_EVENT` = 32 768 B |
 | `capabilities` | 32 | each name ≤ 32 B, sorted, unique |
-| adverts in a snapshot | 128 | each a complete `SignedEvent` ≤ 2 560 B; 128 × 2 560 = 327 680 B, inside `SNAPSHOT_MAX_RESPONSE` |
+| adverts in a snapshot (`SNAPSHOT_MAX_ADS`) | 128 | each a complete `SignedEvent` ≤ `TABLE_AD_SIGNED_MAX` = 1 536 B; 128 × 1 536 = 196 608 B, inside `SNAPSHOT_RESP_MAX` |
+| `ledger_delta` in `HAND_INIT` | `MAX_SEATS` | ascending by seat, unique |
 | `MAX_STAGES_PER_HAND` | 2 048 | exceeding it aborts the hand |
 | `MAX_TRACKED_TABLES` | 4 096 | LRU |
 | `MAX_TRACKED_PRESENCE` | 8 192 | LRU |
 | `MAX_CBOR_NESTING_DEPTH` | 8 | our own limit, well above the 3 levels we use |
 
 String fields: `display_name` ≤ 32 B, `table_name` ≤ 64 B, `client_name` ≤ 64 B,
-`note` ≤ 256 B. All must be valid UTF-8 with no control characters (`U+0000`–
+`note` ≤ 256 B, `LOBBY_CHAT`'s `text` ≤ 512 B. All must be valid UTF-8 with no
+control characters (`U+0000`–
 `U+001F`, `U+007F`, and the bidi overrides `U+202A`–`U+202E`, `U+2066`–`U+2069`).
 All are display-only and are never identifiers, never parsed, and never inputs to
 any state transition.
@@ -2367,11 +2903,15 @@ any state transition.
 The parser must never crash, allocate without bound, execute anything, read out
 of bounds, or bypass schema validation, for any input.
 
+**Every change to anything enumerated in this section is a security-critical
+change under `SPEC_CS.md` §31 and requires a reproducing regression test to land
+first. See `docs/CONTRIBUTING.md`.**
+
 Required `cargo-fuzz` targets:
 
 1. `SignedEvent` decode + canonicality gate — the single outer entry point.
 2. `EventBody` decode + gate.
-3. Each of the 38 payload decoders, dispatched by `event_type`.
+3. Each of the 39 payload decoders, dispatched by `event_type`.
 4. The deck library's deserialisers: `ShuffleProof`, `MaskedDeck`, `RevealToken`,
    `OwnershipProof`. Phase 0 explicitly did **not** fuzz these and flagged it as
    an open risk, and there is a known `assert!` panic path in that library's
@@ -2434,7 +2974,7 @@ So:
   construction;
 * the contents of `PublicTableState` or the set of checkpoints;
 * the card encoding or the deck-index → role map;
-* `LOBBY_MAX_MESSAGE`, `TABLE_MAX_FRAME`, or any per-message cap **in the
+* `GOSSIP_MAX_TRANSMIT`, `LOBBY_MSG_MAX`, `TABLE_FRAME_MAX`, or any per-message cap **in the
   loosening direction** (tightening a cap only rejects messages a conforming peer
   would not send, but loosening one means new peers send frames old peers drop, so
   both directions are treated as major for safety);
@@ -2493,7 +3033,7 @@ sent it. The hand stops.
 | an action out of turn | stage legality (§4.0 step 12) |
 | a corrupt shuffle | proof verification → `INVALID_SHUFFLE_PROOF` |
 | publishing a reveal token for a future street | street gating (§4.6) |
-| sending different histories to different peers | equivocation proof (§5.2) |
+| sending different histories to different peers | equivocation proof (§5.2), for chained events only |
 | malformed or oversized packets | §9, and the parser is a fuzzing target |
 | a wrong `HAND_INIT` | every field is recomputed by every receiver |
 
@@ -2506,8 +3046,23 @@ Stated plainly, because §18 forbids pretending otherwise.
   cost, by D-005's forfeiture rule — but it is a griefing vector with no
   cryptographic mitigation. Only social and reputational ones, which in play money
   means visibility and nothing more.
-* **The `n-1` collusion eviction of §6.3.** Real, unsolved, publicly adjudicable
-  offline only.
+* **Faulting any table on demand by publishing a false `state_hash` at a
+  checkpoint (§6.3 case (c), §6.4).** A `state_hash` is one field in a message
+  every peer must emit; a single peer that publishes a value it did not derive
+  forces the abort, the restoration and the table's closure, with no attribution
+  live. Bounded by three things and closed by none: it costs the attacker the
+  table and, in a tournament, its own equity in it; checkpoint 7 sits before
+  `SHOWDOWN_REVEAL`, so the attacker must commit before learning whether it won;
+  and the evidence is deterministically adjudicable offline by any third party
+  running the reference engine over the unanimous transcript.
+  `THREAT_MODEL.md` X29. See OQ-D.
+* **Ending a heads-up hand by going silent (§8.3).** At `n = 2` there is no
+  enforceable deadline of either kind, so a `kind = 2` abort carries no
+  attribution and restores stacks, and a heads-up player can escape a losing pot
+  by going quiet. Closing this requires a mechanism that does not exist. See
+  OQ-A.
+* **Voiding a hand by two seats going silent together (§8.4).** The interim rule
+  attributes nobody, so the pair pays nothing. See Q-02 and OQ-E.
 * **Out-of-band collusion**, screen sharing, a confederate reading a player's
   cards. Cryptography cannot touch it.
 * **Malware on a player's own machine** reading their own cards.
@@ -2535,11 +3090,61 @@ Stated plainly, because §18 forbids pretending otherwise.
 | # | Question | Blocks | Owner |
 |---|---|---|---|
 | **Q-01** | Is `showdown_policy = TDA_MUCK` offered at all, or is `MANDATORY_REVEAL` the only permitted value? Mucking preserves live poker's strategic value but weakens §13 verification from "the award was correct" to "the award was correct given who did not forfeit" — a colluding pair could have one player muck a winner. Mandatory reveal is fully verifiable but leaks strictly more than real poker does, which is itself a long-run edge. [RULES A8] | `STATE_MACHINE.md`, the engine's showdown path | project owner; belongs in `DECISIONS.md` |
-| **Q-02** | Is §8.4's rule for simultaneous failures correct — exclude already-subject seats from `V`, and on continued deadlock abort attributing every non-voting seat? D-006 specified unanimity for the single-subject case only. | `STATE_MACHINE.md` | project owner |
+| **Q-02** | **How is a multi-subject deadline certificate constructed, and whom does it attribute?** `signers == participants \ {subject}` is unachievable when two or more seats are simultaneously unresponsive, because each required voter set contains the other subject. **Interim behaviour, written into §8.4:** exclude already-subject seats from `V`, and on continued deadlock abort with `cause = 1`, `attributed = []`, `cert_hash = None`, stacks restored — which lets two colluding seats void a hand for free. D-006 specified unanimity for the single-subject case only. Same question as `STATE_MACHINE.md` Q3; carried as blocking in `THREAT_MODEL.md` §9.2 as OQ-E. | `STATE_MACHINE.md`, Phase 4 | project owner |
 | **Q-03** | Should `TABLE_READY` require every participant to have completed a §1.2 handshake with every other, or is founder-mediated introduction acceptable when a pair cannot connect directly? Requiring a full mesh is the safe answer and is what §1.5 specifies, but it means one unreachable pair prevents a table that would otherwise form. Relates to D-004's symmetric-NAT case. | `NETWORK_STACK.md`, §1.5 | project owner |
-| **Q-04** | Is `CERT_SETTLE_MS` with a lowest-seat tie-break (§4.8) the right way to keep concurrent `TIMEOUT_CERT` assembly from forking the chain, or should a certificate stage be modelled as collective instead? | implementation | this document's author, at Phase 4 |
+| **Q-04** | **CLOSED.** Should the certificate stage be collective instead of a `CERT_SETTLE_MS` timer with a lowest-seat tie-break? **Answer: collective** (§4.8). A certificate's body is a pure function of the votes, so by §3.2's stage-kind principle it carries no choice and must not have a single writer; the emitter set is `V(subject)`; the timer, the tie-break and the chain fork all disappear together, and `CERT_SETTLE_MS` is deleted from §13. | — | closed by the Phase 0 fix plan, C-10 |
 | **Q-05** | Does a `DISPUTE` need to be gossiped to the whole lobby, or only within the table mesh? Lobby-wide gossip gives non-participants durable evidence of equivocation, which is the only reputational pressure play money has; it also creates a defamation and spam vector, since a `DISPUTE` is cheap to emit and its `note` is attacker-controlled text. | `THREAT_MODEL.md`, §7.6 | project owner |
 | **Q-06** | Should the per-hand transcript be persisted in full to the profile directory by default? It is the only thing that makes §11.3's "publicly adjudicable offline" real, and it is small (~20 KB heads-up, ~60 KB six-handed). But it is also a permanent record of every hand every opponent played, which has its own privacy cost. | `storage/`, `THREAT_MODEL.md` | project owner |
+
+### Opened by the Phase 0 fix plan
+
+These four are the honest residue of findings A-1, A-2, A-3 and A-6: places where
+the correct edit was to weaken a claim, leaving a real gap that needs an owner
+decision rather than a cleverer construction. `SPEC_CS.md` §36 requires them to be
+carried openly.
+
+**OQ-A** — recorded here, in `THREAT_MODEL.md` §9.2 and in `DECISIONS.md`'s open
+list as proposed `D-008`:
+
+> At two seats a hand that cannot complete must end, and there is no way for the
+> two peers to agree which of them failed. Ending it with restoration lets a
+> player escape a losing pot by going silent; ending it with forfeiture lets a
+> player take an honest opponent's committed chips by asserting a deadline that
+> did not pass. This plan takes restoration, because a liveness/fairness loss is
+> preferable to a theft, but the choice reverses D-005 at `n = 2` and needs a
+> numbered owner decision.
+
+**OQ-B** — recorded here and in `DECISIONS.md`'s open list:
+
+> A dispute path that does not require the accused peer's signature. Already
+> recorded in `DECISIONS.md` (D-007 point 4); it is repeated here because
+> `PROTOCOL.md` §6.3 case (b) currently depends on exactly that circularity and
+> the replacement is not designed.
+
+**OQ-C** — recorded here:
+
+> Should a required voter be obliged to publish a signed `ACTION_SEEN
+> { sequence, event_hash }` before it may vote, so that vote-and-seen are two
+> events by one key in one slot and a lying voter becomes provable? This is a
+> design change with a cost in messages and latency and it is not adopted here.
+
+**OQ-D** — recorded here, in `THREAT_MODEL.md` §9.2 and in `STATE_MACHINE.md`
+§11:
+
+> On `HAND_ABORT cause = 4` (unresolvable state divergence) the chips are
+> restored to their start-of-hand values because no peer can be attributed. This
+> gives any single peer a free escape from a losing pot at the price of the
+> table. The alternatives — forfeiting an unnamed party's commitment, or settling
+> from the last `STATE_ACK`-agreed checkpoint — each need a numbered decision and
+> neither is adopted here.
+
+### Closed elsewhere, recorded here so the answer is not lost
+
+`STATE_MACHINE.md` **Q2** — whose key signs a derived `HAND_INIT` /
+`HAND_COMPLETE`, and is a counter-signature needed — is **closed** by the
+collective-stage form of §3.2 and §4.4: every present seat signs its own
+byte-identical copy under its own application key, so there is no unsigned event
+to design and the counter-signature the question asked about is the mechanism.
 
 ### Carried forward from `DECISIONS.md`, unresolved and untouched here
 
@@ -2555,31 +3160,63 @@ Stated plainly, because §18 forbids pretending otherwise.
 
 ## 13. Constants
 
-One table, so a reader never has to hunt. Every value here is a two-sided
-protocol constant unless marked local.
+**This section is the single normative home for every two-sided constant in the
+corpus.** `NETWORK_STACK.md` §14 points here and restates none of them; a value
+that appears in two documents with two values is exactly the defect this
+consolidation removes. The names are the ones a Rust `constants` module would
+carry, which is why several differ from earlier drafts of this document:
+`LOBBY_MAX_MESSAGE`, `TABLE_MAX_FRAME`, `SNAPSHOT_MAX_REQUEST` and
+`SNAPSHOT_MAX_RESPONSE` are retired in favour of `GOSSIP_MAX_TRANSMIT` /
+`LOBBY_MSG_MAX`, `TABLE_FRAME_MAX`, `SNAPSHOT_REQ_MAX` and `SNAPSHOT_RESP_MAX`.
+**No value has two names anywhere in the corpus.**
+
+Values marked `(local)` are not two-sided: a client may tune them without a
+protocol-version change. Everything else is two-sided, and changing it is a
+major-version change (§10.2).
 
 ```
+PROTOCOL_VERSION                = 1
 PROTOCOL_MAJOR                  = 1
-protocol_version                = 1
 
-identify protocol               = "/p2p-poker/1"
-lobby topic                     = "/p2p-poker/lobby/1"
-lobby snapshot protocol         = "/p2p-poker/lobby-snapshot/1"
-table stream protocol           = "/p2p-poker/table/1"
+IDENTIFY_PROTOCOL               = "/p2p-poker/1"
+LOBBY_TOPIC                     = "/p2p-poker/lobby/1"
+LOBBY_CHAT_TOPIC                = "/p2p-poker/lobby-chat/1"
+SNAPSHOT_PROTOCOL               = "/p2p-poker/lobby-snapshot/1"
+JOIN_PROTOCOL                   = "/p2p-poker/join/1"
+TABLE_PROTOCOL                  = "/p2p-poker/table/1"
+
+LOBBY_DERIVATION_STRING         = "p2p-poker/mainline-lobby/v1"
+LOBBY_INFOHASH                  = fd7c0d69433e32e425db3ca2b7d7718928739f01
+RELAY_DERIVATION_STRING         = "p2p-poker/mainline-relay/v1"
+RELAY_INFOHASH                  = 9c18d8c80f69de3aa079b2ef519bc4bbb67e1cc1
 
 DOMAIN_EVENT                    = "p2p-poker/v1/event" NUL-padded to 24 bytes
+  hex: 70 32 70 2d 70 6f 6b 65 72 2f 76 31 2f 65 76 65 6e 74 00 00 00 00 00 00
+       |<---------- 18 ASCII bytes ---------->|<---- 6 NUL ---->|
+  TO_BE_SIGNED = DOMAIN_EVENT || u32_be(len(body_bytes)) || body_bytes
+  This is a literal signature prefix, NOT a blake3::derive_key domain; its
+  separators are slashes, unlike every string in the §2.8 register.
+
 hash                            = BLAKE3, keyed via derive_key, length-prefixed
 signature                       = Ed25519, verify_strict only
 encoding                        = minicbor 2.3.0, #[cbor(array)], no maps, no floats
 
 MAX_SEATS                       = 10
-MAX_STAGES_PER_HAND             = 2048
+MAX_STAGES_PER_HAND             = 2 048
 MAX_CBOR_NESTING_DEPTH          = 8
 
-LOBBY_MAX_MESSAGE               = 16 384 B
-TABLE_MAX_FRAME                 = 262 144 B
-SNAPSHOT_MAX_REQUEST            = 1 024 B
-SNAPSHOT_MAX_RESPONSE           = 524 288 B
+GOSSIP_MAX_TRANSMIT             = 65 536 B      (GossipSub max_transmit_size)
+LOBBY_MSG_MAX                   = 8 192 B       (application ceiling, any lobby message)
+TABLE_AD_MAX                    = 1 024 B       (LOBBY_TABLE_AD payload)
+TABLE_AD_SIGNED_MAX             = 1 536 B       (a complete SignedEvent of an advert)
+LOBBY_CHAT_MAX                  = 2 048 B       (LOBBY_CHAT payload)
+SNAPSHOT_REQ_MAX                = 1 024 B
+SNAPSHOT_RESP_MAX               = 262 144 B
+SNAPSHOT_MAX_ADS                = 128
+JOIN_REQ_MAX                    = 4 096 B
+JOIN_RESP_MAX                   = 16 384 B
+TABLE_FRAME_MAX                 = 262 144 B     (u32 length prefix on the table stream)
+MAX_EMBEDDED_EVENT              = 32 768 B      (one embedded SignedEvent as evidence)
 
 AD_TTL_MS                       = 90 000        (since receipt)
 AD_REBROADCAST_MS               = 30 000
@@ -2587,7 +3224,10 @@ MAX_AD_LIFETIME_MS              = 300 000       (bound on expires_at vs local ti
 MAX_CLOCK_SKEW_MS               = 120 000
 PRESENCE_TTL_MS                 = 120 000
 PRESENCE_HEARTBEAT_MS           = 40 000
-SNAPSHOT_PEER_COUNT             = 4             (local)
+REANNOUNCE_INTERVAL_MS          = 600 000
+IDLE_CONNECTION_TIMEOUT_MS      = 60 000
+MDNS_QUERY_INTERVAL_MS          = 15 000
+SNAPSHOT_PEER_COUNT             = 4
 MAX_TRACKED_TABLES              = 4 096         (local)
 MAX_TRACKED_PRESENCE            = 8 192         (local)
 MAX_ADS_PER_TABLE_KEY_PER_MIN   = 4             (local)
@@ -2595,7 +3235,6 @@ MAX_ADS_PER_PEER_PER_MIN        = 20            (local)
 MAX_PRESENCE_PER_PEER_PER_MIN   = 4             (local)
 
 HANDSHAKE_DEADLINE_MS           = 15 000
-CERT_SETTLE_MS                  = 2 000
 MAX_CONSECUTIVE_AUTO_ACTIONS    = 3
 
 RATED_SNG_POKERTH_V1:
@@ -2624,3 +3263,69 @@ The `RATED_SNG_POKERTH_V1` values, their PokerTH provenance, and the four
 is this document's addition; it has no PokerTH analogue and must comfortably
 exceed one shuffle prove-and-propagate cycle, measured at ~100 ms of proving plus
 network latency [MENTAL §5.1].
+
+**`RATED_SNG_POKERTH_V1` is fully specified and is not playable by the MVP.** It
+pins `seats = 10` and `min_players_to_start = 10`, while `SPEC_CS.md` §32 requires
+two-player heads-up as the first supported mode and §1.3 scopes the MVP at
+`nlhe/2-6`. The MVP ships `CUSTOM` tables; `RATED_SNG_POKERTH_V1` becomes playable
+when `nlhe/7-10` lands. This is stated rather than left to inference because a
+reader who does not notice will build the wrong acceptance test —
+`STATE_MACHINE.md` §9.5 carries the same statement next to its heads-up
+reachability analysis, and the Phase 8 acceptance test for D-003/D-004 uses a
+`CUSTOM` two-seat table.
+
+**Retired constants.** `LOBBY_MAX_MESSAGE`, `TABLE_MAX_FRAME`,
+`SNAPSHOT_MAX_REQUEST` and `SNAPSHOT_MAX_RESPONSE` are renamed as listed at the
+head of this section. `CERT_SETTLE_MS = 2 000` is **deleted**: the certificate
+stage is collective (§4.8), so there is no settle window and no tie-break, and the
+constant was the last wall-clock read inside the chain-building rule.
+
+**Not here.** The D-002 relay configuration (`max_circuit_duration`,
+`max_circuit_bytes`, `max_reservations`, `max_circuits`, `max_circuits_per_peer`
+and the rest) is transport-local rather than two-sided and lives in
+`NETWORK_STACK.md` §9.6. It is not restated here, and §9.3's relay arithmetic
+points at it.
+
+---
+
+## 14. Objections to the fix plan
+
+Every ruling of `docs/research/PHASE0_FIXPLAN.md` addressed to this document was
+applied as written. Three of them were applied over an objection, recorded here
+rather than resolved in the text, because five editors producing one consistent
+corpus matters more than any one editor's judgement.
+
+**1. C-2's canonical RNG beacon combine drops the session binding this document
+carried.** The plan's canonical form is
+`seed = h("p2p-poker v1 rng-beacon", [ r_1, …, r_n ])`, and §4.4 now carries it
+verbatim. The form this document previously carried was
+`h("p2p-poker v1 rng-beacon", [ session_id, for each seat s ascending: r_s ])`.
+C-2's per-document instructions for `PROTOCOL.md` name only §4.5's `ctx`, §4.3's
+`session_id`, §4.4's `RNG_COMMIT` commitment and §2.8's retired list; they do not
+mention the combine, so the divergence between this document's form and the
+canonical one may not have been noticed when the ruling was written. Applying the
+canonical form was still the right call — `STATE_MACHINE.md` §7.9 is being edited
+to carry exactly it, and leaving two forms in the corpus is the defect C-2 exists
+to remove — but the objection is that the ruling removes a direct binding without
+saying so. The binding is not lost: each `r_s` is bound to `(table_id,
+session_id, committer)` by its own stage-1 commitment, and the beacon's own events
+chain to `GENESIS(0)`, which contains `advert_hash` and `roster_hash(0)`. It is
+now indirect rather than direct, and that should be an explicit choice rather than
+a side effect.
+
+**2. C-7 says there are "now five" protocol strings; §1.1 lists six.** C-7 adds
+`/p2p-poker/join/1` to the four strings this document carried and states the new
+total as five. C-8, applied to the same section's constant register, adds
+`LOBBY_CHAT_TOPIC = /p2p-poker/lobby-chat/1`, which is also a protocol string for
+`PROTOCOL_MAJOR = 1`. §1.1 therefore lists six and says six. The two rulings are
+individually right and their arithmetic does not compose; the count in C-7 is
+stale rather than wrong.
+
+**3. A-1 says the `cert_hash` requirement for `cause = 1` stands; A-7 specifies a
+`cause = 1` abort with `cert_hash = None`.** Both are applied: §4.10 requires
+`cert_hash` for `cause = 1` with a single named exception, the §8.4
+`hand_deadline_ms` path, where unanimity was by construction never reached and no
+certificate can exist. Reading A-1's sentence as absolute would make A-7's interim
+behaviour unrepresentable, so it is read as scoped to the certificate path it was
+written about. If that reading is wrong, §4.10 and §8.4 need a different interim
+disposition, not a different field rule.

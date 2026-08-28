@@ -38,6 +38,12 @@ of the protocol.
 
 ## 1. Summary table
 
+**Module governed by this document (`SPEC_CS.md` §23, interim mapping).** This
+document governs `src/mental_poker/` (`protocol.rs`, `deck.rs`, `shuffle.rs`,
+`proofs.rs`, `reveal.rs`) and `src/security/`. The full §23 source tree is deferred to
+`docs/ARCHITECTURE.md` at the start of Phase 2; this line exists so the separation of
+transport, poker engine and cryptographic deck has an owner before the tree does.
+
 | Layer | Construction | Library / pin | Origin (full citation) |
 |---|---|---|---|
 | Mental-poker card protocol | Threshold (n-of-n) ElGamal cards under an aggregate public key; per-card decryption shares | `ziffle 0.1.0` | Adam Barnett and Nigel P. Smart, *"Mental Poker Revisited"*, in Kenneth G. Paterson (ed.), **Cryptography and Coding — 9th IMA International Conference (IMACC 2003)**, LNCS 2898, Springer, 2003, pp. 370–383. |
@@ -255,20 +261,39 @@ get(&self, idx: usize) -> Option<MaskedCard> }`; `MaskedDeck<N>` has
 
 This is our layer's responsibility and it is load-bearing. Deck index → destination is
 fixed deterministically from `(table_id, hand_id, button, seat order)` and recorded in
-the signed `HAND_INIT` event *before* the first shuffle:
+the `HAND_INIT` stage *before* the first shuffle.
 
-```
-index 0 .. 2n-1 : hole cards, dealt seat-by-seat in two passes, as at a live table
-index 2n        : burn
-index 2n+1 .. 2n+3 : flop
-index 2n+4      : burn
-index 2n+5      : turn
-index 2n+6      : burn
-index 2n+7      : river
-```
+**The canonical deck-index map**, reproduced from `PROTOCOL.md` §4.5, which owns it.
+Let `D = [d_0, …, d_{m-1}]` be the `dealt_in` seats in clockwise order starting from
+the first dealt-in seat strictly clockwise of `button_position` (normal deal order,
+small blind first), `m = |dealt_in|`:
 
-(The exact layout is `PROTOCOL.md`'s to state; what matters cryptographically is only
-that it is fixed and signed before any shuffle happens.)
+| Deck index | Role |
+|---|---|
+| `0 … m-1` | first hole card of `d_0 … d_{m-1}` |
+| `m … 2m-1` | second hole card of `d_0 … d_{m-1}` |
+| `2m`, `2m+1`, `2m+2` | flop |
+| `2m+3` | turn |
+| `2m+4` | river |
+| `2m+5 … 51` | unused; no reveal token for these indices is ever legal |
+
+At most 25 of 52 indices are used. The symbol for the dealt-in count in the index map is
+**`m`** in every document of this corpus. Elsewhere in this document the same count is
+written `n` — the number of parties to the cryptography (§2.1), which is exactly the set
+of dealt-in seats — so `m = n`; `m` is used only where the map is being written down.
+What matters cryptographically is only that the map is fixed and
+agreed before any shuffle happens; the layout itself is `PROTOCOL.md` §4.5's to state,
+and this document reproduces it rather than defining it.
+
+**Recorded departure from live procedure: there are no burn cards.** A burn exists to
+defeat physical marked-card and edge-sorting attacks, and there are no physical cards
+here; a burn that is never opened is indistinguishable from an unused index. This is a
+deliberate departure from live procedure. It is not a free per-document choice: a burn
+costs a deck position and changes the map, and the map is hashed into `index_map_hash`
+inside `DECK_COMMIT`, so two conforming clients with different maps produce a
+guaranteed `DECK_COMMIT` mismatch every hand — a manufactured `SPEC_CS.md` §15 dispute
+per hand, which faults the table. Recorded in the deviation register of
+`THREAT_MODEL.md` §9.1.
 
 If the map were chosen *after* the final deck existed, the last shuffler — who chose
 the last permutation — would gain a lever. Fixing it first removes the degree of
@@ -346,35 +371,54 @@ of `SPEC_CS.md` §9 and §35: a proper subset of the players cannot open a card.
 
 ### 2.7 Hole cards — selective opening
 
-Alice's hole cards are the deck indices assigned to her seat by the §2.4 map. To let
-*only* Alice read them, every **other** player sends Alice their token for exactly
-those two indices, privately, over the direct authenticated libp2p stream to Alice.
-Alice adds her own share and completes the sum.
+Alice's hole cards are the deck indices assigned to her seat by the §2.4 map. Tokens
+for them are **broadcast**, not sent point-to-point: `DEAL_PRIVATE` is a collective
+broadcast stage (`PROTOCOL.md` §3.4 and §4.6, `STATE_MACHINE.md` §7.8). Each dealt-in
+seat emits one message carrying its token for every **other** dealt-in seat's two hole
+indices; it emits no token for its own.
 
 ```
-for j in hole_indices(alice):
-    each i ≠ alice  → alice :  (share_i(j), dleq_i(j))       // point-to-point, signed
-    alice: verifies every DLEQ, adds share_alice(j), looks up m
+each i:  broadcast { (share_i(j), dleq_i(j)) : j ∈ hole_indices(s), s ≠ i }
+alice:   verifies every DLEQ, adds share_alice(j) for her own indices,
+         then looks the recovered plaintext point up in open_deck (§2.6)
 ```
 
-Properties:
+**The counting argument — this, and not delivery secrecy, is why it is safe:**
 
-* Alice needs `n−1` tokens plus her own; she has them, so she reads her cards.
-* Bob receives no token for Alice's indices from anybody, so for Bob those two
-  ciphertexts stay ciphertexts. He is missing at least Alice's own share and cannot
-  produce it, since producing it is equivalent to computing `sk_alice` from
-  `pk_alice`.
-* **A modified client does not help.** Bob's client never receives the material needed
-  to decrypt Alice's cards; there is nothing hidden in his memory to un-hide. This is
-  the property `SPEC_CS.md` §9 demands and the one the adversarial test
-  `CheaterReadOpponentCard` (§25) must assert.
+> Opening deck index `i` requires a reveal token from **every one of the `n`
+> dealt-in seats**. For a hole index owned by seat `P`, every seat except `P`
+> broadcasts its token, so at most `n-1` tokens for that index ever exist
+> publicly. Any other seat `Q` holds only its own token, which is already among
+> the `n-1`; the one missing is `P`'s, and producing it is equivalent to
+> computing `sk_P` from `pk_P`. `P` completes the set with its own share and
+> reads its card. At showdown `P` publishes its own token, completing the set for
+> everyone — the only moment a seat ever publishes a token for its own card, and
+> any earlier such token is a protocol violation.
 
-**Threat to guard at our layer:** ziffle has no notion of *who is entitled to* a
-token. A player who sends Bob a token for Alice's index is doing something ziffle
-considers perfectly valid. Our envelope therefore binds each token to
-`(table_id, hand_id, street, card_index, recipient)`, and a receiver **rejects** any
-token for an index it is not entitled to, attributing the violation to the sender. See
-§9 item 4.
+Consequences:
+
+* Alice needs `n−1` tokens plus her own; the broadcast supplies the `n−1` and she holds
+  the last one, so she reads her cards.
+* **A modified client does not help.** Bob's client, however modified, is short exactly
+  one share — Alice's — for every one of Alice's indices, and no quantity of public
+  material substitutes for it. This is the property `SPEC_CS.md` §9 demands and the one
+  the adversarial test `CheaterReadOpponentCard` (§25) must assert. Note that the
+  earlier form of this argument in this document — *"Bob receives no token for Alice's
+  indices from anybody"* — was **false** under the shipped broadcast design and has
+  been deleted; the counting argument above is the correct one and is the basis of
+  `THREAT_MODEL.md` G1.
+
+**Threat to guard at our layer:** ziffle has no notion of *when* or *for which index* a
+token is legitimate. A player who publishes a token for its own hole index before
+showdown is doing something ziffle considers perfectly valid. Our envelope therefore
+binds each token to `(table_id, hand_id, street, card_index)` and the rule is:
+
+* a token is legal **only for the indices due at the current stage**; and
+* a token from `P` for `P`'s own hole index before `SHOWDOWN_REVEAL` is the specific
+  violation to reject and attribute to `P`.
+
+Any token failing either test is rejected and its sender attributed. See §8 rule 3 and
+§8 rule 4.
 
 ### 2.8 The board, street by street
 
@@ -402,15 +446,17 @@ token for the river index during the pre-flop betting round. Our rules:
    is the load-bearing observation behind **D-006**: a player who walks away from the
    keyboard still cooperates cryptographically, so the board opens on schedule, the
    showdown works, and the hand plays to the end. The only thing missing is a betting
-   decision, and the answer to that is an auto check/fold via a timeout certificate —
-   never an abort, and never anything that ends the tournament.
-3. Burn cards are simply never opened. Their indices are consumed by the map and no
-   token is ever published for them, in the hand or afterwards.
+   decision, and the answer to that is an auto check/fold via a timeout certificate
+   **at `n >= 3`; heads-up the deadline is advisory (D-007)** — never an abort, and
+   never anything that ends the tournament.
+3. **There are no burn cards.** Indices `2m+5 … 51` are never opened and a reveal token
+   for any of them is a protocol violation, attributed to its sender.
 
 ### 2.9 The complete per-hand sequence
 
 ```
-HAND_INIT            table_id, hand_id, button, seat order, dealing map, ctx      (signed)
+HAND_INIT            table_id, hand_id, button, seat order, dealing map, ctx
+                     collective: every present seat signs a byte-identical body   (n copies)
   ↓
 KEY_SETUP            each player: (sk_i, pk_i, OwnershipProof) ; verify all       (65 B each)
                      apk = Σ pk_i                                                  (33 B each)
@@ -419,16 +465,35 @@ SHUFFLE_STEP × n     player k: D_k + ShuffleProof<52>, everyone verifies       
   ↓   any proof fails → INVALID_SHUFFLE_PROOF, hand stops, shuffler attributed
 DECK_COMMIT          hash of the final verified deck enters the transcript
   ↓
-DEAL_PRIVATE         n−1 tokens per hole index, point-to-point           (131 B per token)
+DEAL_PRIVATE         broadcast: each dealt-in seat emits one message carrying its token
+                     for every other dealt-in seat's two hole indices — 2(n−1) tokens
+                     per sender, one message per sender, one collective stage
+                                                                        (131 B per token)
   ↓
-betting …            auto check/fold on a timeout certificate (D-006)
+betting …            auto check/fold on a timeout certificate at n >= 3 (D-006);
+                     heads-up the deadline is advisory (D-007)
 FLOP_REVEAL          tokens for 3 indices, broadcast
 betting … TURN_REVEAL … betting … RIVER_REVEAL … betting …
   ↓
 SHOWDOWN_REVEAL      tokens for the hole indices that must be shown
   ↓
 HAND_COMPLETE        winner, pot, side pots; transcript closed
+                     collective, like HAND_INIT                                   (n copies)
 ```
+
+`HAND_INIT`, `HAND_COMPLETE` and `HAND_ABORT` are **collective** stages, not
+single-writer events: every field is derived from the state before the stage, so every
+present seat computes the same body, signs its own copy and emits it, and there is no
+writer holding a veto over the hand-to-hand transition (`PROTOCOL.md` §3.2 and §4.4,
+`STATE_MACHINE.md` §3.4). One signed event in the sequence above therefore costs `n`
+copies of a small message at each of those three stages.
+
+`DEAL_PRIVATE` costs `2n(n−1)` tokens per hand in total — `2(n−1)` from each of `n`
+senders — at 131 B per token: 262 B per sender heads-up, 1 310 B per sender six-handed.
+Two consequences that only broadcast delivery gives us: a showdown is **one message per
+revealing seat** rather than a fan-out, and **mucking is a policy question rather than
+a cryptographic one**, because the tokens a muck withholds are the revealing seat's own
+and nobody else's.
 
 Every one of these is a signed, hash-chained event per `SPEC_CS.md` §12 and §13. The
 cryptographic objects (proofs, tokens, decks) travel **inside** the signed CBOR
@@ -450,12 +515,23 @@ Per **D-005** and `SPEC_CS.md` §19:
 * If the hand can still be decided without opening anything — everyone else folds to
   one player — it completes normally. No tokens are needed, so a player who quits to
   escape a loss does not escape if the others simply fold.
-* Otherwise the hand **aborts**, with a signed record naming the peer that failed to
-  publish. The absent player's committed chips are forfeited and distributed to the
-  remaining players in proportion to their own contributions. Restoring stacks would
-  hand every player a free escape from a losing pot, which is an in-protocol exploit
-  available to anyone; forfeiture closes it, at the cost of a documented DoS incentive
-  that the threat model classifies as out of scope, not solved.
+* Otherwise the hand **aborts**. At `n >= 3` the abort carries a signed record naming
+  the peer that failed to publish; the absent player's committed chips are forfeited and
+  distributed to the remaining players in proportion to their own contributions.
+  Restoring stacks would hand every player a free escape from a losing pot, which is an
+  in-protocol exploit available to anyone; forfeiture closes it, at the cost of a
+  documented DoS incentive that the threat model classifies as out of scope, not solved.
+  The deadline machinery that carries this is a certificate signed by every other
+  dealt-in seat, and it exists **at `n >= 3`; heads-up the deadline is advisory
+  (D-007)**.
+* **At `n = 2` there is no attribution and no forfeiture.** Two peers with no trusted
+  clock and no third party cannot agree that a deadline passed, so a heads-up abort for
+  a missing cryptographic contribution names nobody (`attributed = []`) and restores
+  both stacks to their start-of-hand values. This reopens the rage-quit escape D-005
+  closes at larger tables: a heads-up player can escape a losing pot by going silent.
+  It is recorded as an unfixed limitation, not solved, and the choice between
+  restoration and forfeiture at two seats is escalated as the fix plan's OQ-A
+  (`PROTOCOL.md` §12, `THREAT_MODEL.md` §9.2).
 * From the **next** hand the absent seat is simply not in `apk` (§2.1). Nothing waits
   for it.
 
@@ -466,9 +542,11 @@ player. We do **not** do this: with `t < n`, any `t` colluding players can decry
 and it breaks the §35 main invariant. n-of-n stands; abort and attribute.
 
 Recorded honestly: **a malicious player can always force a hand to abort by going
-silent.** It cannot steal cards or chips by doing so, but it is a griefing vector, and
-the mitigations are social (visible attribution, repeated-abort reputation), not
-cryptographic.
+silent.** It cannot steal cards, and at `n >= 3` it cannot steal chips either — it
+forfeits its own. At `n = 2` it recovers its own commitment, so going silent is a free
+escape from a losing pot; that is the unfixed limitation above. In both cases the
+mitigations are social (visible attribution where attribution exists, repeated-abort
+reputation), not cryptographic.
 
 ---
 
@@ -597,10 +675,10 @@ serialising. None of it invents a primitive.
 |---|---|---|
 | 1 | **The `ctx` string** fed to every ziffle proof (§6.4) | A domain-separation byte string. It changes no algebra; ziffle already hashes `ctx` into every challenge. Choosing what goes in it is protocol policy |
 | 2 | **The OS-CSPRNG adapter** into ziffle's `R: Rng` bound (§7.2) | Byte forwarding. No generation, no seeding, no internal state: `fill_bytes` calls `getrandom::fill` and returns. It is strictly narrower than writing an RNG — it removes the possibility of one |
-| 3 | **The RNG commit/reveal beacon** for seating and the initial button (§7.3) | A hash commitment `H(r_i ‖ salt_i)` using BLAKE3's keyed mode, then `seed = H(r_1 ‖ … ‖ r_n)`. Textbook commit-and-reveal over a library hash. Not used for the deck — the shuffle chain handles that |
-| 4 | **The deterministic index → recipient map** (§2.4) | Pure bookkeeping over integers. No randomness, so nothing to attack |
-| 5 | **Street gating and entitlement checks** on reveal tokens (§2.7, §2.8) | Policy: *when* and *to whom* a legitimate library operation may be applied. It adds no primitive; it constrains one |
-| 6 | **The signed, hash-chained event envelope** (§12/§13 of the spec) | Deterministic CBOR + Ed25519 + BLAKE3, all library primitives, composed in the standard way: length-prefixed, domain-separated, `previous_event_hash` chained |
+| 3 | **The RNG commit/reveal beacon** for seating and the initial button (§7.3) | A hash commitment over `(table_id, session_id, committer key, r_i, salt_i)` using BLAKE3's keyed mode, then `seed = h("p2p-poker v1 rng-beacon", [r_1, …, r_n])`. Textbook commit-and-reveal over a library hash. Not used for the deck — the shuffle chain handles that |
+| 4 | **The deterministic deck index → seat/board map** (§2.4) | Pure bookkeeping over integers. No randomness, so nothing to attack |
+| 5 | **Street gating and index entitlement checks** on reveal tokens (§2.7, §2.8) | Policy: *when*, and *for which index*, a legitimate library operation may be applied. It adds no primitive; it constrains one |
+| 6 | **The signed, hash-chained event envelope** (§12/§13 of the spec) | Deterministic CBOR + Ed25519 + BLAKE3, all library primitives, composed in the standard way: length-prefixed, domain-separated, `previous_event_hash` chained. The signature prefix is `p2p-poker/v1/event`, defined byte-for-byte in `PROTOCOL.md` §13; this document does not restate it |
 | 7 | **The `DeckCrypto` trait boundary** (§9) | A Rust trait. No cryptographic content at all; it exists so ziffle can be swapped |
 | 8 | **Timeout certificates** (D-006) | `k`-of-`k` Ed25519 signatures over a canonical CBOR body naming seat, sequence and `previous_event_hash`. A multi-signature by concatenation, not an aggregate signature scheme — no new algebra |
 | 9 | **The profile key-slot file format** (§10) | An envelope around library AEAD and library KDF. The AEAD's associated data binds the header, so no slot can be stripped or swapped |
@@ -780,15 +858,42 @@ identity. All of that reaches the challenge only through the `ctx` byte string w
 supply. **If `ctx` is weak, the proof system is weak**, and no amount of correctness
 inside ziffle compensates.
 
-The binding rule, normative:
+The binding rule is normative in `PROTOCOL.md` §4.5 and is reproduced here for the
+reader. `PROTOCOL.md` §4.5 owns it; if the two ever differ, §4.5 wins.
 
 ```
-ctx = "p2ppoker/v1" ‖ 0x00 ‖ protocol_version ‖ table_id ‖ session_nonce
-                    ‖ hand_id ‖ shuffle_round ‖ shuffler_application_pubkey
+ctx = h("p2p-poker v1 deck-ctx", [
+          u16_be(protocol_version),   //  2 B
+          table_id,                   // 32 B  the table's Ed25519 public key
+          session_id,                 // 32 B  = SPEC_CS.md §14/§20 "session nonce"
+          u64_be(hand_id),            //  8 B
+          u64_be(sequence),           //  8 B  the chain stage index of the event carrying the proof
+          [ u8(shuffle_round) ],      //  1 B  0-based position of this shuffler in the chain;
+                                      //       0xFF for every ctx that is not a shuffle step
+          sender_public_key           // 32 B  the emitter's application Ed25519 key
+      ])
 ```
 
-built with the same length-prefixed, domain-separated encoder used for the transcript
-hash, so that no two distinct field tuples can produce the same `ctx` bytes:
+where `h` is `PROTOCOL.md` §2.8's constructor: `blake3::derive_key(domain,
+b"p2p-poker/v1")` as the key, then for each part an 8-byte big-endian length prefix
+followed by the part. The result is 32 bytes and is what is handed to the deck library.
+**The separator is the length prefix; no other separator, delimiter or padding exists.**
+Field order is exactly as listed and is part of the protocol.
+
+`shuffle_round = 0xFF` applies to the `ctx` used for `DECK_INIT` ownership proofs and
+for reveal-token DLEQ proofs; those are not shuffle-chain steps and must not share a
+`ctx` with one.
+
+This supersedes the raw-concatenation form
+(`"p2ppoker/v1" ‖ 0x00 ‖ … ‖ session_nonce ‖ …`) that earlier drafts of this section
+carried; that form is deleted and must not be reintroduced. The field name
+`session_nonce` is retired with it: there is one name, `session_id`, defined by
+`PROTOCOL.md` §4.3, and it denotes the same object `SPEC_CS.md` §14 and §20 call the
+session nonce.
+
+The constructor, which is the same length-prefixed, domain-separated encoder used for
+the transcript hash, so that no two distinct field tuples can produce the same `ctx`
+bytes:
 
 ```rust
 fn transcript_hash(domain: &'static str, parts: &[&[u8]]) -> [u8; 32] {
@@ -802,6 +907,12 @@ fn transcript_hash(domain: &'static str, parts: &[&[u8]]) -> [u8; 32] {
 }
 ```
 
+Every domain string used with this constructor comes from `PROTOCOL.md` §2.8's
+register, which is the single register; a document that invents one has a bug. Note
+that `DOMAIN_EVENT = "p2p-poker/v1/event"` is **not** one of these: it is a literal
+24-byte signature prefix, not a `derive_key` domain, which is why its separators differ.
+Its bytes are in `PROTOCOL.md` §13 and are not restated here.
+
 **Verification: (a) compiled and ran** — `probe-crypto-final` step `[5]` asserts
 `transcript_hash(D, ["AB","C"]) != transcript_hash(D, ["A","BC"])` (length prefixing
 works) and that two domains separate (`docs/research/CRYPTO_LIBS.md` §3.3).
@@ -812,10 +923,11 @@ Each field's role:
 |---|---|
 | `protocol_version` | replay across incompatible protocol revisions |
 | `table_id` | replay of a proof from another table |
-| `session_nonce` | replay from an earlier session at the *same* `table_id` |
+| `session_id` | replay from an earlier session at the *same* `table_id` |
 | `hand_id` | replay of last hand's shuffle into this hand |
-| `shuffle_round` | replaying shuffle 1's proof as shuffle 3's |
-| `shuffler_application_pubkey` | one player presenting another's proof as their own |
+| `sequence` | replay of a proof into a different stage slot of the same hand |
+| `shuffle_round` | replaying shuffle 1's proof as shuffle 3's, and mixing a shuffle-step `ctx` with a non-shuffle one (`0xFF`) |
+| `sender_public_key` | one player presenting another's proof as their own |
 
 **Verified end-to-end, by us, for this document:** a shuffle proof produced under
 `ctx` with `hand=7` and presented under `ctx` with `hand=8` is rejected.
@@ -896,23 +1008,66 @@ n × (prove 100 ms + one-way latency) + (n−1) × verify 42 ms
 ```
 
 ≈ **340 ms heads-up** and ≈ **1.1 s six-handed** at 100 ms RTT, excluding DHT and
-GossipSub join. Inside the "a hand starts in a couple of seconds" budget.
+GossipSub join. **These two figures are estimates at an assumed 100 ms RTT, not
+measurements.** Wherever they appear in this corpus they must be marked as such;
+`PROTOCOL.md` §3.2 and §4.4 carry the same marking. Phase 8 measures the real value.
+
+The estimate must additionally be revised upward for the collective form of
+`HAND_INIT` (§2.9): making `HAND_INIT` a collective stage replaces one message with
+`n`, which adds one collective round trip — one further one-way latency plus the time
+to hear `n−1` copies — ahead of the shuffle chain. The same applies at `HAND_COMPLETE`,
+after the hand rather than before it. The figures above have **not** been re-derived
+with that term included; they are a lower bound until Phase 8 measures.
 
 **Two consequences that are requirements, not observations:**
 
 1. **`SPEC_CS.md` §33: proving and verifying must run on a worker thread.** At ~100 ms
    per proof this would visibly freeze a GUI event loop. Results reach the UI thread as
    messages.
-2. **Bandwidth interacts with D-001.** Shuffle traffic alone is `n × (5547 + 3432)`
-   bytes per hand: **18 KB heads-up, 54 KB six-handed**, before the signed event
-   stream. A *public* Circuit Relay v2 circuit is capped at **128 KiB and 2 minutes**
-   by default in both kubo and rust-libp2p (D-001 addendum), so a public relay carries
-   on the order of **two six-handed hands** before it resets. This is concrete evidence
-   for D-002's split: public relays are fine as hole-punch rendezvous, and cannot carry
-   a session. Note also that a `ShuffleProof<52>` plus deck is 8 979 bytes, comfortably
-   under GossipSub's 64 KiB `max_transmit_size` — but hand traffic goes over direct
-   libp2p streams to table participants, never over the lobby topic, per `SPEC_CS.md`
-   §1.
+2. **Bandwidth interacts with D-001, per circuit and per direction.** A relay's
+   `max_circuit_bytes` is a **per-circuit, per-direction** budget, and a table is a
+   full mesh, so one circuit connects exactly one pair. Comparing table-wide traffic
+   against it is an arithmetic error, and the earlier form of this paragraph — *"so a
+   public relay carries on the order of two six-handed hands before it resets"* — made
+   exactly that error and is deleted. The corrected figures:
+
+   | Quantity | Value | Basis |
+   |---|---:|---|
+   | `ShuffleProof<52>` + `MaskedDeck<52>`, one shuffler | 8 979 B | 5 547 + 3 432, measured — the size table at the head of this section |
+   | Shuffle traffic over **one circuit**, **one direction**, per hand | **8 979 B** | that peer's own step and proof; **independent of `n`** |
+   | Hands per direction against a 131 072 B public-relay budget, shuffle only | **~14** | 131 072 / 8 979 |
+   | The same including the signed event stream | **~10 hands** | order-of-magnitude; measure under `THREAT_MODEL.md` OQ12 |
+   | A relayed peer's **total** per-hand outbound at an `n`-seat table | `(n-1) × 8 979 B` | 44 895 B at six seats — a bandwidth figure, spread over `n-1` separate budgets, never a single cap |
+   | The binding public-relay limit | **`max_circuit_duration = 120 s`**, not the byte cap | a session lasts far longer than two minutes |
+
+   So the byte cap is comfortable and **duration, not bytes, is the binding public-relay
+   limit**: a public circuit expires after two minutes regardless of how little has
+   crossed it. That is still concrete evidence for D-002's split — public relays are
+   fine as hole-punch rendezvous and cannot carry a session — but for the right reason.
+   The D-002 relay configuration itself is transport-local and is stated once, in
+   `NETWORK_STACK.md` §9.6. Note also that a `ShuffleProof<52>` plus deck is 8 979
+   bytes, comfortably under GossipSub's 64 KiB `max_transmit_size` — but hand traffic
+   goes over direct libp2p streams to table participants, never over the lobby topic,
+   per `SPEC_CS.md` §1.
+
+**`SPEC_CS.md` §33's profiling targets — what is measured and what is not.**
+
+§33 names seven quantities. Four are measured above; three are not, and saying so is
+the point of this table. An estimate repeated as a bare number becomes a measurement by
+attrition, so each unmeasured row names the phase that will measure it.
+
+| §33 target | Status |
+|---|---|
+| shuffle generation | measured, 94–111 ms |
+| shuffle verification | measured, 37–43 ms |
+| private deal | measured, within the 1.39–4.34 ms per-card reveal |
+| board reveal | measured, 1.39–4.34 ms per card |
+| **signature verification** | **not measured** — Phase 4, one `verify_strict` per event, and the per-hand event count from `PROTOCOL.md` §3 |
+| **network latency** | **not measured** — Phase 8, two-network test; `NETWORK_STACK.md` §12.12 confirms none has been run |
+| **hand startup latency** | **estimated only** — ~340 ms heads-up, ~1.1 s six-handed at an assumed 100 ms RTT, and not yet revised for the collective `HAND_INIT` of §2.9. Phase 8 measures it. |
+
+These are three measurement obligations, not open questions: nothing about the design
+is undecided, only unmeasured.
 
 ---
 
@@ -936,8 +1091,9 @@ mechanism rather than a bolt-on:
   because of a commitment, but because a shuffle is *published together with a proof
   bound to the exact `(prev, next)` pair*. Once `D_k` is out, changing it means
   producing a second valid proof for a different `next` against the same `prev` at the
-  same `(hand_id, round)`, which is an equivocation: two conflicting signed events for
-  one sequence number, detectable and attributable per `SPEC_CS.md` §14.
+  same `(hand_id, round)`, which is an equivocation: two conflicting signed events in
+  one chained stage slot, detectable and attributable per `SPEC_CS.md` §14. The exact
+  predicate is `PROTOCOL.md` §5.2's and is not restated here.
 
 The adversarial test `CheaterPredictableRNG` and the required test *"a single
 malicious player must not be able to choose the future board by manipulating the last
@@ -1026,32 +1182,62 @@ Two mitigating facts and one required action:
   if our own crates mention `StdRng`, `SmallRng`, `thread_rng`, `from_seed` or
   `test_rng` outside the vendored ziffle. See §12 item 6.
 
+**This section is the source, and two other documents were corrected to match it.**
+`PROTOCOL.md` §4.4 and `THREAT_MODEL.md` assumption A7 both claimed that *"the `rand`
+crate is deliberately absent from the dependency tree"*, so that `SmallRng` and
+`StdRng` were structurally unavailable and `SPEC_CS.md` §7 was enforced by the
+dependency graph. That claim is false — see the `cargo tree` output above — and both
+were corrected to the text of this section. `SPEC_CS.md` §7 is enforced by the CI lint
+of §12 item 6, **not** by the dependency graph, and no document may claim a structural
+guarantee. The residual risk is OQ-8.
+
 ### 7.3 The commit/reveal beacon — where it *is* needed
+
+> **Recorded spec deviation.** `SPEC_CS.md` §16 places `RNG_COMMIT` / `RNG_REVEAL` per
+> hand. We run them **once per table**, in the setup chain, not per hand. The shuffle
+> chain (§7.1) is the per-hand distributed randomness and is strictly stronger for that
+> job; a per-hand beacon would add two stages of latency and buy nothing. The beacon
+> covers seating and the initial button only. This note exists because §36 requires a
+> deviation from a binding spec section to be recorded rather than absorbed. Recorded
+> also in `PROTOCOL.md` §4.4 and in the deviation register of `THREAT_MODEL.md` §9.1
+> (entry 2).
 
 `SPEC_CS.md` §16 names `RNG_COMMIT` and `RNG_REVEAL`, and §7 asks for the mechanism.
 It is needed for the **non-deck** randomness: seat assignment at table start, and the
 initial button position. (Subsequent buttons rotate deterministically; only the first
 needs randomness.)
 
+Both constructions below use `h`, the length-prefixed domain-separated constructor of
+§6.4, with domain strings taken from `PROTOCOL.md` §2.8's register — the single
+register. `p2p-poker v1 rng-seed`, which an earlier draft of this section used for the
+combine step, is not in the register and is retired; it must never be valid.
+
 ```
-commit phase:  each i draws r_i, salt_i from the OS CSPRNG
-               publishes C_i = BLAKE3_keyed(derive_key("p2p-poker v1 rng-commit"),
-                                            len‖table_id ‖ len‖session_nonce
-                                            ‖ len‖peer_pubkey ‖ len‖r_i ‖ len‖salt_i)
-reveal phase:  each i publishes (r_i, salt_i); everyone recomputes C_i and checks
-combine:       seed = BLAKE3_keyed(derive_key("p2p-poker v1 rng-seed"),
-                                   len‖r_1 ‖ … ‖ len‖r_n)     // fixed peer-key order
+commit phase:  each i draws r_i, salt_i from the OS CSPRNG, publishes
+
+               commitment_i = h("p2p-poker v1 rng-commit",
+                                [ table_id, session_id,
+                                  committer_app_public_key, r_i, salt_i ])
+
+reveal phase:  each i publishes (r_i, salt_i); everyone recomputes commitment_i
+               and checks it
+
+combine:       seed = h("p2p-poker v1 rng-beacon", [ r_1, …, r_n ])
+                                                   // ascending by seat index
 ```
 
 **Why a player cannot change its contribution after seeing the others':**
 
-1. The commitment is **binding**: producing a different `r_i'` with the same `C_i`
-   requires a BLAKE3 collision.
-2. The commitment is **hiding**: `salt_i` is 32 fresh OS-CSPRNG bytes, so `C_i` leaks
-   nothing about `r_i` even though `r_i` may come from a small space.
-3. The commitment binds `table_id`, `session_nonce` and the committer's public key, so
-   a commitment cannot be lifted from another table, another session or another
-   player.
+1. The commitment is **binding**: producing a different `r_i'` with the same
+   `commitment_i` requires a BLAKE3 collision.
+2. The commitment is **hiding**: `salt_i` is 32 fresh OS-CSPRNG bytes, so
+   `commitment_i` leaks nothing about `r_i` even though `r_i` may come from a small
+   space.
+3. The commitment binds `table_id`, `session_id` and the committer's application public
+   key, so a commitment cannot be lifted from another table, another session or another
+   player. This five-part binding is the canonical one; the two-part form
+   `h(domain, [r_i, salt_i])` that `PROTOCOL.md` §4.4 previously carried does not bind
+   the table, the session or the committer and was corrected to match this section.
 4. **All** commitments must be published and accepted into the hash chain *before* any
    reveal is accepted. The ordering is enforced by the state machine and by
    `previous_event_hash`, not by wall-clock timing.
@@ -1105,15 +1291,17 @@ independently reproduced in `probe-cryptodoc` as `[2] … None`.
 2. Produce a token **only** against a card taken from a deck this client verified
    itself, i.e. from our own `Verified<MaskedDeck<52>>`. Never against a `MaskedCard`
    handed to us on the wire.
-3. Publish a token **only** for an index that is due (§2.7, §2.8). Publishing early is
-   a protocol violation, attributed to the sender.
+3. Publish a token **only** for an index that is due (§2.7, §2.8), and **never for
+   one's own hole index before `SHOWDOWN_REVEAL`**. Both are protocol violations,
+   attributed to the sender.
 4. Tokens are carried inside the signed CBOR envelope, bound to
    `(table_id, hand_id, street, card_index)`, because the DLEQ itself does not bind
    them (§6.4 item 2).
 5. Token publication is **automatic and never gated on the human** (D-006). Only a
    client that is gone or deliberately withholding produces the D-005 case.
-6. A share for a card that is *not* opened this hand — a mucked hole card, a burn —
-   is never published, never logged, and the scalar is zeroised.
+6. A share for a card that is *not* opened this hand — a mucked hole card, or any of
+   the unused indices `2m+5 … 51` (there are no burns, §2.4) — is never published,
+   never logged, and the scalar is zeroised.
 
 **Cost:** 131 bytes per player per revealed card (33 + 98), and 1.39 ms to 4.34 ms to
 open one card end to end for 2 to 6 players (§6.5).
@@ -1172,7 +1360,60 @@ Transitive crates that enter with it, all MIT OR Apache-2.0: `ark-ec`, `ark-ff`,
 which a strict `cargo-deny` licence policy may not parse; it needs an explicit
 clarification entry.
 
-**Supply-chain finding that changes `CRYPTO_LIBS.md` §4.4.** That document expected
+### 9.1 The cryptographic side of the `SPEC_CS.md` §28 register
+
+§28 requires a register with six columns — name, version, purpose, repository, licence,
+security status — for every crate the client links. **The eventual home of that register
+is a new `docs/DEPENDENCIES.md`, generated from `cargo metadata` and checked in CI so it
+cannot drift**; a hand-maintained register is wrong within a month, and the stale `rand`
+row corrected below is the proof. Until that document exists, the cryptographic side is
+carried here and the transport side in `NETWORK_STACK.md` §5.1.
+
+**This table is not complete and does not claim to be.** It covers the cryptographic
+crates this document is responsible for; it does not cover the transport tree, the GUI,
+or build-only tooling.
+
+| Name | Version | Purpose | Repository | Licence | Security status |
+|---|---|---|---|---|---|
+| `ziffle` | 0.1.0 | Barnett–Smart mental poker, Bayer–Groth shuffle proof, DLEQ, Schnorr | `github.com/v26-solutions/ziffle` | MIT OR Apache-2.0 | **unaudited, semver-unstable (0.x, one release)**; vendored at `vendor/ziffle/`; blocking in-house review is OQ-1 |
+| `ark-ec` | 0.5.0 | elliptic-curve group traits | `github.com/arkworks-rs/algebra` | MIT OR Apache-2.0 | no advisory; not audited |
+| `ark-ff` | 0.5.0 | finite-field arithmetic, `DefaultFieldHasher` | `github.com/arkworks-rs/algebra` | MIT OR Apache-2.0 | pulls `paste 1.0.15` (RUSTSEC-2024-0436, unmaintained) into the **runtime** tree; build-time proc macro only |
+| `ark-poly` | 0.5.0 | polynomial arithmetic used by the shuffle argument | `github.com/arkworks-rs/algebra` | MIT OR Apache-2.0 | no advisory; not audited |
+| `ark-secp256k1` | 0.5.0 | the secp256k1 curve instance | `github.com/arkworks-rs/algebra` | MIT OR Apache-2.0 | no advisory; not audited |
+| `ark-serialize` | 0.5.0 | canonical point/scalar serialisation | `github.com/arkworks-rs/algebra` | MIT OR Apache-2.0 | hostile input not fuzzed — OQ-5 |
+| `ark-std` | 0.5.0 | `no_std` shims; the crate that reintroduces `rand` | `github.com/arkworks-rs/std` | `MIT/Apache-2.0` (deprecated SPDX form; needs a `deny.toml` clarification) | no advisory; not audited |
+| `rand` | 0.8.8 | transitively required by `ark-std` with feature `std_rng`; **not** a source of protocol randomness | `github.com/rust-random/rand` | MIT OR Apache-2.0 | RUSTSEC-2026-0097 — see the finding below; patched at this version |
+| `rand_chacha` | 0.3.1 | backs `StdRng` inside `rand 0.8` | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no advisory |
+| `rand_core` | 0.6.4 | the `RngCore` trait our OS-CSPRNG adapter implements (§7.2) | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no advisory; coexists with `rand_core 0.10` — see the duplicate-versions note below |
+| `blake3` | 1.8.7 | transcript hash, `state_hash`, RNG commitments, `ctx` | `github.com/BLAKE3-team/BLAKE3` | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | **no public third-party audit** — OQ-6 |
+| `ed25519-dalek` | 3.0.0 | application event signatures, `verify_strict` only | `github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek` | BSD-3-Clause | past RUSTSEC-2022-0093 patched in `>= 2`; never enable `hazmat` (§10.1) |
+| `sha2` | 0.10.9 | Fiat–Shamir hash inside ziffle | `github.com/RustCrypto/hashes` | MIT OR Apache-2.0 | no advisory; RustCrypto, widely reviewed |
+| `getrandom` | 0.4.3 | the OS CSPRNG (`fill`, `SysRng`) | `github.com/rust-random/getrandom` | MIT OR Apache-2.0 | no advisory |
+| `minicbor` | 2.3.0 | deterministic CBOR for the signed envelope | `github.com/twittner/minicbor` | BlueOak-1.0.0 | no advisory; licence needs an allow-list entry |
+| `zeroize` | 1.9.0 | scrubbing secret scalars and seeds | `github.com/RustCrypto/utils` | Apache-2.0 OR MIT | no advisory; cannot reach allocator/OS copies (§10.2) |
+| `subtle` | 2.6.1 | constant-time comparison | `github.com/dalek-cryptography/subtle` | BSD-3-Clause | no advisory |
+| `argon2` | 0.6.0 | passphrase → KEK for the profile key slots | `github.com/RustCrypto/password-hashes` | MIT OR Apache-2.0 | no advisory |
+| `chacha20poly1305` | 0.11.0 | XChaCha20-Poly1305 profile AEAD | `github.com/RustCrypto/AEADs` | Apache-2.0 OR MIT | no advisory |
+| `windows-sys` | 0.61.2 | DPAPI key slot on Windows | `github.com/microsoft/windows-rs` | MIT OR Apache-2.0 | no advisory; Windows-only path |
+
+**Verification: (b) source** — every `repository`, `license` and version cell was read
+from the crate's own `Cargo.toml` under
+`~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`.
+
+**The two unaudited, semver-unstable entries in the whole client are `ziffle 0.1.0` and
+`libp2p-stream 0.4.0-alpha`** (the latter on the transport side, `NETWORK_STACK.md`
+§5.1). Both are flagged in both places deliberately: they are the two crates where a
+breaking change or an undiscovered defect lands directly on a security or liveness
+property, and neither has a third-party review behind it.
+
+### 9.2 Supply-chain findings that correct the research notes
+
+`docs/research/CRYPTO_LIBS.md` is evidence, not authority, so both corrections below are
+carried here — in the authoritative document — as well as in the research note. A reader
+of this document must not have to open the research note to learn that a row there is
+wrong.
+
+**Finding 1, changing `CRYPTO_LIBS.md` §4.4.** That document expected
 RUSTSEC-2024-0436 (`paste 1.0.15`, unmaintained) to appear only via the optional
 `dcbor` **dev**-dependency. It is in the **runtime** tree once ziffle lands:
 
@@ -1191,6 +1432,28 @@ warning: 1 allowed warning found` (exit 0).
 scoped `deny.toml` ignore is now required unconditionally, not only when `dcbor` is
 present, and the ignore comment must say so. `cargo audit` still exits 0; `cargo deny
 check advisories` treats unmaintained as a failure without the ignore.
+
+**Finding 2, changing `CRYPTO_LIBS.md` §7.3.** That document's `rand` row reads *"crate
+not in the tree at all"*, which is stale: `rand` re-enters through `ark-std 0.5.0`
+(§7.2). The advisory was never evaluated against the version actually pulled in. The
+corrected row, which `CRYPTO_LIBS.md` §7.3 now carries verbatim:
+
+> `rand` — RUSTSEC-2026-0097 — **in the runtime tree at 0.8.8 via `ark-std 0.5.0`.
+> `informational = "unsound"`, patched at `>= 0.8.6`, so the pinned version is
+> patched. The unsound path requires `rand::thread_rng` inside a custom `log`
+> implementation, which does not occur here.**
+
+**Verification: (c) registry** — the local advisory database,
+`~/.cargo/advisory-db/crates/rand/RUSTSEC-2026-0097.md`: `informational = "unsound"`,
+`patched = [">= 0.10.1", "< 0.10.0, >= 0.9.3", "< 0.9.0, >= 0.8.6"]`, and
+`0.8.8 >= 0.8.6`. `rand_chacha 0.3.1` and `rand_core 0.6.4` enter with it and are added
+to `CRYPTO_LIBS.md` §10's version list.
+
+Note what this does *not* say: the advisory being benign here is a fact about our usage,
+not a structural guarantee. §7 is enforced by the §12 item 6 lint (OQ-8), not by the
+absence of `rand`.
+
+### 9.3 Duplicate versions
 
 **Duplicate versions are unavoidable and must be tolerated, not fought.** Once libp2p,
 the general crypto set and ziffle are in one workspace, cargo links two `sha2` (0.10
@@ -1384,13 +1647,16 @@ and a bespoke SHA-256 transcript rather than merlin raises the stakes.
 proof valid under one sub-argument's challenges and invalid under the other's.
 
 **OQ-3 — Is our `ctx` binding sufficient against every replay?**
-ziffle binds proofs to `ctx`, and §6.4 fixes what `ctx` contains — but that is only as
-strong as our own construction, and `ctx` is *our* bug to make, not ziffle's. In
-particular the DLEQ challenge does not bind card index or street, so token replay
-within a hand is prevented by our envelope alone.
+The canonical form is settled: `ctx = h("p2p-poker v1 deck-ctx", [u16_be(
+protocol_version), table_id, session_id, u64_be(hand_id), u64_be(sequence),
+u8(shuffle_round), sender_public_key])`, normative in `PROTOCOL.md` §4.5 and reproduced
+in §6.4. **What is not settled is whether that binding is sufficient**, which is a
+different question and stays open. It is only as strong as our own construction, and
+`ctx` is *our* bug to make, not ziffle's. In particular the DLEQ challenge does not bind
+card index or street, so token replay within a hand is prevented by our envelope alone.
 *What would settle it:* an adversarial test suite that replays (i) a shuffle proof
 across `hand_id`, (ii) across `shuffle_round`, (iii) across `table_id`,
-(iv) across `session_nonce`, (v) a reveal token onto a different card index in the
+(iv) across `session_id`, (v) a reveal token onto a different card index in the
 same hand, (vi) a reveal token published one street early — each asserting rejection.
 Item (i) is already proven (`probe-cryptodoc` `[1]`); the rest are not.
 
@@ -1467,7 +1733,9 @@ like cryptography problems and are not:
   different humans. That needs an identity or reputation layer this project does not
   have.
 * **Denial of service, including the abort attack of §2.10.** A silent player always
-  forces a hand to abort. Detected and attributed, never prevented.
+  forces a hand to abort. Detected and — at `n >= 3` — attributed, never prevented. At
+  `n = 2` it is detected and **not** attributed, and the stacks are restored (§2.10,
+  D-007, fix-plan OQ-A).
 * **Traffic analysis**, made materially worse by relaying (D-001): a relay operator
   learns who talks to whom, when, and how much.
 * **Nothing above is fixed by making the cryptography stronger.** They belong in
@@ -1479,6 +1747,10 @@ like cryptography problems and are not:
 
 Numbered so `PROTOCOL.md`, `STATE_MACHINE.md` and the test suites can reference them.
 
+**Every change to anything enumerated in this section is a security-critical change
+under `SPEC_CS.md` §31 and requires a reproducing regression test to land first. See
+`docs/CONTRIBUTING.md`.**
+
 1. Vendor `ziffle 0.1.0` at `vendor/ziffle/`, `[patch.crates.io]`, `Cargo.lock`
    committed. Complete the OQ-1 review before the mental-poker layer is considered
    done.
@@ -1487,15 +1759,19 @@ Numbered so `PROTOCOL.md`, `STATE_MACHINE.md` and the test suites can reference 
 3. Build `ctx` exactly as §6.4 specifies, from signed state only, never from a wire
    parameter.
 4. Run shuffle proving and verification on a worker thread (§6.5, spec §33).
-5. Reject, and attribute, any reveal token that is early, for a wrong index, or for a
-   recipient not entitled to it (§2.7, §2.8).
+5. Reject, and attribute, any reveal token that is early, for an index not due at the
+   current stage, or published by a seat for its own hole index before
+   `SHOWDOWN_REVEAL` (§2.7, §2.8).
 6. Add a CI lint banning `StdRng`, `SmallRng`, `thread_rng`, `from_seed` and
    `test_rng` in our own crates (OQ-8).
 7. Deserialise every arkworks wire object with `Validate::Yes`, and impose an explicit
    maximum frame size at the transport boundary (OQ-5).
 8. Port the research probes into `tests/adversarial/` as permanent regression tests:
    T1, T3, T4, T6b, T7a, T7b, T7d, T7e, T8, plus `probe-cryptodoc`'s `ctx` replay
-   test, plus the six replay cases of OQ-3.
+   test, plus the six replay cases of OQ-3. This list is **subordinate to
+   `THREAT_MODEL.md` §5.5**, which maps all eleven of `SPEC_CS.md` §25's named
+   malicious peers to catalogue rows, test modules and asserted outcomes. §5.5 is the
+   one home for that map; the list here is the library-level subset of it.
 9. `deny.toml`: `multiple-versions = "warn"`; licence allow-list including
    `BlueOak-1.0.0`, `CC0-1.0`, `MIT-0`, `BSD-*`, `Unicode-3.0`, `Apache-2.0 WITH
    LLVM-exception`, and a clarification for `ark-std`'s `"MIT/Apache-2.0"`; the
@@ -1565,10 +1841,42 @@ getrandom-0.4.3/src/lib.rs, src/sys_rng.rs           fill(), SysRng
 
 ## 14. Cross-references
 
-| Document | What it must carry from here |
+| Document | Direction and content |
 |---|---|
-| `THREAT_MODEL.md` | §11's OQ list; the §11 "does not solve" list; the abort attack of §2.10 with its DoS trade from D-005; relay metadata exposure from D-001 |
-| `PROTOCOL.md` | the exact `ctx` construction (§6.4); the dealing map (§2.4); the signed envelope fields carrying proofs and tokens; the entitlement and street-gating rules (§2.7, §2.8); the timeout-certificate fields (D-006) |
-| `STATE_MACHINE.md` | the per-hand sequence of §2.9; the absent-seat states and abort path (D-005); deadlines as explicit state, never a wall-clock read inside the engine (D-006) |
-| `NETWORK_STACK.md` | the per-hand crypto byte budget of §6.5 against the 128 KiB / 2 min public-relay cap (D-001), and hand traffic never crossing the lobby topic |
+| `THREAT_MODEL.md` | **carries from here:** §11's OQ list; the §11 "does not solve" list; the abort attack of §2.10 with its DoS trade from D-005 and its unattributed heads-up form; relay metadata exposure from D-001; the §9.1/§9.2 supply-chain findings. **This document points at it for:** the §25 cheater-to-test map (`THREAT_MODEL.md` §5.5) and the deviation register (`THREAT_MODEL.md` §9.1), which own those two lists |
+| `PROTOCOL.md` | **owns, and this document reproduces:** the `ctx` construction (`PROTOCOL.md` §4.5, reproduced in §6.4); the dealing map (`PROTOCOL.md` §4.5, reproduced in §2.4); the domain-string register (`PROTOCOL.md` §2.8); the `DOMAIN_EVENT` signature prefix bytes (`PROTOCOL.md` §13). **Carries from here:** the signed envelope fields that must bind proofs and tokens; the entitlement and street-gating rules (§2.7, §2.8); the five-part `RNG_COMMIT` binding (§7.3); the `rand`/`SmallRng`/`StdRng` correction (§7.2) |
+| `STATE_MACHINE.md` | **carries from here:** the per-hand sequence of §2.9, including the collective form of `HAND_INIT` / `HAND_COMPLETE`; the absent-seat states and abort path (D-005), and its unattributed heads-up form (D-007); deadlines as explicit state, never a wall-clock read inside the engine (D-006) |
+| `NETWORK_STACK.md` | **carries from here:** the corrected per-circuit, per-direction byte budget of §6.5 — 8 979 B per hand per circuit per direction, against which the 128 KiB public-relay cap is comfortable and the **120 s duration limit is the binding one** (D-001) — and hand traffic never crossing the lobby topic. **This document points at it for:** the normative D-002 relay configuration (`NETWORK_STACK.md` §9.6) and the transport-side dependency register (`NETWORK_STACK.md` §5.1) |
+
+---
+
+## 15. Objections to the fix plan
+
+Recorded per the editing rule: the rulings of `docs/research/PHASE0_FIXPLAN.md` were
+applied as written, and where a ruling looks wrong it is noted here rather than
+silently deviated from. Two notes, both narrow.
+
+**1. A-1's "No other change" to this document is too narrow, and I went slightly
+beyond it.** A-1 instructs this document to add *"at `n >= 3`; heads-up the deadline is
+advisory (D-007)"* to §2.8 item 2 and §2.10, and to change nothing else. But §2.10's
+D-005 disposition — *"a signed record naming the peer that failed to publish; the absent
+player's committed chips are forfeited"* — is stated unconditionally, and under the
+plan's own §0.3 it is **false at `n = 2`**, where a `kind = 2` certificate carries
+`attributed = []` and produces no forfeiture. §11's "does not solve" list carried the
+same unconditional *"detected and attributed"*. Leaving either would have this document
+asserting exactly what A-3's edit to `THREAT_MODEL.md` X8 deletes. I therefore added the
+heads-up case to §2.10 and qualified §11's bullet, citing §0.3 and OQ-A. No claim was
+strengthened; two were weakened.
+
+**2. A-8's per-document instruction and A-8's own normative table disagree, and I
+followed the table.** The instruction says to keep the `n × (5547 + 3432)` figure and
+relabel it *"total per-hand outbound for one peer, spread over `n-1` circuits"*. The
+plan's normative table gives that same quantity as `(n-1) × 8 979 B` — 44 895 B at six
+seats, not 53 874 B. `n × 8 979` counts all `n` shufflers' objects and is the
+**table-wide** aggregate, which is precisely the figure whose comparison against a
+per-circuit cap produced the original error. Relabelling it as a per-peer figure would
+reintroduce the defect with a new name. §6.5 therefore carries the table verbatim and
+uses `(n-1) × 8 979 B` for a peer's own outbound and `8 979 B` per circuit per
+direction; the decomposition `5 547 + 3 432 = 8 979` is kept as the per-shuffler object
+size it actually is.
 ```

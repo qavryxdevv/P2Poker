@@ -717,11 +717,76 @@ play-money-first sequencing is right.
 
 ---
 
+---
+
+## D-008 — The timeout certificate is scoped on the voter set, not on the seat count
+
+**Date:** 2026-08-28
+**Status:** accepted
+**Corrects:** D-006, and generalises D-007
+**Source:** Phase 1 verification, finding N3 — a defect no review finding named
+
+### The hole
+
+D-007 said the certificate is unsafe at two seats and scoped the protections on
+`n == 2`. **That scoping is the bug.** The attack does not need a two-seat
+table; it needs a two-member *voter set*, and a modified client can manufacture
+one at any table size.
+
+The required voter set `V` was defined as the dealt-in seats, minus the
+subject, minus any seat excluded for being "named as the subject of an
+outstanding, older unmet deadline". Nothing bounded how many seats could be
+excluded, and a seat is *named* by any peer's unilateral vote — which the
+protocol itself concedes is unprovable when the voter lies.
+
+So at a six-seat table one modified client votes against four seats, then
+declares the fifth. `V` is now `{attacker}`. A certificate completes on that
+single signature, and under D-005 the victim's committed chips are forfeited to
+the remaining players — meaning to the attacker. Every protection was scoped on
+`n`, and `n` is still six, so nothing rejects it.
+
+This is worse than A-1, which it descends from: A-1 cost a folded hand at two
+seats, this takes chips at any size.
+
+### The decision
+
+1. **Every rule that weakens, disables or gates the certificate is scoped on
+   `|V|`, never on `n`.** Wherever a document says "at `n = 2`", it must say
+   "when `|V| < 2`". This single change is what closes the attack, because it
+   makes the protection follow the quantity the attacker can actually
+   manipulate.
+2. **A certificate with `|V| < 2` has no effect.** It is not an error and not
+   evidence; the deadline simply stays advisory, exactly as D-007 has it
+   heads-up. Liveness is not owed here — `SPEC_CS.md` section 19 already ranks
+   security above finishing a hand conveniently.
+3. **A seat may be excluded from `V` only once a *completed, valid* certificate
+   names it.** Being voted against is not exclusion. This makes shrinking `V`
+   inductive: each exclusion needs a certificate, each certificate needed
+   `|V| >= 2` at the time it formed, so `V` cannot be collapsed by assertion.
+4. The same scoping applies to the hand deadline, to `kind = 2` certificates
+   and to anything else the certificate machinery gates. A rule scoped on `n`
+   anywhere in the corpus is to be treated as a defect.
+
+### Why this is the right shape
+
+The attacker's lever was the gap between the *nominal* quorum, which looks
+large, and the *effective* quorum, which they can shrink. Scoping on `|V|`
+removes the gap by construction: whatever `V` ends up being, the floor applies
+to it. Requiring completed certificates for exclusion then stops `V` from being
+shrunk without paying the floor each time.
+
+Neither rule needs new cryptography, and both are checkable by a verifier
+replaying the transcript.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |
 |---|---|---|
 | — | Open-source licence for the project (MIT / Apache-2.0 / dual / GPL-3.0 / AGPL-3.0) | Nothing yet; needed before publication |
 | — | Relay admission: `identify` protocol name, or lobby presence (see D-002) | `NETWORK_STACK.md` |
+| — | A named, versioned reference engine, since four sections claim disputes are "deterministically adjudicable by any third party running the reference engine" and no such engine is defined (verify N2) | `PROTOCOL.md` |
+| — | `DISPUTE` is chained, unsequenced and legal at any time, so the two disputes an honest peer is *required* to emit are an equivocation proof against itself (verify N4) | `PROTOCOL.md` |
 | — | A dispute path that does not require the accused peer's signature (D-007 point 4, review A-1) | `PROTOCOL.md` |
 | — | Drop the libp2p `dns` and `kad` features and run all discovery through Mainline DHT, including relay volunteers under a second infohash? Removes both hickory advisories and ~12 crates from the build; costs access to the public relay commons, which thins D-004's floor. See `research/INTEGRATION.md` section 3. | Nothing yet |
