@@ -133,8 +133,102 @@ consenting setting, never silently on.
 
 ---
 
+## D-002 — A publicly reachable client volunteers as a relay
+
+**Date:** 2026-08-28
+**Decided by:** project owner
+**Status:** accepted
+**Depends on:** D-001
+
+### The decision
+
+A client that AutoNAT reports as publicly reachable runs the Circuit Relay v2
+**server** and relays other players' games over its own connection, with limits
+raised well above the defaults so a relayed connection can carry a whole
+session rather than only a hole-punch coordination.
+
+This is what makes CGNAT-to-CGNAT play possible at all without the project
+operating any infrastructure, since public IPFS relays cap a relayed connection
+at 2 minutes and 128 KiB (see the D-001 addendum).
+
+### Verified: the limits are ours to set
+
+`relay::Config` exposes every field publicly, and raising them from outside the
+crate compiles and runs. Verification: probe crate against `libp2p 0.56.0`
+with the `relay` feature, `cargo check` clean, binary run, printing
+
+```
+Config { max_reservations: 512, max_reservations_per_peer: 4,
+         reservation_duration: 3600s, reservation_rate_limiters: "[3 rate limiters]",
+         max_circuits: 16, max_circuits_per_peer: 4,
+         max_circuit_duration: 3600s, max_circuit_bytes: 1073741824, ... }
+```
+
+### The trap, and the way out
+
+**Circuit Relay v2 is not protocol-selective.** The hop and stop protocol names
+are compile-time constants in `libp2p-relay 0.21.1`:
+
+```rust
+pub const HOP_PROTOCOL_NAME: StreamProtocol =
+    StreamProtocol::new("/libp2p/circuit/relay/0.2.0/hop");
+```
+
+They cannot be renamed. Enabling the relay server therefore advertises the
+standard, network-wide relay protocol, and the `Behaviour` itself decides
+accept-or-deny purely on resource limits and rate limiters — it has no
+application ACL hook. Verification: `src/behaviour.rs`, the
+`handler::Event::ReservationReqReceived` arm, read in full. Left alone, we
+would be running an **open relay for the entire libp2p world**, IPFS traffic
+included, on the user's line. That is not what was agreed to.
+
+**The usable hook is `Config::reservation_rate_limiters` and
+`Config::circuit_src_rate_limiters`.** Their element type sits in a
+`pub(crate)` module and so cannot be named from outside, but the crate carries
+a blanket implementation
+
+```rust
+impl<T: FnMut(PeerId, &Multiaddr, Instant) -> bool + Send> RateLimiter for T
+```
+
+so a closure coerces into the vector without ever naming the trait. Verified by
+compiling exactly that: the probe pushed a per-`PeerId` closure and the printed
+config shows three reservation limiters instead of the default two. Note the
+third parameter is `web_time::Instant`, so a `web-time = "1"` dependency is
+needed to write the closure's signature.
+
+That closure is our admission control: it sees the `PeerId` and the
+`Multiaddr` of whoever asks, and returns false for anyone who is not one of
+ours. Both vectors must be gated — one governs who may reserve a slot to become
+reachable through us, the other who may open a circuit through us.
+
+### Required behaviour
+
+1. Relaying is **off by default** and turned on by an explicit, visible setting.
+   The first run must disclose plainly what it means: strangers' poker traffic
+   crossing the user's connection, at the user's bandwidth cost.
+2. When on, the relay serves **only our own network**. The admission closure
+   admits a peer only once it is known to be a poker peer — identified by our
+   protocol name through `identify`, or already seen in the lobby. Unknown
+   peers are refused. Without this the client is an open relay.
+3. Bandwidth and slot ceilings are user-visible and user-settable, and the
+   network status panel shows how many peers are currently being relayed.
+4. The relay never sees plaintext and never becomes an authority — the
+   constraints of D-001 all continue to apply.
+
+### Open question
+
+Whether a peer that has never been seen before, and is behind CGNAT, can obtain
+a reservation at all. Admission by `identify` protocol name lets a stranger in
+as long as they run our client, which is the point; admission by lobby presence
+is stricter but keeps a brand-new client out. `NETWORK_STACK.md` must settle
+this and state the trade-off.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |
 |---|---|---|
 | — | Open-source licence for the project (MIT / Apache-2.0 / dual / GPL-3.0 / AGPL-3.0) | Nothing yet; needed before publication |
+| — | Relay admission: `identify` protocol name, or lobby presence (see D-002) | `NETWORK_STACK.md` |
