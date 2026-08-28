@@ -762,7 +762,7 @@ in seven passes asked what removes a seat from an `R`.
 | `TIMEOUT_CERT` | `V(subject)`, inductive over completed certificates | unchanged — clean, and clean because D-008 already fixed the version that was not |
 | `STATE_HASH`, `STATE_ACK` | "all present seats" | **changed** — `P(k-1)`, `P(0)` at checkpoint 1, and **`P(k)` at checkpoint 8** (§4.9). Checkpoint 8's is the one `R` in the document that is not `P(k-1)` or a subset of it, and it is the one stage whose *accepted* set is wider than its *required* set: an out-of-set `STATE_HASH` there is compared rather than rejected, which is `L3`'s disposition and is what stops two peers whose `P` has forked from never colliding |
 | the **reconciliation round** of §6.3 step 3 | the re-derived checkpoint's own set | **changed in this pass — `N1`** — `R(c) ∪ W`, where `W` is this receiver's contradiction set. **The one required emitter set in this document with a per-receiver component**, and the paragraph below is why it is admissible; it is also the one with a **floor**, `|R| >= 2`, which is the point of it |
-| `HAND_INIT`, when §4.9's readmission set is non-empty | — | **new in this pass — `N5`** — `P(m) ∪ A`. `A` holds the senders of a stale `PLAYER_SIT_IN`, or of a stale checkpoint-8 `STATE_HASH` that agreed, admitted after this receiver closed the window they name; read once at hand init and cleared |
+| `HAND_INIT`, when §4.9's readmission set is non-empty | — | **unchanged, and that is `P2`'s disposition** — `R` stays `P(m)`. The set `A` — the senders of a stale `PLAYER_SIT_IN`, or of a stale checkpoint-8 `STATE_HASH` that agreed — widens this stage's **accepted** emitter set to `P(m) ∪ A` and never its required one. `N5` put the union in `R`, where a replayed agreeing copy re-enlarged it once per hand for 4 096 hands and stalled stage 0 each time; a required set is now enlarged only by a seat's own accepted copy of a **chain-`m+1`** event, which no replay can forge (§4.9, §4.4) |
 | `HAND_ABORT` | none — witness-independent terminal | unchanged |
 
 **Four sets changed on the status-word finding, and every one of them was defined
@@ -1190,15 +1190,23 @@ the table.
 >    It is the one required emitter set in this document with a **floor**, and the
 >    floor is why it exists: a stage whose purpose is to detect a fork may not have
 >    a set the forked peer can satisfy alone (§4.9, `N1`);
-> 3. **`HAND_INIT(m+1)`, whose `R` is `P(m) ∪ A`** when §4.9's readmission set is
->    non-empty — a seat that signed a `PLAYER_SIT_IN`, or a checkpoint-8
->    `STATE_HASH` that agreed, into a window this receiver had already closed
->    (`N5`). `A` is read once and cleared there.
+> **There is no third, and there was one until this pass.** `N5` made
+> `HAND_INIT(m+1)`'s `R` be `P(m) ∪ A`, with `A` §4.9's readmission set. `P2`
+> deletes that enlargement: `A` widens that stage's **accepted** emitter set and
+> never its required one, so the list of exceptions to *"`R` is `P(k-1)` or a
+> subset of it"* is two long and not three. The reason is in §4.9 and reduces to
+> one sentence — **`A` is written from a stale event, §4.0 step 10a is skipped for
+> stale events, so a replay writes it again, and a required emitter set that grows
+> from a replayable input is a stall an attacker can renew once per hand.**
 >
-> **All three only ever add seats**, which is why none of them weakens the
-> liveness gate this box is about: a larger `R` waits for more, never for less,
-> and a disagreement about who is in it stalls stage 0 loudly rather than
-> completing a stage quietly.
+> **Both remaining exceptions only ever add seats**, which is why neither weakens
+> the liveness gate this box is about: a larger `R` waits for more, never for
+> less, and a disagreement about who is in it stalls stage 0 loudly rather than
+> completing a stage quietly. **Both are also written from an event bound to the
+> chain whose set they enlarge** — a chain-`k` signature for the boundary
+> checkpoint, this receiver's own accepted contradictions for a reconciliation
+> round — which is the property `A` did not have and the one a future editor must
+> re-check before adding a fourth.
 >
 > **A peer's own emission counts into its own `P`, and this is stated because it
 > was not (K1).** "Accepted by this receiver" includes the events this receiver
@@ -1487,9 +1495,10 @@ A status field could not do the job, and the circularity is the whole reason: a
 seat's status changes only
 through a chained event (D-012), a silent seat emits none, so nothing can ever
 change its status and a set defined on it contains that seat **forever**. D-013
-records what that cost — stage stalls, hand deadline at 600 000 ms, every stack
+records what that cost — stage stalls, the hand deadline expires, every stack
 restored by §4.10, next hand byte-identical, nothing ever busts, no end condition
-can fire. Ten minutes per iteration, unbounded. **A required emitter set defined
+can fire. One `hand_deadline_ms` per iteration — since `P3` a figure that scales
+with the seat count and is 38 minutes at ten seats, not ten — unbounded. **A required emitter set defined
 on a seat's status is a defect in this document**, §2.9 is the sweep that says
 there are none left, and §4.11's *Emitter* column is where a new one would be
 visible.
@@ -1509,9 +1518,14 @@ by **signing a chained event** — a `PLAYER_SIT_IN` at a hand boundary, whose
 legality condition §4.10 widens for exactly this, or a checkpoint-8 `STATE_HASH`
 that agrees with this receiver's — which places it in `P` and therefore back in
 every `R` of the following hand. **If the event arrives after this receiver has
-closed the window it names, it is not lost: §4.9's readmission set carries its
-sender into the next hand init this receiver runs** (`N5`), which is what keeps
-the promise honest at a peer that is draining, where every window is zero-width.
+closed the window it names, it is not lost: §4.9's readmission set makes its
+sender an accepted emitter of the next hand init this receiver runs** (`N5`,
+`P2`), so its own copy of that `HAND_INIT` places it in `P` and in every `R` from
+the hand after — which is what keeps the promise honest at a peer that is
+draining, where every window is zero-width. The readmission costs one hand of
+latency and buys the property `P2` needed: **the set a returning seat re-enters is
+grown by that seat's own current-chain signature and never by a replay of an old
+one.**
 Signing requires it to be alive, which is the entire test. **No certificate, no vote, no quorum, no proof
 and no attribution appear anywhere on this path, and none may be added**: this is
 deliberately not the machinery of D-006 to D-008, which D-010 made inert and OQ-F
@@ -1820,7 +1834,7 @@ before the signature so two encodings of one event cannot both be accepted.
 | 9 | `verify_strict(sender_public_key, TO_BE_SIGNED, signature)` | **protocol violation**, attributable |
 | 10 | `chain_scope` matches the `event_type`'s entry in §4.11, and if `chain_scope == 0` the envelope carries the sentinels of §2.3 exactly | drop |
 | 10a | Anti-replay: for a chained event, look up **`slot(E)` exactly as §5.2.1 defines it** — this step reproduces no part of that tuple and reads it whole; for an unchained event, the per-type rule in §5.2.1's box. **For a chained event whose `hand_id` names a hand this receiver has completed, this step is *skipped* and step 10b is the whole of its anti-replay rule — normative, and this is the disposition of `N2`.** §5.3's `event_class == 0` store is one map per table per hand and is dropped when the hand ends, so there is no slot to look such an event up in and **none is created**: no `hand_id` a sender chooses causes an allocation of any kind, here or anywhere in the pipeline. **One exception, and it is the only structure that outlives its hand:** the checkpoint-8 `STATE_ACK` band of §4.9, whose slots §5.3 retains until `TERMINAL(k+1)`; an event landing there is looked up here exactly as a live one is. Skipping the step gives up nothing a stale event could use, because step 10b applies none of them, enters none in a `stage_hash` and counts none into a `P` of an initialised hand — so there is no effect for a duplicate to repeat. §5.3 states the bound and the one capability the skip does give up | violation or duplicate-drop |
-| 10b | **Stale hand — normative, and this is the disposition of `L4`.** If the envelope's `hand_id` names a hand this receiver has **completed**, a chained event is *not* dropped for arriving late. Step 10a has been skipped for it (above) and this step is its whole anti-replay rule. It is evaluated against that hand's **retained record** (§5.3): if the record says this receiver **was** in the solitary regime for that hand (§3.2, past tense) and `sender_seat` is outside the recorded **`P(hand_id - 1)`** — the required emitter set *of the hand the event names*, never `P(hand_id)`; §3.2's rule and step 12 both say `P(k-1)` and this step now says the same thing, which is `N7` — and the type is neither of the two exempt cases, it routes to step 12a; if it is a checkpoint-8 `STATE_HASH` (§4.9) it is compared against the retained `checkpoint8_state_hash`, and a **mismatch** enters §6.3 at step 1 and, where the record says the hand was solitary, routes to step 12a with it (`N1`), while a **match** from a seat outside the recorded set adds its sender to §4.9's readmission set, as a `0x0804 PLAYER_SIT_IN` of that hand's boundary window does (`N5`); otherwise it is dropped as out of stage, exactly as before. It is **never applied**, never enters a `stage_hash`, **counts into no `P` of a hand this receiver has already initialised** — §4.9's readmission set is read once, at the next hand init, and is the entire exception — and never reaches step 13 | freeze, compare, readmit, or drop |
+| 10b | **Stale hand — normative, and this is the disposition of `L4`.** If the envelope's `hand_id` names a hand this receiver has **completed**, a chained event is *not* dropped for arriving late. Step 10a has been skipped for it (above) and this step is its whole anti-replay rule. It is evaluated against that hand's **retained record** (§5.3): if the record says this receiver **was** in the solitary regime for that hand (§3.2, past tense) and `sender_seat` is outside the recorded **`P(hand_id - 1)`** — the required emitter set *of the hand the event names*, never `P(hand_id)`; §3.2's rule and step 12 both say `P(k-1)` and this step now says the same thing, which is `N7` — and the type is neither of the two exempt cases, it routes to step 12a; if it is a checkpoint-8 `STATE_HASH` (§4.9) it is compared against the retained `checkpoint8_state_hash`, and a **mismatch** enters §6.3 at step 1 and, where the record says the hand was solitary, routes to step 12a with it (`N1`), while a **match** from a seat outside the recorded set adds its sender to §4.9's readmission set, as a `0x0804 PLAYER_SIT_IN` of that hand's boundary window does (`N5`); otherwise it is dropped as out of stage, exactly as before. It is **never applied**, never enters a `stage_hash`, **counts into no `P` of a hand this receiver has already initialised**, and **enlarges no required emitter set of any hand — `P2`**: §4.9's readmission set is read once, at the next hand init, where it widens that stage's *accepted* emitter set and not its required one, which is the entire exception and is the reason a replay of this event is inert. It never reaches step 13 | freeze, compare, readmit, or drop |
 | 11 | Decode the payload struct, canonicality gate, per-field range checks | violation |
 | 12 | Stage legality: is this `event_type` from this seat expected at this `sequence`? **And the stage-contribution rule: a seat that has already contributed to a stage may not contribute to it again under a different `event_type`** — the one exception is the terminal `HAND_ABORT` of §4.10, which by construction lands at a stage its emitter has usually already contributed to, and which is also one of the two events exempt from step 10a's chain-position rule (§4.10; the other is a boundary event, whose parent is `TERMINAL(k)`). **And the solitary-stage rule (§3.2): if this receiver was in the solitary regime for the hand this event names and the sender is outside `P(k-1)`, the event is a state divergence and not a rejection — see step 12a.** And **an out-of-set checkpoint-8 `STATE_HASH` is not an out-of-stage event**: §4.9's box widens the accepted set at that one stage and this step must not reject it | violation |
 | 12a | **Solitary-regime divergence (§3.2, K1).** Reached when step 12 says so, **and when step 10b says so for a hand already finished** — the second route is what makes the rule able to fire at all (`L4`). The event is *not* rejected, *not* applied, and *not* counted into any `P`: the receiver enters §6.3 step 1 and freezes, and the freeze is **latched** — released by §6.3 step 3's reconciliation stage alone, which §4.9 requires of at least two seats, and by nothing else. **Two cases are exempt from reaching this step on arrival** and fall through to ordinary handling: `0x0804 PLAYER_SIT_IN` (§4.10), the one message a seat outside `P` exists to be able to send, and a **checkpoint-8 `STATE_HASH`** (§4.9), which is compared instead. **The second exemption is from arrival and not from disagreement (`N1`):** a checkpoint-8 `STATE_HASH` whose value differs from this receiver's own, on a hand the retained record says was solitary, reaches this step with the same finding and the same latch (§4.9, §6.3 step 1) | **freeze; §6.3** |
@@ -1878,6 +1892,22 @@ chains nothing and grows no initialised hand's `P`, and each of its four
 dispositions is idempotent — a freeze already held is not re-entered, a latch
 already set is not re-set, a seat already in the readmission set is already in it,
 and a drop is a drop — so a repeat costs a map lookup and changes nothing.
+
+**That third clause was false for one pass and its repair is `P2`, recorded here
+because this paragraph is where the claim is made.** *"A seat already in the
+readmission set is already in it"* is a statement about the set, and the set is
+**cleared at every hand init** (§4.9). Idempotence of the write does not survive a
+consumer that empties the container between writes: while `A` enlarged
+`R(HAND_INIT(m+1))`, one replayed, perfectly **agreeing** checkpoint-8
+`STATE_HASH` re-enlarged that required set once per hand, for every hand of the
+4 096 §5.3 retains a record for, and stage 0 stalled to the full hand deadline
+each time with `cause = 1` and `attributed = []`. **No key and no forgery were
+needed**, only a signed event the accused really emitted and §1.5's permission to
+forward it. §4.9 now has `A` widen the stage's *accepted* set instead, which is a
+disposition that genuinely repeats to no effect, and the clause is true as
+written. **The shape is the one the last gate named**: this step deleted a guard
+and §4.9 added a disposition behind it, in the same pass, and each half was right
+about itself. Re-read this list after any edit to §4.9's box, not before it.
 **Equivocation detection at a finished hand is given up, and it was already
 gone**: §5.3 keeps only `TERMINAL(k)`, the terminal body and the retained record
 after a hand ends, so the *other* copy the predicate would pair this one with is
@@ -1932,10 +1962,22 @@ cheating and it never keys on `attributed`. Block-listing an identity is a
 > failed verification — with exactly one exception, D-014 tier 1, stated below.**
 > That includes the transport layer: an `EquivocationProof`, an invalid signature
 > and a failed shuffle proof are each evidence, and none of them is an input to
-> any peer-**blocking** decision anywhere. `NETWORK_STACK.md` §6.6 and §11.5 assert
-> the opposite today and are wrong; a block list may be present and compiled in,
-> but its only trigger is the **user**. §9.5's volume-keyed ladder is untouched by
-> this and is the whole of what remains automatic.
+> any peer-**blocking** decision anywhere. A block list may be present and
+> compiled in, but its only trigger is the **user**. §9.5's volume-keyed ladder is
+> untouched by this and is the whole of what remains automatic.
+>
+> **The sentence deleted from this box named `NETWORK_STACK.md` §6.6 and §11.5 as
+> asserting the opposite. They no longer do, and had stopped before this pass**:
+> §6.6 now says *"a proven protocol violation produces no transport action at
+> all"* and §11.5.1 forbids the `block_peer` path in a box of its own. A normative
+> box that accuses a compliant document of non-compliance sends the next reader to
+> re-fix something already fixed, and is the same class of defect as `N8` — a
+> citation that outran its source, pointing the other way. **What `NETWORK_STACK.md`
+> does still owe is the *exception*, not the rule**: it carries **zero**
+> occurrences of `D-014`, and its §0.1 and §1.2 prohibition 7 state the
+> no-unseating rule in the corpus-wide, every-layer form that D-014 tier 1
+> narrows. That is filed in `DECISIONS.md`'s open list, with line numbers, as
+> `P5`; it is not edited from here (D-011 rule 1).
 >
 > **The exception, exactly, and it is narrow.** D-014 narrowed D-010 point 3 and
 > narrowed nothing else. A **tier-1** finding — an event **signed by the accused**
@@ -2423,19 +2465,34 @@ still be a dead, empty seat under the TDA dead-button rule. [RULES A1.3])
 **The required emitter set, normatively. This is §3.2's rule instantiated, it is
 the disposition of J2, and the clause it replaces is deleted (D-013):**
 
-> **`R(HAND_INIT, k) = P(k-1) ∪ A` — the seats that signed at least one chained
-> event this receiver accepted between `GENESIS(k-1)` and `GENESIS(k)`, together
-> with §4.9's readmission set. For `k = 1`, `P(0)` is the set of seats that signed
-> `TABLE_READY`.**
+> **`R(HAND_INIT, k) = P(k-1)` — the seats that signed at least one chained
+> event this receiver accepted between `GENESIS(k-1)` and `GENESIS(k)`. For
+> `k = 1`, `P(0)` is the set of seats that signed `TABLE_READY`. §4.9's
+> readmission set `A` does not appear in it and this is `P2`'s disposition.**
 >
-> **`A` is empty except after a missed window and it is cleared here.** It holds
-> the sender of a `0x0804 PLAYER_SIT_IN`, or of a checkpoint-8 `STATE_HASH` that
-> **agreed** with this receiver's own value, that arrived naming a window this
-> receiver had already closed (§4.9, §4.0 step 10b, `N5`). It is read at this one
-> place, cleared here, and read nowhere else; on a table where every event lands
-> inside its window — which is every healthy table — `R(HAND_INIT, k)` is `P(k-1)`
-> exactly as before. `dealt_in ⊆ R(HAND_INIT, k)` is unchanged in form and picks
-> the union up with it.
+> **`A` widens the *accepted* emitter set of this one stage and nothing else.**
+> It holds the sender of a `0x0804 PLAYER_SIT_IN`, or of a checkpoint-8
+> `STATE_HASH` that **agreed** with this receiver's own value, that arrived naming
+> a window this receiver had already closed (§4.9, §4.0 step 10b, `N5`). It is
+> read at this one place, cleared here, and read nowhere else. A `HAND_INIT(k)`
+> copy from a seat in `A` is accepted rather than rejected at §4.0 step 12, enters
+> `P(k)` under §3.2, and **neither completes nor blocks the stage** — completion
+> is `heard ⊇ P(k-1)`, which `A` does not move. On a table where every event lands
+> inside its window — which is every healthy table — `A` is empty and nothing here
+> is reachable at all.
+>
+> **`R` is never enlarged by an event of a hand this receiver has finished, and
+> that is the rule `P2` installs.** §4.0 step 10a is skipped for such an event, so
+> a replay of one is not suppressed; a rule that let a replayed, *agreeing*
+> checkpoint-8 `STATE_HASH` grow this set grew it once per hand, for the 4 096
+> hands §5.3 retains a record for, and stalled stage 0 to the hand deadline each
+> time. The only thing that grows a required emitter set is now a seat's own
+> accepted copy of a **chain-`k`** event, which no replay of an older chain can
+> forge (§2.4). §4.9's box carries the argument in full.
+>
+> `dealt_in ⊆ R(HAND_INIT, k)` is unchanged in form and now genuinely follows the
+> required set, so a seat readmitted through `A` is dealt in at hand `k+1` rather
+> than at hand `k` — one hand of latency, which §4.9 states as the cost.
 
 The deleted clause read *"every seat that will be `dealt_in`, plus every occupied
 seat that is absent or sitting out and therefore posts dead money"*. It defined the
@@ -2444,7 +2501,7 @@ from it**: `dealt_in = false` did not, `SittingOut` did not, and `Absent` — th
 status this corpus spent two passes arguing about — was named in the *inclusion*
 clause. Since a status changes only through a chained event (D-012) and a silent
 seat emits none, a silent seat was a required emitter forever, and the fixed point
-D-013 derives is the whole table: stage stalls, hand deadline at 600 000 ms, every
+D-013 derives is the whole table: stage stalls, the hand deadline expires, every
 stack restored by §4.10, next hand identical, nothing ever busts, so no end
 condition can fire either. **The table makes no progress, ever.** What replaces it
 costs one hand of stall rather than an unbounded sequence of them.
@@ -3286,16 +3343,73 @@ reason.
 > is always from a seat already in `P(k)`, it **grows no set**, it changes no
 > body, and the only thing that reads the stage is a completion test.
 >
-> **Deferred readmission — normative, and this is `N5`.** A stale chained event of
+> **Deferred readmission — normative, `N5`, and it widens the *accepted* set and
+> never the *required* one (`P2`).** A stale chained event of
 > a finished hand `k` that is either a `0x0804 PLAYER_SIT_IN` in chain `k`'s
 > boundary window (§4.10) or a checkpoint-8 `STATE_HASH` of chain `k` **whose
 > value equals this receiver's retained `checkpoint8_state_hash(k)`** adds its
 > sender to a **readmission set `A`**, and does nothing else: it is not applied,
 > it enters no `stage_hash`, it completes no stage, and it counts into no `P` of a
 > hand this receiver has already initialised. `A` is read at exactly one place —
-> the next hand init this receiver runs, where the required emitter set of hand
-> `m+1` is `P(m) ∪ A` — and is cleared there. `|A| <= MAX_SEATS`; it is one seat
-> set, it is read once, and it is the whole mechanism.
+> the next hand init this receiver runs — and is cleared there. What it does
+> there is **one thing and it is not what this box said until this pass**:
+>
+> > **`R(HAND_INIT, m+1)` is `P(m)`, unchanged and unenlarged. `A` widens the
+> > *accepted emitter* set of that one stage to `P(m) ∪ A`.** A
+> > `HAND_INIT(m+1)` copy from a seat in `A` is **accepted, retained and counted
+> > into `P(m+1)` under §3.2** — §4.0 step 12 must not reject it — and it
+> > **cannot complete the stage and cannot block it**, because completion is
+> > `heard ⊇ P(m)` and nothing else. It is accepted until `TERMINAL(m+1)` is
+> > fixed at this receiver, exactly as `N6` retains the checkpoint-8 `STATE_ACK`
+> > band and for the same reason: the copy and the completion race each other
+> > through the forwarding of §1.5 and neither order is a fault.
+>
+> `|A| <= MAX_SEATS`; it is one seat set, it is read once, and it is the whole
+> mechanism.
+>
+> **Why the required set is the wrong place to put it, and this is `P2`.** `A` is
+> written by §4.0 step 10b, which runs on a **stale** event — one naming a hand
+> this receiver has finished — and step 10a's anti-replay is *skipped* for exactly
+> those events (`N2`). So one signed, perfectly **agreeing** checkpoint-8
+> `STATE_HASH`, replayed by anybody, entered `A` again on every replay; `A` is
+> cleared at every hand init; and a set that is cleared once per hand and refilled
+> once per hand is not idempotent however idempotent each individual write is.
+> Under the deleted rule that re-enlarged `R(HAND_INIT(m+1))` by a seat that is not
+> there, **once per hand, at every receiver, for as long as §5.3 retains the
+> record of hand `k`** — `MAX_RETAINED_HAND_RECORDS = 4 096` hands — and stage 0
+> then stalled to the full hand deadline every time, with `cause = 1` and
+> `attributed = []`. **No key is needed**: the event is one the accused seat
+> genuinely signed, it agrees with this receiver's own value, and forwarding it is
+> a thing §1.5 permits any peer to do.
+>
+> **What closes it is the signature, not a counter.** Under the rule above the
+> only thing that can enlarge a required emitter set is a seat's **own accepted
+> copy of `HAND_INIT(m+1)`**, whose `hand_id`, `sequence` and
+> `previous_event_hash` are inside `TO_BE_SIGNED` (§2.4) and are bound to chain
+> `m+1`. **No replay of any chain-`k` event can produce one**, so the amplifier
+> has no input: replaying the stale copy now re-opens an acceptance that costs a
+> map lookup and completes nothing, which is precisely the idempotence §4.0's
+> skip argument claimed and, until this pass, did not have. It also restores that
+> argument's own sentence to truth — *"a seat already in the readmission set is
+> already in it"* — because entering `A` no longer has an effect that repeats.
+>
+> **What it costs, stated rather than glossed.** A seat readmitted by this route
+> is **not `dealt_in` for hand `m+1`** — `dealt_in ⊆ R(HAND_INIT, m+1) = P(m)`
+> (§4.4) — and becomes a required emitter, and dealable, at hand `m+2`, one hand
+> later than the deleted rule promised. D-013's readmission promise is kept and
+> the latency is one hand: what that promise owes is *a moment at which a
+> returning seat can be heard*, and being accepted into `P(m+1)` is that moment.
+> §4.10's *"a seat rejoins by signing a chained event … that is the entire test"*
+> is satisfied literally rather than by a set this receiver enlarges on the
+> seat's behalf.
+>
+> **And the race it does not enlarge.** Two peers can still disagree about
+> `P(m+1)`, one having accepted the returning seat's copy and the other not, and
+> hand `m+2`'s stage 0 then stalls — the same disagreement, on the same path, that
+> the paragraph below already routes and bounds. What has changed is the entry
+> condition: it now requires the returning seat to have actually signed into
+> chain `m+1`, so the stall costs one hand for a seat that is really there,
+> instead of one hand per hand for a seat that is not.
 >
 > **Why it is needed and why it is safe.** Without it, D-013's readmission promise
 > is void in the regime D-013 itself created. Every window in this document closes
@@ -3304,10 +3418,16 @@ reason.
 > seat that comes back can never be heard by the peer that is draining it —
 > §4.10's *"a seat rejoins by signing a chained event … that is the entire test"*
 > would be a test with no moment at which it can be taken. It is safe because the
-> set can only **grow** a required emitter set, at a stage-0 boundary, where a
-> disagreement between two peers about who is in it is already routed onto a
-> **stalled stage 0** by §4.10's box and by this one — loud, disposed of by §8, and
-> held back from becoming a silent fork by §3.2's solitary-stage rule. And because
+> set can only **grow an *accepted* emitter set**, at a stage-0 boundary, and an
+> extra accepted copy neither completes a stage nor blocks one. **The argument
+> that stood here was that it can only grow a *required* set, and that argument
+> was the defect (`P2`)** — growth is monotone within one hand but the set is
+> cleared at every hand init, so a replayable write into it is a stall renewable
+> once per hand. What survives is the routing: a disagreement between two peers
+> about who is in `P` is still resolved onto a **stalled stage 0** by §4.10's box
+> and by this one — loud, disposed of by §8, and held back from becoming a silent
+> fork by §3.2's solitary-stage rule — one hand later and only for a seat that
+> really signed. And because
 > agreement at checkpoint 8 is agreement about the participation set itself
 > (§6.1's `signed_this_hand`), a seat readmitted by the second route has signed
 > this receiver's own account of who was playing. **`A` does not thaw a freeze:**
@@ -3342,8 +3462,10 @@ condition above is what bounds the window in which that race can happen, and it 
 the same condition as the boundary window's, deliberately, so an implementer has
 one rule to write and not two. **A copy that arrives after the close does not
 disappear and does not enlarge that race:** if it agrees it goes to the
-readmission set and takes effect one hand later, at the next hand init, where the
-same stall disposes of the same disagreement; if it differs it is a divergence.
+readmission set and takes effect one hand later, as an **acceptance** at the next
+hand init and never as an enlargement of its required set (`P2`), and the same
+stall disposes of the same disagreement one hand further on; if it differs it is a
+divergence.
 Neither reaches a hand this receiver has already initialised, which is the one
 thing the close was protecting.
 
@@ -4028,9 +4150,10 @@ self-completes. Read strictly with §4.0 step 10b's *"counts into no `P`"*, a se
 could therefore never rejoin the one peer that most needs to hear from it: the
 peer that is draining it. §4.9's **readmission set** is the disposition: a stale
 `PLAYER_SIT_IN` of chain `k`'s boundary window, and a stale checkpoint-8
-`STATE_HASH` of chain `k` that **agrees** with this receiver's own value, carry
-their sender into the next hand init this receiver runs and do nothing else at
-all. The test is still *signing a chained event*, still requires being alive, and
+`STATE_HASH` of chain `k` that **agrees** with this receiver's own value, make
+their sender an **accepted** emitter of the next hand init this receiver runs and
+do nothing else at all — never a required one, which is `P2`. The test is still
+*signing a chained event*, still requires being alive, and
 still admits no certificate, vote, quorum, proof or third party; what changed is
 that missing a window is no longer permanent.
 
@@ -4098,7 +4221,7 @@ means it does not and never can be.
 | `0x0205` | `TABLE_READY` | table mesh | 1 | collective | every seat of the `PLAYER_LIST` roster; its signers **are** `P(0)` |
 | `0x0301` | `RNG_COMMIT` | table mesh | 1 | collective | `P(0)` — the `TABLE_READY` signers |
 | `0x0302` | `RNG_REVEAL` | table mesh | 1 | collective | `P(0)` — the `TABLE_READY` signers |
-| `0x0303` | `HAND_INIT` | table mesh | 1 | collective | `P(k-1)`, enlarged by §4.9's readmission set `A` when it is non-empty — §3.2, §4.4 |
+| `0x0303` | `HAND_INIT` | table mesh | 1 | collective | `P(k-1)` — §3.2, §4.4. §4.9's readmission set `A` widens the **accepted** emitter set to `P(k-1) ∪ A` and leaves the required set alone (`P2`); it is the second stage in the document whose accepted set is wider than its required one, the first being checkpoint 8 |
 | `0x0304` | `DECK_INIT` | table mesh | 1 | collective | dealt-in seats |
 | `0x0305` | `SHUFFLE_STEP` | table mesh | 1 | single | shuffler `j` |
 | `0x0306` | `SHUFFLE_PROOF` | table mesh | 1 | single | shuffler `j` |
@@ -4720,10 +4843,17 @@ structures*, not by a component of any one index. The separation is the axis.
   this section's occupancy is 80 entries and a constant, against 40 960. Nothing
   else of a finished hand's store is retained, and an event arriving at any other
   `sequence` of a finished chain takes the skip above.
-* **The readmission set `A` (§4.9, `N5`).** One `SeatSet`, `|A| <= MAX_SEATS`,
-  written by §4.0 step 10b and read and cleared at the next hand init. It is not
-  indexed by anything, holds no event and no hash, and is the smallest structure
-  in this section.
+* **The readmission set `A` (§4.9, `N5`, `P2`).** One `SeatSet`,
+  `|A| <= MAX_SEATS`, written by §4.0 step 10b and read and cleared at the next
+  hand init, where it widens that stage's **accepted** emitter set and not its
+  required one. It is not indexed by anything, holds no event and no hash, and is
+  the smallest structure in this section. **Its write is reachable by replay and
+  that is why its read may not enlarge a required set**: step 10a is skipped for
+  the stale events that write it (`N2`), so nothing suppresses a second copy, and
+  this section's LRU is exactly what keeps such a copy effective — a retained
+  record is what makes a stale event evaluable, so the replay window and the
+  retention window are the same 4 096 hands. Under the deleted rule that was
+  4 096 stalled hands from one forwarded, agreeing event.
 * **The retained hand record — normative, and this is the memory half of `L4`.**
   For each finished hand, this receiver keeps four quantities and nothing else:
 
@@ -4933,7 +5063,8 @@ under the words *"at these points and no others"*, which made a conforming
 receiver reject the one checkpoint `STATE_MACHINE.md` §5.2 requires of every hand,
 and the cost of that rejection was not "a missing comparison": T47's settled-path
 gate never discharges, so **T61 fires at `hand_deadline_ms` after every settled
-hand** — `600 000 ms` every two hands on a table where nothing is wrong, which is
+hand** — one whole `hand_deadline_ms` every two hands on a table where nothing is
+wrong, and since `P3` that figure scales with the seat count, which is
 D-013's own fixed point re-created by the fix for the defect D-013's fixed point
 left behind. Checkpoints `2`–`7` all need a `DECK_COMMIT` or a betting round, so
 **two hand shapes place none of them**: a drain hand, which `STATE_MACHINE.md`
@@ -5414,7 +5545,7 @@ unambiguous before the first card exists.
 | `n(14) action_timeout_ms` | `u32` | `5_000 ≤ … ≤ 300_000` [RULES B3] |
 | `n(15) action_grace_ms` | `u32` | `≤ 30_000` |
 | `n(16) crypto_step_timeout_ms` | `u32` | `1_000 ≤ … ≤ 120_000` |
-| `n(17) hand_deadline_ms` | `u32` | `≤ 3_600_000` |
+| `n(17) hand_deadline_ms` | `u32` | `HAND_DEADLINE_FLOOR(n(11)) ≤ … ≤ 3_600_000` — the lower bound is **new in this pass and is `P3`**; it is a function of `n(11)`, `n(14)`, `n(15)`, `n(16)` and `n(19)`, it is derived in §8.2, and an advert below it is rejected by rule 2a below. A single figure here made legal play at six seats and up abort itself |
 | `n(18) join_deadline_ms` | `u32` | `≤ 3_600_000` |
 | `n(19) hand_delay_ms` | `u32` | `≤ 60_000` |
 | `n(20) button_rule` | `u16` | `1` = `DEAD_BUTTON` (only value in version 1) |
@@ -5443,6 +5574,17 @@ available evidence of what "the rated preset" means. [RULES B1, B2, B4]
 2. every numeric range above, including `big_blind == 2 * small_blind`,
    `min_buyin ≤ max_buyin`, `2 ≤ max_players ≤ 10`,
    `min_players_to_start ≤ max_players`;
+2a. **the whole-hand deadline floor of §8.2 — `P3`, and it is the one range check
+   in this list that is a *derived* bound rather than a literal.**
+   `n(17) hand_deadline_ms >= HAND_DEADLINE_FLOOR(n(11))`, computed from this
+   advert's own `n(11)`, `n(14)`, `n(15)`, `n(16)` and `n(19)`. Below it, **every
+   legal hand at this table aborts on its own deadline** with `cause = 1` and
+   `attributed = []` — no progress, nobody named — so the advert is rejected here
+   and the seat is never taken. The check belongs to the joiner because the value
+   is the **founder's**, signed into `table_params_hash`; a founder who wants a
+   table where nothing can ever be won needs no attack, only a small number. A
+   client that joins anyway and applies its own floor locally has made two peers
+   disagree about whether a hand aborted, which §8.2 classes as a consensus fault;
 3. `preset_id == "RATED_SNG_POKERTH_V1"` implies the preset's exact values, or
    the advert is rejected — a preset name that does not carry the preset's values
    is a lie about what game is being offered;
@@ -5681,10 +5823,117 @@ preference:
    provably agreed on. `HAND_INIT` is not: peers accept different copies of it at
    different moments, and a peer that never accepts one would never start.
 
-The window covers `hand_delay_ms` plus the whole of hand `k`; the constant in §13
-is set on that basis and is not rescaled by this ruling. `STATE_MACHINE.md` §5.2
-already reads it this way, so this sentence removes a corpus disagreement rather
-than creating one.
+The window covers `hand_delay_ms` plus the whole of hand `k`. `STATE_MACHINE.md`
+§5.2 already reads it this way, so this sentence removes a corpus disagreement
+rather than creating one. **What that window has to be large enough for is the
+next box, and until this pass it was not** — the sentence that stood here said
+the §13 constant *"is set on that basis and is not rescaled by this ruling"*,
+which is exactly the claim `P3` falsified.
+
+#### `hand_deadline_ms` scales with the seat count — normative, and this is `P3`
+
+`hand_deadline_ms` was one figure, 600 000 ms, for every table from two seats to
+`MAX_SEATS`. **A legal hand at six seats exceeds it before a single stage goes
+wrong.** A no-re-raise hand in which every seat takes its allowed time is `4n`
+betting actions at `action_timeout_ms + action_grace_ms` each; at the §13 preset
+that is `24 × 25 000 = 600 000 ms` at six seats — the deadline exactly, with the
+boundary, the deck and every checkpoint still unpaid — and `40 × 25 000 =
+1 000 000 ms` at `MAX_SEATS = 10`, against 600 000. The hand then aborts under
+§8.4 with `cause = 1`, `attributed = []` and `cert_hash = None`: **no progress and
+nobody at fault**, repeatable for ever, on a table where every peer is honest and
+every message is on time.
+
+**The harm is not only the stall, and the sharper statement is the one that fixes
+the shape of the rule.** §8's two abort paths are asymmetric on purpose: the
+certificate path names a subject, the whole-hand path names nobody. A whole-hand
+deadline that can expire *before* the per-stage deadlines it exists to back up
+lets any seat reach the non-attributing path by making a hand long, which costs it
+nothing and is not even misbehaviour. So the requirement is not *"large enough for
+a typical hand"* but:
+
+> **`hand_deadline_ms` must exceed the sum of the per-stage deadlines of every
+> stage a legal hand walks.** It is a backstop for a stage that stalls where no
+> certificate can be produced (§8.3's `|V| < 2` floor, and the `HAND_INIT` stall
+> of reason 1 above). A backstop that fires first is not a backstop; it is a
+> shorter deadline that attributes nobody.
+
+**The floor.** `n` is `max_players` — `LOBBY_TABLE_AD`'s `n(11)`, §9.4 — and
+**never the number of seats currently occupied**: `hand_deadline_ms` is
+two-sided, every peer must hold the identical value (§8.2's opening rule), and a
+floor derived from a live count moves as players sit down. A hand's walk is
+**`6n + 20`** stages that need a round trip — the boundary's three, the deck's
+`2n + 2`, the deal's three, `n + 2` pre-flop, `3(n + 2)` over the three streets
+and the showdown's four (`research/PHASE3_GATE4.md` §4.1 enumerates them, and
+`n = 4` reproduces the earlier gate's 44 exactly). **`4n − 3` of those are betting
+actions** — `n` pre-flop and `n − 1` on each of three streets — **and the
+remaining `2n + 23` take `crypto_step_timeout_ms`** from the table above. So,
+normatively:
+
+```
+HAND_DEADLINE_FLOOR(n) =  hand_delay_ms
+                        + (2n + 23) * crypto_step_timeout_ms
+                        + 4n        * (action_timeout_ms + action_grace_ms)
+```
+
+`4n` rather than `4n − 3` because the three spare allowances are cheaper than an
+off-by-one an implementer has to re-derive. At the §13 preset —
+`hand_delay_ms = 7 000`, `crypto_step_timeout_ms = 30 000`,
+`action_timeout_ms + action_grace_ms = 25 000`:
+
+| `n` | crypto term | action term | **floor** | preset before `P3` |
+|---:|---:|---:|---:|---:|
+| 2 | 810 000 | 200 000 | **1 017 000** | 600 000 — **below** |
+| 4 | 930 000 | 400 000 | **1 337 000** | 600 000 — **below** |
+| 6 | 1 050 000 | 600 000 | **1 657 000** | 600 000 — **below** |
+| 10 | 1 290 000 | 1 000 000 | **2 297 000** | 600 000 — **below** |
+
+The preset was below its own floor **at every seat count**, including the two the
+last three passes measured; two and four seats survived because the crypto term is
+three orders of magnitude of margin that a healthy table never spends, and six is
+where the *action* term alone crosses. That is why the widening found it and the
+narrow passes did not.
+
+**Re-raises are budgeted by the headroom above the floor, and the headroom is the
+founder's to buy.** A raise that reopens the action entitles up to `n − 1` further
+actions, so a table whose advertised deadline sits above its floor tolerates
+
+```
+REOPENINGS(config) = ⌊ (hand_deadline_ms − HAND_DEADLINE_FLOOR(n))
+                       ÷ ((n − 1) * (action_timeout_ms + action_grace_ms)) ⌋
+```
+
+reopening raises in one hand. At the §13 preset's new value this is four at ten
+seats. **A hand with more reopenings than that still aborts on a legal path**;
+that residual is stated rather than closed, and the two ways of closing it — a cap
+on raises per street, which is a rule of the game and not this document's, or a
+deadline that extends deterministically on accepted chain content, which is a new
+mechanism — are recorded in `DECISIONS.md`'s open list rather than chosen here.
+
+**What a client does with a table whose advertised deadline is below its own
+derived floor: it refuses the table.** This matters because `hand_deadline_ms` is
+a **signed table parameter chosen by the founder** and bound into
+`table_params_hash` (§3.1), so a founder who wants every hand at their table to
+abort neutrally needs no attack at all — they advertise a small number. The check
+therefore belongs to the **joiner**, and it belongs with the other range checks of
+§9.4, **before the advert is shown to a user or stored**:
+
+> **Normative.** A receiver computes `HAND_DEADLINE_FLOOR(n(11))` from the
+> advertised `n(14)`, `n(15)`, `n(16)`, `n(19)` and `n(11)`, and **rejects the
+> advertisement** if `n(17) hand_deadline_ms < HAND_DEADLINE_FLOOR(n(11))`. A
+> rejected advertisement is not displayed, not stored, not joined, and the seat is
+> never taken. **A client must not join and substitute its own floor locally**:
+> the deadline is two-sided, and two peers running different whole-hand deadlines
+> disagree about whether a hand aborted, which §8.2's opening paragraph classes as
+> a consensus fault rather than a UX detail.
+
+**The refusal is the safe direction and the cap does the rest.** Declining a table
+costs a player nothing — no chips exist yet — while joining one guarantees every
+hand ends with `cause = 1` and nobody named. And a founder cannot escape upwards
+either: `n(17)` is capped at `3 600 000` (§9.4), so a configuration whose floor
+exceeds that cap has **no legal deadline at all** and every conforming client
+refuses it. That is the correct outcome and it is why the cap is not widened
+here — the pair (floor, cap) bounds the playable configuration space from both
+sides, and a config outside it is unplayable rather than quietly broken.
 
 If it expires the hand aborts under §8.4 with `cause = 1`,
 `attributed = []` and `cert_hash = None`: **it produces no certificate and names
@@ -5791,8 +6040,9 @@ box above:
   `cert_hash = None` and stacks restored.
 
 **The cost of that second bullet, stated rather than hidden.** Where `|V| < 2` a
-stalled hand now waits `hand_deadline_ms` (600 000 ms in
-`RATED_SNG_POKERTH_V1`) instead of `crypto_step_timeout_ms` (30 000 ms). The
+stalled hand now waits `hand_deadline_ms` (3 300 000 ms in
+`RATED_SNG_POKERTH_V1` since `P3`, and never below `HAND_DEADLINE_FLOOR(n)`)
+instead of `crypto_step_timeout_ms` (30 000 ms). The
 outcome is identical — `cause = 1`, nobody attributed, stacks restored — only the
 wait is longer, and the alternative is a certificate with an effect that one
 signature can manufacture.
@@ -6382,6 +6632,8 @@ outcome is.
 | two byte encodings of one event | the canonicality gate of §2.5, run before the signature | `THREAT_MODEL.md` |
 | malformed or oversized frames | the caps of §9 and the fuzzing obligations of §9.6 | `THREAT_MODEL.md` |
 | stalling a hand to force an abort | `hand_deadline_ms` from `TERMINAL(k-1)` (§8.2) and the terminal stage of §4.10 | `THREAT_MODEL.md` X8 |
+| **a founder advertising a deadline every legal hand exceeds** — free, needs no message and no key, and reaches the abort path that attributes nobody | §9.4 rule 2a: the joiner derives `HAND_DEADLINE_FLOOR(n(11))` from the advert's own fields and **refuses the table** before a seat is taken (§8.2, `P3`) | filed for `THREAT_MODEL.md` in `DECISIONS.md`'s open list |
+| **replaying a signed, *agreeing* checkpoint-8 `STATE_HASH` to re-enlarge a required emitter set once per hand** — also free, also no key, valid for the 4 096 hands §5.3 retains a record for | §4.9: the readmission set widens an **accepted** emitter set and never a required one, so only a seat's own **current-chain** signature can grow `R` (§4.4, §3.2, `P2`) | `THREAT_MODEL.md` X8, same family |
 | faulting a table with a false `state_hash` | §6.3 case (c) and §6.4 | `THREAT_MODEL.md` X29 |
 | a provably illegal message — bad signature, non-canonical encoding, out-of-range field, failed proof, illegal action against an agreed checkpoint | the `DISPUTE { kind = 3 }` carrier and the two-tier removal rule of §4.9, `HAND_ABORT cause = 6` (§4.10), and the re-entry bar on `PLAYER_SIT_IN` (§4.10) | `DECISIONS.md` D-014 |
 | two peers privately playing on as if the other were gone | the boundary checkpoint of §4.9 and §6.2 row 8, compared over a set wider than the one it is required of, with `signed_this_hand` inside `state_hash` (§6.1); §3.2's solitary-stage rule, fired by §4.0 step 10b through **both** its routes, membership and comparison; and §4.9's floor on the reconciliation stage, `\|R(c) ∪ W\| >= 2`, which is what stops the frozen peer from releasing its own freeze (§6.3 step 3) | `DECISIONS.md` K-1 |
@@ -6661,11 +6913,40 @@ RATED_SNG_POKERTH_V1:
   action_timeout_ms             = 20 000
   action_grace_ms               = 5 000
   crypto_step_timeout_ms        = 30 000
-  hand_deadline_ms              = 600 000
+  hand_deadline_ms              = 3 300 000     (was 600 000 — P3. seats = 10, so
+    HAND_DEADLINE_FLOOR(10) = 7 000 + 43*30 000 + 40*25 000 = 2 297 000, and the old
+    value was below its own floor: a legal no-re-raise hand is 40 actions at 25 000 ms
+    = 1 000 000 ms of human time alone. 3 300 000 clears the floor by 1 003 000 ms,
+    which buys REOPENINGS = 1 003 000 / (9 * 25 000) = 4 reopening raises per hand,
+    and stays under n(17)'s 3 600 000 cap. §8.2 derives both formulae.)
   join_deadline_ms              = 120 000
   hand_delay_ms                 = 7 000
   password                      = none
 ```
+
+**`hand_deadline_ms` is not a constant of this section any more; it is a derived
+lower bound and a per-table parameter above it (`P3`).** The formula is §8.2's and
+is repeated here only as a name, because §13 is where an implementer looks for a
+number and there is no longer one to find:
+
+```
+HAND_DEADLINE_FLOOR(n) =  hand_delay_ms
+                        + (2n + 23) * crypto_step_timeout_ms
+                        + 4n        * (action_timeout_ms + action_grace_ms)
+
+  where n = max_players (LOBBY_TABLE_AD n(11)), NEVER the live seated count —
+  the value is two-sided (§8.2) and a floor derived from a count that moves
+  during the table's life is not a constant every peer holds identically.
+
+  At the preset's timings: n=2 → 1 017 000   n=4 → 1 337 000
+                           n=6 → 1 657 000   n=10 → 2 297 000
+```
+
+A receiver rejects any `LOBBY_TABLE_AD` whose `n(17)` is below this (§9.4 rule
+2a). The `n(17)` cap of `3 600 000` is unchanged and is the other side of the
+bound: a configuration whose floor exceeds the cap is unplayable and is refused by
+every conforming client, which is the correct outcome and is why the cap is not
+widened.
 
 The `RATED_SNG_POKERTH_V1` values, their PokerTH provenance, and the four
 `[OUR CHOICE]` timing values are documented in [RULES B1–B5]. `crypto_step_timeout_ms`
@@ -7176,9 +7457,14 @@ a peer in the solitary regime **every** window is zero-width, so a returning sea
 could never be heard by the peer draining it. §4.9's readmission set `A` is the
 disposition: one seat set, written by §4.0 step 10b for a stale `PLAYER_SIT_IN` or
 a stale checkpoint-8 `STATE_HASH` that **agrees**, read once at the next hand
-init, cleared there. Both corrections only ever enlarge a set, both land at
-`HAND_INIT`'s collective body where a disagreement stalls stage 0 loudly, and
-neither thaws a freeze.
+init, cleared there, and widening that stage's **accepted** emitter set alone.
+Both corrections only ever enlarge a set, both land at `HAND_INIT`'s collective
+body where a disagreement stalls stage 0 loudly, and neither thaws a freeze.
+**`P2` narrowed the second of them from the required set to the accepted set**,
+because `A`'s write is reachable by replay — §4.0 step 10a is skipped for the
+stale events that write it — while `A` itself is cleared every hand, so a
+required set built from it could be re-enlarged once per hand for as long as §5.3
+retains the record the replay is evaluated against.
 
 **28. §4.0's anti-eviction box names D-014's exception instead of contradicting it
 (`N3`).** The box bound every document and every layer against unseating a peer

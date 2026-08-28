@@ -32,6 +32,11 @@ pub struct Preset {
     pub small_blind_cap: Chips,
     pub action_timeout_sec: u32,
     pub action_timeout_grace_sec: u32,
+    /// How long one cryptographic step of a hand may take.
+    ///
+    /// Feeds [`Preset::hand_deadline_floor_ms`], where it is by far the largest
+    /// term: a hand has `2n + 23` crypto steps against `4n` betting actions.
+    pub crypto_step_timeout_sec: u32,
     /// Presentation only. The protocol never waits for it.
     pub hand_delay_sec: u32,
     pub hand_deadline_sec: u32,
@@ -71,8 +76,11 @@ pub const RATED_SNG_POKERTH_V1: Preset = Preset {
     small_blind_cap: 50_000,
     action_timeout_sec: 20,
     action_timeout_grace_sec: 5,
+    crypto_step_timeout_sec: 30,
     hand_delay_sec: 7,
-    hand_deadline_sec: 600,
+    // 2 297 s is this preset's own floor at ten seats; the extra buys
+    // reopening raises. See `hand_deadline_floor_ms`.
+    hand_deadline_sec: 2_700,
     join_deadline_sec: 120,
 };
 
@@ -97,8 +105,10 @@ pub const HEADS_UP_PLAY_MONEY_V1: Preset = Preset {
     small_blind_cap: 10_000, // seats * start_stack / 2
     action_timeout_sec: 20,
     action_timeout_grace_sec: 5,
+    crypto_step_timeout_sec: 30,
     hand_delay_sec: 7,
-    hand_deadline_sec: 600,
+    // 1 017 s is the floor at two seats.
+    hand_deadline_sec: 1_200,
     join_deadline_sec: 120,
 };
 
@@ -144,6 +154,58 @@ impl Preset {
     /// (`src/engine/local_engine/localberopreflop.cpp:44`).
     pub fn big_blind(&self, hand: u32) -> Chips {
         self.small_blind(hand) * 2
+    }
+
+    /// The smallest whole-hand deadline at which legal play can finish
+    /// (`PROTOCOL.md` §8.2).
+    ///
+    /// A hand is `6n + 20` round trips. `4n` of them are betting actions, each
+    /// costing an action timeout plus its grace; the other `2n + 23` are
+    /// cryptographic steps. So
+    ///
+    /// ```text
+    /// floor(n) = hand_delay
+    ///          + (2n + 23) * crypto_step_timeout
+    ///          + 4n        * (action_timeout + grace)
+    /// ```
+    ///
+    /// A single unscaled figure here is what made legal play at six seats and
+    /// up abort itself: the action term alone crosses 600 s at six seats. Two
+    /// and four seats survived only because the crypto term carries three
+    /// orders of magnitude of margin a healthy table never spends — which is
+    /// why narrow testing missed it and widening the seat count found it.
+    ///
+    /// A table advertising less than this is refused by the joiner rather than
+    /// silently corrected: the deadline is a signed table parameter, and two
+    /// peers running different whole-hand deadlines is a divergence.
+    pub const fn hand_deadline_floor_ms(&self) -> u64 {
+        let n = self.seats as u64;
+        let delay = self.hand_delay_sec as u64 * 1_000;
+        let crypto = (2 * n + 23) * (self.crypto_step_timeout_sec as u64 * 1_000);
+        let action = 4 * n
+            * ((self.action_timeout_sec as u64 + self.action_timeout_grace_sec as u64) * 1_000);
+        delay + crypto + action
+    }
+
+    /// How many reopening raises one hand can afford above the floor.
+    ///
+    /// A raise that reopens the action entitles up to `n - 1` further actions,
+    /// and the headroom above the floor is what pays for them. A hand with more
+    /// reopenings than this still aborts on a legal path; that residual is
+    /// stated rather than hidden.
+    pub const fn reopenings(&self) -> u64 {
+        let n = self.seats as u64;
+        if n < 2 {
+            return 0;
+        }
+        let deadline = self.hand_deadline_sec as u64 * 1_000;
+        let floor = self.hand_deadline_floor_ms();
+        if deadline <= floor {
+            return 0;
+        }
+        let per_reopening =
+            (n - 1) * ((self.action_timeout_sec as u64 + self.action_timeout_grace_sec as u64) * 1_000);
+        (deadline - floor) / per_reopening
     }
 
     /// Total chips in play, which never changes in a tournament.
@@ -250,6 +312,73 @@ mod tests {
         // The rated preset cannot be played two-handed: PokerTH's
         // CheckSettings rejects any other seat count for a rated game.
         assert_ne!(RATED_SNG_POKERTH_V1.seats, 2);
+    }
+
+    /// The table `PROTOCOL.md` §8.2 derives, reproduced exactly.
+    #[test]
+    fn the_deadline_floor_matches_the_published_derivation() {
+        let base = RATED_SNG_POKERTH_V1;
+        for (seats, expected) in [
+            (2u8, 1_017_000u64),
+            (4, 1_337_000),
+            (6, 1_657_000),
+            (10, 2_297_000),
+        ] {
+            let p = Preset { seats, ..base };
+            assert_eq!(p.hand_deadline_floor_ms(), expected, "at {seats} seats");
+        }
+    }
+
+    /// The defect this floor exists to catch, kept as a regression: the
+    /// shipped deadline used to be 600 000 ms, which is below the floor at
+    /// **every** seat count, two and four included.
+    #[test]
+    fn six_hundred_seconds_is_below_the_floor_at_every_seat_count() {
+        let base = RATED_SNG_POKERTH_V1;
+        for seats in [2u8, 4, 6, 8, 10] {
+            let p = Preset { seats, ..base };
+            assert!(
+                p.hand_deadline_floor_ms() > 600_000,
+                "600 s would have been legal at {seats} seats"
+            );
+        }
+    }
+
+    /// Every preset this project ships must satisfy its own floor, or a joiner
+    /// following the spec refuses the table it advertises.
+    #[test]
+    fn every_shipped_preset_meets_its_own_floor() {
+        for p in [RATED_SNG_POKERTH_V1, HEADS_UP_PLAY_MONEY_V1] {
+            let deadline_ms = p.hand_deadline_sec as u64 * 1_000;
+            assert!(
+                deadline_ms >= p.hand_deadline_floor_ms(),
+                "{} advertises {} ms against a floor of {} ms",
+                p.id,
+                deadline_ms,
+                p.hand_deadline_floor_ms()
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_presets_can_afford_at_least_one_reopening_raise() {
+        for p in [RATED_SNG_POKERTH_V1, HEADS_UP_PLAY_MONEY_V1] {
+            assert!(
+                p.reopenings() >= 1,
+                "{} leaves no headroom for a reopening raise",
+                p.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_deadline_at_exactly_the_floor_affords_no_reopening() {
+        let floor = RATED_SNG_POKERTH_V1.hand_deadline_floor_ms();
+        let tight = Preset {
+            hand_deadline_sec: (floor / 1_000) as u32,
+            ..RATED_SNG_POKERTH_V1
+        };
+        assert_eq!(tight.reopenings(), 0, "no headroom means no reopening");
     }
 
     #[test]
