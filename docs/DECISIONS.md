@@ -61,6 +61,62 @@ the threat model.
    disconnect, and the disconnect/abort handling of `SPEC_CS.md` section 19 has
    to cover it.
 
+### Addendum, 2026-08-28 — what public relays actually are, measured
+
+The question came up whether public relays are already running on the internet
+and can simply be used. They are, in large numbers, but their default limits
+make them unusable as a session transport. This was verified in source, not
+assumed.
+
+**Public relays exist and need no hardcoded list.** In kubo (the reference IPFS
+implementation) `Swarm.RelayService.Enabled` defaults to `true`, so every
+publicly reachable kubo node offers Circuit Relay v2 to the network, and
+`Swarm.RelayClient.Enabled` also defaults to `true`, so a client discovers
+public relays from the network on its own when it detects it is unreachable.
+Verification: `docs/config.md` on the kubo master branch, sections
+`Swarm.RelayService.Enabled` and `Swarm.RelayClient.Enabled`.
+
+**Their default limits are two minutes and 128 KiB per relayed connection.**
+Both the Go and the Rust implementation ship the same numbers:
+
+| Limit | kubo default | rust-libp2p `relay::Config` default |
+|---|---|---|
+| Relayed connection duration | `"2m"` | `max_circuit_duration: 2 * 60 s` |
+| Relayed data, each direction | `131072` (128 KiB) | `max_circuit_bytes: 1 << 17` |
+| Reservation TTL | `"1h"` | `reservation_duration: 60 * 60 s` |
+| Max reservations | `128` | `max_reservations: 128` |
+| Max circuits | `16` | `max_circuits: 16` |
+| Per peer | — | `max_circuits_per_peer: 4` |
+
+Verification: kubo `docs/config.md` (master); rust-libp2p
+`libp2p-relay 0.21.1`, `src/behaviour.rs`, `impl Default for Config`, read from
+the unpacked crate source.
+
+**Consequence.** Two minutes and 128 KiB is sized for exactly one thing:
+coordinating a DCUtR hole punch, after which the peers talk directly and the
+relay drops out. It is not one poker hand. A single hand carries several
+shuffle proofs plus the signed event stream, and a session lasts far longer
+than two minutes. A public IPFS relay will reset the connection mid-hand.
+
+So the relay story splits in two, and the documents must not blur them:
+
+1. **Rendezvous for hole punching.** Public relays are entirely adequate, cost
+   us no infrastructure, and need no shipped address list — AutoNAT plus the
+   standard relay discovery finds them. This is the common path.
+2. **Carrying a whole session, when DCUtR fails on both ends.** Public relays
+   cannot do this. It needs a relay that has raised its own limits. In
+   `rust-libp2p` every field of `relay::Config` is `pub`, so
+   `max_circuit_duration` and `max_circuit_bytes` are ours to set on a relay we
+   control.
+
+This is what makes the "any publicly reachable peer volunteers as a relay"
+constraint below load-bearing rather than decorative: a publicly reachable
+poker client running the relay server with limits raised for our own protocol
+is the only way to get an unlimited relay without operating infrastructure.
+Whether that is acceptable — a client spending its own bandwidth relaying
+strangers' games — is an OPEN QUESTION for the owner, and it must be a visible,
+consenting setting, never silently on.
+
 ### Constraints that remain in force
 
 - A relay is **never** trusted with poker content, never given a key share,
