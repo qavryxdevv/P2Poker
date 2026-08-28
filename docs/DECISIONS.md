@@ -1070,6 +1070,101 @@ rules, the pot arithmetic. Implementation continues there while this closes.
 
 ---
 
+---
+
+## D-012 — Canonical state is never derived from a per-receiver quantity
+
+**Date:** 2026-08-28
+**Status:** accepted
+**Source:** Phase 2 gate, second attempt — blockers H1 and H2
+**Reinforces:** D-011
+
+### What the sixth pass showed
+
+D-011 worked. For the first time in six passes **no two documents disagree**,
+every one of the previous blockers is closed by an edit that names the finding
+and says what it gives up, and — the structural result — **all twenty phases
+have a reachable exit under total silence**. The slot key lives at one site,
+all thirty-nine message types are clean against it, eviction has zero survivors
+at any layer, and chips are conserved on every path in both modes.
+
+Neither of D-011's two named shapes appears: no copy drifted, and no
+consequence makes an attack worth mounting. So the "cut the mechanism" clause
+is not triggered. What appeared is a third shape, and it is worth naming
+because it is the one a fix creates rather than leaves behind:
+
+> **The defect is on the path the previous fix newly made load-bearing.**
+
+P3's witness-independent terminal stage — which is what unfroze eleven phases —
+made "which copy of the abort did this peer accept" a **per-receiver** fact for
+the first time. A line elsewhere had been deriving canonical state from a field
+of that copy, and that line was correct when every completing peer held the
+same body. It is not correct now.
+
+### The rule
+
+**No canonical state — nothing that enters a state hash, a roster hash, a
+chained event body, or the next hand's genesis — may be derived from a quantity
+that can differ between honest receivers.**
+
+Canonical state changes only through a chained event that every participant has
+accepted. Everything else is a local view, and belongs in the structure the
+state machine already separates for that purpose.
+
+Two consequences, which are the two blockers:
+
+1. **H1.** `STATE_MACHINE.md` T46 sets a seat's `status := Absent` from the
+   accepted `HAND_ABORT` copy's `attributed` field. Two honest peers can accept
+   different copies — the certificate path carries `[C]`, the hand-deadline path
+   carries `[]`, and no abort-versus-abort precedence rule exists. Stacks and
+   `TERMINAL(k)` still agree, but the next hand's `dealt_in` and `bb_seat`
+   differ, so its collective stage never completes and the table never plays
+   again. `PROTOCOL.md` §4.10 already forbids exactly this: "no receiver may
+   derive a seat's state from it."
+
+   **T46 loses that line.** A seat's status changes only through a chained
+   event. An abort records who failed as evidence, and under D-010 evidence has
+   no automatic consequence — so deriving a status from it was never going to be
+   right.
+
+2. **H2.** `seat_flags` appears **once in the whole corpus**, inside
+   `roster_hash(k)`, and is never defined. It feeds `GENESIS(k)` and therefore
+   every event, and no default is pickable: two implementers guessing
+   differently share no verifying event at all.
+
+   **Resolve it in the safe direction: `seat_flags` is removed from
+   `roster_hash(k)`.** The roster is the ordered list of seated player
+   identities and nothing else. Anything mutable — sitting out, absent, away —
+   is either established by a chained event, in which case it is already in the
+   chain and need not be hashed again, or it is a local view, in which case it
+   must not be hashed at all. Removing the field closes half of H1 as a side
+   effect, because it is the other route by which a per-receiver status could
+   reach the genesis.
+
+### The process rule this also produces
+
+Twice now a sweep has missed a document, and both times it became a blocker:
+`NETWORK_STACK.md` had zero mentions of D-010 while holding ten places that
+blocked a peer, and now `CRYPTOGRAPHY.md` has zero mentions of D-011 while its
+ownership table still declares the pre-D-011 discipline. Both were left out on
+my judgement that the decision did not touch them. Both times that judgement
+was wrong.
+
+**Every decision sweep covers every document, including `CONTRIBUTING.md` and
+`DEPENDENCIES.md`.** The cost of including a document that turns out to be
+unaffected is one agent reading it and reporting nothing; the cost of excluding
+one has now twice been a blocking defect. A cheap check that occasionally finds
+nothing beats a judgement call that has failed twice.
+
+### Where this leaves the project
+
+The gap is two fields wide, not four mechanisms wide. The poker layer — twenty
+phases, fifty-six live transitions, twenty-nine invariants, the determinism
+contract, the betting rules and the pot arithmetic — has been ready for three
+passes and is already implemented and under test.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |

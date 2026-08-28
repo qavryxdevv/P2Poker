@@ -1,7 +1,7 @@
 # PROTOCOL.md — the versioned wire protocol
 
 Phase 1 output. Binding spec sections: `SPEC_CS.md` §4, §12, §13, §14, §15, §16,
-§17, §20, §27. Binding owner decisions: `DECISIONS.md` D-001 … D-010.
+§17, §20, §27. Binding owner decisions: `DECISIONS.md` D-001 … **D-011**.
 
 **D-007 corrects D-006 and wins over it**: an action deadline is advisory and a
 fold-effect timeout certificate is forbidden where the certificate cannot be
@@ -49,7 +49,7 @@ that no later section has to repeat it and no reader has to assemble it:
 > or fault the table and get their chips back. D-005 closed that with forfeiture;
 > D-010 reopens it knowingly, because forfeiture was measured over four passes to
 > take chips from honest players, and an exploit that harms an honest player is
-> worse than one that merely lets a dishonest player escape a loss. §11.3 carries
+> worse than one that merely lets a dishonest player escape a loss. `THREAT_MODEL.md` §8 limitation 4 carries
 > it as an unfixed limitation and §4.10 states the trade in full.
 
 Two structural consequences follow, and both are stated where they belong rather
@@ -57,11 +57,35 @@ than here: `HAND_ABORT cause = 5` is deleted, because an unchained event may no
 longer terminate a stage (§5.2, §4.10); and a divergence reconciliation is its
 own chained stage rather than a second copy of the checkpoint's (§4.9, §6.3).
 
-This document specifies the bytes on the wire. It does not specify the poker
-rules (`docs/POKER_RULES.md` research output, later `docs/STATE_MACHINE.md`), the
-mental-poker construction (`docs/CRYPTOGRAPHY.md`), or the transport stack
-(`docs/NETWORK_STACK.md`). Where it must refer to those, it refers and does not
-restate.
+**D-011 is the shape of this revision, and it decides three things this document
+had left to another document or to a later pass.**
+
+> 1. **The anti-replay slot key is §5.2.1 and only §5.2.1.** It is a literal
+>    eight-component tuple with field indices, it contains `event_type`, and
+>    every other document in the corpus references that section by number and
+>    reproduces no part of it. §4.11 carries the check of all 39 message types
+>    against it, per type rather than per stage-kind group. This is D-009 rule 1's
+>    sixth attempt; the five that failed were prose.
+> 2. **The terminal stage of an aborted hand is witness-independent, has no
+>    `stage_hash`, and yields `TERMINAL(k) = ABORT_TERMINAL(k)`, a function of
+>    `GENESIS(k)` alone** (§3.1, §3.2, §4.10). It cannot deadlock, because no
+>    seat's silence blocks it, and it cannot fork, because it reads nothing the
+>    peers disagree about. `GENESIS(k+1)` therefore exists on every path and the
+>    next hand can start. P3 is settled here; G1 is closed by point 1.
+> 3. **Nothing consumes an `EquivocationProof`, at any layer** (§5.2, §4.0). No
+>    transition takes one as input, no `cause` value carries one, and no
+>    block-list, allow-list, unseating or seat refusal is driven by one — in this
+>    document or in any other (D-010 point 3, D-011 rule 3).
+
+**This document owns the wire and nothing else** (D-011 rule 1): message shapes,
+the event envelope, the chain, sequence numbers, the anti-replay slot, canonical
+bytes, and what a receiver validates. It does not specify state or transitions
+(`docs/STATE_MACHINE.md`), the mental-poker constructions
+(`docs/CRYPTOGRAPHY.md`), the transport, discovery or connectivity stack
+(`docs/NETWORK_STACK.md`), or the threat classification
+(`docs/THREAT_MODEL.md`). Where it must refer to those, **it refers by section
+number and restates nothing.** §14 notes 16–20 list what was deleted from this
+revision on that rule and what replaced each copy.
 
 ## How to read the evidence tags
 
@@ -88,8 +112,11 @@ load-bearing for this document.
 ### What this protocol does not claim
 
 Per `SPEC_CS.md` §18 and §36: this protocol does **not** make all cheating
-impossible. §11 states, per class, what it makes cryptographically impossible,
-what it merely detects and attributes, and what it cannot touch at all.
+impossible. **`THREAT_MODEL.md` states, per class, what is prevented, what is
+detected, and what is neither** — it is the owner of that classification and this
+document no longer keeps a copy of it (D-011 rule 1, §14 note 20). §11 here is a
+routing table from an attack to the mechanism in *this* document that acts on it,
+and it reaches no verdict of its own.
 
 ---
 
@@ -224,13 +251,19 @@ Five channels carry protocol messages, and each message type is legal on exactly
 one of them. A message arriving on the wrong channel is dropped and its sender
 is rate-limited; it is not processed.
 
-| Channel | libp2p mechanism | Framing |
+**Which libp2p behaviour carries each channel, with what settings, is
+`NETWORK_STACK.md`'s** (D-011 rule 1). The behaviour names, the GossipSub
+validation settings and the crate versions that stood in the middle column here
+are deleted; this table now carries the protocol string, which is a wire
+identifier, and the framing, which is ours and survives a change of crate.
+
+| Channel | Protocol string | Framing |
 |---|---|---|
-| **Lobby broadcast** | GossipSub on `/p2p-poker/lobby/1`, `MessageAuthenticity::Signed` + `ValidationMode::Strict`, `validate_messages()` on [LIBP2P §6] | one `SignedEvent` per GossipSub message, no extra framing |
-| **Lobby chat broadcast** | GossipSub on `/p2p-poker/lobby-chat/1`, same settings (§7.7) | one `SignedEvent` per GossipSub message |
-| **Lobby RPC** | `request_response::cbor::Behaviour` on `/p2p-poker/lobby-snapshot/1` [LIBP2P §7] | codec's own framing; `SNAPSHOT_REQ_MAX` / `SNAPSHOT_RESP_MAX` per §13 |
-| **Join RPC** | `request_response::cbor::Behaviour` on `/p2p-poker/join/1` [LIBP2P §7] | codec's own framing; `JOIN_REQ_MAX` / `JOIN_RESP_MAX` per §13; 20 s timeout |
-| **Table mesh** | `libp2p-stream` 0.4.0-alpha on `/p2p-poker/table/1` [LIBP2P §7] | `u32` big-endian length prefix, then exactly that many bytes of `SignedEvent`. Nothing else. |
+| **Lobby broadcast** | `/p2p-poker/lobby/1` | one `SignedEvent` per broadcast message, no extra framing |
+| **Lobby chat broadcast** | `/p2p-poker/lobby-chat/1` (§7.7) | one `SignedEvent` per broadcast message |
+| **Lobby RPC** | `/p2p-poker/lobby-snapshot/1` | the RPC codec's own framing; `SNAPSHOT_REQ_MAX` / `SNAPSHOT_RESP_MAX` per §13 |
+| **Join RPC** | `/p2p-poker/join/1` | the RPC codec's own framing; `JOIN_REQ_MAX` / `JOIN_RESP_MAX` per §13; 20 s timeout |
+| **Table mesh** | `/p2p-poker/table/1` | `u32` big-endian length prefix, then exactly that many bytes of `SignedEvent`. Nothing else. |
 
 **Which message is legal on which channel.** This is a table rather than prose so
 that adding a channel or a message type cannot leave it stale. §4.11 repeats it
@@ -245,16 +278,20 @@ per message code.
 | `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT` | join RPC |
 | everything else (`PLAYER_LIST`, `TABLE_READY`, and all of groups 3–8) | table mesh |
 
-The table stream is long-lived and bidirectional; both sides push. That is why it
-is `libp2p-stream` and not `request-response`, which cannot express server push.
-[LIBP2P §7] `libp2p-stream` is alpha and semver-exempt; the framing above is ours,
-not the crate's, so replacing the crate does not change the wire.
+**The one requirement this document places on the transport**, stated as a
+requirement rather than as a crate choice: the table channel must be long-lived
+and bidirectional, because both sides push and no message type is a response to
+another. Which crate provides that, and whether it is semver-exempt, is
+`NETWORK_STACK.md`'s. The framing above is ours, so replacing the crate does not
+change the wire.
 
-**GossipSub's message signature is not the application signature.** GossipSub
-`Strict` mode authenticates the libp2p identity that owns the PeerId — "which
-socket said this". `SPEC_CS.md` §12's signature is over canonical CBOR by the
-application key. Both are required and neither substitutes for the other.
-[LIBP2P §6]
+**A transport-layer message signature is never the application signature.** A
+transport that authenticates the peer identity owning the connection
+authenticates "which socket said this". `SPEC_CS.md` §12's signature is over
+canonical CBOR by the **application** key (§2.4). Both are required and neither
+substitutes for the other; a receiver that skips §4.0 step 9 because the
+transport already authenticated the sender has accepted a forged action.
+`NETWORK_STACK.md` owns the transport half.
 
 ### 1.5 The table is a full mesh; forwarding is allowed
 
@@ -278,11 +315,13 @@ a no-op, not a duplicate-message violation.
 Whether a full mesh is *required* before a table may start, or whether a pair
 that cannot connect directly may still be seated, is **OPEN QUESTION Q-03**.
 
-**The connectivity floor, stated honestly.** If two players cannot form a direct
-or relayed connection to each other — symmetric NAT on both ends with no D-002
-relay available — they cannot sit at the same table, because a full mesh requires
-every pair. They can still *see* the lobby, which is D-004's layer 3 and is
-unconditional. This is the limit D-004 records and it is not solved here.
+**The connectivity floor is `NETWORK_STACK.md`'s** (D-011 rule 1). The paragraph
+that stood here restated it — which NAT combinations cannot be traversed, what a
+relay changes, and what D-004's layer 3 still guarantees. What this document is
+normative about is the consequence for the wire, and it is one sentence: **a full
+mesh is a precondition of seating, so a pair that cannot connect cannot both be
+in the roster that `TABLE_READY` freezes.** Whether that precondition should be
+relaxed is Q-03.
 
 ---
 
@@ -586,25 +625,14 @@ construction" is a claim to be tested, not asserted.
 
 ### 2.8 Hashes and domain separation
 
-All protocol hashes are BLAKE3 1.8.7. Reasons, in order [CRYPTO §3.2]:
-
-1. Domain separation is a first-class library feature — `blake3::derive_key` and
-   `Hasher::new_keyed` — rather than a prefix convention we would have to invent,
-   which is what §6 and §36 of the spec tell us not to do.
-2. No length-extension. SHA-256 and SHA-512 are Merkle–Damgård, so the naive
-   `SHA256(secret ‖ msg)` is a trap; BLAKE3 finalises with domain flags.
-3. An XOF for deterministic expansion.
-4. Speed, which §33 makes a requirement — transcript verification is hash-bound.
-
-`sha2` remains in the tree regardless, because Ed25519 is defined over SHA-512 and
-libp2p needs SHA-256 for multihash. [CRYPTO §3.2]
-
-**Honest limitation, to be repeated in `docs/CRYPTOGRAPHY.md`:** no public
-third-party security audit of BLAKE3 was found. Its assurance rests on its
-specification and its BLAKE2/ChaCha lineage. [CRYPTO §3.2] If the mental-poker
-proof system mandates a specific hash for Fiat–Shamir, that mandate wins for
-those bytes; BLAKE3 governs only hashes this document defines. `ziffle` uses
-SHA-256 internally for its own transcript. [MENTAL §4.1]
+All protocol hashes are BLAKE3 1.8.7. **Why BLAKE3, what else is in the tree and
+what is unaudited about it are constructions, and `CRYPTOGRAPHY.md` §3.2 owns
+them** (D-011 rule 1). The four-reason list and the audit limitation that stood
+here were a copy of that section and are deleted; nothing in this document
+depends on them. One consequence is wire-visible and is therefore stated here: if
+the mental-poker proof system mandates a specific hash for Fiat–Shamir, that
+mandate wins for those bytes, and BLAKE3 governs only the hashes **this document
+defines** — the register below and nothing else.
 
 **Every protocol hash is domain-separated and length-prefixed.** Concatenating
 variable-length fields without length prefixes is ambiguous: `"AB" ‖ "C"` and
@@ -637,6 +665,7 @@ change; changing or removing one is a major change.
 | `p2p-poker v1 transcript` | `event_hash` (§3.2) |
 | `p2p-poker v1 stage` | `stage_hash` (§3.2) |
 | `p2p-poker v1 genesis` | the genesis hash of each chain (§3.1) |
+| `p2p-poker v1 abort-terminal` | `ABORT_TERMINAL(k)`, the terminal value of an aborted chain (§3.1) |
 | `p2p-poker v1 state` | `STATE_HASH` (§6) |
 | `p2p-poker v1 roster` | `roster_hash` (§3.1) |
 | `p2p-poker v1 rng-commit` | `RNG_COMMIT` commitment (§4.4) |
@@ -700,8 +729,49 @@ under, so the agreed table parameters are bound into the very first link — eve
 participant provably joined the same advertised game, which is what §4 of the spec
 means by "so that everyone agrees on them before the first hand is dealt".
 
-`TERMINAL(k)` is the `stage_hash` of the last stage of chain `k` — that is,
-of the `HAND_COMPLETE` stage or the `HAND_ABORT` stage.
+**`TERMINAL(k)`, normatively, and this is the disposition of P3 and G1.** A chain
+ends in exactly one of two ways and each has its own terminal value:
+
+```
+TERMINAL(k) = stage_hash of the HAND_COMPLETE stage          the hand was decided
+            = ABORT_TERMINAL(k)                              the hand was aborted
+
+ABORT_TERMINAL(k) = h("p2p-poker v1 abort-terminal",
+                      [ u16_be(protocol_version), table_id, u64_be(k),
+                        GENESIS(k) ])
+```
+
+`TERMINAL(0)` for the setup chain is the `stage_hash` of the `TABLE_READY` stage.
+
+**Why an aborted hand's terminal is a function of its genesis and of nothing
+else.** `GENESIS(k+1)` is a function of `TERMINAL(k)`, so if two peers derive
+different `TERMINAL(k)` the table cannot start another hand — which is exactly
+the deadlock P3 named and the fork G1 created. An abort is, by definition, the
+outcome in which the peers **could not agree about the middle of the hand**:
+which stage stalled, which contributions arrived, which seat was silent. Deriving
+`TERMINAL(k)` from any of those quantities derives it from the one thing that is
+in dispute. `GENESIS(k)` is not in dispute: every peer agreed it before the hand
+started, it is the link that every event of hand `k` chains to, and it carries
+`session_id`, `roster_hash(k)` and `TERMINAL(k-1)` transitively. So on the abort
+path `TERMINAL(k)` is a function of state every peer already agrees on, exactly
+as the commission requires, and `GENESIS(k+1)` exists no matter where, when, or
+by whom the hand was aborted.
+
+Chip conservation carries the rest: an abort restores every stack to its
+start-of-hand value (D-010, §4.10), so `roster_hash(k+1)`'s stack vector equals
+`roster_hash(k)`'s and no peer needs the aborted hand's content to build the next
+genesis.
+
+**The cost, stated rather than hidden.** An aborted hand's events are bound to
+`GENESIS(k)` and to each other, and each is individually signed, so none of them
+can be forged or altered. But they are **not** bound into `GENESIS(k+1)`, so a
+party replaying the session chain cannot tell from the chain alone whether an
+aborted hand's transcript is complete. That is the price of not deriving a
+terminal hash from a disputed quantity, and it costs nothing that depends on it:
+an aborted hand moves no chips, awards no pot and changes no stack, so no later
+value is computed from its content. `HAND_COMPLETE` — the only path on which a
+hand's content changes anything — keeps the ordinary `stage_hash` and keeps the
+full binding.
 
 `session_id` is defined in §4.3. Because it is inside `GENESIS(k)` and every event
 of hand `k` chains transitively to `GENESIS(k)`, every event is bound to the
@@ -711,13 +781,15 @@ session without needing a `session_nonce` field in the envelope. That satisfies
 **The chain is *not* per-sender.** A per-sender chain would let a peer's history
 be reordered relative to another's. It is one chain per hand, shared.
 
-### 3.2 Stages: single-writer and collective
+### 3.2 Stages: single-writer, collective, and witness-independent terminal
 
 The `sequence` field is the **stage index**, starting at 0 within each chain. It
 is shared by every event of the same stage.
 
 Each stage has a *type* and a *required emitter set*, both of which every peer
-derives deterministically from the state after the previous stage. Two shapes:
+derives deterministically from the state after the previous stage. **Three
+shapes**, the third of which is used by exactly one message type and is the
+disposition of P3:
 
 **The stage-kind principle, normative.** Which shape a stage takes is not a free
 choice and is not decided per message type by taste:
@@ -732,8 +804,13 @@ makes that writer an authority. A collective derived stage costs `n` copies of a
 small message instead of one and removes the veto. That is the trade and it is
 taken. Any future message type is classified by this rule and by nothing else.
 
-Applying it: `HAND_INIT`, `HAND_COMPLETE`, `HAND_ABORT` and `TIMEOUT_CERT` are
-**collective**, because every field of each is derived. `SHUFFLE_STEP`,
+There is one exception and it is not a taste exception either: a stage that
+exists **because** a required emitter is silent cannot have a required emitter
+set, and that is the third shape below.
+
+Applying it: `HAND_INIT`, `HAND_COMPLETE` and `TIMEOUT_CERT` are **collective**,
+because every field of each is derived. `HAND_ABORT` is
+**witness-independent terminal**. `SHUFFLE_STEP`,
 `SHUFFLE_PROOF`, every `ACTION_*`, and the voluntary `PLAYER_SIT_OUT` /
 `PLAYER_SIT_IN` / `PLAYER_LEAVE` are single-writer, because the permutation, the
 betting decision and the seat decision are genuine choices.
@@ -749,7 +826,7 @@ stage_hash(s) = h("p2p-poker v1 stage",
 **Collective stage.** A fixed set `R` of seats each emit exactly one event, and
 the stage is complete only when every seat in `R` has been heard. Examples:
 `TABLE_READY`, `RNG_COMMIT`, `HAND_INIT`, `DECK_INIT`, `DEAL_PRIVATE`,
-`BOARD_REVEAL`, `STATE_HASH`, `TIMEOUT_CERT`, `HAND_COMPLETE`, `HAND_ABORT`.
+`BOARD_REVEAL`, `STATE_HASH`, `TIMEOUT_CERT`, `HAND_COMPLETE`.
 
 ```
 stage_hash(s) = h("p2p-poker v1 stage",
@@ -758,6 +835,38 @@ stage_hash(s) = h("p2p-poker v1 stage",
                         u8(s_i) || event_hash(s_i) ])
 ```
 
+**Witness-independent terminal stage — normative, and the disposition of P3.**
+Used by `HAND_ABORT` and by nothing else.
+
+> A witness-independent terminal stage has **no required emitter set**. Any seat
+> of the hand's `HAND_INIT` set may emit its copy; every such seat normally does;
+> and the stage **closes at a receiver on the first copy that verifies and passes
+> §4.10's acceptance gate**. Waiting for a second copy is never required and a
+> silent seat never blocks it.
+>
+> It is the **last** stage of its chain. Nothing chains from it, so it has **no
+> `stage_hash`** — it is the one stage in this protocol that has none, and it
+> needs none, because `TERMINAL(k)` on the abort path is `ABORT_TERMINAL(k)`
+> (§3.1), a function of `GENESIS(k)` alone.
+>
+> Its `sequence` is the index of the stage that stalled: the successor of the last
+> stage complete **at the emitter**, chained from that stage's `stage_hash`. Two
+> peers that disagree about which stage stalled therefore emit at two different
+> `sequence` values, and that disagreement is harmless — it changes nothing that
+> anything downstream reads, because `ABORT_TERMINAL(k)` does not contain
+> `sequence`.
+
+**Why P3 could not be settled any other way.** The abort's old required emitter
+set was "the `HAND_INIT` set minus the seats this abort attributes". On the
+`hand_deadline_ms` path the abort attributes nobody (§8.4), so the set contained
+the silent seat whose silence is the reason the abort exists: the stage could not
+complete, `TERMINAL(k)` was never defined, and `GENESIS(k+1)` never existed.
+Deriving the set from *who was heard* instead was the other candidate, and it
+forks — peers that heard different subsets derive different sets. A stage with no
+set at all disposes of both horns, and it costs nothing, because every field of
+the abort body is a function of `GENESIS(k)` and of the receiver's own timer, so
+there is nothing a witness set would have been protecting.
+
 Every event of stage `s` carries `previous_event_hash = stage_hash(s-1)`, and
 `stage_hash(-1) = GENESIS(hand_id)`.
 
@@ -765,8 +874,12 @@ Every event of stage `s` carries `previous_event_hash = stage_hash(s-1)`, and
 events of `event_class = 0` when the stage closes normally, and over the
 certificates of `event_class = 2` when the stage closes by certificate (§8.3).
 Votes (`event_class = 1`) never enter a `stage_hash`; they are carried inside the
-certificate. A stage therefore has exactly one closing form in the chain, even
-though a vote and a real event may both exist for the same `sequence`.
+certificate. A terminal `HAND_ABORT` enters no `stage_hash` at all, because the
+stage it closes has none. A stage therefore has exactly one closing form in the
+chain, even though a vote and a real event may both exist for the same
+`sequence` — and, at an abandoned stage, a partial set of contributions and the
+abort that abandons it may both exist for the same `sequence` too. Those are two
+slots, not one, because `event_type` is in §5.2.1's key.
 
 ```
 event_hash = h("p2p-poker v1 transcript", [ body_bytes ])
@@ -905,13 +1018,18 @@ no player learns another's contribution while still able to change its own.
 
 Given only the transcript, the table advertisement, and **an implementation of the
 engine — its own**, since no canonical reference engine is defined anywhere in
-this corpus (§6.3 case (c), OQ-F) — an independent third party who was never at
+this corpus (§6.3 case (c), OQ-A) — an independent third party who was never at
 the table can check all of the following, with no secret input:
 
 1. **Structure.** Every event's canonicality gate passes; every signature verifies
    under the `sender_public_key` in its own body with `verify_strict`; every
    `previous_event_hash` equals the computed `stage_hash` of the preceding stage;
-   `GENESIS(k)` chains to `TERMINAL(k-1)`.
+   `GENESIS(k)` chains to `TERMINAL(k-1)`, where `TERMINAL` is §3.1's — the
+   `HAND_COMPLETE` stage's `stage_hash` on a decided hand, and `ABORT_TERMINAL(k-1)`
+   on an aborted one, which a verifier recomputes from `GENESIS(k-1)` alone. The
+   terminal `HAND_ABORT` of an aborted hand has no `stage_hash` and is checked as
+   a signed event chained to the last complete stage of its own chain, not as a
+   link into the next.
 2. **Authorship and order.** Who performed each action and in what order — this is
    `SPEC_CS.md` §13's first two requirements, and it holds because the emitter set
    of every stage is a deterministic function of prior state.
@@ -954,7 +1072,7 @@ the table can check all of the following, with no secret input:
 
 All of this requires that somebody kept the transcript. Whether it is persisted
 to the profile directory by default is **OPEN QUESTION Q-06**; without
-persistence there is no artefact at all, and §11.3's diagnostic claim has nothing
+persistence there is no artefact at all, and §6.3 case (c)'s diagnostic claim has nothing
 behind it.
 
 What a verifier **cannot** check, stated because §36 forbids smoothing this over:
@@ -965,7 +1083,7 @@ What a verifier **cannot** check, stated because §36 forbids smoothing this ove
   canonical one, no versioning rule that ties one to `protocol_version`, and no
   procedure by which two parties establish they ran the same one. So two verifiers
   disagreeing about check 7 reproduces §6.3 case (c) offline instead of resolving
-  it, and a third party's verdict binds nobody. This is **OQ-F** (§12), and until
+  it, and a third party's verdict binds nobody. This is **OQ-A** (§12), and until
   it is settled a verifier's rule-correctness result is a diagnosis, not an
   adjudication.
 
@@ -1009,9 +1127,9 @@ before the signature so two encodings of one event cannot both be accepted.
 | 8 | Sender is a permitted emitter in this context (roster member for a table event; any peer for a lobby event) | drop |
 | 9 | `verify_strict(sender_public_key, TO_BE_SIGNED, signature)` | **protocol violation**, attributable |
 | 10 | `chain_scope` matches the `event_type`'s entry in §4.11, and if `chain_scope == 0` the envelope carries the sentinels of §2.3 exactly | drop |
-| 10a | Anti-replay: `table_id`, `hand_id`, `sequence`, `event_class`, `previous_event_hash` for a chained event; the per-type rule of §5.2 for an unchained one | violation or duplicate-drop |
+| 10a | Anti-replay: for a chained event, look up **`slot(E)` exactly as §5.2.1 defines it** — this step reproduces no part of that tuple and reads it whole; for an unchained event, the per-type rule in §5.2.1's box | violation or duplicate-drop |
 | 11 | Decode the payload struct, canonicality gate, per-field range checks | violation |
-| 12 | Stage legality: is this `event_type` from this seat expected at this `sequence`? | violation |
+| 12 | Stage legality: is this `event_type` from this seat expected at this `sequence`? **And the stage-contribution rule: a seat that has already contributed to a stage may not contribute to it again under a different `event_type`** — the one exception is the terminal `HAND_ABORT` of §4.10, which by construction lands at a stage its emitter has usually already contributed to, and which is also the one event exempt from step 10a's chain-position rule (§4.10) | violation |
 | 13 | Semantic legality: the poker engine re-validates the action from scratch | violation |
 | 14 | Cryptographic proof verification (shuffle proof ≈ 42 ms, DLEQ ≈ 0.1 ms) | violation, `INVALID_SHUFFLE_PROOF` |
 | 15 | Apply to state | — |
@@ -1040,7 +1158,19 @@ goes. What survives is the resource bound: §9.5 may rate-limit or disconnect a
 source that floods malformed or unverifiable frames, keyed on **volume**, not on
 fault, and identical for a buggy peer and a hostile one. It is not a sanction for
 cheating and it never keys on `attributed`. Block-listing an identity is a
-**user** decision, made in the UI from evidence the UI shows. [LIBP2P §1]
+**user** decision, made in the UI from evidence the UI shows.
+
+**Normative, and it binds every layer including the transport (D-011 rule 3).**
+
+> **No document in this corpus may block, evict, unseat, refuse or allow-list a
+> peer on the strength of a protocol proof, an attribution, a fault record or a
+> failed verification.** That includes the transport layer: an
+> `EquivocationProof`, an invalid signature and a failed shuffle proof are each
+> evidence, and none of them is an input to any peer-blocking decision anywhere.
+> `NETWORK_STACK.md` §6.6 and §11.5 assert the opposite today and are wrong;
+> a block list may be present and compiled in, but its only trigger is the
+> **user**. §9.5's volume-keyed ladder is untouched by this and is the whole of
+> what remains automatic.
 
 ### 4.1 `table_id`, and who has authority
 
@@ -1891,9 +2021,9 @@ has already emitted its own event at a collective stage `s` can vote about stage
 about; it does not occupy it.
 
 **The vote's anti-replay slot key includes its subject (D-009 rule 1).** The key
-is `(protocol_version, table_id, hand_id, sequence, event_class,
-sender_public_key)` **plus the payload's `n(1) subject_seat`**, as §5.2 defines
-it normatively for the whole corpus. The class axis alone is not enough: §8.4
+is §5.2.1's, whole; this section reproduces no part of it and adds none. What
+matters here is *why* `subject(E)` has an arm for `event_class == 1`, because the
+reason is a rule of this section: the class axis alone is not enough — §8.4
 specifies two simultaneous subjects at one stage as a normal state, an honest
 voter whose timers expired against both seats is *entitled* to emit a vote about
 each, and with the subject carried only in the body those two votes would be two
@@ -2123,42 +2253,106 @@ deltas — is canonical. [RULES A′4]
 
 **`0x0802 HAND_ABORT`**
 
-*Direction:* **collective stage**, terminal for the hand; the required emitter set
-is the same set that emitted `HAND_INIT`, **minus every seat named in this
-abort's own `n(1) attributed`**. Every field is derived, so there is no writer
-(§3.2).
+*Direction:* **witness-independent terminal stage** (§3.2), terminal for the hand.
+There is **no required emitter set**: any seat of this hand's `HAND_INIT` set may
+emit its copy, every such seat normally does, and the stage closes at a receiver
+on the first copy that verifies and passes the acceptance gate below. Every field
+is derived, so there is no writer either.
 
-**That subtraction is normative and §4.11's row says the same thing (N9(a)).**
-An earlier revision of the summary table gave the emitter cell as "all present
-seats", which cannot be right: a collective stage completes only when every
-required emitter is heard (§3.2), and the attributed seat is by construction the
-one that is silent, so under that cell an abort against a vanished seat could
-never complete its own stage and the whole abort path would deadlock behind the
-failure it exists to dispose of. The set is stated on `attributed` rather than on
-"whose failure is the reason", because `attributed` is a field of the body that
-every peer recomputes identically, so every peer derives the same emitter set
-from the same bytes. Where `attributed` is empty — `cause = 4`, and `cause = 1`
-on the §8.4 `hand_deadline_ms` path and on the §6.3 case (b) path — the set is
-the whole `HAND_INIT` set. The set is never empty: attribution names seats that
-failed, and a seat that is emitting an abort naming itself is not a case this
-document produces.
+**P3 is settled here, normatively, and this cell is the answer the previous
+revision declined to give.**
 
-**Unresolved, and named rather than papered over: the emitter set of an
-unattributed abort (P3).** On the `hand_deadline_ms` path the abort exists
-*because* a seat is silent, and under the cell above that silent seat is in the
-required emitter set, so the stage cannot complete and `TERMINAL(k)` is never
-defined. D-010 does not dissolve this one — it is a liveness defect, not a chip
-defect — and it is the disposition of every below-floor stall, which §8.3 makes
-every heads-up stall. This document does **not** settle it in this revision;
-`STATE_MACHINE.md` §5.2 carries a named default whose own objection is that peers
-that disagree about what arrived derive different emitter sets and therefore fork
-`TERMINAL(k)`. Whatever rule is adopted must make the set a function of state
-every peer already agrees on, and it must be adopted here, in this cell, before
-the engine is written.
+> **The terminal stage of an aborted hand is witness-independent (§3.2), it has
+> no `stage_hash`, and `TERMINAL(k) = ABORT_TERMINAL(k)` (§3.1).** No seat's
+> silence can block it, no two peers can derive different terminal values from
+> it, and `GENESIS(k+1)` therefore exists on every abort path at every table
+> size. `STATE_MACHINE.md`'s witness-independent shape is **adopted**; its
+> `stage_hash` formula is not needed and is not adopted, because the terminal
+> value is taken from §3.1 rather than from the stage.
+
+The cell this replaces read "the same set that emitted `HAND_INIT`, minus every
+seat named in this abort's own `n(1) attributed`", and it deadlocked exactly as
+the gate said: on the `hand_deadline_ms` path `attributed` is empty, so the
+silent seat stayed in the required set and the stage could never complete.
+`STATE_MACHINE.md` §4.1 reached the right shape first and this document owns the
+ruling, so the ruling is made here (D-011 rule 1).
+
+**Its `sequence`, and G1 — the defect the previous pass's own P3 fix created.**
+A stalled stage has no `stage_hash`, so the abort cannot chain from it; it chains
+from the last stage complete at its emitter and therefore carries **the stalled
+stage's own index** as its `sequence`. There is no third option. Every honest
+peer that already contributed to that stalled stage has consequently signed a
+second `chain_scope = 1`, `event_class = 0` body at that `(sequence, sender)`.
+
+Under the slot key as it stood, those were **one slot**: the abort was rejected
+at §4.0 step 10a by every receiver including its own emitter — so `TERMINAL(k)`
+was again never defined, by a new route — and it was simultaneously a verifying
+`EquivocationProof` against the honest peer the protocol *required* to emit it.
+That is D-009 rule 1's sixth occurrence and it is closed by **§5.2.1's key, which
+contains `event_type`** (D-011 rule 2). `DECK_INIT` at `s` and `HAND_ABORT` at
+`s` are two slots. Both halves — the rejection and the self-incrimination — are
+gone, and they are gone by the definition rather than by a rule about this one
+message type, which is the point of writing the key down once.
+
+**One abort per emitter per hand.** A peer emits at most one terminal
+`HAND_ABORT` for a given `hand_id`, at one `sequence`. It cannot vary the
+`sequence` to produce a second, because the first ends the hand at it.
+
 *Legal:* only on one of the terminal triggers enumerated below, **every one of
-which is chained content**: a `kind = 2` `TIMEOUT_CERT` that closed a stage, the
-expiry of `hand_deadline_ms`, a failed shuffle or reveal proof, or the §6
-divergence procedure. An unchained event never makes this message legal (§5.2).
+which is chained content or the emitter's own expired timer**: a `kind = 2`
+`TIMEOUT_CERT` that closed a stage, the expiry of `hand_deadline_ms`, a failed
+shuffle or reveal proof, or the §6 divergence procedure. An unchained event never
+makes this message legal (§5.2).
+
+**Acceptance gate — normative, and it is what stops a witness-independent
+terminal from becoming a one-message hand void.** A receiver accepts a terminal
+`HAND_ABORT` only when the trigger for its `cause` is present **in that
+receiver's own state**:
+
+| `cause` | The receiver's own trigger | Before that trigger |
+|---|---|---|
+| `1`, certified-subject path (`cert_hash = Some`) | it holds, or `n(3) evidence` carries, the named `kind = 2` `TIMEOUT_CERT` with `\|V\| >= 2` | reject |
+| `1`, hand-deadline path (`attributed = []`, `cert_hash = None`) | its **own** `hand_deadline_ms` has expired (§8.2) | **buffer, do not reject** |
+| `1`, §6.3 case (b) | it has itself reached case (b), **or** its own `hand_deadline_ms` has expired | **buffer, do not reject** |
+| `2`, `3` | `n(3) evidence` verifies — the failing `SHUFFLE_PROOF` or reveal proof carries its own disproof | accept at once |
+| `4` | it is itself in the §6.3 case (c) terminus | **buffer, do not reject** |
+
+**Buffer, never reject, is the load-bearing half.** Rejecting a premature abort
+would put the deadlock back: a peer whose timer runs a few hundred milliseconds
+behind would refuse the artefact and both would wait for each other. Buffering
+costs the clock spread and nothing else, because §8.2 anchors every peer's
+`hand_deadline_ms` to the **same agreed event**, `TERMINAL(k-1)` — which is why
+R-1's fix is a correctness precondition of this gate and not a tidy-up.
+
+And an early abort buys an attacker nothing: it is held until the receiver's own
+deadline expires, at which point the receiver would have aborted anyway. The only
+thing a peer can do by emitting one early is to abort the hand at the deadline,
+which it could equally do by going silent (`THREAT_MODEL.md` X8). No new escape is opened.
+
+**Its position in the chain is checked loosely, and that is deliberate.** A
+receiver whose own chain head for hand `k` differs from the abort's
+`previous_event_hash` still accepts it, provided the abort's `sequence` is a
+stage index of hand `k` and every other check passes. Two peers can honestly
+disagree about which stage stalled — one heard a contribution the other did not —
+and a strict parent check would have each reject the other's artefact, which is
+the deadlock again by a third route. This is the **one** exemption from §4.0
+step 10a's chain-position rule in the whole document, and it is safe for exactly
+one reason: **nothing downstream reads the abort's `sequence` or its parent.**
+`ABORT_TERMINAL(k)` is a function of `GENESIS(k)`, so an abort accepted at the
+"wrong" stage index yields the same terminal value as one accepted at the right
+one. The `sequence` and the parent are a record of where this emitter believed
+the hand stopped, and nothing more.
+
+**Precedence against `HAND_COMPLETE`.** A hand is decided or aborted, never both.
+A receiver that holds a complete `HAND_COMPLETE` stage for hand `k` discards
+every `HAND_ABORT` for that hand; a receiver that applied an abort and later
+accepts a complete `HAND_COMPLETE` stage for the same hand replaces its terminal
+with that stage's `stage_hash`. `HAND_COMPLETE` wins because it is collective:
+it completes only if **every** present seat emitted its copy, so a completing
+`HAND_COMPLETE` proves that no seat was silent, which is the premise every abort
+rests on. The race is narrow — it needs a peer's deadline to expire between its
+own `HAND_COMPLETE` emission and the arrival of the last other copy — and it is
+resolved without a vote, a timer or a tie-break.
 
 | Field | Type | Limit / rule |
 |---|---|---|
@@ -2169,9 +2363,10 @@ divergence procedure. An unchained event never makes this message legal (§5.2).
 | `n(4) deltas` | `Vec<i64>` | **all zeroes, always (D-010).** An abort moves no chips, so there is no per-seat delta to carry; the field is a vector of `0` of length `\|occupied seats\|`. It is kept rather than removed so that `HAND_ABORT` and `HAND_COMPLETE` stay directly comparable to a verifier, and so that "the deltas sum to zero" stays one receiver check across both terminal messages rather than two |
 | `n(5) final_stacks` | `Vec<u64>` | **the start-of-hand stacks, always (D-010)** — that is, `stack_at_hand_start[s]` for every occupied seat ascending, exactly the values already bound into `roster_hash(k)` and hence into `GENESIS(k)`. Every peer holds them from the genesis of the hand, so this field is a function of agreed state and two honest peers cannot derive it differently |
 
-*Receiver must validate:* the `cause` is one of the four defined values; the
-trigger for that cause is present in this receiver's own accepted chain content;
-`cert_hash` is present exactly on the certified-subject path and `None`
+*Receiver must validate:* the `cause` is one of the four defined values; **the
+acceptance gate above passes** — the trigger for that cause is present in this
+receiver's own state, and where the gate says *buffer* the event is held, not
+rejected; `cert_hash` is present exactly on the certified-subject path and `None`
 everywhere else; `evidence` is present exactly for causes 2 and 3; and — the
 check that makes D-010 enforceable at the receiver rather than trusted at the
 emitter — **`n(4) deltas` is all zeroes and `n(5) final_stacks` equals this
@@ -2227,7 +2422,7 @@ table (§6.4), and recover its commitment in each case. Nothing in the protocol
 charges for it. The only pressure left is the one play money could ever have
 delivered: repeated aborts attributable to one identity are visible in the
 transcript, to everyone, permanently, and declining to sit with such a player is a
-**user** decision (D-010 point 3). §11.3 carries this as an unfixed limitation and
+**user** decision (D-010 point 3). `THREAT_MODEL.md` §8 limitation 4 carries this and
 `THREAT_MODEL.md` must carry it as one too.
 
 **The `cause` values are evidence, not dispositions.** They no longer select
@@ -2258,7 +2453,7 @@ causes selected between chip outcomes. Folding it into `cause = 4` was the
 alternative and was rejected, because case (b) is a different fact about the world
 — events exist and are being withheld — from case (c), where nothing is missing
 and the derivations still differ, and recording which fact it was is the `cause`
-field's only remaining job. **OQ-B is untouched**: no adjudication of the
+field's only remaining job. **OQ-D is untouched**: no adjudication of the
 withholding is specified here, and none is claimed.
 
 `cause = 4` remains the one cause that **faults the table** — no further hand is
@@ -2266,13 +2461,19 @@ dealt (§6.4). That is a liveness consequence, not a chip consequence, and it is
 the only asymmetry left between the four causes.
 
 **A hand abort never ends the tournament or the cash game.** Per D-006 point 5,
-the next hand begins immediately afterwards, automatically. A seat that went
-silent is treated as absent from the next hand by D-005's absent-seat rule
-**because it is silent**, not because an abort named it: the absent-seat state is
-reached from observed silence and is left by the peer reappearing, and it costs
-the seat its blinds exactly as it would live. It is not a penalty, it is not
-applied on the strength of an attribution, and no seat is unseated by it (D-010
-point 3).
+the next hand begins immediately afterwards, automatically, from
+`GENESIS(k+1)` — which exists on every abort path because `TERMINAL(k)` is
+`ABORT_TERMINAL(k)` (§3.1).
+
+**What an abort does to a seat's state is `STATE_MACHINE.md`'s, not this
+document's** (D-011 rule 1). The paragraph that stood here restated D-005's
+absent-seat rule — that a silent seat is absent from the next hand because it is
+silent and not because an abort named it, that it is left by the peer
+reappearing, and that no seat is unseated by it. `STATE_MACHINE.md` §8.7 owns
+that and says it. What this document is normative about, and repeats nowhere
+else, is the wire fact underneath it: **`n(1) attributed` is not read by any rule
+in this document, and no receiver may derive a seat's state from it** (D-010
+point 2).
 
 ---
 
@@ -2359,7 +2560,7 @@ means it does not and never can be.
 | `0x0702` | `STATE_ACK` | table mesh | 1 | collective | all present seats |
 | `0x0703` | `DISPUTE` | table mesh | **0** | out-of-stage | any participant |
 | `0x0801` | `HAND_COMPLETE` | table mesh | 1 | collective | all present seats |
-| `0x0802` | `HAND_ABORT` | table mesh | 1 | collective | the `HAND_INIT` set minus every seat named in `n(1) attributed` (§4.10) |
+| `0x0802` | `HAND_ABORT` | table mesh | 1 | **witness-independent terminal** | any seat of the `HAND_INIT` set; no required set (§3.2, §4.10) |
 | `0x0803` | `PLAYER_SIT_OUT` | table mesh | 1 | single | the seat |
 | `0x0804` | `PLAYER_SIT_IN` | table mesh | 1 | single | the seat |
 | `0x0805` | `PLAYER_LEAVE` | table mesh | 1 | single | the seat |
@@ -2375,25 +2576,60 @@ envelope paragraph say the same thing and must be kept in step with this row. It
 cells are consistent, not in tension. `PLAYER_LEAVE` is on the chained side of
 that line with no exception of any kind (M4, §4.10).
 
-**Every type in this table has been checked against §5.2's honest-interleaving
-property, and the check is the reason two of the rows carry a subject axis.** The
-result, so a future editor can re-run it rather than re-derive it:
+#### The honest-interleaving check, all 39 types, against §5.2.1's key
 
-| Group | Why one honest sender cannot fill a slot twice |
-|---|---|
-| The thirteen `chain_scope = 0` types | Outside the predicate entirely (§5.2). Anti-replay is per-type and named there |
-| Collective ordinary stages — `TABLE_READY`, `RNG_COMMIT`, `RNG_REVEAL`, `HAND_INIT`, `DECK_INIT`, `DECK_COMMIT`, `DEAL_PRIVATE`, `BOARD_REVEAL`, `SHOWDOWN_REVEAL`, `HAND_COMPLETE`, `HAND_ABORT` | The emitter set is one contribution per seat per stage, and each street's stage has its own `sequence`. Capacity one by the stage rule |
-| `STATE_HASH`, `STATE_ACK` | **Not clean by the stage rule, and the verdict that claimed they were is withdrawn.** These two sat in the row above under "capacity one by the stage rule", which is true of every other member of that group and **false of these two**: §6.3 requires a peer that reconciles after a divergence to publish a *second, different* state hash for a checkpoint it has already signed, and that is two distinct bodies of one honest signer for one `sequence`. It is the corpus's only required re-emission with changed content, against the obligation §5.2 states two paragraphs below its predicate, and it manufactures an `EquivocationProof` against the peer whose only fault was a dropped stream. They are clean **only because §4.9 gives a reconciliation round its own `sequence`**, so the first value and the re-derived one occupy two slots. The property is carried by that rule and not by the stage rule; an editor who deletes the rule reopens the defect, which is why the two types are broken out here rather than left in a group whose reason does not apply to them |
-| Single-writer ordinary stages — `SHUFFLE_STEP`, `SHUFFLE_PROOF`, the five `ACTION_*`, `PLAYER_SIT_OUT`, `PLAYER_SIT_IN`, `PLAYER_LEAVE` | One writer, one event, one stage. Two bodies here is the genuine article: two actions claimed for one turn |
-| `SHOWDOWN_MUCK` against `SHOWDOWN_REVEAL` | The **one** pair of ordinary types that can share a stage. They are mutually exclusive per seat by `showdown_policy` (§4.6), and that exclusivity is what holds the slot at capacity one — it is a normative requirement, not a convention |
-| `TIMEOUT_VOTE`, `TIMEOUT_CERT` | Two subjects at one stage are normal (§8.4), so the class axis alone left one honest sender two legitimate bodies in one slot. Closed by putting the subject in the key (§4.8, §5.2) |
+**This table is derived per type from the slot key of §5.2.1, not from stage-kind
+groups.** The grouped form that stood here certified two defects with one
+sentence — P1's `STATE_HASH` and G1's `HAND_ABORT`, both in the row whose reason
+was "capacity one by the stage rule" — because the group is not what the
+predicate indexes. The question asked of each row is the only question that
+matters: **can one honest peer, doing what this document requires or permits of
+it, produce two `SignedEvent`s whose §5.2.1 keys are equal and whose
+`event_hash`es differ?**
 
-`13 + 11 + 2 + 10 + 1 + 2 = 39`, so the check covers the whole table with nothing
-counted twice and nothing left out; the arithmetic is stated so that a row added
-without a verdict is visible as a mismatch rather than as a silent omission. It
-read `13 + 13 + 10 + 1 + 2 = 39` while `STATE_HASH` and `STATE_ACK` were inside
-the collective-ordinary group — the arithmetic was right and the verdict it
-covered was wrong, which is worth noting: a correct count is not a check.
+The column *Varies within one `(hand_id, sender)`* names what an honest emitter
+may legitimately change between two emissions, and the verdict is clean exactly
+when some key component changes with it.
+
+| # | Type(s) | Required / permitted honest emissions | Varies within one `(hand_id, sender)` | Verdict |
+|---:|---|---|---|---|
+| 1–13 | `HELLO`, `CAPABILITIES`, `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST`, the six `LOBBY_*`, `DISPUTE` | any number, any time | — | **Outside the predicate.** `chain_scope = 0` occupies no slot; per-type anti-replay in §5.2.1's box |
+| 14 | `TABLE_READY` | one per seat, setup chain | — | **Clean** |
+| 15 | `RNG_COMMIT` | one per seat, own stage | — | **Clean** |
+| 16 | `RNG_REVEAL` | one per seat, the next stage | `sequence` | **Clean** |
+| 17 | `HAND_INIT` | one derived copy per present seat | — | **Clean.** A `HAND_INIT` that stalls is disposed of by a `HAND_ABORT` at `HAND_INIT`'s own `sequence`, which differs in `event_type` — row 36 |
+| 18 | `DECK_INIT` | one per dealt-in seat | — | **Clean** |
+| 19 | `SHUFFLE_STEP` | one, single-writer | — | **Clean** |
+| 20 | `SHUFFLE_PROOF` | one, the next stage | `sequence` | **Clean** |
+| 21 | `DECK_COMMIT` | one per dealt-in seat | — | **Clean** |
+| 22 | `DEAL_PRIVATE` | one per dealt-in seat, **exactly** `2(m−1)` entries in one body | — | **Clean.** The "exactly" is what forbids incremental publication, which would be two bodies at one stage |
+| 23 | `BOARD_REVEAL` | one per dealt-in seat per street | `sequence` — each street its own stage | **Clean** |
+| 24 | `SHOWDOWN_REVEAL` | one per showdown seat | — | **Clean** |
+| 25 | `SHOWDOWN_MUCK` | one per showdown seat, mutually exclusive with row 24 by `showdown_policy` (§4.6) | `event_type`, if a seat emits both | **Clean.** Since `event_type` entered the key the pair is two slots, so a seat emitting both is a **stage violation** under §4.0 step 12, not an equivocation. §4.6's exclusivity stays normative and is what rejects the second (§5.2.1) |
+| 26–30 | `ACTION_CHECK`, `ACTION_CALL`, `ACTION_BET`, `ACTION_RAISE`, `ACTION_FOLD` | one per turn, single-writer | `event_type`, if a seat claims two actions for one turn | **Clean.** Same change as row 25 and the same price: two *different* action types at one `sequence` are a stage violation, not a proof; two bodies of the **same** type — two `ACTION_RAISE` with different amounts — are still an equivocation (§5.2.1) |
+| 31 | `TIMEOUT_VOTE` | one per subject per stage; two simultaneous subjects are **normal** (§8.4) | `subject_seat` | **Clean since M2**, by the subject axis in the key |
+| 32 | `TIMEOUT_CERT` | one per `subject_digest` per stage | `subject_digest` | **Clean since M2**, by the subject axis. Its one variable field `n(1) votes` is pinned by the receiver check of §4.8 |
+| 33 | `STATE_HASH` | one per checkpoint, **plus one per reconciliation round** — a required re-emission with *changed* content, the only one in the corpus | `sequence`, and only because §4.9 gives each reconciliation round `s_ckpt + r` | **Clean since P1, and clean by that rule alone.** Not by the stage rule: an editor who deletes §4.9's normative box reopens P1 the same day |
+| 34 | `STATE_ACK` | one per checkpoint and one per reconciliation round | `sequence`, same rule | **Clean since P1**, same reason |
+| 35 | `HAND_COMPLETE` | one derived copy per present seat, at a fresh `sequence` — the last stage completed, so nothing occupies it | — | **Clean** |
+| 36 | `HAND_ABORT` | **one per emitter per hand**, at the stalled stage's own `sequence`, where the emitter has usually already contributed | `event_type` — against the contribution it shares a `(sequence, class)` with | **Clean since G1, and only because `event_type` is in the key (§5.2.1, D-011 rule 2).** This row is the reason the key was rewritten. Under the seven-tuple it read FAILS: the abort collided with its own emitter's contribution, was rejected at §4.0 step 10a, and was a verifying proof against an honest peer |
+| 37 | `PLAYER_SIT_OUT` | one per seat, hand boundary only, single-writer | — | **Clean since M4** |
+| 38 | `PLAYER_SIT_IN` | same | — | **Clean since M4** |
+| 39 | `PLAYER_LEAVE` | same, and **only** there — the courtesy-notice clause is deleted | — | **Clean since M4** |
+
+**39 rows, numbered 1 to 39, one per message type of the table above.** The
+numbering replaces the group arithmetic that stood here (`13 + 11 + 2 + 10 + 1 +
+2 = 39`), because that arithmetic was correct on both occasions it covered a
+wrong verdict. A row added to the summary table without a row here is visible as
+a gap in the numbering, and a row here whose verdict rests on a rule names that
+rule so the rule cannot be deleted by an editor who does not know what it carries
+(rows 33, 34, 36).
+
+**Two verdicts changed direction in this revision and both are recorded as
+changes rather than restated as if they had always read that way:** row 36 went
+from FAILS to clean, and rows 25–30 went from "clean, and the exclusivity is what
+holds it" to "clean, and the collision is now a rejection rather than a proof".
+The second is the price of the first and §5.2.1 argues it.
 
 Codes `0xF000`–`0xFFFF` are reserved for private and experimental use and are
 **never** accepted inside a table session, regardless of capability negotiation.
@@ -2407,7 +2643,7 @@ Codes `0xF000`–`0xFFFF` are reserved for private and experimental use and are
 | Attack (§14 / §17) | Stopped by | Mechanism |
 |---|---|---|
 | replay of an old signed message | `previous_event_hash` + `sequence` | a replayed event's `previous_event_hash` does not equal the current `stage_hash(s-1)`, because the chain has moved on |
-| duplicate message | `event_hash` set per **slot**, where the slot key is §5.2's | a byte-identical repeat is idempotent; a differing repeat in one slot is equivocation. The class axis matters: a seat's own contribution at stage `s` and its `TIMEOUT_VOTE` about stage `s` share a `sequence` and are not duplicates of one another. The subject axis matters for the same reason one level down: two votes by one voter about two seats at stage `s` share a `sequence` **and** a class, and are not duplicates either |
+| duplicate message | an `event_hash` set per **slot**, and the slot key is §5.2.1's — read whole, reproduced nowhere | a byte-identical repeat is idempotent; a differing repeat in one slot is equivocation. §4.11 carries the per-type check that says why each key component is there |
 | out-of-order message | `sequence` = stage index | an event for stage `s+2` is buffered, never applied, until stage `s+1` completes |
 | message from another hand | `hand_id` **and** `previous_event_hash` | the chain of hand `k` cannot link to hand `k'` |
 | message from another table | `table_id` for chained events; the payload's table field for unchained ones | `table_id` is the table's public key, so it cannot be forged; an unchained message names its table in the payload and is bound to it by the signature over the whole body (§2.3) |
@@ -2423,38 +2659,118 @@ Codes `0xF000`–`0xFFFF` are reserved for private and experimental use and are
 
 ### 5.2 Equivocation, exactly
 
-**Definition, canonical for the whole corpus.** `THREAT_MODEL.md` G7 quotes it;
-no document restates it in its own words.
+#### 5.2.1 The anti-replay slot key — the one place it is written (D-011 rule 2)
 
-> Peer `K` equivocates when two `SignedEvent`s `E1 != E2` exist such that both
-> pass the canonicality gate, both verify under `K`'s public key with
-> `verify_strict`, both carry `chain_scope == 1`, their **slot keys are equal**,
-> and `event_hash(E1) != event_hash(E2)`.
->
-> **The slot key**, canonical for the whole corpus:
->
+**NORMATIVE. This box is the definition of the anti-replay slot for the whole
+corpus. `STATE_MACHINE.md`, `CRYPTOGRAPHY.md`, `NETWORK_STACK.md` and
+`THREAT_MODEL.md` reference this section by number and reproduce none of it —
+not the tuple, not a subset of it, not a paraphrase of it. §4.0 step 10a, §5.3's
+stored state and §4.11's per-type check all read this tuple and nothing else.**
+
 > ```
-> slot(E) = (protocol_version, table_id, hand_id, sequence, event_class,
->            sender_public_key == K)
->         ++ subject(E)
+> slot(E)  is defined only for  E.chain_scope == 1 , and is the 8-tuple
 >
-> subject(E) = ()                           when event_class == 0
->            = (payload n(1) subject_seat)   when event_class == 1   (TIMEOUT_VOTE)
->            = (payload n(0) subject_digest) when event_class == 2   (TIMEOUT_CERT)
+> slot(E) = ( E.protocol_version        u16     envelope n(0)
+>           , E.table_id                [u8;32] envelope n(1)
+>           , E.hand_id                 u64     envelope n(2)
+>           , E.sequence                u64     envelope n(3)
+>           , E.sender_public_key       [u8;32] envelope n(4)
+>           , E.event_class             u8      envelope n(11)
+>           , E.event_type              u16     envelope n(5)
+>           , subject(E)                        see below
+>           )
+>
+> subject(E) = ()                             when E.event_class == 0
+>            = ( payload n(1) subject_seat )   when E.event_class == 1  (0x0601)
+>            = ( payload n(0) subject_digest ) when E.event_class == 2  (0x0602)
 > ```
 >
-> Events with `chain_scope == 0` are outside this predicate entirely and can
-> never produce an `EquivocationProof`. Their anti-replay is per-type:
-> `timestamp_unix_ms` strict monotonicity per `table_id` for lobby adverts,
-> `list_serial` for `PLAYER_LIST`, `join_nonce` for the join RPC,
+> **Deliberately absent, each for a stated reason, and none of them may be
+> added by any document:**
+>
+> * `previous_event_hash` — a peer that chains one body to two parents at one
+>   `sequence` is forking the chain, and that must remain an equivocation. Putting
+>   the parent in the key would excuse it.
+> * `payload` and `emitted_at_unix_ms` and `next_deadline_ms` — the key must have
+>   capacity **one**, so it may contain only fields that legitimately vary. A key
+>   containing the body is a key no two events ever share, and a predicate over it
+>   is vacuous. This is also why §5.2.3's re-emission obligation exists.
+> * `chain_scope` — it is not a key component but the predicate's precondition.
+>   `chain_scope == 0` events occupy no slot at all, ever.
+>
+> **`event_class` is implied by `event_type`** — `0x0601` is class 1, `0x0602` is
+> class 2, every other type is class 0 — and it is carried in the key anyway,
+> because §5.3 partitions its stored state by class and because a coarser key
+> would be the unsafe direction: dropping a component merges slots and
+> manufactures false positives against honest peers, which is the failure D-009
+> rule 1 exists to prevent.
+>
+> **Unchained events.** `chain_scope == 0` events are outside this predicate
+> entirely and can never appear in an `EquivocationProof`. Their anti-replay is
+> per-type: `timestamp_unix_ms` strict monotonicity per `table_id` for lobby
+> adverts, `list_serial` for `PLAYER_LIST`, `join_nonce` for the join RPC,
 > `connection_nonce` plus a per-connection counter for the handshake, and for
 > `DISPUTE` idempotent de-duplication by `event_hash` within its
 > `(sender_public_key, table_id, hand_id)` scope, bounded by
 > `MAX_DISPUTES_PER_SENDER_PER_HAND` (§4.9).
 
-**Normative — the property every chained message type must satisfy. This is
-D-009 rule 1 and it is canonical for the corpus; the other four documents point
-here and do not restate it in their own words.**
+**Why `event_type` is in the key, and what it costs.** This is D-011 rule 2 and
+it is the sixth attempt at D-009 rule 1. The five previous attempts failed
+because the key was prose that each editor re-derived; this one is a tuple with
+field indices, and every other document points at it.
+
+`event_type` is the component G1 needed. The terminal `HAND_ABORT` of §4.10 is
+written at the **stalled stage's own `sequence`** — it must be, because a stage
+that never completed has no `stage_hash` to chain a successor from — so every
+honest peer that already contributed to that stage signs a second `class = 0`
+body at that `(sequence, sender)`. Without `event_type` those are one slot: the
+abort is rejected at §4.0 step 10a by every receiver including its own emitter,
+and it is simultaneously a verifying `EquivocationProof` against the honest peer
+that the protocol *required* to emit it. With `event_type` they are two slots and
+both halves are gone. See §4.10 and §4.11's per-type check.
+
+The price is paid in two places and is stated rather than hidden:
+
+* **Two different `ACTION_*` types claimed for one turn are no longer one slot.**
+  "I folded" to one peer and "I raised" to another are `0x0505` and `0x0504`, so
+  they no longer form an `EquivocationProof`. Two `ACTION_RAISE` events with
+  different amounts still do, because the type is equal and the payload is not.
+* **`SHOWDOWN_REVEAL` against `SHOWDOWN_MUCK`** likewise stops being an
+  equivocation and becomes a validity rejection only.
+
+Both remain **rejected**, by §4.0 step 12 and §3.2's stage rule: a stage admits
+one contribution per seat, whatever type it carries, and the second is a
+violation at every receiver that holds the first. Both remain **detected** by the
+route §5.2.4 describes for every equivocation under D-010 — the peers that
+accepted different first copies diverge, the next checkpoint shows two hashes,
+§6.3 runs, the hand ends neutrally. And both remain **evidence**: a `DISPUTE` is
+a carrier (§4.9) and may carry any two conflicting signed events, whether or not
+they meet this predicate. What is lost is the *label*, and under D-010 the label
+carries no consequence: a proof ends no hand, moves no chip and evicts nobody, so
+the difference between "an `EquivocationProof` names this key" and "two signed
+events by this key contradict each other" is one of vocabulary, not of effect.
+Weighed against a key that makes honest peers incriminate themselves — five
+times, in five passes — that is the right side of the trade, and D-011 rule 2
+makes it binding rather than discretionary.
+
+**A message whose honest emission can collide in this key is a defect in the
+message, not in the key** (D-011 rule 2). §4.11 carries the check for all 39
+types and is where a new type is checked before it is added.
+
+#### 5.2.2 The predicate
+
+**Definition, canonical for the whole corpus.** `THREAT_MODEL.md` G7 quotes it;
+no document restates it in its own words.
+
+> Peer `K` equivocates when two `SignedEvent`s `E1 != E2` exist such that both
+> pass the canonicality gate, both verify under `K`'s public key with
+> `verify_strict`, both carry `chain_scope == 1`, `slot(E1) == slot(E2)` under
+> §5.2.1, and `event_hash(E1) != event_hash(E2)`.
+
+#### 5.2.3 The property every chained message type must satisfy
+
+**Normative. This is D-009 rule 1 and it is canonical for the corpus; the other
+four documents point here and do not restate it in their own words.**
 
 > **No sequence of emissions that this protocol requires or permits of an honest
 > peer may produce two `SignedEvent`s in one slot, and therefore none may produce
@@ -2509,8 +2825,7 @@ correctness requirement, not a convenience.** §6.3 step 2 obliges *every* peer 
 emit `DISPUTE { kind = 1 STATE_DIVERGENCE }`, and step 4(a) obliges the same peer
 to emit a second one carrying the `EquivocationProof`. Both concern the same hand
 and, before this fix, both would have been chained with no rule assigning them
-distinct `sequence` values — two bodies in one
-`(protocol_version, table_id, hand_id, sequence, event_class, sender)` slot, which
+distinct `sequence` values — two bodies in one slot under §5.2.1's key, which
 is this predicate satisfied against an honest peer by behaviour the protocol
 *requires* of it. **A predicate that mandatory honest behaviour can satisfy is not
 a predicate; it is a false-positive generator.** With `chain_scope = 0` and the
@@ -2520,13 +2835,15 @@ class A-4 closed for lobby and join traffic, and it is now closed for the one
 message type whose entire purpose is to carry evidence.
 
 This definition works because of the stage rule, **restricted to chained
-events**: a sender emits at most one event per stage per class per subject, so
-the slot key above has capacity one for `chain_scope == 1`, and two distinct
-bodies in one slot is a contradiction the sender created and signed. The
-capacity-one claim is the load-bearing one, and it is exactly what the property
-above obliges each new type to re-establish: an earlier revision of this
-paragraph stated it on the six-tuple alone, which was true of every ordinary
-event and false of a timeout vote. Unchained traffic has no such slot — a `JOIN_REQUEST`,
+events**: a sender emits at most one event per stage per class per type per
+subject, so the slot key of §5.2.1 has capacity one for `chain_scope == 1`, and
+two distinct bodies in one slot is a contradiction the sender created and signed.
+The capacity-one claim is the load-bearing one, and it is exactly what the
+property above obliges each new type to re-establish. Two earlier revisions of
+this paragraph stated it on too short a tuple: on the six-tuple, which was true
+of every ordinary event and false of a timeout vote (M2), and then on the
+seven-tuple, which was true of every ordinary event and false of the terminal
+abort (G1). Unchained traffic has no such slot — a `JOIN_REQUEST`,
 two successive honest lobby adverts and a `HELLO` all sit outside any chain — and
 applying the predicate there would manufacture false positives against honest
 peers. That is why `chain_scope` exists and why the sentinel envelope values of
@@ -2534,12 +2851,20 @@ peers. That is why `chain_scope` exists and why the sentinel envelope values of
 still leave a `JOIN_REQUEST` carrying a real `table_id`, which is a collision
 waiting for a future chained message type.
 
-It catches both practical forms:
+It catches:
 
-* two different actions claimed for the same turn ("I folded" to one peer, "I
-  raised" to another);
-* the same action chained to two different parents — a deliberate fork —
-  because `previous_event_hash` is inside the body.
+* **two different bodies of one message type at one turn or one stage** — two
+  `ACTION_RAISE` events for one turn with different amounts, two `DECK_INIT`
+  contributions with different shares, two `STATE_HASH` values for one
+  reconciliation round;
+* **the same event chained to two different parents** — a deliberate fork —
+  because `previous_event_hash` is inside the body and, deliberately, not in the
+  key (§5.2.1).
+
+It no longer catches two *different* `event_type`s at one turn — "I folded" to
+one peer and "I raised" to another. That pair is now a validity rejection at
+every receiver rather than a proof, for the reason and at the price §5.2.1
+states.
 
 **What it does not catch, and never did.** A `TIMEOUT_VOTE` and a real event for
 the same stage are **not** an equivocation. The vote is signed by the voter and
@@ -2577,9 +2902,14 @@ independently, a genuine `EquivocationProof` against seat `Y` is in flight. A pe
 that applies the certificate first derives
 `HAND_ABORT{cause = 1, attributed = [X], cert_hash = Some(h)}`; a peer that
 applies the proof first derives `HAND_ABORT{cause = 5, attributed = [Y]}`. §4.10
-obliges every receiver to recompute every field, so each rejects the other's copy,
-**the collective terminal stage never completes**, `TERMINAL(k)` is never defined,
-and `GENESIS(k+1)` — a function of it — never exists, so the session cannot start
+obliges every receiver to recompute every field, so each rejects the other's copy
+and **two honest peers end one hand with two different terminal bodies**. Under
+the shape in force when this was written that also meant `TERMINAL(k)` was never
+defined; since §3.1 that particular consequence is gone, because
+`ABORT_TERMINAL(k)` does not read the abort body at all. The defect the ordering
+rule closes is the one that survives regardless: two peers whose *state* after
+the hand differs. And it remains true that if `TERMINAL(k)` did depend on the
+body, `GENESIS(k+1)` — a function of it — would never exist, so the session could not start
 another hand either. Neither artefact is forged; both are genuine. The attacker
 supplies only the delivery order.
 
@@ -2602,12 +2932,18 @@ total order. The sentence that used to stand here — *"A verifying
 `cause = 5` from any phase in which a hand is live, not only from a divergence"* —
 is withdrawn in full.
 
-**What happens instead when a peer equivocates**, stated so nothing is left to
-infer. The two conflicting events share a slot, so §4.0 step 10a rejects whichever
+#### 5.2.4 What happens instead when a peer equivocates
+
+Stated so nothing is left to infer, and this is also the route by which the two
+cross-type conflicts §5.2.1 no longer labels as equivocation are caught.
+
+The two conflicting events share a slot — or, when they differ in `event_type`,
+the same stage cell — so §4.0 step 10a or step 12 rejects whichever
 reaches each peer second, as a violation; peers that accepted different first
 copies now hold different state; the next checkpoint (§6.2) shows two `state_hash`
 values; §6.3 runs; and the hand ends through that **chained** path, neutrally,
-like every other abort. The proof is still built, still broadcast in a `DISPUTE`,
+like every other abort. **The outcome is identical either way**, which is what
+makes the labelling difference §5.2.1 accepts affordable. The proof is still built, still broadcast in a `DISPUTE`,
 still retained forever and still shown to the user. What it no longer does is
 decide anything. And if no peer ever diverges, there was nothing to decide — an
 equivocation nobody's state disagreed about cost nobody anything.
@@ -2657,7 +2993,8 @@ ever have delivered anyway — a public, permanent, independently verifiable rec
 `SPEC_CS.md` §18 forbids claiming more; this now claims less than it did.
 
 **Normative — how a proof is treated. This box is canonical for the corpus;
-`STATE_MACHINE.md` reproduces it and does not restate it in its own words.**
+every other document references §5.2 and reproduces none of it. It is the single
+answer to G2, and it is stated as a plain negative because that is what it is.**
 
 > A verifying `EquivocationProof` is **retained as evidence, in every phase, at
 > every table, and is never silently discarded** — whether or not a hand is live,
@@ -2665,9 +3002,29 @@ ever have delivered anyway — a public, permanent, independently verifiable rec
 > has diverged. Verification needs no table state, no transcript and no knowledge
 > of the game, so there is never a reason to refuse to hold one.
 >
-> **It changes no state.** It ends no hand, moves no chip, unseats nobody,
-> block-lists nobody, and refuses nobody a seat. It is not consumed by any
-> transition. Whether it is forwarded beyond the table is Q-05.
+> **Nothing consumes it.** There is no transition, in any document, that takes an
+> `EquivocationProof` as its input event. It ends no hand, moves no chip, unseats
+> nobody, block-lists nobody, refuses nobody a seat, and produces no
+> `AbortRecord`. Whether it is forwarded beyond the table is Q-05.
+>
+> **There is no wire representation for an equivocation-caused abort and none
+> will be added.** §4.10's `cause` enumeration is `1`–`4`; value `5` is deleted
+> and the code point is not reused. An engine alphabet containing an
+> `AbortKind::Equivocation`, or a transition producing one, names an outcome no
+> legal `HAND_ABORT` can carry, and is a defect in that document.
+
+**G2, decided.** The gate found `STATE_MACHINE.md` T55 consuming a proof, ending
+a hand with it, and producing an `AbortRecord{kind: Equivocation}` whose `cause`
+value this document had deleted, while T55 and T56 both asserted that "the
+accused is blocked at the protocol layer (`PROTOCOL.md` §5.2)". All three
+statements are wrong and this box is why. The simple answer is the true one:
+under D-010 a proof has no consequence, so **nothing consumes it**. `PROTOCOL.md`
+owns the wire and therefore owns what a message may cause; `STATE_MACHINE.md`
+owns the transitions and follows this box (D-011 rule 1). T55 loses its
+`HandAborted` destination and its `AbortRecord` and becomes T56's shape; the
+"blocked at the protocol layer" sentence is false in both rows and in
+`NETWORK_STACK.md` §6.6 and §11.5, because **no layer blocks anything on a proof**
+(D-010 point 3, D-011 rule 3).
 
 Why retention is stated this widely, even though nothing follows from it:
 equivocation is *detected* precisely when things look fine to the detector — it is
@@ -2683,29 +3040,48 @@ the question §12 records and does not answer.
 
 Anti-replay must not become a memory-exhaustion vector (`SPEC_CS.md` §17, §27).
 
-* Per table, per hand, for `event_class == 0`: one `Vec<Option<event_hash>>`
-  indexed by `(stage, seat)`, bounded by `MAX_STAGES_PER_HAND × MAX_SEATS`.
-  `MAX_STAGES_PER_HAND = 2048`; a legitimate hand uses well under 200. The
-  `event_class` axis is what lets a seat hold both its own contribution at stage
-  `s` and a `TIMEOUT_VOTE` about stage `s` without either being treated as a
-  duplicate of the other (§2.3, §5.2).
-* Per table, per hand, for `event_class` 1 and 2: a per-stage map keyed by
-  `(seat, subject_seat)` for votes and `(seat, subject_digest)` for certificates,
-  **allocated only for a stage at which such an event has actually been
-  accepted**. At most `MAX_SEATS × (MAX_SEATS − 1) = 90` entries per stage per
-  class, and the number of stages is bounded as above. The subject axis is
-  §5.2's slot key and it is not optional: without it two votes by one honest
-  voter about two seats at one stage collide, which is defect M2. Sparse rather
-  than dense because the dense form is `MAX_STAGES_PER_HAND × MAX_SEATS × 2 ×
-  MAX_SEATS` slots for a structure a legitimate hand populates a handful of times
-  — the deadline classes only ever touch a stage that stalled.
+**The stored state is one structure per `event_class`, and each is indexed by
+exactly the components of §5.2.1's key that vary within one `(table_id, hand_id,
+sender)` — nothing more and nothing less.** The three fixed components
+(`protocol_version`, `table_id`, `hand_id`) are the scope of the structure rather
+than part of its index, and `sender_public_key` is the seat. That is the whole
+derivation; this section defines no key of its own.
+
+* **`event_class == 0`.** One `Vec<Option<event_hash>>` per table per hand,
+  indexed by `(stage, seat, event_type_slot)`, where `event_type_slot` has
+  capacity **2** — a seat's own contribution to stage `s`, and the terminal
+  `HAND_ABORT` of §4.10, which lands at a stage the seat has usually already
+  contributed to and is the only second `class = 0` type an honest emitter
+  produces at one `sequence` (§4.11 row 36). Bounded by `MAX_STAGES_PER_HAND ×
+  MAX_SEATS × 2`. `MAX_STAGES_PER_HAND = 2048`; a legitimate hand uses well
+  under 200 stages and fills the second cell at most once, in the hand's last
+  stage. **The `event_type` axis is not optional**: without it the abort and the
+  contribution collide, which is defect G1.
+* **`event_class` 1 and 2.** A per-stage map keyed by `(seat, subject_seat)` for
+  votes and `(seat, subject_digest)` for certificates, **allocated only for a
+  stage at which such an event has actually been accepted**. At most `MAX_SEATS ×
+  (MAX_SEATS − 1) = 90` entries per stage per class, and the number of stages is
+  bounded as above. `event_type` needs no axis here because each class holds
+  exactly one type. **The subject axis is not optional**: without it two votes by
+  one honest voter about two seats at one stage collide, which is defect M2.
+  Sparse rather than dense because the dense form is `MAX_STAGES_PER_HAND ×
+  MAX_SEATS × 2 × MAX_SEATS` slots for a structure a legitimate hand populates a
+  handful of times — the deadline classes only ever touch a stage that stalled.
+
+**Why the three structures are separate rather than one map (R-4).** The
+sentence that stood here said the `event_class` axis "is what lets a seat hold
+both its own contribution at stage `s` and a `TIMEOUT_VOTE` about stage `s`",
+immediately after an index that did not contain `event_class`. That was true in
+effect and wrong in wording: the class axis is expressed by *these being three
+structures*, not by a component of any one index. The separation is the axis.
 * Per table, per hand, per sender: a count of accepted distinct `DISPUTE`s and
   their `event_hash`es, bounded by `MAX_DISPUTES_PER_SENDER_PER_HAND = 8`
   (§4.9). `DISPUTE` is unchained, so it has no slot in the array above and needs
   its own bound; without one, the one message type that is legal at any time
   would be the one unbounded allocation in the section.
 * A hand exceeding `MAX_STAGES_PER_HAND` aborts with `cause = 4`.
-* Completed hands keep only `TERMINAL(k)` and the `HAND_COMPLETE` body in memory;
+* Finished hands keep only `TERMINAL(k)` and the terminal body — the
+  `HAND_COMPLETE` body, or the accepted `HAND_ABORT` copy — in memory;
   the full transcript is written to the profile directory and dropped from RAM.
 * The lobby keeps at most `MAX_TRACKED_TABLES = 4096` `(table_id, last_timestamp)`
   pairs in an LRU, and at most `MAX_TRACKED_PRESENCE = 8192` peers.
@@ -2823,9 +3199,11 @@ host. The procedure is:
 **Step 1 — freeze.** The moment any peer observes two distinct `state_hash`
 values at one checkpoint, it stops accepting and stops emitting hand events. No
 card opens, no action is applied, no chips move. Silently continuing is what §15
-forbids. This freeze is `STATE_MACHINE.md` §5.1's `Diverged` phase; the engine
-and this section describe the same machine, and steps 2–4 below are its
-transitions.
+forbids. **Which phase the engine is in while frozen, and which transitions carry
+steps 2–4, is `STATE_MACHINE.md`'s** (D-011 rule 1); the sentence that named the
+phase and mapped the steps onto its transitions is deleted. What this section
+specifies is the **messages** the procedure emits and the **stages** they occupy,
+and nothing else.
 
 **Step 2 — declare.** Every peer broadcasts `DISPUTE { kind = 1 STATE_DIVERGENCE,
 at_sequence = the checkpoint stage, table_id, hand_id, evidence = its own
@@ -2905,8 +3283,8 @@ The transcript records which peers were asked for which events and did not serve
 them, which is publicly readable but is **not adjudicable inside the protocol**,
 because any adjudication that requires the accused peer's signature is circular at
 every table size (D-007 point 4). A dispute path that does not require the accused
-peer's signature does not exist and is not designed here: **OQ-B** (§12). D-010
-does not close OQ-B — it only makes the cost of leaving it open a wasted hand
+peer's signature does not exist and is not designed here: **OQ-D** (§12). D-010
+does not close OQ-D — it only makes the cost of leaving it open a wasted hand
 rather than a stalemate over chips.
 
 **(c) The transcripts are byte-identical after reconciliation, and derived states
@@ -2933,7 +3311,7 @@ third party runs, and D-4 defers the source tree to `docs/ARCHITECTURE.md`, so
 there is not even a named binary. Moving a derivation offline does not create the
 observer-independent reference that the paragraph above spends its length
 establishing does not exist; it only changes when the disagreement happens.
-Defining that reference is **OQ-F** (§12) and is carried in `DECISIONS.md`'s open
+Defining that reference is **OQ-A** (§12) and is carried in `DECISIONS.md`'s open
 list. Until it is defined, what the artefact supports is diagnosis, not
 adjudication, and `SPEC_CS.md` §36 forbids the stronger word.
 
@@ -2960,8 +3338,16 @@ reproducible divergence report to the profile directory containing the full
 transcript, every peer's `STATE_HASH`, and its own derived `PublicTableState`.
 That report is the bug report, and it is also the diagnostic material of
 §6.3 case (c). The UI must say plainly that the game ended because the
-participants could not agree, and must not guess at fault. The engine reaches this
-state from `STATE_MACHINE.md`'s `Diverged` phase with `Fault{StateDivergence}`.
+participants could not agree, and must not guess at fault. **How the engine
+reaches this state, from which phase and with which fault record, is
+`STATE_MACHINE.md`'s** (D-011 rule 1); the sentence that named the phase and the
+fault variant is deleted.
+
+**`cause = 4` still yields a `TERMINAL(k)`.** Faulting the table means no further
+hand is dealt; it does not mean the chain has no end. The abort is a
+witness-independent terminal stage like every other (§3.2) and
+`TERMINAL(k) = ABORT_TERMINAL(k)` (§3.1), so the transcript closes cleanly and a
+verifier can check it end to end.
 
 **Restoration is no longer this cause's peculiarity; it is every abort's
 disposition (D-010, §4.10).** The clause that called `cause = 4` "the one
@@ -2977,7 +3363,7 @@ and `THREAT_MODEL.md` X29 carries it. Under D-005 it was the one path on which a
 losing player could recover its chips; under D-010 it is one of several, and it is
 now the *expensive* one, since stalling to `hand_deadline_ms` recovers the same
 chips without costing the attacker the table. That does not make it smaller — it
-makes the class larger, which §4.10 states in full and §11.3 carries. **Two**
+makes the class larger, which §4.10 states in full and `THREAT_MODEL.md` X8 carries. **Two**
 things bound this particular member of it and neither removes it: it costs the
 attacker the table and, in a tournament, their own equity in it; and checkpoint 7
 sits before `SHOWDOWN_REVEAL` (§6.2), so the attacker must commit before learning
@@ -2986,7 +3372,7 @@ whether it won.
 A third bound was previously claimed here and is **withdrawn**: *"the evidence is
 deterministically adjudicable offline by any third party running the reference
 engine over the unanimous transcript."* No reference engine exists to run — see
-§6.3 case (c) and **OQ-F** (§12). What survives is weaker and is all that may be
+§6.3 case (c) and **OQ-A** (§12). What survives is weaker and is all that may be
 claimed: the evidence is preserved and is sufficient for a human, or for a future
 adjudicator, to diagnose the divergence; no adjudication procedure is specified.
 That is a diagnostic property, not a bound on the attack, which is why the count
@@ -2995,9 +3381,9 @@ sentence as one of its three bounds.
 
 The alternatives — forfeiting an unnamed party's commitment, or settling from the
 last `STATE_ACK`-agreed checkpoint — each need a numbered owner decision and
-neither is adopted here. **OQ-D** (§12), which D-010 narrows rather than closes:
+neither is adopted here. **Q-07** (§12), which D-010 narrows rather than closes:
 the forfeiture half is now decided *against* for the MVP by a numbered decision,
-so what OQ-D still asks is whether settling from the last agreed checkpoint is
+so what Q-07 still asks is whether settling from the last agreed checkpoint is
 worth building, and that question is unchanged and unanswered.
 
 ---
@@ -3316,8 +3702,35 @@ deterministic function of the table parameters and the kind of the next stage:
 A peer that writes a different value emits an invalid event. There is nothing to
 negotiate and nothing to game.
 
-The whole-hand limit `hand_deadline_ms` runs on the same relative basis from
-`HAND_INIT`. If it expires the hand aborts under §8.4 with `cause = 1`,
+**The whole-hand limit `hand_deadline_ms` runs on the same relative basis from
+`TERMINAL(k-1)` — normative, and this is R-1's disposition.** The timer for hand
+`k` starts when the peer accepts the event that fixes `TERMINAL(k-1)`: the
+completing copy of the `HAND_COMPLETE` stage of hand `k-1`, or the terminal
+`HAND_ABORT` of hand `k-1`, or, for a table's first hand, the completing copy of
+the `TABLE_READY` stage. It is **not** started by `HAND_INIT`.
+
+Two reasons, and the second is a correctness precondition rather than a
+preference:
+
+1. **A stalled `HAND_INIT` is then covered.** Under the old reading a `HAND_INIT`
+   collective stage that never completed started no timer and was covered by
+   none: §4.3's abandonment timer stops at `TABLE_READY`, and from hand 2 onward
+   there is no other. A seat that vanishes between two hands froze the table
+   permanently. Now the timer is already running when `HAND_INIT` is due, so the
+   stall aborts hand `k` like any other and `GENESIS(k+1)` follows (§3.1).
+2. **It anchors every peer's deadline to one agreed event**, which is what makes
+   §4.10's acceptance gate safe. That gate has a receiver *buffer* an abort until
+   its own deadline expires; buffering is bounded only if every peer's timer
+   started at the same point, and `TERMINAL(k-1)` is the last thing every peer
+   provably agreed on. `HAND_INIT` is not: peers accept different copies of it at
+   different moments, and a peer that never accepts one would never start.
+
+The window covers `hand_delay_ms` plus the whole of hand `k`; the constant in §13
+is set on that basis and is not rescaled by this ruling. `STATE_MACHINE.md` §5.2
+already reads it this way, so this sentence removes a corpus disagreement rather
+than creating one.
+
+If it expires the hand aborts under §8.4 with `cause = 1`,
 `attributed = []` and `cert_hash = None`: **it produces no certificate and names
 nobody.** The earlier form of this sentence — *"produces a certificate with
 `kind = 2` naming every seat that has an outstanding contribution"* — was the
@@ -3433,7 +3846,7 @@ be read as a `|V| < 2` limitation any more.** It said the escape D-005 closed wa
 "reopened wherever `|V| < 2`". Under D-010 an abort is neutral at every `|V|` and
 on every path, so the escape is open everywhere: a player facing a losing pot goes
 silent, waits `hand_deadline_ms`, and recovers its commitment, at two seats or at
-ten. §4.10 states that cost in full and §11.3 carries it. What remains specific to
+ten. §4.10 states that cost in full and `THREAT_MODEL.md` X8 carries it. What remains specific to
 this section is only the *wait*.
 
 The floor itself is unaffected by that, and the reasoning for it has to be
@@ -3444,10 +3857,10 @@ prefer against. What a below-floor certificate would still buy is a **one-messag
 on-demand hand void**, manufacturable by a single signature at any moment — which
 is strictly better for an attacker than waiting ten minutes for the same outcome,
 and which D-009 rule 2 forbids on its own terms. The floor stands, for a smaller
-and more honest reason than it used to have. **OQ-A** (§12) survives in the same
-narrowed form as OQ-D: the restoration-versus-forfeiture half is now decided by
-D-010 for the MVP, and what stays open is what a later version does when the
-machinery is sound.
+and more honest reason than it used to have. The disposition question this paragraph
+used to defer to a letter is **closed**: D-010 decided restoration, for the MVP,
+everywhere. What stays open is what a later version does once the machinery is
+sound, and D-010's own “when this is revisited” clause carries it (§12).
 
 **Why the exclusion rule is inductive, and why that closes the attack.** Each
 exclusion costs a *completed* certificate; each completed certificate needed
@@ -3485,7 +3898,7 @@ about what it saw.** A `TIMEOUT_VOTE` and the action it is about are signed by
 different keys and sit in different `event_class` slots (§4.8, §5.2), so a peer
 that both accepted an action and voted that it timed out has not equivocated and
 nothing is provable from the two bodies. Whether a voter should be obliged to
-publish a signed `ACTION_SEEN` first, making a lying voter provable, is **OQ-C**
+publish a signed `ACTION_SEEN` first, making a lying voter provable, is **Q-08**
 (§12); it is a design change with a cost in messages and latency and it is not
 adopted.
 
@@ -3592,11 +4005,16 @@ weaken here: there is no attribution to gate. It is also the path every
 `|V| < 2` stall now takes (§8.3).
 
 **It covers hands only, and that is the whole extent of the claim.**
-`hand_deadline_ms` runs from `HAND_INIT`, so it says nothing about a stall in the
-setup chain (`hand_id = 0`, `JOIN_REQUEST` through `TABLE_READY`). A table that
-never forms is not aborted by this path and needs no certificate: §4.3's
-formation-abandonment rule disposes of it with a local timer and the advert's
-`AD_TTL_MS`, with no cooperation from anybody and nothing signed.
+`hand_deadline_ms` runs from `TERMINAL(k-1)` (§8.2, R-1), so it covers hand `k`
+in full — including a `HAND_INIT` that never completes, which under the old
+"from `HAND_INIT`" reading was covered by nothing from hand 2 onward. It still
+says nothing about a stall in the **setup chain** (`hand_id = 0`, `JOIN_REQUEST`
+through `TABLE_READY`), because `TERMINAL(0)` does not exist until that chain
+ends. A table that never forms is not aborted by this path and needs no
+certificate: §4.3's formation-abandonment rule disposes of it with a local timer
+and the advert's `AD_TTL_MS`, with no cooperation from anybody and nothing
+signed. Between the two rules every stall from `JOIN_REQUEST` to the last hand is
+covered, with no gap at the join between them.
 
 **Normative — the join deadline. This sentence is canonical for the corpus;
 `STATE_MACHINE.md` reproduces it and does not restate it in its own words
@@ -3610,15 +4028,11 @@ formation-abandonment rule disposes of it with a local timer and the advert's
 > nothing, and needs no voter set, no unanimity and no `|V|` floor because it
 > attributes nobody and moves no chips.
 >
-> A state machine that needs a transition out of its seating phase on a formation
-> timeout therefore takes it from **that local timer expiry**, not from a
-> certificate. The engine's event alphabet must contain no variant that no wire
-> message can produce: a `TimeoutCertificate{Join}` is such a variant, and the
-> transition it triggers is to be rebuilt on the timer. `STATE_MACHINE.md`'s
-> recorded objection is well founded — the kind had no counterpart here — and
-> this is the ruling it deferred to. The `|V| >= 2` floor that was added to the
-> transition as a precaution against a D-008 hole goes with the kind: a local
-> timer has no voter set to floor.
+> The wire consequence, which is all this document states: **no wire message
+> produces a join-deadline certificate, so no engine alphabet may contain a
+> variant for one.** What transition replaces it, out of which phase, and with
+> what guard is `STATE_MACHINE.md`'s (D-011 rule 1); the paragraph that specified
+> that transition here is deleted.
 
 None of that is a gap to be filled by inventing a certificate kind, and none
 should be invented — `SPEC_CS.md` §36 prefers the plain local timer to a
@@ -3828,20 +4242,27 @@ any state transition.
 
 ### 9.5 Connection and rate bounds
 
-`libp2p::connection_limits` is always compiled in — there is **no**
-`connection-limits` cargo feature, and asking for one is a hard resolver error.
-[LIBP2P §1]
+**Connection limits are transport bounds and `NETWORK_STACK.md` owns them**
+(D-011 rule 1). The four `libp2p::connection_limits` values and the dial-attempt
+cap that stood here — `max_pending_incoming`, `max_established_incoming`,
+`max_established_per_peer`, `memory_connection_limits`, and dial attempts per DHT
+lookup round — are deleted, together with the note about which cargo feature they
+need. They are not two-sided: a peer that sets them differently is not
+incompatible with anyone.
+
+What survives is the bounds that are **protocol** bounds, because they decide
+whether an event is accepted:
 
 | Bound | Value |
 |---|---|
-| `max_pending_incoming` | 32 |
-| `max_established_incoming` | 256 |
-| `max_established_per_peer` | 2 |
-| `memory_connection_limits` | 25 % of system memory (needs the `memory-connection-limits` feature) |
 | table-stream events per peer per second | 64, then throttle |
 | shuffle proofs verified per peer per hand | 1 per shuffle round; a second is a violation |
 | concurrent table sessions per client | 8 |
-| dial attempts per DHT lookup round | 64 — the DHT list is unverified and pollutable [DHT §7] |
+
+**Every bound in this section is keyed on volume, never on fault** (D-010
+point 3, D-011 rule 3). Throttling a peer that floods is a resource decision and
+is identical for a buggy peer and a hostile one; it is not a sanction, it never
+reads `attributed`, and no proof of any kind feeds it.
 
 ### 9.6 Fuzzing obligations (`SPEC_CS.md` §27)
 
@@ -3967,126 +4388,63 @@ after it has upgraded internally.
 
 ---
 
-## 11. What this protocol does and does not prevent
+## 11. Which wire mechanism stops which attack
 
-`SPEC_CS.md` §18 and §36 require this to be stated per class rather than
-summarised. `THREAT_MODEL.md` is the authority; this is the wire-protocol view.
+**`THREAT_MODEL.md` owns the classification of what this system prevents,
+detects and merely bounds, and this document restates none of it** (D-011
+rule 1). What stood here was a three-part copy of that classification — a
+"cryptographically prevented" table, a "detected and attributed" table, and
+eleven bullets of "neither prevented nor solved". Every one of those statements
+lives in `THREAT_MODEL.md` §8 and its X-numbered attack rows, and keeping a
+second copy in a wire specification is exactly the drift D-011 exists to stop:
+the two copies were edited by different passes and the survivors of the D-010
+sweep were found in the gaps between them.
 
-### 11.1 Cryptographically prevented
+What is left here is the only part no other document owns — **the map from an
+attack to the mechanism in *this* document that acts on it**. It is a routing
+table, not a verdict: it says where to look, and `THREAT_MODEL.md` says what the
+outcome is.
 
-The attack cannot succeed regardless of the attacker's client, because the
-mathematics does not permit it.
+| Attack | The wire mechanism, in this document | Classified in |
+|---|---|---|
+| reading unrevealed hole cards, or the board early | reveal-token publication is street-gated (§4.6); no secret that could reconstruct a card enters the transcript (§3.4) | `THREAT_MODEL.md` |
+| forging or altering another participant's action | the signed byte string of §2.4 and `verify_strict` at §4.0 step 9 | `THREAT_MODEL.md` |
+| altering hand history | the chain of §3.1–§3.2 | `THREAT_MODEL.md` |
+| a fake, duplicate or removed card | proof verification at §4.0 step 14 | `THREAT_MODEL.md` |
+| replaying a shuffle proof into another hand or seat | the `ctx` binding (§4.5) | `THREAT_MODEL.md` |
+| replaying a reveal token onto a different card | the DLEQ proof (§4.6) | `THREAT_MODEL.md` |
+| replay of any chained event | `previous_event_hash` and `sequence` (§5.1) | `THREAT_MODEL.md` |
+| replay of unchained traffic | the per-type rules in §5.2.1's box | `THREAT_MODEL.md` |
+| an illegal or out-of-turn action | §4.0 steps 12 and 13 | `THREAT_MODEL.md` |
+| a false stack, pot or award | `STATE_HASH` at every checkpoint (§6.2) and full recomputation of `HAND_COMPLETE` (§4.10) | `THREAT_MODEL.md` |
+| a `HAND_ABORT` that moves a chip | §4.10's receiver check on `n(4) deltas` and `n(5) final_stacks` | `THREAT_MODEL.md` |
+| sending different histories to different peers | the slot key and predicate of §5.2.1–§5.2.2, and the divergence path of §6.3 | `THREAT_MODEL.md` |
+| two byte encodings of one event | the canonicality gate of §2.5, run before the signature | `THREAT_MODEL.md` |
+| malformed or oversized frames | the caps of §9 and the fuzzing obligations of §9.6 | `THREAT_MODEL.md` |
+| stalling a hand to force an abort | `hand_deadline_ms` from `TERMINAL(k-1)` (§8.2) and the terminal stage of §4.10 | `THREAT_MODEL.md` X8 |
+| faulting a table with a false `state_hash` | §6.3 case (c) and §6.4 | `THREAT_MODEL.md` X29 |
 
-| Attack (`SPEC_CS.md` §17) | Why |
-|---|---|
-| reading another player's unrevealed hole cards | `n`-of-`n` ElGamal; `n-1` tokens reveal nothing, verified [MENTAL T7d/T7e] |
-| reading the future board early | same, plus street gating on token publication |
-| forging another participant's action | Ed25519 `verify_strict` over canonical bytes |
-| a fake card, a duplicate card, a removed card | Bayer–Groth soundness, verified against a duplicated-card deck [MENTAL T4] |
-| altering a signed action after the fact | signature plus `event_hash` in the chain |
-| altering hand history | the hash chain |
-| replaying a shuffle proof into another hand or seat | the `ctx` binding (§4.5) |
-| replaying a reveal token onto a different card | the DLEQ proof [MENTAL T7b] |
-| a single player choosing the deck order | composition of `n` secret permutations; one honest player suffices [MENTAL §6] |
+**Three statements of this document's own limits, kept here because they are
+about the wire and not about the threat model:**
 
-### 11.2 Detected and attributed, not prevented
+* **A mechanism above is a *check*, never a *sanction*.** Every row ends in a
+  rejection, a buffered event or a signed record. No row ends in a chip moving, a
+  seat being taken or a key being blocked (D-010, D-011 rule 3). A reader who
+  reads the left column as a list of things that are punished has read the wrong
+  document.
+* **§11's old bullet list is where the rage-quit escape was disclosed**, and the
+  disclosure is not weakened by moving it: `THREAT_MODEL.md` §8 limitation 4 and
+  X8 carry it in full, in the terms `SPEC_CS.md` §18 requires, and §4.10 states
+  the wire half — every abort restores every stack, at every table size, on every
+  path, and nothing in this protocol charges for it.
+* **What this document assumes and does not verify** is the deck layer's
+  soundness. Phase 0 verified that the chosen implementation rejects thirteen
+  specific attacks, which is not soundness; a line-by-line review against the
+  Bayer–Groth paper is a prerequisite [MENTAL §9 risk 1]. If that assumption
+  fails, the first four rows of the table above fail with it. `CRYPTOGRAPHY.md`
+  owns the assessment; this sentence records only that this document's rows
+  depend on it.
 
-The attacker can emit the message; every honest peer rejects it and can prove who
-sent it. The hand stops. **"Attributed" means recorded, not punished (D-010):** on
-every row of this table the outcome is a rejection plus a signed record, and no
-chip moves and no peer is removed on the strength of it. The one row where even
-the hand no longer stops is equivocation, and it says so.
-
-| Attack | Detection |
-|---|---|
-| an illegal poker action | local re-validation by every peer [RULES A3–A5] |
-| a false stack, pot, or award | `STATE_HASH` at every checkpoint, plus `HAND_COMPLETE` recomputation |
-| an action out of turn | stage legality (§4.0 step 12) |
-| a corrupt shuffle | proof verification → `INVALID_SHUFFLE_PROOF` |
-| publishing a reveal token for a future street | street gating (§4.6) |
-| sending different histories to different peers | equivocation proof (§5.2), for chained events only. **Detected and recorded, and nothing more:** under D-010 and §5.2's ordering rule the proof ends no hand, moves no chips and removes nobody. The hand stops only if the divergence it caused reaches a checkpoint, through §6.3's chained path |
-| malformed or oversized packets | §9, and the parser is a fuzzing target |
-| a wrong `HAND_INIT` | every field is recomputed by every receiver |
-
-### 11.3 Neither prevented nor solved — bounded only
-
-Stated plainly, because §18 forbids pretending otherwise.
-
-* **Going silent to force a hand abort — the rage-quit escape, now open at every
-  table size (D-010).** Inherent to `n`-of-`n` [MENTAL §8]. It cannot steal cards.
-  **It costs the quitter nothing, anywhere, on any path**: every abort restores
-  every stack to its start-of-hand value, so a player losing a big pot who stops
-  publishing gets their money back after `hand_deadline_ms`, whatever `|V|` is and
-  whoever the abort names. This bullet previously said the escape was open only
-  where `|V| < 2` and that above the floor "quitting costs exactly what folding
-  would have cost, by D-005's forfeiture rule". That rule is deleted and the
-  scoping with it; the limitation is now unconditional and larger, and
-  `SPEC_CS.md` §18 requires it be stated that way rather than left in its old
-  narrower form. D-010 records the trade: forfeiture was measured, over four
-  adversarial passes, to take chips from *honest* peers who followed the protocol,
-  and that is the worse failure. The mitigation is visibility and nothing more —
-  the transcript names who stopped publishing, permanently, and declining to sit
-  with that identity is a user decision.
-* **Faulting any table on demand by publishing a false `state_hash` at a
-  checkpoint (§6.3 case (c), §6.4).** A `state_hash` is one field in a message
-  every peer must emit; a single peer that publishes a value it did not derive
-  forces the abort, the restoration and the table's closure, with no attribution
-  live. Bounded by two things and closed by neither: it costs the attacker the
-  table and, in a tournament, its own equity in it; and checkpoint 7 sits before
-  `SHOWDOWN_REVEAL`, so the attacker must commit before learning whether it won.
-  The evidence is preserved and is sufficient for a human or a future adjudicator
-  to diagnose the divergence, but **no adjudication procedure is specified and no
-  reference engine exists** (§6.3 case (c), OQ-F), so that is not a third bound
-  and is no longer counted as one. `THREAT_MODEL.md` X29. See OQ-D.
-* **Losing the *attribution* as well, wherever `|V| < 2` (§8.3).** Below D-008's
-  floor there is no enforceable deadline of either kind: the certificate is inert
-  and the hand ends at `hand_deadline_ms` with **no attribution at all**. Since
-  D-010 the chips come back either way, so what the floor now costs is not the
-  escape — that is the bullet above, and it is open everywhere — but the record:
-  above the floor the transcript names which seat went silent, below it the
-  transcript shows only that something was owed and never served. At two dealt-in
-  seats this is every hand, which is the regime the MVP ships in. It is stated on
-  `|V|` rather than on the seat count because an attacker can reach `|V| < 2` at a
-  larger table too — only by first obtaining completed certificates against the
-  other seats, which is expensive and visible, never by assertion (§8.4). Closing
-  it requires a mechanism that does not exist. See OQ-A.
-* **Voiding a hand by two seats going silent together (§8.4).** Neither voter
-  set can be reduced, so neither certificate forms and the hand ends on the
-  `hand_deadline_ms` path attributing nobody: the pair pays nothing. This is the
-  deliberate price of deleting the exclusion rule that N3 exploited. See Q-02 and
-  OQ-E.
-
-* **Equivocating without consequence (§5.2, D-010).** A peer that signs two
-  conflicting events for one slot is provably caught, forever, by a proof anyone
-  can verify from two byte strings — and **nothing in this protocol acts on it**:
-  the hand does not abort, no chips move, the key is not block-listed and the seat
-  is not taken. What the equivocation actually causes is a state divergence, which
-  ends the hand neutrally through §6.3 like any other. The prevention that
-  remains is the *record*, and it is the same one play money has for everything
-  else. This bullet is new in this revision: it was previously not a limitation at
-  all, because the proof aborted the hand and forfeited the accused's chips. That
-  it is now listed here rather than in §11.2 is the honest form of D-010's cost.
-* **Out-of-band collusion**, screen sharing, a confederate reading a player's
-  cards. Cryptography cannot touch it.
-* **Malware on a player's own machine** reading their own cards.
-* **Sybil and multi-accounting.** Keys are free (§7.6).
-* **Denial of service**, including a relay operator dropping one peer (D-001).
-  The protocol treats a relayed connection loss identically to any other
-  disconnect, which is the correct behaviour, not a fix.
-* **Traffic analysis.** A relay learns who talks to whom, when, how much, and for
-  how long (D-001). The DHT publishes each player's IP to strangers [DHT §7].
-* **Physical coercion.**
-* **Timing side channels in the deck library.** Phase 0 measured throughput, not
-  constant-time behaviour, and the arkworks stack is not written with
-  curve25519-dalek's constant-time discipline. Unmeasured. [MENTAL §9 risk 4]
-* **The soundness of the chosen shuffle implementation.** Phase 0 verified that
-  it rejects 13 specific attacks; that is emphatically not soundness. A
-  line-by-line review of its 1 779 lines against the Bayer–Groth paper is a
-  **prerequisite**, not a nice-to-have, and the library's own README says not to
-  use it for money. [MENTAL §9 risk 1] This protocol document assumes the deck
-  layer is sound; if it is not, §11.1 shrinks.
-
----
 
 ## 12. Open questions
 
@@ -4097,126 +4455,81 @@ Stated plainly, because §18 forbids pretending otherwise.
 | **Q-03** | Should `TABLE_READY` require every participant to have completed a §1.2 handshake with every other, or is founder-mediated introduction acceptable when a pair cannot connect directly? Requiring a full mesh is the safe answer and is what §1.5 specifies, but it means one unreachable pair prevents a table that would otherwise form. Relates to D-004's symmetric-NAT case. | `NETWORK_STACK.md`, §1.5 | project owner |
 | **Q-04** | **CLOSED.** Should the certificate stage be collective instead of a `CERT_SETTLE_MS` timer with a lowest-seat tie-break? **Answer: collective** (§4.8). A certificate's body is a pure function of the votes, so by §3.2's stage-kind principle it carries no choice and must not have a single writer; the emitter set is `V(subject)`; the timer, the tie-break and the chain fork all disappear together, and `CERT_SETTLE_MS` is deleted from §13. | — | closed by the Phase 0 fix plan, C-10 |
 | **Q-05** | Does a `DISPUTE` need to be gossiped to the whole lobby, or only within the table mesh? Lobby-wide gossip gives non-participants durable evidence of equivocation, which is the only reputational pressure play money has; it also creates a defamation and spam vector, since a `DISPUTE` is cheap to emit and its `note` is attacker-controlled text. | `THREAT_MODEL.md`, §7.6 | project owner |
-| **Q-06** | Should the per-hand transcript be persisted in full to the profile directory by default? It is the only artefact behind §6.3 case (c)'s and §11.3's diagnostic claim — the transcript is necessary for it, and, pending **OQ-F**, not sufficient — and it is small (~20 KB heads-up, ~60 KB six-handed). But it is also a permanent record of every hand every opponent played, which has its own privacy cost. | `storage/`, `THREAT_MODEL.md` | project owner |
+| **Q-06** | Should the per-hand transcript be persisted in full to the profile directory by default? It is the only artefact behind §6.3 case (c)'s diagnostic claim — the transcript is necessary for it, and, pending **OQ-A**, not sufficient — and it is small (~20 KB heads-up, ~60 KB six-handed). But it is also a permanent record of every hand every opponent played, which has its own privacy cost. | `storage/`, `THREAT_MODEL.md` | project owner |
+| **Q-07** | On `HAND_ABORT cause = 4` (unresolvable divergence) the chips are restored, because no peer can be attributed, so any single peer has a free escape from a losing pot at the price of the table (§6.4). The alternatives — forfeiting an unnamed party's commitment, or settling from the last `STATE_ACK`-agreed checkpoint — each need a numbered decision and neither is adopted here. D-010 decides the first half **against** for the MVP; what stays open is whether settling from the last agreed checkpoint is worth building. Formerly this document's `OQ-D` (R-2). | §6.4, `STATE_MACHINE.md` | project owner |
+| **Q-08** | Should a required voter be obliged to publish a signed `ACTION_SEEN { sequence, event_hash }` before it may vote, so that vote-and-seen are two events by one key in one slot and a lying voter becomes provable (§8.3)? A design change with a cost in messages and latency; not adopted. Formerly this document's `OQ-C` (R-2). | §8.3, §8.4 | project owner |
 
-### Opened by the Phase 0 fix plan and the Phase 1 verification
+### The corpus-wide open questions — `DECISIONS.md`'s letters, adopted (R-2)
 
-OQ-A to OQ-D are the honest residue of findings A-1, A-2, A-3 and A-6; **OQ-F** is
-the residue of the Phase 1 verification's finding N2. All five are places where
-the correct edit was to weaken a claim, leaving a real gap that needs an owner
-decision rather than a cleverer construction. `SPEC_CS.md` §36 requires them to be
-carried openly. There is no OQ-E here: that label belongs to `THREAT_MODEL.md`
-§9.2 and names the same question as Q-02 above, and reusing it would give one
-question two names.
+**`DECISIONS.md` is authority for the `OQ-*` series and this document adopts its
+letters and its wording** (D-011 rule 1). Three letters exist corpus-wide —
+**OQ-A**, **OQ-D**, **OQ-F** — and this document uses no others. The parallel
+scheme that stood here, in which `OQ-A`, `OQ-B`, `OQ-C`, `OQ-D` and the
+disambiguated `OQ-F(engine)` / `OQ-F(produce)` named different questions than the
+same letters name in `DECISIONS.md`, is deleted. A reader following a letter from
+one document to the other now lands on the same question.
 
-**OQ-A** — recorded here and in `THREAT_MODEL.md` §9.2. **`D-008` is no longer
-proposed: it is decided and binding**, and it is what rescoped this document from
-`n` to `|V|`. What D-008 settled is the *scoping*; what OQ-A still asks is the
-disposition, and that remains open:
+**The mapping, recorded once so an old cross-reference can still be followed, and
+not to be maintained:**
 
-> Wherever `|V| < 2` a hand that cannot complete must still end, and there is no
-> way for the remaining peers to agree which of them failed. Ending it with
-> restoration lets a player escape a losing pot by going silent; ending it with
-> forfeiture lets a player take an honest opponent's committed chips by asserting
-> a deadline that did not pass. This document takes restoration, because a
-> liveness/fairness loss is preferable to a theft, but the choice reverses D-005
-> wherever `|V| < 2` — at two dealt-in seats, always — and needs a numbered owner
-> decision. It was recorded as an `n = 2` question; D-008 shows the condition is
-> `|V| < 2`, which is strictly wider.
->
-> **Narrowed by D-010, not closed.** The numbered owner decision this question
-> asked for has been made, and it chose restoration — not "wherever `|V| < 2`"
-> but everywhere, for the MVP. The disposition is therefore settled and the
-> scoping question with it. What stays open is the question one layer up, which
-> D-010 defers explicitly: whether a later version, once the certificate,
-> equivocation and dispute machinery has survived a full adversarial pass with no
-> new defect of this class, should charge a quitter anything at all. Until then
-> this row stands as a reminder that the MVP's answer is a knowing regression and
-> not a solution.
+| This document's former label | Now |
+|---|---|
+| `OQ-F` / `OQ-F(engine)` — the reference engine | **OQ-A** |
+| `OQ-B` — a dispute path not needing the accused's signature | **OQ-D** |
+| `OQ-F(produce)` — produce the machinery at all? | **OQ-F** (unchanged) |
+| `OQ-A` — restoration versus forfeiture below the floor | **closed by D-010**, which decided restoration everywhere for the MVP; D-010's "when this is revisited" clause carries what is left |
+| `OQ-D` — settle from the last agreed checkpoint | **Q-07**, this document's local series |
+| `OQ-C` — an obligatory `ACTION_SEEN` before a vote | **Q-08**, this document's local series |
 
-**OQ-B** — recorded here and in `DECISIONS.md`'s open list:
+`OQ-E` is `THREAT_MODEL.md`'s and names the same question as **Q-02** above; it
+is referenced, never redefined here. `STATE_MACHINE.md` cross-references written
+against the old scheme are rewritten by that document against this table.
 
-> A dispute path that does not require the accused peer's signature. Already
-> recorded in `DECISIONS.md` (D-007 point 4); it is repeated here because
-> `PROTOCOL.md` §6.3 case (b) currently depends on exactly that circularity and
-> the replacement is not designed.
+---
 
-**OQ-C** — recorded here:
+**OQ-A** — the reference engine. `DECISIONS.md`'s wording, quoted rather than
+paraphrased:
 
-> Should a required voter be obliged to publish a signed `ACTION_SEEN
-> { sequence, event_hash }` before it may vote, so that vote-and-seen are two
-> events by one key in one slot and a lying voter becomes provable? This is a
-> design change with a cost in messages and latency and it is not adopted here.
+> A named, versioned reference engine, since several sections claim disputes are
+> "deterministically adjudicable by any third party running the reference engine"
+> and no such engine is defined (review N2). Interim answer: withdraw the claim;
+> the engine is defined when the crate has a tagged release.
 
-**OQ-D** — recorded here, in `THREAT_MODEL.md` §9.2 and in `STATE_MACHINE.md`
-§11:
+Where this document depends on it: §3.5 check 7 and its "cannot check" note, §6.3
+case (c), §6.4's withdrawn third bound, and §11's diagnostic claim. All four
+carry the weakened form already — the evidence is preserved and is sufficient for
+a human or a future adjudicator to **diagnose** the divergence; no adjudication
+procedure is specified, and `SPEC_CS.md` §36 forbids the stronger word. Answering
+OQ-A would restore a real third bound on the §6.4 attack; until then that bound
+does not exist and must not be counted.
 
-> On `HAND_ABORT cause = 4` (unresolvable state divergence) the chips are
-> restored to their start-of-hand values because no peer can be attributed. This
-> gives any single peer a free escape from a losing pot at the price of the
-> table. The alternatives — forfeiting an unnamed party's commitment, or settling
-> from the last `STATE_ACK`-agreed checkpoint — each need a numbered decision and
-> neither is adopted here.
+**OQ-D** — a dispute path that does not require the accused peer's signature.
+`DECISIONS.md`'s wording:
 
-**OQ-F**, and where disambiguation is needed **OQ-F(engine)** — opened by the
-Phase 1 verification (finding N2), recorded here and, under the label **OQ-A**,
-in `DECISIONS.md`'s open list. Every other OQ-F reference in this document is to
-this question; see the collision note below:
+> A dispute path that does not require the accused peer's signature — circular at
+> every table size, not only heads-up (D-007 point 4, review A-1). Interim answer
+> under D-010: a dispute that cannot resolve ends the hand neutrally, so the
+> circularity costs a hand rather than a stalemate.
 
-> **Is there a canonical reference engine, and if so what is it?** §3.5 check 7,
-> §6.3 case (c), §6.4 and §11.3 previously claimed that a divergence is
-> "deterministically adjudicable offline by any third party running the reference
-> engine". No document in this corpus defines such an engine, versions it against
-> `protocol_version`, or specifies how two parties establish that they ran the
-> same one. `STATE_MACHINE.md` specifies the deterministic engine as a thing every
-> client implements — which is exactly the plurality that makes case (c)
-> unresolvable in the first place — and D-4 defers the source tree to
-> `docs/ARCHITECTURE.md`, so there is not even a named binary.
->
-> All four claims are **weakened**, not repaired: the evidence is preserved and is
-> sufficient for a human or a future adjudicator to diagnose the divergence; no
-> adjudication procedure is specified. `SPEC_CS.md` §36 prefers the open question
-> to the invention, and defining an engine — its identity, its versioning rule,
-> who may run it, and what makes its output binding on anyone — is a numbered
-> owner decision, not an editorial fix.
->
-> Answering it would restore a real third bound on the §6.4 attack. Until then
-> that bound does not exist and must not be counted.
+Where this document depends on it: §6.3 case (b), whose whole disposition rests
+on that circularity, and §4.10's note that no adjudication of a withholding is
+specified and none is claimed.
 
-### Opened by D-010
+**OQ-F** — whether the machinery is produced at all. `DECISIONS.md`'s wording:
 
-**`DECISIONS.md`'s OQ-F — recorded here, unresolved, and not this document's to
-resolve.**
+> Whether `TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` should still be
+> *produced* in the MVP now that D-010 gives them no effect, or be deferred
+> wholesale until the machinery is sound. Producing them keeps the transcript
+> adjudicable later; deferring them removes four passes' worth of surface.
 
-> **Should `TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` still be
-> *produced* in the MVP at all, now that D-010 gives them no effect — or be
-> deferred wholesale until the machinery is sound?**
->
-> Producing them keeps the transcript adjudicable by a human or by a later
-> version, which is the entire remaining justification for them: D-010 point 4
-> keeps them precisely because they are the artefact somebody later adjudicates
-> from. Deferring them removes four adversarial passes' worth of attack surface
-> in one edit — the two deadline classes, their subject axes in §5.2's slot key
-> and §5.3's anti-replay state, `V(subject)` and its inductive exclusion rule,
-> §8.5's offline verifier, and the `EquivocationProof` object — none of which any
-> transition in this version consumes.
->
-> It is recorded and **not answered**. `SPEC_CS.md` §36 prefers the open question
-> to the invention, and this one is a scope decision for the owner rather than an
-> editorial fix: it changes what ships, not what is true.
+What deferring would remove **from this document**, listed so the scope of the
+decision is visible: the two deadline classes and their subject axes in §5.2.1's
+key, the matching structures in §5.3, `V(subject)` and its inductive exclusion
+rule in §8.3, §8.5's offline verifier, and the `EquivocationProof` object in
+§5.2. No transition in this version consumes any of them. It is recorded and
+**not answered**: it is a scope decision for the owner, and it changes what
+ships rather than what is true.
 
-**A label collision, named rather than silently worked around.** This document
-and `STATE_MACHINE.md` have used **OQ-F** since the Phase 1 verification for the
-*reference engine* question above (finding N2); `DECISIONS.md`'s open list uses
-**OQ-F** for the question in this subsection, and uses **OQ-A** and **OQ-D** for
-what this document calls OQ-F and OQ-B respectively. One label naming two
-questions across the corpus is exactly the defect the shared-constant rule exists
-to prevent, and it cannot be fixed from inside this document without breaking
-`STATE_MACHINE.md`'s existing cross-references. Until `DECISIONS.md` settles a
-single numbering, this document distinguishes them as **OQ-F(engine)** — every
-existing OQ-F reference in §3.5, §6.3, §6.4, §11.3 and above — and
-**OQ-F(produce)** — the question in this subsection only. Reconciling the two
-schemes is `DECISIONS.md`'s to do and is listed in §14 note 15.
 
 ### Closed elsewhere, recorded here so the answer is not lost
 
@@ -4382,10 +4695,12 @@ behaviour this document had previously specified. Notes 6 to 11 do the same for
 M5 and N9(a): a longer anti-replay slot key, a normative re-emission rule, one
 withdrawn reading of `TIMEOUT_VOTE`'s legality, one deleted clause, and one
 corrected emitter cell. Notes 12 to 15 do the same for **D-010** and for the
-fourth verification pass's findings P1, P2, P6 and M3 — this revision is mostly
-deletion, and what is deleted is recorded here so the rest of the corpus can be
-checked against it. All are stated so that the other documents can be checked
-against them rather than against the text they replace.
+fourth verification pass's findings P1, P2, P6 and M3. Notes 16 to 20 do the same
+for **D-011** and for the Phase 2 gate's findings G1, G2, P3, R-1, R-2 and R-4 —
+this revision decides the terminal stage, rewrites the anti-replay slot key as a
+literal tuple, and deletes this document's copies of what other documents own.
+All are stated so that the other documents can be checked against them rather
+than against the text they replace.
 
 **1. C-2's canonical RNG beacon combine drops the session binding this document
 carried.** The plan's canonical form is
@@ -4541,6 +4856,13 @@ failure it exists to dispose of. The subtraction is now written on the body's ow
 derives the same emitter set from the same bytes with no judgement call about
 what "the reason for the abort" means.
 
+**Superseded by note 16.** The subtraction was the right repair of the *disagreement*
+and the wrong repair of the *defect*: it made both cells implementable and left
+the `attributed = []` paths — which are three of the four — with the silent seat
+still inside the required set. `HAND_ABORT` no longer has a required emitter set
+at all (§3.2, §4.10), so nothing is subtracted from anything and this note stands
+only as the record of a step on the way.
+
 **12. D-010 is applied by deletion, and this is the list of what left (§4.10,
 §4.0, §5.2, §6.3, §6.4, §8.3, §8.4, §8.5, §11).** In order of how much depended
 on it: the forfeiture rule on `HAND_ABORT` and its distribution arithmetic; the
@@ -4607,13 +4929,99 @@ reconciliation now occupies a stage that did not exist before, and
 Their previous trigger — the phrase "transcript reconciliation completes" and then
 a re-emission this document never specified — was an event no wire rule produced.
 
-**15. `DECISIONS.md`'s open-list labels collide with this document's (§12).**
-`DECISIONS.md` uses OQ-A for what this document and `STATE_MACHINE.md` call
-OQ-F(engine), OQ-D for what this document calls OQ-B, and OQ-F for the
-produce-or-defer question D-010 opened. This document records the new question
-under `DECISIONS.md`'s label and disambiguates the two OQ-Fs in §12 rather than
-renumbering, because renumbering here would break `STATE_MACHINE.md`'s existing
-references and a wire specification is the wrong place to settle a numbering owned
-by the decisions document. It is bookkeeping, and it is the bookkeeping that
-schedules the decisions Phase 4 is blocked on; four passes have now recorded some
-form of it.
+**15. The `OQ-*` label collision is resolved by adopting `DECISIONS.md`'s letters
+(R-2), and the objection recorded here is withdrawn.** The note that stood here
+declined to renumber, on the reasoning that a wire specification is the wrong
+place to settle a numbering owned by the decisions document and that renumbering
+would break `STATE_MACHINE.md`'s references. Under D-011 rule 1 the first half is
+exactly backwards: `DECISIONS.md` **is** the owner, so following it is not this
+document settling a numbering, it is this document ceasing to keep a competing
+one. The second half is real and is paid: §12 carries the old-to-new mapping once
+so an existing cross-reference can be followed, and `STATE_MACHINE.md` rewrites
+its own references against that table. Five passes recorded some form of this
+collision without an editor taking it; this edit takes it.
+
+**16. The terminal stage is decided here, and it is decided against both of the
+shapes the gate proposed (P3, G1).** The gate ranked two corrections for G1:
+move the abort to `s+1` behind a sentinel, or give it `event_class = 3`. Neither
+is taken. The first needs a new `stage_hash` rule for an abandoned stage and
+leaves the abort's own `sequence` a quantity peers can disagree about; the second
+extends an envelope field §2.3 calls exhaustive and needs a `subject(E)` arm.
+What is taken instead is **the key of D-011 rule 2** — `event_type` in the slot,
+which the decision mandates anyway — plus a **witness-independent terminal
+stage** with **no `stage_hash`** and a `TERMINAL(k)` taken from `GENESIS(k)`
+(§3.1). That is one new hash function and one new stage shape, against a new
+envelope value or a new chaining rule, and it closes P3 and both halves of G1 in
+the same edit.
+
+The consequence worth recording, because it is a real loss and it is not
+recoverable later without a wire change: **an aborted hand's transcript is no
+longer bound into the next hand's genesis.** §3.1 argues that nothing depends on
+it, and nothing does today — an abort moves no chip and awards no pot, so no
+later value is a function of the aborted hand's content. If a future version
+gives an abort a chip consequence, that binding has to come back, and it cannot
+come back as a hash of a disputed quantity. It would need a *decided* quantity,
+which is what a reconciliation round produces (§4.9), and that is a larger design
+than this one.
+
+**17. `event_type` enters the slot key and two detections become rejections
+(D-011 rule 2, §5.2.1, §4.11 rows 25–30).** The key is now capacity-one for every
+one of the 39 types with no exception and no caveat, which is what D-009 rule 1
+has asked for six times. The price is that two *different* `event_type`s from one
+signer at one `sequence` no longer form an `EquivocationProof`: fold-versus-raise
+for one turn, and reveal-versus-muck at one showdown. Both are still rejected by
+§4.0 step 12, both still cause the divergence that ends the hand, and both are
+still carriable as `DISPUTE` evidence — what is lost is the label, and under
+D-010 the label carries no consequence.
+
+The objection to be recorded honestly is that this is a *narrowing of a security
+predicate*, and the corpus has narrowed that predicate in every pass. Four of
+those narrowings were extensions of the key to stop false positives; this one is
+an extension that also causes false negatives, which is a different direction. It
+is taken because D-011 rule 2 is binding and states `event_type` explicitly, and
+because the alternative — a derived `slot_type` that is the identity on 37 types
+and merges the alternatives on the other two — is a second concept in a place
+whose whole purpose is to have exactly one. If a later pass finds the false
+negatives matter, the smaller fix is to make the five `ACTION_*` codes one
+`event_type` with the kind in the payload, which restores fold-versus-raise as an
+equivocation and shrinks the catalogue from 39 to 35.
+
+**18. Nothing consumes an `EquivocationProof`, stated as a plain negative (G2).**
+The box in §5.2 previously said the proof "is not consumed by any transition"
+while `STATE_MACHINE.md` T55 consumed one and ended a hand with it. Under D-011
+rule 1 the wire document decides what a message may cause, so the negative is the
+answer and it is now stated in the form that cannot be read as an omission: there
+is no `cause` value, none will be added, and an engine variant for one names an
+outcome no legal message can carry. The alternative — overruling §5.2 and letting
+a proof end a hand — was available and needed a numbered decision, and it
+reopens P2's two-honest-peers fork exactly as filed. It is not taken.
+
+**19. `hand_deadline_ms` starts at `TERMINAL(k-1)` (R-1), and that is a
+precondition rather than a preference.** The gate called this "one sentence in
+one document" and it would have been, before note 16. §4.10's acceptance gate has
+a receiver **buffer** a terminal abort until its own deadline expires, and
+buffering is bounded only if every peer's timer started from the same agreed
+event. `HAND_INIT` is not one: a peer that never accepts a copy never starts. So
+R-1's fix is load-bearing for the terminal stage, not only for the stalled-init
+hole it was filed about.
+
+**20. Seven copies of other documents' material are deleted rather than
+corrected (D-011 rule 1).** §11's three-part restatement of `THREAT_MODEL.md`'s
+classification, replaced by a routing table from an attack to the mechanism in
+*this* document; §2.8's BLAKE3 rationale and audit limitation, which are
+`CRYPTOGRAPHY.md` §3.2's; §1.4's libp2p behaviour column and its GossipSub and
+`libp2p-stream` notes, and §1.5's connectivity floor, and §9.5's
+`connection_limits` table, all `NETWORK_STACK.md`'s; §4.10's absent-seat paragraph
+and §8.4's join-timeout transition paragraph and §6.3/§6.4's two `Diverged`-phase
+sentences, all `STATE_MACHINE.md`'s. In each case a pointer replaces the copy and
+the wire fact underneath it — which is what this document is actually normative
+about — is stated in one sentence. Three partial restatements of the slot key,
+in §4.0 step 10a, §4.8 and §5.1, are replaced by a reference to §5.2.1.
+
+The objection: some of those copies were load-bearing for a *reader*, and §11 in
+particular was where a reader of this document alone learned that the rage-quit
+escape is open. That reader now has to open `THREAT_MODEL.md`. It is accepted
+because five passes measured what the copies cost — they drift, and the D-010
+sweep's three survivors were found in exactly the gaps between them — and because
+a wire specification that also classifies threats will be edited by whoever is
+fixing the wire.
