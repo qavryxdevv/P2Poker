@@ -530,6 +530,88 @@ still in it.
 
 ---
 
+## D-006 — An action timeout is an auto check/fold, never an abort
+
+**Date:** 2026-08-28
+**Stated by:** project owner
+**Status:** accepted
+**Corrects a conflation in:** D-005
+
+### The requirement
+
+A player who fails to decide inside the time limit is automatically checked or
+folded, the betting round finishes among the other players, the next street
+card comes, and the next hand starts. A timeout must **never** tear down the
+tournament or the cash game.
+
+### The distinction D-005 blurred, and which matters
+
+D-005 treated "timeout" as one thing. It is two, and they have nothing in
+common but the word.
+
+**An action timeout is not a cryptographic event at all.** Publishing a
+decryption share is something the *client* does automatically as a protocol
+step — it is not a decision and it never waits for the human. So a player who
+walks away from the keyboard is still fully cooperating cryptographically: the
+board opens on schedule, showdowns work, everything proceeds. The only thing
+missing is a betting decision, and poker has had an answer to that forever.
+
+| | Human absent, client running | Client gone or withholding |
+|---|---|---|
+| Betting decision | auto check/fold | auto check/fold |
+| Decryption shares | published normally | **not published** |
+| The hand | **continues to the end** | cannot open further cards |
+| Consequence | next street, next hand | D-005: abort, attribute, next hand |
+
+Only the right-hand column is hard. The left-hand column — which is the
+overwhelmingly common case, the player who steps away — costs nothing.
+
+### The rule
+
+1. Each seat has a decision deadline. On expiry the engine applies **check** if
+   nothing is owed, **fold** if facing a bet. Never fold a hand that could check
+   for free.
+2. The auto-action is a real, signed protocol event in the transcript, not a
+   local UI convenience. Every peer derives it identically from the same state,
+   so it stays deterministic and verifiable per `SPEC_CS.md` sections 11 and 13.
+3. The betting round then continues among the remaining players, the street card
+   opens, and the hand plays out normally. Nothing aborts and nothing waits.
+4. After a configured number of consecutive auto-actions the seat is marked
+   sitting out and enters the D-005 absent-seat state: it keeps its stack, pays
+   its blinds and antes, takes no cards, and drains until it busts. The player
+   can sit back in at a hand boundary.
+5. **No timeout of any kind ends the tournament or the cash game.** At worst a
+   single hand aborts, and only in the D-005 case where shares stop arriving.
+   The next hand begins immediately afterwards, automatically, per
+   `SPEC_CS.md` section 4.
+
+### Agreeing that a deadline passed, without a trusted clock
+
+This is the part that needs care, because there is no server to say "time is
+up" and clocks disagree. One peer asserting a timeout cannot be enough — it
+would let anyone steal the action from a player who was about to act.
+
+A timeout takes effect through a **timeout certificate**: every other player
+still active in the hand signs an assertion that the deadline for a given seat,
+at a given sequence and chaining from a given `previous_event_hash`, expired.
+The certificate is what the state machine consumes; the auto check/fold is its
+effect. Because it names the parent event, it cannot be replayed into a
+different position in the hand.
+
+Requiring the other active players to be unanimous also settles the race
+cleanly. If the slow player's action arrives at any one of them first, that
+peer will not sign, so no certificate forms and the action stands. If none of
+them accepted an action, the certificate forms and the action is too late.
+There is no window in which both a valid action and a valid certificate exist
+for the same parent.
+
+`PROTOCOL.md` must specify the certificate's exact fields and validation, and
+`STATE_MACHINE.md` must carry the deadline as explicit state rather than as a
+wall-clock read inside the engine — the engine stays free of clocks, and time
+enters only as a signed event.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |
