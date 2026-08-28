@@ -226,6 +226,108 @@ this and state the trade-off.
 
 ---
 
+## D-003 — Global lobby visibility is the acceptance criterion
+
+**Date:** 2026-08-28
+**Stated by:** project owner
+**Status:** accepted
+
+### The requirement, in the owner's words
+
+Everyone running this application, anywhere on the internet, must see which
+tables are open in the public lobby.
+
+That is the bar the discovery design is measured against. Not "usually", not
+"if the network cooperates" — a client that starts anywhere and reaches the
+internet sees the same list of open tables as everyone else.
+
+### Why this is achievable, and the part that matters
+
+**Seeing the lobby does not require being reachable.** This is the point that
+makes the requirement far easier than the connectivity discussion in D-001 and
+D-002 suggests. A client behind NAT or CGNAT dials *outward*, and outbound
+connections work everywhere. Once it has one connection into the GossipSub
+mesh it receives every table advertisement and can publish its own. Inbound
+reachability, hole punching and relays matter for *playing a hand* against
+another unreachable peer — not for *seeing* the lobby.
+
+So the chain is:
+
+```
+announce_peer(LOBBY_INFOHASH)   -> we are findable
+get_peers(LOBBY_INFOHASH)       -> a list of IP:port, unverified, a hint only
+dial each over QUIC             -> identity settled by the handshake
+subscribe the lobby topic       -> live table ads from the whole network
+snapshot request to a few peers -> the tables that already existed
+```
+
+### Verified: the DHT-to-libp2p bridge
+
+The load-bearing step is turning a bare `IP:port` with no PeerId into an
+authenticated connection. Verified by compiling and running against
+`libp2p 0.56.0`:
+
+```rust
+let from_dht = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 43117);
+let addr: Multiaddr = Multiaddr::empty()
+    .with(Protocol::Ip4(*from_dht.ip()))
+    .with(Protocol::Udp(from_dht.port()))
+    .with(Protocol::QuicV1);
+let opts = DialOpts::unknown_peer_id().address(addr).build();
+// -> /ip4/203.0.113.7/udp/43117/quic-v1, peer_id None
+```
+
+`mainline`'s `get_peers` returns exactly `Vec<SocketAddrV4>`, which is the input
+this takes. Identity comes from the Noise/TLS handshake, never from the DHT
+entry — which is what `SPEC_CS.md` section 1 requires when it says the DHT list
+is a hint about where to try, never a claim about who is there.
+
+### The one precondition, stated honestly
+
+The mesh only forms if **at least one client is dialable**. If every user were
+behind CGNAT and nobody relayed, no client could reach another and no lobby
+would exist. This is not a theoretical worry for a small user base — it is the
+single realistic way this requirement fails, and it is exactly why D-002 was
+accepted.
+
+Mitigation: any publicly reachable client is automatically useful to everyone
+else, both as a dial target and, under D-002, as a relay. The client should
+therefore report its own reachability prominently, because a user who can open
+a port materially helps the whole network.
+
+### Which port to announce
+
+`mainline::Dht::announce_peer(info_hash, port: Option<u16>)`, per its own doc
+comment: the peer is announced on the process's IP as the DHT sees it, and
+
+- `None` sets BEP 5 `implied_port`, so remote nodes record **the source port of
+  our DHT packet** — the DHT socket's NAT-mapped port, which is not our QUIC
+  port;
+- `Some(p)` records the literal port `p`, which must be our *externally*
+  reachable QUIC port, not the internal one.
+
+So we announce `Some(external_quic_port)`, learning the external port from
+`identify`'s observed address or AutoNAT once we have any connection; announces
+repeat periodically, so the first one being imperfect is survivable. For a
+publicly reachable peer, internal and external port are the same and this is
+simply correct — and those are precisely the entries worth dialing. A NATed
+peer that announces a port nobody can reach produces a dead entry, which costs
+a dial timeout, not a correctness failure. The DHT list is a hint; dead hints
+are expected.
+
+Note for implementation: the synchronous `Dht::announce_peer` is marked
+`#[deprecated(note = "use the async API via Dht::as_async() instead")]`, so the
+async `AsyncDht` API is the one to build on.
+
+### Acceptance test
+
+Two clients on unrelated networks, neither told anything about the other, both
+started cold. Within a bounded time both show the same set of open tables, and
+a table opened by either appears in the other's lobby. This test belongs in the
+Phase 8 integration suite and is the criterion this decision is judged by.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |
