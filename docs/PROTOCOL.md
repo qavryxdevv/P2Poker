@@ -787,13 +787,20 @@ is admissible, and one that can *shrink* or *replace* one is not — the second 
 J2's shape and the first cannot reach canonical state without passing through a
 stage every peer recomputes.
 
-**3. `PublicTableState`.** Every field, because it is the widest hashed struct in
-the corpus: `protocol_version`, `table_id`, `hand_id`, `checkpoint`, `roster`,
-`button_position`, `sb_position`, `bb_seat`, `level`, `small_blind`, `big_blind`,
-`ante`, `street`, `board`, `committed_this_round`, `committed_this_hand`,
-`current_bet`, `last_full_raise`, `player_to_act`, `pots`, `deck_commitment`,
-`ledger_in`, `ledger_out`, `transcript_head`, `signed_this_hand`, and the
-`Vec<bool>` flag vectors.
+**3. `PublicTableState`.** Every field of **§6.1's table**, which is this
+enumeration's index and is the **one normative statement of the struct's field
+order** in this document; the list that stood here is deleted rather than
+corrected (`P7-w`). It listed the same fields in a different order —
+`signed_this_hand` before the `Vec<bool>` flag vectors instead of after them — and
+`PublicTableState` is `#[cbor(array)]`, so **field order is the encoding**: two
+transcriptions from the two lists are two `state_hash` values for one state, and
+every checkpoint in the corpus then reports a divergence between two peers who
+agree about the game. A sweep is a list of verdicts and has no business being a
+second wire definition, so it carries none: **this paragraph enumerates verdicts
+and never order**, `STATE_MACHINE.md` §3.3 adopted §6.1's table for the engine and
+adds no third listing, and a fourth listing anywhere is a defect on sight
+(D-011 rule 2).
+
 All clean, and four are worth naming. `level`, `small_blind` and `big_blind` are
 **derived from `hand_id` in closed form** rather than incremented, which is the
 single most common place a poker protocol admits a per-receiver quantity and which
@@ -3338,13 +3345,19 @@ reason.
 > closes the hand boundary window (§4.10). What the close bounds is the admission
 > of a **`STATE_HASH`** copy, because that is the only checkpoint-8 event that can
 > grow `P(k)`. A checkpoint-8 `STATE_HASH` for hand `k` arriving after the close
-> is a **stale-hand** event and §4.0 step 10b disposes of it in three ways and no
-> others: a value that **differs** from this receiver's retained
-> `checkpoint8_state_hash(k)` is a divergence and enters §6.3 at step 1 — and
-> §4.0 step 12a with it, when the retained record says this receiver derived hand
-> `k` in the solitary regime; a value that **agrees**, from a seat outside the
-> recorded set, adds its sender to the deferred readmission set below; and nothing
-> else is done with either. Neither is applied and neither enters a `stage_hash`.
+> is a **stale-hand** event, and **§4.0 row 10b is the sole authority on what
+> becomes of it** — its outcome column, *"freeze, compare, readmit, or drop"*, is
+> the enumeration, and this box reproduces no part of it (D-011 rule 1). What
+> matters here is only the consequence for the close: **whichever of those four
+> dispositions applies, the copy is never applied and never enters a
+> `stage_hash`**, so a `STATE_HASH` arriving after the close cannot grow `P(k)`,
+> which is the whole of what the close bounds. The words *"disposes of it in
+> three ways and no others"* stood here and enumerated three of the four,
+> omitting the ordinary **drop** of an agreeing copy from a seat **inside** the
+> recorded set — the §1.5 forwarding reorder this box's own `N6` argument is
+> built on, and not an adversarial case at all. That was a restatement claiming
+> exhaustiveness against its own owner (`G6-R5`), and it is replaced by the
+> pointer rather than by a fourth item.
 >
 > **The checkpoint-8 `STATE_ACK` stage is not closed by that window — normative,
 > and this is `N6`.** Every peer emits its checkpoint-8 `STATE_ACK` and its
@@ -4949,6 +4962,15 @@ state_hash = h("p2p-poker v1 state", [ canonical_cbor(PublicTableState) ])
 
 `PublicTableState` is a `#[cbor(array)]` struct containing exactly:
 
+> **Normative, and this is `P7-w`.** The table below is the **field order**, read
+> top to bottom, left to right within a cell. `#[cbor(array)]` means the order
+> **is** the encoding, so this table is not a summary of the struct — it is the
+> struct. It is the only field-order statement this document makes: §2.9's sweep
+> deleted its own second list rather than align it, and `STATE_MACHINE.md` §3.3
+> adopts this table for the engine (D-011 rule 1). An implementer transcribing
+> `PublicTableState` into `src/protocol/messages.rs` reads this table and nothing
+> else.
+
 | Field | Notes |
 |---|---|
 | `protocol_version`, `table_id`, `hand_id`, `checkpoint` | |
@@ -5550,7 +5572,7 @@ unambiguous before the first card exists.
 |---|---|---|
 | `n(0) game` | `u16` | `1` = NLHE. Nothing else is defined in version 1. |
 | `n(1) mode` | `u16` | `1` = `CASH_PLAY_MONEY`, `2` = `TOURNAMENT_SNG_PLAY_MONEY` |
-| `n(2) preset_id` | `bytes` | ≤ 32 B ASCII; `"RATED_SNG_POKERTH_V1"` or `"CUSTOM"` |
+| `n(2) preset_id` | `bytes` | **a closed two-value enum in version 1: `"RATED_SNG_POKERTH_V1"` or `"CUSTOM"`, and nothing else.** Any other byte string — including a name a client recognises from its own source — is rejected by rule 3 below. This is `G6-R6`; the ≤ 32 B ASCII bound remains as the parse limit and is no longer the admission rule |
 | `n(3) table_name` | `bytes` | ≤ 64 B UTF-8, no control characters; display only |
 | `n(4) small_blind` | `u64` | ≥ 1 |
 | `n(5) big_blind` | `u64` | `== 2 * small_blind` |
@@ -5565,7 +5587,7 @@ unambiguous before the first card exists.
 | `n(14) action_timeout_ms` | `u32` | `5_000 ≤ … ≤ 300_000` [RULES B3] |
 | `n(15) action_grace_ms` | `u32` | `≤ 30_000` |
 | `n(16) crypto_step_timeout_ms` | `u32` | `1_000 ≤ … ≤ 120_000` |
-| `n(17) hand_deadline_ms` | `u32` | `HAND_DEADLINE_FLOOR(n(11)) ≤ … ≤ 3_600_000` — the lower bound is **new in this pass and is `P3`**; it is a function of `n(11)`, `n(14)`, `n(15)`, `n(16)` and `n(19)`, it is derived in §8.2, and an advert below it is rejected by rule 2a below. A single figure here made legal play at six seats and up abort itself |
+| `n(17) hand_deadline_ms` | `u32` | `HAND_DEADLINE_MIN(n(11)) ≤ … ≤ 3_600_000` — the lower bound is derived, not a literal (`P3`, and raised by one `REOPENING_COST` in this pass by `G5-Q6`); it is a function of `n(11)`, `n(14)`, `n(15)`, `n(16)` and `n(19)`, it is derived in §8.2, and an advert below it is rejected by rule 2a below. A single figure here made legal play at six seats and up abort itself, and the floor alone let the first re-raise do the same |
 | `n(18) join_deadline_ms` | `u32` | `≤ 3_600_000` |
 | `n(19) hand_delay_ms` | `u32` | `≤ 60_000` |
 | `n(20) button_rule` | `u16` | `1` = `DEAD_BUTTON` (only value in version 1) |
@@ -5589,25 +5611,52 @@ available evidence of what "the rated preset" means. [RULES B1, B2, B4]
 
 *Receiver must validate, before the advert is shown to a user or stored:*
 
+> **These numbered rules are §7.2's and are cited as *"§7.2 rule N"*.** Six sites
+> in this document, and several outside it, cited the same list as *"§9.4 rule
+> 2a"* / *"rule 3"*; §9.4 is *Collection bounds* and contains no numbered rule —
+> this document's six are corrected, the rest are filed (`G6-R7`). The rules
+> below are the joiner's admission check and are the only place `preset_id` and
+> `hand_deadline_ms` are validated against anything.
+
 1. `verify_strict` passes under `sender_public_key`, which is taken as the
    `table_public_key`; the envelope carries the unchained sentinels of §2.3;
 2. every numeric range above, including `big_blind == 2 * small_blind`,
    `min_buyin ≤ max_buyin`, `2 ≤ max_players ≤ 10`,
    `min_players_to_start ≤ max_players`;
-2a. **the whole-hand deadline floor of §8.2 — `P3`, and it is the one range check
-   in this list that is a *derived* bound rather than a literal.**
-   `n(17) hand_deadline_ms >= HAND_DEADLINE_FLOOR(n(11))`, computed from this
-   advert's own `n(11)`, `n(14)`, `n(15)`, `n(16)` and `n(19)`. Below it, **every
-   legal hand at this table aborts on its own deadline** with `cause = 1` and
-   `attributed = []` — no progress, nobody named — so the advert is rejected here
-   and the seat is never taken. The check belongs to the joiner because the value
-   is the **founder's**, signed into `table_params_hash`; a founder who wants a
-   table where nothing can ever be won needs no attack, only a small number. A
-   client that joins anyway and applies its own floor locally has made two peers
-   disagree about whether a hand aborted, which §8.2 classes as a consensus fault;
-3. `preset_id == "RATED_SNG_POKERTH_V1"` implies the preset's exact values, or
+2a. **the whole-hand deadline admitted minimum of §8.2 — `P3` and `G5-Q6`, and it is
+   the one range check in this list that is a *derived* bound rather than a
+   literal.** `n(17) hand_deadline_ms >= HAND_DEADLINE_MIN(n(11))`, computed from
+   this advert's own `n(11)`, `n(14)`, `n(15)`, `n(16)` and `n(19)`. Below
+   `HAND_DEADLINE_FLOOR`, **every legal hand at this table aborts on its own
+   deadline** with `cause = 1` and `attributed = []` — no progress, nobody named.
+   Between the floor and the minimum the table buys the walk and no reopening, so
+   **the first re-raise reaches that same abort** (`G5-Q6`), which is why the
+   admitted bound is the floor plus one `REOPENING_COST(n(11))` and not the floor.
+   Either way the advert is rejected here and the seat is never taken. The check
+   belongs to the joiner because the value is the **founder's**, signed into
+   `table_params_hash`; a founder who wants a table where nothing can ever be won
+   needs no attack, only a small number. A client that joins anyway and applies
+   its own bound locally has made two peers disagree about whether a hand aborted,
+   which §8.2 classes as a consensus fault;
+3. **`preset_id` is one of exactly two byte strings and its value implies the
+   whole configuration.** `"RATED_SNG_POKERTH_V1"` implies §13's exact values, or
    the advert is rejected — a preset name that does not carry the preset's values
-   is a lie about what game is being offered;
+   is a lie about what game is being offered. `"CUSTOM"` implies nothing and
+   carries every value in the fields above. **Any third value is rejected on
+   sight, whether or not this client knows the name** (`G6-R6`). A receiver that
+   accepts an unknown name has accepted a table whose identity it cannot check:
+   the name asserts values by this very rule, the advert asserts values in its
+   fields, and nothing in version 1 says the two agree. Two clients shipping
+   different tables under one unrecognised name is `G6-R1`'s defect with a
+   different label on it — `hand_deadline_ms` alone is signed into
+   `table_params_hash`, so they cannot join each other and neither can say why.
+   **A named configuration that lives only in an implementation is therefore
+   advertised as `"CUSTOM"`**, which costs nothing: every value is already in the
+   advert and already bound into `table_params_hash`, so a joiner reads the
+   numbers rather than trusting the name. §13's heads-up reference configuration
+   is exactly such a name and is not a `preset_id`. Adding a third value is a
+   minor change under §10.1 only if it arrives with a full pinned value list in
+   §13; without one it is not addable at all;
 4. `deck_suite` is a suite this client supports;
 5. `expires_at_unix_ms > timestamp_unix_ms`, and `expires_at` is **not more than
    `MAX_AD_LIFETIME_MS = 300_000` ahead of local time**, and `timestamp` is not
@@ -5877,7 +5926,7 @@ a typical hand"* but:
 > of reason 1 above). A backstop that fires first is not a backstop; it is a
 > shorter deadline that attributes nobody.
 
-**The floor.** `n` is `max_players` — `LOBBY_TABLE_AD`'s `n(11)`, §9.4 — and
+**The floor.** `n` is `max_players` — `LOBBY_TABLE_AD`'s `n(11)`, §7.2 — and
 **never the number of seats currently occupied**: `hand_deadline_ms` is
 two-sided, every peer must hold the identical value (§8.2's opening rule), and a
 floor derived from a live count moves as players sit down. A hand's walk is
@@ -5927,19 +5976,71 @@ seats. **A hand with more reopenings than that still aborts on a legal path**;
 that residual is stated rather than closed, and the two ways of closing it — a cap
 on raises per street, which is a rule of the game and not this document's, or a
 deadline that extends deterministically on accepted chain content, which is a new
-mechanism — are recorded in `DECISIONS.md`'s open list rather than chosen here.
+mechanism — are `G4-P3-r` in `DECISIONS.md`'s open list rather than chosen here.
+
+#### The admitted minimum is the floor plus one reopening — normative, and this is `G5-Q6`
+
+**`REOPENINGS` may not be zero, because a table where the first re-raise can abort
+the hand is the `P3` defect one raise later.** The floor above budgets a
+**no-re-raise** hand: every seat calls or folds, nobody ever raises into a live
+bet. That is a legal hand and it is not poker. A table advertising exactly
+`HAND_DEADLINE_FLOOR(n)` has `REOPENINGS = 0`, so the **first** raise that reopens
+the action can carry the hand past its own deadline, and it ends under §8.4 with
+`cause = 1`, `attributed = []` and `cert_hash = None` — no progress, nobody named,
+on a table where every peer is honest, every message is on time, and the only
+thing that happened is that somebody re-raised.
+
+That is the identical harm the floor above already refuses, so it takes
+the identical remedy rather than a new one. Naming the denominator of `REOPENINGS`
+is the whole of the mechanism; no quantity is added:
+
+```
+REOPENING_COST(n)    = (n − 1) * (action_timeout_ms + action_grace_ms)
+
+HAND_DEADLINE_MIN(n) = HAND_DEADLINE_FLOOR(n) + REOPENING_COST(n)
+```
+
+`HAND_DEADLINE_MIN(n)` is the **admitted minimum** and is what §7.2 rule 2a
+compares against; `HAND_DEADLINE_FLOOR(n)` keeps its meaning unchanged as the cost
+of the walk, and remains the term every other statement in this document reads.
+`n(17) >= HAND_DEADLINE_MIN(n)` is exactly `REOPENINGS >= 1`, which is why it is
+written as the floor plus one unit of the same cost rather than as a second
+formula.
+
+| `n` | floor | `REOPENING_COST` | **admitted minimum** |
+|---:|---:|---:|---:|
+| 2 | 1 017 000 | 25 000 | **1 042 000** |
+| 4 | 1 337 000 | 75 000 | **1 412 000** |
+| 6 | 1 657 000 | 125 000 | **1 782 000** |
+| 10 | 2 297 000 | 225 000 | **2 522 000** |
+
+The §13 preset's `3 300 000` clears the ten-seat minimum by 778 000 ms and its
+`REOPENINGS` is unchanged at four. The cap is untouched and still binds from
+above: `2 522 000 < 3 600 000`, so the playable configuration space is non-empty
+at every seat count from two to ten, which is the check that has to pass before a
+lower bound may be raised at all.
+
+**What this does not close, said plainly so the next pass does not read it as
+closed.** `G4-P3-r` stands exactly as it was. One reopening is now guaranteed
+instead of zero; a hand with more reopenings than the founder's headroom bought
+still aborts on a legal path, and the two closures for *that* are still unchosen.
+This raises the bound by one unit and changes nothing about the shape of the
+residual. It was taken because zero and one are not the same kind of number here:
+at zero the abort is reachable by ordinary play at **every** table that sits on
+its floor, and at one it needs a hand the founder did not pay for.
 
 **What a client does with a table whose advertised deadline is below its own
-derived floor: it refuses the table.** This matters because `hand_deadline_ms` is
+derived minimum: it refuses the table.** This matters because `hand_deadline_ms` is
 a **signed table parameter chosen by the founder** and bound into
 `table_params_hash` (§3.1), so a founder who wants every hand at their table to
 abort neutrally needs no attack at all — they advertise a small number. The check
 therefore belongs to the **joiner**, and it belongs with the other range checks of
-§9.4, **before the advert is shown to a user or stored**:
+§7.2, **before the advert is shown to a user or stored**:
 
-> **Normative.** A receiver computes `HAND_DEADLINE_FLOOR(n(11))` from the
+> **Normative.** A receiver computes `HAND_DEADLINE_MIN(n(11))` from the
 > advertised `n(14)`, `n(15)`, `n(16)`, `n(19)` and `n(11)`, and **rejects the
-> advertisement** if `n(17) hand_deadline_ms < HAND_DEADLINE_FLOOR(n(11))`. A
+> advertisement** if `n(17) hand_deadline_ms < HAND_DEADLINE_MIN(n(11))` — that
+> is, if the table cannot afford the walk **and one reopening raise** (`G5-Q6`). A
 > rejected advertisement is not displayed, not stored, not joined, and the seat is
 > never taken. **A client must not join and substitute its own floor locally**:
 > the deadline is two-sided, and two peers running different whole-hand deadlines
@@ -5949,11 +6050,11 @@ therefore belongs to the **joiner**, and it belongs with the other range checks 
 **The refusal is the safe direction and the cap does the rest.** Declining a table
 costs a player nothing — no chips exist yet — while joining one guarantees every
 hand ends with `cause = 1` and nobody named. And a founder cannot escape upwards
-either: `n(17)` is capped at `3 600 000` (§9.4), so a configuration whose floor
-exceeds that cap has **no legal deadline at all** and every conforming client
-refuses it. That is the correct outcome and it is why the cap is not widened
-here — the pair (floor, cap) bounds the playable configuration space from both
-sides, and a config outside it is unplayable rather than quietly broken.
+either: `n(17)` is capped at `3 600 000` (§7.2), so a configuration whose
+`HAND_DEADLINE_MIN` exceeds that cap has **no legal deadline at all** and every
+conforming client refuses it. That is the correct outcome and it is why the cap is
+not widened here — the pair (minimum, cap) bounds the playable configuration space
+from both sides, and a config outside it is unplayable rather than quietly broken.
 
 If it expires the hand aborts under §8.4 with `cause = 1`,
 `attributed = []` and `cert_hash = None`: **it produces no certificate and names
@@ -6061,7 +6162,7 @@ box above:
 
 **The cost of that second bullet, stated rather than hidden.** Where `|V| < 2` a
 stalled hand now waits `hand_deadline_ms` (3 300 000 ms in
-`RATED_SNG_POKERTH_V1` since `P3`, and never below `HAND_DEADLINE_FLOOR(n)`)
+`RATED_SNG_POKERTH_V1` since `P3`, and never below `HAND_DEADLINE_MIN(n)`)
 instead of `crypto_step_timeout_ms` (30 000 ms). The
 outcome is identical — `cause = 1`, nobody attributed, stacks restored — only the
 wait is longer, and the alternative is a certificate with an effect that one
@@ -6652,7 +6753,7 @@ outcome is.
 | two byte encodings of one event | the canonicality gate of §2.5, run before the signature | `THREAT_MODEL.md` |
 | malformed or oversized frames | the caps of §9 and the fuzzing obligations of §9.6 | `THREAT_MODEL.md` |
 | stalling a hand to force an abort | `hand_deadline_ms` from `TERMINAL(k-1)` (§8.2) and the terminal stage of §4.10 | `THREAT_MODEL.md` X8 |
-| **a founder advertising a deadline every legal hand exceeds** — free, needs no message and no key, and reaches the abort path that attributes nobody | §9.4 rule 2a: the joiner derives `HAND_DEADLINE_FLOOR(n(11))` from the advert's own fields and **refuses the table** before a seat is taken (§8.2, `P3`) | filed for `THREAT_MODEL.md` in `DECISIONS.md`'s open list |
+| **a founder advertising a deadline every legal hand exceeds** — free, needs no message and no key, and reaches the abort path that attributes nobody | §7.2 rule 2a: the joiner derives `HAND_DEADLINE_MIN(n(11))` from the advert's own fields and **refuses the table** before a seat is taken (§8.2, `P3`, `G5-Q6`) | filed for `THREAT_MODEL.md` in `DECISIONS.md`'s open list |
 | **replaying a signed, *agreeing* checkpoint-8 `STATE_HASH` to re-enlarge a required emitter set once per hand** — also free, also no key, valid for the 4 096 hands §5.3 retains a record for | §4.9: the readmission set widens an **accepted** emitter set and never a required one, so only a seat's own **current-chain** signature can grow `R` (§4.4, §3.2, `P2`) | `THREAT_MODEL.md` X8, same family |
 | faulting a table with a false `state_hash` | §6.3 case (c) and §6.4 | `THREAT_MODEL.md` X29 |
 | a provably illegal message — bad signature, non-canonical encoding, out-of-range field, failed proof, illegal action against an agreed checkpoint | the `DISPUTE { kind = 3 }` carrier and the two-tier removal rule of §4.9, `HAND_ABORT cause = 6` (§4.10), and the re-entry bar on `PLAYER_SIT_IN` (§4.10) | `DECISIONS.md` D-014 |
@@ -6918,55 +7019,91 @@ MAX_PRESENCE_PER_PEER_PER_MIN   = 4             (local)
 HANDSHAKE_DEADLINE_MS           = 15 000
 MAX_CONSECUTIVE_AUTO_ACTIONS    = 3
 
-RATED_SNG_POKERTH_V1:
-  seats                         = 10
-  min_players_to_start          = 10
-  start_stack                   = 10 000
-  first_small_blind             = 50
-  big_blind                     = 2 * small_blind
-  ante                          = 0
-  blind_raise                   = DOUBLE_EVERY_N_HANDS, every 11 hands
-  small_blind_cap               = 50 000
-  button_rule                   = DEAD_BUTTON
-  odd_chip_rule                 = FIRST_SEAT_LEFT_OF_BUTTON
-  showdown_policy               = MANDATORY_REVEAL       (pending Q-01)
-  action_timeout_ms             = 20 000
-  action_grace_ms               = 5 000
-  crypto_step_timeout_ms        = 30 000
-  hand_deadline_ms              = 3 300 000     (was 600 000 — P3. seats = 10, so
+RATED_SNG_POKERTH_V1 — all twenty-five parts of table_params_hash (§3.1), in
+that box's order, so this block can be diffed against it field by field:
+  n(0)    game                  = 1     NLHE                  sole legal value §7.2
+  n(1)    mode                  = 2     TOURNAMENT_SNG_PLAY_MONEY      (G7-S3)
+  n(2)    preset_id             = "RATED_SNG_POKERTH_V1"
+  n(4)    small_blind           = 50                          == n(13.2), see below
+  n(5)    big_blind             = 100                         == 2 * n(4), §7.2
+  n(6)    ante                  = 0                           sole legal value §7.2
+  n(7)    min_buyin             = 10 000                      == n(9)        (G7-S3)
+  n(8)    max_buyin             = 10 000                      == n(9)        (G7-S3)
+  n(9)    start_stack           = 10 000
+  n(11)   max_players           = 10        (written "seats" before this pass)
+  n(12)   min_players_to_start  = 10
+  n(13.0) blind_schedule.mode   = 1     DOUBLE_EVERY_N_HANDS  sole legal value §7.2
+  n(13.1) every_n_hands         = 11
+  n(13.2) first_small_blind     = 50
+  n(13.3) small_blind_cap       = 50 000                      = n(11)*n(9)/2
+  n(14)   action_timeout_ms     = 20 000
+  n(15)   action_grace_ms       = 5 000
+  n(16)   crypto_step_timeout_ms = 30 000
+  n(17)   hand_deadline_ms      = 3 300 000  (was 600 000 — G4-P3. n(11) = 10, so
     HAND_DEADLINE_FLOOR(10) = 7 000 + 43*30 000 + 40*25 000 = 2 297 000, and the old
     value was below its own floor: a legal no-re-raise hand is 40 actions at 25 000 ms
     = 1 000 000 ms of human time alone. 3 300 000 clears the floor by 1 003 000 ms,
     which buys REOPENINGS = 1 003 000 / (9 * 25 000) = 4 reopening raises per hand,
     and stays under n(17)'s 3 600 000 cap. §8.2 derives both formulae.)
-  join_deadline_ms              = 120 000
-  hand_delay_ms                 = 7 000
-  password                      = none
+  n(18)   join_deadline_ms      = 120 000
+  n(19)   hand_delay_ms         = 7 000
+  n(20)   button_rule           = 1     DEAD_BUTTON           sole legal value §7.2
+  n(21)   odd_chip_rule         = 1     FIRST_SEAT_LEFT_OF_BUTTON  sole legal value §7.2
+  n(22)   showdown_policy       = 1     MANDATORY_REVEAL      (pending Q-01)
+  n(24)   deck_suite            = "bs-bg12-secp256k1/1"       sole legal value §7.2
+  not a part of table_params_hash, and stated only so its absence is not read
+  as an omission: n(23) password_required = false (no password)
 ```
+
+**Why the block is now indexed to `n(…)`, and this is `G7-S3`.** `n(1) mode`,
+`n(7) min_buyin` and `n(8) max_buyin` are parts of `table_params_hash` and this
+block pinned **none** of them; §7.2 gives each only a range. Two clients both
+correctly implementing `RATED_SNG_POKERTH_V1` therefore computed different
+`table_params_hash` values and **neither was wrong**, so they could not join each
+other's table and §7.2 rule 3 — *the name implies §13's exact values* — had no
+values to imply. That is `G6-R1`'s defect a third time, and it was invisible
+because a **missing** line reads as an omission rather than as a contradiction.
+The three values are not choices: `mode` is forced to `2` by `n(9) start_stack`,
+which §7.2 admits in tournament modes only; and a Sit-and-Go's buy-in **is** its
+starting stack, every entrant getting an equal stack, so `n(7) = n(8) = n(9)` —
+§7.2 rule 2 now enforces that in tournament modes rather than leaving it to be
+restated per configuration. The remedy for the class is the indexing: a named
+configuration is audited by diffing its block against §3.1's twenty-five parts,
+and a part with no line is visible at a glance. The parts that carry no line here
+are the ones §7.2 admits **one** legal value for in version 1 — they are pinned by
+the range itself and are shown above with that noted, rather than left out.
+
+**`n(4) small_blind` is the level-1 blind and cannot be anything else.** It is a
+distinct part from `n(13.2) first_small_blind`, so a configuration that pins only
+the schedule pins only one of the two. Nothing has to be added for it: an advert
+is withdrawn when the table starts (§7.3 `reason = 1`) and §7.2 rule 7 discards
+any re-broadcast whose parameters changed, so an advertised table has dealt no
+hand and is at level 1, where `small_blind == first_small_blind`. §7.2 states the
+equality as a receiver check so that the two parts cannot be filled in
+independently.
 
 **`hand_deadline_ms` is not a constant of this section any more; it is a derived
-lower bound and a per-table parameter above it (`P3`).** The formula is §8.2's and
-is repeated here only as a name, because §13 is where an implementer looks for a
-number and there is no longer one to find:
+lower bound and a per-table parameter above it (`G4-P3`).** `HAND_DEADLINE_FLOOR(n)`,
+`REOPENING_COST(n)` and `HAND_DEADLINE_MIN(n)` are **defined in §8.2 and are not
+reproduced here**, and neither are their values at each seat count: §8.2's two
+tables are the only ones in the corpus. This section carried a second copy of both
+the formulae and the table until this pass, which is a value no test validates
+sitting in two places — the shape that produced `G6-R1` and `G7-S1`, and the reason
+`n = 8` had to be added in three places instead of one. What §13 owes an
+implementer here is the pointer and nothing else, because there is no longer a
+number to find: the deadline is the founder's, bounded below by §8.2's derivation
+and above by `n(17)`'s cap.
 
-```
-HAND_DEADLINE_FLOOR(n) =  hand_delay_ms
-                        + (2n + 23) * crypto_step_timeout_ms
-                        + 4n        * (action_timeout_ms + action_grace_ms)
-
-  where n = max_players (LOBBY_TABLE_AD n(11)), NEVER the live seated count —
-  the value is two-sided (§8.2) and a floor derived from a count that moves
-  during the table's life is not a constant every peer holds identically.
-
-  At the preset's timings: n=2 → 1 017 000   n=4 → 1 337 000
-                           n=6 → 1 657 000   n=10 → 2 297 000
-```
-
-A receiver rejects any `LOBBY_TABLE_AD` whose `n(17)` is below this (§9.4 rule
-2a). The `n(17)` cap of `3 600 000` is unchanged and is the other side of the
-bound: a configuration whose floor exceeds the cap is unplayable and is refused by
-every conforming client, which is the correct outcome and is why the cap is not
-widened.
+A receiver rejects any `LOBBY_TABLE_AD` whose `n(17)` is below
+`HAND_DEADLINE_MIN` (§7.2 rule 2a). **The admitted minimum is the floor plus one
+reopening and not the floor itself — `G5-Q6`:** the floor budgets a hand nobody
+re-raises, and a table sitting exactly on it aborts on the first raise that
+reopens the action, with `cause = 1` and nobody named, which is `P3`'s harm one
+raise later. The `n(17)` cap of `3 600 000` is unchanged and is the other side of
+the bound: a configuration whose minimum exceeds the cap is unplayable and is
+refused by every conforming client, which is the correct outcome and is why the
+cap is not widened. `2 522 000 < 3 600 000`, so the space stays non-empty at every
+seat count from two to ten.
 
 The `RATED_SNG_POKERTH_V1` values, their PokerTH provenance, and the four
 `[OUR CHOICE]` timing values are documented in [RULES B1–B5]. `crypto_step_timeout_ms`
@@ -6975,7 +7112,7 @@ exceed one shuffle prove-and-propagate cycle, measured at ~100 ms of proving plu
 network latency [MENTAL §5.1].
 
 **`RATED_SNG_POKERTH_V1` is fully specified and is not playable by the MVP.** It
-pins `seats = 10` and `min_players_to_start = 10`, while `SPEC_CS.md` §32 requires
+pins `n(11) max_players = 10` and `n(12) min_players_to_start = 10`, while `SPEC_CS.md` §32 requires
 two-player heads-up as the first supported mode and §1.3 scopes the MVP at
 `nlhe/2-6`. The MVP ships `CUSTOM` tables; `RATED_SNG_POKERTH_V1` becomes playable
 when `nlhe/7-10` lands. This is stated rather than left to inference because a
@@ -6983,6 +7120,82 @@ reader who does not notice will build the wrong acceptance test —
 `STATE_MACHINE.md` §9.5 carries the same statement next to its heads-up
 reachability analysis, and the Phase 8 acceptance test for D-003/D-004 uses a
 `CUSTOM` two-seat table.
+
+#### The heads-up reference configuration — **not a preset, and this is `G6-R6`**
+
+The `CUSTOM` two-seat table the sentence above names is the only table the MVP
+can actually play, so its values are written down here. **They are a reference
+configuration and not a `preset_id`.** `HEADS_UP_PLAY_MONEY_V1` exists in
+`src/poker/tournament.rs` as a source constant; version 1 has **no such preset**
+and §7.2 rule 3 admits exactly two `preset_id` values, so a table built from these
+values advertises `preset_id = "CUSTOM"` and carries every number below in its own
+advert fields.
+
+```
+the heads-up reference configuration — advertised as CUSTOM:
+  mode                          = 2  (TOURNAMENT_SNG_PLAY_MONEY)
+  max_players                   = 2
+  min_players_to_start          = 2
+  start_stack                   = 10 000       (= min_buyin = max_buyin)
+  first_small_blind             = 50
+  big_blind                     = 2 * small_blind
+  ante                          = 0
+  blind_raise                   = DOUBLE_EVERY_N_HANDS, every 11 hands
+  small_blind_cap               = 10 000
+  button_rule                   = DEAD_BUTTON
+  odd_chip_rule                 = FIRST_SEAT_LEFT_OF_BUTTON
+  showdown_policy               = MANDATORY_REVEAL       (pending Q-01)
+  action_timeout_ms             = 20 000
+  action_grace_ms               = 5 000
+  crypto_step_timeout_ms        = 30 000
+  hand_delay_ms                 = 7 000
+  hand_deadline_ms              = 1 200 000
+  join_deadline_ms              = 120 000
+  password                      = none
+```
+
+**Why these numbers, since values written down have to be justified whether or not
+a name carries them.** Everything but the last two lines is the rated preset's,
+unchanged, because nothing about two seats makes 50/100 blinds, a 10 000 stack, a
+zero ante or an eleven-hand level the wrong choice — the rated values already carry
+[RULES B1–B5] and copying them is cheaper than inventing a second provenance.
+**`small_blind_cap = 10 000` is the rated preset's rule and not a new number:**
+PokerTH computes the cap as `seats × start_stack ÷ 2`, half the chips the
+tournament started with, which is 50 000 at ten seats and **10 000 at two**
+[RULES B4]. The same formula at a different seat count is not a deviation. Two
+values are genuinely this configuration's:
+
+* **`min_players_to_start = 2`**, which is `max_players`, so the table starts when
+  it is full. There is no smaller legal value, and D-007 is why a two-seat table
+  is a distinct object rather than the rated preset with eight empty chairs.
+* **`hand_deadline_ms = 1 200 000`**, against the preset's 3 300 000. It is a
+  per-table parameter and not a constant (`P3`), and `HAND_DEADLINE_MIN(2)` is
+  **1 042 000**, so this clears the admitted minimum by 158 000 ms and buys
+  `REOPENINGS = ⌊(1 200 000 − 1 017 000) ÷ 25 000⌋ = 7` — more reopenings per hand
+  than the rated preset's four at ten seats, which is the right way round, since
+  this is the table the MVP's hands are actually played and tested on. It is under
+  the `3 600 000` cap with room to spare.
+
+**Why this is a reference configuration and not a third `preset_id`, which is the
+decision `G6-R6` asked for.** A `preset_id` is a **claim about values carried by a
+name**: §7.2 rule 3 makes the name imply the numbers, which is what gives
+`RATED_SNG_POKERTH_V1` its worth and is exactly what made it dangerous when the
+code and §13 disagreed by 600 000 ms (`G6-R1`). That claim is only worth its cost
+when an outside authority fixes the values — PokerTH's own rated-game settings
+check does, and there is **no analogous authority for a two-seat rated game**;
+every number above is either copied or chosen here. Pinning them under a name
+would manufacture the appearance of provenance for a configuration this corpus
+invented, and would create a second set of values that two documents, a source
+file and a test fixture must be kept in step on — the drift that produced
+`G6-R1` in the first place, now with nothing outside the project to check against.
+
+Advertising the same table as `CUSTOM` costs nothing and closes the hazard
+outright: every value is in the advert's own fields and every one of them is bound
+into `table_params_hash` (§3.1), so a joiner reads numbers instead of trusting a
+name, and two clients whose "heads-up table" differs by one field see the
+difference **before** a seat is taken (§7.2 rules 2, 2a and 7) rather than
+discovering it as a failure to join. The name may go on staying in the source, in
+a test fixture and in a UI menu; what it may not do is travel on the wire.
 
 **Retired constants.** `LOBBY_MAX_MESSAGE`, `TABLE_MAX_FRAME`,
 `SNAPSHOT_MAX_REQUEST` and `SNAPSHOT_MAX_RESPONSE` are renamed as listed at the

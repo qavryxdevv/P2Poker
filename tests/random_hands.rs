@@ -20,7 +20,7 @@ use p2p_poker::poker::engine::{
 use p2p_poker::poker::evaluator::{evaluate_holdem, HandRank};
 use p2p_poker::poker::pots::{award, build_pots, total};
 use p2p_poker::poker::state::{Card, Chips, SeatIdx, Street};
-use p2p_poker::poker::tournament::{HEADS_UP_PLAY_MONEY_V1, RATED_SNG_POKERTH_V1};
+use p2p_poker::poker::tournament::{HEADS_UP_CUSTOM_2P, RATED_SNG_POKERTH_V1};
 
 /// Deterministic, reproducible, and not used for anything that must be secret.
 struct Xorshift(u64);
@@ -268,7 +268,7 @@ fn run_table(seed: u64, hands: usize, seats: usize, start_stack: Chips) -> usize
         }
 
         let preset = if seats == 2 {
-            HEADS_UP_PLAY_MONEY_V1
+            HEADS_UP_CUSTOM_2P
         } else {
             RATED_SNG_POKERTH_V1
         };

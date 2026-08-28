@@ -1,0 +1,341 @@
+//! Protocol constants (`PROTOCOL.md` §13).
+//!
+//! Wire-visible values and the bounds a receiver enforces. Everything here is
+//! transcribed from §13, which owns them (D-011); a value that appears in a
+//! second document is a defect, and has twice been one.
+//!
+//! # Why the deadline bounds are functions and not numbers
+//!
+//! `hand_deadline_ms` was a single figure, `600_000`, and it was below its own
+//! floor at **every** seat count. Legal play at six seats and up aborted
+//! itself, with `cause = 1` and nobody at fault.
+//!
+//! What makes it worth a note here is that **no timing test in this project
+//! could have caught it**. A protocol-paced table finishes a hand in a couple
+//! of seconds at ten seats, hundreds of times inside 600 000 ms, so every
+//! healthy-table walk passed. What the deadline has to pay for is the *human*
+//! action term — forty actions at twenty-five seconds — which the walk never
+//! measures. So the bound is derived here rather than written down, and a bare
+//! literal deadline is a defect on sight.
+
+use crate::poker::state::Chips;
+
+// ---------------------------------------------------------------------------
+// Identity and protocol strings
+// ---------------------------------------------------------------------------
+
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_MAJOR: u16 = 1;
+
+pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/1";
+pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/1";
+pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/1";
+pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/1";
+pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/1";
+pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/1";
+
+/// The string the lobby infohash is derived from, so the constant below is
+/// checkable rather than arbitrary.
+pub const LOBBY_DERIVATION_STRING: &str = "p2p-poker/mainline-lobby/v1";
+
+/// The fixed Mainline DHT infohash every client announces under
+/// (`SPEC_CS.md` §3).
+pub const LOBBY_INFOHASH: [u8; 20] = [
+    0xfd, 0x7c, 0x0d, 0x69, 0x43, 0x3e, 0x32, 0xe4, 0x25, 0xdb, 0x3c, 0xa2, 0xb7, 0xd7, 0x71, 0x89,
+    0x28, 0x73, 0x9f, 0x01,
+];
+
+pub const RELAY_DERIVATION_STRING: &str = "p2p-poker/mainline-relay/v1";
+
+/// Where relay volunteers announce, kept apart from the player lobby.
+pub const RELAY_INFOHASH: [u8; 20] = [
+    0x9c, 0x18, 0xd8, 0xc8, 0x0f, 0x69, 0xde, 0x3a, 0xa0, 0x79, 0xb2, 0xef, 0x51, 0x9b, 0xc4, 0xbb,
+    0xb6, 0x7e, 0x1c, 0xc1,
+];
+
+// ---------------------------------------------------------------------------
+// Table and chain shape
+// ---------------------------------------------------------------------------
+
+pub const MAX_SEATS: u8 = 10;
+pub const MAX_STAGES_PER_HAND: u64 = 2_048;
+
+/// A boundary event of chain `k` carries `sequence = BOUNDARY_SEQUENCE_BASE + seat`.
+pub const BOUNDARY_SEQUENCE_BASE: u64 = 4_096;
+
+/// The boundary checkpoint's own sequence base (§4.9).
+pub const BOUNDARY_CHECKPOINT_BASE: u64 = 8_192;
+
+/// How many past hands a receiver keeps a record of, for the stale-event test.
+pub const MAX_RETAINED_HAND_RECORDS: usize = 4_096;
+
+pub const MAX_CBOR_NESTING_DEPTH: usize = 8;
+pub const MAX_DISPUTES_PER_SENDER_PER_HAND: usize = 8;
+pub const MAX_CONSECUTIVE_AUTO_ACTIONS: u8 = 3;
+
+// ---------------------------------------------------------------------------
+// Size caps (`SPEC_CS.md` §17, §27: every message and every collection bounded)
+// ---------------------------------------------------------------------------
+
+pub const GOSSIP_MAX_TRANSMIT: usize = 65_536;
+pub const LOBBY_MSG_MAX: usize = 8_192;
+pub const TABLE_AD_MAX: usize = 1_024;
+pub const TABLE_AD_SIGNED_MAX: usize = 1_536;
+pub const LOBBY_CHAT_MAX: usize = 2_048;
+pub const SNAPSHOT_REQ_MAX: usize = 1_024;
+pub const SNAPSHOT_RESP_MAX: usize = 262_144;
+pub const SNAPSHOT_MAX_ADS: usize = 128;
+pub const JOIN_REQ_MAX: usize = 4_096;
+pub const JOIN_RESP_MAX: usize = 16_384;
+pub const TABLE_FRAME_MAX: usize = 262_144;
+pub const MAX_EMBEDDED_EVENT: usize = 32_768;
+
+// ---------------------------------------------------------------------------
+// Lobby and transport timing
+// ---------------------------------------------------------------------------
+
+pub const AD_TTL_MS: u64 = 90_000;
+pub const AD_REBROADCAST_MS: u64 = 30_000;
+pub const MAX_AD_LIFETIME_MS: u64 = 300_000;
+pub const MAX_CLOCK_SKEW_MS: u64 = 120_000;
+pub const PRESENCE_TTL_MS: u64 = 120_000;
+pub const PRESENCE_HEARTBEAT_MS: u64 = 40_000;
+
+/// How often the DHT announce is repeated. A legitimate `600_000`, and the
+/// only one in the protocol: a Mainline record is short-lived and the announce
+/// must be renewed.
+pub const REANNOUNCE_INTERVAL_MS: u64 = 600_000;
+
+pub const IDLE_CONNECTION_TIMEOUT_MS: u64 = 60_000;
+pub const MDNS_QUERY_INTERVAL_MS: u64 = 15_000;
+pub const HANDSHAKE_DEADLINE_MS: u64 = 15_000;
+pub const SNAPSHOT_PEER_COUNT: usize = 4;
+
+pub const MAX_TRACKED_TABLES: usize = 4_096;
+pub const MAX_TRACKED_PRESENCE: usize = 8_192;
+pub const MAX_ADS_PER_TABLE_KEY_PER_MIN: u32 = 4;
+pub const MAX_ADS_PER_PEER_PER_MIN: u32 = 20;
+pub const MAX_PRESENCE_PER_PEER_PER_MIN: u32 = 4;
+
+// ---------------------------------------------------------------------------
+// The deadline bounds (`PROTOCOL.md` §8.2)
+// ---------------------------------------------------------------------------
+
+/// The largest whole-hand deadline any advert may carry.
+pub const HAND_DEADLINE_CAP_MS: u64 = 3_600_000;
+
+/// What one reopening raise costs: it entitles up to `n - 1` further actions.
+pub const fn reopening_cost_ms(seats: u8, action_timeout_ms: u64, action_grace_ms: u64) -> u64 {
+    let n = seats as u64;
+    if n < 2 {
+        return 0;
+    }
+    (n - 1) * (action_timeout_ms + action_grace_ms)
+}
+
+/// The smallest deadline at which a hand with no reopening raise can finish.
+///
+/// A hand is `6n + 20` round trips; `4n` of them are betting actions and the
+/// other `2n + 23` are cryptographic steps.
+pub const fn hand_deadline_floor_ms(
+    seats: u8,
+    action_timeout_ms: u64,
+    action_grace_ms: u64,
+    crypto_step_timeout_ms: u64,
+    hand_delay_ms: u64,
+) -> u64 {
+    let n = seats as u64;
+    hand_delay_ms
+        + (2 * n + 23) * crypto_step_timeout_ms
+        + 4 * n * (action_timeout_ms + action_grace_ms)
+}
+
+/// The **admitted** minimum: the floor plus one reopening.
+///
+/// Between the floor and this, a table buys the walk and no reopening at all,
+/// so the very first re-raise reaches the same abort the floor was raised to
+/// prevent. A joiner rejects any advert below this, and does **not** join and
+/// substitute its own bound — two peers running different whole-hand deadlines
+/// disagree about whether a hand aborted, which is a consensus fault.
+pub const fn hand_deadline_min_ms(
+    seats: u8,
+    action_timeout_ms: u64,
+    action_grace_ms: u64,
+    crypto_step_timeout_ms: u64,
+    hand_delay_ms: u64,
+) -> u64 {
+    hand_deadline_floor_ms(
+        seats,
+        action_timeout_ms,
+        action_grace_ms,
+        crypto_step_timeout_ms,
+        hand_delay_ms,
+    ) + reopening_cost_ms(seats, action_timeout_ms, action_grace_ms)
+}
+
+// ---------------------------------------------------------------------------
+// Preset identity (`PROTOCOL.md` §7.2 rule 3)
+// ---------------------------------------------------------------------------
+
+/// The two byte strings `preset_id` may carry, and nothing else.
+///
+/// A preset name **asserts** the configuration's values, so an unrecognised
+/// name is a table whose identity cannot be checked: the name asserts values by
+/// that rule, the advert asserts values in its fields, and nothing says the two
+/// agree. Two clients shipping different tables under one unknown name is an
+/// identity failure that has already happened twice in this project, so a third
+/// value is rejected on sight whether or not this client knows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PresetId {
+    /// Implies §13's exact values, or the advert is rejected.
+    RatedSngPokerthV1,
+    /// Implies nothing; every value is carried in the advert's own fields.
+    Custom,
+}
+
+impl PresetId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PresetId::RatedSngPokerthV1 => "RATED_SNG_POKERTH_V1",
+            PresetId::Custom => "CUSTOM",
+        }
+    }
+
+    /// Parse a `preset_id` from the wire, rejecting any third value.
+    pub fn parse(s: &str) -> Option<PresetId> {
+        match s {
+            "RATED_SNG_POKERTH_V1" => Some(PresetId::RatedSngPokerthV1),
+            "CUSTOM" => Some(PresetId::Custom),
+            _ => None,
+        }
+    }
+}
+
+/// The rated preset's whole-hand deadline, the one value §13 fixes directly.
+pub const RATED_HAND_DEADLINE_MS: u64 = 3_300_000;
+
+/// Chips the rated preset starts every seat with.
+pub const RATED_START_STACK: Chips = 10_000;
+
+
+// ---------------------------------------------------------------------------
+// Compile-time relationships between the constants
+// ---------------------------------------------------------------------------
+//
+// These hold by construction rather than by test, so a value edited into an
+// inconsistent state fails the build instead of a test run. They are the
+// relationships a reader would otherwise have to re-derive by eye.
+
+/// The caps nest the way the transports do: an advert fits its signed form,
+/// which fits a lobby message, which fits a GossipSub frame.
+const _: () = assert!(TABLE_AD_MAX < TABLE_AD_SIGNED_MAX);
+const _: () = assert!(TABLE_AD_SIGNED_MAX <= LOBBY_MSG_MAX);
+const _: () = assert!(LOBBY_MSG_MAX <= GOSSIP_MAX_TRANSMIT);
+const _: () = assert!(LOBBY_CHAT_MAX <= LOBBY_MSG_MAX);
+const _: () = assert!(MAX_EMBEDDED_EVENT <= TABLE_FRAME_MAX);
+const _: () = assert!(SNAPSHOT_RESP_MAX <= TABLE_FRAME_MAX);
+
+/// One lost rebroadcast must not expire an advert, and one lost heartbeat must
+/// not drop a player from the lobby.
+const _: () = assert!(AD_REBROADCAST_MS * 2 <= AD_TTL_MS);
+const _: () = assert!(PRESENCE_HEARTBEAT_MS * 2 <= PRESENCE_TTL_MS);
+
+/// The boundary window sits above the stage numbers and below the boundary
+/// checkpoint, with room for every seat.
+const _: () = assert!(BOUNDARY_SEQUENCE_BASE > MAX_STAGES_PER_HAND);
+const _: () = assert!(BOUNDARY_CHECKPOINT_BASE > BOUNDARY_SEQUENCE_BASE + MAX_SEATS as u64);
+
+/// Players and relays announce under different infohashes, or a relay
+/// volunteer would be dialled as a player.
+const _: () = assert!(LOBBY_INFOHASH.len() == 20);
+const _: () = assert!(RELAY_INFOHASH.len() == 20);
+
+/// The rated deadline is inside the range every advert must satisfy.
+const _: () = assert!(RATED_HAND_DEADLINE_MS <= HAND_DEADLINE_CAP_MS);
+const _: () = assert!(
+    RATED_HAND_DEADLINE_MS >= hand_deadline_min_ms(MAX_SEATS, 20_000, 5_000, 30_000, 7_000)
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §8.2's published table, extended to `n = 8` which it omits.
+    #[test]
+    fn the_floor_matches_the_published_derivation() {
+        // The rated preset's timing: 20 s action, 5 s grace, 30 s crypto step,
+        // 7 s hand delay.
+        let f = |n: u8| hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000);
+        assert_eq!(f(2), 1_017_000);
+        assert_eq!(f(4), 1_337_000);
+        assert_eq!(f(6), 1_657_000);
+        assert_eq!(f(8), 1_977_000);
+        assert_eq!(f(10), 2_297_000);
+    }
+
+    #[test]
+    fn the_admitted_minimum_is_the_floor_plus_one_reopening() {
+        for n in [2u8, 4, 6, 8, 10] {
+            let floor = hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000);
+            let cost = reopening_cost_ms(n, 20_000, 5_000);
+            let min = hand_deadline_min_ms(n, 20_000, 5_000, 30_000, 7_000);
+            assert_eq!(min, floor + cost, "at {n} seats");
+            assert!(min > floor, "the minimum must leave room for one reopening");
+        }
+        assert_eq!(hand_deadline_min_ms(10, 20_000, 5_000, 30_000, 7_000), 2_522_000);
+    }
+
+    /// The regression that no timing test could see. 600 000 ms is below the
+    /// floor at every seat count, and a protocol-paced walk passes at it
+    /// because what it cannot pay for is the human action term.
+    #[test]
+    fn six_hundred_thousand_is_below_the_floor_everywhere() {
+        for n in [2u8, 4, 6, 8, 10] {
+            assert!(
+                hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000) > 600_000,
+                "600 000 ms would be legal at {n} seats"
+            );
+        }
+    }
+
+    /// §8.2 derives four reopening raises at the rated value; the code asserts
+    /// the consequence rather than the inequality, because an inequality once
+    /// passed at a value that falsified this very sentence.
+    #[test]
+    fn the_rated_deadline_buys_exactly_four_reopenings() {
+        let floor = hand_deadline_floor_ms(MAX_SEATS, 20_000, 5_000, 30_000, 7_000);
+        let cost = reopening_cost_ms(MAX_SEATS, 20_000, 5_000);
+        assert_eq!((RATED_HAND_DEADLINE_MS - floor) / cost, 4);
+    }
+
+    #[test]
+    fn a_one_seat_table_costs_nothing_to_reopen() {
+        // Guarded so the n - 1 cannot underflow on a malformed advert.
+        assert_eq!(reopening_cost_ms(1, 20_000, 5_000), 0);
+        assert_eq!(reopening_cost_ms(0, 20_000, 5_000), 0);
+    }
+
+    #[test]
+    fn the_two_infohashes_differ() {
+        // Compile-time asserts cover their length; this one compares values,
+        // and it matters: a relay volunteer announced under the player
+        // infohash would be dialled as a player.
+        assert_ne!(LOBBY_INFOHASH, RELAY_INFOHASH);
+        assert_ne!(LOBBY_INFOHASH, [0u8; 20]);
+    }
+
+    #[test]
+    fn preset_ids_round_trip_and_a_third_name_is_refused() {
+        for p in [PresetId::RatedSngPokerthV1, PresetId::Custom] {
+            assert_eq!(PresetId::parse(p.as_str()), Some(p));
+        }
+        for unknown in ["HEADS_UP_PLAY_MONEY_V1", "", "rated_sng_pokerth_v1", "TURBO"] {
+            assert_eq!(
+                PresetId::parse(unknown),
+                None,
+                "an unrecognised preset name asserts values nothing checks"
+            );
+        }
+    }
+
+}

@@ -87,16 +87,25 @@ pub const RATED_SNG_POKERTH_V1: Preset = Preset {
 
 /// A two-seat table, for the first supported mode.
 ///
-/// **Ours, not PokerTH's.** `SPEC_CS.md` section 32 requires heads-up play
-/// money to work before anything else, and the rated Sit-and-Go cannot be
-/// played two-handed — `CheckSettings` rejects a rated game with any other seat
-/// count. Section 4 permits a founder to use custom parameters, so this is one
-/// such set, named so that two clients can agree on it without negotiating.
+/// **This is a CUSTOM advert, not a named preset.** `PROTOCOL.md` §7.2 rule 3
+/// admits exactly two `preset_id` values — `RATED_SNG_POKERTH_V1`, which
+/// asserts §13's exact values, and `CUSTOM`, which asserts nothing and carries
+/// every value in the advert's own fields. A third name is rejected on sight,
+/// because a name that asserts values nothing checks is how two clients ship
+/// different tables under one identity. That has already happened twice here.
+///
+/// So these values travel in the advert, and [`crate::protocol::constants::PresetId::Custom`]
+/// is what goes in `preset_id`. The constant is a convenience for building the
+/// advert, never an identity two clients could disagree about.
+///
+/// `SPEC_CS.md` section 32 requires heads-up play money first, and the rated
+/// Sit-and-Go cannot be played two-handed — PokerTH's `CheckSettings` rejects a
+/// rated game with any other seat count.
 ///
 /// The blind structure is the rated one scaled to a two-player chip pool, so
 /// the cap stays at half the chips in play.
-pub const HEADS_UP_PLAY_MONEY_V1: Preset = Preset {
-    id: "HEADS_UP_PLAY_MONEY_V1",
+pub const HEADS_UP_CUSTOM_2P: Preset = Preset {
+    id: "CUSTOM",
     seats: 2,
     min_players_to_start: 2,
     start_stack: 10_000,
@@ -302,9 +311,28 @@ mod tests {
         }
     }
 
+    /// The heads-up configuration must not present itself as a named preset.
+    /// PROTOCOL.md section 7.2 rule 3 admits two names and rejects a third on
+    /// sight, because a name asserts values nothing checks - the identity
+    /// failure this project has already had twice.
+    #[test]
+    fn the_heads_up_configuration_advertises_itself_as_custom() {
+        use crate::protocol::constants::PresetId;
+        assert_eq!(HEADS_UP_CUSTOM_2P.id, PresetId::Custom.as_str());
+        assert_eq!(
+            PresetId::parse(HEADS_UP_CUSTOM_2P.id),
+            Some(PresetId::Custom)
+        );
+        assert_eq!(
+            PresetId::parse(RATED_SNG_POKERTH_V1.id),
+            Some(PresetId::RatedSngPokerthV1),
+            "the rated preset keeps its name, which asserts section 13 exactly"
+        );
+    }
+
     #[test]
     fn the_heads_up_preset_is_two_handed_and_caps_at_half_its_own_pool() {
-        let p = HEADS_UP_PLAY_MONEY_V1;
+        let p = HEADS_UP_CUSTOM_2P;
         assert_eq!(p.seats, 2, "spec section 32 wants heads-up first");
         assert_eq!(p.min_players_to_start, 2);
         assert_eq!(p.small_blind_cap, p.derived_cap());
@@ -323,6 +351,7 @@ mod tests {
             (2u8, 1_017_000u64),
             (4, 1_337_000),
             (6, 1_657_000),
+            (8, 1_977_000),
             (10, 2_297_000),
         ] {
             let p = Preset { seats, ..base };
@@ -349,7 +378,7 @@ mod tests {
     /// following the spec refuses the table it advertises.
     #[test]
     fn every_shipped_preset_meets_its_own_floor() {
-        for p in [RATED_SNG_POKERTH_V1, HEADS_UP_PLAY_MONEY_V1] {
+        for p in [RATED_SNG_POKERTH_V1, HEADS_UP_CUSTOM_2P] {
             let deadline_ms = p.hand_deadline_sec as u64 * 1_000;
             assert!(
                 deadline_ms >= p.hand_deadline_floor_ms(),
@@ -385,7 +414,7 @@ mod tests {
 
     #[test]
     fn the_shipped_presets_can_afford_at_least_one_reopening_raise() {
-        for p in [RATED_SNG_POKERTH_V1, HEADS_UP_PLAY_MONEY_V1] {
+        for p in [RATED_SNG_POKERTH_V1, HEADS_UP_CUSTOM_2P] {
             assert!(
                 p.reopenings() >= 1,
                 "{} leaves no headroom for a reopening raise",
@@ -408,7 +437,7 @@ mod tests {
     fn timing_values_respect_pokerths_only_hard_floor() {
         // src/net/servergame.cpp:1257-1260 rejects an action timeout below 5 s
         // on a non-LAN server. Ours must clear that for every preset.
-        for p in [RATED_SNG_POKERTH_V1, HEADS_UP_PLAY_MONEY_V1] {
+        for p in [RATED_SNG_POKERTH_V1, HEADS_UP_CUSTOM_2P] {
             assert!(p.action_timeout_sec >= 5, "{} is below PokerTH's floor", p.id);
             assert!(p.hand_deadline_sec > p.action_timeout_sec);
             assert!(p.join_deadline_sec > 0);
