@@ -19,7 +19,7 @@ which are only detected, and which are beyond the protocol's reach. This documen
 is the place where that distinction is made and it is deliberately conservative:
 **an unjustified "prevented" is the worst error this document can contain.**
 
-**Binding owner decisions.** `docs/DECISIONS.md` D-001 to D-011 outrank both the
+**Binding owner decisions.** `docs/DECISIONS.md` D-001 to D-013 outrank both the
 research notes and any judgement in this document. Where a decision creates a
 threat or an open question, it is recorded here as such rather than argued with.
 **D-007 corrects D-006** and wins over it: at two seats an action deadline is
@@ -126,11 +126,44 @@ is free under X7 — so it is classified **DNA** for a reason no other row has:
 there is nobody to name. It was created by the fix that unfroze the stalled hand,
 which is a **third defect shape** to set beside D-011's two, and the one that
 tells a reviewer where to look next: *the path the previous fix newly made
-load-bearing*. And its own fix has a price — nothing marks a seat absent
-automatically any more, so a silent seat is dealt in every hand and stalls each
-one to the deadline (X33, `STATE_MACHINE.md` Q7). D-012 also carries a process
-rule this document is bound by: **every decision sweep covers every document**,
-because twice a document scoped out by judgement became a blocking defect.
+load-bearing*. **The price D-012 believed it was paying was stated wrongly, and
+the correction is D-013's** — see below and X34; the sentence that stood here,
+*"nothing marks a seat absent automatically any more, so a silent seat is dealt
+in every hand and stalls each one to the deadline until a human acts"*, was
+false in all three of its parts and is not to be reproduced. D-012 also carries
+a process rule this document is bound by: **every decision sweep covers every
+document**, because twice a document scoped out by judgement became a blocking
+defect. This document was the third such omission: it stood at **one** occurrence
+of `D-013` while carrying that decision's superseded cost model in two places
+and its superseded reconnect rule in a third.
+
+**D-013 outranks D-012, and it corrects D-012 rather than extending it.** Its
+rule: **liveness is inherited from the chain, not from a seat's status** — a
+seat is required to emit in hand `k+1` only if it signed at least one chained
+event during hand `k`, and for the first hand the required set is the signers of
+`TABLE_READY`. `PROTOCOL.md` §3.2 owns the set and its notation; this document
+does not restate either. Four consequences bind the classifications below.
+
+1. **D-012's cost model was not merely optimistic, it was the wrong shape**, and
+   the corrected version is catalogued in its own right as **X34**. Marking a
+   seat absent never removed it from the required emitter set, so the liveness
+   D-012 believed it was spending had been gone for every previous pass; and the
+   stall was not a slow table but a **fixed point** — every stack is restored on
+   abort, so no seat busts, so no end condition can fire. Under D-013 a silent
+   seat stalls exactly one hand and is then skipped, it is blinded off, it
+   genuinely busts, and the tournament can end.
+2. **No human acts, and none can.** Wherever this document said a seat's stall
+   ends "until a human sits it out or leaves", the grammatical subject of that
+   escape was the *silent* seat, and `PLAYER_SIT_OUT` and `PLAYER_LEAVE` are
+   single-writer by the seat itself. There is no operator, no majority and no
+   third party with a lever here, and no revision of this file may imply one.
+3. **Nothing rejoins automatically.** A seat returns only by signing a chained
+   event. §7.3(b) carried the opposite and is corrected.
+4. **D-013's own fix has made two paths load-bearing that were not**, which is
+   D-012's third shape applied to D-013 itself. Both are catalogued: the genesis
+   the required set is anchored to (**X35**) and the required set on the one
+   path where it narrows (**X36**). X36 is the first row this document has ever
+   had to place in the bucket §5.4 previously said no row occupied.
 
 Read the catalogue in §5 with all of that in front of you. **Two payoffs have
 been deleted from the design, and every row that turned on either is
@@ -925,11 +958,21 @@ addressed in §6 or §7.
 |---|---|
 | **CP** — cryptographically prevented | Under assumptions A1–A7 (and the specific ones named in the row), the adversary cannot construct a message that both achieves the goal and is accepted by an honest client. The adversary's only option is to be rejected. This includes attacks that are *structurally excluded*, i.e. for which no message in the protocol's grammar could express the attack. |
 | **D&A** — detected and attributed | The adversary *can* emit the message. Every honest client rejects it, the state does not advance, and the misbehaviour is bound to a specific application key by a signature, so the evidence is transferable to third parties. **Under D-010 the second half of the name is narrower than it sounds and must be read narrowly:** attribution puts a signed name in the transcript and nothing follows from it automatically — no forfeiture, no block list, no unseating. D&A means *detected and named*, never *detected and answered*. **D-011 rule 3 is what makes the "no block list" half true at every layer rather than only in this document**: until it landed, `NETWORK_STACK.md` still called `block_peer` on an `EquivocationProof` in two places and `STATE_MACHINE.md` still unseated a seat on a self-contained proof in one, so a row classified D&A here could still cost the *accused* — honest or not — its connections. That gap is closed, and the honest reading of every D&A row is now uniform: rejection, a name in the transcript, and nothing else. |
-| **DNA** — detected but not attributable | The divergence or conflict is detected, and play stops, but the transcript does not establish *who* was at fault. **Two different situations share this bucket, and X33 is the first of the second kind:** either an adversary is present and the design cannot name them (X10, X22, X29), or **there is no adversary at all** and the design has produced a divergence between honest peers (X33). Both are "detected, nobody named"; only the first is somebody escaping a name. |
+| **DNA** — detected but not attributable | The divergence or conflict is detected, and play stops, but the transcript does not establish *who* was at fault. **Two different situations share this bucket, and X33 was the first of the second kind:** either an adversary is present and the design cannot name them (X10, X22, X29), or **there is no adversary at all** and the design has produced a divergence between honest peers (X33, X34, X35). Both are "detected, nobody named"; only the first is somebody escaping a name. The second kind is now three of the six DNA rows, which is the shape of the last three review passes and not a coincidence: the defects this corpus produces are no longer attacks. |
+| **NP&ND** — not prevented and not detected | The divergence happens, nothing rejects it, no invariant fires, no deadline expires, no proof forms, and **no peer ever learns that it happened**. Each peer's own view stays internally consistent and self-verifying, so there is no moment at which anything could be reported to a human. This is the **worst bucket in the scheme** — worse than V, which at least leaves a record somebody can read, and worse than OOS, which makes no claim rather than a false one. §5.4 said for four passes that no row occupied it. **X36 occupies it**, and the honest consequence is that this document may no longer offer "every divergence is at least detected" as a property of the design. A row leaves this bucket only by a fix that makes the divergence observable, not by a fix that makes it rarer. |
 | **V** — visible, not prevented | The attack **succeeds**. Nothing rejects it, nothing in the protocol acts against the attacker, and no proof changes the outcome. What the design delivers is a signed, permanent record that it happened, and a per-identity count of it in the lobby. This is the weakest non-OOS bucket in the scheme, and `SPEC_CS.md` §18 forbids describing a row in it as anything more than visible. It is distinguished from OOS only in that the attack runs *through the poker protocol* and the protocol therefore sees and records it. |
 | **OOS** — out of scope | The protocol does not and cannot address it. Mitigations may exist and are named, but no security claim is made. |
 
-**The V bucket is new in this revision and it exists because of D-010.** Before
+**The NP&ND bucket is new in this revision and it exists because of X36**, on
+the same discipline that produced V: there was no honest label for a divergence
+that nothing detects among the five buckets that existed, and stretching DNA to
+cover it would have been the error this document is most concerned with, since
+DNA's whole content is that *something* stopped. Adding the bucket costs one
+line in a table; stretching DNA would have cost the meaning of four other rows.
+Note what this does to the reading of §5.4: the CP column did not move, the
+denominator rose, and the design acquired a failure mode nobody can see.
+
+**The V bucket is new in the previous revision and it exists because of D-010.** Before
 D-010 the rage-quit escape was closed by automated forfeiture and X8 was a D&A
 row; D-010 removes the forfeiture, the escape returns, and there is no honest
 label for it among the four buckets that existed — it is neither prevented, nor

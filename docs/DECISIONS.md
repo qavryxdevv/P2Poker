@@ -1263,6 +1263,146 @@ list is the one place every editor of every document is required to read.
 
 ---
 
+---
+
+## D-014 — A cheater is removed from the table on self-authenticating evidence
+
+**Date:** 2026-08-28
+**Decided by:** project owner
+**Status:** accepted
+**Narrows:** D-010 point 3, which was over-broad
+
+### The requirement
+
+A player who cheats, or tries to alter the game illegally, is removed from the
+table. The hand they attacked is voided and play continues without them. An
+information window tells the other players that the anti-cheat mechanism
+removed that player.
+
+### Why D-010 banned this, and why it was too broad
+
+D-010 removed automated eviction after four review passes in which **every**
+severe defect ended the same way: an honest peer's chips forfeited and its key
+blocked, for following the protocol. Counting *forfeit* across the verification
+reports: 6, 5, 14, 12.
+
+But look at what those defects actually had in common. Every one of them turned
+on a judgement that **two honest peers can reach differently**:
+
+- "peer X did not publish before the deadline" — needs a clock nobody shares;
+- "peer X equivocated" — needed a slot key that was wrong five times running;
+- "peer X caused this abort" — the `attributed` field, which H1 showed is
+  per-receiver;
+- "the voter set is complete" — which N3 showed one client can shrink at will.
+
+Not one of them was "peer X sent a message that is provably illegal". That class
+was never the problem, and banning it along with the rest was an
+over-generalisation on my part. The owner's requirement is the narrow class, and
+the narrow class is sound.
+
+### The distinction that makes it safe
+
+> **Evidence is self-authenticating when it is a message signed by the accused,
+> whose illegality any peer can decide alone, from that message plus state the
+> peers provably share.**
+
+An honest peer cannot be framed by such evidence, because framing it would mean
+forging the victim's signature over an illegal message. There is no vote, no
+quorum, no timing, no per-receiver judgement — the three things that produced
+every previous defect are all absent. Every honest peer reaches the same verdict
+from data it already holds, and a third party replaying the transcript reaches
+it too.
+
+That is a genuinely different object from an accusation, and it is why this can
+be automated when accusation cannot.
+
+### Two tiers, because state-dependence is where this could still go wrong
+
+**Tier 1 — self-contained.** Illegality is decidable from the offending message
+alone, with no reference to game state:
+
+- a signature that does not verify under the sender's key;
+- a non-canonical encoding (`PROTOCOL.md` §2.5's gate);
+- a malformed message, an out-of-range field, a card index outside `0..=51`;
+- a failed shuffle proof, a failed decryption-share proof, a failed
+  key-ownership proof;
+- a deck that gains, loses or duplicates a card across a shuffle;
+- a message whose chain parent does not exist, or whose signer is not a party to
+  this table.
+
+These are safe to act on the moment they arrive. Nothing about them can differ
+between honest receivers.
+
+**Tier 2 — state-dependent.** Illegality is decidable only against game state:
+an out-of-turn action, a raise below the minimum, a bet larger than the stack, a
+showdown claim that contradicts the board.
+
+These are **only** safe once the state they are judged against is agreed. If two
+peers have diverged — and K1 in the open list is exactly such a divergence — an
+honest peer's perfectly legal action looks illegal to a peer whose state has
+drifted, and the anti-cheat would evict the honest player. That is the same
+failure mode D-010 closed, arriving by a new road.
+
+> **Rule: a tier-2 eviction requires the accused's message to be judged against
+> state fixed by a checkpoint both peers have signed.** Before that point a
+> tier-2 violation is recorded and the hand is voided, but nobody is removed.
+
+Tier 1 needs no checkpoint. Tier 2 waits for one.
+
+### What removal does
+
+1. **The attacked hand is voided.** Stacks return to their start-of-hand values,
+   exactly as D-010's neutral abort already specifies. Nothing new is needed.
+2. **The offender leaves the protocol immediately.** It is no longer a key
+   holder, is not dealt in, is not in any required emitter set, and cannot act.
+   Under D-013 it would have dropped out of the emitter set anyway once it
+   stopped signing; this is the same exit, taken at once and for cause.
+3. **Its seat becomes dead and its stack is blinded off**, precisely as D-005
+   treats an absent seat, until the stack is gone. This keeps chip conservation
+   exact — removing a stack from a tournament would change the chip total and
+   break invariant I1 — and it lets the tournament reach its end condition
+   normally.
+4. **It cannot rejoin the table.** Unlike an absent seat, this exit is one-way.
+5. **The evidence is kept in the transcript**, so the removal is replayable and
+   checkable by anyone afterwards, including by the accused.
+
+### What the players see
+
+`SPEC_CS.md` §22's information window, naming the removed player, the tier, and
+what the evidence was — "invalid shuffle proof", "signature did not verify",
+"raise below the minimum after checkpoint 4". A removal that cannot be explained
+in one sentence to the other players should not be automatic.
+
+The window must also state that the hand was voided and that no chips changed
+hands, so nobody reads a void as a loss.
+
+### What this does not become
+
+This is **not** a route back to D-010's forfeiture or to accusation-driven
+eviction. Specifically:
+
+- no removal on a timeout, a missing publication, or any liveness judgement;
+- no removal on an equivocation proof, whose predicate has failed five times;
+- no removal on `attributed`, on a vote, on a certificate, or on any quorum;
+- the offender's chips are never awarded to anyone — they are blinded off.
+
+If a proposed removal cannot point at a message the accused signed, it is not a
+D-014 removal.
+
+### The check this needs before it ships
+
+The recurring lesson of eight passes is that the worst defect appears on the
+path a fix newly made load-bearing. This decision makes **the correctness of
+every validator** load-bearing in a way it was not before: a validator that is
+too strict now ejects honest players rather than merely rejecting a message.
+
+So the adversarial suite must carry the mirror of `SPEC_CS.md` §25's cheater
+list: for every legal action an honest client can emit, under every legal
+interleaving, **no honest peer is ever evictable**. That test is the gate on
+this feature, and it is the same shape as D-009 rule 1's mirror test.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |
@@ -1271,6 +1411,8 @@ list is the one place every editor of every document is required to read.
 | — | Relay admission: `identify` protocol name, or lobby presence (see D-002) | `NETWORK_STACK.md` |
 | J-1 | **DONE in this pass.** `PROTOCOL.md` has dropped `advert_hash` from `GENESIS(0)`, `session_id` and hence `ctx`, and §3.1 now carries a normative `table_params_hash` box — domain `p2p-poker v1 table-params`, twenty-five parts in `LOBBY_TABLE_AD` field order, with `timestamp_unix_ms` and `expires_at_unix_ms` excluded by name. J1(b) is closed at three checked places: §7.2 receiver rule 7, `PLAYER_LIST`'s `n(1)` and `TABLE_READY`'s `n(2)`, both of which changed from `advert_hash` to `table_params_hash` and are now **checked** rather than carried and ignored. | — |
 | J-2 | **DONE in this pass.** `PROTOCOL.md` §3.2 carries the general rule and the set `P(k)`; §4.4 instantiates `R(HAND_INIT, k) = P(k-1)`; `dealt_in ⊆ P(k-1)` is normative; `RNG_COMMIT`, `RNG_REVEAL`, `STATE_HASH` and `STATE_ACK` were swept off status words too, and §2.9 is the sweep that enumerates all nine collective sets. | — |
+| D-014-1 | Integrate D-014 across the corpus: the two evidence tiers, the checkpoint precondition for tier 2, the one-way exit, the dead seat blinded off, and the information window. Touches all five specification documents. | all — **not started** |
+| D-014-2 | The mirror test D-014 requires: under every legal interleaving, no honest peer is evictable. Blocks shipping the feature, not writing it. | adversarial suite |
 | K-1 | **BLOCKER. `P(k)` is a per-receiver quantity on the one path where it narrows, and its payoff is a silent permanent fork.** `PROTOCOL.md` §3.2 justifies D-013 with *"the terminal stage of a chain is witness-independent, so two honest peers that reach `TERMINAL(k)` have accepted the same chain-`k` prefix and derive the same `P(k)`"*. That inverts P3's property: `ABORT_TERMINAL(k)` is a function of `GENESIS(k)` alone **precisely so that peers with different prefixes reach it**. §3.2 also proves that `P` can narrow **only** at a stalled stage 0 — i.e. only on a hand that aborted — so `P(k)` is agreed exactly where it is inert and per-receiver exactly where it acts. Two peers that once disagree about `dealt_in` each reject the other's `HAND_INIT` copy, so each holds `P = {self}` from the next hand, every collective stage becomes self-completing, and both play the drain path alone to a §9.3 condition 1 "tournament won" naming themselves. One dropped frame is enough; no invariant, deadline, equivocation predicate or chip-conservation check fires. Also undefined and deciding which failure occurs: **whether a peer's own emission counts into its own `signed_this_hand`** — counts ⇒ fork, does not count ⇒ `Paused`. This is `Q-10` / `Q8`, which both documents defer to the other. Owner decision needed: ratify the stalled stage, or floor `\|P(k)\|` at 2. | `PROTOCOL.md` §3.2, §4.4; `STATE_MACHINE.md` §5.3 step 4, I31 |
 | K-2 | **BLOCKER. `Q-09` is a wire question, not a placement question, and it sits under the sole re-entry path.** §12 grades it *"a placement decision, not a wire change"*. `hand_id` and `sequence` are inside `TO_BE_SIGNED` (§2.4), are two of the eight slot-key components §4.0 step 10a reads whole, fix `previous_event_hash` through §3.2, and are what §4.0 step 12 asks about. Nothing assigns a total order when two seats emit boundary events at one boundary. Under D-013 a seat outside `P(k)` may legally emit **exactly one** chained event — `PLAYER_SIT_IN` — so the entire re-entry mechanism runs through the message whose chain position is undefined; and an accepted `PLAYER_LEAVE` changes `roster_hash(k)`, so a placement disagreement forks `GENESIS(k)` outright. Fix: §4.10 states chain, `sequence`, parent and total order for `0x0803`/`0x0804`/`0x0805` in one paragraph; §4.11 rows 37–39 cite it; `Q-09` closes. | `PROTOCOL.md` §4.10, §12 |
 | K-3 | **BLOCKER. A drain hand places no checkpoint, so the corpus's only cross-peer detection route is inert in the regime D-013 made a steady state.** §6.2's checkpoints are *"these points and no others"*; 2–7 all require `DECK_COMMIT` or a betting round, and `STATE_MACHINE.md` §5.3 step 9 sends `\|dealt_in\| == 1` straight to `Settling`. §12.1.2 says a silent opponent produces **about forty consecutive drain hands**. §5.2.4's promise — *"the next checkpoint shows two `state_hash` values; §6.3 runs; the outcome is identical either way"* — has no next checkpoint there, and the **tournament result itself is never checkpointed**. Fix, small: checkpoint `8` after `HAND_COMPLETE` on any hand that placed no other checkpoint. It opens nothing and converts K-1 from silent to a `cause = 4` faulted table. **K-3b, same class:** `HandComplete` is zero-width (T47 *"derived, immediate, no external input"*, §8.3 *"the protocol does not wait for `hand_delay_ms`"*), and it is one of only two phases that can accept a `PLAYER_SIT_IN` — the other being `Paused`, which needs every seat silent. So D-013's *"it rejoins by signing … that is the entire test"* has no window in which the test can be taken. | `PROTOCOL.md` §6.2; `STATE_MACHINE.md` §5.2 T47/T59, §5.3 step 9, §8.3 |
