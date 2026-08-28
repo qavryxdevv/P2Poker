@@ -1165,12 +1165,112 @@ passes and is already implemented and under test.
 
 ---
 
+---
+
+## D-013 — Liveness is inherited from the chain, not from a seat's status
+
+**Date:** 2026-08-28
+**Status:** accepted
+**Source:** Phase 2 gate, third attempt — blockers J1 and J2
+**Reinforces:** D-012
+
+### First, a correction
+
+D-012 said the cost of deleting T46's status derivation was that "a silent seat
+is dealt in every hand and stalls each one until the hand deadline". **That
+understated it, and the gate found out why.**
+
+`HAND_INIT`'s required emitter set is "every seat that will be `dealt_in`, plus
+every occupied seat that is absent or sitting out". So marking a seat `Absent`
+never removed it from the set in the first place, and the machine's actual fixed
+point is:
+
+> silent seat stays `Active` → dealt in → required emitter → stage stalls →
+> hand deadline at 600 000 ms → every stack restored → next hand → **identical
+> state**.
+
+Ten minutes per iteration, unbounded, and no seat can ever bust because every
+stack is restored, so no end condition can fire either. That is not a slow
+table. **The table makes no progress, ever.** D-012's cost model was wrong and
+is corrected here rather than left standing.
+
+### J2 — the rule
+
+The circularity is the whole problem: a seat's status may change only through a
+chained event (D-012 / I30), and a silent seat emits nothing, so nothing can
+ever change its status, so it is required forever.
+
+The way out is to stop asking about status at all:
+
+> **A seat is required to emit in hand `k+1` only if it signed at least one
+> chained event during hand `k`.** For the first hand, the required set is the
+> signers of `TABLE_READY`.
+
+Liveness is inherited from demonstrated participation in the agreed chain, not
+from a status field. This is not a per-receiver quantity: "did seat `s` sign
+anything in hand `k`" is a function of the accepted chain, and after H1's fix
+the terminal stage is witness-independent, so honest peers agree on it.
+
+Consequences, all of them intended:
+
+- A seat that goes silent stalls exactly **one** hand — the one it went silent
+  in — and is then skipped. Every later hand proceeds among the seats that are
+  actually there.
+- It keeps its seat and its stack, and the blinds eat it, which is exactly
+  D-005 and exactly what the owner asked for. It now genuinely busts, so the
+  tournament can end.
+- It rejoins by signing a chained event, which requires it to be alive. Nothing
+  else can put it back, and nothing else needs to.
+- No certificate, no vote, no proof, no attribution. This is deliberately not
+  the machinery of D-006 to D-008, which D-010 made inert and `OQ-F` still
+  questions.
+
+### J1 — the rule
+
+`advert_hash` enters `GENESIS(0)` and `session_id`, and it is a per-receiver
+quantity: rule 6 requires each re-broadcast to carry a strictly greater
+timestamp, so two honest players who join thirty seconds apart hash different
+advertisements, derive different `GENESIS(0)`, and no `TABLE_READY` verifies.
+`TABLE_READY` carries the field and nothing ever checks it.
+
+> **`advert_hash` is removed from `GENESIS(0)`, `session_id` and `ctx`, and
+> replaced by a hash of the agreed table parameters** — preset id, seats,
+> starting stack, blind schedule, ante, timing values — and nothing else.
+
+Every joiner sees the same parameters whichever re-broadcast reached them,
+because the parameters are what they agreed to; the timestamp is not. This also
+closes J1(b), where nothing forbade the founder re-signing with *different*
+parameters and forking the blinds, because a changed parameter now changes the
+hash and every peer sees it.
+
+### The process finding, which is D-011's own shadow
+
+`NETWORK_STACK.md` found J1, wrote it up in full, named both fixes, and marked
+it a blocker for `PROTOCOL.md`. `PROTOCOL.md` never acted. The gate's phrasing
+is worth keeping:
+
+> **A finding correctly assigned across an owner boundary is a finding nobody
+> owns.**
+
+D-011 gave every concept one owner so that copies would stop drifting. It also
+created a way for work to fall between owners, because the document that *finds*
+a defect is now often not the document that may *fix* it.
+
+**So: a defect a document assigns to another document's owner is recorded in
+this file's open list in the same pass that finds it.** Not only in the finding
+document, where it is invisible to the editor who has to act on it. The open
+list is the one place every editor of every document is required to read.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |
 |---|---|---|
 | — | Open-source licence for the project (MIT / Apache-2.0 / dual / GPL-3.0 / AGPL-3.0) | Nothing yet; needed before publication |
 | — | Relay admission: `identify` protocol name, or lobby presence (see D-002) | `NETWORK_STACK.md` |
+| J-1 | `PROTOCOL.md` must drop `advert_hash` from `GENESIS(0)`/`session_id`/`ctx` and put a table-parameter hash in its place (D-013). Found and fully specified by `NETWORK_STACK.md` §0.5.6, which cannot make the change itself. | `PROTOCOL.md` — **blocking** |
+| J-2 | `PROTOCOL.md` §4.4 must narrow `HAND_INIT`'s required emitter set to the seats that signed a chained event in the previous hand (D-013), replacing "plus every occupied seat that is absent or sitting out". | `PROTOCOL.md` — **blocking** |
 | OQ-A | A named, versioned reference engine, since several sections claim disputes are "deterministically adjudicable by any third party running the reference engine" and no such engine is defined (review N2). Interim answer: withdraw the claim; the engine is defined when the crate has a tagged release. | `PROTOCOL.md` |
 | OQ-D | A dispute path that does not require the accused peer's signature — circular at every table size, not only heads-up (D-007 point 4, review A-1). Interim answer under D-010: a dispute that cannot resolve ends the hand neutrally, so the circularity costs a hand rather than a stalemate. | `PROTOCOL.md` |
 | OQ-F | Whether `TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` should still be *produced* in the MVP now that D-010 gives them no effect, or be deferred wholesale until the machinery is sound. Producing them keeps the transcript adjudicable later; deferring them removes four passes' worth of surface. | `PROTOCOL.md`, `STATE_MACHINE.md` |
