@@ -572,7 +572,8 @@ mod tests {
     /// `table_id` would be indexing on an attacker-chosen value.
     #[test]
     fn an_unchained_event_must_carry_the_sentinels() {
-        let cases: [(&str, fn(&mut EventBody)); 4] = [
+        type Breaker = fn(&mut EventBody);
+        let cases: [(&str, Breaker); 4] = [
             ("table_id", |b| b.table_id = [1u8; 32]),
             ("hand_id", |b| b.hand_id = 0),
             ("previous_event_hash", |b| b.previous_event_hash = [1u8; 32]),
