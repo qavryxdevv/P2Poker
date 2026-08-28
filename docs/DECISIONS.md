@@ -429,6 +429,107 @@ must still see the same set of open tables.
 
 ---
 
+## D-005 — A disconnected player keeps their seat and is blinded off
+
+**Date:** 2026-08-28
+**Stated by:** project owner
+**Status:** accepted, with one part deviating from live rules by necessity
+
+### The requirement
+
+In both tournaments and cash games, if a player disconnects the game must go on
+for everyone else. The absent player's seat keeps its stack, and the blinds
+(and antes) eat it, as international tournament rules prescribe for an absent
+player.
+
+### Part one: the game continues. Fully achievable.
+
+From the next hand onward the absent player is simply **not a party to the
+cryptography**. They are not in the joint key, they are not dealt cards, and
+nothing about the protocol waits for them. Their seat is a chip pile that pays
+its blinds and antes and folds when action reaches it. The stack drains one
+orbit at a time until it is gone and the seat busts, exactly as it would live.
+On reconnect they rejoin the key-holder set at the next hand boundary.
+
+This costs nothing and needs no new cryptography, because a player who is never
+dealt in never has to open anything.
+
+### The one deviation from live rules, and why it is forced
+
+Under TDA-style rules an absent player is still dealt in, and if their stack is
+smaller than the blind they are all-in for it and their hand goes to showdown —
+they can win. We cannot do that. Opening their cards at showdown needs their
+decryption share, and they are not there to publish it. Nobody else can produce
+it, and any mechanism that let the others produce it would be exactly the
+mechanism `SPEC_CS.md` section 19 forbids: a way for a subset of players to
+decrypt an absent player's hole cards. That is not a corner case to trade away,
+it is the attack — collude, "disconnect" a player, read their cards.
+
+So an absent seat posts its blind as dead money and takes no cards. It cannot
+win the hand it pays for. The practical difference from live rules is small:
+absent players lose their blinds either way, and only rarely win an all-in.
+The difference must still be documented, not smoothed over.
+
+### Part two: the hand already in progress. This is the hard one.
+
+A player who vanishes mid-hand was dealt in, so they hold a share of the n-of-n
+deck key. Until they publish, **no further card can be opened by anyone** —
+not the flop, not the other players' showdown cards. The hand cannot be
+finished by the remaining players. This is inherent to the construction, and
+`SPEC_CS.md` section 19 already anticipates it: define a timeout, a hand abort,
+evidence of which peer failed, and a penalty.
+
+Two cases:
+
+1. **The hand can still be decided without opening anything.** Everyone else
+   folds to one player. Then it completes normally — no shares are needed.
+   Notably, a player who quits to escape a loss does not escape if the others
+   simply fold.
+2. **Anything else** — a timeout expires, the hand aborts with a signed record
+   of which peer failed to publish.
+
+### What happens to the chips on abort, and why
+
+This choice matters more than it looks, because the two obvious options each
+open a different exploit.
+
+- **Restore every stack to its start-of-hand value.** Chip-conserving and
+  simple, but it hands every player a free escape: a player about to lose a big
+  pot disconnects, the hand is voided, and they get their money back. That is
+  an *in-protocol* exploit, available to anyone, for free, with no special
+  capability. Unacceptable.
+- **The absent player forfeits what they committed; it is distributed to the
+  remaining players in proportion to their own contributions.** Chip-conserving,
+  and it removes the escape entirely — quitting costs exactly what folding
+  would have cost. Its weakness is a DoS incentive: an opponent who could knock
+  a player offline right after a big bet would collect it.
+
+**We take the second.** The rage-quit escape is an in-protocol exploit that
+anyone can use at will and must be closed; knocking a peer off the network is
+an out-of-protocol attack that the threat model already lists as out of scope,
+and it requires real capability against the victim's connection. Closing the
+free exploit at the cost of a documented, expensive one is the right trade.
+
+It is also the closest chip-conserving analogue to the live rule: in a real
+game a player who cannot act has their hand folded and loses what they bet.
+Here the hand cannot continue, so their commitment goes to the players who were
+still in it.
+
+### What must follow
+
+- The timeout, the abort, and the attribution are protocol events, signed and
+  in the transcript, so every participant can verify who failed and when.
+- Repeated aborts attributable to one identity are visible to everyone. In play
+  money that is the whole penalty, and it is enough; `SPEC_CS.md` section 18
+  forbids claiming more.
+- No anti-disconnect mechanism may ever expose an absent player's hole cards.
+  This stands above the convenience of finishing a hand, per section 19.
+- `STATE_MACHINE.md` must carry the absent-seat states, the timeout states and
+  the abort path; `THREAT_MODEL.md` must carry both exploits above, with the
+  DoS one classified honestly as out of scope rather than solved.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |
