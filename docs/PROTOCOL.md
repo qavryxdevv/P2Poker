@@ -348,7 +348,7 @@ fields `n(8)` and `n(9)` because they have opposite trust properties (§2.6, §8
 | Field | Type | Values |
 |---|---|---|
 | `chain_scope` | `u8` | `1` = the event occupies a stage slot in a hand chain or in the setup chain; `0` = unchained (handshake, join, lobby) |
-| `event_class` | `u8` | `0` = ordinary chain event; `1` = `TIMEOUT_VOTE`; `2` = `TIMEOUT_CERT`. Meaningless and always `0` when `chain_scope == 0`. |
+| `event_class` | `u8` | `0` = ordinary chain event; `1` = `TIMEOUT_VOTE`; `2` = `TIMEOUT_CERT`. Meaningless and always `0` when `chain_scope == 0`. For classes `1` and `2` the class is **not** the whole slot key: the subject is part of it too (§5.2). |
 
 An **unchained** event (`chain_scope = 0`) must carry `table_id = ZERO32`,
 `hand_id = 0xFFFF_FFFF_FFFF_FFFF`, `previous_event_hash = ZERO32`,
@@ -380,6 +380,15 @@ The two fields exist for one reason each, and both are load-bearing:
 stage slot, and `event_class` gives a `TIMEOUT_VOTE` its own slot so that a voter
 at a collective stage does not equivocate against its own contribution (§4.8).
 Neither is optional.
+
+Neither is *sufficient* either, and that is why §5.2 states the slot key as a
+rule rather than leaving it to be read off this table. A vote about seat `A` and
+a vote about seat `B` at one stage are two events one honest voter is entitled to
+emit, so the class alone would put them in one slot; §5.2 therefore extends the
+key with the subject for `event_class` 1 and 2. **A message type whose envelope
+lets one honest sender produce two bodies in one slot is a defect in the type,
+not in the sender** — the property is stated normatively in §5.2 and every new
+chained type is checked against it before it is added here.
 
 Field indices are append-only forever (§2.2 rule 5), so `n(10)` and `n(11)` sit
 after `next_deadline_ms` rather than beside the fields they are related to.
@@ -1752,7 +1761,22 @@ Codes `0x0600`–`0x06FF`. Full semantics in §8.
 
 *Direction:* any seat in the required voter set → all.
 *Legal:* only when the local monotonic timer for the subject stage has expired
-(§8.2) **and** this client has not accepted any valid event for that stage.
+(§8.2) **and** this client has not accepted a valid event for that stage **from
+`subject_seat`**.
+
+**The legality condition is per subject, normatively (M5).** The condition is
+*"nothing from `subject_seat` at that stage"*, and it is stated in exactly those
+words here, in the receiver check below, and in §8.3. The reading discarded is
+the one an earlier revision of this line carried — *"has not accepted any valid
+event for that stage"*, i.e. nothing from **anyone**. It is discarded because
+every cryptographic stage is collective (§4.11), so at every stage a `kind = 2`
+vote could concern, the emitter has by construction already accepted events from
+the seats that did contribute; under that reading no `kind = 2` vote is ever
+legal, the whole cryptographic-step deadline path is unreachable, and §8.4's
+simultaneous-failure section describes a state that cannot arise. A gate that
+deletes the machinery it guards is not the gate that was meant. The per-subject
+reading is normative; the any-event reading appears nowhere in this corpus except
+in this paragraph, which records its withdrawal.
 
 | Field | Type | Limit / rule |
 |---|---|---|

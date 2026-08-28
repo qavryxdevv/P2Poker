@@ -287,8 +287,8 @@ mod tests {
                     eligible: (0..winners as SeatIdx).collect(),
                 };
                 let mut rank = [None; 4];
-                for seat in 0..winners {
-                    rank[seat] = Some(ranks[0]);
+                for slot in rank.iter_mut().take(winners) {
+                    *slot = Some(ranks[0]);
                 }
                 for button in 0..4u8 {
                     let payout = award(&pot, &rank, button, 4);

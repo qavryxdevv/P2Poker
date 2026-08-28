@@ -19,7 +19,7 @@ which are only detected, and which are beyond the protocol's reach. This documen
 is the place where that distinction is made and it is deliberately conservative:
 **an unjustified "prevented" is the worst error this document can contain.**
 
-**Binding owner decisions.** `docs/DECISIONS.md` D-001 to D-008 outrank both the
+**Binding owner decisions.** `docs/DECISIONS.md` D-001 to D-009 outrank both the
 research notes and any judgement in this document. Where a decision creates a
 threat or an open question, it is recorded here as such rather than argued with.
 **D-007 corrects D-006** and wins over it: at two seats an action deadline is
@@ -33,6 +33,27 @@ evidence, the deadline simply stays advisory. A seat leaves `V` only once a
 **completed, valid** certificate names it; being voted against is not exclusion.
 Any rule in this document still scoped on `n` would be a defect, and the attack
 that scoping on `n` failed to stop is catalogued in its own right as **X30**.
+
+**D-009 reinforces D-008** with three rules that bind every claim below.
+
+1. **No sequence of actions the protocol *requires* of an honest peer may
+   produce a valid `EquivocationProof` against that peer.** The slot key of the
+   equivocation predicate must include every field that legitimately varies for
+   one signer at one stage; for `TIMEOUT_VOTE` the subject seat is part of the
+   **key**, not of the body alone, because the protocol specifies two
+   simultaneous subjects as normal. The attack this closes is catalogued as
+   **X31** and it is the most damaging one any review pass has found, because it
+   ended with an honest player's chips forfeited under D-005.
+2. **A certificate below the `|V| >= 2` floor is inert in every document and at
+   every table size**: not chained, not evidence, no terminating effect, no
+   `AbortRecord`, no forfeiture. It is silently ignored. This holds for
+   `kind = Crypto` and for the hand deadline as much as for anything else.
+   Liveness is not owed — §19 of the spec ranks security above finishing a hand
+   — and a below-floor certificate must **never** be allowed to end a hand on
+   demand, because that is the escape D-005 closed (§7.3(c)).
+3. **No security property may be stated as an absence from the dependency
+   tree.** State the discipline our own code follows and enforce it
+   mechanically. A7 below is written under this rule.
 
 ---
 
@@ -258,21 +279,50 @@ collide to one transcript hash — a direct §13/§14 break.
 0.10.2 nor `rand_core` 0.10.1 contains the symbol, and `rand_core` has no `os_rng`
 feature. The requirement is implemented under its current name.
 
-**Correction, and it weakens the assumption.** An earlier revision of this
-document claimed the `rand` crate is deliberately absent from the dependency tree
-and that §7's prohibition on `SmallRng`/`StdRng` is therefore enforced
-structurally rather than by reviewer discipline. That is false. `rand 0.8.8` **is**
-in the runtime tree via `ark-std 0.5.0` (which depends on `rand 0.8` with feature
-`std_rng`), together with `rand_chacha 0.3.1` and `rand_core 0.6.4`. `SmallRng` is
-absent only because rand 0.8's `small_rng` feature is not enabled; `StdRng` is
-compiled in and is used by `ziffle` for deterministic nothing-up-my-sleeve public
-constants. `SPEC_CS.md` §7 is therefore enforced by **the CI lint of
-`CRYPTOGRAPHY.md` §12 item 6**, not by the dependency graph
+**Correction, twice made, and it weakens the assumption both times (D-009 rule
+3).** An early revision of this document claimed the `rand` crate is deliberately
+absent from the dependency tree, so that §7's prohibition on `SmallRng`/`StdRng`
+was enforced structurally rather than by reviewer discipline. A later revision
+narrowed that to "`SmallRng` is absent because rand 0.8's `small_rng` feature is
+not enabled". **Both are false, and no restatement of an absence belongs here.**
+
+What is true, verified in crate source rather than inferred:
+
+* `rand` is in the runtime tree at **three majors — 0.8.8, 0.9.5 and 0.10.2**.
+  `rand 0.8.8` arrives via `ark-std 0.5.0` (feature `std_rng`) with
+  `rand_chacha 0.3.1` and `rand_core 0.6.4`; `rand 0.9.5` arrives via
+  `hickory-proto`, `hickory-resolver`, `igd-next` and `yamux`, reached through
+  libp2p's `dns`, `upnp` and `yamux` features (`DEPENDENCIES.md` §5.4, §7).
+* `rand-0.9.5/Cargo.toml` lists
+  `default = [ "std", "std_rng", "os_rng", "small_rng", "thread_rng" ]`, and
+  `igd-next 0.16.2` and `yamux 0.13.10` both take `rand` **with defaults**.
+  Features unify additively, so **`SmallRng` and `rand::rng()` are compiled into
+  the integrated binary**, alongside `StdRng`, which `ziffle` uses for
+  deterministic nothing-up-my-sleeve public constants.
+* **This cannot be changed without dropping libp2p features we need.**
+  `igd-next` arrives through `libp2p-upnp` and `yamux 0.13.10` is mandatory for
+  the relay of D-001/D-002. Removing `SmallRng` from the build means removing
+  those, which the connectivity design depends on.
+
+`SPEC_CS.md` §7 is therefore **not** enforced by the dependency graph and no
+document may claim it is. The enforced property is a **discipline over our own
+code**: every draw goes through `security::rng::fill`, which wraps
+`getrandom::SysRng`, and nothing in this crate names another generator. That is
+mechanical rather than editorial —
+`src/security/rng.rs`'s `tests::our_own_code_uses_no_generator_but_the_os_one`
+scans this crate's own sources on every test run and **fails the build** on
+`SmallRng`, `StdRng`, `thread_rng`, `from_seed`, `seed_from_u64` or
+`rand::rngs`, with `src/security/rng.rs` itself the single exemption because it
+must name the identifiers in order to forbid them. The gate was verified to bite
+by injecting a violation and watching the test fail, then pass again once it was
+removed (D-009 rule 3); a gate never seen to fail is not a gate. The CI lint of
+`CRYPTOGRAPHY.md` §12 item 6 is the same rule at the repository level
 (see `CRYPTOGRAPHY.md` §7.2 and its OQ-8).
-*If false*, or if the lint is removed: §7's prohibition is unenforced and a future
-contributor can reach `StdRng` from our own crates. And if the OS CSPRNG itself is
-unsound, keys, permutations and RNG contributions become predictable; every
-secrecy goal falls for the affected client.
+*If false*, or if the source scan and the lint are removed: §7's prohibition is
+unenforced and a future contributor can reach `StdRng` or `SmallRng` from our own
+crates — both are already linked in and need only be named. And if the OS CSPRNG
+itself is unsound, keys, permutations and RNG contributions become predictable;
+every secrecy goal falls for the affected client.
 
 **A8 — We assume each player's own endpoint (OS, RAM, display) is not
 compromised.**
@@ -655,15 +705,29 @@ misbehaviour.
 of one logical event" escape.
 *Limit, stated here rather than in the justification column:* the proof exists as
 soon as both events reach one honest party. It does **not** guarantee they do.
-*Second limit — the false-positive class.* The predicate must never be applied to
-unchained traffic. Before the `chain_scope` discriminator existed, two successive
-honest lobby adverts, and a joiner's `JOIN_REQUEST` alongside its own
-`RNG_REVEAL`, both satisfied the old predicate — an honest peer would have been
-provably framed by a rule in the specification. A specification-level
-false-positive source is worse than a user-level one, and it is recorded here so
-that any future message type is checked against it. `NETWORK_STACK.md` §7.4's
-founder-contradiction rule for two adverts with the same `timestamp_unix_ms` is a
-local lobby-hygiene rule and is **not** an `EquivocationProof` in this sense.
+*Second limit — the false-positive class, and it is the one that keeps
+recurring.* The predicate must never be applied to unchained traffic, and its
+slot key must never be coarser than the behaviour the protocol requires. Before
+the `chain_scope` discriminator existed, two successive honest lobby adverts, and
+a joiner's `JOIN_REQUEST` alongside its own `RNG_REVEAL`, both satisfied the old
+predicate — an honest peer would have been provably framed by a rule in the
+specification. The same defect then reappeared in `DISPUTE`, which an honest peer
+is *required* to emit twice, and again in `TIMEOUT_VOTE`, where it moved chips
+(X31). Three recurrences is why it is now a binding rule rather than a caution:
+
+> **D-009 rule 1.** No sequence of actions the protocol requires of an honest
+> peer may produce a valid `EquivocationProof` against that peer. The slot key
+> must include every field that legitimately varies for one signer at one stage.
+
+A specification-level false-positive source is worse than a user-level one, and
+every future message type is to be checked against the rule **before** it is
+added, with the check standing as a test rather than a paragraph: `SPEC_CS.md`
+§25 already requires a `CheaterEquivocation` peer, and the mirror of it — an
+*honest* peer that never generates a proof against itself under any legal
+interleaving — is the one that catches this class (§5.5).
+`NETWORK_STACK.md` §7.4's founder-contradiction rule for two adverts with the
+same `timestamp_unix_ms` is a local lobby-hygiene rule and is **not** an
+`EquivocationProof` in this sense.
 
 **G8 — Independent verifiability.**
 Every honest client can decide accept/reject on every public state transition and
@@ -796,9 +860,10 @@ complete than the system is.
 | X28 | Traffic analysis of relayed and DHT traffic | **OOS** | §6 and §8. The relay sees who talks to whom, when and how much; the DHT publishes presence to strangers on a schedule. |
 | X29 | Fault any table on demand by publishing a false `state_hash` at a checkpoint | **DNA** | A `state_hash` is a one-field value in a message every peer must emit. A single peer that publishes a value it did not derive forces the `PROTOCOL.md` §6.3 case (c) path: the hand aborts with `cause = 4`, stacks are restored, and the table closes, with no attribution live. It needs no invalid signature and no divergent transcript, and "at least two peers disagreeing" is satisfied by one liar plus the honest victim. Bounded by three things — it costs the attacker the table and, in a tournament, their own equity in it; checkpoint 7 sits **before `SHOWDOWN_REVEAL`**, and no checkpoint is placed after a hole card has been opened **to anyone but its owner** (every player opens its own two cards at `DEAL_PRIVATE`, which precedes checkpoints 3–7, so the rule is about *public* opening and is stated that way rather than in the falsifiable shorter form an earlier revision used), so the attacker must commit while it still knows only its own hand; and the evidence, the unanimous transcript plus every peer's signed `STATE_HASH`, is written to the profile directory and **is preserved in a form sufficient for a human, or for a future adjudicator, to diagnose the divergence — no adjudication procedure is specified.** An earlier revision of this row claimed the evidence was "deterministically adjudicable offline by any third party running the reference engine over it, forever". **That claim is withdrawn.** No document in this corpus defines, versions against `protocol_version`, or authorises such a reference engine, and moving a derivation offline does not manufacture the observer-independent reference that this row's own argument says does not exist. Whether a canonical reference engine is named is an open decision, recorded in `docs/DECISIONS.md`'s open list. Until it is, this third bound is **evidence preservation, not recourse**: neither live nor offline adjudication is available, and neither is claimed. An earlier draft resolved case (c) by removing the odd peer out under a "unanimity minus one" rule; that rule was **deleted**, because it let `n-1` colluders take an honest player's committed chips at `n >= 3` (two colluders suffice at `n = 3`), and because there is no observer-independent derivation at run time by which anyone could be named — every peer derives with its own engine, so "attribute whoever disagrees" is a vote over the facts, which `SPEC_CS.md` §15 forbids. Not solved. Related: X8, X22, OQ-D. |
 | X30 | Shrinking the required voter set to one seat — itself — and then taking the subject's committed chips with a certificate that seat signs alone, at **any** table size | **D&A**, and only because of a rule our own client enforces | **The attack.** `V(subject)` was the other dealt-in seats minus any seat "named as the subject of an outstanding, older unmet deadline", and a seat is *named* by any peer emitting a `TIMEOUT_VOTE` against it — an assertion the protocol concedes is unprovable when the voter lies ("there is no artefact that settles the race when a voter lies about what it saw", `PROTOCOL.md` §8.3). Nothing bounded how many seats one client could name. Six-seat table, one modified client at seat 1: Mallory votes against seats 2, 3, 4 and 5 at one stage; at the next she declares seat 6 the subject, and `V(6) = {1,2,3,4,5} \ {2,3,4,5} = {Mallory}`. She emits the one required vote, assembles a complete certificate from her own signature, the stage completes, a `kind = 2` certificate aborts the hand with seat 6 attributed, and under **D-005** seat 6's committed chips are forfeited to the remaining seats — which is mostly to her.<br><br>**The earlier scoping on `n` did not stop it, and that is the point.** Every protection D-007 wrote was conditioned on `n == 2`; here `n` is six and stays six, so nothing rejected the certificate. The nominal `\|V\| = n - 1` table printed in three documents was never the operative rule — `\|V\|` was `n - 1 - \|excluded\|`, and the attacker controlled `\|excluded\|`. This is the A-1 attack reappearing above heads-up, and worse than A-1, which cost a folded hand rather than chips.<br><br>**The mitigation.** **D-008**: every rule that weakens, disables or gates the certificate is scoped on `\|V\|` and never on `n`; a certificate whose required voter set has fewer than two members **has no effect**; and **a seat leaves `V` only once a completed, valid certificate names it — being voted against is not exclusion.** The second half is what makes the first hold inductively: each exclusion now costs a completed certificate, and each such certificate needed `\|V\| >= 2` at the moment it formed, so `V` cannot be collapsed by assertion at any seat count. Normative in `PROTOCOL.md` §8.3/§8.4 and `STATE_MACHINE.md` §8.4; checkable by any verifier replaying the transcript, with no new cryptography.<br><br>**Why D&A and not CP, stated rather than rounded up.** The message stays constructible: a modified client can always sign and broadcast a one-signer certificate. What changed is that an honest client gives it no effect, so the state does not advance and no chips move; the artefact names its signers, so it is bound to a key. The attribution half is deliberately weak and must not be overstated — under D-008 an inert certificate is *not evidence of misbehaviour*, so no seat is sanctioned for emitting one and nothing is forfeited; what is transferable is the artefact, not a verdict. And the rejection rests on our own clients enforcing the `\|V\|` floor, an implementation obligation in the class of A12 and A14, not on A1–A7 — which is exactly why this row is not CP.<br><br>**Residual.** D-008 closes the *manufactured* `\|V\| = 1`, not the earned one. Where the voter set is honestly small or honestly hostile, X10 stands unchanged (**DNA**), and two or more seats going silent together is still X7's DNA case. |
+| X31 | Two Sybil seats stall one collective stage so that **an honest voter's own two required timeout votes become an `EquivocationProof` against itself**, and D-005 then forfeits that honest player's committed chips and blocks their key | **D&A**, and only because of a slot key our own client enforces | **This is the most damaging attack any review pass of this corpus has found**, and it is recorded in its own right rather than folded into X7, because unlike every other row here the victim's *compliance* is the entire exploit. It needs no coalition majority, no cryptographic break, no modified victim and no capability against the victim's connection.<br><br>**The mechanism.** `TIMEOUT_VOTE` was given `chain_scope = 1`, `event_class = 1` and `sequence = subject_sequence`, with the seat the vote is *about* carried in the body. The equivocation predicate (G7, `PROTOCOL.md` §5.2) is a six-tuple that does not include the subject, and the anti-replay array (`PROTOCOL.md` §5.3) was indexed by `(stage, seat, event_class)` — a slot of capacity one. **Which seat a vote is about therefore did not change its slot.** Meanwhile every cryptographic stage is collective, and `PROTOCOL.md` §8.4 specifies two simultaneous subjects at one stage as *normal* ("two simultaneous subjects therefore deadlock, by design"). So the protocol both requires an honest voter to vote against each seat that owed it something, and treats two distinct bodies in that one slot as proof of misbehaviour.<br><br>**The attack.** Identity is free (X26, §6): Mallory seats two keys, `M1` and `M2`, at one table. Both go silent at one collective crypto stage `s` — the capability X7 already concedes to everyone, at zero cost. Honest Bob's timers expire and he does exactly what the protocol asks: `TIMEOUT_VOTE{subject_seat = M1, sequence = s}` and `TIMEOUT_VOTE{subject_seat = M2, sequence = s}`. Two distinct bodies, one slot. Mallory holds both, wraps them as `EquivocationProof{accused = Bob}` — which by design verifies with no table state, no transcript and no knowledge of the game — and files it. `STATE_MACHINE.md` T55 aborts the hand, raises `Fault{Equivocation}`, writes `AbortRecord{kind: Equivocation, attributed: [Bob]}` and applies the §8.6 forfeiture formula: **Bob's committed chips are distributed to the remaining seats, two of which are Mallory's**, and `PROTOCOL.md` §5.2 adds Bob's key to `libp2p::allow_block_list`. Repeatable every hand, against a different honest seat each time, at the price of two free keypairs and silence.<br><br>**The mitigation is D-009 rule 1**, and it is a change to the canonical predicate rather than a patch at the consumer: *no sequence of actions the protocol requires of an honest peer may produce a valid `EquivocationProof` against that peer, so the slot key must include every field that legitimately varies for one signer at one stage.* Concretely, **`subject_seat` becomes part of the key, not of the body alone**: `PROTOCOL.md` §5.3's array is indexed by `(stage, seat, event_class, subject_seat)` and `subject_seat` joins §5.2's tuple for `event_class == 1`. Two votes about two subjects then occupy two slots, the predicate is not satisfied, and what Mallory files is not a proof of anything. The rule is also a standing obligation on every future message type, checked before it is added (G7, §5.5).<br><br>**Why D&A and not CP, stated rather than rounded up.** The artefact stays constructible — anyone can concatenate two of Bob's genuine signed votes and call the result a proof. What changed is that an honest client's predicate no longer matches, so the object verifies as nothing, the state does not advance, and no chips move. The rejection rests on **our own clients implementing the corrected slot key** — an implementation obligation in the class of A12 and A14, not on A1–A7 — which is exactly why this row is not CP. The attribution half is deliberately weak: a purported proof that fails the predicate is *not* evidence of misbehaviour by whoever filed it, so nothing is forfeited from Mallory either, and what is transferable is the artefact, not a verdict.<br><br>**Residual.** D-009 rule 1 closes the manufactured proof, not the stall behind it. Two seats going silent together still voids the hand for free with `attributed = []` and stacks restored — X7's DNA case, open as OQ-E — and Bob still gets no attribution against Mallory for it. What is removed is only that Bob *pays* for having followed the rules. |
 
-**Extended catalogue counts: CP 6 · D&A 7 · DNA 3 · OOS 12 · split D&A/DNA 1 (X7)
-· total 29.**
+**Extended catalogue counts: CP 6 · D&A 8 · DNA 3 · OOS 12 · split D&A/DNA 1 (X7)
+· total 30.**
 
 **X11 is retired.** Its claim — that unanimity structurally excluded the race
 between a late action and a timeout certificate — was false, and its substance is
