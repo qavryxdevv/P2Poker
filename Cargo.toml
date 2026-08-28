@@ -1,0 +1,67 @@
+[package]
+name = "p2p-poker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Decentralised No-Limit Texas Hold'em over libp2p and BitTorrent Mainline DHT"
+repository = "https://github.com/example/p2p-poker"
+publish = false
+
+# ---------------------------------------------------------------------------
+# Phase 0 integration check.
+#
+# Every version below comes from a research document that verified it in
+# isolation, by compiling. Nobody had yet verified they COEXIST - and the
+# arkworks, dalek and rand ecosystems are exactly where that breaks. This
+# manifest exists to answer that question before any code is written on top.
+# ---------------------------------------------------------------------------
+
+[dependencies]
+
+# --- network transport: docs/research/LIBP2P.md ---------------------------
+libp2p = { version = "0.56.0", features = [
+    "tokio", "macros",
+    "quic", "tcp", "noise", "tls", "yamux", "dns",
+    "gossipsub", "kad", "identify", "ping", "autonat", "dcutr", "relay",
+    "request-response", "cbor",
+    "upnp", "metrics", "memory-connection-limits",
+    "ed25519", "serde",
+] }
+libp2p-stream = "0.4.0-alpha"
+
+# --- global discovery: docs/research/MAINLINE_DHT.md ----------------------
+mainline = { version = "=8.0.0", default-features = false, features = ["async"] }
+futures-lite = "2.6"
+
+# --- mental poker: docs/research/MENTAL_POKER.md --------------------------
+ziffle = "=0.1.0"
+
+# --- cryptography: docs/research/CRYPTO_LIBS.md ---------------------------
+ed25519-dalek    = { version = "3.0.0", default-features = false, features = ["fast", "zeroize", "rand_core"] }
+curve25519-dalek = { version = "5.0.0", default-features = false, features = ["alloc", "precomputed-tables", "zeroize", "digest"] }
+sha2      = { version = "0.11.0", default-features = false, features = ["alloc"] }
+blake3    = { version = "1.8.7",  default-features = false, features = ["std"] }
+rand_core = { version = "0.10.1", default-features = false }
+getrandom = { version = "0.4.3",  default-features = false, features = ["std", "sys_rng"] }
+zeroize   = { version = "1.9.0",  default-features = false, features = ["alloc", "derive"] }
+subtle    = { version = "2.6.1",  default-features = false }
+minicbor  = { version = "2.3.0",  default-features = false, features = ["std", "derive"] }
+argon2           = { version = "0.6.0",  default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
+
+# --- gui: docs/research/GUI_STACK.md --------------------------------------
+eframe      = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+egui_extras = { version = "0.36.1", features = ["image"] }
+rust-embed  = "8.12.0"
+image       = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# --- runtime --------------------------------------------------------------
+tokio   = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures = "0.3"
+# Present only because libp2p-autonat needs rand_core 0.6's OsRng. Our own
+# code must never draw cryptographic randomness from it - spec section 7
+# forbids SmallRng and self-seeded generators. See CRYPTO_LIBS.md section 3.
+rand = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
