@@ -328,6 +328,107 @@ Phase 8 integration suite and is the criterion this decision is judged by.
 
 ---
 
+## D-004 — The lobby must be visible even if every client is behind NAT
+
+**Date:** 2026-08-28
+**Stated by:** project owner
+**Status:** accepted
+**Sharpens:** D-003
+
+### The requirement
+
+D-003 said the lobby must be visible to everyone. The owner sharpened it: that
+must hold **even in a world where no client at all is publicly reachable**. The
+precondition D-003 recorded — "at least one client must be dialable" — is not
+accepted as a get-out. Design for the all-NAT case.
+
+### Why this is achievable
+
+It is achievable, and it does not need anything the project has to operate. The
+answer is four independent mechanisms, tried in order. The first needs nothing
+beyond the DHT.
+
+**Layer 0 — the DHT does not care about NAT.** Mainline DHT is millions of
+publicly reachable BitTorrent nodes, and our client only ever talks to them
+outbound. `get_peers(LOBBY_INFOHASH)` returns the other poker clients' external
+`IP:port` whether or not we are reachable and whether or not they are. Announce
+works the same way: the receiving node records the source address it actually
+saw. This is exactly why BitTorrent swarms form at all when most peers are
+behind NAT. `mainline` supports this directly with `Dht::client()`, which
+participates without serving.
+
+So *discovering that other players exist, and where they appear from*, already
+survives an all-NAT world. Nothing else is required for that step.
+
+**Layer 1 — mutual dialing, which is hole punching with no relay at all.**
+Both A and B announce, and both call `get_peers`, so **both independently learn
+the other's external address at roughly the same time**. If both then dial, the
+outbound packets open the NAT mapping on each side and the connection
+completes. There is no coordination server in this, because the DHT already
+delivered the information symmetrically. This is classic UDP hole punching, and
+it is the mechanism that makes the all-NAT case work.
+
+It requires endpoint-independent mapping on at least one side. Measured on the
+development machine, using one local UDP socket against four different STUN
+servers:
+
+```
+stun.l.google.com     -> ('198.51.100.17', 64707)
+stun1.l.google.com    -> ('198.51.100.17', 64707)
+stun.cloudflare.com   -> ('198.51.100.17', 64707)
+stun.nextcloud.com    -> ('198.51.100.17', 64707)
+local socket bound to port 64707
+```
+
+The same external port to every destination is endpoint-independent mapping,
+and the external port equals the local port, so this NAT also preserves port
+numbers. The external address is a public one, not `100.64.0.0/10`, so this
+machine is not behind CGNAT. One router is not a survey — but this is the
+common home case, and it is the case layer 1 is built for.
+
+**Layer 2 — DCUtR over a public relay**, when blind mutual dialing does not
+converge because of timing or address-dependent filtering. Public relays are
+abundant and free (see the D-001 addendum), and their 2-minute, 128 KiB limits
+are sized for exactly this: coordinate the punch, then get out of the way.
+
+**Layer 3 — lobby gossip over a public relay.** A table advertisement is a few
+hundred bytes. Even a public relay's 128 KiB budget carries a great deal of
+lobby traffic, and the 2-minute reset is survivable for gossip because the
+client simply reconnects. So in the worst case, where no punch succeeds
+anywhere, **lobby visibility still survives on public relays alone**. This is
+the floor under D-003, and it is what makes the requirement unconditional.
+
+**Layer 4 — a D-002 relay with raised limits**, needed only to *play a hand*
+when both players are unreachable and no punch worked. Playing is where the
+2-minute limit actually bites; reading the lobby is not.
+
+### The case that genuinely fails
+
+Symmetric NAT on both ends — a different external port per destination —
+defeats address prediction, so layers 1 and 2 fail. Those players fall through
+to layers 3 and 4: they still see the lobby, and they can still play if a
+relay with raised limits is available. If neither is, they cannot play. That
+limit is real and belongs in `THREAT_MODEL.md` and in the user-facing
+limitations, not hidden.
+
+### Consequence for the announced port
+
+Layer 1 only works if the port announced in the DHT is the external port of our
+QUIC socket. On a port-preserving NAT like the one measured above, the local
+port is already correct. Elsewhere it is not, so the client announces its local
+QUIC port on the first pass and corrects it as soon as `identify` reports an
+observed address or AutoNAT resolves. Announces repeat periodically, so a wrong
+first announce self-corrects within one cycle and costs other peers a dial
+timeout in the meantime.
+
+### Acceptance test, revised
+
+The D-003 test, run with **both** clients behind NAT and neither port-forwarded,
+with the relay of D-002 disabled, so that only layers 0 to 3 are in play. Both
+must still see the same set of open tables.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |
