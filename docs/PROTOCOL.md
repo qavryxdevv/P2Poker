@@ -778,11 +778,24 @@ of the last completed stage, and every checkpoint is itself a collective stage, 
 every emitter has completed the same prefix. And the flag vector **was five and is
 now four**: `absent` is deleted (§6.1, J5).
 
+**One thing this sweep asserted and got wrong, corrected here rather than left
+standing (K1).** It read: *"No 'who is connected', 'who was heard', or
+delivery-order quantity enters one."* **`P(k)` does**, on exactly one path, and
+this sweep missed it because it audited the *sets* and not the *narrowing*.
+`P(k)` is `stage_hash` membership wherever the stage completed, and wherever the
+stage stalled it is strictly *who was heard* — `Q-10`, named in §3.2 and adopted
+as a default there. §3.2 proves that `P` narrows at a stalled stage 0 and nowhere
+else, so the per-receiver input is present on **every** path where `P` does
+anything at all. The honest form of the sentence is: *no per-receiver quantity
+enters any construction in this document, and the one that enters a required
+emitter set is `Q-10`'s, is named, and is contained by the solitary-stage rule of
+§3.2 rather than removed.* A sweep that enumerates sets and not the transitions
+between them will miss this class again, which is the reusable finding.
+
 **What the sweep looked for and did not find, recorded so it is not re-filed.** No
 wall-clock read enters any construction — §2.6 is the rule and §8.2 is the one place
-a timer is legitimately read, locally, feeding nobody's canonical state. No "who is
-connected", "who was heard", or delivery-order quantity enters one; §5.2's ordering
-rule is the general form of why. One candidate was chased and cleared:
+a timer is legitimately read, locally, feeding nobody's canonical state. One
+candidate was chased and cleared:
 `TIMEOUT_CERT`'s `n(1) votes` embeds complete `SignedEvent`s **with signatures**,
 and §3.2 concedes that a malicious signer can produce a second valid signature over
 one body, so two honest certificate emitters could embed different bytes for one
@@ -812,7 +825,7 @@ GENESIS(0) → setup chain → TERMINAL(0) ─┐
 ```
 GENESIS(0) = h("p2p-poker v1 genesis",
                [ u16_be(protocol_version), table_id, u64_be(0),
-                 table_public_key, table_params_hash, ZERO32 ])
+                 ZERO32, table_params_hash, ZERO32 ])
 
 GENESIS(k) = h("p2p-poker v1 genesis",                              for k >= 1
                [ u16_be(protocol_version), table_id, u64_be(k),
@@ -822,6 +835,24 @@ roster_hash(k) = h("p2p-poker v1 roster",
                    [ for each seat s in ascending seat index:
                        u8(s) || app_public_key[s] || u64_be(stack_at_hand_start[s]) ])
 ```
+
+**The two forms have the same six parts in the same slots, and slot 4 of
+`GENESIS(0)` is `ZERO32` (K5).** It carried `table_public_key`, and §4.1 is
+normative that `table_id` **is** `table_public_key` — the same 32 bytes — so
+slot 2 and slot 4 were one value hashed twice. The duplicate is removed. It is
+replaced by the sentinel rather than deleted outright so that both forms keep six
+parts under one domain string: `h` (§2.8) carries no arity, so two part-lists of
+different lengths under one domain are two preimages a future editor would have
+to reason about, and there is no reason to create that obligation for a value
+that binds nothing. `ZERO32` in slot 4 reads exactly as `ZERO32` in slot 6
+already does — *there is no session yet*, beside *there is no previous terminal*
+— and `session_id` cannot appear there, because §4.3 derives it from the
+`TABLE_READY` events of the chain `GENESIS(0)` opens.
+
+The reason this section gives below for excluding `protocol_version` and
+`table_id` from `table_params_hash` — *"`GENESIS(0)` already carries both as
+separate parts"* — is unaffected and is now the only claim resting on that part
+list: slots 1 and 2 carry them, once each.
 
 **The roster is the ordered list of seated identities and their start-of-hand
 stacks, and nothing else. This is D-012 and it is normative.** A
@@ -854,10 +885,67 @@ one has a bug. Seat status is `STATE_MACHINE.md`'s (D-011 rule 1) and it changes
 only through a chained event; this hash is not a second route to it.
 
 The three surviving components are each a function of accepted chained content.
-The seat index and `app_public_key[s]` are ratified unanimously at `TABLE_READY`
-and change only at a hand boundary through an accepted `PLAYER_LEAVE` or seat
-entry. `stack_at_hand_start[s]` is a function of `TERMINAL(k-1)` and
-`HAND_INIT`'s `n(11) ledger_delta`, both chained. By the bullets above the stack
+
+**The seat vector is frozen for the whole session, and this is the disposition of
+K2's genesis half.** The clause that stood here read *"ratified unanimously at
+`TABLE_READY` and change only at a hand boundary through an accepted
+`PLAYER_LEAVE` or seat entry"*, and its second half was both **unreachable** and
+**unsafe**.
+
+> **Normative: the seat index and `app_public_key[s]` components of
+> `roster_hash(k)` are fixed at `TABLE_READY` and never change again. No seat is
+> added to the vector, removed from it, or reordered within it for the life of the
+> table. `roster_hash(k)` therefore varies only in `stack_at_hand_start[s]`, which
+> is `TERMINAL(k-1)`'s `n(5) final_stacks` and is settled by that terminal — so
+> `GENESIS(k)` is a function of `TERMINAL(k-1)` and of session constants, and of
+> nothing that happens after `TERMINAL(k-1)`.**
+
+*Unreachable*, because §4.3 already says so in terms: *"The set of `n`
+`TABLE_READY` events is unanimous ratification of the roster by every
+participant, so from here on nobody can be added, removed or reordered without a
+new table."* There is no seat-entry message after formation in version 1 — §4.3
+is formation only, and §4.1 ends the table key's authority at `TABLE_READY` — so
+half of the deleted clause named a route that does not exist, which is the defect
+class J4 was filed for.
+
+*Unsafe*, because the other half named a route that does: `PLAYER_LEAVE` is
+accepted in the hand boundary window (§4.10), which sits **after** `TERMINAL(k)`
+and has no required emitter set, so no stage completion proves a receiver has
+seen all of it. Letting it reach `roster_hash(k+1)` would derive `GENESIS(k+1)`
+from *which boundary events this receiver happened to hear* — a per-receiver
+quantity in the position D-012 forbids above all others. The consequence is J1's,
+total and silent: two peers that differ by one `PLAYER_LEAVE` derive different
+`GENESIS(k+1)`, so **no event of hand `k+1` verifies at either**, and — because
+`ABORT_TERMINAL(k+1)` is a function of `GENESIS(k+1)` — their `GENESIS(k+2)`
+differs too, and every hand after it. That fork is permanent and no rule in this
+document can end it.
+
+**What happens to a departing seat instead.** Its seat stays in the vector with
+its `app_public_key` and takes no further part: it is outside `P` — §3.2 excludes
+`PLAYER_LEAVE` from participation, for the reason given there — hence outside
+every `R` and outside `dealt_in`, and it occupies a row in a hash and nothing
+else. Its **chips** leave through the field that already carries them,
+`HAND_INIT`'s `n(11) ledger_delta` (§4.4), which is inside a collective
+byte-identical body that every receiver recomputes. That is the property this
+disposition buys: two peers that heard different boundary windows now **reject
+each other's `HAND_INIT` copy and stall stage 0** — loud, at a stage, and
+disposed of by §8 — instead of deriving two genesis values and never verifying
+another event of each other's for the life of the table. **That path is exactly
+the one §3.2's solitary-stage rule covers, and it is a precondition of this
+disposition rather than a separate concern**; the dependency is stated in §4.10's
+boundary-window box.
+
+**What is not settled here, and is not invented here.** *When* the departing
+stack is subtracted — which terminal's `final_stacks` first shows the seat at
+zero, and therefore which `HAND_INIT`'s `ledger_delta` carries it — is a
+question about `n(5) final_stacks` and the ledger identity, not about the
+genesis, and it is untouched by this box. It is recorded in `DECISIONS.md`'s open
+list rather than answered, because answering it wrongly is how a redundant hash
+becomes a fork: `roster_hash(k)`'s stack vector is `TERMINAL(k-1)`'s
+`final_stacks` and nothing else, whatever the answer turns out to be.
+
+`stack_at_hand_start[s]` is `TERMINAL(k-1)`'s `n(5) final_stacks`, which is
+chained and agreed. By the bullets above the stack
 is redundant — it *could* be dropped on the same argument — and it is retained
 deliberately, as a check rather than as a binding: §4.10's receiver validation of
 `n(5) final_stacks` is written against it, and a redundant hash of a quantity
@@ -1052,19 +1140,48 @@ the table.
 > `TABLE_READY`.**
 >
 > Write `P(k)` for that set: the seats that signed at least one `chain_scope = 1`
-> event, accepted by this receiver, **between `GENESIS(k)` and `GENESIS(k+1)`** —
-> so every event of chain `k` and every hand-boundary single-writer event that
-> follows its terminal, whichever chain such an event is finally assigned to
-> (Q-09). `P(0)` is the set of seats that signed `TABLE_READY`. Every `R` in §4 is
-> `P(k-1)`, or a subset of it fixed by chained content.
+> event, accepted by this receiver, **in chain `k`** — every stage of chain `k`,
+> plus chain `k`'s hand boundary window, whose chain, `hand_id`, `sequence`,
+> parent and total order §4.10 defines (this is the closure of `Q-09`). `P(0)` is
+> the set of seats that signed `TABLE_READY`. Every `R` in §4 is `P(k-1)`, or a
+> subset of it fixed by chained content.
 >
-> **One event is excluded and the exclusion is not optional: a terminal
-> `HAND_ABORT` never counts as participation.** It enters no `stage_hash`, its
-> stage is witness-independent, and two honest peers routinely accept copies
-> signed by **different seats** (the terminal shape defined below, §4.10) — so counting its
-> signer would derive `P(k)` from *which copy this receiver happened to accept
-> first*, which is the exact per-receiver quantity P3 built the terminal stage to
-> refuse. `STATE_MACHINE.md` I31(c) asserts this from the engine side.
+> **A peer's own emission counts into its own `P`, and this is stated because it
+> was not (K1).** "Accepted by this receiver" includes the events this receiver
+> itself signed and emitted: a peer accepts its own emissions into its own chain —
+> it must, since it chains from them and computes `stage_hash` over them — and the
+> alternative reading is a reductio. Under it a peer would never be in its own
+> `P(k)`, hence never in any `R` of hand `k+1`, hence not a permitted emitter of
+> the `HAND_INIT` it is required to emit; and the base case would fail outright,
+> since `P(0)` is *the signers of `TABLE_READY`* and every peer signed one. It
+> counts. `STATE_MACHINE.md` maintains the same set as `signed_this_hand` and
+> takes this reading with it.
+>
+> **Two events are excluded, and neither exclusion is optional.**
+>
+> **(1) A terminal `HAND_ABORT` never counts as participation.** It enters no
+> `stage_hash`, its stage is witness-independent, and two honest peers routinely
+> accept copies signed by **different seats** (the terminal shape defined below,
+> §4.10) — so counting its signer would derive `P(k)` from *which copy this
+> receiver happened to accept first*, which is the exact per-receiver quantity P3
+> built the terminal stage to refuse. `STATE_MACHINE.md` I31(c) asserts this from
+> the engine side.
+>
+> **(2) A `PLAYER_LEAVE` never counts as participation.** It is the one chained
+> event whose content is a statement that its signer will emit nothing further,
+> and `P` is a *required emitter* set. Counting it would make every voluntary
+> departure a required emitter of the next hand, which nobody can satisfy: the
+> stage stalls, hand `k+1` runs to `hand_deadline_ms` and aborts, and the seat
+> leaves `P` only on the hand after the one it announced its departure in. That is
+> a stall bought for nothing, on the one path where the seat told us in advance.
+> The exclusion costs nothing, because a departing seat needs no vote and is
+> removed from no hash (§3.1).
+>
+> `PLAYER_SIT_OUT` is **not** excluded and must not be: a seat that sits itself out
+> is alive, keeps posting dead money (D-005), and can and must sign the next
+> hand's `HAND_INIT`. It is outside `dealt_in`, which is `STATE_MACHINE.md`'s
+> derivation and a strict subset of `P` (§4.4) — a different question from this
+> one.
 
 **Where `P(k)` comes from, in one line per case, because the two cases have
 different strength.** For every stage of chain `k` that **completed**, membership
@@ -1086,14 +1203,27 @@ is `Q-10`.** The stage that stalled has no `stage_hash`, so "seat `s` contribute
 there" is strictly *who was heard*. It cannot simply be excluded: a hand that stalls
 at `HAND_INIT` completes no stage at all, so excluding it would empty the next
 hand's set and stop the table instead of skipping one seat. **Named default,
-adopted: a contribution to the stalled stage counts.** The residual is bounded and
-**loud rather than silent** — two peers that disagree derive different
-`n(8) dealt_in`, each rejects the other's `HAND_INIT` copy, the stage does not
-complete, and the hand aborts at the deadline; that is a hand lost and recoverable
-through §6.3's event request, not a chain fork, because `GENESIS(k+1)` is a
-function of `roster_hash(k+1)` and `ABORT_TERMINAL(k)` and reads no participation
-at all. Q-10 is the same question as `STATE_MACHINE.md` Q8, which correctly filed
-it here.
+adopted: a contribution to the stalled stage counts.**
+
+**The residual is real and it is not bounded to one hand. The claim that it was
+is deleted (K1).** What stood here read that two peers who disagree *"derive
+different `n(8) dealt_in`, each rejects the other's `HAND_INIT` copy, the stage
+does not complete, and the hand aborts at the deadline; that is a hand lost and
+recoverable"*. Every clause of that is true and the conclusion does not follow,
+because the analysis stops after one iteration. Run it twice: each peer's `P`
+narrows again at the hand that just aborted, and it narrows to `{self}` — after
+which every collective stage has one member, completes alone, and the two peers
+never need each other again. One lost hand is the first step of a permanent
+silent fork, not the whole cost.
+
+What is true, and is all that may be claimed, is that the residual **cannot fork
+the chain**: `GENESIS(k+1)` is a function of `roster_hash(k+1)` and
+`ABORT_TERMINAL(k)` (§3.1) and reads no participation at all, so both peers hold
+the same genesis and every event each emits still verifies at the other. That is
+what the solitary-stage rule below turns into a detection: the events keep
+arriving, and a peer that has narrowed to `{self}` must stop rather than ignore
+them. `Q-10` stays open — nothing here ratifies the stalled stage — and it is
+the same question as `STATE_MACHINE.md` Q8, which correctly filed it here.
 
 **One name, two halves.** `STATE_MACHINE.md` maintains this set as
 `signed_this_hand` and gates `dealt_in` on it (its §5.3 step 4, I31). That is the
@@ -1101,12 +1231,105 @@ it here.
 collective stage — and the two are the same set under two names, one per owner
 (D-011 rule 1). Neither document restates the other's derivation.
 
-**`P(k)` is not a per-receiver quantity, and that is why this rule is available
-where a status field was not.** "Did seat `s` sign anything in chain `k`" is a
-function of the accepted chain; the terminal stage of a chain is
-witness-independent, so two honest peers that reach `TERMINAL(k)` have accepted
-the same chain-`k` prefix and derive the same `P(k)`. A status field could not do
-the job, and the circularity is the whole reason: a seat's status changes only
+**`P(k)` is agreed wherever the stage that determined it completed, and is
+`Q-10`'s residual wherever it did not — which is every hand in which `P` narrows.
+This paragraph replaces a false one, and the falsehood is the whole of K1.** What
+stood here read:
+
+> *"`P(k)` is not a per-receiver quantity … the terminal stage of a chain is
+> witness-independent, so two honest peers that reach `TERMINAL(k)` have accepted
+> the same chain-`k` prefix and derive the same `P(k)`."*
+
+**The clause after the semicolon asserts the converse of the property it cites,
+and the converse is false.** `ABORT_TERMINAL(k)` is a function of `GENESIS(k)`
+and of nothing else **precisely so that peers holding different prefixes reach
+it** — §3.1 says so in terms, and that is what unfroze eleven phases. Reaching
+the same terminal on the abort path is therefore evidence of nothing whatever
+about the prefix. This section proves above that `P` narrows at stage 0 and
+nowhere else, and a hand whose stage 0 stalled is a hand that aborts.
+So the honest statement is the one that heads this paragraph: **`P(k)` is agreed
+exactly where it is inert, and per-receiver exactly where it acts.**
+
+**There is no construction that removes the residual, and pretending otherwise is
+what produced K1.** Agreeing who contributed to the stalled stage requires a
+collective step at exactly the point where collectivity failed; ratifying it in
+the abort body makes `P(k)` a function of which abort copy this receiver accepted,
+which is the same per-receiver quantity by another name and is inadmissible under
+D-012; and refusing to narrow `P` at all restores the fixed point D-013 exists to
+escape. The residual is real, it is `Q-10`, and what this document owes is not a
+proof that it cannot happen but a rule that it cannot be **silent**. That rule is
+the solitary-stage rule below.
+
+**The solitary-stage rule — normative, and this is the disposition of K1.**
+
+> A peer is in the **solitary regime** for hand `k` when the required emitter set
+> of a collective stage of that hand is `{self}` and contains no other seat.
+> Dealing such a hand is permitted: a table whose other seats are genuinely gone
+> must drain them, or a tournament never ends and D-013 buys nothing.
+>
+> **While in the solitary regime, a chained event of hand `k` from a seat outside
+> `P(k-1)` that reaches §4.0 step 12 is not a rejection. It is a state divergence,
+> and the receiver enters §6.3 at step 1: it freezes, completes no stage, awards
+> no pot, and evaluates no end condition.** The one exempt type is
+> `0x0804 PLAYER_SIT_IN` (§4.10), which is the message a seat outside `P` exists
+> to be able to send.
+
+**Why this is the disposition, and what it costs.** In the solitary regime this
+peer's belief is *no other seat is participating in hand `k`*. A verifying,
+canonical, correctly-signed chained event of hand `k` from another seat is that
+seat's signature on the opposite belief. **They cannot both be true, and the
+event is the only wire evidence that separates the two situations a solitary peer
+cannot otherwise tell apart** — the opponent is gone, or the opponent is there and
+we disagree. A peer that is genuinely alone receives nothing and drains normally,
+so the drain path is untouched and costs nothing. A peer that is not genuinely
+alone receives the contradiction **on its first solitary hand**, because the peer
+that did not narrow is still emitting.
+
+Without it, K1's trace runs: one dropped `HAND_INIT` copy, both peers derive
+different `P`, each rejects the other's copy, each narrows to `{self}`, each
+self-completes every collective stage of every later hand, each drains the other
+one blind at a time, and each reaches §9.3's tournament end condition **naming
+itself the winner**. Nothing in that trace is invalid, no deadline fires, no
+invariant breaks, chip conservation holds at both, and no checkpoint is placed
+(K3) — so the two peers are two tables that were one, and neither can tell. That
+is an integrity failure, and `SPEC_CS.md` §19 is explicit about the ranking:
+*"Security má přednost před pohodlným dokončením handy."* A table that stops is
+the price, and it is the right price.
+
+**What it does not do, stated rather than hidden.** It does not make `P` agreed,
+and it does not close `Q-10`; it converts one outcome into another. The residual
+is a **bidirectional** partition — each peer hears nothing from the other for the
+whole drain — under which both drain, both finish, and no contradiction reaches
+either. That outcome is not K1's: it is what D-013's drain does under a partition
+whatever `P` is defined to be, it is indistinguishable at both peers from the case
+the drain exists for, and there is no wire evidence that separates them, because
+by construction no wire carries anything. K1's own trace — one dropped frame, both
+peers transmitting throughout — is closed, and it is closed unilaterally: the
+freeze needs no cooperation, no quorum and no reply, so it holds even if the
+contradicting peer never speaks again.
+
+**Rejected alternatives, and why.** *Floor `|P(k)|` at 2* — a table with fewer
+than two participants pauses rather than dealing — was the other candidate. It
+prevents the fork instead of exposing it, and it makes the own-emission question
+harmless, since both readings then land on `Paused`. It is rejected because it
+deletes the drain, which is the whole of D-013's liveness answer and of §12.1.2's
+ending: a heads-up table whose opponent leaves would pause forever, nobody would
+bust, and no end condition could fire — D-013's fixed point again, reached from the
+other side. It also strands the paused peer, whose `P` cannot grow without hearing
+events it is no longer in a stage to accept. The solitary-stage rule buys the same
+integrity property on the only path where the two differ — a peer that is not
+alone — and buys it without paying for it on the path where they do not.
+
+**What now depends on this rule, and must be checked with it.** §3.1's frozen
+roster deliberately routes a boundary-window disagreement into a **stalled stage
+0** rather than into a forked genesis, and a stalled stage 0 is the one place `P`
+narrows; §4.10's boundary window closes per-receiver for the same reason. Both
+are safe **because** a narrowed `P` can no longer complete a hand in silence. An
+editor who deletes or weakens the solitary-stage rule reopens §3.1 and §4.10 in
+the same edit, and the failure it reopens is J1's, not K1's.
+
+A status field could not do the job, and the circularity is the whole reason: a
+seat's status changes only
 through a chained event (D-012), a silent seat emits none, so nothing can ever
 change its status and a set defined on it contains that seat **forever**. D-013
 records what that cost — stage stalls, hand deadline at 600 000 ms, every stack
@@ -1174,8 +1397,11 @@ set at all disposes of both horns, and it costs nothing, because every field of
 the abort body is a function of `GENESIS(k)` and of the receiver's own timer, so
 there is nothing a witness set would have been protecting.
 
-Every event of stage `s` carries `previous_event_hash = stage_hash(s-1)`, and
-`stage_hash(-1) = GENESIS(hand_id)`.
+Every event of stage `s` carries `previous_event_hash = stage_hash(s-1)`, with
+`stage_hash(-1) = GENESIS(hand_id)` and
+`stage_hash(BOUNDARY_SEQUENCE_BASE - 1) = TERMINAL(hand_id)` — the second for the
+hand boundary window of §4.10, whose events all chain from the terminal because
+no emitter can know which other seats will occupy the window.
 
 **Which events enter a `stage_hash`.** `stage_hash(s)` is computed over the
 events of `event_class = 0` when the stage closes normally, and over the
@@ -1436,7 +1662,8 @@ before the signature so two encodings of one event cannot both be accepted.
 | 10 | `chain_scope` matches the `event_type`'s entry in §4.11, and if `chain_scope == 0` the envelope carries the sentinels of §2.3 exactly | drop |
 | 10a | Anti-replay: for a chained event, look up **`slot(E)` exactly as §5.2.1 defines it** — this step reproduces no part of that tuple and reads it whole; for an unchained event, the per-type rule in §5.2.1's box | violation or duplicate-drop |
 | 11 | Decode the payload struct, canonicality gate, per-field range checks | violation |
-| 12 | Stage legality: is this `event_type` from this seat expected at this `sequence`? **And the stage-contribution rule: a seat that has already contributed to a stage may not contribute to it again under a different `event_type`** — the one exception is the terminal `HAND_ABORT` of §4.10, which by construction lands at a stage its emitter has usually already contributed to, and which is also the one event exempt from step 10a's chain-position rule (§4.10) | violation |
+| 12 | Stage legality: is this `event_type` from this seat expected at this `sequence`? **And the stage-contribution rule: a seat that has already contributed to a stage may not contribute to it again under a different `event_type`** — the one exception is the terminal `HAND_ABORT` of §4.10, which by construction lands at a stage its emitter has usually already contributed to, and which is also one of the two events exempt from step 10a's chain-position rule (§4.10; the other is a boundary event, whose parent is `TERMINAL(k)`). **And the solitary-stage rule (§3.2): if this receiver is in the solitary regime for this hand and the sender is outside `P(k-1)`, the event is a state divergence and not a rejection — see step 12a** | violation |
+| 12a | **Solitary-regime divergence (§3.2, K1).** Reached only when step 12 says so. The event is *not* rejected, *not* applied, and *not* counted into any `P`: the receiver enters §6.3 step 1 and freezes. The one exempt type is `0x0804 PLAYER_SIT_IN`, which falls through to ordinary step 12 handling | **freeze; §6.3** |
 | 13 | Semantic legality: the poker engine re-validates the action from scratch | violation |
 | 14 | Cryptographic proof verification (shuffle proof ≈ 42 ms, DLEQ ≈ 0.1 ms) | violation, `INVALID_SHUFFLE_PROOF` |
 | 15 | Apply to state | — |
@@ -1807,9 +2034,26 @@ commitment_i = h("p2p-poker v1 rng-commit",
                  [ table_id, session_id, committer_app_public_key, r_i, salt_i ])
 ```
 
-This is the canonical form for the whole corpus (C-2). The earlier two-part
-`h(..., [r_i, salt_i])` is deleted: it bound neither the table, nor the session,
-nor the committer, so a commitment could be lifted from one table into another.
+**This section is the normative owner of `commitment_i` and of the `seed` combine
+below, for the whole corpus, and this is the disposition of K6 (D-011 rule 1).**
+The earlier two-part `h(..., [r_i, salt_i])` is deleted: it bound neither the
+table, nor the session, nor the committer, so a commitment could be lifted from
+one table into another (C-2).
+
+`CRYPTOGRAPHY.md` §7.3 reproduces both constructions in full and its own
+ownership sentence points the other way — *"this five-part binding is the
+canonical one; the two-part form that `PROTOCOL.md` §4.4 previously carried …
+**was corrected to match this section**"*. The two copies are byte-identical
+today, which is exactly the condition D-011 rule 1 was adopted for after five
+passes of copies drifting, and it is settled here in the direction the rest of the
+corpus already runs: these are **wire** values — they are the payload of `0x0301`
+and `0x0302` and a receiver check is written against them in this section — and
+`CRYPTOGRAPHY.md` §6.4's `ctx` blocks were deleted under the same rule in the H7
+sweep. §7.3 keeps what only it can say: the binding, hiding, ordering and
+anti-regrind arguments, its recorded `SPEC_CS.md` §16 deviation, and its D-012
+check. It keeps no construction. That edit belongs to `CRYPTOGRAPHY.md`'s owner
+and is recorded as **K-6** in `DECISIONS.md`'s open list rather than made here
+(D-013's process rule).
 
 `r_i` and `salt_i` are each 32 bytes from `getrandom::SysRng`. `OsRng` no longer
 exists in the current `rand` / `rand_core` line; the OS source is
@@ -2774,8 +3018,11 @@ receiver whose own chain head for hand `k` differs from the abort's
 stage index of hand `k` and every other check passes. Two peers can honestly
 disagree about which stage stalled — one heard a contribution the other did not —
 and a strict parent check would have each reject the other's artefact, which is
-the deadlock again by a third route. This is the **one** exemption from §4.0
-step 10a's chain-position rule in the whole document, and it is safe for exactly
+the deadlock again by a third route. This is the **first of exactly two**
+exemptions from §4.0 step 10a's chain-position rule in this document — the other
+is the hand boundary window below, whose events all chain from `TERMINAL(k)`
+because no emitter can know which other seats will occupy it (K2) — and it is
+safe for exactly
 one reason: **nothing downstream reads the abort's `sequence` or its parent.**
 `ABORT_TERMINAL(k)` is a function of `GENESIS(k)`, so an abort accepted at the
 "wrong" stage index yields the same terminal value as one accepted at the right
@@ -2925,6 +3172,99 @@ status could not.
 
 ---
 
+#### The hand boundary window — normative, and this is the closure of `Q-09` (K2)
+
+`0x0803 PLAYER_SIT_OUT`, `0x0804 PLAYER_SIT_IN` and `0x0805 PLAYER_LEAVE` are
+chained (`chain_scope = 1`) and legal only at a hand boundary. This box gives
+them the four envelope quantities that were undefined, and the total order that
+was undefined with them. **`Q-09` graded this a placement decision and that grade
+was wrong**: `hand_id` and `sequence` are inside `TO_BE_SIGNED` (§2.4), so two
+implementations that place the event differently produce **different signed bytes
+for the same intent**; they are two of the eight components of the slot key
+(§5.2.1) that §4.0 step 10a reads whole, so a receiver cannot look the event up;
+`sequence` fixes `previous_event_hash` through §3.2; and §4.0 step 12 asks
+whether this type from this seat is expected at this `sequence` and had no answer
+to be given. Under D-013 a seat outside `P(k)` may legally emit **exactly one**
+chained event — `PLAYER_SIT_IN` — so the whole of re-entry ran through the one
+message whose chain position this document declined to specify.
+
+> **Chain.** A boundary event belongs to **chain `k`**, the hand that has just
+> ended, and carries `hand_id = k`. It does **not** belong to chain `k+1`.
+>
+> **`sequence`.** `sequence = BOUNDARY_SEQUENCE_BASE + sender_seat`, where
+> `BOUNDARY_SEQUENCE_BASE = 4 096` (§13) and `sender_seat` is the emitter's own
+> seat index. Every seat has one reserved slot in the window and no other. A
+> receiver rejects a boundary event whose `sequence` is not exactly that value,
+> and rejects any other chained type at a `sequence >= BOUNDARY_SEQUENCE_BASE`.
+>
+> **Parent.** `previous_event_hash = TERMINAL(k)` for **every** boundary event of
+> the window, whichever seats emit and in whatever order they arrive. Equivalently,
+> §3.2's rule extended: `stage_hash(BOUNDARY_SEQUENCE_BASE - 1) := TERMINAL(k)`,
+> beside `stage_hash(-1) = GENESIS(hand_id)`.
+>
+> **The window has no `stage_hash`.** Nothing chains from it: `GENESIS(k+1)` is a
+> function of `roster_hash(k+1)` and `TERMINAL(k)` (§3.1), and neither reads the
+> window. It is the second stage in this protocol with no `stage_hash`, after the
+> witness-independent terminal, and for the same reason — nothing needs one.
+>
+> **Total order.** Ascending seat index, which the `sequence` rule already fixes.
+> Two seats emitting at one boundary occupy two `sequence` values and are applied
+> low seat first, at every receiver, without a tie-break.
+>
+> **One per seat per boundary.** A seat may emit at most one boundary event for
+> hand `k`; a second, of any type, is a stage violation under §4.0 step 12.
+>
+> **Close.** The window for hand `k` closes at this receiver's acceptance of a
+> complete `HAND_INIT(k+1)` stage. A boundary event for hand `k` arriving after
+> that is rejected as out of stage; the seat re-emits at the next boundary.
+
+**Why chain `k` and not chain `k+1`, and this is what decides it.** A boundary
+event placed at the head of chain `k+1` would chain from `GENESIS(k+1)` — and
+`GENESIS(k+1)` reads `roster_hash(k+1)`, which a `PLAYER_LEAVE` would change.
+The event would then be chained from a value it is an input to. Placing the
+window at the tail of chain `k` has no such circularity: `TERMINAL(k)` is fixed
+before the window opens, on both terminal paths, and §3.2's `P(k)` window —
+*"every stage of chain `k`, plus chain `k`'s hand boundary window"* — is exactly
+this placement and needed no adjustment to receive it.
+
+**Why the parent is `TERMINAL(k)` and not the previous boundary event.** A seat
+signs its boundary event without knowing which other seats will emit one, so a
+running parent is not computable by the emitter. `TERMINAL(k)` is: it is
+`stage_hash` of the `HAND_COMPLETE` stage on the decided path and
+`ABORT_TERMINAL(k)` on the abort path, and **both are agreed by every peer by
+construction** — the abort path's terminal is agreed even when the abort's own
+`sequence` is not, which is the whole of P3's property and the one place it is
+used for something. The window is therefore a fan and not a chain, and that is
+why each seat needs a reserved `sequence` rather than a running one. This is the
+**second** exemption from §4.0 step 10a's chain-position rule, after the terminal
+`HAND_ABORT`'s, and it is stated here so the count stays exact.
+
+**Why a per-receiver close is safe here, and what it depends on.** Two receivers
+can hold different windows — one heard a `PLAYER_LEAVE` the other did not — and
+nothing collective closes the window. That would be fatal if the window fed
+`GENESIS(k+1)`; §3.1 is what stops it, by freezing the roster's seat vector for
+the life of the table, so a window disagreement reaches canonical state only
+through `HAND_INIT(k+1)`'s **collective, byte-identical** body — its
+`n(8) dealt_in` and `n(11) ledger_delta` — where the two peers reject each
+other's copy and **stage 0 stalls**. That is loud, it is disposed of by §8, and
+both peers still hold the same `GENESIS(k+1)` and the same `ABORT_TERMINAL(k+1)`,
+so nothing is permanent.
+
+**And a stalled stage 0 is the one place `P` narrows, so this disposition depends
+on §3.2's solitary-stage rule and is not safe without it.** With it, the peers
+that narrowed cannot complete a hand in silence and the disagreement surfaces;
+without it, the very next hand is K1's trace. The two rules are one fix and must
+be read together: an editor who deletes either has restored a permanent silent
+fork by way of the other.
+
+**What is still `STATE_MACHINE.md`'s.** Which engine phase the table sits in
+while the window is open, and for how long, is that document's (D-011 rule 1) and
+is `K-3b` in `DECISIONS.md`'s open list: `HandComplete` is a zero-width derived
+hop there, and a wire window with no phase to hold it is a window no
+implementation can use. This box defines the wire; the phase is owed.
+
+---
+
 **`0x0803 PLAYER_SIT_OUT`** — single-writer stage at a hand boundary only.
 `n(0) reason: u16` (`1` voluntary, `2` derived from consecutive auto-actions).
 The derived case needs no message at all — after `MAX_CONSECUTIVE_AUTO_ACTIONS`
@@ -2933,8 +3273,17 @@ message exists for the voluntary case and as an explicit record. A seat that is
 sitting out keeps its stack, pays its blinds and antes, takes no cards, and drains
 until it busts.
 
-**`0x0804 PLAYER_SIT_IN`** — single-writer stage at a hand boundary only. No
-fields beyond the envelope. Takes effect from the next `HAND_INIT`, never mid-hand.
+**`0x0804 PLAYER_SIT_IN`** — single-writer stage in the boundary window defined
+above: `hand_id = k`, `sequence = BOUNDARY_SEQUENCE_BASE + seat`, parent
+`TERMINAL(k)`. No fields beyond the envelope. Takes effect from the next
+`HAND_INIT`, never mid-hand.
+
+**It is the one type exempt from §3.2's solitary-stage rule**, and the exemption
+is not incidental: a seat outside `P` may emit this and nothing else, so a
+solitary peer that treated it as a contradiction would fault the table on the
+message whose whole purpose is to end the solitude. Every other chained type from
+a seat outside `P(k-1)`, received while this peer is in the solitary regime, is a
+divergence under §4.0 step 12a.
 
 **Its legality condition is widened by D-013, and this is the whole of re-entry
 (J2).** It read *"legal only from a seat currently sitting out"*, which under the
@@ -2953,9 +3302,22 @@ quorum, no proof, no attribution, and no action by any other seat. Nothing else
 puts a seat back and nothing else needs to.
 
 **`0x0805 PLAYER_LEAVE`** — single-writer stage at a hand boundary, and **only**
-there. `n(0) reason: u16` (`1` voluntary, `2` client shutting down). A leave is
-never *required*: a client that vanishes must be handled identically, because a
-departing peer announcing anything can never be a precondition. [NAT §7.3]
+there, in the window defined above. `n(0) reason: u16` (`1` voluntary, `2` client
+shutting down). A leave is never *required*: a client that vanishes must be
+handled identically, because a departing peer announcing anything can never be a
+precondition. [NAT §7.3]
+
+**It removes no seat from `roster_hash` and it counts into no `P` (K2, §3.1,
+§3.2).** The seat keeps its row in the roster vector for the life of the table —
+§4.3 already says the roster cannot be *"added to, removed from or reordered
+without a new table"*, and §3.1 now says it normatively where the hash is
+defined, because letting this message reach `roster_hash(k+1)` would derive
+`GENESIS(k+1)` from a window no stage completion covers. Its chips leave through
+`HAND_INIT`'s `n(11) ledger_delta`, inside a collective body every receiver
+recomputes. And it is excluded from `P` for the reason §3.2 gives: it is the one
+chained event that says its signer will emit nothing further, so counting it as
+participation would make every announced departure a required emitter of the next
+hand and stall that hand to the deadline.
 
 **The "courtesy notice that is not chained" clause is deleted (M4).** It read:
 *"or accepted at any time as a courtesy notice that is not chained"*, and it
@@ -3024,9 +3386,9 @@ means it does not and never can be.
 | `0x0703` | `DISPUTE` | table mesh | **0** | out-of-stage | any participant |
 | `0x0801` | `HAND_COMPLETE` | table mesh | 1 | collective | the set that emitted `HAND_INIT`, `P(k-1)` — §4.10 |
 | `0x0802` | `HAND_ABORT` | table mesh | 1 | **witness-independent terminal** | any seat of the `HAND_INIT` set; no required set (§3.2, §4.10) |
-| `0x0803` | `PLAYER_SIT_OUT` | table mesh | 1 | single | the seat |
-| `0x0804` | `PLAYER_SIT_IN` | table mesh | 1 | single | the seat |
-| `0x0805` | `PLAYER_LEAVE` | table mesh | 1 | single | the seat |
+| `0x0803` | `PLAYER_SIT_OUT` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, at `sequence = BOUNDARY_SEQUENCE_BASE + seat` |
+| `0x0804` | `PLAYER_SIT_IN` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; the one type a seat outside `P(k)` may emit |
+| `0x0805` | `PLAYER_LEAVE` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; counts into no `P` (§3.2) |
 
 39 message types. Lobby chat is on `/p2p-poker/lobby-chat/1` and not on the lobby
 topic, so §1.4's "a message on the wrong channel is dropped" rule covers it like
@@ -3084,9 +3446,9 @@ when some key component changes with it.
 | 34 | `STATE_ACK` | one per checkpoint and one per reconciliation round | `sequence`, same rule | **Clean since P1**, same reason |
 | 35 | `HAND_COMPLETE` | one derived copy per seat of `P(k-1)`, at a fresh `sequence` — the last stage completed, so nothing occupies it | — | **Clean** |
 | 36 | `HAND_ABORT` | **one per emitter per hand**, at the stalled stage's own `sequence`, where the emitter has usually already contributed | `event_type` — against the contribution it shares a `(sequence, class)` with | **Clean since G1, and only because `event_type` is in the key (§5.2.1, D-011 rule 2).** This row is the reason the key was rewritten. Under the seven-tuple it read FAILS: the abort collided with its own emitter's contribution, was rejected at §4.0 step 10a, and was a verifying proof against an honest peer |
-| 37 | `PLAYER_SIT_OUT` | one per seat, hand boundary only, single-writer | — | **Clean since M4** |
-| 38 | `PLAYER_SIT_IN` | same | — | **Clean since M4** |
-| 39 | `PLAYER_LEAVE` | same, and **only** there — the courtesy-notice clause is deleted | — | **Clean since M4** |
+| 37 | `PLAYER_SIT_OUT` | **at most one per seat per boundary window**, at `sequence = BOUNDARY_SEQUENCE_BASE + seat` in chain `k`, parent `TERMINAL(k)` — §4.10 | — | **Clean since M4, and now clean for a stated reason (K2).** The seat's own reserved `sequence` gives it capacity one by construction; a second boundary event of any type from that seat is a stage violation at step 12, and where the type differs it is two slots, so it is a rejection and never a proof |
+| 38 | `PLAYER_SIT_IN` | same window, same reserved `sequence` | — | **Clean, same reason.** This is the one type a seat outside `P(k)` may emit, and the window is what makes that emission placeable |
+| 39 | `PLAYER_LEAVE` | same window, same reserved `sequence`, and **only** there — the courtesy-notice clause is deleted | — | **Clean, same reason.** It shares the seat's one slot with rows 37 and 38, which is what forbids a seat both sitting out and leaving at one boundary |
 
 **39 rows, numbered 1 to 39, one per message type of the table above.** The
 numbering replaces the group arithmetic that stood here (`13 + 11 + 2 + 10 + 1 +
@@ -3728,7 +4090,25 @@ host. The procedure is:
 **Step 1 — freeze.** The moment any peer observes two distinct `state_hash`
 values at one checkpoint, it stops accepting and stops emitting hand events. No
 card opens, no action is applied, no chips move. Silently continuing is what §15
-forbids. **Which phase the engine is in while frozen, and which transitions carry
+forbids.
+
+**There is a second entry condition and it is normative (K1).** A peer in the
+**solitary regime** (§3.2) — every collective stage of this hand required of
+`{self}` alone — freezes here on receipt of any chained event of this hand from a
+seat outside `P(k-1)`, other than `0x0804 PLAYER_SIT_IN`, that reaches §4.0 step
+12. There is no checkpoint on that path to compare hashes at: a hand with one
+participant reaches no `DECK_COMMIT` and no betting round, so §6.2 places none
+(that is `K-3` in `DECISIONS.md`'s open list, and it is why this trigger cannot
+be left to the checkpoint route). The event **is** the divergence: it is another
+seat's signature on the proposition that it is participating in a hand this peer
+believes it is playing alone. **The freeze is unilateral and complete on its own**
+— it needs no reply, no quorum and no reconciliation, and it holds even if the
+contradicting peer never speaks again. Steps 2 to 4 then run as written and may
+recover the hand; if they cannot, case (b) or case (c) disposes of it. What the
+freeze guarantees regardless is that this peer completes no stage alone, awards no
+pot, and reaches no §9.3 end condition while another seat is signing against it.
+
+**Which phase the engine is in while frozen, and which transitions carry
 steps 2–4, is `STATE_MACHINE.md`'s** (D-011 rule 1); the sentence that named the
 phase and mapped the steps onto its transitions is deleted. What this section
 specifies is the **messages** the procedure emits and the **stages** they occupy,
@@ -5002,8 +5382,8 @@ about the wire and not about the threat model:**
 | **Q-06** | Should the per-hand transcript be persisted in full to the profile directory by default? It is the only artefact behind §6.3 case (c)'s diagnostic claim — the transcript is necessary for it, and, pending **OQ-A**, not sufficient — and it is small (~20 KB heads-up, ~60 KB six-handed). But it is also a permanent record of every hand every opponent played, which has its own privacy cost. | `storage/`, `THREAT_MODEL.md` | project owner |
 | **Q-07** | On `HAND_ABORT cause = 4` (unresolvable divergence) the chips are restored, because no peer can be attributed, so any single peer has a free escape from a losing pot at the price of the table (§6.4). The alternatives — forfeiting an unnamed party's commitment, or settling from the last `STATE_ACK`-agreed checkpoint — each need a numbered decision and neither is adopted here. D-010 decides the first half **against** for the MVP; what stays open is whether settling from the last agreed checkpoint is worth building. Formerly this document's `OQ-D` (R-2). | §6.4, `STATE_MACHINE.md` | project owner |
 | **Q-08** | Should a required voter be obliged to publish a signed `ACTION_SEEN { sequence, event_hash }` before it may vote, so that vote-and-seen are two events by one key in one slot and a lying voter becomes provable (§8.3)? A design change with a cost in messages and latency; not adopted. Formerly this document's `OQ-C` (R-2). | §8.3, §8.4 | project owner |
-| **Q-09** | **Which chain does a hand-boundary single-writer event belong to, and at what `sequence`?** `PLAYER_SIT_OUT`, `PLAYER_SIT_IN` and `PLAYER_LEAVE` are chained (`chain_scope = 1`) and legal **only** at a hand boundary (§4.10), but `HAND_COMPLETE` is the terminal stage of chain `k` and `HAND_INIT` is stage 0 of chain `k+1`, so this document names no stage index for them in either chain. Nothing depended on it before this pass. §3.2's `P(k)` does, so `P(k)`'s window is written as *"any chained event accepted between `GENESIS(k)` and `GENESIS(k+1)`"* — correct under either answer, and deliberately written to be. Found by §2.9's sweep; answering it is a placement decision, not a wire change. | §3.2, §4.10, `STATE_MACHINE.md` §5.3 | project owner |
-| **Q-10** | **What ratifies a contribution to the stage that stalled?** For every stage that completed, `P(k)` (§3.2) is exactly `stage_hash` membership and two peers holding the same prefix agree by construction. For the one stage that stalled — the reason the hand aborted — no `stage_hash` exists, so "seat `s` contributed there" is strictly *who was heard*, the quantity P3 refused. **Named default, adopted in §3.2: a contribution to the stalled stage counts, and a terminal `HAND_ABORT` never does.** It cannot simply be excluded: a hand that stalls at `HAND_INIT` completes no stage, so excluding it empties the next hand's set. The residual is loud rather than silent — disagreement costs a hand at the deadline, not a chain fork — and closing it properly means saying what ratifies a partial stage, which is a wire question. Same question as `STATE_MACHINE.md` **Q8**, which filed it here; referenced, never redefined there. | §3.2, §4.4 | project owner |
+| **Q-09** | **CLOSED (K2).** *Which chain does a hand-boundary single-writer event belong to, and at what `sequence`?* **Answer, in §4.10's boundary-window box:** chain `k`, `hand_id = k`, `sequence = BOUNDARY_SEQUENCE_BASE + sender_seat`, `previous_event_hash = TERMINAL(k)` for every event of the window, total order ascending seat index, one event per seat per boundary, window closing at this receiver's acceptance of a complete `HAND_INIT(k+1)`. The grade this row carried — *"a placement decision, not a wire change"* — **was wrong**: `hand_id` and `sequence` are inside `TO_BE_SIGNED` (§2.4) and in the slot key (§5.2.1), so two placements are two signed byte strings for one intent. Chain `k+1` is refused because a boundary event would then chain from a `GENESIS(k+1)` that a `PLAYER_LEAVE` is an input to. | — | closed in this pass |
+| **Q-10** | **What ratifies a contribution to the stage that stalled?** For every stage that completed, `P(k)` (§3.2) is exactly `stage_hash` membership and two peers holding the same prefix agree by construction. For the one stage that stalled — the reason the hand aborted — no `stage_hash` exists, so "seat `s` contributed there" is strictly *who was heard*, the quantity P3 refused. **Named default, adopted in §3.2: a contribution to the stalled stage counts; a terminal `HAND_ABORT` and a `PLAYER_LEAVE` never do; and a peer's own emission does (K1's sub-question, answered).** It cannot simply be excluded: a hand that stalls at `HAND_INIT` completes no stage, so excluding it empties the next hand's set. **The claim that the residual was "loud rather than silent" is withdrawn and was K1**: it costs a hand at the deadline on the *first* iteration and a permanent silent fork on the second, because both peers then narrow to `{self}` and every collective stage self-completes. What replaces it is not a ratification but a detection — §3.2's **solitary-stage rule**, which makes a peer whose `P` has narrowed to itself freeze on the first contradicting event instead of playing on. `Q-10` itself stays open: nothing ratifies the stalled stage, and no construction can, because agreeing it needs a collective step at the point collectivity failed. Same question as `STATE_MACHINE.md` **Q8**, which filed it here; referenced, never redefined there. | §3.2, §4.4 | project owner |
 
 ### The corpus-wide open questions — `DECISIONS.md`'s letters, adopted (R-2)
 
@@ -5161,6 +5541,11 @@ encoding                        = minicbor 2.3.0, #[cbor(array)], no maps, no fl
 
 MAX_SEATS                       = 10
 MAX_STAGES_PER_HAND             = 2 048
+BOUNDARY_SEQUENCE_BASE          = 4 096         (§4.10's hand boundary window;
+  a boundary event of chain k carries sequence = BOUNDARY_SEQUENCE_BASE + seat,
+  so the window occupies 4 096 .. 4 105 and is disjoint from every stage index,
+  which MAX_STAGES_PER_HAND bounds at 2 047. No other chained type may carry a
+  sequence >= BOUNDARY_SEQUENCE_BASE.)
 MAX_CBOR_NESTING_DEPTH          = 8
 MAX_DISPUTES_PER_SENDER_PER_HAND = 8            (DISPUTE is unchained; §4.9, §5.3)
 
@@ -5264,6 +5649,11 @@ fourth verification pass's findings P1, P2, P6 and M3. Notes 16 to 20 do the sam
 for **D-011** and for the Phase 2 gate's findings G1, G2, P3, R-1, R-2 and R-4 —
 this revision decides the terminal stage, rewrites the anti-replay slot key as a
 literal tuple, and deletes this document's copies of what other documents own.
+Notes 21 to 24 do the same for the Phase 3 gate's findings **K1, K2 and K5**: a
+deleted justification that inverted the property it cited, a rule that stops a
+peer rather than preventing a fork, the boundary window that `Q-09` declined to
+place, a frozen roster, and one duplicated genesis part. Notes 21 and 22 are one
+fix stated twice and each names the other as its precondition.
 All are stated so that the other documents can be checked against them rather
 than against the text they replace.
 
@@ -5592,3 +5982,70 @@ because five passes measured what the copies cost — they drift, and the D-010
 sweep's three survivors were found in exactly the gaps between them — and because
 a wire specification that also classifies threats will be edited by whoever is
 fixing the wire.
+
+**21. `P(k)`'s residual is contained rather than removed, and the containment
+costs a table (K1).** §3.2 previously justified D-013 with a sentence that
+inverted P3's property, and the inversion hid a permanent silent fork reachable
+from one dropped frame. The sentence is deleted and the truth stated: `P(k)` is
+agreed exactly where it is inert and per-receiver exactly where it acts. Three
+repairs were available and two are refused in the text. **Ratifying the stalled
+stage** — an abort body naming its emitter's contributor set, with `P(k)` the
+union over accepted copies — is circular: it needs a collective step at the point
+collectivity failed, and *which abort copy this receiver accepted* is the same
+per-receiver quantity under a new name, inadmissible under D-012. **Flooring
+`|P(k)|` at 2** prevents the fork outright and is the stronger guarantee; it is
+refused because it deletes the drain, and the drain is D-013's entire liveness
+answer — a heads-up table whose opponent leaves would pause for ever, nobody would
+bust, and no end condition could fire, which is D-013's own fixed point reached
+from the other side. What is adopted is the **solitary-stage rule**: a peer whose
+required emitter set is `{self}` alone may deal, but a chained event of that hand
+from a seat outside `P(k-1)` freezes it. **The cost is a stopped table where there
+would have been a completed one**, on every path where two live peers disagree
+about `P`; `SPEC_CS.md` §19 ranks that above a silent fork and this document takes
+the ranking. **The residual, which is not closed:** under a bidirectional
+partition each peer drains the other and each declares itself the winner, because
+no contradiction crosses a partition. That is what D-013's drain does under a
+partition however `P` is defined, it is indistinguishable at both peers from the
+case the drain exists for, and it is stated in §3.2 rather than argued away.
+
+**22. `Q-09` is answered as a wire question and its old grade is recorded as
+wrong (K2).** §12 graded it *"a placement decision, not a wire change"*, and
+`hand_id` and `sequence` sit inside `TO_BE_SIGNED` and inside the slot key, so two
+placements are two signed byte strings for one intent. §4.10's boundary-window box
+fixes chain, `sequence`, parent and total order. Two consequences are recorded
+rather than buried. **The window is a second exemption from §4.0 step 10a's
+chain-position rule** — every boundary event chains from `TERMINAL(k)`, not from
+its predecessor — because an emitter cannot know which other seats will emit; the
+exemption count in this document is now two, and both are stated where they arise.
+**And the window closes per receiver**, which is safe only because §3.1 freezes
+the roster's seat vector so the window cannot reach `GENESIS(k+1)`. The
+alternative was to let `PLAYER_LEAVE` change `roster_hash` and to define a
+collective close for the window: a new required emitter set at a hand boundary,
+which is a new liveness gate in the place D-013 spent a decision removing one. It
+is not taken. **What that leaves is a stalled stage 0 on a window disagreement,
+which is the one path where `P` narrows — so note 21's rule is a precondition of
+this one**, and an editor who weakens either has restored J1's failure mode
+through the other.
+
+**23. The roster's seat vector is frozen by deletion, and one route disappears
+with it (K2).** §3.1's clause *"change only at a hand boundary through an accepted
+`PLAYER_LEAVE` or seat entry"* is deleted. Its seat-entry half named a message
+that does not exist — §4.3 is formation only and §4.1 ends the table key's
+authority at `TABLE_READY` — and §4.3 already said the roster cannot be added to,
+removed from or reordered without a new table, so the deletion aligns two sections
+that disagreed rather than deciding between them. The cost is that **a departing
+seat keeps a row in every `roster_hash` for the life of the table**, and that
+version 1 has no mid-session seat entry and no re-buy; both were already true and
+neither was written down. What is *not* decided is when the departing stack is
+subtracted, which is `K-8` in `DECISIONS.md`'s open list: `roster_hash(k)`'s stack
+vector is `TERMINAL(k-1)`'s `final_stacks` whatever the answer, which is what
+makes leaving it open safe.
+
+**24. `GENESIS(0)`'s duplicate part becomes a sentinel rather than being removed
+(K5).** Deleting `table_public_key` outright would leave the two genesis forms
+with five and six parts under one domain string, and `h` (§2.8) carries no arity.
+That is a preimage-shape obligation created for nothing, so the slot keeps its
+place and carries `ZERO32`, reading as *no session yet* beside slot 6's *no
+previous terminal*. The cost is one part hashed that binds nothing, which is
+exactly what the old text had; what changes is that it is no longer a second copy
+of `table_id` that an implementer can accidentally make differ.

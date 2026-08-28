@@ -6,20 +6,26 @@ Specification of the transport and discovery layer of `p2p-poker`.
 (Mainline DHT discovery + GossipSub lobby). No implementation exists yet.
 
 **Authority order.** `docs/SPEC_CS.md` is the specification and wins over
-everything here. `docs/DECISIONS.md` (D-001 … D-012) is binding owner decision and
+everything here. `docs/DECISIONS.md` (D-001 … D-013) is binding owner decision and
 outranks the research documents and any preference of this document. **D-007
 corrects D-006, and D-008 generalises D-007**; both win over D-006. An action
 deadline is advisory and a fold-effect timeout certificate is forbidden whenever
 the required voter set `V` (`PROTOCOL.md` §8.3) has fewer than two members. That
 is always the case at two seats and is reachable at any seat count, which is why
 every such rule is scoped on `|V|` and **never on `n`** (§8.4, §15).
-**D-010, D-011 and D-012 bind this document and this layer**, which earlier
-revisions denied by omission twice over: the first carried no mention of D-010
-and ten places where the transport removed a peer, and the second carried no
-mention of D-012 while this layer is the corpus's largest producer of
-per-receiver quantities. §0 records what all four of D-009…D-012 change here,
-§0.5 is the D-012 pass, and §11.5 is where
-the boundary between a *protocol* verdict and a *transport* defence is drawn.
+**D-010, D-011, D-012 and D-013 bind this document and this layer**, which
+earlier revisions denied by omission three times over: the first carried no
+mention of D-010 and ten places where the transport removed a peer; the second
+carried no mention of D-012 while this layer is the corpus's largest producer of
+per-receiver quantities; and the third carried no mention of D-013 while holding
+the most tempting wrong answer to the question D-013 asks — connection state as a
+liveness signal. **Three for three**, and each time on the judgement that
+transport was unaffected. That judgement is not to be made again: this document is
+in every sweep, and its coverage is checked by counting the decision's occurrences
+here, not by asserting that the sweep ran. §0 records what all five of
+D-009…D-013 change here, §0.5 is the D-012 pass, §0.5.7 is D-013's, and §11.5 is
+where the boundary between a *protocol* verdict and a *transport* defence is
+drawn.
 Under **D-011 rule 1** this document is the normative owner of **transport,
 discovery and connectivity** and of nothing else; where it needs a wire
 definition it names the owning section of `PROTOCOL.md` and does not reproduce
@@ -51,11 +57,11 @@ is written as **OPEN QUESTION** and carried to §13 rather than guessed
 
 ---
 
-## 0. D-009 to D-012 as they bind this layer
+## 0. D-009 to D-013 as they bind this layer
 
-This section exists because this document has now twice been left out of a
-decision sweep on the judgement that transport was unaffected, and both times
-that judgement was wrong.
+This section exists because this document has now **three times** been left out of
+a decision sweep on the judgement that transport was unaffected, and all three
+times that judgement was wrong.
 
 The first time was D-010. **Eviction is a transport action**, so a decision that
 forbids automated eviction lands here whether or not the decision mentions
@@ -73,6 +79,14 @@ a timer says, what AutoNAT concluded, whether a link is relayed, how many peers
 answered. A rule about which quantities may become canonical reaches the layer
 that manufactures the disqualified ones first. §0.5 is that pass. It also
 carries the one site where the omission had already cost something.
+
+The third time was D-013, and it is the one that should have been predictable
+from the other two. D-013 replaces a question about a seat's *status* with a
+question about its *participation*, and participation is a liveness question —
+which is the one kind of question this layer is always able to answer cheaply and
+always wrong to answer canonically. A decision that redefines who must speak next
+reaches the layer that knows who is currently reachable. §0.5.7 is that pass, and
+it also carries the disposition of §0.5.6, which D-013's J1 rule closed.
 
 D-009's three rules are honoured in §1.3.2(iii), §5.1 and §5.1.1 and are
 registered in §15; nothing in this pass changed them.
@@ -231,7 +245,7 @@ genesis" is **no**.
 | AutoNAT v2's reachability verdict | §9.2, §9.3 | our own decision to volunteer as a relay (§9.6), the GUI (§2.2), and the self-reported `reachability` hint of `PROTOCOL.md` §7.4, which that section already declares worthless as a claim and never an input to a game decision |
 | Relay reservation and circuit status, and a circuit's advertised `Limit` | §9.5 | our own dialling and our own decision whether to *ask* for a seat (§0.5.5). Never another peer's seat |
 | Number of snapshot responders, and multiplicity of a DHT candidate across responders | §4.6, §7.2 | dial ordering and local sync-completion only. §7.4 already states the rule that matters: *counting is never evidence* |
-| The merged lobby view — which table ads and which copy of each we hold | §7.4, §10.3 | display, and choosing a table to try to join. **One consequence of this row is not yet safe: §0.5.6** |
+| The merged lobby view — which table ads and which copy of each we hold | §7.4, §10.3 | display, and choosing a table to try to join. **This row carried the corpus's one live exception until the Phase 3 gate; it is closed (§0.5.6), and the row now has the same unqualified answer as every other** |
 | A peer's D-002 relay tier (A/B) | §9.6 | our own relay admission. Never leaves this client, never gossiped, never persisted |
 | A table marked `EQUIVOCATION` by the founder-contradiction rule | §7.4 rule 4 | this client declining to display one table as joinable. Never gossiped, never persisted, never hashed, and explicitly not an `EquivocationProof` |
 | The user's own block list | §11.5.3 | this client's own dialling. Local by construction, and D-011 rule 3 forbids sharing it |
@@ -297,51 +311,154 @@ disconnect and **remains seated** — a rule §8.4 already states and which D-01
 now also requires, since the alternative is a roster that differs by who is
 behind which relay.
 
-#### 0.5.6 The one site where a local view still reaches canonical state
+#### 0.5.6 The site where a local view reached canonical state, and how it was closed
 
-Reported rather than fixed, because the fix is not this document's to make.
+**Status: closed.** `PROTOCOL.md` acted on this in the Phase 3 gate, under
+**D-013**'s J1 rule. The problem statement below is kept as the record of the
+finding, in the past tense; the disposition follows it, and it is **neither of
+the two remedies this section proposed**.
 
-`GENESIS(0)` and `session_id` both contain `advert_hash`, which `PROTOCOL.md`
-§3.1 defines as the `event_hash` of the `LOBBY_TABLE_AD` the participants joined
-under, and which each joiner names for itself in `JOIN_REQUEST` `n(0)`
-(`PROTOCOL.md` §4.3). A joiner takes that value **out of its local lobby view**,
-which is this document's §7.4 and §10.3: the union of what several snapshot peers
-happened to return, plus live gossip, keeping the validly signed ad with the
-highest `timestamp` per `table_id`.
+**What was wrong.** `GENESIS(0)` and `session_id` both contained `advert_hash`,
+which was the `event_hash` of the `LOBBY_TABLE_AD` the participants joined under,
+and which each joiner named for itself in `JOIN_REQUEST`. A joiner took that value
+**out of its local lobby view**, which is this document's §7.4 and §10.3: the union
+of what several snapshot peers happened to return, plus live gossip, keeping the
+validly signed ad with the highest `timestamp` per `table_id`.
 
-That view is per-receiver, and here it is not merely per-receiver in principle:
-the founder re-broadcasts every `AD_REBROADCAST_MS`, and `PROTOCOL.md` §7.2's
-own rule 6 requires each re-broadcast to carry a strictly greater
-`timestamp_unix_ms` or be discarded. So each re-broadcast is a **different signed
-event with a different `event_hash`**, and which one a joiner holds is decided by
-nothing but when it happened to be listening. Two honest players joining a
-minute apart therefore name two different `advert_hash` values, both validly
-signed by the founder, both unexpired, and both accepted. `JOIN_ACCEPT` echoing
-`advert_event` verbatim does not converge them: it echoes back *the joiner's own*
-copy, which is what makes the joiner's local view canonical rather than
-replacing it.
+That view is per-receiver, and there it was not merely per-receiver in principle:
+the founder re-broadcasts every `AD_REBROADCAST_MS`, and `PROTOCOL.md` §7.2's own
+rule 6 requires each re-broadcast to carry a strictly greater `timestamp_unix_ms`
+or be discarded. So each re-broadcast was a **different signed event with a
+different `event_hash`**, and which one a joiner held was decided by nothing but
+when it happened to be listening. Two honest players joining a minute apart
+therefore named two different `advert_hash` values, both validly signed by the
+founder, both unexpired, and both accepted. `JOIN_ACCEPT` echoing `advert_event`
+verbatim did not converge them: it echoes back *the joiner's own* copy, which is
+what made the joiner's local view canonical rather than replacing it.
 
-Downstream, `advert_hash` is a component of `GENESIS(0)` and of `session_id`,
-and `session_id` is a component of every `GENESIS(k)`. Peers holding different
-copies therefore derive different `GENESIS(0)`, so no `TABLE_READY` verifies
-against any other's, the collective stage never completes, and the table never
-starts — silently, and for a reason no participant can see. It is H1's shape
-exactly: agreed content, one per-receiver field, total divergence.
+Downstream, `advert_hash` was a component of `GENESIS(0)` and of `session_id`, and
+`session_id` is a component of every `GENESIS(k)`. Peers holding different copies
+therefore derived different `GENESIS(0)`, so no `TABLE_READY` verified against any
+other's, the collective stage never completed, and the table never started —
+silently, and for a reason no participant could see. It was H1's shape exactly:
+agreed content, one per-receiver field, total divergence. `THREAT_MODEL.md`
+catalogues it as **X35**.
 
-**This document's half of the fix is done and is stated where it belongs**: the
-merged lobby view is a local view (§0.5.2, §7.4, §7.5), the transport asserts
-nothing canonical about which copy is current, and TTL and re-broadcast govern
-display only (§10.3, §10.4).
+**The disposition, and it is `PROTOCOL.md` §3.1's.** `advert_hash` is **removed
+from `GENESIS(0)`, from `session_id` and transitively from `ctx`**, and replaced by
+`table_params_hash` — a hash over the agreed table parameters and nothing else,
+specified in a normative box in `PROTOCOL.md` §3.1 which this document references
+by number and reproduces no part of (D-011 rule 1, D-011 rule 2). The two fields
+that made the old value per-receiver, `timestamp_unix_ms` and `expires_at_unix_ms`,
+are excluded from it **by name**. Every joiner therefore derives the identical
+value from whichever re-broadcast reached it, because the parameters are what it
+agreed to and the timestamp is not.
 
-**The other half is `PROTOCOL.md`'s and is a blocker.** `advert_hash` must stop
-being read out of a per-receiver view: one copy has to be pinned for the whole
-session by a chained event every participant accepts — the founder's
-`PLAYER_LIST` value made normative and `TABLE_READY` required to equal it, or
-`advert_hash` dropped from `GENESIS(0)` in favour of `table_public_key`, which
-`GENESIS(0)` already contains. Which of those is right is `PROTOCOL.md` §3.1's
-call under D-011 rule 1, not this document's, and this document must not
-pre-empt it by inventing a lobby-side convergence rule that would only move the
-per-receiver quantity somewhere less visible.
+**`advert_hash` did not become normative elsewhere; it became a lobby-layer
+pointer, which is this layer's business.** `PROTOCOL.md` §2.8's domain register
+now records that it names which advertisement a joiner is answering and enters no
+chained hash at all. That is precisely the destination §0.5.2's merged-lobby-view
+row permits, so the row is now clean rather than carrying an exception.
+
+**Neither remedy this section proposed was adopted, and recording that is the
+point of keeping this paragraph.** It proposed either *"the founder's
+`PLAYER_LIST` value made normative and `TABLE_READY` required to equal it"* or
+*"`advert_hash` dropped from `GENESIS(0)` in favour of `table_public_key`"*. The
+first pins one copy but pins the *timestamp* with it, so the table's identity
+still depends on when the founder last re-broadcast, and it makes the founder's
+view canonical rather than the agreement. The second binds too little: dropping to
+`table_public_key` would have left **nothing** binding the blind schedule, the
+starting stack or the timing values into the genesis, which is what J1(b) needed —
+the founder could then re-sign with a different `small_blind` and hand two joiners
+two rule sets. The adopted fix is strictly better than both because it changes
+*what* is hashed rather than *whose copy* is hashed: it keeps everything the
+participants agreed to and drops only the quantity that varies. A reader who
+thinks this section's remedies were reasonable should notice that the document
+that *found* the defect proposed two fixes and the document that *owned* it
+adopted neither — which is an argument for the owner boundary, not against it.
+
+**J1(b), which this section did not find, closed with it.** Nothing had forbidden
+the founder re-signing with different parameters, and the check that catches it is
+a lobby receiver rule and therefore reaches this layer: `PROTOCOL.md` §7.2's
+receiver rule 7 discards a re-broadcast whose `table_params_hash` differs from the
+one already held for that `table_id`. This document's §7.4 merge and §10.3
+freshness rules are downstream of that check and do not restate it; what matters
+here is that the merge may **not** be written to prefer the newest advert
+unconditionally, because rule 7 makes newness insufficient on its own.
+
+**What this document owed and still owes.** This document's half was and remains
+done: the merged lobby view is a local view (§0.5.2, §7.4, §7.5), the transport
+asserts nothing canonical about which copy is current, and TTL and re-broadcast
+govern display only (§10.3, §10.4). The standing obligation is the one in §0.5.3:
+**no quantity from §0.5.2's table may be proposed as a component of any protocol
+hash**, and a future field added to `LOBBY_TABLE_AD` that varies per re-broadcast
+would re-open this exact defect, because §3.1's box excludes the two time fields by
+name rather than by a general rule. If such a field is added, it is this layer's
+business to say so, since this layer is where per-broadcast variation is produced.
+
+#### 0.5.7 D-013 at the transport layer, and the one trap it sets here
+
+**D-013 outranks D-012 and this layer is bound by it**, for the third consecutive
+decision on which this document's involvement was not obvious in advance. Its rule
+is that **liveness is inherited from the chain, not from a seat's status**: a seat
+is required to emit in the next hand only if it signed at least one chained event
+in the current one. `PROTOCOL.md` §3.2 owns the rule, the set and its notation, and
+this document reproduces none of them.
+
+**Why it reaches transport at all, which is the part a sweep would skip.** D-013
+replaces a *status* question with a *participation* question, and this layer holds
+the single most tempting wrong answer to it. Connection state is exactly a
+liveness signal, it is available here, it is cheap, it is usually right, and it is
+**per-receiver** — §0.5.2's first row. An implementer who has just read "a seat
+that is not participating is skipped" and who has a `ConnectionState` to hand will
+be tempted to wire the two together.
+
+> **Connection state may never contribute to the participation record.** Whether
+> this client currently holds a connection to a peer, when the connection dropped,
+> whether the link is relayed, and what any keep-alive or ping concluded, are local
+> views and stay local views. Whether a seat signed a chained event in hand `k` is
+> a function of the **accepted chain** and of nothing this layer measures. The two
+> agree most of the time, which is what makes the substitution attractive and what
+> would make the resulting fork rare, late and hard to reproduce.
+
+This is prohibition 8 in §1.2 applied to a new consumer rather than a new rule,
+and it is the same line §8.4 already draws for seating: a seated participant whose
+circuit degrades is reported as a disconnect and **remains seated**. D-013 extends
+what that sentence protects. Before it, a wrong answer here cost a seat's *status*,
+which nothing acted on after D-010. Now the same wrong answer would decide who is
+**required to emit in the next hand**, and two clients that disagree about that
+derive different `HAND_INIT` bodies — the failure `THREAT_MODEL.md` catalogues as
+**X36**, whose payoff is a silent permanent fork rather than a wasted hand. The
+prohibition did not change; **what it is now load-bearing for did**, and that is
+the check this section exists to record.
+
+**Re-entry is signed, never sensed.** Under D-013 a seat that went quiet returns to
+the required set by **signing a chained event**, and by nothing else. A socket that
+reconnects, a relay reservation that is re-established, an `identify` exchange that
+completes, a peer that reappears in a snapshot — none of these is a re-entry, none
+may synthesise, prompt or stand in for one, and this layer must not report one to
+the layers above as though it were. What the transport may do on reconnect is
+exactly what it does on any dial: deliver bytes. `THREAT_MODEL.md` §7.3(b) carried
+the opposite claim — that a reconnecting player rejoins the key-holder set at the
+next hand boundary — for four passes, and it is corrected there.
+
+**What D-013 retires here.** §0.5.6's open site, and with it the only exception in
+§0.5.2's table. `GENESIS(0)` no longer depends on which copy of a re-broadcast this
+client holds, so the merged lobby view is now a local view with no downstream
+qualification at all.
+
+**The process rule, and this document is on both sides of it.** D-013 records that
+*a finding correctly assigned across an owner boundary is a finding nobody owns*,
+and it names this document as the example: §0.5.6 found J1, wrote it up in full,
+named two candidate fixes and marked it a blocker for `PROTOCOL.md`, which did not
+act for a pass. The other half of that hand-off is the half this section is: **the
+finding document must be told when the owner acts**, and it was not — §0.5.6 stood
+as a live blocker notice, with a wrong problem statement and two wrong remedies,
+for a full gate after the defect was fixed. A reader sent there was worse off than
+one who never followed the pointer. The mechanism now is `DECISIONS.md`'s open
+list, which is the one place every editor of every document reads; a finding
+assigned elsewhere is recorded there in the same pass that finds it, and its
+disposition is written back here when the owner acts.
 
 ---
 
@@ -1440,9 +1557,24 @@ now a pointer.
 What this document owns is the transport behaviour around it. The response
 carries **complete, independently signed `LOBBY_TABLE_AD` events exactly as they
 were gossiped** — the responder forwards the original signed bytes and never
-re-serialises, re-signs or summarises them, because a re-serialised advert is a
-different `event_hash` and the hash of the advert is load-bearing downstream
-(§0.5.6). Four caps apply, all valued in `PROTOCOL.md` §13:
+re-serialises, re-signs or summarises them.
+
+**The reason this rule was given has changed, and the rule has not.** It used to
+be that a re-serialised advert has a different `event_hash` and that the hash of
+the advert was load-bearing downstream. Since D-013 it is not: `advert_hash`
+enters no chained hash at all (§0.5.6). The rule survives on two grounds that were
+always the stronger ones and are now the only ones. **First, the responder cannot
+re-sign.** It does not hold the table key, so any byte it changes destroys the
+founder's signature and the ad is rejected by the receiver's own `verify_strict`
+— a responder that re-serialises is a responder whose entire snapshot is
+discarded. **Second, the parameters must survive the hop intact**, because the
+joiner recomputes `table_params_hash` from this very object, and that value *is*
+load-bearing downstream. A responder that summarised an ad — dropping a field it
+thought was display-only — would hand the joiner a value no other participant
+derives, which is §0.5.6's defect re-created one layer out. **Forwarding is not an
+optimisation here; it is the only thing a responder is permitted to do.**
+
+Four caps apply, all valued in `PROTOCOL.md` §13:
 `SNAPSHOT_MAX_ADS` on the count, `SNAPSHOT_RESP_MAX` on the total,
 `TABLE_AD_MAX` on each ad's **payload**, and `TABLE_AD_SIGNED_MAX` on each
 **complete signed** ad. The count and the total were chosen together and the
@@ -1492,8 +1624,10 @@ event body or a hand's genesis (§0.5.2, §1.2 prohibition 8). Concretely, none 
 these is canonical: the set of tables we display, the ordering we display them
 in, whether we are still waiting on responders, the `EQUIVOCATION` mark of rule 4
 — which never leaves this client — and **which copy of a founder's re-broadcast
-advert we currently hold**, that last one being the row where the corpus does not
-yet hold the line (§0.5.6).
+advert we currently hold**. That last one was the site where the corpus did not
+hold the line; it is closed, and the reason it is worth naming even now is that
+the copy we hold **is still read**, to recompute a value from it. What changed is
+that the value recomputed no longer varies between copies (§0.5.6).
 
 Rule 2 is the same rule stated for the merge itself, and it was already right
 before D-012: *counting is never evidence*. An ad reported by one responder is
@@ -1526,8 +1660,11 @@ canonical, a responder's power would stop being omission and delay and start
 being **fork**: it would only have to show two clients different things to make
 them derive different state, which is a far cheaper attack than the eclipse
 above and needs no control of the peer set at all. §7.4's closing rule is what
-keeps that shut, and §0.5.6 records the one place where the corpus has not
-finished shutting it.
+keeps that shut. **The one place where the corpus had not finished shutting it is
+now shut** (§0.5.6), and the shape of that fix is worth carrying into any future
+merge rule: it was closed by making the canonical value **the same in every copy**,
+not by making every client hold the same copy. A convergence rule at this layer
+would have been the wrong fix, and this document was right not to invent one.
 
 ---
 
@@ -2217,8 +2354,10 @@ Rules:
   because lobby traffic is unchained and this view is displayed rather than
   hashed (§0.5.4). Two honest clients holding different table sets, or different
   copies of one table's advert, are both correct. What must not happen is any of
-  it being read as agreed state — see §0.5.6 for the one place downstream where
-  the corpus does not yet hold that line.
+  it being read as agreed state — §0.5.6 records the one place downstream where
+  the corpus once did exactly that, and its disposition: closed in the Phase 3
+  gate, so that this paragraph's "both correct" now holds all the way down
+  instead of stopping one layer short.
 
 ### 10.4 What these TTLs do **not** govern
 
@@ -2665,7 +2804,8 @@ parameters beside it genuinely are local: a denser mesh costs only its owner.
 | **D-009** rule 1 — mandatory honest behaviour may never satisfy the equivocation predicate. The slot key is `PROTOCOL.md` §5.2's and this document reproduces no part of it; the `InMemoryTransport` conflict injector is written against that section rather than against a copy, because a harness built on a stale copy tests the copy. Rule 3 — no security property is stated as an absence from the dependency tree: the register of §5.1.1 states what each crate *is* and flags the two unaudited ones, and `libp2p-allow-block-list` is explicitly recorded as unavoidable in the link (§5.1) rather than claimed absent | §1.3.2(iii), §5.1, §5.1.1 |
 | **D-010** point 3 — **no automated eviction.** Every `block_peer` on a protocol proof is deleted from this document; a proof produces no transport action of any kind. Point 2's neutral attribution is recorded where the transport touches the abort path. What is *kept* is every defence whose reason is a resource, rate, size, admission, capacity or membership fact, plus the user's own explicit choice — and the boundary between the two is drawn once, in §0.2, so an implementer cannot read "no eviction" as "no defences" | §0 (sweep table §0.4), §1.2 prohibition 7, §5.5, §6.6, §7.4, §8.4, §10.4, §11.5, §12.9a |
 | **D-011** rule 1 — this document is the normative owner of transport, discovery and connectivity, and restates nothing another document owns. Seven restatements are now pointers, listed site by site in §0.3: the slot key, the unchained sentinel envelope, every two-sided size constant, the lobby validation checklist, the snapshot request and response bodies, the table-stream framing and its sizing argument, and the lobby freshness and skew rules. Rule 2 — the slot key is that one tuple and appears here **only** by reference. Rule 3 — D-010 point 3 binds this layer, which is what §0 exists to record | §0, §0.3, §1.3.2(iii), §6.4, §6.5, §7.3, §8.4, §10.3, §11.3, §11.5, §14 |
-| **D-012** — no canonical state from a per-receiver quantity. This layer produces almost all of them, so the rule lands here as a constraint on outputs: prohibition 8 in §1.2, the catalogue of every per-receiver quantity and where each may go in §0.5.2, the one transport value that legitimately sits in a chained body and why it is safe in §0.5.3, clock-derived acceptance confined to unchained lobby traffic in §0.5.4, relay capacity gating only our own request for a seat in §0.5.5, and the snapshot merge and the lobby TTLs confirmed as local views in §7.4, §7.5 and §10.4. **One site is reported and not fixed**: `advert_hash` reaches `GENESIS(0)` and `session_id` out of the per-receiver lobby view, and the fix belongs to `PROTOCOL.md` §3.1 and §4.3 — §0.5.6 | §0.5, §1.2 prohibition 8, §2.2, §6.4, §7.3, §7.4, §7.5, §8.4, §9.5, §9.6, §10.3, §10.4, §11.5.2 |
+| **D-012** — no canonical state from a per-receiver quantity. This layer produces almost all of them, so the rule lands here as a constraint on outputs: prohibition 8 in §1.2, the catalogue of every per-receiver quantity and where each may go in §0.5.2, the one transport value that legitimately sits in a chained body and why it is safe in §0.5.3, clock-derived acceptance confined to unchained lobby traffic in §0.5.4, relay capacity gating only our own request for a seat in §0.5.5, and the snapshot merge and the lobby TTLs confirmed as local views in §7.4, §7.5 and §10.4. **The one site reported and not fixed is now fixed**, by `PROTOCOL.md` §3.1 under D-013's J1 rule: `advert_hash` no longer reaches `GENESIS(0)`, `session_id` or `ctx`, `table_params_hash` replaced it, and this layer has **no** remaining per-receiver quantity with a canonical destination — §0.5.6 records the disposition and why neither remedy this document proposed was the one adopted | §0.5, §1.2 prohibition 8, §2.2, §6.4, §7.3, §7.4, §7.5, §8.4, §9.5, §9.6, §10.3, §10.4, §11.5.2 |
+| **D-013** — liveness is inherited from the chain, not from a seat's status. The rule, the required set and its notation are `PROTOCOL.md` §3.2's and this document reproduces none of them. What lands here is one prohibition and one retirement. **The prohibition (§0.5.7):** connection state, drop time, relay status and keep-alive results may never contribute to the participation record that decides who must emit next hand — they are §0.5.2's first row, they agree with the chain most of the time, and that is what makes substituting them attractive and the resulting fork rare and hard to reproduce. This is §1.2 prohibition 8 with a **new consumer**, not a new rule: the prohibition is unchanged, but a wrong answer now decides a required emitter set rather than a status nothing acts on, so its failure mode moved from a wasted hand to `THREAT_MODEL.md`'s **X36**. **Re-entry is signed, never sensed:** a reconnected socket, a re-established reservation or a peer reappearing in a snapshot is not a re-entry and may not be reported as one. **The retirement:** §0.5.6's open site, and with it the last qualification on §0.5.2's merged-lobby-view row | §0.5.6, §0.5.7, §1.2 prohibition 8, §1.3.1, §7.4, §8.4, §10.4, §11.5 |
 
 ---
 

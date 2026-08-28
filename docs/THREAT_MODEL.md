@@ -1260,7 +1260,7 @@ a test failure.
 | `CheaterEquivocation` | §5.2 row 16; X31; X32; G7 | `tests/adversarial/equivocation.rs` | **D&A** — two chained events by one key in one slot, with different `event_hash` values, produce a transferable `EquivocationProof`. **[R10]** The slot key is `PROTOCOL.md` §5.2's and is not reproduced in this table; the test binds against §5.2, not against a copy printed here, and a test written against a copy is how three of the five recurrences in G7's table survived review. The test must also assert the **false-positive** half of G7, and this half is not optional: no unchained pair — two honest lobby adverts, or a `JOIN_REQUEST` alongside the sender's own `RNG_REVEAL` — ever produces one. **And it must carry the mirror of the cheater, which is what D-009 rule 1 makes standing:** an *honest* peer, driven through every legal interleaving, never generates a proof against itself. **Three** interleavings must be in the suite by name, one per recurrence that a slot key had to be widened to close. (1) **X31's** — two seats silent at one collective stage, one honest voter emitting a required timeout vote against each — asserting the two votes occupy **different** slots. (2) **The reconciliation one** — a peer that misses an event, reconciles under `PROTOCOL.md` §6.3 step 3, and re-derives its checkpoint value — asserting its first and second emissions do not together satisfy the predicate; this now passes, because §4.9 gives a reconciliation round its own stage and `sequence`. (3) **X32's** — a collective stage stalls, the hand deadline expires, and the honest peer that already contributed to that stage emits the terminal `HAND_ABORT` — asserting that the abort **is accepted** (the liveness half: the hand actually ends) and that the abort and the contribution do **not** together satisfy the predicate (the evidence half). Interleaving (3) fails against any corpus whose slot key omits `event_type`, and it belongs in the suite as the test that pins D-011 rule 2 rather than as one written after the fix. **A suite that tests only the cheater passes while every one of these is live**, which is the whole reason the mirror is mandatory. Note that D-010 and D-011 rule 3 change what a verifying proof *costs* the victim and change nothing about this test: the mirror asserts the proof does not verify, never that its consequences are tolerable. |
 | `CheaterReadOpponentCard` | §5.2 row 6; G1 | `tests/adversarial/hole_card_secrecy.rs` | **CP** — a coalition of `n-1` holding every message it legitimately received cannot output the victim's hole cards. *Inherits A1.* |
 | `CheaterFutureBoard` | §5.2 row 7; X3; G2 | `tests/adversarial/street_gating.rs` | **CP** for opening a future street's index; **D&A** for the attempt — an early reveal token opens nothing and is rejected and attributed. *Inherits A1, A10.* |
-| `CheaterDisconnect` | X7, X8, X30, X32, X33; §7 | `tests/adversarial/disconnect.rs` | **D&A with one silent seat where `\|V(subject)\| >= 2`; DNA with two or more silent seats; DNA wherever `\|V\| < 2`, which at `n = 2` is always** — matching X7's split class. The test must cover all three cases, and under **D-010** the chip assertion is now the same on all three and is the strongest one available: **no chips move and every stack is bit-identical to its start-of-hand value**, whatever the cause and whoever is attributed. The `\|V\| < 2` abort additionally carries `attributed = []` (`PROTOCOL.md` §8.4). A test that asserts forfeiture on any branch is testing a mechanism this version does not have. It must also cover **X30**, because D-008's floor is only as real as the check that enforces it: a client emitting `TIMEOUT_VOTE`s against several seats must **not** thereby shrink `V` — exclusion requires a completed, valid certificate — and a certificate assembled with `\|V\| < 2` must have no effect at **any** seat count, not merely at two. "No effect" is to be asserted at its strongest (D-009 rule 2): the certificate is not chained, produces no `AbortRecord`, moves no chips **and does not end the hand** — the test must show the hand still running afterwards and ending only when `hand_deadline_ms` expires. Under D-010 the reason for that last assertion is narrower than it was and the test comment must say so: the escape it protects is **not** closed any more (X8 is V), so what the assertion buys is that the escape costs the full deadline of visible stalling rather than one signature, and that no chained event names a victim on the strength of one peer's word (§7.3(c)). **And it must assert the liveness half of X32 on the shipped configuration**: with one seat silent at a collective stage and the hand deadline expired, the terminal abort emitted by a seat that already contributed to that stage is **accepted**, the hand ends, and the next hand begins. A disconnect suite that only checks chip outcomes passes on a table that can never start another hand.<br><br>**And it must assert X33's D-012 property, which the X32 assertion above does not reach.** Drive the two abort paths that can end one hand differently — a certificate that names a peer, and the hand deadline that names nobody — and assert that **every peer's next-hand `dealt_in` and `bb_seat` are identical** and that hand `k+1` actually completes its opening collective stage. The failing version of this test passes every chip assertion, every terminal-value assertion and the X32 liveness assertion, and then hangs at hand `k+1`; that is what makes X33 worth its own assertion rather than a comment. Assert it directly at the source too: **no code path reads a seat's status out of an `AbortRecord`**, for `attributed` or for any other field. |
+| `CheaterDisconnect` | X7, X8, X30, X32, X33, X34, X36; §7 | `tests/adversarial/disconnect.rs` | **D&A with one silent seat where `\|V(subject)\| >= 2`; DNA with two or more silent seats; DNA wherever `\|V\| < 2`, which at `n = 2` is always** — matching X7's split class. The test must cover all three cases, and under **D-010** the chip assertion is now the same on all three and is the strongest one available: **no chips move and every stack is bit-identical to its start-of-hand value**, whatever the cause and whoever is attributed. The `\|V\| < 2` abort additionally carries `attributed = []` (`PROTOCOL.md` §8.4). A test that asserts forfeiture on any branch is testing a mechanism this version does not have. It must also cover **X30**, because D-008's floor is only as real as the check that enforces it: a client emitting `TIMEOUT_VOTE`s against several seats must **not** thereby shrink `V` — exclusion requires a completed, valid certificate — and a certificate assembled with `\|V\| < 2` must have no effect at **any** seat count, not merely at two. "No effect" is to be asserted at its strongest (D-009 rule 2): the certificate is not chained, produces no `AbortRecord`, moves no chips **and does not end the hand** — the test must show the hand still running afterwards and ending only when `hand_deadline_ms` expires. Under D-010 the reason for that last assertion is narrower than it was and the test comment must say so: the escape it protects is **not** closed any more (X8 is V), so what the assertion buys is that the escape costs the full deadline of visible stalling rather than one signature, and that no chained event names a victim on the strength of one peer's word (§7.3(c)). **And it must assert the liveness half of X32 on the shipped configuration**: with one seat silent at a collective stage and the hand deadline expired, the terminal abort emitted by a seat that already contributed to that stage is **accepted**, the hand ends, and the next hand begins. A disconnect suite that only checks chip outcomes passes on a table that can never start another hand.<br><br>**And it must assert X33's D-012 property, which the X32 assertion above does not reach.** Drive the two abort paths that can end one hand differently — a certificate that names a peer, and the hand deadline that names nobody — and assert that **every peer's next-hand `dealt_in` and `bb_seat` are identical** and that hand `k+1` actually completes its opening collective stage. The failing version of this test passes every chip assertion, every terminal-value assertion and the X32 liveness assertion, and then hangs at hand `k+1`; that is what makes X33 worth its own assertion rather than a comment. Assert it directly at the source too: **no code path reads a seat's status out of an `AbortRecord`**, for `attributed` or for any other field. **Three cases added by D-013, and the last of them is the one this test cannot currently express.** The disconnect suite must show that a silent seat stalls **exactly one** hand and is skipped from the next — not stalled repeatedly, which is **X34**, the fixed point D-012 left behind and D-013 removed; that such a seat is blinded off until it **busts**, since that is what lets a tournament with a silent seat end at all; and that it comes back **only** by signing a chained event, never by reconnecting a socket, which is §7.3(b) as corrected. The third is **X36** and it is open: a test can produce the fork — drop one frame at a stalled stage on an aborted hand — but there is no assertion available that fails, because both peers are internally consistent and no checkpoint compares them. The honest form is a **cross-peer** assertion the harness makes from outside the protocol, comparing the two peers' tournament results directly and failing if they disagree, marked as testing a defect rather than a property until `DECISIONS.md` K-1 is decided. A suite that only asserts each peer's own consistency passes this fork, which is exactly how it survived a gate. |
 
 **The two mandatory standalone tests of `SPEC_CS.md` §25**, which are not tied to a
 named cheater implementation:
@@ -1483,13 +1483,41 @@ heads-up the first shipped mode, so the first mode this project ships is the one
 in which this machinery does not apply. See X10, X30, §9.1.2 limitation 3, and
 `STATE_MACHINE.md` §8.5 and §9.5.
 
-**(b) The player is absent between hands.** From the next hand onward they are
-simply **not a party to the cryptography**: not in the joint key, not dealt cards,
-and nothing waits for them. Their seat is a chip pile that pays its blinds and
-antes and folds when the action reaches it, draining one orbit at a time until it
-busts. On reconnect they rejoin the key-holder set at the next hand boundary. No
-new cryptography is needed, because a player who is never dealt in never has to
-open anything.
+**(b) The player is not participating between hands.** From the next hand onward
+they are simply **not a party to the cryptography**: not in the joint key, not
+dealt cards, and nothing waits for them. Their seat is a chip pile that pays its
+blinds and antes and folds when the action reaches it, draining one orbit at a
+time until it busts. No new cryptography is needed, because a player who is never
+dealt in never has to open anything.
+
+**Two things in this case changed under D-013 and the previous wording was wrong
+about both.** First, *who this case applies to*: it is not a seat carrying an
+"absent" status, because no status governs this any more. It is a seat that
+**signed no chained event during the previous hand**, and that is a fact about
+the accepted chain rather than a fact about anybody's view of a player.
+`PROTOCOL.md` §3.2 owns the definition; this document does not restate it. What
+this buys is X34: the seat is skipped rather than waited for, so the table keeps
+playing, and because it is blinded off it genuinely busts, so the tournament can
+end.
+
+**Second, and this is the sentence that was false: they do *not* rejoin
+automatically.** This paragraph read *"On reconnect they rejoin the key-holder
+set at the next hand boundary"* for four passes. Nothing rejoins anybody. Under
+D-013 a seat returns to the required set by **signing a chained event**, which
+requires it to be alive and willing — that is the entire re-entry test, and it is
+deliberately the only one. A client whose socket reconnects has demonstrated
+nothing; a client that signs has demonstrated the only thing this design asks
+for. The transition and the message that carries it are `STATE_MACHINE.md`'s and
+`PROTOCOL.md`'s respectively.
+
+**The residual on that re-entry path is open and is recorded rather than
+smoothed.** `DECISIONS.md` **K-3b** observes that the phases in which the
+re-entry message can be accepted are a zero-width derived phase and a phase that
+requires every seat to be silent, so the test D-013 defines may have no window in
+which it can be taken. If that holds, a reconnecting player keeps their seat and
+their stack and is blinded off correctly — case (b) is sound — but cannot come
+back, which converts a temporary disconnection into a permanent one. That is a
+liveness defect, not an integrity defect, and it is owned by `STATE_MACHINE.md`.
 
 **The forced deviation from live rules, stated rather than smoothed over.** Under
 TDA-style rules an absent player is still dealt in, and if their stack is below the
@@ -2241,12 +2269,28 @@ have already adopted them. The parallel scheme that stood here, in which `OQ-A`,
 `DECISIONS.md`, is **deleted**. A reader following a letter from one document to
 another now lands on the same question, which is the whole point of a letter.
 
+**`DECISIONS.md`'s numbered open blockers are adopted on the same terms, and one
+of them belongs in this table**: **K-1**, because it is the only item in the
+corpus that changes a *classification* here rather than a rule elsewhere. This is
+D-013's process finding being complied with rather than described. That finding
+is that *a finding correctly assigned across an owner boundary is a finding
+nobody owns* — the document that finds a defect is often not the document that
+may fix it, so the finding sits in the finder's pages, invisible to the editor
+who has to act. **K-4, the item that produced this revision, is the same failure
+one layer down and in this document**: a previous pass filed it correctly against
+`THREAT_MODEL.md`, and three passes went by with the superseded cost model still
+in §9.3 and the superseded reconnect rule still in §7.3(b), while this file
+carried exactly **one** occurrence of `D-013`. The coverage signature was
+available the whole time and nobody read it, which is the argument for the count
+being reported rather than the sweep being asserted.
+
 | # | Question, in `DECISIONS.md`'s wording | Where this document depends on it |
 |---|---|---|
 | **OQ-A** | *"A named, versioned reference engine, since several sections claim disputes are 'deterministically adjudicable by any third party running the reference engine' and no such engine is defined (review N2). Interim answer: withdraw the claim; the engine is defined when the crate has a tagged release."* | X29's third bound, which is **evidence preservation, not recourse**, until this is answered; §9.1.2 limitation 5; the withdrawn "deterministically adjudicable offline" claim wherever it appeared |
 | **OQ-D** | *"A dispute path that does not require the accused peer's signature — circular at every table size, not only heads-up (D-007 point 4, review A-1). Interim answer under D-010: a dispute that cannot resolve ends the hand neutrally, so the circularity costs a hand rather than a stalemate."* | X7; §7.3(c). Formerly this document's `OQ-B` |
 | **OQ-F** | *"Whether `TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` should still be produced in the MVP now that D-010 gives them no effect, or be deferred wholesale until the machinery is sound. Producing them keeps the transcript adjudicable later; deferring them removes four passes' worth of surface."* | X10, X30, X31, X32 and the `CheaterEquivocation` / `CheaterDisconnect` rows of §5.5 all describe machinery this letter asks whether to build at all. It changes what ships rather than what is true, so no classification here turns on it |
 | **OQ-E** | **Blocking.** How is a timeout certificate constructed when two or more seats are simultaneously unresponsive, and whom does it attribute? `signers == participants \ {subject}` is unachievable, and attributing every non-voting seat punishes honest seats behind a partition. The interim behaviour is to abort with no attribution and no chip movement, which lets two colluding seats void a hand for free. Blocking for Phase 4. | X7 (DNA case); §7.3(c). **This letter is this document's own**, referenced by `PROTOCOL.md` Q-02 and `STATE_MACHINE.md` Q3 and defined nowhere else |
+| **K-1** | **Blocking, and this document's heaviest open item.** *“The required emitter set is a per-receiver quantity on the one path where it narrows, and its payoff is a silent permanent fork.”* The set is agreed between honest peers exactly where it is inert and per-receiver exactly where it acts — a stalled stage on an aborted hand — and the argument offered for it inverts the witness-independence property it rests on. Owner decision needed: ratify the stalled stage, or floor the set at two members. A second quantity, whether a peer's own emission counts toward its own participation record, is undefined in both owning documents and decides which of two failures occurs. | **X36**, the only **NP&ND** row in the catalogue, and the reason §9.3 carries a seventh qualification. This document cannot classify the row any higher until the decision is taken, and cannot claim that honest divergence is always detected while it stands. `DECISIONS.md` **K-3** would move it from NP&ND to DNA without deciding K-1, by checkpointing a hand that placed no other checkpoint. |
 
 **The mapping from this document's former labels, recorded once so an old
 cross-reference can still be followed, and not to be maintained:**
@@ -2314,8 +2358,8 @@ getting it accepted at all is X32.
 
 ### 9.3 The standing caution
 
-This document classifies **17 of 51** catalogued attacks as cryptographically
-prevented. That number is meaningful only alongside six qualifications, and it
+This document classifies **17 of 54** catalogued attacks as cryptographically
+prevented. That number is meaningful only alongside seven qualifications, and it
 must never be quoted without them:
 
 1. Four of those seventeen — the deck-integrity rows — rest on **A3 and A4, which
@@ -2323,17 +2367,19 @@ must never be quoted without them:
 2. Thirteen attacks are **out of scope entirely**, and they include the ones most
    likely to be used against a real game: collusion, endpoint compromise, and
    denial of service.
-3. Four are **detected but not attributable**, and one more (X7) is attributable
+3. Six are **detected but not attributable**, and one more (X7) is attributable
    in only one of its three cases. Detection without attribution stops a hand; it
    does not name anybody, and under this design it does not move chips either.
    **Nor does attribution**, since D-010 — and since D-011 rule 3 it does not
    cost the named peer its seat or its connections either. The difference
    between the D&A and DNA buckets is now a difference in what the transcript
-   records, not in what happens to anybody. One of the four, **X33, is not
-   attributable because there is no attacker at all**: two honest peers fork the
-   next hand's roster between them, and the bucket is doing something different
-   there — it records that the design has no name to offer, not that a culprit
-   escaped one.
+   records, not in what happens to anybody. **Three of the six — X33, X34 and
+   X35 — are not attributable because there is no attacker at all**: honest peers
+   diverge, or a table simply stops progressing, and the bucket is doing
+   something different there. It records that the design has no name to offer,
+   not that a culprit escaped one. That half of the bucket has grown from one row
+   to three in two passes, and it is now the fastest-growing thing in this
+   catalogue.
 4. "Prevented" always means *under the stated assumptions*, never *impossible*.
 5. **Three of the fifteen D&A rows — X30, X31 and X32 — are D&A only because our
    own client enforces a rule.** Their rejection rests on an implementation
@@ -2352,18 +2398,32 @@ must never be quoted without them:
    it may not be described as bounded, deterred or expensive. `SPEC_CS.md` §18
    requires exactly this distinction to be drawn: some cheating is prevented, some
    is detected, and this one is merely visible.
+7. **One divergence is neither prevented, nor detected, nor out of reach, and it
+   needs no attacker: X36.** Two honest peers fork, each finishes the tournament
+   alone, and each client tells its player it won. Nothing rejects it, no
+   invariant fires, no proof forms, and — the part that makes this the heaviest
+   qualification on the list — **no peer ever learns that it happened**, so
+   there is no moment at which anything could be shown to a human. Qualifications
+   1 to 6 all restrict what *prevented* means; this one restricts what *detected*
+   means, and it is the reason §5.1 gained the NP&ND bucket. It is open, it is a
+   blocker, and it is `DECISIONS.md` **K-1**. While it stands, **no claim in this
+   document that divergence is always at least detected is true**, and any such
+   claim found in a future revision is a defect in that revision.
 
 The count fell from 18 to 17 in the Phase 0 review: X11 claimed the race between a
 late action and a timeout certificate was structurally excluded, and that claim was
 false. A CP row removed because its argument did not hold is the review working as
 intended, and the number is recorded as having moved rather than quietly restated.
-The denominator has since risen four times for the same reason in the other
-direction: X30, X31, X32 and X33 are attacks the corpus was carrying without
+The denominator has since risen seven times for the same reason in the other
+direction: X30 to X36 are attacks the corpus was carrying without
 knowing it, and adding them enlarges the total rather than the CP column. The
-proportion classified as prevented falls when a review works.
+proportion classified as prevented falls when a review works — it has fallen from
+18/47 to 17/54 across seven passes, and **not one of those passes made anything
+cryptographically preventable that was not preventable before**. The last three
+additions needed no attacker at all.
 
-**Neither D-010, nor D-011, nor D-012 moved the CP column at all, and that is the
-point worth making about all three.** Removing automated forfeiture, then removing
+**Neither D-010, nor D-011, nor D-012, nor D-013 moved the CP column at all, and
+that is the point worth making about all four.** Removing automated forfeiture, then removing
 automated eviction from every layer, did not make one attack cryptographically
 preventable. D-010 made five attacks worthless and one attack free. D-011
 rule 3 made four more worth less without moving a single label, and D-011 rule 2
@@ -2374,18 +2434,38 @@ it does hold"** — paying for the first with X8 and for the second with a
 document that is less self-contained (§9.1.3). A decision that improves a
 corpus by deleting things should be visible in the counts as buckets moving
 sideways, one row moving down, and the denominator going up. That is exactly
-what §5.4 shows.
+what §5.4 shows. **D-013 deletes rather than adds too** — it removes the question
+of a seat's status from every progress rule instead of introducing machinery to
+answer it — and it moved the CP column no more than the other three did.
 
 **D-012 adds one row to DNA and nothing else, and the honest reading of that is
 not reassuring.** It closes X33 by forbidding a derivation, so no attack becomes
-preventable and no attacker loses a capability; what improves is that a table
-which would have hung forever at hand `k+1` now merely plays slowly against a
-silent seat. The cost is stated in X33 and in `STATE_MACHINE.md` Q7: **nothing
-marks a seat absent automatically any more**, so a silent seat is dealt in every
-hand and stalls each one to the hand deadline until a human acts. That is a
-liveness price paid to avoid an integrity failure, in the order `SPEC_CS.md` §19
-sets, and it must not be described as a fix that made anything faster or safer
-against an adversary.
+preventable and no attacker loses a capability. **What it cost was stated here
+wrongly, and the correction is worse than the claim**: this paragraph said the
+price was that *"nothing marks a seat absent automatically any more, so a silent
+seat is dealt in every hand and stalls each one to the hand deadline until a
+human acts"* — a slow table, paid deliberately. It was not a slow table. It was a
+fixed point in which the table never played again and no human could intervene,
+because the only messages that could break the loop are single-writer by the
+silent seat itself. That is **X34**, and its mitigation is **D-013**: liveness is
+inherited from the chain rather than from a status, a silent seat stalls one hand
+and is skipped, and it busts, so the tournament can end. The liveness price that
+actually remains is one stalled hand per disconnection, which *is* a price paid
+to avoid an integrity failure, in the order `SPEC_CS.md` §19 sets. No revision of
+this file may restore the earlier sentence, and none may describe D-012 or D-013
+as having made anything safer against an adversary.
+
+**D-013 in turn adds two rows to DNA and one to a bucket that did not exist, and
+that last one retracts a property this document has been claiming.** X34 and X35
+are closed. **X36 is not**, and while it stands, the sentence *"every divergence
+between honest peers is at least detected"* is **false** and may not be written
+here in any form. Two honest peers can fork silently and both finish the
+tournament believing they won it, with every check this corpus defines passing on
+both sides. The count of qualifications on the CP number rises from six to seven
+for that reason, and the seventh is the heaviest of them, because the other six
+qualify what "prevented" means and this one qualifies what "detected" means.
+`DECISIONS.md` **K-1** is the owner decision, and **K-3** is the smaller change
+that would at least make the failure visible without deciding it.
 
 `SPEC_CS.md`'s closing instruction is binding on every future revision of this
 file: never claim the system makes all cheating impossible; prove precisely which

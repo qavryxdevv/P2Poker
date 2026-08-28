@@ -46,7 +46,7 @@ that a signed observation enters the transcript — never that anything is taken
 them. The accepted cost is stated plainly in §2.10 and §11: the rage-quit escape
 returns, and a losing player who goes silent gets their chips back.
 
-**`DECISIONS.md` D-009 to D-012, and where each one lands here.** This block exists
+**`DECISIONS.md` D-009 to D-013, and where each one lands here.** This block exists
 because the sixth pass found that this document had **zero** mentions of D-011 while
 four sibling documents had 74, 35, 26 and 20 (finding H7). It was left out of the
 D-011 sweep on the judgement that a decision about document ownership did not touch a
@@ -55,6 +55,20 @@ declaring the pre-D-011 discipline — and it was the *second* such miss, which 
 D-012 now requires every sweep to cover every document. A reader who wants to know
 whether this document is in scope for a decision should find the answer here rather
 than infer it from silence.
+
+**It happened a third time, in this document, one decision later.** The Phase 3
+gate found **zero** mentions of D-013 here, and this document was not opened in
+that pass — the same omission that produced D-012's process rule, in the same
+document that produced it, immediately after it was written. The rule was
+therefore not merely broken; it was broken by the pass that would have been its
+first test. Two things follow, and both are recorded rather than resolved by
+resolve. First, **a rule that depends on an editor remembering to apply it is not
+a control**, which is why the coverage check is now a count — occurrences of the
+decision's identifier in each document, reported before and after every sweep —
+rather than an assurance that the sweep happened. Second, a document is in scope
+for a decision **by default**, and scoping one out is a judgement that must be
+written down with its reason so a later reader can see it was made. Silence is
+the failure mode all three misses share.
 
 * **D-009 rule 1** — mandatory honest behaviour may never satisfy the equivocation
   predicate. **Nothing to mirror here, and that is the design working.** This document
@@ -66,12 +80,18 @@ than infer it from silence.
 * **D-009 rule 3** — state the discipline, never an absence in the dependency tree.
   Carried in §7.2, §11 OQ-8 and §12 item 6.
 * **D-010** — the paragraph above; every consequence in this document.
-* **D-011 rule 1** — one normative owner per concept. Applied in this pass. Four
-  constructions that `PROTOCOL.md` owns were **reproduced** here, and every
-  reproduction is now a reference by section number: the `ctx` construction (§6.4 →
-  `PROTOCOL.md` §4.5), the deck-index map (§2.4 → `PROTOCOL.md` §4.5), the hash
-  constructor `h` and the domain-string register (§6.4, §7.3 → `PROTOCOL.md` §2.8),
-  and the `DOMAIN_EVENT` prefix bytes (already a reference, `PROTOCOL.md` §13). What
+* **D-011 rule 1** — one normative owner per concept. Applied in the sixth pass and
+  completed in this one. **Five** constructions that `PROTOCOL.md` owns were
+  **reproduced** here, and every reproduction is now a reference by section number: the
+  `ctx` construction (§6.4 → `PROTOCOL.md` §4.5), the deck-index map (§2.4 →
+  `PROTOCOL.md` §4.5), the hash constructor `h` and the domain-string register (§6.4,
+  §7.3 → `PROTOCOL.md` §2.8), the `DOMAIN_EVENT` prefix bytes (already a reference,
+  `PROTOCOL.md` §13), and — the one the sixth pass missed — the RNG beacon's
+  `commitment_i` and `seed` blocks (§7.3 → `PROTOCOL.md` §4.4), which is `K-6`. That
+  miss is worth naming: the sweep deleted the `ctx` copies because `ctx` was what the
+  finding named, and left two copies of a different construction standing on the same
+  page. **A sweep run against the finding rather than against the rule finds what the
+  finding named and nothing else.** What
   this document keeps and owns is the **constructions and the arguments about them**:
   why `ctx` must carry what it carries, what ziffle does and does not bind, why n-of-n
   and not `t`-of-`n`, why the map must be fixed before the shuffle chain. What it no
@@ -79,9 +99,27 @@ than infer it from silence.
   slot key written once) and **rule 3** (no automated eviction at any layer) need no
   edit here: this document never wrote a slot key, and D-010's neutrality already
   removed every eviction sentence.
-* **D-012** — no canonical state derived from a per-receiver quantity. Swept in this
-  pass. Three sites were checked and one needed the pin made explicit; see §2.1, §2.10
-  and §7.3, and the summary in §15 note 5.
+* **D-012** — no canonical state derived from a per-receiver quantity. Swept in the
+  sixth pass. Three sites were checked and one needed the pin made explicit; see §2.1,
+  §2.10 and §7.3, and the summary in §15 note 5. **One of those three checks passed
+  for the wrong reason and is corrected under D-013 below.**
+* **D-013** — liveness is inherited from the chain, not from a seat's status. The
+  rule, the required emitter set and its notation are `PROTOCOL.md` §3.2's, and this
+  document restates none of them, because none of them is cryptography: no
+  construction here consults a seat's status, and the joint key's membership is
+  already `dealt_in`, which is chained content. **What D-013 changes here is the
+  record, not the wire, and the distinction is the whole of the item.** Its J1 rule
+  removed `advert_hash` from `GENESIS(0)`, from `session_id` and transitively from
+  `ctx`, which made §6.4's discipline item 1 **true**. That item asserted the
+  condition as though it had been checked, and it had not been — the violating path
+  ran through `session_id`, two documents away, and neither document knew the path
+  existed. The correction is at §6.4 item 1 and it is written in the past tense
+  deliberately: **a claim that was false when made and is true now must not be left
+  reading as evidence that the check was once run**, because the next editor will
+  treat it as a discharged obligation and will not re-run it. That is `J-5`.
+  D-013 also carries the process finding that a defect assigned across an owner
+  boundary is recorded in `DECISIONS.md`'s open list in the same pass that finds it,
+  which is where `K-6` was recorded and how §7.3 came to be fixed in this one.
 
 ---
 
@@ -218,6 +256,16 @@ only as a sum that no participant computes; decryption is done from shares (§2.
   finding H1) and which under **D-010** is evidence with no automatic consequence
   anyway. A seat leaves the key set because a chained event every participant accepted
   put it outside `dealt_in`, never because this peer's copy of an abort named it.
+* **D-013: the pin is unchanged, and what it rests on is not.** `dealt_in` is still
+  read from the chained `HAND_INIT` and from nowhere else, so nothing in this section
+  needs an edit. But under D-013 `dealt_in` is constrained by the required emitter set
+  of the *previous* hand, so this pin is now exactly as agreed as `HAND_INIT` is, and
+  `DECISIONS.md` **K-1** holds that that set can differ between honest peers on the
+  abort path. **That is `PROTOCOL.md` §3.2's to settle, not this document's**, and it
+  is recorded rather than worked around: an implementer must not "harden" the key set
+  by deriving membership here from anything local, because a second derivation is how
+  the two peers stop even failing in the same way. The full note, including why this
+  layer's loud failure never actually fires on that path, is §15 note 5's D-013 item.
 * Keys are **fresh per hand**, not long-lived. `ctx` (`PROTOCOL.md` §4.5) contains
   `hand_id`, so a
   key generated for hand `k` cannot have its ownership proof replayed into hand `k+1`.
@@ -787,7 +835,7 @@ serialising. None of it invents a primitive.
 |---|---|---|
 | 1 | **The `ctx` string** fed to every ziffle proof (§6.4) | A domain-separation byte string. It changes no algebra; ziffle already hashes `ctx` into every challenge. Choosing what goes in it is protocol policy |
 | 2 | **The OS-CSPRNG adapter** into ziffle's `R: Rng` bound (§7.2) | Byte forwarding. No generation, no seeding, no internal state: `fill_bytes` calls `getrandom::fill` and returns. It is strictly narrower than writing an RNG — it removes the possibility of one |
-| 3 | **The RNG commit/reveal beacon** for seating and the initial button (§7.3) | A hash commitment over `(table_id, session_id, committer key, r_i, salt_i)` using BLAKE3's keyed mode, then `seed = h("p2p-poker v1 rng-beacon", [r_1, …, r_n])`. Textbook commit-and-reveal over a library hash. Not used for the deck — the shuffle chain handles that |
+| 3 | **The RNG commit/reveal beacon** for seating and the initial button (§7.3) | A hash commitment, then a hash combine, both over BLAKE3's keyed mode through §2.8's constructor. **Both constructions are `PROTOCOL.md` §4.4's and are not reproduced here or in §7.3** (D-011 rule 1, `K-6`) — this row's claim is about the *composition*, which is what §5.2 is for: textbook commit-and-reveal over a library hash, with no bespoke primitive and no novel construction, so §6 and §36 are satisfied. §7.3 points 1 to 5 carry why each part of the binding is there. Not used for the deck — the shuffle chain handles that |
 | 4 | **The deterministic deck index → seat/board map** (§2.4) | Pure bookkeeping over integers. No randomness, so nothing to attack |
 | 5 | **Street gating and index entitlement checks** on reveal tokens (§2.7, §2.8) | Policy: *when*, and *for which index*, a legitimate library operation may be applied. It adds no primitive; it constrains one |
 | 6 | **The signed, hash-chained event envelope** (§12/§13 of the spec) | Deterministic CBOR + Ed25519 + BLAKE3, all library primitives, composed in the standard way: length-prefixed, domain-separated, `previous_event_hash` chained. The signature prefix is `p2p-poker/v1/event`, defined byte-for-byte in `PROTOCOL.md` §13; this document does not restate it |
@@ -1046,11 +1094,37 @@ permanent regression test in `tests/adversarial/`, not a one-off probe.
 1. The **same** `ctx` must be used by prover and every verifier for a given step. It
    is derived from signed state, never sent as a free parameter alongside the proof —
    a `ctx` taken from the wire would let an attacker choose the domain. **This is also
-   the D-012 obligation on `ctx`:** every one of `PROTOCOL.md` §4.5's fields is either
-   a protocol constant or a value fixed by a chained event every participant accepted,
-   and none of them is a local view. Adding a field that could differ between honest
-   receivers would not merely be a D-012 violation in principle — it would make honest
-   verifiers derive different challenges and reject each other's proofs.
+   the D-012 obligation on `ctx`:** every one of `PROTOCOL.md` §4.5's fields must be
+   either a protocol constant or a value fixed by a chained event every participant
+   accepted, and none of them a local view. Adding a field that could differ between
+   honest receivers would not merely be a D-012 violation in principle — it would make
+   honest verifiers derive different challenges and reject each other's proofs.
+
+   **The condition holds today. It did not hold when this item was written, and the
+   record is owed here even though nothing is owed on the wire.** This item was added
+   in the D-012 sweep and stated the condition as satisfied. It was not: `ctx` names
+   `session_id`, `session_id` named `advert_hash`, and `advert_hash` was the
+   `event_hash` of whichever copy of the founder's re-broadcast advertisement a joiner
+   happened to hold — a per-receiver quantity of the purest kind, since the
+   re-broadcast rule obliges every copy to differ. Two honest players joining thirty
+   seconds apart derived different `ctx` values and would have rejected each other's
+   shuffle proofs, and this item asserted the opposite. **D-013's J1 rule removed
+   `advert_hash` from all three places** and `PROTOCOL.md` §4.5 records that its block
+   needed no edit for the third, because `ctx` never named the field directly. With
+   that removal all seven parts satisfy the condition and the item is true as written
+   above.
+
+   **Why this correction is worth its space rather than a silent edit.** The claim was
+   not wrong about `ctx`'s own seven parts — each of those was, individually, exactly
+   what it appeared to be. It was wrong because the property is **transitive** and the
+   check was not: a part that is "fixed by a chained event" can still be derived from a
+   local view one or two hops upstream, and no reader of §4.5's field list could see
+   that. An editor who meets this item in future must therefore read it as an
+   obligation that is **re-checked whenever any part's own definition changes**, not as
+   a box that was ticked once. Concretely: if `session_id`, `table_id` or
+   `protocol_version` ever gains a component, this item is open again until somebody
+   walks the new component to its own source. The failure this closes is catalogued as
+   `THREAT_MODEL.md` **X35**.
 2. The DLEQ challenge binds `pk`, `share`, `c1`, `t_G`, `t_c1` and `ctx` — **but not
    the card index or the street**. A token is therefore bound to a ciphertext, not to
    a position in the game. Our signed envelope must carry
@@ -1515,24 +1589,33 @@ It is needed for the **non-deck** randomness: seat assignment at table start, an
 initial button position. (Subsequent buttons rotate deterministically; only the first
 needs randomness.)
 
-Both constructions below use `h`, the length-prefixed domain-separated constructor
-defined once in `PROTOCOL.md` §2.8, with domain strings taken from that same section's
-register — the single register. `p2p-poker v1 rng-seed`, which an earlier draft of this section used for the
-combine step, is not in the register and is retired; it must never be valid.
+**Ownership, settled: `PROTOCOL.md` §4.4 owns `commitment_i` and `seed`, and this
+section owns the argument for why they are shaped that way.** This is the
+disposition of `K-6`. Until this pass **both** documents claimed to be the
+canonical source of the same two constructions — §4.4 saying *“this is the canonical
+form for the whole corpus”*, and this section saying the five-part binding here was
+the canonical one and that §4.4's earlier two-part form *“was corrected to match this
+section”*. They were byte-identical, which is exactly the condition D-011 rule 1 was
+adopted for and not a defence: two canonical claims about one construction is a
+drifted copy that has not drifted **yet**, and every copy in this corpus that
+eventually diverged was byte-identical first. **The two code blocks that stood here
+are deleted**; §4.4 carries the commit and combine constructions, the field order and
+the receiver's recomputation check, and this section reproduces no part of them.
 
-```
-commit phase:  each i draws r_i, salt_i from the OS CSPRNG, publishes
+The reason the wire owner wins rather than the construction owner is D-011 rule 1
+applied without exception: `commitment_i` and `seed` are **message field contents**,
+they are recomputed by receivers as a validation step, and a receiver reading a stale
+copy rejects honest peers. The reasoning below is what this document keeps, and it is
+not a copy of anything — §4.4 states *what the bytes are*, and points 1 to 5 state
+*why they must be those bytes and what breaks if they are not*.
 
-               commitment_i = h("p2p-poker v1 rng-commit",
-                                [ table_id, session_id,
-                                  committer_app_public_key, r_i, salt_i ])
-
-reveal phase:  each i publishes (r_i, salt_i); everyone recomputes commitment_i
-               and checks it
-
-combine:       seed = h("p2p-poker v1 rng-beacon", [ r_1, …, r_n ])
-                                                   // ascending by seat index
-```
+Both constructions use `h`, the length-prefixed domain-separated constructor defined
+once in `PROTOCOL.md` §2.8, with domain strings taken from that same section's
+register — the single register. **One retirement is this document's own record and is
+kept here for that reason:** `p2p-poker v1 rng-seed`, which an earlier draft of this
+section used for the combine step, is not in the register and must never be valid.
+§2.8 lists it among the retired strings, and the note stays here so that a reader who
+finds the old string in an old branch learns where it came from and that it was ours.
 
 **Why a player cannot change its contribution after seeing the others':**
 
@@ -1543,9 +1626,13 @@ combine:       seed = h("p2p-poker v1 rng-beacon", [ r_1, …, r_n ])
    space.
 3. The commitment binds `table_id`, `session_id` and the committer's application public
    key, so a commitment cannot be lifted from another table, another session or another
-   player. This five-part binding is the canonical one; the two-part form
-   `h(domain, [r_i, salt_i])` that `PROTOCOL.md` §4.4 previously carried does not bind
-   the table, the session or the committer and was corrected to match this section.
+   player. **Those three parts are the whole of this point and the reason §4.4's
+   earlier two-part form `h(domain, [r_i, salt_i])` was insufficient**: it bound
+   neither the table, nor the session, nor the committer, so a commitment observed at
+   one table could be replayed at another by a peer who had not yet drawn. Which form
+   is normative is §4.4's to state and it states it; what this point contributes is
+   the attack each of the three parts is there to stop, which is the thing an editor
+   tempted to shorten the part list needs to read first.
 4. **All** commitments must be published and accepted into the hash chain *before* any
    reveal is accepted. The ordering is enforced by the state machine and by
    `previous_event_hash`, not by wall-clock timing.
@@ -2273,7 +2360,7 @@ libp2p-autonat-0.15.0/Cargo.toml         `[dependencies.rand] version = "0.8"` (
 | Document | Direction and content |
 |---|---|
 | `THREAT_MODEL.md` | **carries from here:** §11's OQ list; the §11 "does not solve" list; the abort attack of §2.10 in its **D-010** form — the abort is neutral, stacks are restored whatever `|V|` is, attribution is evidence with no automatic consequence, and the **rage-quit escape is reopened and unsolved**; the `|V|`-scoped question of whether a peer is *named* (never of what it pays); relay metadata exposure from D-001; the §9.1/§9.2 supply-chain findings. **This document points at it for:** the §25 cheater-to-test map (`THREAT_MODEL.md` §5.5) and the deviation register (`THREAT_MODEL.md` §9.1), which own those two lists |
-| `PROTOCOL.md` | **owns, and this document references by section number and does not reproduce (D-011 rule 1):** the `ctx` construction — `PROTOCOL.md` §4.5, pointed at from §6.4, §2.1, §11 OQ-3 and §12 item 3; the deck-index map and the no-burn rule — `PROTOCOL.md` §4.5, pointed at from §2.4; the hash constructor `h` and the domain-string register — `PROTOCOL.md` §2.8, pointed at from §6.4 and §7.3; the `DOMAIN_EVENT` signature prefix bytes — `PROTOCOL.md` §13, pointed at from §5.2 item 6 and §6.4. **This is a change of discipline, not of content.** Until this pass the row read *"owns, and this document reproduces"*, and §6.4 carried the `ctx` block twice on one screen — once as a reproduction and once quoted from §4.5 to prove the two agreed. Every copy is deleted; the byte-identity claims that policed them are deleted with the copies, because there is nothing left to compare. What survives here is the *argument*: why `ctx` must carry what ziffle's transcript leaves unbound (§6.4), why the map must be fixed before the shuffle chain (§2.4), and why length prefixing is load-bearing (§6.4). If a construction and this document's reasoning about it ever disagree, `PROTOCOL.md` has the construction. **Carries from here:** the signed envelope fields that must bind proofs and tokens; the entitlement and street-gating rules (§2.7, §2.8); the five-part `RNG_COMMIT` binding (§7.3); the `rand`/`SmallRng`/`StdRng` correction (§7.2), which under **D-009 rule 3** is a *discipline plus a test*, never an absence. **Owns and this document deliberately does not restate:** the equivocation predicate and its anti-replay slot key (`PROTOCOL.md` §5.2, §5.3). §6.4 and §7.1 name equivocation and defer — *"The exact predicate is `PROTOCOL.md` §5.2's and is not restated here"* — so **D-009 rule 1**'s move of the subject seat into the slot key for `TIMEOUT_VOTE` needs no mirror edit here. It could not have reached `ctx` in any case: `ctx` is the Fiat–Shamir binding for a *deck proof*, a `TIMEOUT_VOTE` carries no deck proof and no `ctx`, and the two are separately domain-separated at `PROTOCOL.md` §2.8 — `"p2p-poker v1 deck-ctx"` against `"p2p-poker v1 timeout-cert"` — so a change inside one cannot reach the other. Since this pass there is also no `ctx` block here for such a change to reach |
+| `PROTOCOL.md` | **owns, and this document references by section number and does not reproduce (D-011 rule 1):** the `ctx` construction — `PROTOCOL.md` §4.5, pointed at from §6.4, §2.1, §11 OQ-3 and §12 item 3; the deck-index map and the no-burn rule — `PROTOCOL.md` §4.5, pointed at from §2.4; the hash constructor `h` and the domain-string register — `PROTOCOL.md` §2.8, pointed at from §6.4 and §7.3; the `DOMAIN_EVENT` signature prefix bytes — `PROTOCOL.md` §13, pointed at from §5.2 item 6 and §6.4; and, added in this pass as the disposition of **K-6**, the RNG beacon's `commitment_i` and `seed` constructions — `PROTOCOL.md` §4.4, pointed at from §7.3. **This is a change of discipline, not of content.** Until this pass the row read *"owns, and this document reproduces"*, and §6.4 carried the `ctx` block twice on one screen — once as a reproduction and once quoted from §4.5 to prove the two agreed. Every copy is deleted; the byte-identity claims that policed them are deleted with the copies, because there is nothing left to compare. What survives here is the *argument*: why `ctx` must carry what ziffle's transcript leaves unbound (§6.4), why the map must be fixed before the shuffle chain (§2.4), and why length prefixing is load-bearing (§6.4). If a construction and this document's reasoning about it ever disagree, `PROTOCOL.md` has the construction. **K-6, and why it is the same defect as the `ctx` blocks one pass later.** Two code blocks survived the D-011 sweep in §7.3, and both documents claimed to be canonical for them. The sweep deleted §6.4's `ctx` blocks and missed these, which is the ordinary way a sweep fails: it is run against the *finding* that prompted it rather than against the rule. **They were byte-identical when found**, and that is the argument for deleting them rather than the argument for keeping them — every copy this corpus has lost was byte-identical up to the pass in which it was not. **Carries from here:** the signed envelope fields that must bind proofs and tokens; the entitlement and street-gating rules (§2.7, §2.8); the *reasoning* for the five-part `RNG_COMMIT` binding and the attack each part stops, the construction itself now being §4.4's (§7.3); the `rand`/`SmallRng`/`StdRng` correction (§7.2), which under **D-009 rule 3** is a *discipline plus a test*, never an absence. **Owns and this document deliberately does not restate:** the equivocation predicate and its anti-replay slot key (`PROTOCOL.md` §5.2, §5.3). §6.4 and §7.1 name equivocation and defer — *"The exact predicate is `PROTOCOL.md` §5.2's and is not restated here"* — so **D-009 rule 1**'s move of the subject seat into the slot key for `TIMEOUT_VOTE` needs no mirror edit here. It could not have reached `ctx` in any case: `ctx` is the Fiat–Shamir binding for a *deck proof*, a `TIMEOUT_VOTE` carries no deck proof and no `ctx`, and the two are separately domain-separated at `PROTOCOL.md` §2.8 — `"p2p-poker v1 deck-ctx"` against `"p2p-poker v1 timeout-cert"` — so a change inside one cannot reach the other. Since this pass there is also no `ctx` block here for such a change to reach |
 | `STATE_MACHINE.md` | **carries from here:** the per-hand sequence of §2.9, including the collective form of `HAND_INIT` / `HAND_COMPLETE`; the absent-seat states and abort path (D-005's requirement that the game continues and the absent seat is blinded off, which D-010 leaves untouched); the **neutral** abort of **D-010** — one chip rule for every abort, stacks restored to their start-of-hand values, no `AbortRecord` consumer that moves a chip or unseats a peer, and no eviction transition at all; the `|V| < 2` form in which the abort additionally names nobody (D-007, D-008 — the scope is the required voter set, never the seat count); deadlines as explicit state, never a wall-clock read inside the engine (D-006) |
 | `NETWORK_STACK.md` | **carries from here:** the corrected per-circuit **bidirectional** byte budget of §6.5 — `2 × 8 979 = 17 958 B` per hand per circuit, both directions counted against one 131 072 B cap, giving ~7 hands shuffle-only and ~5 with the event stream, against which the **120 s duration limit is still the binding one** (D-001) — and hand traffic never crossing the lobby topic. The earlier "per circuit **per direction**" form of this row, and its ~14 hands, are withdrawn: `max_circuit_bytes` is one counter for both directions (§6.5, `NETWORK_STACK.md` §16.1). **This document points at it for:** the normative D-002 relay configuration (`NETWORK_STACK.md` §9.6) and the transport-side dependency register (`NETWORK_STACK.md` §5.1) |
 
@@ -2493,9 +2580,18 @@ defect.
      `attributed` field of an abort is not an input. The failure this prevents is not
      subtle — it is every shuffle proof in the next hand failing to verify for one
      honest peer.
-  2. **`ctx` (§6.4).** Every field is a protocol constant or fixed by a chained event;
-     the discipline list's item 1 now says so as a D-012 obligation, alongside the
-     older "never from the wire" rule it generalises.
+  2. **`ctx` (§6.4) — and this check was recorded as passing when it was failing.**
+     The sweep read §4.5's seven parts, found each of them a protocol constant or a
+     value fixed by a chained event, and wrote item 1 to say so. The property is
+     **transitive** and the reading was not: `session_id` contained `advert_hash`, and
+     `advert_hash` was whichever copy of the founder's re-broadcast a joiner happened
+     to hold. One hop past the field list was a per-receiver quantity, and no reader of
+     the field list could have seen it. Closed by **D-013**'s J1 rule, which removed
+     `advert_hash` from `GENESIS(0)`, `session_id` and `ctx`; the correction and the
+     obligation it leaves behind — re-check whenever any part's own definition changes
+     — are at §6.4 item 1, and the failure is `THREAT_MODEL.md` **X35**. **A sweep that
+     stops at the field list of the thing it is checking is not a sweep**, and that,
+     rather than the missing field, is what this entry is kept for.
   3. **The RNG beacon seed (§7.3).** Clean already, by point 4's rule that every
      commitment is chained before any reveal is accepted, but the reason is now stated
      as a D-012 reason: the combine runs over the chained committer set, never over the
@@ -2508,6 +2604,36 @@ defect.
   document no longer holds a copy of any of them. `seat_flags`, the other half of the
   D-012 pair (finding H2), never appeared in this document at any point — checked, not
   assumed.
+* **D-013 — nothing owed on the wire, two things owed on the record, and one
+  observation this document is the only one positioned to make.**
+  1. **The record (`J-5`).** §6.4 item 1 and note 5's site 2 above, both corrected
+     rather than quietly rewritten, for the reason D-009 rule 3 gives about absences:
+     a claim that reads as a discharged check will not be re-run.
+  2. **The ownership (`K-6`).** §7.3's two code blocks are deleted in favour of
+     `PROTOCOL.md` §4.4; see the D-011 bullet at the head of this document.
+  3. **Site 1 of note 5 now rests on something D-013 made load-bearing, and it is not
+     yet agreed.** The `apk` pin says membership of the joint key comes from the
+     chained `HAND_INIT`'s `dealt_in`, which was the safe answer under D-012 because
+     `HAND_INIT` is a collective stage whose bodies must be byte-identical. Under
+     D-013 `dealt_in` is constrained by the required emitter set of the previous hand,
+     and `DECISIONS.md` **K-1** holds that that set can differ between honest peers on
+     the abort path. The pin is therefore exactly as agreed as `HAND_INIT` is, and no
+     more — which is a statement about `PROTOCOL.md` §3.2, not about this document, and
+     is why it is recorded here rather than fixed here.
+
+     **The observation, which cuts the other way and is worth having.** If two peers
+     ever disagreed about `dealt_in` **while a deck was being shuffled**, this layer
+     would catch it immediately and unmistakably: `apk` is appended to ziffle's
+     Fiat–Shamir transcript under the label `"apk"`, so a differing key set means a
+     differing challenge, and **every shuffle proof in that hand fails to verify for
+     the other peer**. That is the loudest failure the corpus can produce. **It never
+     fires on the path K-1 describes**, because that path is the drain hand: with one
+     dealt-in seat the state machine goes straight to settlement, so there is no
+     `DECK_COMMIT`, no joint key, no shuffle chain and no proof to fail. The
+     cryptography that would have made the fork loud is bypassed precisely where the
+     fork happens — the same shape as `K-3`'s finding about checkpoints, arrived at
+     from a different layer, and an independent reason to think K-3's cheap fix is
+     worth taking on its own merits.
 * **Nothing was strengthened to pay for any of this.** Every OPEN QUESTION in §11
   still asks what it asked, the "does not solve" list is untouched, and not one
   `Verification:` line in §2 to §10 changed. The only edit inside §11 is OQ-3's
