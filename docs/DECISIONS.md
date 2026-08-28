@@ -993,7 +993,11 @@ quietly upgraded.
 |---|---|---|
 | — | Open-source licence for the project (MIT / Apache-2.0 / dual / GPL-3.0 / AGPL-3.0) | Nothing yet; needed before publication |
 | — | Relay admission: `identify` protocol name, or lobby presence (see D-002) | `NETWORK_STACK.md` |
-| — | A named, versioned reference engine, since four sections claim disputes are "deterministically adjudicable by any third party running the reference engine" and no such engine is defined (verify N2) | `PROTOCOL.md` |
-| — | `DISPUTE` is chained, unsequenced and legal at any time, so the two disputes an honest peer is *required* to emit are an equivocation proof against itself (verify N4) | `PROTOCOL.md` |
-| — | A dispute path that does not require the accused peer's signature (D-007 point 4, review A-1) | `PROTOCOL.md` |
+| OQ-A | A named, versioned reference engine, since several sections claim disputes are "deterministically adjudicable by any third party running the reference engine" and no such engine is defined (review N2). Interim answer: withdraw the claim; the engine is defined when the crate has a tagged release. | `PROTOCOL.md` |
+| OQ-D | A dispute path that does not require the accused peer's signature — circular at every table size, not only heads-up (D-007 point 4, review A-1). Interim answer under D-010: a dispute that cannot resolve ends the hand neutrally, so the circularity costs a hand rather than a stalemate. | `PROTOCOL.md` |
+| OQ-F | Whether `TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` should still be *produced* in the MVP now that D-010 gives them no effect, or be deferred wholesale until the machinery is sound. Producing them keeps the transcript adjudicable later; deferring them removes four passes' worth of surface. | `PROTOCOL.md`, `STATE_MACHINE.md` |
 | — | Drop the libp2p `dns` and `kad` features and run all discovery through Mainline DHT, including relay volunteers under a second infohash? Removes both hickory advisories and ~12 crates from the build; costs access to the public relay commons, which thins D-004's floor. See `research/INTEGRATION.md` section 3. | Nothing yet |
+
+**Settled and removed from this list:** the `DISPUTE` self-equivocation question
+(review N4) is answered by D-009 rule 1 — the slot key must include every field
+that legitimately varies — and is no longer open.
