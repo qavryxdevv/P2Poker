@@ -882,6 +882,111 @@ seen to fail is not a gate.
 
 ---
 
+---
+
+## D-010 — The MVP has no automated forfeiture and no automated eviction
+
+**Date:** 2026-08-28
+**Status:** accepted
+**Revises:** D-005's chip rule on abort — which was my own reasoning, not a
+requirement the owner stated. D-005's actual requirement, that the game
+continues and the absent seat is blinded off, is untouched.
+**Source:** the pattern across four review passes
+
+### The observation that forces this
+
+Four adversarial passes have run. Each found a defect worse than the one
+before: A-1, then N3, then M2, then P1. D-009 rule 1 — that mandatory honest
+behaviour must not manufacture equivocation evidence — has now been violated a
+**fourth** time, by a different message each time: lobby traffic, `DISPUTE`,
+`TIMEOUT_VOTE`, and now `STATE_HASH` re-emission on the *happy path* of
+divergence recovery.
+
+The severe findings all end the same way. Counting the word across the four
+verification reports: 6, 5, 14, 12 occurrences of *forfeit*. Every one of the
+worst defects terminates in **the honest peer's chips being taken, and its key
+blocked**, for doing what the protocol requires.
+
+That is not forty defects. It is one defect with many mouths. Automated
+forfeiture is the prize that makes all of these attacks worth mounting, and
+automated eviction is the second prize. Patching the fourth mouth will not stop
+a fifth, because the machinery that has to be right — timeout certificates,
+equivocation proofs, dispute resolution, attribution, and forfeiture computed
+from all of them — is a consensus protocol, and we keep discovering that we
+have not specified one correctly.
+
+### The decision
+
+For the MVP, an abort is **neutral**:
+
+1. **Stacks are restored to their start-of-hand values.** No chips move on an
+   abort, in any direction, for any cause.
+2. **Attribution is recorded as evidence, and has no automatic consequence.**
+   The transcript still says which peer failed to publish, and that record is
+   still signed and verifiable. Nothing acts on it automatically.
+3. **No automated eviction.** A peer is not block-listed, unseated or penalised
+   by the protocol on the strength of a proof.
+4. Equivocation proofs and timeout certificates remain *specified and produced*
+   — they are how a human or a later version adjudicates — but consuming one
+   never moves a chip or removes a player in this version.
+
+The whole attack class evaporates, because there is nothing to win. The worst
+an adversary achieves is a wasted hand, which is the same outcome as a flaky
+network connection, and which the protocol must survive anyway.
+
+### The cost, stated plainly
+
+**The rage-quit escape returns.** A player who is losing a big pot can stall or
+disconnect, the hand aborts, and their chips come back. D-005 closed that with
+forfeiture; this reopens it.
+
+That is a real regression and it is accepted knowingly, because the alternative
+has been measured and is worse: forfeiture has produced four rounds of attacks
+that take chips from *honest* players, and an exploit that harms an honest
+player is worse than one that merely lets a dishonest player escape a loss.
+
+Mitigations that do not require the fragile machinery:
+
+- Repeated aborts attributable to one identity are plainly visible in the
+  transcript, to everyone, forever. In play money that is the whole penalty,
+  and `SPEC_CS.md` section 18 forbids claiming more.
+- The client should show a per-identity abort count in the lobby, so players can
+  decline to sit with someone who does it.
+- Sitting a repeat aborter out is a *user* decision, not a protocol action.
+
+This is exactly the trade `SPEC_CS.md` section 18 asks to be made explicit
+rather than hidden: some cheating is prevented, some is detected, and some —
+here, escaping a losing hand — is merely visible.
+
+### Why this is the right time
+
+`SPEC_CS.md` section 32 requires heads-up play money first and expansion only
+once the protocol works. D-007 already established that a heads-up deadline
+cannot be enforced at all, so for the very first supported mode the forfeiture
+machinery was never going to work anyway. Building it before the simple case
+runs is the wrong order.
+
+### What this deletes, and what it unblocks
+
+Deleted from the MVP: the forfeiture arithmetic, automatic attribution
+consequences, and the eviction path. Whole branches of the dispute machinery
+lose their purpose and go with them.
+
+Of the four blockers the last verification named, this dissolves rather than
+fixes most: **P1**, **P2** and **P4** cost nothing once a proof moves no chips,
+and **P3**'s terminus no longer needs to be peer-deterministic about *who*
+failed, only *that* the hand ended. **P5** — the frozen `Diverged` phase — still
+needs a liveness exit, and now has an obvious one: abort neutrally.
+
+### When this is revisited
+
+Before real money, and not before the certificate, equivocation and dispute
+machinery has gone a full adversarial pass with no new defect of this class.
+That will be a new numbered decision with its own evidence; this one is not
+quietly upgraded.
+
+---
+
 ## Open decisions
 
 | # | Question | Blocking |

@@ -529,10 +529,19 @@ Per **D-005** and `SPEC_CS.md` §19:
 * **When `|V| < 2` there is no attribution and no forfeiture.** A certificate whose
   required voter set has fewer than two members rests on one peer's unilateral
   assertion that a deadline passed — or, at `|V| = 0`, on nobody at all — and no peer
-  can check that assertion: there is no trusted clock and no third party. Such a
-  certificate therefore has no effect: the
-  abort for a missing cryptographic contribution names nobody (`attributed = []`) and
-  restores stacks to their start-of-hand values. This reopens the rage-quit escape
+  can check that assertion: there is no trusted clock and no third party. **Such a
+  certificate is inert, and the two halves of that must not be run together into one
+  sentence** (D-009 rule 2, finding M1). First: the certificate itself has *no effect*
+  at all — it is not chained, it is not evidence, it produces no `AbortRecord`, it
+  terminates nothing and it forfeits nothing. It is silently ignored, at every table
+  size and for `kind = Crypto` as much as for anything else. The hand does **not** end
+  there. Second, and separately: the hand ends later, at `hand_deadline_ms` under
+  `PROTOCOL.md` §8.4, on a local timer expiry that every peer reaches from the same
+  signed `HAND_INIT` and the same relative duration rather than on anybody's
+  certificate — and *that* abort is the one which names nobody (`attributed = []`) and
+  restores stacks to their start-of-hand values. Liveness is not owed in between:
+  `SPEC_CS.md` §19 ranks security above finishing a hand conveniently. This reopens the
+  rage-quit escape
   D-005 closes when `|V| >= 2`: a player facing a single-member voter set can escape a
   losing pot by going silent. It is recorded as an unfixed limitation, not solved, and
   the choice between restoration and forfeiture in that case is escalated as OQ-A
@@ -1055,7 +1064,11 @@ with that term included; they are a lower bound until Phase 8 measures.
    `if this.max_circuit_bytes > 0 && this.bytes_sent > this.max_circuit_bytes` at line
    78, and the two `forward_data` calls — src→dst at line 88, dst→src at line 98 — each
    followed by `this.bytes_sent += i` (lines 92 and 102) into that one counter. There
-   is no second counter and no per-direction accounting anywhere in the file. A-8's own
+   is no second counter and no per-direction accounting anywhere in the file. The
+   crate's own `quickcheck` property settles it beyond reading: `copy_future.rs:241`
+   asserts `a.len() + b.len() > max_circuit_bytes as usize` — the two directions
+   **summed** against one cap, in the test the maintainers wrote for this behaviour.
+   A-8's own
    citations (`src/behaviour.rs`, `impl Default for Config`; `src/behaviour/handler.rs`)
    establish the default value and its delivery to each circuit; they do not reach the
    accounting. The recorded objection is `NETWORK_STACK.md` §16.1 and §15 note 3 below.
@@ -1078,6 +1091,46 @@ with that term included; they are a lower bound until Phase 8 measures.
    still concrete evidence for D-002's split — public relays are fine as hole-punch
    rendezvous and cannot carry a session — but for the right reason, and with half the
    margin previously claimed.
+
+   **The working, end to end, so the hands-per-circuit figure is never quoted without
+   the measurement it stands on.** Every step comes from this document's own measured
+   sizes — the table at the head of §6.5 — and one crate constant. Re-derived at the
+   close of Phase 1 and unchanged:
+
+   ```
+   ShuffleProof<52>                    5 547 B   measured, probe-ziffle T5 round-trip
+   MaskedDeck<52>                    + 3 432 B   measured, probe-cryptodoc [4]
+                                     ---------
+   one shuffler's step + proof         8 979 B
+
+   a circuit joins exactly 2 seats; each shuffles once per hand and sends its own
+   step + proof the other way, and libp2p-relay counts both directions into one
+   bytes_sent:
+   per circuit per hand              2 x 8 979 = 17 958 B     (independent of n)
+
+   max_circuit_bytes default          1 << 17  = 131 072 B    behaviour.rs:163
+   hands per circuit               131 072 / 17 958 = 7.298…  -> 7
+   check the floor and the ceiling  7 x 17 958 = 125 706 B <= 131 072 B   fits
+                                    8 x 17 958 = 143 664 B  > 131 072 B   does not
+
+   with the signed event stream (order-of-magnitude, NOT measured):
+   allowance per seat per hand         13 107 B  = the withdrawn 131 072 / 10
+   per circuit per hand              2 x 13 107 = 26 214 B
+   hands per circuit               131 072 / 26 214 = 5.0     -> 5
+                                    5 x 26 214 = 131 070 B <= 131 072 B   fits, barely
+
+   a peer's own per-hand outbound at n seats:  (n-1) x 8 979 B
+                                    n = 6:    5 x 8 979 = 44 895 B
+                                    spread over n-1 circuits, n-1 separate budgets
+   ```
+
+   Two properties of this derivation are the ones a later reader must not lose. The
+   `2 ×` is the bidirectional cap, **not** two shufflers' work being double-counted:
+   the same 8 979 B crosses the circuit once in each direction and both crossings hit
+   one counter. And the `(n−1) × 8 979 B` row is a *bandwidth* figure that must never
+   be compared against `max_circuit_bytes`, because it is spread across `n−1` circuits
+   each with its own budget — comparing a table-wide or peer-wide total against a
+   per-circuit cap is the original A-8 error, and it is the one that would come back.
 
    **Third-party relays: assume the stricter reading.** kubo's `docs/config.md`
    describes its equivalent `ConnectionDataLimit` as applying "in each direction".
@@ -1219,32 +1272,109 @@ all three majors; §9's register above reproduces the provenance. The recommenda
 `CRYPTO_LIBS.md` §1.2 makes is therefore not merely unmet, it is **unreachable**: no
 choice available to this project removes `rand` from the build.
 
-Two mitigating facts and one required action:
+One fact that was got wrong twice, one that is benign, and the action that replaces
+both:
 
-* `SmallRng` is **not** compiled in: it lives behind rand 0.8's separate `small_rng`
-  feature, which nothing in the workspace enables. **Verification: (b) source** —
-  `rand-0.8.8/Cargo.toml` `[features]`, `small_rng = []`; **(a) executed** —
-  `cargo tree -e features -i rand@0.8.8` in the integrated workspace resolves exactly
-  `alloc`, `default`, `getrandom`, `libc`, `rand_chacha`, `std`, `std_rng`. This is now
-  checked across *every* consumer of `rand 0.8.8`, not only ark-std, because
-  `libp2p-autonat` is a second one.
+* **`SmallRng` *is* compiled in, and no choice open to this project removes it.** An
+  earlier form of this bullet read *"`SmallRng` is **not** compiled in: it lives behind
+  rand 0.8's separate `small_rng` feature, which nothing in the workspace enables."*
+  That is **withdrawn** (**D-009 rule 3**, finding M3). Its evidence covered
+  `rand 0.8.8` only, and the conclusion was stated over the whole build. `rand 0.9.5`
+  lists `small_rng` — and `thread_rng` — among its **default** features, and it enters
+  the integrated tree through four dependencies, all of them under libp2p features we
+  use:
+
+  ```
+  rand v0.9.5
+  ├── hickory-proto v0.25.2
+  │   └── hickory-resolver v0.25.2
+  │       └── libp2p-dns v0.44.0
+  │           └── libp2p v0.56.0
+  │               └── p2p-poker v0.1.0
+  ├── hickory-resolver v0.25.2 (*)
+  ├── igd-next v0.16.2
+  │   └── libp2p-upnp v0.5.0
+  │       └── libp2p v0.56.0 (*)
+  └── yamux v0.13.10
+      └── libp2p-yamux v0.47.0
+          └── libp2p v0.56.0 (*)
+  ```
+
+  Two of the four take `rand` with its default feature set — `igd-next` and `yamux`,
+  neither of which passes `default-features = false` — and cargo unifies features
+  additively across the graph, so their `default` enables `small_rng` on the single
+  `rand 0.9.5` every consumer shares. The two hickory crates do pass
+  `default-features = false`; that suppresses nothing, which is precisely why an
+  absence argued from one consumer's manifest does not survive integration.
+  **Verification: (b) source** — `rand-0.9.5/Cargo.toml` l. 66–72,
+  `default = ["std", "std_rng", "os_rng", "small_rng", "thread_rng"]`, with
+  `small_rng = []` at l. 81; `igd-next-0.16.2/Cargo.toml` l. 148–149 and
+  `yamux-0.13.10/Cargo.toml` l. 57–58, both plain `version = "0.9.0"` with no
+  `default-features` key; `hickory-proto-0.25.2/Cargo.toml` l. 318–324 and
+  `hickory-resolver-0.25.2/Cargo.toml` l. 217–220, both
+  `default-features = false`. **(a) executed** —
+  `cargo tree --edges normal -i rand@0.9.5` prints the tree above **verbatim** — all
+  four consumers arrive under `libp2p 0.56.0`, through the `dns`, `upnp` and `yamux`
+  features this project turns on — and `cargo tree -e features -i rand@0.9.5` resolves `alloc`, `default`,
+  `os_rng`, **`small_rng`**, `std`, `std_rng`, **`thread_rng`**, with the enabling
+  edge shown as `small_rng ← default ← {igd-next v0.16.2, yamux v0.13.10}`.
+
+  The narrower 0.8 fact is kept for what it actually is, a fact about one major and
+  not about the build: `small_rng` is **not** enabled on `rand 0.8.8`.
+  **Verification: (b) source** — `rand-0.8.8/Cargo.toml` `[features]`,
+  `small_rng = []`; **(a) executed** — `cargo tree -e features -i rand@0.8.8` resolves
+  exactly `alloc`, `default`, `getrandom`, `libc`, `rand_chacha`, `std`, `std_rng`
+  across both its consumers, `ark-std 0.5.0` and `libp2p-autonat 0.15.0`. `rand 0.10.2`
+  has no `small_rng` feature at all — `rand-0.10.2/Cargo.toml` l. 58–74 — but resolves
+  `std_rng`, `sys_rng` and `thread_rng`. So across the three majors: `StdRng` is in the
+  build at all three, `thread_rng` at 0.9.5 and 0.10.2, `SmallRng` at 0.9.5.
 * `StdRng` *is* present, and ziffle uses it deliberately and correctly for
   *deterministic public constants only* — the Pedersen generators and the 52 open-deck
   points, each seeded from a fixed SHA-256 of a public label. That is a
   nothing-up-my-sleeve derivation, not a source of protocol randomness.
-* **Required:** since the dependency graph no longer enforces §7, a lint must. Add a
-  CI check (a `clippy.toml` disallowed-type entry or a grep test) that fails the build
-  if our own crates mention `StdRng`, `SmallRng`, `thread_rng`, `from_seed` or
-  `test_rng` outside the vendored ziffle. See §12 item 6.
+* **Done, and it is what the security property now rests on.** Since the dependency
+  graph does not enforce §7 and cannot be made to, our own code does, mechanically.
+  `src/security/rng.rs` is the only source of cryptographic randomness in the crate —
+  `pub fn fill(dest: &mut [u8])` over `getrandom::SysRng` — and its test
+  `tests::our_own_code_uses_no_generator_but_the_os_one` walks every `.rs` file under
+  `src/` on every test run and fails the build on `SmallRng`, `StdRng`, `thread_rng`,
+  `from_seed`, `seed_from_u64` or `rand::rngs`. `rng.rs` itself is the single exempt
+  file, because it must name the identifiers in order to forbid them. See §12 item 6.
+
+  **The gate was verified to bite**, by injecting a violation into an unrelated module
+  and observing the failure, then removing it and observing the pass — a gate never
+  seen to fail is not a gate (`DECISIONS.md` D-009 rule 3):
+
+  ```
+  SPEC_CS.md section 7 forbids these generators for cryptographic use;
+  draw from security::rng::fill instead:
+    poker\actions.rs:8: SmallRng
+  test result: FAILED. 0 passed; 1 failed
+  ```
+
+  **Verification: (a) executed** — with the violation removed,
+  `cargo test --lib security::rng -- --test-threads=19` gives
+  `test security::rng::tests::our_own_code_uses_no_generator_but_the_os_one ... ok`,
+  `test result: ok. 3 passed; 0 failed`.
 
 **This section is the source, and two other documents were corrected to match it.**
 `PROTOCOL.md` §4.4 and `THREAT_MODEL.md` assumption A7 both claimed that *"the `rand`
 crate is deliberately absent from the dependency tree"*, so that `SmallRng` and
 `StdRng` were structurally unavailable and `SPEC_CS.md` §7 was enforced by the
 dependency graph. That claim is false — see the `cargo tree` output above — and both
-were corrected to the text of this section. `SPEC_CS.md` §7 is enforced by the CI lint
-of §12 item 6, **not** by the dependency graph, and no document may claim a structural
+were corrected to the text of this section. `SPEC_CS.md` §7 is enforced by the test of
+§12 item 6, **not** by the dependency graph, and no document may claim a structural
 guarantee. The residual risk is OQ-8.
+
+**And the same correction had to be made a second time, which is the reason D-009
+rule 3 exists.** The first pass replaced *"the `rand` crate is absent"* with
+*"`rand 0.8.8` is present but `small_rng` is not enabled"* — a narrower absence, still
+stated over the whole build, still false at `rand 0.9.5`. Any document restating this
+section carries the *discipline* and the test that enforces it, never an absence:
+`PROTOCOL.md` §4.4 and `THREAT_MODEL.md` A7 must therefore drop "`SmallRng` is absent"
+in every form, and `research/CRYPTO_LIBS.md` §7.3's 0.8-only check must gain the 0.9.5
+line above. **No security property of this project may be stated as the absence of
+something from the dependency tree** (`DECISIONS.md` D-009 rule 3).
 
 **The enforceable discipline, in the words of the document that owns the integrated
 tree.** `docs/research/INTEGRATION.md` §2, quoted rather than paraphrased so the two
@@ -1254,8 +1384,11 @@ cannot drift:
 > `rand`'s `SmallRng`, `StdRng` and any self-seeded generator are never used
 > for keys, masking factors, permutations or commitments.
 
-That is what §12 item 6's lint must check, and it is a rule about *our* code, which is
-the only thing we control — the tree contains three `rand` majors and will keep them.
+That is what §12 item 6's test checks, and it is a rule about *our* code, which is the
+only thing we control — the tree contains three `rand` majors and will keep them, with
+`SmallRng` reachable at 0.9.5 and `StdRng` at all three. The enforceable statement is
+this discipline and the scan in `src/security/rng.rs` that fails the build on a
+violation. Nothing weaker, and nothing phrased as an absence.
 
 ### 7.3 The commit/reveal beacon — where it *is* needed
 
@@ -1781,12 +1914,20 @@ complaint or if OQ-1's review results in a fork anyway.
 `rand 0.9.5` and `rand 0.10.2` enter through other libp2p subtrees
 (`research/INTEGRATION.md` §2, re-verified in §9). This contradicts
 `CRYPTO_LIBS.md` §1.2's plan to enforce §7 through the dependency graph, and no
-dependency choice open to us restores that plan. `SmallRng` stays out (feature not
-enabled anywhere in the workspace) and `StdRng` is used only for nothing-up-my-sleeve
-constants, but the structural guarantee is gone.
-*What would settle it:* a CI lint that fails on `StdRng`/`SmallRng`/`thread_rng`/
-`from_seed`/`test_rng` in our own crates. Until that lint exists, §7 is enforced by
-review discipline alone.
+dependency choice open to us restores that plan. `SmallRng` does **not** stay out: an
+earlier form of this row claimed the feature was "not enabled anywhere in the
+workspace", which is false at `rand 0.9.5`, where `small_rng` is a **default** feature
+that `igd-next` and `yamux` take (§7.2, D-009 rule 3). `StdRng` is in the build at all
+three majors and is used by ziffle only for nothing-up-my-sleeve constants. The
+structural guarantee is gone and cannot be recovered.
+*Settled, and the risk is now residual rather than open:* the source scan in
+`src/security/rng.rs`
+(`tests::our_own_code_uses_no_generator_but_the_os_one`) fails the build if any file
+under `src/` mentions `StdRng`, `SmallRng`, `thread_rng`, `from_seed`, `seed_from_u64`
+or `rand::rngs`, and it was verified to bite by injecting a violation (§7.2, §12
+item 6). What remains open is only its reach: the scan is textual and covers this
+crate's own sources, so it catches a use, not an obfuscation, and it says nothing about
+the vendored ziffle, which is reviewed under OQ-1 instead.
 
 **OQ-9 — RUSTSEC-2024-0436 is now a runtime-tree finding.**
 `paste 1.0.15` (unmaintained) arrives through `ark-ff 0.5.0`, not only through the
@@ -1854,11 +1995,20 @@ and `PROTOCOL.md` §9.6 carries the same sentence for its own list.
 5. Reject, and attribute, any reveal token that is early, for an index not due at the
    current stage, or published by a seat for its own hole index before
    `SHOWDOWN_REVEAL` (§2.7, §2.8).
-6. Add a CI lint banning `StdRng`, `SmallRng`, `thread_rng`, `from_seed` and
-   `test_rng` in our own crates (OQ-8). What it enforces is the discipline quoted in
-   §7.2 from `research/INTEGRATION.md` §2: *"Our own code draws cryptographic
-   randomness only from `getrandom::SysRng`."* The lint is scoped to our own crates
-   because the tree carries three `rand` majors and always will.
+6. **Done** — the ban on `StdRng`, `SmallRng`, `thread_rng`, `from_seed`,
+   `seed_from_u64` and `rand::rngs` in our own crates (OQ-8) is enforced by
+   `src/security/rng.rs`, whose test
+   `tests::our_own_code_uses_no_generator_but_the_os_one` scans every `.rs` file under
+   `src/` on each test run and fails the build on a hit; `rng.rs` is the single exempt
+   file, since it names the identifiers in order to forbid them. That deny-list is the
+   normative one and supersedes the earlier draft's, which named `test_rng` and omitted
+   `seed_from_u64` and `rand::rngs`. What it enforces is the discipline quoted in §7.2
+   from `research/INTEGRATION.md` §2: *"Our own code draws cryptographic randomness
+   only from `getrandom::SysRng`."* It is scoped to our own crates because the tree
+   carries three `rand` majors and always will, with `SmallRng` compiled in at
+   `rand 0.9.5` — the absence is not available to be asserted (D-009 rule 3).
+   **Verification: (a) executed** — the test passes clean, and was verified to fail on
+   an injected violation (§7.2).
 7. Deserialise every arkworks wire object with `Validate::Yes`, and impose an explicit
    maximum frame size at the transport boundary (OQ-5).
 8. Port the research probes into `tests/adversarial/` as permanent regression tests:
@@ -1928,7 +2078,13 @@ ark-secp256k1-0.5.0/src/fields/fr.rs      scalar field modulus
 ark-secp256k1-0.5.0/src/curves/mod.rs     ScalarField association
 ark-ec-0.5.0/src/models/short_weierstrass/group.rs   the point-sampling routine
 ark-std-0.5.0/Cargo.toml          rand 0.8 with std_rng, default-features = false
-rand-0.8.8/Cargo.toml             small_rng is a separate, unenabled feature
+rand-0.8.8/Cargo.toml             small_rng is a separate, unenabled feature -- at 0.8 only
+rand-0.9.5/Cargo.toml             l. 66-72: small_rng and thread_rng are DEFAULT features
+rand-0.10.2/Cargo.toml            l. 58-74: no small_rng feature exists at 0.10
+igd-next-0.16.2/Cargo.toml        l. 148: rand "0.9.0", defaults taken -> small_rng on
+yamux-0.13.10/Cargo.toml          l. 57:  rand "0.9.0", defaults taken -> small_rng on
+hickory-proto-0.25.2/Cargo.toml   l. 318: rand "0.9", default-features = false
+hickory-resolver-0.25.2/Cargo.toml l. 217: rand "0.9", default-features = false
 getrandom-0.4.3/src/lib.rs, src/sys_rng.rs           fill(), SysRng
 libp2p-relay-0.21.1/src/copy_future.rs   one bytes_sent counter, both directions (§6.5)
 libp2p-autonat-0.15.0/Cargo.toml         `[dependencies.rand] version = "0.8"` (§9)
@@ -1941,7 +2097,7 @@ libp2p-autonat-0.15.0/Cargo.toml         `[dependencies.rand] version = "0.8"` (
 | Document | Direction and content |
 |---|---|
 | `THREAT_MODEL.md` | **carries from here:** §11's OQ list; the §11 "does not solve" list; the abort attack of §2.10 with its DoS trade from D-005 and its unattributed `|V| < 2` form; relay metadata exposure from D-001; the §9.1/§9.2 supply-chain findings. **This document points at it for:** the §25 cheater-to-test map (`THREAT_MODEL.md` §5.5) and the deviation register (`THREAT_MODEL.md` §9.1), which own those two lists |
-| `PROTOCOL.md` | **owns, and this document reproduces:** the `ctx` construction (`PROTOCOL.md` §4.5, reproduced in §6.4); the dealing map (`PROTOCOL.md` §4.5, reproduced in §2.4); the domain-string register (`PROTOCOL.md` §2.8); the `DOMAIN_EVENT` signature prefix bytes (`PROTOCOL.md` §13). **Carries from here:** the signed envelope fields that must bind proofs and tokens; the entitlement and street-gating rules (§2.7, §2.8); the five-part `RNG_COMMIT` binding (§7.3); the `rand`/`SmallRng`/`StdRng` correction (§7.2) |
+| `PROTOCOL.md` | **owns, and this document reproduces:** the `ctx` construction (`PROTOCOL.md` §4.5, reproduced in §6.4); the dealing map (`PROTOCOL.md` §4.5, reproduced in §2.4); the domain-string register (`PROTOCOL.md` §2.8); the `DOMAIN_EVENT` signature prefix bytes (`PROTOCOL.md` §13). **Carries from here:** the signed envelope fields that must bind proofs and tokens; the entitlement and street-gating rules (§2.7, §2.8); the five-part `RNG_COMMIT` binding (§7.3); the `rand`/`SmallRng`/`StdRng` correction (§7.2), which under **D-009 rule 3** is a *discipline plus a test*, never an absence. **Owns and this document deliberately does not restate:** the equivocation predicate and its anti-replay slot key (`PROTOCOL.md` §5.2, §5.3). §6.4 and §7.1 name equivocation and defer — *"The exact predicate is `PROTOCOL.md` §5.2's and is not restated here"* — so **D-009 rule 1**'s move of the subject seat into the slot key for `TIMEOUT_VOTE` needs no mirror edit here, and the `ctx` block of §6.4 is unaffected by it: `ctx` binds seven fields for a *deck proof*, and a `TIMEOUT_VOTE` carries no deck proof and no `ctx`. The two are separately domain-separated at `PROTOCOL.md` §2.8 — `"p2p-poker v1 deck-ctx"` against `"p2p-poker v1 timeout-cert"` — so a change inside one cannot reach the other |
 | `STATE_MACHINE.md` | **carries from here:** the per-hand sequence of §2.9, including the collective form of `HAND_INIT` / `HAND_COMPLETE`; the absent-seat states and abort path (D-005), and its unattributed `|V| < 2` form (D-007, D-008 — the scope is the required voter set, never the seat count); deadlines as explicit state, never a wall-clock read inside the engine (D-006) |
 | `NETWORK_STACK.md` | **carries from here:** the corrected per-circuit **bidirectional** byte budget of §6.5 — `2 × 8 979 = 17 958 B` per hand per circuit, both directions counted against one 131 072 B cap, giving ~7 hands shuffle-only and ~5 with the event stream, against which the **120 s duration limit is still the binding one** (D-001) — and hand traffic never crossing the lobby topic. The earlier "per circuit **per direction**" form of this row, and its ~14 hands, are withdrawn: `max_circuit_bytes` is one counter for both directions (§6.5, `NETWORK_STACK.md` §16.1). **This document points at it for:** the normative D-002 relay configuration (`NETWORK_STACK.md` §9.6) and the transport-side dependency register (`NETWORK_STACK.md` §5.1) |
 
@@ -1951,7 +2107,7 @@ libp2p-autonat-0.15.0/Cargo.toml         `[dependencies.rand] version = "0.8"` (
 
 Recorded per the editing rule: the rulings of `docs/research/PHASE0_FIXPLAN.md` were
 applied as written, and where a ruling looks wrong it is noted here rather than
-silently deviated from. Three notes.
+silently deviated from. Four notes.
 
 **1. A-1's "No other change" to this document is too narrow, and I went slightly
 beyond it.** A-1 instructs this document to add *"at `n >= 3`; heads-up the deadline is
@@ -1999,3 +2155,40 @@ either way, and the D-002 split stands — so what changed is a comfort margin a
 number that four documents had begun to quote. `THREAT_MODEL.md` OQ12 must now be
 stated as a bidirectional measurement; measured one way it would report twice the
 headroom that exists, which is exactly how a withdrawn claim comes back.
+
+**4. D-009's three rules, applied to this document, and what each one cost.**
+`DECISIONS.md` **D-009** is a decision document and outranks the fix plan; its rules
+were applied as written and not re-derived. What they changed here:
+
+* **Rule 3 — never state a security property as an absence** (finding M3). §7.2's
+  bullet *"`SmallRng` is **not** compiled in"* is **withdrawn**, and so is OQ-8's
+  *"`SmallRng` stays out (feature not enabled anywhere in the workspace)"*. Both were
+  false: `rand 0.9.5` carries `small_rng` among its **default** features and
+  `igd-next 0.16.2` and `yamux 0.13.10` take those defaults, so `SmallRng` is in the
+  binary and cannot be got out. This is the *second* time the absence was narrowed
+  rather than dropped — the first pass replaced "`rand` is absent" with "`small_rng` is
+  not enabled on `rand 0.8.8`", which is true of one major and was still stated over
+  the whole build. What replaces it is the discipline plus the mechanism that enforces
+  it: `src/security/rng.rs` and its source scan, verified to fail on an injected
+  violation. No claim was strengthened; one was replaced by a weaker claim with a test
+  behind it.
+* **Rule 2 — a below-floor certificate is inert everywhere** (finding M1). §2.10 said
+  *"Such a certificate therefore has no effect: the abort … names nobody"* — asserting
+  in one sentence both that nothing happens and that an abort happens. The two are now
+  separate statements: the certificate does nothing at all, and the hand ends later at
+  `hand_deadline_ms` on a local timer, which is the event that names nobody and
+  restores stacks. Nothing else in this document gives a `|V| < 2` certificate an
+  effect; §2.8 item 2, §2.9's sequence, §5.2 item 8 and §11's "does not solve" bullet
+  were re-read and all four are already scoped on `|V|` and already deny the effect.
+* **Rule 1 — mandatory honest behaviour may never satisfy the equivocation predicate**
+  (finding M2). **No edit was needed here, and that is the point.** This document names
+  equivocation twice (§7.1 on a re-shuffle, §10.1 on signature malleability) and both
+  times defers to `PROTOCOL.md` §5.2 rather than restating the predicate, so moving the
+  subject seat into the anti-replay slot key does not have to be mirrored. §6.4's `ctx`
+  block was re-diffed against `PROTOCOL.md` §4.5 after the change and is
+  **byte-identical**, field order, comments, `0xFF` sentinel and all. It could not have
+  drifted: `ctx` is the Fiat–Shamir binding for a *deck proof* under
+  `"p2p-poker v1 deck-ctx"`, a `TIMEOUT_VOTE` carries no deck proof and no `ctx`, and
+  the certificate's own digest is domain-separated under `"p2p-poker v1 timeout-cert"`
+  (`PROTOCOL.md` §2.8). Ownership working as designed is what kept the blast radius to
+  one document.
