@@ -1002,7 +1002,7 @@ addressed in §6 or §7.
 | Bucket | Meaning |
 |---|---|
 | **CP** — cryptographically prevented | Under assumptions A1–A7 (and the specific ones named in the row), the adversary cannot construct a message that both achieves the goal and is accepted by an honest client. The adversary's only option is to be rejected. This includes attacks that are *structurally excluded*, i.e. for which no message in the protocol's grammar could express the attack. |
-| **D&A** — detected and attributed | The adversary *can* emit the message. Every honest client rejects it, the state does not advance, and the misbehaviour is bound to a specific application key by a signature, so the evidence is transferable to third parties. **Under D-010 the second half of the name is narrower than it sounds and must be read narrowly:** attribution puts a signed name in the transcript and nothing follows from it automatically — no forfeiture, no block list, no unseating. D&A means *detected and named*, never *detected and answered*. **D-011 rule 3 is what makes the "no block list" half true at every layer rather than only in this document**: until it landed, `NETWORK_STACK.md` still called `block_peer` on an `EquivocationProof` in two places and `STATE_MACHINE.md` still unseated a seat on a self-contained proof in one, so a row classified D&A here could still cost the *accused* — honest or not — its connections. That gap is closed, and the honest reading of every D&A row is now uniform: rejection, a name in the transcript, and nothing else. **D-014 splits that uniformity in two and the split is by evidence, not by severity.** Where the rejected message is **tier-1 self-authenticating** — a signature that does not verify, a non-canonical encoding, a malformed message or out-of-range field, a failed shuffle / decryption-share / key-ownership proof, a deck that gains or loses a card, a chain parent that does not exist, a signer who is not a party to the table — the sender **loses its seat**: the hand is voided neutrally, the seat is dead and blinded off, and the exit is one-way (`STATE_MACHINE.md` T64, T65, I34). Where the rejected message is **tier-2 state-dependent**, the same is true **only** once the state it was judged against is fixed by a checkpoint both peers signed; before that, D-010's reading stands unchanged — rejection, a name, and nothing else. Where the "evidence" is a timeout, a certificate, a vote, an `attributed` field or an `EquivocationProof`, D-010's reading stands **permanently**, and a row that reads a removal into any of those has rebuilt the forfeiture D-010 deleted. A reader classifying a new row must therefore answer one question before reaching for D&A's stronger half: *can two honest receivers of this evidence disagree about the verdict?* If yes, there is no removal, whatever the attack costs. |
+| **D&A** — detected and attributed | The adversary *can* emit the message. Every honest client rejects it, the state does not advance, and the misbehaviour is bound to a specific application key by a signature, so the evidence is transferable to third parties. **Under D-010 the second half of the name is narrower than it sounds and must be read narrowly:** attribution puts a signed name in the transcript and nothing follows from it automatically — no forfeiture, no block list, no unseating. D&A means *detected and named*, never *detected and answered*. **D-011 rule 3 is what makes the "no block list" half true at every layer rather than only in this document**: until it landed, `NETWORK_STACK.md` still called `block_peer` on an `EquivocationProof` in two places and `STATE_MACHINE.md` still unseated a seat on a self-contained proof in one, so a row classified D&A here could still cost the *accused* — honest or not — its connections. That gap is closed, and the honest reading of every D&A row is now uniform: rejection, a name in the transcript, and nothing else. **D-014 splits that uniformity in two and the split is by evidence, not by severity.** Where the rejected message is **tier-1 self-authenticating** — a signature that does not verify, a non-canonical encoding, a malformed message or out-of-range field, a failed shuffle / decryption-share / key-ownership proof, a deck that gains or loses a card, a signer who is not a party to the table — the sender **loses its seat**: the hand is voided neutrally, the seat is dead and blinded off, and the exit is one-way (`STATE_MACHINE.md` T64, T65, I34). Where the rejected message is **tier-2 state-dependent**, the same is true **only** once the state it was judged against is fixed by a checkpoint both peers signed; before that, D-010's reading stands unchanged — rejection, a name, and nothing else. Where the "evidence" is a timeout, a certificate, a vote, an `attributed` field or an `EquivocationProof`, D-010's reading stands **permanently**, and a row that reads a removal into any of those has rebuilt the forfeiture D-010 deleted. A reader classifying a new row must therefore answer one question before reaching for D&A's stronger half: *can two honest receivers of this evidence disagree about the verdict?* If yes, there is no removal, whatever the attack costs. **The sharp form of that question, and the general test a proposed tier-1 addition must pass, is §5.1.1.** |
 | **DNA** — detected but not attributable | The divergence or conflict is detected, and play stops, but the transcript does not establish *who* was at fault. **Two different situations share this bucket, and X33 was the first of the second kind:** either an adversary is present and the design cannot name them (X10, X22, X29), or **there is no adversary at all** and the design has produced a divergence between honest peers (X33, X34, X35). Both are "detected, nobody named"; only the first is somebody escaping a name. The second kind is now three of the six DNA rows, which is the shape of the last three review passes and not a coincidence: the defects this corpus produces are no longer attacks. |
 | **NP&ND** — not prevented and not detected | The divergence happens, nothing rejects it, no invariant fires, no deadline expires, no proof forms, and **no peer ever learns that it happened**. Each peer's own view stays internally consistent and self-verifying, so there is no moment at which anything could be reported to a human. This is the **worst bucket in the scheme** — worse than V, which at least leaves a record somebody can read, and worse than OOS, which makes no claim rather than a false one. §5.4 said for four passes that no row occupied it. **X36 occupies it**, and the honest consequence is that this document may no longer offer "every divergence is at least detected" as a property of the design. A row leaves this bucket only by a fix that makes the divergence observable, not by a fix that makes it rarer. |
 | **V** — visible, not prevented | The attack **succeeds**. Nothing rejects it, nothing in the protocol acts against the attacker, and no proof changes the outcome. What the design delivers is a signed, permanent record that it happened, and a per-identity count of it in the lobby. This is the weakest non-OOS bucket in the scheme, and `SPEC_CS.md` §18 forbids describing a row in it as anything more than visible. It is distinguished from OOS only in that the attack runs *through the poker protocol* and the protocol therefore sees and records it. |
@@ -1038,6 +1038,62 @@ can construct, and it either holds or it does not.
 **Every CP row inherits A1–A7. In particular, every CP row that concerns deck
 integrity (rows 1–4) also inherits A3 and A4, which are NOT verified.** If the
 review named in A3 finds a soundness gap, rows 1–4 fall out of CP entirely.
+
+#### 5.1.1 The admissibility test for tier 1, and the clause that failed it
+
+D-014's tier 1 is the only evidence in this design that costs a person their
+seat with no checkpoint, no quorum and no waiting. What makes that safe is a
+property of the *evidence*, not of the attack, and the property has to be checked
+clause by clause. **This is the general test, and it is stated here because this
+document owns the classification scheme (D-011 rule 1); every other document
+points at it rather than restating it.**
+
+> **A clause belongs in tier 1 only if its verdict is a function of the offending
+> message's own bytes and inputs the peers provably share — and of nothing else.**
+> Concretely, three questions, all of which must be answered *no*:
+>
+> 1. **Does deciding it require reading anything the receiver stores?** Its own
+>    chain, its own head, its own set of seen events, its own buffer, its own
+>    clock, its own connection table.
+> 2. **Can the answer change for one honest receiver because of what the network
+>    did** — a frame dropped, delayed, reordered, or delivered to somebody else
+>    first?
+> 3. **Does it need a second message, a count, a vote, a certificate or another
+>    peer's cooperation to become decidable?**
+>
+> Any *yes* puts the clause in tier 2 at best, where a checkpoint both peers
+> signed fixes the state it is judged against — or out of the removal path
+> altogether.
+
+**The clause that failed it, and it stood in tier 1 in three documents: *the
+event chains to a parent that does not exist*.** It fails question 1 outright and
+question 2 with it. Whether a parent exists is decidable **only against the
+receiver's own store**: an honest peer that has not yet received the parent — one
+dropped frame, one reordered delivery, one slow relay — computes *no such parent*
+where every other peer computes *present*, and it computes it about a message the
+accused signed perfectly legally. **One dropped frame would remove an honest
+player.** That is the exact failure the two tiers exist to prevent, and it was
+sitting in the tier meant to be safe, where it would have fired without a
+checkpoint and without any chance to wait for one.
+
+It is deleted here (§5.1's D&A cell, §5.2's re-classification table),
+in `PROTOCOL.md` (§4.0's normative box, §4.9's acceptance gate) and in
+`DECISIONS.md` D-014's own list. It was deleted from the code first:
+`src/security/validation.rs` no longer has `SelfContained::ParentUnknown`, and
+its `no_tier_one_violation_depends_on_the_receivers_store` test asserts the
+variant count so that adding one forces the author past the comment that says
+why. **A missing parent is still a reason to buffer or reject the event, which is
+all it ever was** — it is not evidence against anybody.
+
+**Why this matters more than one deleted bullet.** Every tier-1 clause that
+survives is answered by the *cryptography* or the *encoder* — a signature, a
+canonical encoding, a range, a proof, a permutation, a roster membership — and
+none of them reads a store. The parent check looked like that family because it
+is cheap and local; it is not in that family, because *local* and
+*receiver-independent* are different properties and only the second one is the
+one tier 1 needs. That confusion is the general shape a future addition will
+arrive in, which is why the test above is three questions rather than an appeal
+to judgement.
 
 ### 5.2 The `SPEC_CS.md` §17 catalogue
 
@@ -1079,7 +1135,7 @@ checking a **boundary**, and a boundary is only checkable if both sides are visi
 | 1, 2, 3 — fake / duplicate / removed card | **1** (a deck that gains, loses or duplicates a card across a shuffle) | CP unchanged; the message was already unconstructible, and if one is nevertheless emitted the emitter **loses its seat** |
 | 4(a) — an invalid shuffle | **1** (failed shuffle proof) | as above. `STATE_MACHINE.md` T21 already aborted the hand and named the shuffler; the removal is what is added |
 | 12 — changing an already-signed action | **1** (signature does not verify) | CP unchanged; **loses its seat** |
-| 13 — replay of old actions | **1** (chain parent does not exist at the replayed position) | CP unchanged; **loses its seat** |
+| 13 — replay of old actions | **none**, and this row is the correction §5.1.1 exists for. It read *tier 1 (chain parent does not exist at the replayed position)*, which fails question 1 of the admissibility test: the parent is looked for in **this receiver's own store**, so a peer that has not yet received the parent would remove an honest sender over a dropped frame | **CP unchanged, and it is CP that answers this row** — the signed body binds `protocol_version`, `table_id`, `hand_id`, `sequence` and `previous_event_hash`, so a replayed event is valid at exactly one position of one chain and is simply rejected and named. No removal follows. A replay that is *also* illegal against checkpoint-fixed state reaches tier **2** by that other route and by its own precondition, never by this one |
 | 15 — impersonation | **1** (signer is not a party to this table) | CP unchanged; **loses its seat** |
 | 17 — malformed packets | **1** (malformed message, out-of-range field, non-canonical encoding) | D&A becomes **detected, named and answered**: the sender **loses its seat**. The residual in that row is untouched — an unfuzzed crypto deserialiser is a remote panic, and a peer that panics never reaches the validator that would remove anybody |
 | 18 — oversized packets | **none** | unchanged, and deliberately: an over-cap frame is dropped **before decoding**, so there is no signed message to judge and no accused. The response is volume-keyed, which D-011 rule 3 requires it to stay |
@@ -1089,12 +1145,17 @@ checking a **boundary**, and a boundary is only checkable if both sides are visi
 | 11 — action out of order | **2** (`player_to_act` is a function of state) | as above |
 | 16 — equivocation | **neither** | **unchanged, and this is the row that shows where the boundary is.** An `EquivocationProof` is not a message the accused signed asserting something illegal; it is a *predicate over two* messages, and that predicate has failed five times, twice against honest peers following the rules (X31, X32). D-014 excludes it by name. The worst case stays a wasted hand |
 
-**The pattern in that table is the useful part.** Every tier-1 row is one the
-cryptography or the encoder already answered, and every tier-2 row is one the
-*engine* answers — which is why tier 2 needs the checkpoint and tier 1 does not, and
-why the rows D-010 was written about (16, and X7, X10, X30, X31, X32 below) are in
-neither column. D-014 hardens the cases that were already hard and leaves the soft
-ones exactly as soft as they were.
+**The pattern in that table is the useful part, and it is now exact rather than
+nearly exact.** Every tier-1 row is one the **cryptography or the encoder**
+already answered, and every tier-2 row is one the **engine** answers — which is
+why tier 2 needs the checkpoint and tier 1 does not, and why the rows D-010 was
+written about (16, and X7, X10, X30, X31, X32 below) are in neither column.
+D-014 hardens the cases that were already hard and leaves the soft ones exactly
+as soft as they were. **Row 13 is what made the pattern only nearly exact**: it
+was tier 1 on a check the *store* answers, which is neither of the two, and
+§5.1.1 is the test that catches that class. A proposed tier-1 addition that
+cannot be handed to the cryptography or to the encoder is in the wrong tier, and
+that is the cheap version of §5.1.1's three questions.
 
 ### 5.3 Protocol-level attacks not named in §17
 
@@ -2466,7 +2527,7 @@ argument for reporting counts and the reason this document reports its own.
 | **OQ-D** | *"A dispute path that does not require the accused peer's signature — circular at every table size, not only heads-up (D-007 point 4, review A-1). Interim answer under D-010: a dispute that cannot resolve ends the hand neutrally, so the circularity costs a hand rather than a stalemate."* | X7; §7.3(c). Formerly this document's `OQ-B` |
 | **OQ-F** | *"Whether `TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` should still be produced in the MVP now that D-010 gives them no effect, or be deferred wholesale until the machinery is sound. Producing them keeps the transcript adjudicable later; deferring them removes four passes' worth of surface."* | X10, X30, X31, X32 and the `CheaterEquivocation` / `CheaterDisconnect` rows of §5.5 all describe machinery this letter asks whether to build at all. It changes what ships rather than what is true, so no classification here turns on it |
 | **OQ-E** | **Blocking.** How is a timeout certificate constructed when two or more seats are simultaneously unresponsive, and whom does it attribute? `signers == participants \ {subject}` is unachievable, and attributing every non-voting seat punishes honest seats behind a partition. The interim behaviour is to abort with no attribution and no chip movement, which lets two colluding seats void a hand for free. Blocking for Phase 4. | X7 (DNA case); §7.3(c). **This letter is this document's own**, referenced by `PROTOCOL.md` Q-02 and `STATE_MACHINE.md` Q3 and defined nowhere else |
-| **D-014-1** | **Open, and this document's row is discharged in this pass while the corpus's is not.** *"Integrate D-014 across the corpus: the two evidence tiers, the checkpoint precondition for tier 2, the one-way exit, the dead seat blinded off, and the information window. Touches all five specification documents."* | §5.1's D&A definition, §5.2's re-classification table, §5.3's **X37**, §5.5's tier column and the mirror gate. What this document does **not** own and must not be read as settling: the wire representation of a removed seat — `PROTOCOL.md` §6.1's `PublicTableState` hashes `sitting_out` and no longer hashes `absent`, so a `Removed` seat is canonical per-seat state that **no vector hashes**, and two peers that disagree about a removal would agree on every hashed vector. That is filed as `D-014-3` |
+| **D-014-1** | **Open, and this document's row is discharged in this pass while the corpus's is not.** *"Integrate D-014 across the corpus: the two evidence tiers, the checkpoint precondition for tier 2, the one-way exit, the dead seat blinded off, and the information window. Touches all five specification documents."* | §5.1's D&A definition, §5.2's re-classification table, §5.3's **X37**, §5.5's tier column and the mirror gate. What this document does **not** own and must not be read as settling: the wire representation of a removed seat — `PROTOCOL.md` §6.1's `PublicTableState` hashes `sitting_out` and no longer hashes `absent`, so a `Removed` seat is canonical per-seat state that **no vector hashes**, and two peers that disagree about a removal would agree on every hashed vector. That is filed as `D-014-3`. **Corrected in this pass, and it is the discharge being wrong rather than incomplete:** §5.1's D&A cell and §5.2's row 13 both carried *a chain parent that does not exist* as **tier 1**, which fails the admissibility test — the parent is looked for in the receiver's own store, so one dropped frame removes an honest player. Both are corrected, row 13 is re-classified to **none** (CP already answers it), and **§5.1.1 is new**: the three-question test a proposed tier-1 addition must pass, stated here because this document owns the classification scheme and every other document points at it. `src/security/validation.rs` had deleted the clause first; `PROTOCOL.md` and `DECISIONS.md` D-014 are corrected in the same pass |
 | **D-014-2** | **Blocking for shipping the removal, and it is this document's gate.** *"The mirror test D-014 requires: under every legal interleaving, no honest peer is evictable."* | **X37**, whose whole content is what happens if this is not run, and §5.5's mirror block, where it is specified as a test. Nothing here classifies the removal feature as safe until it passes; X37 is DNA today and stays DNA |
 | **D-014-3** | **New in this pass, opened by D-014's own integration.** How does a removal reach canonical state? D-014's safety argument is that every honest peer reaches the same verdict from data it already holds — true of the **verdict** and not of the **holding**: whether the offending message reached this peer is per-receiver, and a seat's status is canonical state (D-012, `STATE_MACHINE.md` I30). So the *evidence* must itself be chained, which needs a message type, a stage, a chain position, and an answer for a peer that never received the offending message. **Owner: `PROTOCOL.md`.** | X37's mechanism half. Until it is answered, a removal derived from a locally observed fact is a D-012 violation wearing D-014's name, and this document classifies nothing on the assumption that it will be answered one way rather than another |
 | **N8** | **New in this pass, small, and it is a citation that outran its source.** D-014 says the removal is explained to the other players by *"`SPEC_CS.md` §22's information window"*, and **§22 contains no such element**: its GUI tree is *network status*, *lobby*, and a *poker table* ending at `timer` and `protocol/security status`, with one further sentence forbidding the display of a cryptographically unverified card. An anti-cheat window naming a removed player, the tier and the evidence is **not among them**. The disposition is to **record it as a required addition to §22 rather than to cite it as existing** — `SPEC_CS.md` is the owner's document and is not edited from here — and to make sure no other document cites it as present: `STATE_MACHINE.md` T64's cell now says *required addition* in terms, and this row is the corpus's record of it. **What the addition must say is already fixed and is not re-opened here**: the removed player, the tier, what the evidence was, **and that the hand was voided and no chips changed hands** — the last clause is not decoration, since a void that reads as a loss is how a correct removal becomes a support complaint. | The user-facing half of **X37** and of §5.2's D-014 re-classification. Nothing in the catalogue turns on it — a missing window changes no attacker's payoff — which is exactly why it could sit uncited for a pass: **it is the one part of D-014 that no test would have caught**, because the corpus tests behaviour and this is the sentence a person reads |

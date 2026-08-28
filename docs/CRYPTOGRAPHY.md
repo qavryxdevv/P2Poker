@@ -136,7 +136,18 @@ the failure mode all three misses share.
   not looking at the same inputs*, so the public inputs must be accepted chain content or
   the verdict is a divergence and not a removal. §8.1.5 adds the one rule this document
   owes the decision: **a removal may rest only on a verifier that ran and returned
-  invalid, never on a verification that could not be performed.**
+  invalid, never on a verification that could not be performed.** **Re-checked in the
+  following pass and recorded as §8.1.6**, on the discipline of the paragraph above —
+  the two properties D-014's safety rests on are asserted for this document as a whole
+  rather than only where they are argued: **no tier-1 clause here needs receiver state**
+  (the nearest candidate, §8 rule 3's undue index, is classified tier 2 by name), and
+  **each of the three failures is stated as evidence against its own signer, needing no
+  quorum, vote, certificate or timing**, which is what makes tier 1 safe to act on at
+  arrival. One thing changed underneath the section and cost it nothing: D-014's tier-1
+  list lost the clause *a message whose chain parent does not exist*, which is decidable
+  only against the receiver's own store — nothing in §8.1 cited or depended on it, the
+  six-bullet count this document quotes is unchanged, and the general admissibility test
+  is now `THREAT_MODEL.md` §5.1.1's.
 
 ---
 
@@ -1900,6 +1911,46 @@ message arrived is per-receiver while a seat's status is hashed. That is
 `DECISIONS.md` **D-014-3**, owned by `PROTOCOL.md`. This section defines what the evidence
 proves; it does not decide how the verdict is carried, and an implementer must not infer
 from *"any peer can decide alone"* that a peer may act alone on canonical state.
+
+#### 8.1.6 This section audited against itself, and one thing changed underneath it
+
+Two questions, asked of this document as a whole rather than of one subsection,
+because D-014's safety rests on the answers being *yes* everywhere and not merely
+in the paragraph where they are argued.
+
+**(1) Does anything here describe a tier-1 violation that needs receiver state? No.**
+Every removal-bearing verdict this document owns is computed by a verifier over
+`(the signed message, public inputs, the Fiat–Shamir transcript)` and reads nothing
+the receiver stores. The public inputs are named per proof and are constants or
+**accepted chain content** — `ctx` from `table_id`, `hand_id` and the round sentinel
+(§8.1.1); `apk`, the accepted input deck `D_{k-1}` and `ctx` (§8.1.2); the `pk_i` inside
+this hand's `apk` (§8.1.3). Where such an input differs between two peers the verdict is
+a **divergence and not a removal**, which is the fine print stated at the top of §8.1 and
+repeated in §8.1.2 because that is the proof it bites hardest. The nearest thing to a
+state-dependent clause in this document is §8 rule 3's *undue index*, and it is
+classified **tier 2** by name (§8.1.3) precisely because deciding it needs the street and
+the deal map. There is no clause here that a dropped frame or a slow peer could flip.
+
+**(2) Is each of the three failures stated as evidence against its signer, needing no
+quorum? Yes, and that is the property doing the work.** §8.1.1, §8.1.2 and §8.1.3 each
+open with *what a failure proves* about **the signer of that message**, and §8.1's general
+shape states once, for all three, that a failed proof needs **no quorum, no vote, no
+certificate and no timing** — which is why tier 1 may act on arrival rather than waiting
+for a checkpoint. The counterpart is stated just as plainly: a **missing** token is
+silence and never evidence (§8.1.3), and a verification that could not be *performed* is
+never evidence either (§8.1.5).
+
+**What changed underneath this section in this pass.** D-014's tier-1 list carried a
+seventh kind of clause — *a message whose chain parent does not exist* — which is
+decidable only against the receiver's own store, so one dropped frame would have removed
+an honest player. It is deleted from `DECISIONS.md` D-014, `PROTOCOL.md` and
+`THREAT_MODEL.md`, and it was never this document's: **nothing in §8.1 cited it, depended
+on it, or has to change for it.** The count this section quotes is unaffected — D-014's
+list still has six bullets, three of them this document's — and `THREAT_MODEL.md` §5.1.1
+is now the normative owner of the admissibility test a future tier-1 clause must pass.
+That test is the general form of the property §8.1 argues for these three proofs, and a
+new verifier added here must be held to both: it must return `invalid` from a run that
+happened (§8.1.5), and its verdict must read nothing the receiver stores.
 
 ---
 

@@ -13,19 +13,24 @@ deadline is advisory and a fold-effect timeout certificate is forbidden whenever
 the required voter set `V` (`PROTOCOL.md` §8.3) has fewer than two members. That
 is always the case at two seats and is reachable at any seat count, which is why
 every such rule is scoped on `|V|` and **never on `n`** (§8.4, §15).
-**D-010, D-011, D-012 and D-013 bind this document and this layer**, which
-earlier revisions denied by omission three times over: the first carried no
+**D-010, D-011, D-012, D-013 and D-014 bind this document and this layer**, which
+earlier revisions denied by omission four times over: the first carried no
 mention of D-010 and ten places where the transport removed a peer; the second
 carried no mention of D-012 while this layer is the corpus's largest producer of
-per-receiver quantities; and the third carried no mention of D-013 while holding
+per-receiver quantities; the third carried no mention of D-013 while holding
 the most tempting wrong answer to the question D-013 asks — connection state as a
-liveness signal. **Three for three**, and each time on the judgement that
-transport was unaffected. That judgement is not to be made again: this document is
-in every sweep, and its coverage is checked by counting the decision's occurrences
-here, not by asserting that the sweep ran. §0 records what all five of
-D-009…D-013 change here, §0.5 is the D-012 pass, §0.5.7 is D-013's, and §11.5 is
-where the boundary between a *protocol* verdict and a *transport* defence is
-drawn.
+liveness signal; and the fourth carried no mention of **D-014** while stating, in
+two places, the every-layer form of the rule D-014 narrows, so that the document
+did not merely lag the decision, it **asserted its negation** and survived three
+further passes that each named it by line number. **Four for four**, and each time
+on the judgement that transport was unaffected. That judgement is not to be made
+again: this document is in every sweep, and its coverage is checked by counting the
+decision's occurrences here, not by asserting that the sweep ran — **and a count of
+zero must be read for which of the two it is**, a gap or a contradiction, because
+the second is the more urgent and looks identical in the count. §0 records what all
+six of D-009…D-014 change here, §0.5 is the D-012 pass, §0.5.7 is D-013's, §0.6 is
+D-014's, and §11.5 is where the boundary between a *protocol* verdict and a
+*transport* defence is drawn.
 Under **D-011 rule 1** this document is the normative owner of **transport,
 discovery and connectivity** and of nothing else; where it needs a wire
 definition it names the owning section of `PROTOCOL.md` and does not reproduce
@@ -57,10 +62,10 @@ is written as **OPEN QUESTION** and carried to §13 rather than guessed
 
 ---
 
-## 0. D-009 to D-013 as they bind this layer
+## 0. D-009 to D-014 as they bind this layer
 
-This section exists because this document has now **three times** been left out of
-a decision sweep on the judgement that transport was unaffected, and all three
+This section exists because this document has now **four times** been left out of
+a decision sweep on the judgement that transport was unaffected, and all four
 times that judgement was wrong.
 
 The first time was D-010. **Eviction is a transport action**, so a decision that
@@ -88,19 +93,44 @@ always wrong to answer canonically. A decision that redefines who must speak nex
 reaches the layer that knows who is currently reachable. §0.5.7 is that pass, and
 it also carries the disposition of §0.5.6, which D-013's J1 rule closed.
 
+The fourth time was D-014, and it is the first of the four where the omission was
+not silence but **contradiction**, which is why it survived three further passes
+that each named it and none of which opened this file. D-014 narrows D-010
+point 3 — and §0.1 and §1.2 prohibition 7 state D-010 point 3 in the
+**corpus-wide, every-layer** form D-011 rule 3 gave it. A document that carries
+that form and **zero** occurrences of `D-014` is therefore not merely behind the
+sweep: it asserts the negation of a binding decision, and an implementer reading
+it alone would refuse to build a thing `STATE_MACHINE.md` T64 requires. §0.6 is
+that pass. Its result is a **re-scoping and not a weakening**: everything this
+layer was forbidden to do it is still forbidden to do, without exception and
+without a proof it may consult, and D-014's one exception lives entirely above
+this layer and reaches a seat rather than a socket.
+
 D-009's three rules are honoured in §1.3.2(iii), §5.1 and §5.1.1 and are
 registered in §15; nothing in this pass changed them.
 
 ### 0.1 The rule, stated once
 
-> **D-010 point 3, as D-011 rule 3 extends it to every layer.** No automated
-> eviction, anywhere: no `block_peer`, no unseating, and no allow-list or
-> block-list populated by the poker protocol. An
+> **D-010 point 3, as D-011 rule 3 extends it to every layer, and as D-014
+> narrows it above this one.** No automated eviction **at this layer**, ever: no
+> `block_peer`, no disconnect, no dial refusal, no persisted mark, no unseating,
+> and no allow-list or block-list populated by the poker protocol. An
 > `EquivocationProof` (`PROTOCOL.md` §5.2), a timeout certificate
 > (`PROTOCOL.md` §8.3), a signed abort attribution, an invalid application
 > signature — **none of them causes this layer to disconnect, refuse, block or
 > unseat anybody.** A proof is evidence for a human. The user may always choose
 > not to play with someone; the protocol may not choose for them.
+>
+> **The one exception is not this layer's, and it takes nothing away from this
+> box (D-014).** A **tier-1** finding — an event **signed by the accused**, whose
+> illegality any peer decides alone from that event's own bytes — removes its
+> sender **from the table**, and from nothing else. That is a seat disposition
+> (`STATE_MACHINE.md` T64, T65, I34), reaching canonical state through
+> `HAND_INIT(k+1)`'s collective body, and it produces **no transport action of
+> any kind**. Every one of the artefacts named in the paragraph above stays
+> forbidden as an input to anything here, including the invalid application
+> signature that is a tier-1 trigger by name above this layer. §0.6 states the
+> exception in full, and states why the word *anywhere* had to go.
 
 The reason is D-010's, and it is worth repeating where an implementer will meet
 it: automated eviction was the *second prize* that made four rounds of attacks
@@ -118,7 +148,7 @@ like:
 
 | Reason for the action | Status | Where |
 |---|---|---|
-| A protocol proof, verdict or attribution — equivocation, a timeout certificate, an abort record, an invalid application signature | **forbidden.** No transport consequence of any kind | §0.1, §6.6, §7.4, §11.5 |
+| A protocol proof, verdict or attribution — equivocation, a timeout certificate, an abort record, an invalid application signature | **forbidden.** No transport consequence of any kind, and D-014 does not change this row: its tier-1 exception costs a **seat**, never a socket | §0.1, §0.6, §6.6, §7.4, §11.5 |
 | A **resource** fact — connection count, pending-dial count, process memory share | **kept.** Refuse the connection | §11.1 |
 | A **rate** fact — this socket is spending more of our budget than we allot it | **kept.** `Ignore` the excess, then stop dialling, then disconnect | §6.6 |
 | A **size or malformation** fact — over cap, non-canonical, unparseable | **kept.** Drop the message | §6.4, §11.3 |
@@ -145,6 +175,13 @@ Two corollaries an implementer must not blur:
   disconnects a peer that keeps exceeding its lobby budget. That peer may
   reconnect, is not recorded anywhere, and carries no mark. It is backpressure,
   and it must never be described, logged or displayed as a sanction.
+* **A D-014 removal is not a transport action, and the table's row is not in
+  this table.** The one automated removal the corpus permits takes a **seat** and
+  nothing else: no socket is closed, no dial refused, no reservation withdrawn
+  and no name persisted because of it, and a removed player's connections are
+  handled exactly as anyone else's until the user chooses otherwise. It is
+  therefore neither a "forbidden" row nor a "kept" row above — it is not this
+  layer's action at all (§0.6).
 
 ### 0.3 D-011 rule 1 as it applies here
 
@@ -460,6 +497,111 @@ list, which is the one place every editor of every document reads; a finding
 assigned elsewhere is recorded there in the same pass that finds it, and its
 disposition is written back here when the owner acts.
 
+### 0.6 D-014 at the transport layer — the exception is above it, and stays above it
+
+**What D-014 decides, in one sentence, and it is not this document's to restate
+beyond it (D-011 rule 1).** A player who sends a **provably illegal** message is
+removed from the **table**; the attacked hand is voided neutrally, the seat is
+dead and blinded off, the exit is one-way, and the evidence stays in the
+transcript. `DECISIONS.md` **D-014** is the decision, `PROTOCOL.md` §4.0 and §4.9
+own the wire, `STATE_MACHINE.md` T64, T65 and I34 own the seat, and
+`CRYPTOGRAPHY.md` §8.1 owns what a failed proof does and does not prove. This
+section states one thing and only one thing: **what changes here, which is
+nothing, and why that needed saying.**
+
+#### 0.6.1 What had to change in this document, and it is a scope word
+
+Nothing in the transport gained or lost a capability. What was wrong was the
+**scope** two sentences claimed:
+
+| Site | Claimed | Now claims |
+|---|---|---|
+| §0.1 | *"No automated eviction, **anywhere**"*, on D-011 rule 3's every-layer extension | No automated eviction **at this layer**, ever — and the one exception, above this layer, named and pointed at |
+| §1.2 prohibition 7 | *"remove, block, unseat, refuse or penalise a peer on the strength of a protocol proof"*, unscoped | the same, **at this layer**, with D-014's tier-1 removal named as a table disposition that never reaches here |
+| §11.5.1 | correct as written — genuinely transport-only | unchanged, plus the paragraph that stops an implementer arriving from T64 reading it as licence to call `block_peer` |
+
+The distinction the corrected wording rests on is the one §0.2 already draws, in
+its own terms: **what supplies the reason.** D-014 did not add a reason this
+layer may act on. It added a consequence a *different* layer may reach, from a
+reason this layer must still refuse to look at.
+
+#### 0.6.2 The exception, stated exactly, so it is not read wider than it is
+
+> **Only self-authenticating evidence removes anybody, and it removes them from
+> the table.** Evidence is self-authenticating when it is a **message signed by
+> the accused, whose illegality any peer decides alone**, from that message plus
+> state the peers provably share. That is D-014's **tier 1**: a signature that
+> does not verify, a non-canonical encoding, a malformed message or an
+> out-of-range field, a failed shuffle, decryption-share or key-ownership proof,
+> a deck that is not a permutation, a signer that is not a party to this table.
+> Removal is `STATE_MACHINE.md` T64/T65 and reaches canonical state only through
+> `HAND_INIT(k+1)`'s collective body. **It produces no transport action of any
+> kind, at any layer of `net/`, ever.**
+
+Two properties do the whole of the safety work, and both are absent from every
+judgement this layer is able to make:
+
+1. **No quorum, no vote, no timing.** The verdict is a pure function of the
+   accused's own signed bytes and inputs the peers provably share, so every
+   honest peer computes the same answer and a replaying third party computes it
+   too. Framing an honest peer would mean forging its signature.
+2. **No receiver state.** Tier 1 is decidable from the offending message alone.
+   A clause that needs the receiver's own store is not tier 1 and may not be
+   treated as one — *whether the event's chain parent exists* was such a clause,
+   it was tier 1 in three documents, and it is deleted from all of them and from
+   `src/security/validation.rs`, because one dropped frame would have removed an
+   honest player.
+
+**Tier 2 — illegality decidable only against game state — is not this layer's
+business at all**, and is named here only so it is not confused with tier 1: it
+removes nobody until the state it is judged against is fixed by a checkpoint both
+peers signed (`PROTOCOL.md` §4.9).
+
+#### 0.6.3 What stays prohibited here, and it is every judgement this layer can make
+
+D-014 narrowed D-010 point 3 **once**, for one input, above this layer. Every
+other prohibition in §0.1, §1.2 prohibition 7 and §11.5.1 stands unamended, and
+the reason is exactly the reason D-010 existed: each of these is a judgement two
+honest receivers can reach differently, which is the property that produced every
+severe finding of four adversarial passes.
+
+| Judgement this layer can cheaply make | Status under D-014 |
+|---|---|
+| A peer is disconnected, unreachable, or slow to answer | **still no removal, of any kind.** A liveness judgement, and D-014 excludes liveness by name |
+| A peer's stream dropped mid-hand | **still a hint** (§8.4), and the verdict remains D-006's certificate, inert whenever `\|V\| < 2` (D-008) |
+| A peer equivocated | **still no removal.** D-014 excludes `EquivocationProof` by name; the predicate has been wrong five times, twice against honest peers |
+| A `HAND_ABORT` attributes somebody | **still no removal.** `attributed` is per-receiver (D-012) |
+| A timeout certificate names a seat | **still no removal**, at this layer or any other |
+| A count of any of the above | **still no removal.** A count of per-receiver facts is a per-receiver fact |
+
+And the transport's own defences are untouched by all of it. §0.2's "kept" rows —
+resource limits, rate limits, connection and dial limits, size and canonicality
+checks, relay admission, relay capacity, the DHT deny-all filter, the signed
+roster's membership gate — are driven by facts about **our own** memory, sockets,
+budget and consent, need no belief about anybody's honesty, and are neither
+strengthened nor weakened here. §11.5.3's user block list keeps its single caller:
+an explicit action the user took in the GUI. **The separation is the point**: a
+D-014 removal and a rate-limit disconnect must never be described, logged or
+displayed as the same event, because one is a verdict about a person and the
+other is a statement about our uplink.
+
+#### 0.6.4 D-013 as it bears on this, recorded here because the two compose
+
+D-013 is registered in §15 and its transport pass is §0.5.7; what it adds *to
+D-014* is one prohibition worth stating where a reader meets the removal. A
+removed seat leaves the required emitter set, and **participation is inherited
+from the chain, never sensed** — so no quantity this layer produces may be read as
+evidence that a seat is gone, whether the seat left by D-014's one-way exit or by
+any other route. A reconnected socket is not a re-entry (§0.5.7), and a silent
+socket is not a removal. Both directions of that are §1.2 prohibition 8.
+
+D-013's **process rule** is why this section exists at all rather than a fourth
+open-list entry: a defect belonging to another owner is recorded in the pass that
+finds it, and its disposition is written back to the finding document when the
+owner acts. `DECISIONS.md`'s `G4-P5` row filed this one, with the three line numbers,
+and was carried for three passes without this file being opened. The disposition
+is written back there in the same pass as this section.
+
 ---
 
 ## 1. Layers, and the rule that constrains all of them
@@ -538,14 +680,22 @@ layer must **not**:
 5. treat a `PeerId`, a connection, or a DHT record as an authorisation to act as a
    player (`SPEC_CS.md` §20 — "PeerId říká, s jakým socketem mluvíš, ne kdo hraje");
 6. hold, forward, log or persist any secret from the mental-poker layer;
-7. **remove, block, unseat, refuse or penalise a peer on the strength of a
-   protocol proof.** An `EquivocationProof` (`PROTOCOL.md` §5.2), a timeout
-   certificate (`PROTOCOL.md` §8.3), a signed abort attribution or an invalid
-   application signature are evidence for a human and produce **no transport
-   action at all** (D-010 point 3, D-011 rule 3, §0.1). This prohibition is
-   about the *reason*, not the action: the same disconnect is permitted when its
-   reason is a resource, rate, size or admission fact (§0.2), and forbidden when
-   its reason is a verdict about whether somebody cheated;
+7. **remove, block, unseat, refuse or penalise a peer *at this layer* on the
+   strength of a protocol proof.** An `EquivocationProof` (`PROTOCOL.md` §5.2), a
+   timeout certificate (`PROTOCOL.md` §8.3), a signed abort attribution or an
+   invalid application signature are evidence for a human and produce **no
+   transport action at all** (D-010 point 3, D-011 rule 3, §0.1). This
+   prohibition is about the *reason*, not the action: the same disconnect is
+   permitted when its reason is a resource, rate, size or admission fact (§0.2),
+   and forbidden when its reason is a verdict about whether somebody cheated.
+   **D-014 does not amend this prohibition and cannot reach it**, and the words
+   *at this layer* are what this pass added: a tier-1 self-authenticating finding
+   — an invalid application signature among its triggers by name — removes its
+   sender from the **table** (`STATE_MACHINE.md` T64, T65), and never from a
+   socket, a dial queue, a relay reservation or a list of names here. An
+   implementer who reaches a tier-1 verdict and then reaches into `net/` for it
+   has crossed this prohibition; §0.6 draws the boundary and §11.5.1 restates it
+   where the deleted `block_peer` path used to be;
 8. **supply any quantity of its own as canonical state.** Nothing this layer
    measures — which peers are connected, in what order bytes arrived, what the
    local clock reads, what AutoNAT concluded, whether a link is relayed, how many
@@ -2539,6 +2689,20 @@ document was missing, and D-011 named its absence a blocker.
 > (`PROTOCOL.md` §8.3), a `HAND_ABORT` attribution, a `DISPUTE`, an invalid
 > application signature, a `STATE_HASH` divergence, or a count of any of them.
 
+**That box is unchanged by D-014, and this is the paragraph an implementer who
+has just read `STATE_MACHINE.md` T64 needs.** D-014 permits one automated
+removal, on a tier-1 self-authenticating finding, and every item in the box above
+— including *an invalid application signature*, which is a tier-1 trigger by name
+— stays forbidden here regardless. The reason is that a D-014 removal is a
+**table** disposition and not a transport one: it takes the offender's seat
+(T64, T65, I34), blinds its stack off, and reaches canonical state through
+`HAND_INIT(k+1)`'s collective body. It closes no socket, refuses no dial,
+withdraws no relay reservation and writes no name to disk. **Arriving at T64 is
+not licence to call `block_peer`**, and there is no path from a tier-1 verdict
+into this section: the removed player's connections are handled exactly as any
+other peer's until §11.5.3's user chooses otherwise. §0.6 states the exception in
+full and is the normative record of it in this document.
+
 The transport does not read those objects at all. It cannot construct one, it has
 no branch that consumes one, and an implementer who finds themselves passing a
 proof down into `net/` has crossed the boundary of §1.2 prohibition 7 and should
@@ -2806,6 +2970,7 @@ parameters beside it genuinely are local: a denser mesh costs only its owner.
 | **D-011** rule 1 — this document is the normative owner of transport, discovery and connectivity, and restates nothing another document owns. Seven restatements are now pointers, listed site by site in §0.3: the slot key, the unchained sentinel envelope, every two-sided size constant, the lobby validation checklist, the snapshot request and response bodies, the table-stream framing and its sizing argument, and the lobby freshness and skew rules. Rule 2 — the slot key is that one tuple and appears here **only** by reference. Rule 3 — D-010 point 3 binds this layer, which is what §0 exists to record | §0, §0.3, §1.3.2(iii), §6.4, §6.5, §7.3, §8.4, §10.3, §11.3, §11.5, §14 |
 | **D-012** — no canonical state from a per-receiver quantity. This layer produces almost all of them, so the rule lands here as a constraint on outputs: prohibition 8 in §1.2, the catalogue of every per-receiver quantity and where each may go in §0.5.2, the one transport value that legitimately sits in a chained body and why it is safe in §0.5.3, clock-derived acceptance confined to unchained lobby traffic in §0.5.4, relay capacity gating only our own request for a seat in §0.5.5, and the snapshot merge and the lobby TTLs confirmed as local views in §7.4, §7.5 and §10.4. **The one site reported and not fixed is now fixed**, by `PROTOCOL.md` §3.1 under D-013's J1 rule: `advert_hash` no longer reaches `GENESIS(0)`, `session_id` or `ctx`, `table_params_hash` replaced it, and this layer has **no** remaining per-receiver quantity with a canonical destination — §0.5.6 records the disposition and why neither remedy this document proposed was the one adopted | §0.5, §1.2 prohibition 8, §2.2, §6.4, §7.3, §7.4, §7.5, §8.4, §9.5, §9.6, §10.3, §10.4, §11.5.2 |
 | **D-013** — liveness is inherited from the chain, not from a seat's status. The rule, the required set and its notation are `PROTOCOL.md` §3.2's and this document reproduces none of them. What lands here is one prohibition and one retirement. **The prohibition (§0.5.7):** connection state, drop time, relay status and keep-alive results may never contribute to the participation record that decides who must emit next hand — they are §0.5.2's first row, they agree with the chain most of the time, and that is what makes substituting them attractive and the resulting fork rare and hard to reproduce. This is §1.2 prohibition 8 with a **new consumer**, not a new rule: the prohibition is unchanged, but a wrong answer now decides a required emitter set rather than a status nothing acts on, so its failure mode moved from a wasted hand to `THREAT_MODEL.md`'s **X36**. **Re-entry is signed, never sensed:** a reconnected socket, a re-established reservation or a peer reappearing in a snapshot is not a re-entry and may not be reported as one. **The retirement:** §0.5.6's open site, and with it the last qualification on §0.5.2's merged-lobby-view row | §0.5.6, §0.5.7, §1.2 prohibition 8, §1.3.1, §7.4, §8.4, §10.4, §11.5 |
+| **D-014** — a cheater is removed from the table on self-authenticating evidence. **This layer's disposition is: no change to any behaviour, and a change to two scope words.** D-014 narrows D-010 point 3 above this layer and nowhere in it; §0.1 and §1.2 prohibition 7 stated that rule in the every-layer form D-011 rule 3 gave it, so until this pass this document — carrying **zero** occurrences of `D-014` — asserted the negation of a binding decision rather than merely omitting it. Both now say **at this layer**, and both name the exception without restating it (D-011 rule 1: the decision is `DECISIONS.md`'s, the wire `PROTOCOL.md` §4.0/§4.9's, the seat `STATE_MACHINE.md` T64/T65/I34's, the proofs `CRYPTOGRAPHY.md` §8.1's). The exception is **one** input — a tier-1 finding: an event signed by the accused whose illegality any peer decides alone from that event's own bytes — and **one** consequence: the loss of a **seat**. No socket is closed, no dial refused, no reservation withdrawn and no name persisted by it; `block_peer` keeps its single caller, the user (§11.5.3). Every liveness and attribution judgement this layer can make stays prohibited as an input to any removal, at any layer (§0.6.3), and every §0.2 "kept" defence — resource, rate, size, admission, capacity, membership, user choice — is untouched and must stay visibly separate from it. §11.5.1 additionally carries the paragraph that stops an implementer arriving from T64 reading it as licence to block | §0, §0.1, §0.2, §0.6, §1.2 prohibition 7, §11.5.1, §11.5.3 |
 
 ---
 

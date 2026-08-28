@@ -78,9 +78,10 @@ pub const RATED_SNG_POKERTH_V1: Preset = Preset {
     action_timeout_grace_sec: 5,
     crypto_step_timeout_sec: 30,
     hand_delay_sec: 7,
-    // 2 297 s is this preset's own floor at ten seats; the extra buys
-    // reopening raises. See `hand_deadline_floor_ms`.
-    hand_deadline_sec: 2_700,
+    // Normative in `PROTOCOL.md` §13. The floor at ten seats is 2 297 000 ms,
+    // so this clears it by 1 003 000 ms, which buys exactly four reopening
+    // raises per hand and stays under the 3 600 000 ms cap.
+    hand_deadline_sec: 3_300,
     join_deadline_sec: 120,
 };
 
@@ -358,6 +359,28 @@ mod tests {
                 p.hand_deadline_floor_ms()
             );
         }
+    }
+
+    /// The rated preset is a **named** preset, so its name implies exact
+    /// values and `hand_deadline_ms` is signed into the table parameter hash.
+    /// A client built from a different number cannot join a table advertised
+    /// by one built from this one - so the value is pinned to the document,
+    /// not merely checked against the floor.
+    ///
+    /// An earlier version shipped 2 700 s. It cleared the floor and passed a
+    /// `reopenings() >= 1` check, and was still wrong: it made this client a
+    /// different table from every conforming one.
+    #[test]
+    fn the_rated_preset_matches_the_normative_value_exactly() {
+        assert_eq!(
+            RATED_SNG_POKERTH_V1.hand_deadline_sec, 3_300,
+            "PROTOCOL.md section 13 is normative for a named preset"
+        );
+        assert_eq!(
+            RATED_SNG_POKERTH_V1.reopenings(),
+            4,
+            "section 8.2 derives four reopening raises at this value"
+        );
     }
 
     #[test]

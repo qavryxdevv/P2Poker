@@ -89,6 +89,13 @@ pub struct AgreedCheckpoint {
     state_hash: Hash,
     /// The chain position it fixes.
     sequence: u64,
+    /// Which checkpoint of the hand this is, `1..=8`.
+    ///
+    /// The position half of the precondition. A violation is judged against
+    /// state fixed at a particular point of the hand, and a checkpoint from
+    /// *earlier* in the same hand has not fixed it yet — so the hand matching
+    /// is necessary and not sufficient.
+    number: u8,
     /// The hand it covers. A checkpoint from another hand judges nothing here.
     hand_id: u64,
     /// Every seat that signed it.
@@ -106,6 +113,11 @@ pub enum WitnessError {
     ReceiverNotAnEmitter,
     /// The checkpoint covers a different hand from the offending message.
     WrongHand { checkpoint: u64, message: u64 },
+    /// The checkpoint is from earlier in the hand than the state this
+    /// violation is judged against, so it has not fixed that state.
+    CheckpointTooEarly { have: u8, need: u8 },
+    /// Not a checkpoint number this protocol defines.
+    CheckpointOutOfRange(u8),
 }
 
 impl core::fmt::Display for WitnessError {
@@ -121,6 +133,13 @@ impl core::fmt::Display for WitnessError {
                 f,
                 "checkpoint covers hand {checkpoint}, the message is from hand {message}"
             ),
+            WitnessError::CheckpointTooEarly { have, need } => write!(
+                f,
+                "checkpoint {have} is earlier than {need}, so it has not fixed this state"
+            ),
+            WitnessError::CheckpointOutOfRange(n) => {
+                write!(f, "checkpoint {n} is outside the defined range 1..=8")
+            }
         }
     }
 }
@@ -135,12 +154,16 @@ impl AgreedCheckpoint {
     pub fn covering(
         state_hash: Hash,
         sequence: u64,
+        number: u8,
         hand_id: u64,
         emitters: Vec<PlayerId>,
         accused: &PlayerId,
         receiver: &PlayerId,
         message_hand_id: u64,
     ) -> Result<Self, WitnessError> {
+        if !Self::CHECKPOINT_RANGE.contains(&number) {
+            return Err(WitnessError::CheckpointOutOfRange(number));
+        }
         if hand_id != message_hand_id {
             return Err(WitnessError::WrongHand { checkpoint: hand_id, message: message_hand_id });
         }
@@ -150,7 +173,15 @@ impl AgreedCheckpoint {
         if !emitters.contains(receiver) {
             return Err(WitnessError::ReceiverNotAnEmitter);
         }
-        Ok(AgreedCheckpoint { state_hash, sequence, hand_id, emitters })
+        Ok(AgreedCheckpoint { state_hash, sequence, number, hand_id, emitters })
+    }
+
+    /// The checkpoint numbers this protocol defines.
+    pub const CHECKPOINT_RANGE: core::ops::RangeInclusive<u8> = 1..=8;
+
+    /// Which checkpoint of the hand this is.
+    pub fn number(&self) -> u8 {
+        self.number
     }
 
     pub fn state_hash(&self) -> Hash {
@@ -179,12 +210,25 @@ pub struct Tier2Finding {
 
 impl Tier2Finding {
     /// Build a finding, which requires naming the checkpoint it is judged
-    /// against.
+    /// against **and** that the checkpoint is late enough to have fixed the
+    /// state in question.
     ///
     /// There is deliberately no other constructor. A caller holding only a
-    /// local view has nothing to pass here, which is the point.
-    pub fn new(violation: StateDependent, against: AgreedCheckpoint) -> Self {
-        Tier2Finding { violation, against }
+    /// local view has nothing to pass here, which is the point; and a caller
+    /// holding a checkpoint from earlier in the hand has a witness to state
+    /// that was not yet settled when the accused acted.
+    pub fn new(
+        violation: StateDependent,
+        against: AgreedCheckpoint,
+        fixed_at_checkpoint: u8,
+    ) -> Result<Self, WitnessError> {
+        if against.number() < fixed_at_checkpoint {
+            return Err(WitnessError::CheckpointTooEarly {
+                have: against.number(),
+                need: fixed_at_checkpoint,
+            });
+        }
+        Ok(Tier2Finding { violation, against })
     }
 
     pub fn violation(&self) -> StateDependent {
@@ -283,17 +327,19 @@ mod tests {
     const HAND: u64 = 5;
 
     /// A witness both parties signed, covering the hand in question.
+    const CP: u8 = 5;
+
     fn checkpoint() -> AgreedCheckpoint {
         AgreedCheckpoint::covering(
-            [1u8; 32],
-            42,
-            HAND,
+            [1u8; 32], 42, CP, HAND,
             vec![ACCUSED, RECEIVER],
-            &ACCUSED,
-            &RECEIVER,
-            HAND,
+            &ACCUSED, &RECEIVER, HAND,
         )
-        .expect("both parties signed it and it covers this hand")
+        .expect("both parties signed it, it covers this hand, and 5 is in range")
+    }
+
+    fn finding(v: StateDependent) -> Tier2Finding {
+        Tier2Finding::new(v, checkpoint(), CP).expect("the witness is late enough")
     }
 
     #[test]
@@ -314,7 +360,7 @@ mod tests {
 
     #[test]
     fn tier_two_removes_only_when_judged_against_an_agreed_checkpoint() {
-        let finding = Finding::Tier2(Tier2Finding::new(StateDependent::OutOfTurn, checkpoint()));
+        let finding = Finding::Tier2(finding(StateDependent::OutOfTurn));
         let (outcome, order) = adjudicate(ACCUSED, finding, EVIDENCE);
         assert_eq!(outcome, Outcome::VoidHandAndRemove);
         assert!(order.is_some());
@@ -344,7 +390,7 @@ mod tests {
     fn every_finding_voids_the_hand() {
         let cases = [
             Finding::Tier1(SelfContained::Malformed),
-            Finding::Tier2(Tier2Finding::new(StateDependent::OutOfTurn, checkpoint())),
+            Finding::Tier2(finding(StateDependent::OutOfTurn)),
             Finding::Tier2Unconfirmed(StateDependent::OutOfTurn),
         ];
         for finding in cases {
@@ -381,7 +427,7 @@ mod tests {
             StateDependent::ShowdownClaimFalse,
             StateDependent::ActionInWrongPhase,
         ] {
-            let text = explain(&Finding::Tier2(Tier2Finding::new(violation, checkpoint())));
+            let text = explain(&Finding::Tier2(finding(violation)));
             assert!(seen.insert(text), "{violation:?} reuses another's wording");
         }
     }
@@ -391,9 +437,10 @@ mod tests {
     #[test]
     fn a_tier_two_finding_names_the_state_it_was_judged_against() {
         let cp = checkpoint();
-        let finding = Tier2Finding::new(StateDependent::RaiseBelowMinimum, cp.clone());
-        assert_eq!(finding.checkpoint(), &cp);
-        assert_eq!(finding.violation(), StateDependent::RaiseBelowMinimum);
+        let f = Tier2Finding::new(StateDependent::RaiseBelowMinimum, cp.clone(), CP)
+            .expect("late enough");
+        assert_eq!(f.checkpoint(), &cp);
+        assert_eq!(f.violation(), StateDependent::RaiseBelowMinimum);
     }
 
     /// The witness has to witness the thing. A checkpoint the accused never
@@ -405,7 +452,7 @@ mod tests {
         let stranger: PlayerId = [77u8; 32];
         assert_eq!(
             AgreedCheckpoint::covering(
-                [1u8; 32], 42, HAND,
+                [1u8; 32], 42, CP, HAND,
                 vec![RECEIVER, stranger],
                 &ACCUSED, &RECEIVER, HAND
             ),
@@ -418,7 +465,7 @@ mod tests {
         let stranger: PlayerId = [77u8; 32];
         assert_eq!(
             AgreedCheckpoint::covering(
-                [1u8; 32], 42, HAND,
+                [1u8; 32], 42, CP, HAND,
                 vec![ACCUSED, stranger],
                 &ACCUSED, &RECEIVER, HAND
             ),
@@ -432,12 +479,56 @@ mod tests {
     fn a_checkpoint_from_another_hand_cannot_witness_a_finding() {
         assert_eq!(
             AgreedCheckpoint::covering(
-                [1u8; 32], 42, HAND,
+                [1u8; 32], 42, CP, HAND,
                 vec![ACCUSED, RECEIVER],
                 &ACCUSED, &RECEIVER, HAND + 1
             ),
             Err(WitnessError::WrongHand { checkpoint: HAND, message: HAND + 1 })
         );
+    }
+
+
+    /// The position half of the precondition, which was a comment for two
+    /// review passes. A checkpoint from earlier in the same hand has not fixed
+    /// the state the violation is judged against, so it witnesses nothing.
+    #[test]
+    fn a_checkpoint_from_earlier_in_the_hand_cannot_witness_a_finding() {
+        let early = AgreedCheckpoint::covering(
+            [1u8; 32], 10, 2, HAND,
+            vec![ACCUSED, RECEIVER],
+            &ACCUSED, &RECEIVER, HAND,
+        )
+        .expect("checkpoint 2 is well formed");
+
+        assert_eq!(
+            Tier2Finding::new(StateDependent::RaiseBelowMinimum, early, 5),
+            Err(WitnessError::CheckpointTooEarly { have: 2, need: 5 })
+        );
+    }
+
+    #[test]
+    fn a_later_checkpoint_still_witnesses_an_earlier_requirement() {
+        let late = AgreedCheckpoint::covering(
+            [1u8; 32], 90, 8, HAND,
+            vec![ACCUSED, RECEIVER],
+            &ACCUSED, &RECEIVER, HAND,
+        )
+        .unwrap();
+        assert!(Tier2Finding::new(StateDependent::OutOfTurn, late, 3).is_ok());
+    }
+
+    #[test]
+    fn a_checkpoint_number_outside_the_protocol_range_is_refused() {
+        for n in [0u8, 9, 255] {
+            assert_eq!(
+                AgreedCheckpoint::covering(
+                    [1u8; 32], 42, n, HAND,
+                    vec![ACCUSED, RECEIVER],
+                    &ACCUSED, &RECEIVER, HAND,
+                ),
+                Err(WitnessError::CheckpointOutOfRange(n))
+            );
+        }
     }
 
     /// `ParentUnknown` used to sit in tier 1. It is decidable only against the

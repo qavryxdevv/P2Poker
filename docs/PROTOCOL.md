@@ -1973,19 +1973,23 @@ cheating and it never keys on `attributed`. Block-listing an identity is a
 > box that accuses a compliant document of non-compliance sends the next reader to
 > re-fix something already fixed, and is the same class of defect as `N8` — a
 > citation that outran its source, pointing the other way. **What `NETWORK_STACK.md`
-> does still owe is the *exception*, not the rule**: it carries **zero**
-> occurrences of `D-014`, and its §0.1 and §1.2 prohibition 7 state the
-> no-unseating rule in the corpus-wide, every-layer form that D-014 tier 1
-> narrows. That is filed in `DECISIONS.md`'s open list, with line numbers, as
-> `P5`; it is not edited from here (D-011 rule 1).
+> owed was the *exception*, not the rule, and it is now paid**: it carried **zero**
+> occurrences of `D-014` while its §0.1 and §1.2 prohibition 7 stated the
+> no-unseating rule in the corpus-wide, every-layer form D-014 tier 1 narrows —
+> a contradiction rather than an omission. Both sites now say *at this layer* and
+> name the exception without restating it, §11.5.1's box is unchanged and gains
+> the paragraph that stops an implementer arriving from `STATE_MACHINE.md` T64
+> reading it as licence to call `block_peer`, and that layer's own D-014 pass is
+> `NETWORK_STACK.md` §0.6. **The transport prohibition is absolute and unamended**,
+> exactly as this box has said (`DECISIONS.md` `G4-P5`).
 >
 > **The exception, exactly, and it is narrow.** D-014 narrowed D-010 point 3 and
 > narrowed nothing else. A **tier-1** finding — an event **signed by the accused**
 > whose illegality any peer decides alone from that event's own bytes: a failed
 > `verify_strict` at step 9, a non-canonical encoding at step 2 or step 4, an
 > out-of-range field at step 11, a failed proof at step 14, a deck that is not a
-> permutation, a parent that does not exist, a signer that is not a party to the
-> table — **removes its sender from the table**, by the derivation §4.9's
+> permutation, a signer that is not a party to the table — **removes its sender
+> from the table**, by the derivation §4.9's
 > `kind = 3` box specifies and reaching canonical state only through
 > `HAND_INIT(k+1)`'s collective body. A **tier-2** finding — illegal only against
 > game state — removes nobody until this receiver holds the completed `STATE_ACK`
@@ -1993,6 +1997,22 @@ cheating and it never keys on `attributed`. Block-listing an identity is a
 > **Nothing else moves:** the exception ends in a seat, never in a chip, and
 > D-010 points 1 and 2 stand unamended — `n(1) attributed` is still read by
 > nothing, and no removal is derived from any field naming a culprit.
+>
+> **One clause that stood in this list is deleted and may not return: *the event
+> chains to a parent that does not exist*.** Whether a parent exists is decidable
+> only against **the receiver's own store**, so a single dropped or reordered
+> frame would remove an honest player — the exact failure the two tiers exist to
+> prevent, sitting in the tier meant to be safe. It is gone from §4.9's
+> acceptance gate, from `DECISIONS.md` D-014, from `THREAT_MODEL.md` §5.1's D&A
+> cell and §5.2's row 13, and from `src/security/validation.rs`, whose
+> `no_tier_one_violation_depends_on_the_receivers_store` test is the tripwire
+> against it coming back. A missing parent is still a reason to **buffer or
+> reject** the event (§5.1), which is what it always was; it is not evidence
+> against anybody. `THREAT_MODEL.md` **§5.1.1** states the general test a proposed
+> tier-1 addition must pass — three questions, all of which must be answered *no*:
+> does deciding it read anything the receiver stores; can the answer change with
+> what the network did; does it need a second message, a count, a vote or a
+> certificate — and it is the normative owner of that reasoning (D-011 rule 1).
 >
 > **Everything else in this document keeps the full prohibition.** Every liveness
 > judgement, every attribution, every fault record, every timeout certificate and
@@ -3566,8 +3586,8 @@ The wire consequences are these:
 >
 > **Why the carrier has to be unchained.** Half of D-014's tier 1 is events this
 > protocol never accepts into a chain — a signature that does not verify (§4.0
-> step 9), a non-canonical encoding (§2.5), a field out of range (§4.0 step 11), a
-> parent that does not exist. Those events reach only the peers they were sent to,
+> step 9), a non-canonical encoding (§2.5), a malformed body, a field out of range
+> (§4.0 step 11). Those events reach only the peers they were sent to,
 > so a chained carrier would need the offender's cooperation to place, and a
 > receiver that never saw the offending message would never learn of it. The
 > `DISPUTE` is what puts the bytes in front of every peer; **it is not what makes
@@ -3774,7 +3794,7 @@ receiver's own state**:
 | `1`, uncertified path (`attributed = []`, `cert_hash = None`) — the hand-deadline path and §6.3 case (b) are **one row**, see below | its **own** `hand_deadline_ms` has expired (§8.2), **or** it has itself reached §6.3 case (b) | **buffer, do not reject** |
 | `2`, `3` | `n(3) evidence` verifies — the failing `SHUFFLE_PROOF` or reveal proof carries its own disproof | accept at once |
 | `4` | it is itself in the §6.3 case (c) terminus | **buffer, do not reject** |
-| `6`, tier 1 (D-014) | `n(3) evidence` carries exactly one `SignedEvent` signed by the seat named in `n(1) attributed`, and **this receiver's own** run of §4.0 over that event returns a tier-1 illegality — a signature that does not verify, a non-canonical encoding, an out-of-range field, a failed proof, a parent that does not exist | accept at once |
+| `6`, tier 1 (D-014) | `n(3) evidence` carries exactly one `SignedEvent` signed by the seat named in `n(1) attributed`, and **this receiver's own** run of §4.0 over that event returns a tier-1 illegality — a signature that does not verify, a non-canonical encoding, a malformed message, an out-of-range field, a failed shuffle / decryption-share / key-ownership proof, a deck that is not a permutation, a signer who is not a party to this table. **The list is closed and every member is decidable from the offending event's own bytes**; *a parent that does not exist* stood here and is deleted, because it is decidable only against this receiver's own store (§4.0's box, `THREAT_MODEL.md` §5.1) | accept at once |
 | `6`, tier 2 (D-014) | as above, **and** this receiver holds a completed `STATE_ACK` stage for a checkpoint of the same chain at or before the offending event's `sequence`, whose emitter set contained both the accused and this receiver, **and** the event is illegal against the `PublicTableState` that checkpoint fixed | reject |
 
 **Why the two uncertified `cause = 1` paths are one row, and not two (H4).** They
