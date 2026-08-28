@@ -102,6 +102,21 @@ pub struct AgreedCheckpoint {
     emitters: Vec<PlayerId>,
 }
 
+/// A checkpoint this peer observed, before it is known to witness anything.
+///
+/// Kept apart from [`AgreedCheckpoint`] so the two cannot be confused: this is
+/// what was seen, that is what has been checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedCheckpoint {
+    pub state_hash: Hash,
+    pub sequence: u64,
+    /// Which checkpoint of the hand, `1..=8`.
+    pub number: u8,
+    pub hand_id: u64,
+    /// Every seat that signed it.
+    pub emitters: Vec<PlayerId>,
+}
+
 /// Why a checkpoint cannot witness a finding against this pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WitnessError {
@@ -152,15 +167,13 @@ impl AgreedCheckpoint {
     /// The only constructor. It refuses unless both the accused and this
     /// receiver signed the checkpoint and it covers the message's own hand.
     pub fn covering(
-        state_hash: Hash,
-        sequence: u64,
-        number: u8,
-        hand_id: u64,
-        emitters: Vec<PlayerId>,
+        observed: ObservedCheckpoint,
         accused: &PlayerId,
         receiver: &PlayerId,
         message_hand_id: u64,
     ) -> Result<Self, WitnessError> {
+        let ObservedCheckpoint { state_hash, sequence, number, hand_id, emitters } = observed;
+
         if !Self::CHECKPOINT_RANGE.contains(&number) {
             return Err(WitnessError::CheckpointOutOfRange(number));
         }
@@ -331,9 +344,16 @@ mod tests {
 
     fn checkpoint() -> AgreedCheckpoint {
         AgreedCheckpoint::covering(
-            [1u8; 32], 42, CP, HAND,
-            vec![ACCUSED, RECEIVER],
-            &ACCUSED, &RECEIVER, HAND,
+            ObservedCheckpoint {
+                state_hash: [1u8; 32],
+                sequence: 42,
+                number: CP,
+                hand_id: HAND,
+                emitters: vec![ACCUSED, RECEIVER],
+            },
+            &ACCUSED,
+            &RECEIVER,
+            HAND,
         )
         .expect("both parties signed it, it covers this hand, and 5 is in range")
     }
@@ -452,9 +472,16 @@ mod tests {
         let stranger: PlayerId = [77u8; 32];
         assert_eq!(
             AgreedCheckpoint::covering(
-                [1u8; 32], 42, CP, HAND,
-                vec![RECEIVER, stranger],
-                &ACCUSED, &RECEIVER, HAND
+                ObservedCheckpoint {
+                state_hash: [1u8; 32],
+                sequence: 42,
+                number: CP,
+                hand_id: HAND,
+                emitters: vec![RECEIVER, stranger],
+            },
+                &ACCUSED,
+                &RECEIVER,
+                HAND,
             ),
             Err(WitnessError::AccusedNotAnEmitter)
         );
@@ -465,9 +492,16 @@ mod tests {
         let stranger: PlayerId = [77u8; 32];
         assert_eq!(
             AgreedCheckpoint::covering(
-                [1u8; 32], 42, CP, HAND,
-                vec![ACCUSED, stranger],
-                &ACCUSED, &RECEIVER, HAND
+                ObservedCheckpoint {
+                state_hash: [1u8; 32],
+                sequence: 42,
+                number: CP,
+                hand_id: HAND,
+                emitters: vec![ACCUSED, stranger],
+            },
+                &ACCUSED,
+                &RECEIVER,
+                HAND,
             ),
             Err(WitnessError::ReceiverNotAnEmitter)
         );
@@ -479,9 +513,16 @@ mod tests {
     fn a_checkpoint_from_another_hand_cannot_witness_a_finding() {
         assert_eq!(
             AgreedCheckpoint::covering(
-                [1u8; 32], 42, CP, HAND,
-                vec![ACCUSED, RECEIVER],
-                &ACCUSED, &RECEIVER, HAND + 1
+                ObservedCheckpoint {
+                state_hash: [1u8; 32],
+                sequence: 42,
+                number: CP,
+                hand_id: HAND,
+                emitters: vec![ACCUSED, RECEIVER],
+            },
+                &ACCUSED,
+                &RECEIVER,
+                HAND + 1,
             ),
             Err(WitnessError::WrongHand { checkpoint: HAND, message: HAND + 1 })
         );
@@ -494,9 +535,16 @@ mod tests {
     #[test]
     fn a_checkpoint_from_earlier_in_the_hand_cannot_witness_a_finding() {
         let early = AgreedCheckpoint::covering(
-            [1u8; 32], 10, 2, HAND,
-            vec![ACCUSED, RECEIVER],
-            &ACCUSED, &RECEIVER, HAND,
+            ObservedCheckpoint {
+                state_hash: [1u8; 32],
+                sequence: 10,
+                number: 2,
+                hand_id: HAND,
+                emitters: vec![ACCUSED, RECEIVER],
+            },
+            &ACCUSED,
+            &RECEIVER,
+            HAND,
         )
         .expect("checkpoint 2 is well formed");
 
@@ -509,9 +557,16 @@ mod tests {
     #[test]
     fn a_later_checkpoint_still_witnesses_an_earlier_requirement() {
         let late = AgreedCheckpoint::covering(
-            [1u8; 32], 90, 8, HAND,
-            vec![ACCUSED, RECEIVER],
-            &ACCUSED, &RECEIVER, HAND,
+            ObservedCheckpoint {
+                state_hash: [1u8; 32],
+                sequence: 90,
+                number: 8,
+                hand_id: HAND,
+                emitters: vec![ACCUSED, RECEIVER],
+            },
+            &ACCUSED,
+            &RECEIVER,
+            HAND,
         )
         .unwrap();
         assert!(Tier2Finding::new(StateDependent::OutOfTurn, late, 3).is_ok());
@@ -522,9 +577,16 @@ mod tests {
         for n in [0u8, 9, 255] {
             assert_eq!(
                 AgreedCheckpoint::covering(
-                    [1u8; 32], 42, n, HAND,
-                    vec![ACCUSED, RECEIVER],
-                    &ACCUSED, &RECEIVER, HAND,
+                    ObservedCheckpoint {
+                        state_hash: [1u8; 32],
+                        sequence: 42,
+                        number: n,
+                        hand_id: HAND,
+                        emitters: vec![ACCUSED, RECEIVER],
+                    },
+                    &ACCUSED,
+                    &RECEIVER,
+                    HAND,
                 ),
                 Err(WitnessError::CheckpointOutOfRange(n))
             );
