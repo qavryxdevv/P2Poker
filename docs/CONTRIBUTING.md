@@ -77,8 +77,11 @@ One commit does one thing and leaves the tree building and green. The unit is a
   odd-chip rule` explains in its body why pots are derived rather than accumulated
   and what that buys — that is the standard. A body that only restates the subject
   is a body that will not help the person who bisects to it.
-* Where tests were run, the message records the command and the result, e.g.
-  `cargo test -- --test-threads=19   22 passed, 0 failed`.
+* Where tests were run, the message records the command and **what it actually
+  said**, e.g. `cargo test --no-fail-fast -- --test-threads=19   54 passed;
+  4 failed (random_hands, pre-existing, see §5)`. A red suite is recorded as red,
+  with the failures named. Rounding a run up to "tests pass" is the same failure as
+  claiming a lint that did not run.
 * Commits are in English. So is the code, and so are the documents. (Conversation is
   in Czech; the repository is not.)
 
@@ -198,8 +201,8 @@ written to stop. See §4.5.
 ## 2. Evidence: how a claim earns its place
 
 `SPEC_CS.md` §36 closes with *"security-critical claims must be demonstrable"*. These
-rules are how that is enforced in day-to-day work, and all four came from this
-project getting it wrong first.
+rules are how that is enforced in day-to-day work, and every one of the five came
+from this project getting it wrong first.
 
 ### 2.1 Every API claim is verified by compiling or by reading crate source
 
@@ -567,8 +570,11 @@ A dependency change is a security-critical change whenever the crate is in
 `DEPENDENCIES.md` §5. It follows §1.3 like any other, and additionally:
 
 1. **Update `Cargo.lock` and commit it** in the same commit.
-2. **Run `DEPENDENCIES.md` §10's commands** and update that register: the 425 / 611 /
-   186 counts, the affected §5 rows, and §4's advisory table.
+2. **Run `DEPENDENCIES.md` §10's commands** and work through its §8.2 checklist: the
+   425 / 611 / 186 counts, the affected §5 rows, §4's advisory table, and §10's
+   mechanical row check over the *whole* register — with its match count checked, or
+   a regex that matched nothing reports the same clean result as a register that is
+   current.
 3. **Do not remove a `=` pin without reading why it is there.** `ziffle`, `mainline`
    and `rs_poker` are exact-pinned for recorded reasons — an unaudited single-author
    crate, an internals dependency that is not semver-stable in practice, and a

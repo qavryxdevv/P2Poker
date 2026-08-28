@@ -113,6 +113,25 @@ has three rules and all three bind this document:
    one; all three are deleted. Until they were, this document's claim that a
    proof "block-lists nobody" was true only of this document.
 
+**D-012 outranks D-011, and it adds a row rather than moving one.** Its rule:
+**no canonical state — nothing entering a state hash, a roster hash, a chained
+event body or the next hand's genesis — may be derived from a quantity that can
+differ between honest receivers.** Canonical state changes only through a chained
+event every participant accepted; everything else is a local view. What it
+catalogues here is **X33**: an abort's `attributed` field is per-receiver, a
+transition elsewhere read it into the next hand's roster, and two honest peers
+therefore forked the table permanently. Three things about it are worth carrying
+into the reading of §5. It needs **no attacker** — silence is enough, and silence
+is free under X7 — so it is classified **DNA** for a reason no other row has:
+there is nobody to name. It was created by the fix that unfroze the stalled hand,
+which is a **third defect shape** to set beside D-011's two, and the one that
+tells a reviewer where to look next: *the path the previous fix newly made
+load-bearing*. And its own fix has a price — nothing marks a seat absent
+automatically any more, so a silent seat is dealt in every hand and stalls each
+one to the deadline (X33, `STATE_MACHINE.md` Q7). D-012 also carries a process
+rule this document is bound by: **every decision sweep covers every document**,
+because twice a document scoped out by judgement became a blocking defect.
+
 Read the catalogue in §5 with all of that in front of you. **Two payoffs have
 been deleted from the design, and every row that turned on either is
 re-classified.** The first was chips: every row whose payoff was chips taken
@@ -491,7 +510,10 @@ signed state transition from it, and forbids a fold-effect certificate at two
 seats; **D-008** generalises the protection to the quantity that actually governs
 it, so a certificate with `|V| < 2` has no effect **at any seat count**, and `V`
 cannot be shrunk by assertion. At `n = 2`, `|V| = 1` always, which is why the
-heads-up case is the permanent instance of this. See X10, X30, §9.1 and OQ-A.
+heads-up case is the permanent instance of this. See X10, X30 and §9.1. What an
+unfinishable hand then does with the chips was carried here as a lettered open
+question; it is **closed by D-010** — restoration on every path — and the letter
+`OQ-A` now names a different question (§9.2).
 *If false:* i.e. if any single peer's clock assertion were honoured, that peer
 could steal the action from a player who was about to act — which is precisely
 the `|V| = 1` case D-007 and D-008 refuse to build on.
@@ -903,7 +925,7 @@ addressed in §6 or §7.
 |---|---|
 | **CP** — cryptographically prevented | Under assumptions A1–A7 (and the specific ones named in the row), the adversary cannot construct a message that both achieves the goal and is accepted by an honest client. The adversary's only option is to be rejected. This includes attacks that are *structurally excluded*, i.e. for which no message in the protocol's grammar could express the attack. |
 | **D&A** — detected and attributed | The adversary *can* emit the message. Every honest client rejects it, the state does not advance, and the misbehaviour is bound to a specific application key by a signature, so the evidence is transferable to third parties. **Under D-010 the second half of the name is narrower than it sounds and must be read narrowly:** attribution puts a signed name in the transcript and nothing follows from it automatically — no forfeiture, no block list, no unseating. D&A means *detected and named*, never *detected and answered*. **D-011 rule 3 is what makes the "no block list" half true at every layer rather than only in this document**: until it landed, `NETWORK_STACK.md` still called `block_peer` on an `EquivocationProof` in two places and `STATE_MACHINE.md` still unseated a seat on a self-contained proof in one, so a row classified D&A here could still cost the *accused* — honest or not — its connections. That gap is closed, and the honest reading of every D&A row is now uniform: rejection, a name in the transcript, and nothing else. |
-| **DNA** — detected but not attributable | The divergence or conflict is detected, and play stops, but the transcript does not establish *who* was at fault. |
+| **DNA** — detected but not attributable | The divergence or conflict is detected, and play stops, but the transcript does not establish *who* was at fault. **Two different situations share this bucket, and X33 is the first of the second kind:** either an adversary is present and the design cannot name them (X10, X22, X29), or **there is no adversary at all** and the design has produced a divergence between honest peers (X33). Both are "detected, nobody named"; only the first is somebody escaping a name. |
 | **V** — visible, not prevented | The attack **succeeds**. Nothing rejects it, nothing in the protocol acts against the attacker, and no proof changes the outcome. What the design delivers is a signed, permanent record that it happened, and a per-identity count of it in the lobby. This is the weakest non-OOS bucket in the scheme, and `SPEC_CS.md` §18 forbids describing a row in it as anything more than visible. It is distinguished from OOS only in that the attack runs *through the poker protocol* and the protocol therefore sees and records it. |
 | **OOS** — out of scope | The protocol does not and cannot address it. Mitigations may exist and are named, but no security claim is made. |
 
@@ -917,7 +939,9 @@ follows: a label that overstates is the error this document is most concerned
 with.
 
 One row (X7) carries **two classes**, because its class depends on how many seats
-are silent at once and on `n`. A split cell is honest where a single label would
+are silent at once and on `|V|` — never on the seat count `n`, which is the
+scoping D-008 point 4 makes a defect wherever it survives. A split cell is honest
+where a single label would
 overstate one of the cases; it is written as `D&A / DNA` and the cases are
 enumerated in the justification. Splitting is not a way to avoid a verdict, and no
 row may split between CP and anything else — CP is a claim about what an adversary
@@ -1017,7 +1041,7 @@ did. A review that works makes the proportion classified as prevented fall.
 | X7 | Withholding decryption shares to force a hand to abort (griefing) | **D&A / DNA** | Permanent and inherent to the n-of-n construction: any player who goes silent makes it impossible for anyone to open any further card. The missing `REVEAL_TOKEN` for a given `(hand_id, card_index)` is publicly visible and every other player's signed events prove they did their part. **Attribution depends on the case and is not uniform:**<br><br>*one silent seat, with `\|V(subject)\| >= 2`* — **D&A**;<br>*two or more seats silent simultaneously* — **DNA**;<br>*any silent seat where `\|V(subject)\| < 2`, which at `n = 2` is always* — **DNA**.<br><br>Attribution is sound for a single silent seat whenever the required voter set still has two or more members; it is unavailable when two or more seats stop at once, because each required voter set contains the other subject and D-008 forbids removing a seat from `V` on anything short of a completed certificate (`PROTOCOL.md` Q-02, `STATE_MACHINE.md` Q3, OQ-E), and unavailable whenever `\|V\| < 2` for the reason in D-007 as generalised by D-008. **It cannot be prevented, and the fix that would prevent it is forbidden** — see §7. **Under D-010 the three cases have identical chip outcomes**: every abort restores every stack to its start-of-hand value, so the silent seat keeps its commitment in all three, and the split above now records only whether the transcript *names* anybody. That distinction no longer changes any outcome, because attribution carries no automatic consequence — it is kept in the split because naming is still what a human or a later version would adjudicate on, and because a document that collapsed the cases would be claiming an attribution property it does not have. The attacker gains no cards. What it gains is a wasted hand; where the silent seat is also the losing seat, that is X8's escape rather than pure griefing, and X8 is where the cost is classified. Repeated aborts attributable to one identity are visible to everyone and counted per identity in the lobby; in play money that is the whole penalty, and `SPEC_CS.md` §18 forbids claiming more. |
 | X8 | **The rage-quit escape, reopened by D-010**: a player about to lose a large pot stalls or disconnects, the hand aborts, and their committed chips come back to them | **V** — visible, not prevented | **This row is D-010's accepted cost, carried as a catalogue entry in its own right rather than as a footnote to a decision.** D-005 closed this escape with forfeiture: the vanished player's committed chips were distributed to the remaining players in proportion to their own contributions, so quitting cost exactly what folding would have cost. **D-010 reverses that**, knowingly and with the reason recorded: forfeiture was the prize that made five successive rounds of attacks worth mounting, and every severe one of them ended in an *honest* peer's chips being taken and its key blocked for following the protocol (X30, X31, X32). An exploit that harms an honest player is worse than one that merely lets a dishonest player escape a loss, so the escape is accepted and the machinery is deleted.<br><br>**What the attack now is.** Any player, at any table size, at will, with no special capability, no coalition, no modified client beyond the ability to stop sending: stop publishing at a cryptographic step, wait, and the hand ends with every stack restored. There is no `\|V\|` condition on it any more, no `cause` on which it fails, and nothing that distinguishes it from the honest disconnect it imitates. The one case it does not reach is unchanged and is worth stating, because it is the only structural bound: **the hand completes normally if everybody else folds**, so a quitter does not escape when the others simply fold.<br><br>**The mitigations, in full, and there are exactly two.** (i) The transcript records the abort and the missing contribution, signed, permanently, and every participant can verify which peer stopped publishing — where a certificate can attribute, it is named outright, and where it cannot the gap in the stage is still legible. (ii) The client shows a **per-identity abort count in the lobby**, so players can decline to sit with someone who does it. Both are *social*: sitting a repeat aborter out is a user decision, never a protocol action (D-010 point 3). Neither has teeth, and §6 says why — a new identity is a locally generated keypair and costs nothing.<br><br>**What may not be claimed about this row.** `SPEC_CS.md` §18 forbids describing a merely visible failure as prevented or detected-and-punished, and this row is the corpus's clearest instance of one: some cheating is prevented, some is detected, and this is **merely visible**. No document may say the escape is closed, bounded by a penalty, deterred by reputation, or made expensive. It is none of those.<br><br>**What is still true, and it is the one thing the design keeps.** The escape is **slow and legible**, not instantaneous. A below-floor certificate is inert (D-009 rule 2), so no single message voids a hand: the quitter must stall for the whole hand deadline — **[R16]** whose value is `PROTOCOL.md` §8.4's and is not printed here — with the missing contribution visible the whole time, and the abort count rises. That is a difference in cost and in visibility, not in outcome, and it must not be reported as more. **One thing this row used to be able to claim and can no longer:** that the escape at least left the quitter exposed to the transport-layer consequences of any proof they generated on the way out. There are none (D-011 rule 3). The escape now costs a stall and nothing else. §7.4 records the trade and §9.1.2 limitation 4 carries it as a limitation. Revisited before real money, and not before the certificate, equivocation and dispute machinery has survived a full adversarial pass (D-010, closing paragraph). |
 | X9 | Knock an opponent off the network right after a large bet | **OOS**, and **its payoff is deleted by D-010** | This row existed because D-005 handed the attacker something: the victim's forfeited commitment, distributed to the seats still in the hand, one of which was the attacker's. **Under D-010 there is nothing to collect.** The hand aborts, every stack returns to its start-of-hand value, and the attacker has spent a real out-of-protocol capability against the victim's connection (network DoS, or control of the relay that connection depends on — §3.5) to buy a wasted hand — the same outcome the victim's own flaky Wi-Fi would have produced for free. The row stays in the catalogue, and stays **OOS**, because the capability is unchanged and §6 still lists network denial of service as beyond the protocol's reach; what is gone is the *incentive*, and with it the one poker-specific aggravation that made this worse than generic DoS. Note the direction of the trade, stated plainly rather than presented as a win: D-005 closed X8 at the price of X9, and D-010 closes X9 at the price of X8. The reason for preferring this direction is that X9 harms an honest player and X8 only lets a dishonest one escape a loss (D-010). |
-| X10 | A forged timeout certificate by all other dealt-in seats, stealing the subject's action | **DNA** (where `\|V\| >= 2`) | Under **D-006** a timeout takes effect only through a certificate signed by every member of `V(subject)`, the set of **all other dealt-in seats**. **[R19]** What the certificate names and how it chains are `PROTOCOL.md` §4.8's, not this row's. Nominally `\|V\| = n - 1`: **one seat at `n = 2`, two at `n = 3`, nine at `n = 10`** — but that table is a ceiling, not the operative rule. `V` is the other dealt-in seats **minus any seat a completed, valid certificate has already attributed in this hand** (`PROTOCOL.md` §8.3), so the operative quantity is `\|V\|` and every rule in this row is written on `\|V\|` rather than on `n`, per **D-008**. That is not a formality: an earlier draft let a seat be removed from `V` by an unproven accusation, which collapsed `\|V\|` to one at any table size — X30. Requiring all of `V` defeats a single false accuser. It does **not** defeat a coalition consisting of all of them, who are unanimous with themselves — available with two colluders at `n = 3`. The victim can broadcast their own signed action carrying the same parent hash, so any third party sees a conflict — but with no trusted clock (A13) nobody can establish which came first. **Detected, not resolvable.**<br><br>**Whenever `\|V\| < 2` the mechanism gives no protection at all and is therefore inert.** With `\|V\| = 1`, "unanimous" is one signature and unanimity is vacuous; **D-007** makes the heads-up action deadline advisory and produces no signed state transition from it. **The rule is scoped on `\|V\|`, never on the seat count, and both kinds have one disposition.** An earlier revision of this cell said a `kind = 1` certificate "is invalid at two seats and must be rejected by every receiver". **That sentence is withdrawn on both counts** (D-008, `PROTOCOL.md` §8.3): it was scoped on `n`, which is the scoping X30 walked through, and it used the word *invalid*, which `PROTOCOL.md` §8.3 withdrew precisely because it gave `kind = 1` and `kind = 2` two dispositions where D-009 rule 2 gives them one. The disposition is uniform and it is not an error: **a certificate whose required voter set has fewer than two members is silently ignored**, at any seat count and for either kind. **D-008** carries that floor to every seat count: a certificate whose required voter set has fewer than two members has no effect at all — not an error, not evidence, not chained, the deadline simply stays advisory. **D-009 rule 2** makes that unconditional, so it holds for `kind = 2` and for the hand deadline as much as for `kind = 1`: a below-floor certificate **does not end a hand**, and a hand that cannot proceed ends instead when `hand_deadline_ms` expires as a local timer every peer derives from the same signed `HAND_INIT` (§7.3(c), `PROTOCOL.md` §8.4). At `n = 2`, `\|V\| = 1` always, so heads-up is the permanent instance rather than the only one.<br><br>**The race between a late action and a certificate is settled only by the presence of an honest required voter; there is no cryptographic artefact that settles it.** An earlier draft carried this as a separate row claiming the race was structurally impossible, on the argument that a peer emitting both a `TIMEOUT_VOTE` and a real event for one stage had equivocated provably. That claim was false — the vote is signed by the voter and the action by the subject, two events by two different keys, which prove nothing against anyone — and after the `event_class` discriminator (`PROTOCOL.md` §5.2, §4.8) the two do not even occupy the same slot. The honest statement: if at least one required voter is honest and saw the action, no certificate forms and the action stands; if every required voter is dishonest, or none saw the action, a certificate forms. Nothing settles the race when a voter lies about what it saw. OQ-C records the `ACTION_SEEN` construction that would make a lying voter provable, and it is **not** adopted.<br><br>This is a genuine, unfixed limitation of the design and it is carried forward as OQ8 and, for the `\|V\| < 2` case (which heads-up always is), OQ-A. Distinguish it from X30: X10 is a coalition that *legitimately is* the whole voter set; X30 was a single client *manufacturing* that position.<br><br>**What D-010 and D-011 remove from this row, and what they leave.** Removed by D-010: the chip half. A certificate against the subject used to end the hand with the subject's committed chips distributed to the seats that signed it, so a legitimate voter set that was also a coalition could *take* from the honest player it out-voted. It cannot now — the abort is neutral, every stack is restored, and the certificate names a seat without any consequence following from the name. Removed by D-011 rule 3: the escalation. A completed certificate names a seat, and a named seat used to be reachable by the layers that acted on names; no layer acts on one now, so the victim of a forged certificate keeps its seat and its connections as well as its chips. Left standing, and not softened: at `\|V\| >= 2` a coalition that is the whole voter set can still **steal the honest player's action**, folding a hand the player was about to defend, and no artefact settles the race. The classification stays **DNA** for exactly that reason — the theft of an action is real, it is detected, and nobody can be named for it. **What the row's worst case has become is one hand the honest player did not get to play.** |
+| X10 | A forged timeout certificate by all other dealt-in seats, stealing the subject's action | **DNA** (where `\|V\| >= 2`) | Under **D-006** a timeout takes effect only through a certificate signed by every member of `V(subject)`, the set of **all other dealt-in seats**. **[R19]** What the certificate names and how it chains are `PROTOCOL.md` §4.8's, not this row's. Nominally `\|V\| = n - 1`: **one seat at `n = 2`, two at `n = 3`, nine at `n = 10`** — but that table is a ceiling, not the operative rule. `V` is the other dealt-in seats **minus any seat a completed, valid certificate has already attributed in this hand** (`PROTOCOL.md` §8.3), so the operative quantity is `\|V\|` and every rule in this row is written on `\|V\|` rather than on `n`, per **D-008**. That is not a formality: an earlier draft let a seat be removed from `V` by an unproven accusation, which collapsed `\|V\|` to one at any table size — X30. Requiring all of `V` defeats a single false accuser. It does **not** defeat a coalition consisting of all of them, who are unanimous with themselves — available with two colluders at `n = 3`. The victim can broadcast their own signed action carrying the same parent hash, so any third party sees a conflict — but with no trusted clock (A13) nobody can establish which came first. **Detected, not resolvable.**<br><br>**Whenever `\|V\| < 2` the mechanism gives no protection at all and is therefore inert.** With `\|V\| = 1`, "unanimous" is one signature and unanimity is vacuous; **D-007** makes the heads-up action deadline advisory and produces no signed state transition from it. **The rule is scoped on `\|V\|`, never on the seat count, and both kinds have one disposition.** An earlier revision of this cell said a `kind = 1` certificate "is invalid at two seats and must be rejected by every receiver". **That sentence is withdrawn on both counts** (D-008, `PROTOCOL.md` §8.3): it was scoped on `n`, which is the scoping X30 walked through, and it used the word *invalid*, which `PROTOCOL.md` §8.3 withdrew precisely because it gave `kind = 1` and `kind = 2` two dispositions where D-009 rule 2 gives them one. The disposition is uniform and it is not an error: **a certificate whose required voter set has fewer than two members is silently ignored**, at any seat count and for either kind. **D-008** carries that floor to every seat count: a certificate whose required voter set has fewer than two members has no effect at all — not an error, not evidence, not chained, the deadline simply stays advisory. **D-009 rule 2** makes that unconditional, so it holds for `kind = 2` and for the hand deadline as much as for `kind = 1`: a below-floor certificate **does not end a hand**, and a hand that cannot proceed ends instead when `hand_deadline_ms` expires as a local timer every peer derives from the same signed `HAND_INIT` (§7.3(c), `PROTOCOL.md` §8.4). At `n = 2`, `\|V\| = 1` always, so heads-up is the permanent instance rather than the only one.<br><br>**The race between a late action and a certificate is settled only by the presence of an honest required voter; there is no cryptographic artefact that settles it.** An earlier draft carried this as a separate row claiming the race was structurally impossible, on the argument that a peer emitting both a `TIMEOUT_VOTE` and a real event for one stage had equivocated provably. That claim was false — the vote is signed by the voter and the action by the subject, two events by two different keys, which prove nothing against anyone — and after the `event_class` discriminator (`PROTOCOL.md` §5.2, §4.8) the two do not even occupy the same slot. The honest statement: if at least one required voter is honest and saw the action, no certificate forms and the action stands; if every required voter is dishonest, or none saw the action, a certificate forms. Nothing settles the race when a voter lies about what it saw. `PROTOCOL.md` **Q-08** records the `ACTION_SEEN` construction that would make a lying voter provable, and it is **not** adopted. (That question was this document's `OQ-C` until the letter series was reconciled onto `DECISIONS.md`'s — §9.2.)<br><br>This is a genuine, unfixed limitation of the design and it is carried forward as OQ8; for the `\|V\| < 2` case, which heads-up always is, the deadline is simply advisory (D-007, D-008) and there is no chip question left to carry, D-010 having taken restoration everywhere. Distinguish it from X30: X10 is a coalition that *legitimately is* the whole voter set; X30 was a single client *manufacturing* that position.<br><br>**What D-010 and D-011 remove from this row, and what they leave.** Removed by D-010: the chip half. A certificate against the subject used to end the hand with the subject's committed chips distributed to the seats that signed it, so a legitimate voter set that was also a coalition could *take* from the honest player it out-voted. It cannot now — the abort is neutral, every stack is restored, and the certificate names a seat without any consequence following from the name. Removed by D-011 rule 3: the escalation. A completed certificate names a seat, and a named seat used to be reachable by the layers that acted on names; no layer acts on one now, so the victim of a forged certificate keeps its seat and its connections as well as its chips. Left standing, and not softened: at `\|V\| >= 2` a coalition that is the whole voter set can still **steal the honest player's action**, folding a hand the player was about to defend, and no artefact settles the race. The classification stays **DNA** for exactly that reason — the theft of an action is real, it is detected, and nobody can be named for it. **What the row's worst case has become is one hand the honest player did not get to play.** |
 | X12 | Colluding muck: a colluder with the winning hand mucks so the pot goes to their partner | **OOS** | Collusion, §6. It also interacts with an unresolved design question: if mucking is allowed at all, the transcript can only prove "the award was correct given the players who did not forfeit", not "no unrevealed hand was better" (`research/POKER_RULES.md` §A8). That weakens G8 in a precisely stateable way. Mandatory universal reveal removes the attack but changes the game and leaks strictly more than real poker. Unresolved — OQ6. |
 | X13 | Table-advert bait and switch: advertised parameters differ from those actually played | **D&A** | The advert is signed and carries the full parameter set (blinds, stacks, schedule, timers, seats). The parameters that bind are the ones every participant agreed and signed before the first hand (`SPEC_CS.md` §4), and every event carries them transitively through the chain. A mismatch is rejected before any hand starts. |
 | X14 | Protocol-version downgrade | **D&A** | `protocol_version` is inside every signed body and inside `ctx`. A peer offering an older version is refused rather than accommodated (A14). |
@@ -1035,20 +1059,24 @@ did. A review that works makes the proportion classified as prevented fall.
 | X26 | Multi-accounting / Sybil identities at one table | **OOS** | §6. Identity is free: a new profile is a new Ed25519 key. |
 | X27 | Coercion of a player | **OOS** | §6. |
 | X28 | Traffic analysis of relayed and DHT traffic | **OOS** | §6 and §8. The relay sees who talks to whom, when and how much; the DHT publishes presence to strangers on a schedule. |
-| X29 | Fault any table on demand by publishing a false `state_hash` at a checkpoint | **DNA** | A `state_hash` is a one-field value in a message every peer must emit. A single peer that publishes a value it did not derive forces the `PROTOCOL.md` §6.3 case (c) path: the hand aborts with `cause = 4`, stacks are restored, and the table closes, with no attribution live. It needs no invalid signature and no divergent transcript, and "at least two peers disagreeing" is satisfied by one liar plus the honest victim. Bounded by three things — it costs the attacker the table and, in a tournament, their own equity in it; checkpoint 7 sits **before `SHOWDOWN_REVEAL`**, and no checkpoint is placed after a hole card has been opened **to anyone but its owner** (every player opens its own two cards at `DEAL_PRIVATE`, which precedes checkpoints 3–7, so the rule is about *public* opening and is stated that way rather than in the falsifiable shorter form an earlier revision used), so the attacker must commit while it still knows only its own hand; and the evidence, the unanimous transcript plus every peer's signed `STATE_HASH`, is written to the profile directory and **is preserved in a form sufficient for a human, or for a future adjudicator, to diagnose the divergence — no adjudication procedure is specified.** An earlier revision of this row claimed the evidence was "deterministically adjudicable offline by any third party running the reference engine over it, forever". **That claim is withdrawn.** No document in this corpus defines, versions against `protocol_version`, or authorises such a reference engine, and moving a derivation offline does not manufacture the observer-independent reference that this row's own argument says does not exist. Whether a canonical reference engine is named is an open decision, recorded in `docs/DECISIONS.md`'s open list. Until it is, this third bound is **evidence preservation, not recourse**: neither live nor offline adjudication is available, and neither is claimed. An earlier draft resolved case (c) by removing the odd peer out under a "unanimity minus one" rule; that rule was **deleted**, because it let `n-1` colluders take an honest player's committed chips at `n >= 3` (two colluders suffice at `n = 3`), and because there is no observer-independent derivation at run time by which anyone could be named — every peer derives with its own engine, so "attribute whoever disagrees" is a vote over the facts, which `SPEC_CS.md` §15 forbids. Not solved. Related: X8, X22, OQ-D.<br><br>**Under D-010 two of this row's bounds change, one for the better and one for the worse.** Better: the deleted "unanimity minus one" rule can no longer be missed, because there is nothing for it to have done — no proof and no attribution moves a chip, so even a correctly named liar would forfeit nothing, and `cause = 4`'s restoration is no longer a *disposition chosen among alternatives* but the only disposition the MVP has. OQ-D's question therefore shrinks from "who pays" to "does anything distinguish this abort from any other", and the answer is no. Worse, and it must be said: this row used to be one of the two ways to escape a losing pot, and it was the expensive one — it cost the attacker the table. **X8 is now the cheap one**, so an attacker with that motive has no reason to come here at all. What survives as this row's own attack is the griefing use — faulting a table on demand, at the cost of one's own equity in it — and that is unchanged. |
+| X29 | Fault any table on demand by publishing a false `state_hash` at a checkpoint | **DNA** | A `state_hash` is a one-field value in a message every peer must emit. A single peer that publishes a value it did not derive forces the `PROTOCOL.md` §6.3 case (c) path: the hand aborts with `cause = 4`, stacks are restored, and the table closes, with no attribution live. It needs no invalid signature and no divergent transcript, and "at least two peers disagreeing" is satisfied by one liar plus the honest victim. Bounded by three things — it costs the attacker the table and, in a tournament, their own equity in it; checkpoint 7 sits **before `SHOWDOWN_REVEAL`**, and no checkpoint is placed after a hole card has been opened **to anyone but its owner** (every player opens its own two cards at `DEAL_PRIVATE`, which precedes checkpoints 3–7, so the rule is about *public* opening and is stated that way rather than in the falsifiable shorter form an earlier revision used), so the attacker must commit while it still knows only its own hand; and the evidence, the unanimous transcript plus every peer's signed `STATE_HASH`, is written to the profile directory and **is preserved in a form sufficient for a human, or for a future adjudicator, to diagnose the divergence — no adjudication procedure is specified.** An earlier revision of this row claimed the evidence was "deterministically adjudicable offline by any third party running the reference engine over it, forever". **That claim is withdrawn.** No document in this corpus defines, versions against `protocol_version`, or authorises such a reference engine, and moving a derivation offline does not manufacture the observer-independent reference that this row's own argument says does not exist. Whether a canonical reference engine is named is an open decision, recorded in `docs/DECISIONS.md`'s open list. Until it is, this third bound is **evidence preservation, not recourse**: neither live nor offline adjudication is available, and neither is claimed. An earlier draft resolved case (c) by removing the odd peer out under a "unanimity minus one" rule; that rule was **deleted**, because it let `n-1` colluders take an honest player's committed chips at `n >= 3` (two colluders suffice at `n = 3`), and because there is no observer-independent derivation at run time by which anyone could be named — every peer derives with its own engine, so "attribute whoever disagrees" is a vote over the facts, which `SPEC_CS.md` §15 forbids. Not solved. Related: X8, X22, and **OQ-A** — the reference engine this row's withdrawn third bound would need.<br><br>**Under D-010 two of this row's bounds change, one for the better and one for the worse.** Better: the deleted "unanimity minus one" rule can no longer be missed, because there is nothing for it to have done — no proof and no attribution moves a chip, so even a correctly named liar would forfeit nothing, and `cause = 4`'s restoration is no longer a *disposition chosen among alternatives* but the only disposition the MVP has. The `cause = 4` chip question therefore shrinks from "who pays" to "does anything distinguish this abort from any other", and the answer is no; of what that question used to bundle together, the *settle-from-the-last-agreed-checkpoint* half is now `PROTOCOL.md` **Q-07** and the *adjudication* half is **OQ-A** (§9.2). Worse, and it must be said: this row used to be one of the two ways to escape a losing pot, and it was the expensive one — it cost the attacker the table. **X8 is now the cheap one**, so an attacker with that motive has no reason to come here at all. What survives as this row's own attack is the griefing use — faulting a table on demand, at the cost of one's own equity in it — and that is unchanged. |
 | X30 | Shrinking the required voter set to one seat — itself — and then taking the subject's committed chips with a certificate that seat signs alone, at **any** table size | **D&A**, and only because of a rule our own client enforces | **The attack.** `V(subject)` was the other dealt-in seats minus any seat "named as the subject of an outstanding, older unmet deadline", and a seat is *named* by any peer emitting a `TIMEOUT_VOTE` against it — an assertion the protocol concedes is unprovable when the voter lies ("there is no artefact that settles the race when a voter lies about what it saw", `PROTOCOL.md` §8.3). Nothing bounded how many seats one client could name. Six-seat table, one modified client at seat 1: Mallory votes against seats 2, 3, 4 and 5 at one stage; at the next she declares seat 6 the subject, and `V(6) = {1,2,3,4,5} \ {2,3,4,5} = {Mallory}`. She emits the one required vote, assembles a complete certificate from her own signature, the stage completes, a `kind = 2` certificate aborts the hand with seat 6 attributed, and under **D-005** seat 6's committed chips are forfeited to the remaining seats — which is mostly to her.<br><br>**The earlier scoping on `n` did not stop it, and that is the point.** Every protection D-007 wrote was conditioned on `n == 2`; here `n` is six and stays six, so nothing rejected the certificate. The nominal `\|V\| = n - 1` table printed in three documents was never the operative rule — `\|V\|` was `n - 1 - \|excluded\|`, and the attacker controlled `\|excluded\|`. This is the A-1 attack reappearing above heads-up, and worse than A-1, which cost a folded hand rather than chips.<br><br>**The mitigation.** **D-008**: every rule that weakens, disables or gates the certificate is scoped on `\|V\|` and never on `n`; a certificate whose required voter set has fewer than two members **has no effect**; and **a seat leaves `V` only once a completed, valid certificate names it — being voted against is not exclusion.** The second half is what makes the first hold inductively: each exclusion now costs a completed certificate, and each such certificate needed `\|V\| >= 2` at the moment it formed, so `V` cannot be collapsed by assertion at any seat count. Normative in `PROTOCOL.md` §8.3/§8.4 and `STATE_MACHINE.md` §8.4; checkable by any verifier replaying the transcript, with no new cryptography.<br><br>**Why D&A and not CP, stated rather than rounded up.** The message stays constructible: a modified client can always sign and broadcast a one-signer certificate. What changed is that an honest client gives it no effect, so the state does not advance and no chips move; the artefact names its signers, so it is bound to a key. The attribution half is deliberately weak and must not be overstated — under D-008 an inert certificate is *not evidence of misbehaviour*, so no seat is sanctioned for emitting one and nothing is forfeited; what is transferable is the artefact, not a verdict. And the rejection rests on our own clients enforcing the `\|V\|` floor, an implementation obligation in the class of A12 and A14, not on A1–A7 — which is exactly why this row is not CP.<br><br>**Residual.** D-008 closes the *manufactured* `\|V\| = 1`, not the earned one. Where the voter set is honestly small or honestly hostile, X10 stands unchanged (**DNA**), and two or more seats going silent together is still X7's DNA case.<br><br>**D-010 deletes the prize, and the row's title is now historical.** "Taking the subject's committed chips" is what this attack was *for*; a completed certificate no longer moves a chip, so a modified client that succeeded in manufacturing `\|V\| = 1` today would end a hand neutrally and gain nothing that X8 does not give it for less effort. The class stays **D&A** and the floor stays in the client, for two reasons that survive the deletion of the payoff: the certificate is a chained event that **names a seat**, and a corpus that let one peer manufacture a naming would be putting a false attribution into the permanent record that D-010 point 2 says a human may later adjudicate on; and D-010 is explicitly revisitable before real money, at which point the payoff returns and this floor is the only thing standing between it and X30. A defence kept because the decision that removed its necessity is scheduled to be reconsidered is worth saying out loud rather than quietly dropping. |
 | X31 | Two Sybil seats stall one collective stage so that **an honest voter's own two required timeout votes become an `EquivocationProof` against itself** — under D-005 that forfeited the honest player's committed chips and blocked their key; under **D-010** and **D-011 rule 3** it costs a wasted hand | **D&A**, and only because of a slot key our own client enforces | **When it was found this was the most damaging attack any review pass of this corpus had produced**, and it is recorded in its own right rather than folded into X7, because unlike every other row here the victim's *compliance* is the entire exploit. It needs no coalition majority, no cryptographic break, no modified victim and no capability against the victim's connection.<br><br>**The mechanism. [R9]** The wire shape that made it possible is `PROTOCOL.md` §4.8's and the slot it collided in is §5.2's; neither is reproduced here any more, and the tuples this cell used to print are deleted under D-011 rule 1 — printing a superseded key beside a live one is how a reader certifies the next X31 as clean. In classification terms: `TIMEOUT_VOTE` named the seat it was *about* in its body only, so **which seat a vote concerned did not change its slot**, while `PROTOCOL.md` §8.4 specifies two simultaneous subjects at one stage as *normal*. The protocol therefore both required an honest voter to vote against each seat that owed it something, and treated two distinct bodies in that one slot as proof of misbehaviour.<br><br>**The attack.** Identity is free (X26, §6): Mallory seats two keys, `M1` and `M2`, at one table. Both go silent at one collective crypto stage `s` — the capability X7 already concedes to everyone, at zero cost. Honest Bob's timers expire and he does exactly what the protocol asks: `TIMEOUT_VOTE{subject_seat = M1, sequence = s}` and `TIMEOUT_VOTE{subject_seat = M2, sequence = s}`. Two distinct bodies, one slot. Mallory holds both, wraps them as `EquivocationProof{accused = Bob}` — which by design verifies with no table state, no transcript and no knowledge of the game — and files it. `STATE_MACHINE.md` T55 aborts the hand, raises `Fault{Equivocation}`, writes `AbortRecord{kind: Equivocation, attributed: [Bob]}` and — **as the corpus stood under D-005** — applied the forfeiture formula that then existed: Bob's committed chips were distributed to the remaining seats, two of which are Mallory's, and the transport layer put Bob's key on its block list. Repeatable every hand, against a different honest seat each time, at the price of two free keypairs and silence.<br><br>**Both consequences are deleted — the first by D-010, the second only by D-011 rule 3, and the difference is worth recording.** D-010 removed the forfeiture formula, so the filed proof ends a hand neutrally and Bob's stack is restored. This cell then asserted that "Bob's key is not block-listed", and **that assertion was true of this document and false of the corpus**: `NETWORK_STACK.md` still called `block_peer` on an `EquivocationProof` in two places, and `STATE_MACHINE.md` T55/T56 still cited that consequence as live. A threat model that classified the attack on the strength of its own text, while the transport layer went on executing the payoff, is exactly the drift D-011 rule 1 exists to stop — and it was found by a sweep, not by reading this file. With D-011 rule 3 the claim is now true at every layer: Bob keeps his stack **and** his connections, and Mallory has spent two identities and a stall to buy one wasted hand, which X7 already gives her for nothing. The attack's economics collapse entirely. What survives is the *defect*: a specification that requires an honest peer to manufacture verifying evidence against itself is wrong on its own terms, the record is permanent and D-010 point 2 says a human may later adjudicate on it, and D-010 is revisitable before real money. That is why the mitigation below is a change to the canonical predicate rather than a note that it no longer matters.<br><br>**The mitigation is D-009 rule 1, now carried by D-011 rule 2. [R8]** The rule is normative in `PROTOCOL.md` §5.2 and the concrete key change — the subject becoming part of the key rather than of the body alone — is §5.2's and §5.3's to state; the index and tuple this cell used to print are deleted. What the row asserts is the classification consequence: two votes about two subjects occupy two slots, the predicate is not satisfied, and what Mallory files is not a proof of anything. D-011 rule 2 is what makes that durable rather than re-derived — one literal key, one site, `event_type` included — and the property is a standing obligation on every future message type, checked before it is added (G7, §5.5).<br><br>**Why D&A and not CP, stated rather than rounded up.** The artefact stays constructible — anyone can concatenate two of Bob's genuine signed votes and call the result a proof. What changed is that an honest client's predicate no longer matches, so the object verifies as nothing, the state does not advance, and no chips move. The rejection rests on **our own clients implementing the corrected slot key** — an implementation obligation in the class of A12 and A14, not on A1–A7 — which is exactly why this row is not CP. The attribution half is deliberately weak: a purported proof that fails the predicate is *not* evidence of misbehaviour by whoever filed it, so nothing is forfeited from Mallory either, and what is transferable is the artefact, not a verdict.<br><br>**Residual, and it is now the important half.** D-009 rule 1 closes the manufactured proof, not the stall behind it. Two seats going silent together still voids the hand for free, with nobody named and stacks restored — X7's DNA case, open as OQ-E — and Bob still gets no attribution against Mallory for it. **And the rule has since been violated twice more, taking the count to five.** The fourth was `STATE_HASH` re-emission during divergence recovery, **now closed**: a reconciliation round is its own stage with its own `sequence`, so the reconciling peer occupies a fresh slot rather than re-signing into an occupied one (`PROTOCOL.md` §4.9). The fifth is the terminal `HAND_ABORT`, and it is the sharpest of the five because it needs no Sybil pair and no dropped stream — it fires on the shipped heads-up configuration when an opponent simply goes quiet. It is catalogued in its own right as **X32** rather than left as a footnote here, and it is closed by D-011 rule 2. G7's table carries all five; §9.1.2 limitation 12 states why the property is asserted rather than demonstrated until the mirror test exists, and §5.5 is where it is caught. |
 
 | X32 | **The terminus turns on the peer that reaches for it**: an opponent goes quiet at a collective stage, and the mechanism that exists to end the stalled hand — the terminal `HAND_ABORT` — is written at the stalled stage's own index, where the honest peer that already contributed to that stage has signed a different body. Its own abort is rejected, so the hand cannot end, **and the pair is a verifying `EquivocationProof` against the peer that emitted it** | **D&A**, and only because of a slot key our own client enforces | **The lesson this row exists to record: a mechanism built to end a stalled hand can itself become the evidence against the honest peer that emits it.** Every other row in this catalogue is an attack somebody mounts. This one is a *rescue path* that incriminates its user, and the attacker's whole contribution is to stop sending — the capability X7 already concedes to everyone for free. It was created by the fix to a different defect, which is the pattern worth naming: the flaw is never in the rule that was just written, it is in the path that rule newly made load-bearing.<br><br>**The two halves.** *(a) Liveness.* The abort chains from the last complete stage, so it lands at the stalled stage's index — there is no other index available, because the stalled stage never closed and nothing can chain from a `stage_hash` that does not exist. Every peer that contributed to that stage has already occupied that slot, so its own abort is a differing body at an occupied slot and is rejected by every receiver, its own client included. The only peers with a free slot there are the silent ones the abort exists to dispose of. On the shipped heads-up configuration there is no such peer that is also willing to emit, so **the hand cannot be ended at all** and no next hand can begin. *(b) Evidence.* The same two events satisfy the equivocation predicate exactly — same signer, same slot, different `event_hash` — and this is conduct the protocol **requires**, so it is D-009 rule 1's fifth violation (G7's table). The two halves compose into the four-pass pattern reconstituted with the chips removed: an honest peer follows the protocol, manufactures a proof against itself, and — until D-011 rule 3 — had its key block-listed at the transport layer. It kept its stack and lost the network.<br><br>**The mitigation is D-011 rule 2**, and the form of the mitigation is the point. D-009 rule 1 had already said the slot key must contain every field that legitimately varies for one signer at one stage. It was *prose*, and prose was re-derived differently by each editor, so `event_type` was never in the key and an abort therefore collided with an ordinary contribution at the same index. **D-011 rule 2 makes the key one literal tuple, written once, in `PROTOCOL.md` §5.2, including `event_type`; every other document points at it and none reproduces it.** With `event_type` in the key the terminal abort occupies a slot no contribution can occupy, so it is accepted, the hand ends, and no proof forms. **This is the sixth attempt at one property** — after the `chain_scope` discriminator, unchaining `DISPUTE`, putting the subject in the key, giving a reconciliation round its own stage, and D-009 rule 1 stated as a principle. The first five each closed one instance and left the property to be re-derived; the sixth replaces the principle with a definition that has a single site. If a seventh instance appears, D-011's own closing rule applies and the mechanism comes out of the MVP rather than acquiring a seventh rule.<br><br>**What it costs now, at each of the three stages of the fix.** Before D-010: the honest emitter's chips forfeited and its key blocked. After D-010, before D-011: chips restored, key still block-listed at the transport layer — a peer that played correctly loses its connections. After D-011 rules 2 and 3: **a wasted hand, and at most a connection the victim re-establishes.** The liveness half is not a chip defect and D-010 could not dissolve it; it needed rule 2.<br><br>**Why D&A and not CP, stated rather than rounded up.** The colliding pair stays constructible — anyone can take an honest peer's contribution and its abort and present them together. What changes is that with `event_type` in the key an honest client's predicate no longer matches, so the object verifies as nothing and the state does not advance. The rejection rests on **our own clients implementing the canonical key**, an implementation obligation in the class of A12 and A14, not on A1–A7, which is exactly why this row is not CP. It is the third row in this catalogue that is D&A only because of a rule this corpus got wrong first (with X30 and X31), and §9.3 caution 5 counts it.<br><br>**Residual.** Rule 2 closes the collision, not the stall behind it. The opponent who went quiet still wastes the hand for free — that is X7, and where they were losing it, X8. |
+| X33 | **The fix that unfroze the hand made an agreed quantity per-receiver, and a line elsewhere read it into the next hand.** An opponent goes quiet, the hand ends by the terminal abort X32's fix made reachable — and two honest peers accept *different copies* of that abort, because the certificate path carries a name and the hand-deadline path carries none, with no precedence rule between them. A transition elsewhere then set a seat's status from the accepted copy's `attributed` field, so the next hand's `dealt_in` and `bb_seat` differ between honest peers, its collective stage never completes, and **the table never plays again** | **DNA** | **This row records a defect the corpus was carrying, and the lesson is a third shape to add to the two D-011 named.** D-011's two shapes were *a copy that drifted* and *a consequence that made an attack worth mounting*. Neither appears here. What appears is: **the defect is on the path the previous fix newly made load-bearing.** X32's fix — a witness-independent terminal stage — is what unfroze eleven phases, and it is the same fix that made "which copy of the abort did this peer accept" a per-receiver fact for the first time. The line that read `attributed` was *correct* while every completing peer necessarily held the same body. It stopped being correct the moment the terminus stopped requiring a witness, and nothing in the change touched the line that broke.<br><br>**Why it is worse than a stalled hand, which is the reason it is catalogued rather than noted.** X7 and X32 cost one hand. This costs the table permanently and silently: nothing is invalid, no signature fails, no proof forms, and each peer's own view is internally consistent. The two peers simply disagree about who is dealt in, so the collective stage that opens the next hand can never gather byte-identical bodies, and the failure surfaces as a table that hangs at hand `k+1` with no error to report. Stacks and the terminal value still agree, which is what makes it hard to see — the divergence is confined to two fields nobody hashes into anything that would mismatch first.<br><br>**Attacker capability required: none beyond silence**, which X7 already concedes to everyone at zero cost. The attacker does not choose which copy anybody accepts and does not need to; the fork is a property of the specification, not of anything the attacker sends. That is also why it is **DNA and not D&A**: the outcome is plainly *detected* — the table stops dead and the disagreement is visible in each peer's own `dealt_in` — but there is nobody to attribute it to. Both honest peers followed the protocol, and the peer that went silent did nothing that a network partition would not have done.<br><br>**The mitigation is D-012, and it is a rule about inputs rather than a new mechanism.** *No canonical state — nothing entering a state hash, a roster hash, a chained event body or the next hand's genesis — may be derived from a quantity that can differ between honest receivers. Canonical state changes only through a chained event that every participant has accepted; everything else is a local view.* Applied here it deletes the derivation rather than repairing it: a seat's status changes only through a chained event, and an abort's `attributed` field is evidence, which under **D-010** already has no automatic consequence — so reading a status from it was never going to be right. The same rule removed `seat_flags` from `roster_hash`, the other route by which a per-receiver status could have reached the genesis. `STATE_MACHINE.md` T46 and Q7 carry the transition half; `PROTOCOL.md` §4.10 already forbade it in terms — *"no receiver may derive a seat's state from it"* — and the defect was that one document said so while another did it.<br><br>**What it costs to fix, stated rather than glossed.** Nothing now marks a seat `Absent` automatically. A seat that goes silent is dealt in again every hand and stalls each one until the hand deadline, until a human sits it out or leaves. That is a real liveness cost, paid deliberately: a slow table is a liveness cost and a forked chain is an integrity cost, and `SPEC_CS.md` §19 ranks them in that order.<br><br>**Residual.** D-012 closes the derivation, not the silence behind it — that is X7 — and it does not supply the basis on which a seat *could* be marked absent by agreement. `STATE_MACHINE.md` Q7 is that question, and it is open. |
 
-**Extended catalogue counts: CP 6 · D&A 8 · DNA 3 · V 1 (X8) · OOS 12 · split
-D&A/DNA 1 (X7) · total 31.**
+**Extended catalogue counts: CP 6 · D&A 8 · DNA 4 · V 1 (X8) · OOS 12 · split
+D&A/DNA 1 (X7) · total 32.**
 
-Two rows moved and one was added. **X8 moved from D&A to V** under D-010, and no
+Two rows moved and two were added. **X8 moved from D&A to V** under D-010, and no
 row moved in the other direction or into CP. **X32 is new**, added by the Phase 2
-gate (G1) and closed by D-011 rule 2; like X30 and X31 before it, it is a defect
-the corpus was carrying rather than an attack the design newly answers, so it
-enlarges the denominator.
+gate (G1) and closed by D-011 rule 2. **X33 is new**, added by the second Phase 2
+gate (H1) and closed by D-012. Like X30 and X31 before them, both are defects the
+corpus was carrying rather than attacks the design newly answers, so they enlarge
+the denominator. X33 is the first row in this catalogue whose classification is
+**DNA** for a reason that has nothing to do with the attacker: both peers behave
+honestly and the fork is created by the specification, so there is nobody to name.
 
 **X11 is retired.** Its claim — that unanimity structurally excluded the race
 between a late action and a timeout certificate — was false, and its substance is
@@ -1061,11 +1089,11 @@ resolve to a deletion rather than to a different attack.
 |---|---:|---:|---:|
 | Cryptographically prevented (CP) | 11 | 6 | **17** |
 | Detected and attributed (D&A) | 7 | 8 | **15** |
-| Detected but not attributable (DNA) | 0 | 3 | **3** |
+| Detected but not attributable (DNA) | 0 | 4 | **4** |
 | Split D&A / DNA by case (X7) | 0 | 1 | **1** |
 | **Visible, not prevented (V)** | 0 | 1 | **1** |
 | Out of scope (OOS) | 1 | 12 | **13** |
-| **Total** | **19** | **31** | **50** |
+| **Total** | **19** | **32** | **51** |
 
 Counted after the Phase 0 review corrections: X11 removed from CP, X29 added to
 DNA, X7 reclassified from D&A to the split row. Then after the Phase 1
@@ -1082,23 +1110,40 @@ of D&A rows fell by one and the design did not get better at X8, it stopped
 answering it. Then the **Phase 2 gate**: **X32 added to D&A** — the terminal
 abort colliding with its own emitter's contribution, closed by D-011 rule 2 —
 taking the extended catalogue from 30 to 31 and the combined total from 49 to
-50. **D-011 rule 3 moved no row into a different bucket at all**, and that is
+50. Then the **second Phase 2 gate**: **X33 added to DNA** — a per-receiver
+`attributed` field read into the next hand's `dealt_in`, closed by D-012 — taking
+the extended catalogue from 31 to 32 and the combined total from 50 to 51. It is
+the first row added to DNA rather than to D&A since X29, and the reason is worth
+stating in the counts: it needs no attacker, so there is no one for the transcript
+to name. **D-011 rule 3 moved no row into a different bucket at all**, and that is
 the honest way to report it: it deleted a payoff that four rows carried, which
 shrinks the worst case underneath four labels without changing any label. One
 row counts in exactly one line of this table; X7 has its own line because its
 class depends on the number of simultaneously silent seats and on `|V|`, and
 forcing it into either bucket would overstate one case.
 
-Neither X30, nor X31, nor X32 makes the system safer than it was believed to be:
-all three are defects that successive review passes found in the corpus itself,
-each worse or more reachable than the one before, and each is counted here as an
-attack the design has to answer rather than as a feature. The pattern the counts
-do not show is that all three are two failures wearing three faces — a rule
-scoped on a quantity the attacker controls (X30), and a slot key coarser than
-the behaviour the protocol mandates (X31, X32) — which is why D-008, D-009 and
-D-011 are written as general rules rather than as three patches, and why D-011
-rule 2 replaces the general rule with a single literal definition after the
+Neither X30, nor X31, nor X32, nor X33 makes the system safer than it was believed
+to be: all four are defects that successive review passes found in the corpus
+itself, each worse or more reachable than the one before, and each is counted here
+as an attack the design has to answer rather than as a feature. The pattern the
+counts do not show is that the first three are two failures wearing three faces —
+a rule scoped on a quantity the attacker controls (X30), and a slot key coarser
+than the behaviour the protocol mandates (X31, X32) — which is why D-008, D-009
+and D-011 are written as general rules rather than as three patches, and why
+D-011 rule 2 replaces the general rule with a single literal definition after the
 general rule was re-derived wrongly five times.
+
+**X33 is a third failure and not a fourth face of the first two**, which is why
+D-012 is a new rule rather than a sixth application of an old one. Nothing about
+it is a drifted copy or a scoping mistake, and its consequence is not a payoff
+that made an attack worth mounting — there is no attacker to reward. It is the
+shape a *fix* leaves behind: the terminal stage was made witness-independent to
+unfreeze eleven phases, that change made "which copy of the abort did I accept" a
+per-receiver fact, and a line written when it was not per-receiver went on reading
+it. The lesson for a reviewer is procedural and belongs in the counts as much as
+in a row: **after a fix, re-read the paths the fix newly made load-bearing, not
+only the rule that was written.** The rule that was written is almost never where
+the next defect is.
 
 Read the CP column with A3 and A4 in mind. Rows 1–4 of the §17 table — four of the
 seventeen CP entries, and the four that matter most to the integrity of the deck —
@@ -1133,7 +1178,7 @@ a test failure.
 | `CheaterEquivocation` | §5.2 row 16; X31; X32; G7 | `tests/adversarial/equivocation.rs` | **D&A** — two chained events by one key in one slot, with different `event_hash` values, produce a transferable `EquivocationProof`. **[R10]** The slot key is `PROTOCOL.md` §5.2's and is not reproduced in this table; the test binds against §5.2, not against a copy printed here, and a test written against a copy is how three of the five recurrences in G7's table survived review. The test must also assert the **false-positive** half of G7, and this half is not optional: no unchained pair — two honest lobby adverts, or a `JOIN_REQUEST` alongside the sender's own `RNG_REVEAL` — ever produces one. **And it must carry the mirror of the cheater, which is what D-009 rule 1 makes standing:** an *honest* peer, driven through every legal interleaving, never generates a proof against itself. **Three** interleavings must be in the suite by name, one per recurrence that a slot key had to be widened to close. (1) **X31's** — two seats silent at one collective stage, one honest voter emitting a required timeout vote against each — asserting the two votes occupy **different** slots. (2) **The reconciliation one** — a peer that misses an event, reconciles under `PROTOCOL.md` §6.3 step 3, and re-derives its checkpoint value — asserting its first and second emissions do not together satisfy the predicate; this now passes, because §4.9 gives a reconciliation round its own stage and `sequence`. (3) **X32's** — a collective stage stalls, the hand deadline expires, and the honest peer that already contributed to that stage emits the terminal `HAND_ABORT` — asserting that the abort **is accepted** (the liveness half: the hand actually ends) and that the abort and the contribution do **not** together satisfy the predicate (the evidence half). Interleaving (3) fails against any corpus whose slot key omits `event_type`, and it belongs in the suite as the test that pins D-011 rule 2 rather than as one written after the fix. **A suite that tests only the cheater passes while every one of these is live**, which is the whole reason the mirror is mandatory. Note that D-010 and D-011 rule 3 change what a verifying proof *costs* the victim and change nothing about this test: the mirror asserts the proof does not verify, never that its consequences are tolerable. |
 | `CheaterReadOpponentCard` | §5.2 row 6; G1 | `tests/adversarial/hole_card_secrecy.rs` | **CP** — a coalition of `n-1` holding every message it legitimately received cannot output the victim's hole cards. *Inherits A1.* |
 | `CheaterFutureBoard` | §5.2 row 7; X3; G2 | `tests/adversarial/street_gating.rs` | **CP** for opening a future street's index; **D&A** for the attempt — an early reveal token opens nothing and is rejected and attributed. *Inherits A1, A10.* |
-| `CheaterDisconnect` | X7, X8, X30, X32; §7 | `tests/adversarial/disconnect.rs` | **D&A with one silent seat where `\|V(subject)\| >= 2`; DNA with two or more silent seats; DNA wherever `\|V\| < 2`, which at `n = 2` is always** — matching X7's split class. The test must cover all three cases, and under **D-010** the chip assertion is now the same on all three and is the strongest one available: **no chips move and every stack is bit-identical to its start-of-hand value**, whatever the cause and whoever is attributed. The `\|V\| < 2` abort additionally carries `attributed = []` (OQ-A). A test that asserts forfeiture on any branch is testing a mechanism this version does not have. It must also cover **X30**, because D-008's floor is only as real as the check that enforces it: a client emitting `TIMEOUT_VOTE`s against several seats must **not** thereby shrink `V` — exclusion requires a completed, valid certificate — and a certificate assembled with `\|V\| < 2` must have no effect at **any** seat count, not merely at two. "No effect" is to be asserted at its strongest (D-009 rule 2): the certificate is not chained, produces no `AbortRecord`, moves no chips **and does not end the hand** — the test must show the hand still running afterwards and ending only when `hand_deadline_ms` expires. Under D-010 the reason for that last assertion is narrower than it was and the test comment must say so: the escape it protects is **not** closed any more (X8 is V), so what the assertion buys is that the escape costs the full deadline of visible stalling rather than one signature, and that no chained event names a victim on the strength of one peer's word (§7.3(c)). **And it must assert the liveness half of X32 on the shipped configuration**: with one seat silent at a collective stage and the hand deadline expired, the terminal abort emitted by a seat that already contributed to that stage is **accepted**, the hand ends, and the next hand begins. A disconnect suite that only checks chip outcomes passes on a table that can never start another hand. |
+| `CheaterDisconnect` | X7, X8, X30, X32, X33; §7 | `tests/adversarial/disconnect.rs` | **D&A with one silent seat where `\|V(subject)\| >= 2`; DNA with two or more silent seats; DNA wherever `\|V\| < 2`, which at `n = 2` is always** — matching X7's split class. The test must cover all three cases, and under **D-010** the chip assertion is now the same on all three and is the strongest one available: **no chips move and every stack is bit-identical to its start-of-hand value**, whatever the cause and whoever is attributed. The `\|V\| < 2` abort additionally carries `attributed = []` (`PROTOCOL.md` §8.4). A test that asserts forfeiture on any branch is testing a mechanism this version does not have. It must also cover **X30**, because D-008's floor is only as real as the check that enforces it: a client emitting `TIMEOUT_VOTE`s against several seats must **not** thereby shrink `V` — exclusion requires a completed, valid certificate — and a certificate assembled with `\|V\| < 2` must have no effect at **any** seat count, not merely at two. "No effect" is to be asserted at its strongest (D-009 rule 2): the certificate is not chained, produces no `AbortRecord`, moves no chips **and does not end the hand** — the test must show the hand still running afterwards and ending only when `hand_deadline_ms` expires. Under D-010 the reason for that last assertion is narrower than it was and the test comment must say so: the escape it protects is **not** closed any more (X8 is V), so what the assertion buys is that the escape costs the full deadline of visible stalling rather than one signature, and that no chained event names a victim on the strength of one peer's word (§7.3(c)). **And it must assert the liveness half of X32 on the shipped configuration**: with one seat silent at a collective stage and the hand deadline expired, the terminal abort emitted by a seat that already contributed to that stage is **accepted**, the hand ends, and the next hand begins. A disconnect suite that only checks chip outcomes passes on a table that can never start another hand.<br><br>**And it must assert X33's D-012 property, which the X32 assertion above does not reach.** Drive the two abort paths that can end one hand differently — a certificate that names a peer, and the hand deadline that names nobody — and assert that **every peer's next-hand `dealt_in` and `bb_seat` are identical** and that hand `k+1` actually completes its opening collective stage. The failing version of this test passes every chip assertion, every terminal-value assertion and the X32 liveness assertion, and then hangs at hand `k+1`; that is what makes X33 worth its own assertion rather than a comment. Assert it directly at the source too: **no code path reads a seat's status out of an `AbortRecord`**, for `attributed` or for any other field. |
 
 **The two mandatory standalone tests of `SPEC_CS.md` §25**, which are not tied to a
 named cheater implementation:
@@ -1492,8 +1537,11 @@ only rarely win an all-in — but it is a deviation and it is documented as one.
      to describe the one corner of the design where the escape survived; it now
      describes the general case, and the escape is catalogued in its own right
      as X8. **DNA** for attribution, **V** for the outcome, and recorded as an
-     unfixed limitation in §9.1 rather than hidden. OQ-A, whose question D-010
-     answers corpus-wide by taking restoration everywhere (§9.2).
+     unfixed limitation in §9.1 rather than hidden. The lettered question this
+     document used to carry here — restore or forfeit where nobody can be named —
+     is **answered corpus-wide by D-010**, which takes restoration everywhere, and
+     the letter that carried it has been released to `DECISIONS.md`'s series
+     (§9.2).
 
 ### 7.4 The chips on abort, and the exploit each option opens
 
@@ -1548,10 +1596,12 @@ reference derivation that does not exist at run time, and the only implementable
 version is "attribute everyone who disagrees with me", which is a vote over the
 facts and `SPEC_CS.md` §15 forbids it. That argument still holds and is still
 worth keeping, because it is the reason `cause = 4` is not a special case any
-more: **every** cause disposes of chips the way `cause = 4` always did. OQ-D and
-OQ-A ask which disposition is correct; D-010 answers both the same way, for the
-whole protocol rather than for a corner, and §9.2 records that neither question's
-canonical wording has been edited to say so.
+more: **every** cause disposes of chips the way `cause = 4` always did. The two
+lettered questions this document used to carry — which disposition is right on
+`cause = 4`, and which is right where nobody can be named — asked exactly that,
+and **D-010 answers both the same way**, for the whole protocol rather than for a
+corner. §9.2 records what is left of each after the answer, and which letters
+their labels have since been released to.
 
 Chip conservation (G9) holds on every one of these paths, and it holds more
 simply than before: the property test is that **every stack after an abort is
@@ -1575,13 +1625,18 @@ The three-way split of §7.3(c) survives as a statement about **naming**, not
 about chips. Where `|V(subject)| >= 2` and no other seat is silent, the
 transcript names the peer that failed; where two or more seats are silent, or
 wherever `|V| < 2` — which at two seats is always — it names nobody. Nothing
-follows from either, which is why OQ-A and OQ-E are now questions about the
-*shape* of the abort event rather than about who pays for it.
+follows from either, which is why what remains open here — **OQ-E** — is a question
+about the *shape* of the abort event rather than about who pays for it. The chip
+half is not open at all: D-010 settled it.
 
 **What is still not left open, and it is a smaller list than it was.** An
-attacker cannot reach the no-attribution corner deliberately at a larger table by
-voting the voter set away — that was X30, and D-008 closes it by making exclusion
-from `V` cost a completed certificate. And no single message ends a hand: a
+attacker does not reach the no-attribution corner deliberately at a larger table
+by voting the voter set away — that was X30, and D-008 closes it by making
+exclusion from `V` cost a completed certificate. **Both sentences below are true
+only of clients that implement the rule**, which is why X30 and the below-floor
+floor are D&A rather than CP (§9.3 caution 5); neither is a property an honest
+peer gets from A1–A7 whatever its opponent is running. And no single message ends
+a hand: a
 below-floor certificate is inert, so the escape costs the full `hand_deadline_ms`
 of visible stalling rather than one signature (D-009 rule 2, §7.3(c)). Both rules
 are kept, and what each is now claimed to deliver is smaller than it was: not
@@ -1906,10 +1961,11 @@ carrying its own list.
    *Superseded wording.* This item previously read that the rage-quit escape had
    reopened "in that corner only", where `|V| < 2`, and that the interim default
    preferred a liveness and fairness loss to a theft. The corner is now the
-   general case (§7.5), and the interim default is a decision. OQ-A, which asked
-   which disposition is right at two seats, is answered corpus-wide by D-010
-   taking restoration everywhere; its canonical wording is deliberately unchanged
-   (§9.2).
+   general case (§7.5), and the interim default is a decision. The lettered
+   question that asked which disposition is right at two seats is answered
+   corpus-wide by D-010 taking restoration everywhere, and is recorded as closed in
+   §9.2 rather than carried; the letter it used is now `DECISIONS.md`'s and names
+   the reference engine.
 5. **Any single peer can fault any table on demand** by publishing a `state_hash`
    it did not derive at a checkpoint (X29). The hand aborts with `cause = 4`,
    stacks are restored and the table closes, with nobody named, because no
@@ -1923,7 +1979,7 @@ carrying its own list.
    "deterministically adjudicable offline"; that is withdrawn, because it needs a
    canonical reference engine that is named, versioned against `protocol_version`
    and agreed authoritative, and no document in this corpus owns one. Whether to
-   define one is an open decision in `docs/DECISIONS.md`. **OQ-D.**
+   define one is an open decision in `docs/DECISIONS.md`. **OQ-A.**
 6. **Collusion, endpoint compromise, screen sharing, Sybil identities, coercion,
    traffic analysis and DoS are outside the protocol's reach** (§6). This is not a
    temporary gap.
@@ -2083,87 +2139,100 @@ document records the disagreement as a finding rather than picking a side.
 | **OQ5** | Fuzzing the cryptographic deserialisers (§27), including `ziffle`'s `Transcript` `assert!` panic path. Until this lands, §17 row 17 carries a live remote-panic risk. | §5 row 17 | Phase 6 |
 | **OQ6** | Mucking policy at showdown. Three options — mandatory universal reveal, TDA-faithful mucking with binding forfeiture, or delayed reveal at end of tournament — and each changes the cryptographic protocol, not just the engine. Option 3 reopens §19 because escrowed shares must survive a disconnect. Affects G8 and X12. | G8; X12 | `docs/DECISIONS.md`, then `docs/PROTOCOL.md` |
 | **OQ7** | Relay admission policy: by `identify` protocol name (lets any stranger running our client in, which is the point) or by lobby presence (stricter, keeps a brand-new client out). Both `reservation_rate_limiters` and `circuit_src_rate_limiters` must be gated either way. | X21 | `docs/NETWORK_STACK.md` (D-002 open question) |
-| **OQ8** | Is there any defence against a forged timeout certificate signed by all the other dealt-in seats (X10) that does not introduce a trusted clock? None is currently known. Where `\|V\| < 2` — heads-up always — the question is subsumed by OQ-A, and the *manufactured* `\|V\| = 1` is closed by D-008 (X30) rather than left to this question. **D-010 halves what the question is worth without answering it:** a forged certificate no longer takes the subject's chips, so what is at stake is a stolen action and a wasted hand. The question stays open at that reduced stake, and returns at full stake whenever D-010 is revisited. | X10 | `docs/PROTOCOL.md` |
+| **OQ8** | Is there any defence against a forged timeout certificate signed by all the other dealt-in seats (X10) that does not introduce a trusted clock? None is currently known. Where `\|V\| < 2` — heads-up always — the mechanism is inert and the deadline is advisory (D-007, D-008), so there is nothing left for this question to protect there; the *manufactured* `\|V\| = 1` is closed by D-008 (X30) rather than left to this question. **D-010 halves what the question is worth without answering it:** a forged certificate no longer takes the subject's chips, so what is at stake is a stolen action and a wasted hand. The question stays open at that reduced stake, and returns at full stake whenever D-010 is revisited. | X10 | `docs/PROTOCOL.md` |
 | **OQ9** | Is a visible abort record a meaningful sanction when identity is free? If not, say so plainly in the UI rather than implying a reputation system exists. **D-010 promotes this from a fair question to a load-bearing one:** the abort record and the per-identity lobby abort count are now the *only* mitigations against X7 and X8, so if the answer is no, the honest statement is that those two attacks have no mitigation at all — which §9.1.2 limitation 4 already says, and which the UI must not contradict. | §6, §9.1.2 limitations 4 and 7 | `docs/PROTOCOL.md` |
 | **OQ10** | Is it acceptable for a client to spend its own bandwidth relaying strangers' games (D-002)? Must be a visible, consenting setting, never silently on. | X21 | project owner (D-001 addendum) |
 | **OQ11** | Should the epoch-rotating `LOBBY_INFOHASH` of §8.5 be adopted, at the cost of cross-version compatibility? The spec currently mandates one fixed constant, so this needs a numbered decision. | §8 | `docs/DECISIONS.md` |
 | **OQ12** | What is the real per-hand byte count over **one relayed circuit, counting both directions together**, measured against the `Limit` a real relay returns? **The measurement must be bidirectional**, because the byte cap is one budget for the whole circuit; measuring one direction reports twice the headroom there is, which is the mistake this corpus already made in two places at once. **[R25]** The estimates, the caps and the arithmetic behind them are `NETWORK_STACK.md` §9.5 and §16.1's and are not restated here — an open question that carries its own copy of the numbers it is asking about will be closed against the copy. What this row asks is unchanged: measure it, bidirectionally, against a real relay's returned limit, and confirm what the owner document predicts — that the **duration** limit binds long before the byte cap does. | X20 | Phase 5 measurement, then Phase 8 |
 | **OQ13** | Open-source licence. `zshuffle` was rejected partly on GPL-3.0-only; the recommended set is permissive. Needed before publication. | — | project owner (already open in `DECISIONS.md`) |
 
-**Open questions opened or restated by the Phase 0 review.** These are lettered
-rather than numbered because they cut across documents and each needs a numbered
-owner decision, not a technical answer from an editor. Their wording is canonical
-and is carried identically in the documents named.
+**The corpus-wide lettered open questions — `DECISIONS.md`'s letters, adopted
+(R-2, H6).** These are lettered rather than numbered because they cut across
+documents and each needs a numbered owner decision rather than a technical answer
+from an editor.
 
-| # | Question | Blocks | Owner / where resolved |
-|---|---|---|---|
-| **OQ-A** | At two seats a hand that cannot complete must end, and there is no way for the two peers to agree which of them failed. Ending it with restoration lets a player escape a losing pot by going silent; ending it with forfeiture lets a player take an honest opponent's committed chips by asserting a deadline that did not pass. This plan takes restoration, because a liveness/fairness loss is preferable to a theft, but the choice reverses D-005 at `n = 2` and needs a numbered owner decision. | X7, X8, X10; §7.3(c), §9.1.2 limitations 3–4 | Still open and **not yet in `docs/DECISIONS.md`'s open list**. The number `D-008` was taken by a different decision — the `\|V\|` scoping — which does **not** answer this question. Also `PROTOCOL.md` §12 |
-| **OQ-B** | A dispute path that does not require the accused peer's signature. Already recorded in `DECISIONS.md` (D-007 point 4); it is repeated here because `PROTOCOL.md` §6.3 case (b) currently depends on exactly that circularity and the replacement is not designed. | X7; §7.3(c) | `docs/DECISIONS.md` open list; `PROTOCOL.md` §12 |
-| **OQ-D** | On `HAND_ABORT cause = 4` (unresolvable state divergence) the chips are restored to their start-of-hand values because no peer can be attributed. This gives any single peer a free escape from a losing pot at the price of the table. The alternatives — forfeiting an unnamed party's commitment, or settling from the last `STATE_ACK`-agreed checkpoint — each need a numbered decision and neither is adopted here. | X8, X22, X29; §7.4; §9.1.2 limitation 5 | `PROTOCOL.md` §12, `STATE_MACHINE.md` §11, `docs/DECISIONS.md` |
-| **OQ-E** | **Blocking.** How is a timeout certificate constructed when two or more seats are simultaneously unresponsive, and whom does it attribute? `signers == participants \ {subject}` is unachievable, and attributing every non-voting seat punishes honest seats behind a partition. The interim behaviour is to abort with no attribution and no chip movement, which lets two colluding seats void a hand for free. Blocking for Phase 4. | X7 (DNA case); §7.3(c) | `PROTOCOL.md` Q-02, `STATE_MACHINE.md` Q3 |
+**`DECISIONS.md` is authority for the `OQ-*` series, and this document adopts its
+letters and its wording** (D-011 rule 1). Three letters exist corpus-wide —
+**OQ-A**, **OQ-D**, **OQ-F** — and `PROTOCOL.md` §12 and `STATE_MACHINE.md` §11
+have already adopted them. The parallel scheme that stood here, in which `OQ-A`,
+`OQ-B` and `OQ-D` named different questions than the same letters name in
+`DECISIONS.md`, is **deleted**. A reader following a letter from one document to
+another now lands on the same question, which is the whole point of a letter.
 
-**D-008 generalises the scope of OQ-A and OQ-E, and their wording has deliberately
-not been changed here.** Both are written on "two seats" and on "simultaneously
-unresponsive" seats because both predate D-008. Read them on `|V|`: OQ-A's
-question arises wherever the required voter set has fewer than two members — at
-two seats always, and above two seats only after completed certificates have
-legitimately attributed the other seats — and OQ-E's arises wherever no
-certificate can complete because each required voter set contains another subject.
-The wording is left byte-identical with `PROTOCOL.md` §12 and
-`STATE_MACHINE.md` §11 as the lettered questions require; whoever restates it must
-restate it in every document at once, and this paragraph records why it has not
-been done unilaterally here.
+| # | Question, in `DECISIONS.md`'s wording | Where this document depends on it |
+|---|---|---|
+| **OQ-A** | *"A named, versioned reference engine, since several sections claim disputes are 'deterministically adjudicable by any third party running the reference engine' and no such engine is defined (review N2). Interim answer: withdraw the claim; the engine is defined when the crate has a tagged release."* | X29's third bound, which is **evidence preservation, not recourse**, until this is answered; §9.1.2 limitation 5; the withdrawn "deterministically adjudicable offline" claim wherever it appeared |
+| **OQ-D** | *"A dispute path that does not require the accused peer's signature — circular at every table size, not only heads-up (D-007 point 4, review A-1). Interim answer under D-010: a dispute that cannot resolve ends the hand neutrally, so the circularity costs a hand rather than a stalemate."* | X7; §7.3(c). Formerly this document's `OQ-B` |
+| **OQ-F** | *"Whether `TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` should still be produced in the MVP now that D-010 gives them no effect, or be deferred wholesale until the machinery is sound. Producing them keeps the transcript adjudicable later; deferring them removes four passes' worth of surface."* | X10, X30, X31, X32 and the `CheaterEquivocation` / `CheaterDisconnect` rows of §5.5 all describe machinery this letter asks whether to build at all. It changes what ships rather than what is true, so no classification here turns on it |
+| **OQ-E** | **Blocking.** How is a timeout certificate constructed when two or more seats are simultaneously unresponsive, and whom does it attribute? `signers == participants \ {subject}` is unachievable, and attributing every non-voting seat punishes honest seats behind a partition. The interim behaviour is to abort with no attribution and no chip movement, which lets two colluding seats void a hand for free. Blocking for Phase 4. | X7 (DNA case); §7.3(c). **This letter is this document's own**, referenced by `PROTOCOL.md` Q-02 and `STATE_MACHINE.md` Q3 and defined nowhere else |
 
-**D-010 answers OQ-A and OQ-D, and their wording has likewise not been changed
-here.** Both ask which chip disposition is right when nobody can be attributed —
-OQ-A at two seats, OQ-D on `cause = 4` — and both offer restoration and
-forfeiture as the two candidates. **D-010 chooses restoration, for every cause,
-at every table size, whether or not anybody is named.** So the *question* each
-row asks is settled by a numbered owner decision, which is exactly what each row
-said it needed. Two things are therefore true at once and must not be conflated:
-the questions are answered, and the rows still read as open because their wording
-is canonical and shared with `PROTOCOL.md` §12 and `STATE_MACHINE.md` §11. What
-remains genuinely open under each letter is smaller than what the wording
-describes — for OQ-A, nothing about chips, and for OQ-D, only whether a canonical
-reference engine is ever defined so that `cause = 4` acquires an adjudication
-path (limitation 5). **OQ-E is not answered**: it asks how the abort event is
-*shaped* when two or more seats are unresponsive and whom it attributes, and
-D-010 removes the consequence of attribution without settling the shape, so it
-stays blocking for Phase 4 for the reason the P3 finding gives — an abort naming
-nobody still needs a required emitter set that every peer derives identically.
-**D-011 rule 1 settles which document answers it, not what the answer is**:
-`PROTOCOL.md` owns the terminal stage's shape, its `sequence` and what may
-trigger it, and `STATE_MACHINE.md` follows. That removes the disagreement the
-Phase 2 gate found between the two, and it removes this document from the
-question entirely — a threat model that proposed an emitter set would be
-writing the wire, which is what D-011 rule 1 forbids. What this document does
-carry is the classification: an abort that names nobody is **DNA**, and the
-liveness half of getting it accepted at all is X32.
+**The mapping from this document's former labels, recorded once so an old
+cross-reference can still be followed, and not to be maintained:**
 
-**A defect in the letter series itself, recorded rather than fixed unilaterally.**
-`docs/DECISIONS.md`'s open list now carries rows labelled `OQ-A`, `OQ-D` and
-`OQ-F`, and **two of those letters name different questions there than they do
-here**: its `OQ-A` is the canonical-reference-engine question (which this document
-carries unlettered, under limitation 5 and OQ-D), and its `OQ-D` is the
-dispute-path circularity that this document calls **OQ-B**. The letters are
-supposed to be canonical across the corpus — that is the entire reason this
-section refuses to reword them locally — so a reader following `OQ-A` from one
-document to the other lands on the wrong question. This is bookkeeping, but it is
-the bookkeeping that schedules the decisions Phase 4 is blocked on
-(`research/PHASE1_VERIFY3.md` N8, three passes running). It needs one editor
-resolving it in every document at once, and it is flagged here rather than
-patched in one place, which would deepen the collision rather than close it.
+| Former label here | Now |
+|---|---|
+| `OQ-A` — restoration versus forfeiture where `\|V\| < 2` | **Closed by D-010**, and closed wider than it was asked: restoration on every path, at every table size, whether or not anybody is named. The letter `OQ-A` now names the reference engine |
+| `OQ-B` — a dispute path not needing the accused's signature | **OQ-D** |
+| `OQ-C` — an obligatory `ACTION_SEEN` before a vote | **`PROTOCOL.md` Q-08**, that document's local series |
+| `OQ-D` — `cause = 4`: restore, forfeit, or settle from the last agreed checkpoint | Its **chip half is closed by D-010** (restoration). Of the rest, *settle from the last agreed checkpoint* is **`PROTOCOL.md` Q-07** and *how anyone establishes which peer diverged* is **OQ-A**. The letter `OQ-D` now names the dispute path |
+| `OQ-E` | **unchanged**, and still this document's |
 
-**OQ-C** is recorded in `PROTOCOL.md` §12 only, because it is a message-design
-question rather than a risk this document carries: should a required voter publish
-a signed `ACTION_SEEN { sequence, event_hash }` before it may vote, so that
-vote-and-seen are two events by one key in one slot and a lying voter becomes
-provable? It is **not adopted**, and X10's honest statement of the race stands
-without it.
+**Two assertions that stood in this paragraph's place are deleted because they had
+become false (H6).** The first was that the lettered wording here was kept
+*byte-identical* with `PROTOCOL.md` §12 and `STATE_MACHINE.md` §11, and that
+rewording it locally would therefore break a shared canonical text. Both of those
+documents have since reconciled onto `DECISIONS.md`'s letters and **neither holds
+the rows that claim pointed at any more**, so the text this document believed it
+was preserving byte-identity with no longer exists. Refusing to reword on that
+ground had stopped protecting a shared wording and started protecting the
+collision. The second assertion was that `OQ-C` is *"recorded in `PROTOCOL.md` §12
+only"*, which is now wrong about the label as well as the location: that question
+is `PROTOCOL.md` **Q-08**. The question itself is unchanged and still **not
+adopted** — should a required voter publish a signed
+`ACTION_SEEN { sequence, event_hash }` before it may vote, so that vote-and-seen
+are two events by one key in one slot and a lying voter becomes provable — and
+X10's honest statement of the race stands without it.
+
+**The bookkeeping defect this section used to flag is closed rather than
+re-flagged.** Three passes running, this document recorded that the letters
+collided across the corpus and declined to fix it here, reasoning that one editor
+had to resolve it everywhere at once. That editor has now been round:
+`PROTOCOL.md` §12 and `STATE_MACHINE.md` §11 adopted `DECISIONS.md`'s letters,
+this section is the third and last, and `DECISIONS.md` is authority under the
+project's own ordering. Recording a collision for three passes while every
+document kept its own scheme is the defect, not the fix; the fix is to adopt, and
+the mapping table above is what an old cross-reference lands on.
+
+**D-008 generalises the scope of OQ-E, and its wording is deliberately unchanged.**
+It is written on seats "simultaneously unresponsive" because it predates D-008.
+Read it on `|V|`: it arises wherever no certificate can complete because each
+required voter set contains another subject. The same generalisation applied to
+the question this document formerly lettered `OQ-A` — that one arose wherever
+`|V| < 2`, which is at two seats always and above two seats only after completed
+certificates have legitimately attributed the other seats — and that question is
+closed by D-010 rather than carried.
+
+**What D-010 settled, and what it did not.** The two questions this document
+formerly lettered `OQ-A` and `OQ-D` both asked which chip disposition is right
+when nobody can be attributed. **D-010 chose restoration, for every cause, at
+every table size, whether or not anybody is named**, so both are answered by a
+numbered owner decision, which is exactly what each said it needed; the mapping
+table above records what is left of each. **OQ-E is not answered.** It asks how
+the abort event is *shaped* when two or more seats are unresponsive and whom it
+attributes, and D-010 removes the consequence of attribution without settling the
+shape, so it stays blocking for Phase 4 for the reason the P3 finding gives — an
+abort naming nobody still needs a required emitter set that every peer derives
+identically. **D-011 rule 1 settles which document answers it, not what the answer
+is**: `PROTOCOL.md` owns the terminal stage's shape, its `sequence` and what may
+trigger it, and `STATE_MACHINE.md` follows. That removes this document from the
+question entirely — a threat model that proposed an emitter set would be writing
+the wire, which is what D-011 rule 1 forbids. What this document carries is the
+classification: an abort that names nobody is **DNA**, and the liveness half of
+getting it accepted at all is X32.
 
 ### 9.3 The standing caution
 
-This document classifies **17 of 50** catalogued attacks as cryptographically
+This document classifies **17 of 51** catalogued attacks as cryptographically
 prevented. That number is meaningful only alongside six qualifications, and it
 must never be quoted without them:
 
@@ -2172,13 +2241,17 @@ must never be quoted without them:
 2. Thirteen attacks are **out of scope entirely**, and they include the ones most
    likely to be used against a real game: collusion, endpoint compromise, and
    denial of service.
-3. Three are **detected but not attributable**, and one more (X7) is attributable
+3. Four are **detected but not attributable**, and one more (X7) is attributable
    in only one of its three cases. Detection without attribution stops a hand; it
    does not name anybody, and under this design it does not move chips either.
    **Nor does attribution**, since D-010 — and since D-011 rule 3 it does not
    cost the named peer its seat or its connections either. The difference
    between the D&A and DNA buckets is now a difference in what the transcript
-   records, not in what happens to anybody.
+   records, not in what happens to anybody. One of the four, **X33, is not
+   attributable because there is no attacker at all**: two honest peers fork the
+   next hand's roster between them, and the bucket is doing something different
+   there — it records that the design has no name to offer, not that a culprit
+   escaped one.
 4. "Prevented" always means *under the stated assumptions*, never *impossible*.
 5. **Three of the fifteen D&A rows — X30, X31 and X32 — are D&A only because our
    own client enforces a rule.** Their rejection rests on an implementation
@@ -2202,13 +2275,13 @@ The count fell from 18 to 17 in the Phase 0 review: X11 claimed the race between
 late action and a timeout certificate was structurally excluded, and that claim was
 false. A CP row removed because its argument did not hold is the review working as
 intended, and the number is recorded as having moved rather than quietly restated.
-The denominator has since risen three times for the same reason in the other
-direction: X30, X31 and X32 are attacks the corpus was carrying without knowing
-it, and adding them enlarges the total rather than the CP column. The proportion
-classified as prevented falls when a review works.
+The denominator has since risen four times for the same reason in the other
+direction: X30, X31, X32 and X33 are attacks the corpus was carrying without
+knowing it, and adding them enlarges the total rather than the CP column. The
+proportion classified as prevented falls when a review works.
 
-**Neither D-010 nor D-011 moved the CP column at all, and that is the point
-worth making about both.** Removing automated forfeiture, then removing
+**Neither D-010, nor D-011, nor D-012 moved the CP column at all, and that is the
+point worth making about all three.** Removing automated forfeiture, then removing
 automated eviction from every layer, did not make one attack cryptographically
 preventable. D-010 made five attacks worthless and one attack free. D-011
 rule 3 made four more worth less without moving a single label, and D-011 rule 2
@@ -2220,6 +2293,17 @@ document that is less self-contained (§9.1.3). A decision that improves a
 corpus by deleting things should be visible in the counts as buckets moving
 sideways, one row moving down, and the denominator going up. That is exactly
 what §5.4 shows.
+
+**D-012 adds one row to DNA and nothing else, and the honest reading of that is
+not reassuring.** It closes X33 by forbidding a derivation, so no attack becomes
+preventable and no attacker loses a capability; what improves is that a table
+which would have hung forever at hand `k+1` now merely plays slowly against a
+silent seat. The cost is stated in X33 and in `STATE_MACHINE.md` Q7: **nothing
+marks a seat absent automatically any more**, so a silent seat is dealt in every
+hand and stalls each one to the hand deadline until a human acts. That is a
+liveness price paid to avoid an integrity failure, in the order `SPEC_CS.md` §19
+sets, and it must not be described as a fix that made anything faster or safer
+against an adversary.
 
 `SPEC_CS.md`'s closing instruction is binding on every future revision of this
 file: never claim the system makes all cheating impossible; prove precisely which
@@ -2271,7 +2355,8 @@ this document carried the claim:
 Nothing was strengthened, and the DNA classification of X29 no longer rests on a
 mechanism that does not exist. Whether a canonical reference engine is defined —
 named, versioned against `protocol_version`, and agreed authoritative — is now an
-open decision in `docs/DECISIONS.md`'s open list; if it is defined, X29 and
+open decision in `docs/DECISIONS.md`'s open list, carried corpus-wide as **OQ-A**
+(§9.2); if it is defined, X29 and
 limitation 5 may point at the definition and the stronger sentence becomes true
 again. Until then, an offline-adjudication claim must not be quoted from this
 document as a mitigation, here or anywhere else in the corpus.

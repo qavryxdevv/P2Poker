@@ -2508,8 +2508,12 @@ defect.
   document no longer holds a copy of any of them. `seat_flags`, the other half of the
   D-012 pair (finding H2), never appeared in this document at any point — checked, not
   assumed.
-* **Nothing was strengthened to pay for any of this.** §11's OPEN QUESTIONS list, the
-  "does not solve" list, and every `Verification:` line in §2 to §10 are exactly as
-  they were. D-011 is a rule about where a sentence lives and D-012 a rule about what
-  may feed a hash; neither makes a cryptographic claim safer, and this pass did not
-  pretend otherwise.
+* **Nothing was strengthened to pay for any of this.** Every OPEN QUESTION in §11
+  still asks what it asked, the "does not solve" list is untouched, and not one
+  `Verification:` line in §2 to §10 changed. The only edit inside §11 is OQ-3's
+  parenthetical, which now says the `ctx` construction lives at one site rather than
+  two, and that is a weaker statement about this document rather than a stronger one
+  about the protocol — the question OQ-3 asks, *whether that binding is sufficient*,
+  is verbatim. D-011 is a rule about where a sentence lives and D-012 a rule about
+  what may feed a hash; neither makes a cryptographic claim safer, and this pass did
+  not pretend otherwise.

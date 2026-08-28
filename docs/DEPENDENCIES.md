@@ -798,9 +798,16 @@ Recorded as obligations rather than quietly omitted, because §28 asks for
 | Fuzzing of the deserialisers (`SPEC_CS.md` §27) | **not done** — OQ-5 | Phase 6 |
 
 **This register is hand-written, and a hand-written register is wrong within a
-month.** That is not a hypothetical: §9 lists three drift findings this document
-found on its first pass. The generated register is the fix; §8 is what holds the line
-until it exists.
+month.** That is not a hypothetical: §9 lists six drift findings this document found
+in other files on its first pass, plus two it found in **itself** on the second. The
+generated register is the fix; §8 is what holds the line until it exists.
+
+The measured tables held up better than the prose around them. On 2026-08-28 every
+one of the 122 rows still matched the lockfile and the registry checkouts (§5), while
+both self-corrections were in sentences nothing mechanical checks — an authority list
+and a security conclusion. **The parts of this document a script can verify are the
+parts that stayed right**, which is the argument for the generated register stated as
+evidence rather than as a preference.
 
 ---
 
@@ -904,6 +911,10 @@ are about specific lines of upstream source.
 `docs/research/` is evidence, not authority; the five specification documents are
 authority but are not immune. Recorded here so no reader has to open the older file
 to learn that a row in it is wrong.
+
+**Entries 7 and 8 are corrections to this document itself**, from the D-009…D-012
+sweep of 2026-08-28. They are in the same list as the rest deliberately: a register
+that only ever records other documents' errors is a register nobody has audited.
 
 1. **`NETWORK_STACK.md` §5.1.1 registers `libp2p-mdns 0.48.0`, which is not
    compiled**, and **omits `libp2p-kad 0.48.0` and `libp2p-metrics 0.17.0`, which
