@@ -7,15 +7,60 @@ the two interim halves — `CRYPTOGRAPHY.md` §9.1 (cryptographic side) and
 that they were incomplete and temporary. Those two sections stay where they are as
 the *reasoning* for their own crates; this document is the register.
 
-**Authority order.** `SPEC_CS.md` binds. `DECISIONS.md` (D-001 … D-008) outranks
-everything below it. The five specification documents come next. `docs/research/`
-is **evidence, not authority** — three of its statements are corrected in §9 of this
-document, and a research note is never a reason to leave a measured number wrong.
+**Authority.** `SPEC_CS.md` binds. **`DECISIONS.md` outranks this document**, and
+this document does not restate what is in it — not the decisions, not their numbers.
+That is D-011 rule 1 applied here, and it is applied because the line that stood in
+this place read *"D-001 … D-008"* four decisions after D-012 was accepted. The five
+specification documents come next. `docs/research/` is **evidence, not authority** —
+three of its statements are corrected in §9 of this document, and a research note is
+never a reason to leave a measured number wrong.
 
-**Measured on:** 2026-08-28, Windows 10, `x86_64-pc-windows-msvc`, 24 cores,
+**D-009 rule 3 governs this register**, and is restated in §0 below rather than left
+to be inferred, because this is the document where a claimed absence does the most
+damage.
+
+**Measured on:** 2026-08-28, Windows 10, `x86_64-pc-windows-msvc`, 24 cores with
+cargo held to **19** by `.cargo/config.toml` (`[build] jobs = 19`; the test harness
+has its own pool and needs `--test-threads=19` passed separately),
 `rustc 1.95.0 (59807616e 2026-04-14)` / `cargo 1.95.0 (f2d3ce0bd 2026-03-21)`,
 RustSec advisory database with 1 226 advisories loaded. Every number in this
-document is reproducible by §10.
+document is reproducible by §10. The job ceiling changes nothing in the tables — it
+is recorded because §10's commands are run under it and a reproducer should be
+running the same build.
+
+---
+
+## 0. What may not be claimed here — D-009 rule 3
+
+> **No security property of this project may be stated as the absence of something
+> from the dependency tree.** State the discipline our own code follows, and enforce
+> it mechanically.
+
+This register is the document where breaking that rule is most expensive, because a
+register is exactly where a reader goes to be told what is and is not present. Three
+claimed absences have already been measured false after integration — B-1, B-3 and
+M3, the last being *"`SmallRng` is not compiled in"*, which `rand 0.9.5`'s **default**
+`small_rng` feature and four dependencies falsify. The pattern is always the same: an
+absence verified in an isolated probe does not survive integration, and nobody
+re-checks it.
+
+So, for everything in this document:
+
+* A **fact about the build** — "`libp2p-mdns` is locked but not compiled",
+  "the DNSSEC module is behind a feature we do not enable" — is allowed, is marked
+  **(a)** or **(b)**, and is **never** the same sentence as a security conclusion. It
+  is a fact about today's feature set, and §8.1 trigger 1 exists because a feature
+  flip elsewhere reverses it silently.
+* A **security property** is stated as a discipline our own code follows, with the
+  mechanism that enforces it named. §5.4's `getrandom`-only rule is the model:
+  `src/security/rng.rs` scans this crate's own sources on every test run, and it was
+  verified to fail by injecting a violation. `CONTRIBUTING.md` §1.4 has that record —
+  a gate that has never been observed to fail is not a gate.
+* The two are never merged. "Not compiled, therefore safe" is the forbidden shape.
+
+**The register was swept against this rule on 2026-08-28. One row needed changing**
+— `argon2` in §5.3, which read a parser's absence as a security conclusion; it is
+corrected in place and the correction is recorded in §9.7.
 
 **Verification codes**, as used across the corpus:
 **(a)** compiled or executed here; **(b)** read from the crate's own source under
@@ -315,6 +360,25 @@ dependency, not a bug to be fixed downstream.
 Run 2026-08-28 against `Cargo.lock`, 1 226 advisories loaded, 612 lockfile packages
 scanned. This is the whole output, not a selection. **(a)**
 
+**Re-run 2026-08-28 at the close of the D-009…D-012 sweep, and the result is
+unchanged**: same four IDs, same versions, same solutions, same exit. Verbatim, the
+lines that decide the table:
+
+```
+Scanning Cargo.lock for vulnerabilities (612 crate dependencies)
+hickory-proto 0.25.2  RUSTSEC-2026-0118  Solution: No fixed upgrade is available!
+hickory-proto 0.25.2  RUSTSEC-2026-0119  Solution: Upgrade to >=0.26.1
+paste         1.0.15  RUSTSEC-2024-0436  Warning: unmaintained
+lru           0.16.4  RUSTSEC-2026-0253  Warning: unsound
+error: 2 vulnerabilities found!
+warning: 2 allowed warnings found
+```
+
+**`cargo audit` reads `Cargo.lock`, so it is feature-blind, and that has not changed
+either.** It scanned all 612 lockfile packages, not the 425 that are compiled. Two of
+the four rows below are only decidable by `cargo tree --edges normal -i` — see §1, and
+the "Compiled?" column exists because of it.
+
 | ID | Crate | Version | Class | Fix available | Compiled? | Status |
 |---|---|---|---|---|---|---|
 | RUSTSEC-2026-0118 | `hickory-proto` | 0.25.2 | vulnerability — DoS | **none** | crate yes, **vulnerable module no** | accepted, §3.2 |
@@ -366,6 +430,28 @@ actually compiled, from `cargo tree --edges normal` — **(a)**.
 2026-08-28 RustSec database, and it is absent from §4's table. It does **not** mean
 audited, and it does not mean reviewed by us.
 
+> **Re-verified 2026-08-28, mechanically, against the lockfile and the registry
+> checkouts rather than against the earlier text of this document.** Every
+> `name`+`version` in every §5 table was matched against a `[[package]]` entry in
+> `Cargo.lock`, and every `licence` and `repository` cell was re-read from
+> `<crate>-<version>/Cargo.toml` under the local registry checkout. **All 122 rows
+> matched; nothing had drifted.** The 25 four-column rows in §5.5 were checked
+> against their section's blanket claim as well — all 25 really do carry licence
+> `MIT` and repository `github.com/libp2p/rust-libp2p`. The lockfile holds 612
+> `[[package]]` entries (611 excluding the root) and `cargo tree --edges normal`
+> yields 426 unique `name version` pairs (425 excluding the root), so §1's
+> 425 / 611 / 186 all still hold. **(a)(b)**
+>
+> A matching pass is worth as little as its coverage, so the coverage is stated: the
+> check parsed 126 version-bearing rows, of which 4 belong to §6's licence-count
+> table and are not crate rows, leaving the 122 the register claims. A run that
+> matched fewer rows than that would be a silent pass, not a clean one.
+>
+> `rs_poker =5.0.0` is among them and is current: it is registered in §5.10, its `=`
+> pin is justified in §3.6, `Cargo.toml` declares
+> `rs_poker = { version = "=5.0.0", default-features = false }`, and `Cargo.lock`
+> resolves exactly `5.0.0`. It was **not** missing from this register.
+
 ### 5.1 Mental poker — the deck (8)
 
 | Name | Version | Purpose | Repository | Licence | Security status |
@@ -410,7 +496,7 @@ no open advisory) is a proc-macro and is counted with the unregistered remainder
 
 | Name | Version | Purpose | Repository | Licence | Security status |
 |---|---|---|---|---|---|
-| `argon2` | 0.6.0 | passphrase → KEK for the profile key slots | `github.com/RustCrypto/password-hashes` | MIT OR Apache-2.0 | no open advisory. Used as a raw KDF: the `password-hash` feature is off, so `password-hash`, `phc`, `pkcs8`, `spki` and `der` are locked but not compiled — no PHC string format is parsed |
+| `argon2` | 0.6.0 | passphrase → KEK for the profile key slots | `github.com/RustCrypto/password-hashes` | MIT OR Apache-2.0 | no open advisory. **The discipline:** our code calls Argon2 as a raw KDF only and never parses or emits a PHC string, so no attacker-supplied encoding reaches a parser through this crate. **The build fact, which is not the same claim:** the `password-hash` feature is off today, so `password-hash`, `phc`, `pkcs8`, `spki` and `der` are locked but not compiled **(a)(b)** — a feature flip restores them silently (§8.1 trigger 1), and the discipline is what still holds when it does. §0 |
 | `blake2` | 0.11.0 | BLAKE2b inside Argon2 | `github.com/RustCrypto/hashes` | MIT OR Apache-2.0 | no open advisory |
 | `chacha20poly1305` | 0.11.0 | XChaCha20-Poly1305 profile AEAD | `github.com/RustCrypto/AEADs` | Apache-2.0 OR MIT | no open advisory |
 | `chacha20` | 0.10.2 | the stream cipher under it | `github.com/RustCrypto/stream-ciphers` | MIT OR Apache-2.0 | no open advisory |
@@ -484,7 +570,7 @@ directly (§3.5). No open advisory on any of them at these versions; the histori
 | `libp2p-upnp` | 0.5.0 | IGD port mapping | no open advisory. Speaks HTTP to a LAN device that is not authenticated — §5.9 |
 | `libp2p-connection-limits` | 0.6.0 | connection caps | no open advisory. **There is no `connection-limits` cargo feature** — it is a non-optional dependency and `libp2p::connection_limits` is always available; asking for the feature is a hard resolver error |
 | `libp2p-memory-connection-limits` | 0.5.0 | memory-based caps | no open advisory. This one *is* a feature, spelled `memory-connection-limits` |
-| `libp2p-allow-block-list` | 0.6.0 | peer blocklist | no open advisory; non-optional, like `connection-limits` |
+| `libp2p-allow-block-list` | 0.6.0 | peer blocklist | no open advisory; non-optional, like `connection-limits`. **Its presence in the build is not permission to drive it from a protocol proof** — D-010 point 3 and D-011 rule 3 forbid automated eviction at every layer, transport included, and this crate is the transport-layer mechanism they were written about. A user-initiated block is a user decision and is fine; a block triggered by an `EquivocationProof` or a `TIMEOUT_CERT` is a defect. `NETWORK_STACK.md` owns the rule (D-011) |
 | `libp2p-metrics` | 0.17.0 | Prometheus metrics | no open advisory. Enabled in `Cargo.toml`; absent from `NETWORK_STACK.md` §5.1.1 — §9 |
 
 > **Correction, verified in source, that must be carried everywhere it appears.**
@@ -758,8 +844,18 @@ Run §10 in full and diff against this document. Then, for every difference:
    compiles it is on, check whether our call pattern meets the preconditions. Write
    down what was read, with file and line.
 4. Re-read licence and repository cells for anything whose version changed. **(b)**,
-   from the registry checkout, never from memory.
+   from the registry checkout, never from memory. Run §10's mechanical row check over
+   the whole register, not only the changed rows, and check its match count.
 5. Update §5's rows and §5.12's count so they still sum to 425.
+6. **Sweep the register against D-009 rule 3** (§0). Any cell that has become "not
+   compiled, therefore safe" is rewritten as a discipline plus a separately labelled
+   build fact. A feature flip is the change most likely to create one, and a feature
+   flip is trigger 1.
+7. **Read every document against any decision this change carries, including this
+   one and `CONTRIBUTING.md`** — D-012's process rule, `CONTRIBUTING.md` §2.5. A
+   document read with nothing found is reported as such; silence is
+   indistinguishable from a skipped file, and both documents were skipped by every
+   sweep until 2026-08-28.
 
 ### 8.3 Who decides an advisory is acceptable, and what they may not accept
 
@@ -842,10 +938,28 @@ to learn that a row in it is wrong.
 6. **The fix plan's A-8 replacement text calls `max_circuit_bytes` "per circuit and
    per direction".** It is a bidirectional total — §5.5, verified in
    `copy_future.rs`. Every derived figure halves.
+7. **This document's own `argon2` row stated a security property as an absence**,
+   which D-009 rule 3 forbids: *"the `password-hash` feature is off, so
+   `password-hash`, `phc`, `pkcs8`, `spki` and `der` are locked but not compiled — no
+   PHC string format is parsed"*. The build fact is true and stays; the conclusion
+   drawn from it was the wrong shape, because a feature flip in a transitive
+   dependency restores those crates without touching our code, and the row would then
+   assert a safety we no longer have. The corrected row states the discipline — we
+   call Argon2 as a raw KDF and never parse or emit a PHC string — and keeps the
+   feature state separately, labelled as a fact about today's tree. §0, §5.3.
+8. **This document's own authority line read "D-001 … D-008"** while D-012 was in
+   force. It has been replaced by a pointer rather than an updated list, per D-011
+   rule 1: a copied list is what drifts, and this is the third document in which that
+   exact copy went stale.
 
 ---
 
 ## 10. Reproducing every number in this document
+
+Run from the repository root, so `.cargo/config.toml`'s `[build] jobs = 19` applies —
+every number below was measured under that ceiling, and it is also the reason a
+reproducer's build is slower than 24 cores would suggest rather than differently
+resolved. `cargo test` ignores `jobs` and needs `--test-threads=19` passed by hand.
 
 ```bash
 export PATH="~/.cargo/bin:$PATH"      # cargo is not on the Bash PATH
@@ -866,6 +980,19 @@ cargo tree --edges features -i <crate>             # which features of it are on
 cargo deny check licenses                          # needs a deny.toml first, see §7
 ```
 
+**Checking §5 against the lockfile without re-reading it by eye.** Every `| \`name\` |
+version |` row in this file is a claim that can be matched mechanically, and a
+re-audit should match it that way — a hand-check of 122 rows is how drift survives a
+pass. Parse `Cargo.lock`'s `[[package]]` entries into `name → {versions}`, parse this
+document's table rows with `^\|\s*\`([\w-]+)\`\s*\|\s*([0-9][^|]*?)\s*\|`, and report
+every row whose version is not among the lockfile's for that name. Then, for the
+six-column rows, re-read `license` and `repository` from the registry checkout and
+compare. **Print the number of rows the parser matched and check it against 122
+before trusting a clean result**: a regex that silently matched nothing reports the
+same "no drift" as a register that is genuinely current. §6's licence-count table
+contributes 4 rows that look like crate rows and are not; 126 matches minus those 4
+is the expected figure.
+
 Licence and repository cells: read `license` and `repository` from
 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/<crate>-<version>/Cargo.toml`.
 Advisories: `~/.cargo/advisory-db/crates/<crate>/RUSTSEC-*.md`, whose `[versions]`
@@ -878,6 +1005,27 @@ crates.io metadata (release count, owners, newest version) needs a User-Agent:
 curl -s -H "User-Agent: p2p-poker-dependency-register (<your-email>)" \
      https://crates.io/api/v1/crates/<crate>
 ```
+
+---
+
+**Sweep record, 2026-08-28 — D-009 to D-012 against this document.** Reported in
+full, including the decisions that changed nothing, because D-012's process rule
+counts silence as a skipped file.
+
+| Decision | Found here | Action |
+|---|---|---|
+| **D-009 rule 1** (honest behaviour must not satisfy the equivocation predicate) | nothing — this document defines no message and no slot key | none |
+| **D-009 rule 2** (a below-floor certificate is inert) | nothing — no certificate logic here | none |
+| **D-009 rule 3** (never state a security property as an absence) | **one row**: `argon2` in §5.3 | rewritten; §0 added; §9.7 |
+| **D-010** (neutral abort, no automated forfeiture or eviction) | `libp2p-allow-block-list 0.6.0` is registered in §5.5 with no note that it may not be driven from a proof | note added to the row |
+| **D-011 rule 1** (one normative owner) | the authority line restated `DECISIONS.md`'s contents, and had gone stale at "D-001 … D-008" | replaced with a pointer; §9.8 |
+| **D-011 rule 2** (the slot key written once) | nothing — the key is not reproduced here | none |
+| **D-011 rule 3** (no eviction at any layer) | same finding as D-010 above; `NETWORK_STACK.md` owns the rule, this register points at it | pointer, not a restatement |
+| **D-012** (no canonical state from a per-receiver quantity) | **nothing.** Nothing in this document enters a state hash, a roster hash, a chained event body or a genesis; crate versions, licences and advisory IDs are the same for every receiver by construction | none |
+
+Before this pass the document contained zero occurrences of D-009, D-010, D-011 and
+D-012. That is the condition D-012's process rule exists to prevent, and it was the
+third instance.
 
 ---
 

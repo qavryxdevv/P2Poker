@@ -146,17 +146,46 @@ pub fn round_complete(round: &BettingRound, dealt_in: &DealtIn) -> bool {
         })
 }
 
-/// Whether any further betting is possible this hand.
+/// Whether everyone has folded to one seat, which ends the hand at once.
 ///
-/// With at most one seat able to act and nothing owed, the remaining streets
-/// are still dealt — they decide the pots — but no action happens between them.
-/// The hand is not abandoned.
+/// This is a **separate** hand-ending condition from [`round_complete`], and
+/// forgetting that is a real bug rather than a nicety: the last live seat has
+/// not acted, so the round is not complete by that rule, yet offering it the
+/// action lets it fold too and leaves a pot nobody is eligible for. The
+/// random-hand harness found exactly that, with two heads-up seats both folded
+/// and 150 chips in a pot with an empty eligible set.
+///
+/// The survivor wins every pot it is eligible for and never reveals a card.
+pub fn only_one_live(round: &BettingRound, dealt_in: &DealtIn) -> bool {
+    live_count(round, dealt_in) == 1
+}
+
+/// Whether any further betting is possible **in this hand**.
+///
+/// Distinct from [`round_complete`], which is about one street. With at most
+/// one seat able to act and nothing owed, there is nobody left to bet into:
+/// the remaining board cards are still dealt, because they decide the pots, but
+/// no action happens between them and the hand is not abandoned
+/// (`POKER_RULES.md` A2, A6).
+///
+/// The condition is deliberately **not** "and that seat has acted". A lone
+/// seat facing no bet has nothing to do, whether or not it has acted this
+/// street, and offering it the action lets it fold a hand it has already won.
+/// The random-hand harness found that: two seats contested a side pot above an
+/// all-in player, one folded, and the survivor was then offered the action and
+/// folded too, leaving 19 326 chips in a pot with nobody eligible for it.
 pub fn betting_is_closed(round: &BettingRound, dealt_in: &DealtIn) -> bool {
-    let able = (0..round.committed.len())
+    let actors: Vec<SeatIdx> = (0..round.committed.len())
         .map(|s| s as SeatIdx)
         .filter(|&seat| can_act(round, dealt_in, seat))
-        .count();
-    able <= 1 && round_complete(round, dealt_in)
+        .collect();
+
+    match actors.as_slice() {
+        [] => true,
+        // One seat with chips: it acts only if it still owes something.
+        [only] => round.to_call(*only) == 0,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -319,6 +348,81 @@ mod tests {
         );
         r.apply(2, Action::Call).unwrap();
         assert!(!betting_is_closed(&r, &dealt), "two seats can still act");
+    }
+
+    /// The regression the random-hand harness produced: heads-up, the button
+    /// folds pre-flop, and if the survivor is then offered the action it can
+    /// fold too, leaving a 150-chip pot with an empty eligible set.
+    #[test]
+    fn a_fold_out_ends_the_hand_before_the_survivor_can_fold_too() {
+        let dealt = [true, true];
+        let mut r = round(100, &[5000, 5000]);
+        post_blinds(&mut r, 0, 1, 50, 100);
+
+        assert!(!only_one_live(&r, &dealt));
+        r.apply(0, Action::Fold).unwrap();
+
+        assert!(only_one_live(&r, &dealt), "the hand is over now");
+        assert!(
+            !round_complete(&r, &dealt),
+            "and the round is NOT complete - the survivor has not acted, which              is exactly why this needs its own condition"
+        );
+        // The survivor is still technically able to act, which is the trap.
+        assert!(can_act(&r, &dealt, 1));
+    }
+
+    #[test]
+    fn only_one_live_ignores_seats_that_were_never_dealt_in() {
+        let dealt = [true, false, true];
+        let mut r = round(100, &[5000, 5000, 5000]);
+        assert!(!only_one_live(&r, &dealt));
+        r.apply(0, Action::Fold).unwrap();
+        assert!(only_one_live(&r, &dealt), "seat 1 was never in the hand");
+    }
+
+    /// The second regression from the random-hand harness, and the sharper of
+    /// the two. Two seats contest a side pot above an all-in player; one folds;
+    /// the survivor owes nothing and must not be asked again.
+    #[test]
+    fn a_lone_seat_owing_nothing_is_not_asked_to_act() {
+        let dealt = [true, true, true];
+        let mut r = round(100, &[5000, 300, 5000]);
+
+        r.apply(0, Action::Bet(300)).unwrap();
+        r.apply(1, Action::Call).unwrap(); // seat 1 all-in for 300
+        r.apply(2, Action::Call).unwrap();
+        assert!(!betting_is_closed(&r, &dealt), "two seats still have chips");
+
+        // A later street: seats 0 and 2 bet on, seat 1 is all-in and out of it.
+        r.current_bet = 0;
+        r.last_full_raise = 100;
+        r.committed.iter_mut().for_each(|c| *c = 0);
+        r.acted.iter_mut().for_each(|a| *a = false);
+
+        r.apply(0, Action::Bet(500)).unwrap();
+        r.apply(2, Action::Fold).unwrap();
+
+        assert!(
+            betting_is_closed(&r, &dealt),
+            "seat 0 owes nothing and is the only seat with chips"
+        );
+        assert!(
+            !only_one_live(&r, &dealt),
+            "seat 1 is still live while all-in, so the fold-out rule does not fire"
+        );
+    }
+
+    #[test]
+    fn a_lone_seat_that_still_owes_must_act() {
+        let dealt = [true, true];
+        let mut r = round(100, &[5000, 300]);
+        r.apply(1, Action::Bet(300)).unwrap(); // seat 1 all-in
+        assert!(
+            !betting_is_closed(&r, &dealt),
+            "seat 0 owes 300 and must call or fold"
+        );
+        r.apply(0, Action::Call).unwrap();
+        assert!(betting_is_closed(&r, &dealt));
     }
 
     #[test]

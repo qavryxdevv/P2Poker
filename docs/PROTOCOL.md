@@ -720,9 +720,48 @@ GENESIS(k) = h("p2p-poker v1 genesis",                              for k >= 1
 
 roster_hash(k) = h("p2p-poker v1 roster",
                    [ for each seat s in ascending seat index:
-                       u8(s) || app_public_key[s] || u64_be(stack_at_hand_start[s])
-                       || u8(seat_flags[s]) ])
+                       u8(s) || app_public_key[s] || u64_be(stack_at_hand_start[s]) ])
 ```
+
+**The roster is the ordered list of seated identities and their start-of-hand
+stacks, and nothing else. This is D-012 and it is normative.** A
+`u8(seat_flags[s])` component stood in this hash and is **deleted**. It appeared
+exactly once in the whole corpus — here — and was never defined, so two
+implementers had to guess it; but it is deleted rather than defined, and the
+reason is general and binds every future addition.
+
+`roster_hash(k)` feeds `GENESIS(k)`, and every event of hand `k` chains
+transitively to `GENESIS(k)`. A component two honest receivers can compute
+differently therefore does not cost them one field: it costs them every event of
+the hand, because neither will verify a single one of the other's. That failure
+is total, and it is silent until the first event arrives.
+
+Anything mutable about a seat is one of exactly two things, and neither belongs
+here:
+
+* It is **established by a chained event every participant accepted** — sitting
+  out by `PLAYER_SIT_OUT`, a stack by the previous hand's terminal, a departure
+  by `PLAYER_LEAVE`. Then it is already in the chain, signed and accepted by
+  every participant, and hashing it into the genesis a second time adds no
+  binding the chain does not already carry.
+* It is a **local view** — what this peer last heard from that seat, whether this
+  peer believes it is away, how long ago it answered. Then it can differ between
+  honest receivers, and hashing it forks the genesis.
+
+There is no third case. **No per-seat status, flag, presence bit or liveness
+estimate may enter `roster_hash`**, and a document or an implementation that adds
+one has a bug. Seat status is `STATE_MACHINE.md`'s (D-011 rule 1) and it changes
+only through a chained event; this hash is not a second route to it.
+
+The three surviving components are each a function of accepted chained content.
+The seat index and `app_public_key[s]` are ratified unanimously at `TABLE_READY`
+and change only at a hand boundary through an accepted `PLAYER_LEAVE` or seat
+entry. `stack_at_hand_start[s]` is a function of `TERMINAL(k-1)` and
+`HAND_INIT`'s `n(11) ledger_delta`, both chained. By the bullets above the stack
+is redundant — it *could* be dropped on the same argument — and it is retained
+deliberately, as a check rather than as a binding: §4.10's receiver validation of
+`n(5) final_stacks` is written against it, and a redundant hash of a quantity
+every peer already agrees on cannot fork anything.
 
 `advert_hash` is the `event_hash` of the `LOBBY_TABLE_AD` the participants joined
 under, so the agreed table parameters are bound into the very first link — every
@@ -2312,10 +2351,36 @@ receiver's own state**:
 | `cause` | The receiver's own trigger | Before that trigger |
 |---|---|---|
 | `1`, certified-subject path (`cert_hash = Some`) | it holds, or `n(3) evidence` carries, the named `kind = 2` `TIMEOUT_CERT` with `\|V\| >= 2` | reject |
-| `1`, hand-deadline path (`attributed = []`, `cert_hash = None`) | its **own** `hand_deadline_ms` has expired (§8.2) | **buffer, do not reject** |
-| `1`, §6.3 case (b) | it has itself reached case (b), **or** its own `hand_deadline_ms` has expired | **buffer, do not reject** |
+| `1`, uncertified path (`attributed = []`, `cert_hash = None`) — the hand-deadline path and §6.3 case (b) are **one row**, see below | its **own** `hand_deadline_ms` has expired (§8.2), **or** it has itself reached §6.3 case (b) | **buffer, do not reject** |
 | `2`, `3` | `n(3) evidence` verifies — the failing `SHUFFLE_PROOF` or reveal proof carries its own disproof | accept at once |
 | `4` | it is itself in the §6.3 case (c) terminus | **buffer, do not reject** |
+
+**Why the two uncertified `cause = 1` paths are one row, and not two (H4).** They
+stood here as two rows, and a receiver could not tell which of them it was
+looking at. Both bodies carry `cause = 1`, `attributed = []`, `cert_hash = None`,
+`deltas` all zeroes and `final_stacks` equal to the start-of-hand stacks — and
+those are every field of `HAND_ABORT`. **The two bodies are byte-identical.** A
+gate that selects a row by a distinction the wire does not carry is not
+implementable: the receiver has no input to select on, so a row it cannot reach
+is either dead text or a licence to guess.
+
+**The union is adopted.** One row, one trigger, and the trigger is the
+disjunction the two rows already spanned: the receiver buffers an uncertified
+`cause = 1` abort until **either** its own `hand_deadline_ms` has expired **or**
+it has itself reached §6.3 case (b), then accepts. Adopting the union rather than
+inventing a discriminator field is the safe direction, because the two triggers
+had the same disposition already — buffer, then abort neutrally, table not
+faulted — so the union admits no outcome either row did not, and it removes the
+only choice the receiver could have got wrong. Note that §6.3 case (b)'s row was
+already the union of its own trigger and the deadline; this makes the deadline
+row match it rather than the other way round.
+
+The `cause` table further below still records **three** ways an uncertified
+`cause = 1` abort comes about. That table is for a reader and a future
+adjudicator, and it stays: what an emitter believed ended the hand is worth
+recording even though no receiver can verify which of the three it was, and no
+rule in this document reads it. What is not permitted is a *receiver* rule keyed
+to a distinction the bytes do not carry, and there is now none.
 
 **Buffer, never reject, is the load-bearing half.** Rejecting a premature abort
 would put the deadlock back: a peer whose timer runs a few hundred milliseconds
@@ -2357,7 +2422,7 @@ resolved without a vote, a timer or a tie-break.
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) cause` | `u16` | `1` failure to publish a required cryptographic contribution; `2` invalid shuffle proof; `3` invalid reveal proof; `4` unresolvable state divergence. **Value `5` (equivocation proven) is deleted** — see §5.2's ordering rule and the note below. Every surviving value is a function of chained content that the ordering buffer can place, which is what makes two honest peers derive one body |
-| `n(1) attributed` | `Vec<bytes[32]>` | ≤ `MAX_SEATS` app public keys, ascending by encoded bytes; may be empty, and is empty for `cause = 4` and for `cause = 1` on each of the three paths listed below. **Evidence only — nothing in this document reads it to move a chip or to remove a player (D-010)** |
+| `n(1) attributed` | `Vec<bytes[32]>` | ≤ `MAX_SEATS` app public keys, ascending by encoded bytes; may be empty. It carries the certified subject on `cause = 1`'s certified-subject path, the shuffler for `cause = 2`, the revealer for `cause = 3`, and is **empty** on `cause = 1`'s uncertified path — the gate's single `attributed = []`, `cert_hash = None` row, which spans both the hand-deadline expiry and §6.3 case (b) — and for `cause = 4`. **Evidence only — nothing in this document reads it to move a chip or to remove a player (D-010)** |
 | `n(2) cert_hash` | `Option<bytes[32]>` | `event_hash` of the `TIMEOUT_CERT`. Required for `cause = 1` **when a certificate with an effect exists**, which is the certified-subject path and only that; `None` on every `attributed = []` path, where unanimity was by construction never reached and no certificate can exist |
 | `n(3) evidence` | `Vec<bytes>` | ≤ 2 `SignedEvent`s, each ≤ `MAX_EMBEDDED_EVENT` = 32 768 B; required for `cause` 2 and 3, which are the two causes a single chained event proves on its own |
 | `n(4) deltas` | `Vec<i64>` | **all zeroes, always (D-010).** An abort moves no chips, so there is no per-seat delta to carry; the field is a vector of `0` of length `\|occupied seats\|`. It is kept rather than removed so that `HAND_ABORT` and `HAND_COMPLETE` stay directly comparable to a verifier, and so that "the deltas sum to zero" stays one receiver check across both terminal messages rather than two |
@@ -3013,19 +3078,6 @@ answer to G2, and it is stated as a plain negative because that is what it is.**
 > `AbortKind::Equivocation`, or a transition producing one, names an outcome no
 > legal `HAND_ABORT` can carry, and is a defect in that document.
 
-**G2, decided.** The gate found `STATE_MACHINE.md` T55 consuming a proof, ending
-a hand with it, and producing an `AbortRecord{kind: Equivocation}` whose `cause`
-value this document had deleted, while T55 and T56 both asserted that "the
-accused is blocked at the protocol layer (`PROTOCOL.md` §5.2)". All three
-statements are wrong and this box is why. The simple answer is the true one:
-under D-010 a proof has no consequence, so **nothing consumes it**. `PROTOCOL.md`
-owns the wire and therefore owns what a message may cause; `STATE_MACHINE.md`
-owns the transitions and follows this box (D-011 rule 1). T55 loses its
-`HandAborted` destination and its `AbortRecord` and becomes T56's shape; the
-"blocked at the protocol layer" sentence is false in both rows and in
-`NETWORK_STACK.md` §6.6 and §11.5, because **no layer blocks anything on a proof**
-(D-010 point 3, D-011 rule 3).
-
 Why retention is stated this widely, even though nothing follows from it:
 equivocation is *detected* precisely when things look fine to the detector — it is
 two peers comparing what they each received, which is §1.5's forwarding rule
@@ -3047,16 +3099,34 @@ sender)` — nothing more and nothing less.** The three fixed components
 than part of its index, and `sender_public_key` is the seat. That is the whole
 derivation; this section defines no key of its own.
 
-* **`event_class == 0`.** One `Vec<Option<event_hash>>` per table per hand,
-  indexed by `(stage, seat, event_type_slot)`, where `event_type_slot` has
-  capacity **2** — a seat's own contribution to stage `s`, and the terminal
-  `HAND_ABORT` of §4.10, which lands at a stage the seat has usually already
-  contributed to and is the only second `class = 0` type an honest emitter
-  produces at one `sequence` (§4.11 row 36). Bounded by `MAX_STAGES_PER_HAND ×
-  MAX_SEATS × 2`. `MAX_STAGES_PER_HAND = 2048`; a legitimate hand uses well
-  under 200 stages and fills the second cell at most once, in the hand's last
-  stage. **The `event_type` axis is not optional**: without it the abort and the
-  contribution collide, which is defect G1.
+* **`event_class == 0`.** One map per table per hand, keyed by
+  `(stage, seat, event_type)` — the **whole `u16`**, exactly as §5.2.1 carries
+  it, not a positional slot standing in for it — holding the accepted
+  `event_hash`. **The `event_type` axis is not optional**: without it the
+  terminal `HAND_ABORT` of §4.10 and its emitter's own contribution to the
+  stalled stage collide, which is defect G1.
+
+  **Capacity 2 is a bound on occupancy, not a component of the index, and the
+  distinction is the whole of H3.** An earlier revision indexed this structure by
+  an `event_type_slot` of capacity 2, which is not §5.2.1's `event_type` and does
+  not agree with it: two different `ACTION_*` claimed for one turn, and
+  `SHOWDOWN_REVEAL` against `SHOWDOWN_MUCK`, are **two slots** under the key
+  (§5.2.1, §4.11 rows 24–25 and 26–30) and would have been **one cell** in that
+  store. A receiver would then reject the second at step 10a as a replay, and
+  refuse an `EquivocationProof` a conforming client built from the same pair —
+  the store contradicting the key it claims to index. Keying by the full
+  `event_type` removes the contradiction without costing the bound, because the
+  bound never came from the index in the first place: **§4.0 step 12 admits at
+  most two `class = 0` events per `(stage, seat)`** — the seat's one
+  contribution, plus the terminal `HAND_ABORT`, which is step 12's only
+  exception (§4.11 row 36) — and this structure records only events that were
+  accepted. So occupancy stays at `MAX_STAGES_PER_HAND × MAX_SEATS × 2` entries.
+  `MAX_STAGES_PER_HAND = 2048`; a legitimate hand uses well under 200 stages and
+  fills the second entry at most once, in the hand's last stage. A third
+  `class = 0` type at one `(stage, seat)` is rejected by step 12 before it
+  reaches this structure, so no additional cap is needed here and none is
+  imposed. Sparse rather than dense for the same reason as the classes below: a
+  dense `u16` axis would be 65 536 cells per `(stage, seat)` for a pair.
 * **`event_class` 1 and 2.** A per-stage map keyed by `(seat, subject_seat)` for
   votes and `(seat, subject_digest)` for certificates, **allocated only for a
   stage at which such an event has actually been accepted**. At most `MAX_SEATS ×
@@ -3133,6 +3203,21 @@ map.
 Including the derived `pots` is deliberate redundancy: they are a pure function of
 `committed_this_hand` and `folded`, so including them makes an engine divergence
 in the pot layering visible at the checkpoint instead of at the award.
+
+**Every per-seat flag in this struct must be a deterministic function of accepted
+chained events, and D-012 is what makes that a requirement rather than a
+convention.** `folded`, `all_in`, `acted_this_round`, `sitting_out` and `absent`
+are the five, and each is a `Vec<bool>` by seat. The bullet above already
+excludes what a peer merely *observes*; this states the same rule from the other
+side, because `absent` is the one that could be got wrong. A seat's presence must
+not be derived from how long that seat has been quiet at this receiver, from a
+dropped connection, from a relay status, or from any field of an accepted
+`HAND_ABORT` — §4.10 forbids the last of these outright, and the general form is
+D-012. Two honest peers with the same accepted chain must compute the same five
+vectors; if they cannot, the checkpoint reports a divergence that neither caused
+and §6.3 ends a hand for nothing. Which chained events set them is
+`STATE_MACHINE.md`'s (D-011 rule 1) and is not restated here; that they may have
+no other source is this section's.
 
 ### 6.2 Checkpoints
 
