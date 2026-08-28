@@ -120,6 +120,23 @@ the failure mode all three misses share.
   D-013 also carries the process finding that a defect assigned across an owner
   boundary is recorded in `DECISIONS.md`'s open list in the same pass that finds it,
   which is where `K-6` was recorded and how §7.3 came to be fixed in this one.
+* **D-014** — a cheater is removed from the table on self-authenticating evidence.
+  **This document owns three of the six tier-1 clauses** — the shuffle proof, the
+  decryption-share proof and the key-ownership proof — and carried **zero** occurrences
+  of the identifier before this pass, while the decision's whole safety argument is about
+  what those three proofs establish. That is `N9`, and it is the third consecutive pass
+  in which this document was the one a decision did not reach: D-012's rule was written
+  here, D-013 missed it (`J-5`), and D-014 missed it again. The count is reported rather
+  than an assurance given, per the paragraph above: **0 before this pass**, and the
+  occurrences after it are in the sweep record you are reading, in §2.1, §6.1, §8 rule 3
+  and in **§8.1**, which is the new section and the substance of the item. What §8.1
+  states for each proof is what a verification failure **proves** — evidence against its
+  signer, needing no quorum, which is why tier 1 can act on arrival — and what it does
+  **not** prove, in particular that a failure says *either the prover cheated or we are
+  not looking at the same inputs*, so the public inputs must be accepted chain content or
+  the verdict is a divergence and not a removal. §8.1.5 adds the one rule this document
+  owes the decision: **a removal may rest only on a verifier that ran and returned
+  invalid, never on a verification that could not be performed.**
 
 ---
 
@@ -219,6 +236,13 @@ The proof of knowledge is not decoration. Without it a malicious player could pu
 `pk_j = X − Σ_{i≠j} pk_i` for a target `X` whose discrete log it knows — a rogue-key
 attack that would hand it sole control of the aggregate key. Requiring knowledge of
 `sk_j` closes this.
+
+**Under D-014 this proof is also evidence, and §8.1.1 states its limits.** A failed
+key-ownership proof is one of the three tier-1 clauses `DECISIONS.md` D-014 rests on: it
+is decidable from the message and `ctx` alone, with no game state in the verdict, which
+is why it needs no quorum. What it does and does not establish — in particular that the
+rejection is *itself* the mitigation, so nothing is lost by refusing to over-read it —
+is §8.1.1.
 
 Every player verifies every other player's proof, obtaining a `Verified<PublicKey>`,
 and then all form the same **aggregate public key**:
@@ -870,7 +894,10 @@ in zero knowledge — `π` and `ρ` are not revealed. Written out, `𝒞'[i].c1 
 Because `π` must be a permutation of the whole index set, a shuffler cannot drop a
 card, duplicate a card, or substitute a card. That is `SPEC_CS.md` §8's requirement
 ("remove 2c, add a second As must be cryptographically detectable"), and it is
-exactly what the *product* half of the argument enforces.
+exactly what the *product* half of the argument enforces. **It is also D-014's tier-1
+clause about a deck that gains or loses a card — the same verdict and not a second
+check (§8.1.4) — and §8.1.2 names the three public inputs a failure is only evidence
+against its signer *given*.**
 
 **Measured, not assumed:** the research suite serialised a valid deck, overwrote card
 5's bytes with card 3's, re-deserialised and presented the honest proof — rejected
@@ -1711,6 +1738,10 @@ independently reproduced in `probe-cryptodoc` as `[2] … None`.
    one's own hole index before `SHOWDOWN_REVEAL`**. Both are protocol violations: the
    receiver **rejects** the token, which is the enforcement, and names the sender in
    the transcript, which under **D-010** is a record with no automatic consequence.
+   **Neither is a proof failure and neither is D-014 tier 1**: the token verifies, and
+   what is wrong with it is a judgement against protocol state — which street it is and
+   which indices this hand's deal map made due — so it is **tier 2** and reaches a
+   removal only against state fixed by a checkpoint both peers signed (§8.1.3).
 4. Tokens are carried inside the signed CBOR envelope, bound to
    `(table_id, hand_id, street, card_index)`, because the DLEQ itself does not bind
    them (§6.4 item 2).
@@ -1722,6 +1753,153 @@ independently reproduced in `probe-cryptodoc` as `[2] … None`.
 
 **Cost:** 131 bytes per player per revealed card (33 + 98), and 1.39 ms to 4.34 ms to
 open one card end to end for 2 to 6 players (§6.5).
+
+### 8.1 What a failed proof proves, and what it does not (D-014)
+
+**Why this section exists.** **D-014** removes a player from the table on
+*self-authenticating* evidence — *"a message signed by the accused, whose illegality any
+peer can decide alone, from that message plus state the peers provably share"* — and
+its tier-1 list has six clauses, of which **three are this document's**: a failed
+**shuffle proof** (§6), a failed **decryption-share proof** (§2.6, §8) and a failed
+**key-ownership proof** (§2.1). A fourth, *a deck that gains, loses or duplicates a card
+across a shuffle*, is not a separate check at all and §8.1.4 says why. Until this pass
+this document carried **zero** occurrences of `D-014` while owning half of the evidence
+the decision rests on, which is the omission `N9` names. What follows states, for each
+proof, the two things an implementer has to know before a verdict is allowed to cost
+somebody their seat: **what a verification failure proves**, and **what it does not**.
+
+**The general shape, stated once.** A verifier here is a pure function of
+`(the signed message, public inputs, the Fiat–Shamir transcript)`. Where every public
+input is either a constant or accepted chain content, two honest peers run the *same*
+function on the *same* arguments and get the *same* answer — which is exactly D-014's
+condition, and it is why **a failed proof needs no quorum, no vote, no certificate and
+no timing**: the evidence is a signature by the accused over an object that is invalid
+on its face, and framing it would mean forging that signature (§2.4's `verify_strict`).
+That is also why **tier 1 can act on arrival** — the verdict does not depend on arrival
+order, on how many peers received the message, or on anything a slow peer might still
+send. Compare the artefacts D-014 excludes by name: a timeout needs a clock nobody
+shares, an equivocation predicate needs a slot key that has been wrong five times, and
+`attributed` is per-receiver. None of those is a function of shared inputs; all three of
+these are.
+
+**And the one condition on that, which is the whole of the fine print.** The public
+inputs must be the *agreed* ones. Each proof below names them explicitly. A verifier
+that substitutes a locally reconstructed input for a chained one has stopped computing
+the shared function, and its *invalid* verdict then proves nothing about the signer —
+it proves the two peers disagree about the input, which is a divergence
+(`STATE_MACHINE.md` T50, `PROTOCOL.md` §6.3) and never a removal.
+
+#### 8.1.1 The key-ownership proof (§2.1) — the purest tier 1
+
+**What a failure proves.** The signer published a `DECK_INIT` carrying `pk_i` and a
+Schnorr proof that does not verify under `(ctx, pk_i)`. Because the proof is checked
+against the message's own fields plus `ctx`, and `ctx` is a function of `table_id`,
+`hand_id` and the shuffle-round sentinel alone (`PROTOCOL.md` §4.5, §6.4 discipline item
+1), **no game state whatever enters the verdict**. It is decidable from the message and
+constants, which is the strictest reading of D-014 tier 1 and the only one of the three
+that needs no chain content at all. What it establishes is precisely §2.1's stated
+threat: a party that cannot demonstrate knowledge of `sk_i` may be mounting the rogue-key
+construction `pk_j = X − Σ_{i≠j} pk_i`, and the proof is what closes it.
+
+**What it does not prove.** Not that the rogue-key attack succeeded — it cannot have,
+because `AggregatePublicKey::new` takes `Verified<PublicKey>` and an unverified key is
+not aggregable, so the honest peer's failure is *also* the mitigation. Not that any other
+key in the hand is honest. Not that the signer is the party who benefits: a relayed or
+replayed body is still signed by its author, and §2.4's envelope plus `hand_id` in `ctx`
+is what makes a cross-hand replay fail here rather than elsewhere. And **not** that the
+hand is unplayable — the hand is voided by `STATE_MACHINE.md` T64 because a removal voids
+it, not because the cryptography could not continue.
+
+#### 8.1.2 The shuffle proof (§6) — tier 1, with its inputs named
+
+**What a failure proves.** The signer published a `DECK_SHUFFLE` whose proof does not
+verify for the statement of §6.1 against **the input deck `D_{k-1}` this peer accepted as
+chain content**, the aggregate key `apk` of this hand, and the transcript of §6.4. It
+proves that this signer's output deck is not a re-encryption permutation of that input —
+which, by §6.1's permutation argument, covers dropping, duplicating and substituting a
+card in one verdict.
+
+**What it does not prove, and the first item is the one that matters.** It does **not**
+prove misbehaviour if `D_{k-1}`, `apk` or `ctx` differ between the two peers: completeness
+is unconditional, so an honest prover's proof always verifies *against the inputs it
+proved over*, and a failure therefore says either *the prover cheated* or *we are not
+looking at the same deck*. The corpus has produced the second case with no adversary at
+all (`DECISIONS.md` K-1, `THREAT_MODEL.md` X33–X37). This is why the three inputs must be
+read off accepted chain content and never re-derived: `apk` is pinned to the chained
+`HAND_INIT`'s `dealt_in` (§2.1's D-012 bullet), `D_{k-1}` is the accepted previous stage,
+and every part of `ctx` is a constant or accepted chained content — **which is true now
+and was not when §6.4's discipline item 1 was written** (`DECISIONS.md` J-5: `session_id`
+carried `advert_hash` transitively until J1 was fixed, so the binding item 1 demands was
+violated through a field item 1 did not mention). Second, a failure does not localise
+*what* was wrong in the deck: the argument is one statement about the whole permutation,
+and an implementation must not report "card 5 was duplicated" from a failed verification,
+because it did not learn that. Third, it says nothing about earlier shufflers in the
+chain, whose proofs stand or fall on their own inputs.
+
+#### 8.1.3 The decryption-share proof (§2.6, §8) — tier 1 for the share, tier 2 for the timing
+
+**What a failure proves.** The signer published a reveal token whose Chaum–Pedersen DLEQ
+does not tie `share_i` to the `sk_i` behind the `pk_i` that is in this hand's `apk`. It is
+evidence against that signer alone: §8's negatives are measured, and both of the
+misbehaviours the proof exists to catch — a random share (`T7a`) and a token replayed onto
+a different card (`T7b`) — fail verification, so the failure is not a diagnosis of which
+one it was, only that this signer's token is not a share of this card under its committed
+key.
+
+**What it does not prove.** Not that the card is lost: an invalid token is simply not
+aggregated (rule 1), and the card opens as soon as the honest shares are in. Not anything
+about a **missing** token — silence is not a proof failure, it is D-005's disconnect case
+and D-006's timeout case, and neither is ever a removal (D-014 excludes them by name). And
+— this is the boundary an implementer will get wrong — **a token that verifies but arrives
+for an index that is not due is not tier-1 evidence at all.** §8's rule 3 forbids
+publishing a token for an undue index and for one's own hole index before
+`SHOWDOWN_REVEAL`; those are judgements against *protocol state* — which street it is,
+which indices this hand's deal map made due — so they are **D-014 tier 2** and reach a
+removal only once the state they are judged against is fixed by a checkpoint both peers
+signed. Rule 3's own sentence stands as written for the tier-1 half: the receiver
+**rejects** the token and names the sender, and under D-010, as narrowed by D-014, nothing
+further follows automatically until the tier-2 precondition is met.
+
+#### 8.1.4 The fourth clause is not a fourth check
+
+D-014's tier-1 list also names *"a deck that gains, loses or duplicates a card across a
+shuffle"*. That is **the same verdict as §8.1.2 and not an independent one**: §6.1's
+permutation statement is exactly what excludes it, and the research suite measured it
+(`T4`: a deck with card 5 overwritten by card 3, presented with an honest proof, is
+rejected). An implementation that adds a hand-rolled card-conservation check beside the
+proof has built a **second verifier** for one statement, which is the drifted-copy shape
+D-011 rule 1 exists to stop — and under D-014 a drifted copy no longer costs a rejected
+message, it costs an honest player their seat.
+
+#### 8.1.5 The rule this section adds, and it is the one D-014 makes load-bearing here
+
+> **A removal may rest only on a verifier that ran and returned *invalid*. It may never
+> rest on a verification that could not be performed.** A deserialisation failure, a
+> truncated body, a length that does not match, an allocation failure, a panic caught at
+> the boundary, a missing input, a library version that cannot parse the encoding — none
+> of these is a proof failure. They are indistinguishable, at the verifier's call site,
+> from *our own* defect, and D-014's safety argument covers only the case where every
+> honest peer computes the same verdict from the same inputs. Where verification cannot
+> be completed, the message is rejected or deferred and **no `CheatProven` is produced**.
+
+The reason to write that down in this document rather than in the engine's is that this is
+where the call sites are, and the failure mode is ours and not the adversary's: with
+D-014, *"a validator that is too strict now ejects honest players rather than merely
+rejecting a message"*. `DECISIONS.md` **C-1 to C-3** are three live instances — the shipped
+`src/protocol/` signs a digest where §2.4 signs a domain-prefixed body, and its domain
+register matches `PROTOCOL.md` §2.8 in no string — and two implementations differing that
+way would each remove the other on sight, each correctly by its own rules. The gate on
+that is `THREAT_MODEL.md`'s mirror test (`DECISIONS.md` **D-014-2**): under every legal
+interleaving, no honest peer is evictable. **Nothing in this section may be read as
+clearing the removal feature to ship; it states what the evidence means, and the mirror
+test is what says it is safe to act on.**
+
+**And what none of the three proofs answers, recorded because it is somebody else's and is
+open:** how a removal reaches canonical state at all, given that whether the offending
+message arrived is per-receiver while a seat's status is hashed. That is
+`DECISIONS.md` **D-014-3**, owned by `PROTOCOL.md`. This section defines what the evidence
+proves; it does not decide how the verdict is carried, and an implementer must not infer
+from *"any peer can decide alone"* that a peer may act alone on canonical state.
 
 ---
 
@@ -2234,6 +2412,13 @@ repeated here rather than only linked, so that this list stays usable if the poi
 ever breaks; `docs/CONTRIBUTING.md` is where the process it belongs to is specified,
 and `PROTOCOL.md` §9.6 carries the same sentence for its own list.
 
+0. **A proof verdict that can cost a seat is produced only by a verifier that ran.**
+   §8.1.5: `invalid` is evidence; *could not verify* — a decode failure, a truncated
+   body, a resource failure, a caught panic, a missing input — is **not**, and must
+   reject or defer rather than produce evidence. The three tier-1 clauses D-014 rests on
+   are this document's (§8.1), and this is the obligation their call sites carry.
+   Numbered `0` so the existing numbering is not disturbed, on the rule
+   `STATE_MACHINE.md` §9.3 uses for its conditions `0.5` and `0.6`.
 1. Vendor `ziffle 0.1.0` at `vendor/ziffle/`, `[patch.crates.io]`, `Cargo.lock`
    committed. Complete the OQ-1 review before the mental-poker layer is considered
    done.

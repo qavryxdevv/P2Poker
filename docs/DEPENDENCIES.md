@@ -147,6 +147,18 @@ These are read first and none of them is softened. Full rows follow in §5.
 
 ### 3.1 `ziffle 0.1.0` — the deck itself, unaudited, one author, one release
 
+> **What D-014 changed about this entry, and it is not the risk rating.** Under D-010 a
+> proof this crate wrongly rejected cost a rejected message and, at worst, a stalled hand.
+> Under **D-014** a failed shuffle proof, decryption-share proof or key-ownership proof is
+> **tier-1 evidence that removes a player from the table** (`CRYPTOGRAPHY.md` §8.1,
+> `STATE_MACHINE.md` T64/T65). So this crate's *false-reject* behaviour, not only its
+> soundness, is now load-bearing against a person, and two implementations that verify
+> differently would each eject the other and each be right by its own rules. Nothing in the
+> row below moves — the version, the pin and the vendoring are unchanged — but **OQ-1**,
+> the blocking in-house review, now discharges a second obligation besides deck integrity,
+> and `DECISIONS.md` **D-014-2**'s mirror test (no honest peer is evictable under any legal
+> interleaving) is the gate that must pass before the removal feature ships.
+
 This is the crate the entire mental-poker layer stands on, and it is the weakest
 link in the corpus.
 
@@ -570,7 +582,7 @@ directly (§3.5). No open advisory on any of them at these versions; the histori
 | `libp2p-upnp` | 0.5.0 | IGD port mapping | no open advisory. Speaks HTTP to a LAN device that is not authenticated — §5.9 |
 | `libp2p-connection-limits` | 0.6.0 | connection caps | no open advisory. **There is no `connection-limits` cargo feature** — it is a non-optional dependency and `libp2p::connection_limits` is always available; asking for the feature is a hard resolver error |
 | `libp2p-memory-connection-limits` | 0.5.0 | memory-based caps | no open advisory. This one *is* a feature, spelled `memory-connection-limits` |
-| `libp2p-allow-block-list` | 0.6.0 | peer blocklist | no open advisory; non-optional, like `connection-limits`. **Its presence in the build is not permission to drive it from a protocol proof** — D-010 point 3 and D-011 rule 3 forbid automated eviction at every layer, transport included, and this crate is the transport-layer mechanism they were written about. A user-initiated block is a user decision and is fine; a block triggered by an `EquivocationProof` or a `TIMEOUT_CERT` is a defect. `NETWORK_STACK.md` owns the rule (D-011) |
+| `libp2p-allow-block-list` | 0.6.0 | peer blocklist | no open advisory; non-optional, like `connection-limits`. **Its presence in the build is not permission to drive it from a protocol proof** — D-010 point 3 and D-011 rule 3 forbid automated eviction at every layer, transport included, and this crate is the transport-layer mechanism they were written about. A user-initiated block is a user decision and is fine; a block triggered by an `EquivocationProof` or a `TIMEOUT_CERT` is a defect. `NETWORK_STACK.md` owns the rule (D-011). **D-014 does not reopen this and the distinction is the layer:** a removal for cause takes a seat out of the *table* — dead, blinded off, one-way (`STATE_MACHINE.md` T64, T65, I34) — and never out of the *transport*. The removed peer keeps its connections, and an implementation that reaches for this crate on a `CheatProven` has rebuilt the eviction D-011 rule 3 forbids, with the one decision that sounds like a licence for it |
 | `libp2p-metrics` | 0.17.0 | Prometheus metrics | no open advisory. Enabled in `Cargo.toml`; absent from `NETWORK_STACK.md` §5.1.1 — §9 |
 
 > **Correction, verified in source, that must be carried everywhere it appears.**
@@ -862,7 +874,11 @@ Run §10 in full and diff against this document. Then, for every difference:
    one and `CONTRIBUTING.md`** — D-012's process rule, `CONTRIBUTING.md` §2.5. A
    document read with nothing found is reported as such; silence is
    indistinguishable from a skipped file, and both documents were skipped by every
-   sweep until 2026-08-28.
+   sweep until 2026-08-28 — and then by the two sweeps after it, for D-013 and D-014,
+   which is why the record above reports a **count per decision, before and after**
+   rather than an assurance that the reading happened. **Report the count even when it
+   is zero and stays zero**: a zero with a reason is a discharged sweep, and a zero with
+   nothing beside it is the state this file was in for three passes.
 
 ### 8.3 Who decides an advisory is acceptable, and what they may not accept
 
@@ -1037,6 +1053,20 @@ counts silence as a skipped file.
 Before this pass the document contained zero occurrences of D-009, D-010, D-011 and
 D-012. That is the condition D-012's process rule exists to prevent, and it was the
 third instance.
+
+**Sweep record, 2026-08-28 — D-013 and D-014 against this document.** Same form, same
+reason, and the count first: before this sweep the file contained **zero** occurrences of
+`D-013` and **zero** of `D-014`, while the sweep record above cited the rule that every
+decision is read against every document. That is the **fourth and fifth** instance of the
+same omission, in the same file, and it was recorded as `L8` in `DECISIONS.md`'s open list
+in three consecutive passes without being acted on. `CONTRIBUTING.md`'s header says what
+that pattern costs and §2.5 item 4 there now carries it as a numbered failure of the rule.
+
+| Decision | Found here | Action |
+|---|---|---|
+| **D-013** (liveness is inherited from the chain, not from a seat's status) | **nothing on the wire or in the register.** This document names no seat, no status, no required emitter set and no hand; a crate's presence in the tree is not a per-hand quantity. The one place it could have reached — `lru 0.16.4` in §3.3 — is registered for the receiver-side caches `PROTOCOL.md` §5.3 bounds, and D-013 changed which caches exist without changing the crate's status | none; recorded so silence is not read as a skip |
+| **D-014** (removal on self-authenticating evidence) | **one row, and it is a narrowing rather than a finding.** `libp2p-allow-block-list 0.6.0` in §5.5 carries a D-010 note that it *"may not be driven from a proof"*. D-014 does not change that note: a removal under D-014 is a **table-level** disposition carried by the poker layer — the seat is dead and blinded off (`STATE_MACHINE.md` T64, T65, I34) — and it is **not** a transport-layer block. D-011 rule 3 stands unamended: no `block_peer`, no allow/block list driven by a protocol proof, at any layer, including for tier-1 evidence | note extended to say D-014 does not reopen it |
+| **D-014, second half** (the verifier is now load-bearing against a person) | **the whole register, read a new way, and this is the item worth the sweep.** D-014 makes a removal rest on a proof verifier's verdict, so **a dependency that verifies a proof is now a dependency that can eject a player**: `ziffle 0.1.0` (§3.1) — unaudited, one author, one release, semver-unstable — is the code behind all three of the tier-1 clauses `CRYPTOGRAPHY.md` §8.1 owns. A false *reject* in it was previously a rejected message and a stalled hand; it is now an ejected honest player. Nothing in the register changes, and the standing item that already covers it is **OQ-1**, the blocking in-house review of `MultiExpArg` and `SingleValueProductArg` — which §3.1 grades a prerequisite and which D-014 promotes from *deck integrity* to *nobody is ejected wrongly* | §3.1 pointer added; OQ-1's justification restated, its status unchanged |
 
 ---
 

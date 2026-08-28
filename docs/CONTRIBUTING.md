@@ -12,6 +12,27 @@ against the decisions as they now stand rather than against D-008 scoping that D
 had made inert, and §5's measured state was corrected against a run rather than
 against memory. §2.5 is the rule that should have caught this three passes ago.
 
+**Swept again against D-013 and D-014 on 2026-08-28**, and this second record exists
+because the first one stopped at D-012 while two further decisions landed. Coverage
+before this sweep: **zero** occurrences of `D-013` and **zero** of `D-014` in this file
+and in `DEPENDENCIES.md`, both of which cite §2.5's rule that every sweep covers every
+document. What changed: §2.5 gains the fourth failure of that rule, §3's checklist gains
+the two items D-013 and D-014 produce and item 5 is narrowed by D-014, and the sentence
+below that counted *"the four"* decisions now counts six.
+
+**And the reason this record is worth reading rather than skipping.** This file and
+`DEPENDENCIES.md` were **named in three consecutive review passes as carrying stale
+sweep records, and were not fixed in any of them** — `DECISIONS.md`'s open list carried
+it as `L8`, graded *low*, twice deferred while the specification documents were edited.
+That is not a small omission with a small consequence: **it is precisely the failure
+mode D-013's process rule exists to stop**, which is that a defect assigned to a document
+nobody is currently editing stays assigned and never gets done, and it happened to the
+two documents whose whole job is to tell a contributor how the work is checked. A
+process document that is itself three decisions out of date is a checklist that certifies
+the wrong things. If you are reading this because you are about to make a change: the
+lesson `L8` teaches is not *remember to sweep*, it is **a deferred documentation defect
+does not decay gracefully — it is read as current by everyone who arrives after it**.
+
 **Authority.** `docs/DECISIONS.md` outranks this file and every specification
 document, and **this file does not restate its contents** — not the decisions, not
 their numbers, not their count. That is D-011's one-normative-owner rule applied to a
@@ -23,8 +44,10 @@ precisely the copy that drifts.
 So read `DECISIONS.md` there, not here. `SPEC_CS.md` is the binding specification;
 `docs/research/` is **evidence and never authority** (§2.2); where a specification
 document and a numbered decision disagree, the decision wins and the document is
-corrected. **D-009 to D-012** are the four that decide how a change is written and
-reviewed, and §3 below is the checklist they produce.
+corrected. **D-009 to D-014** are the six that decide how a change is written and
+reviewed, and §3 below is the checklist they produce. The count is stated and not the
+contents, for the reason the paragraph above gives; when a decision lands, the count here
+moves with it, and if it has not moved, this file has not been swept.
 
 This is a security project before it is a poker project. Most of what follows exists
 because `SPEC_CS.md` §35's invariant has to survive a modified client, and process is
@@ -324,6 +347,18 @@ by a later pass as a blocking defect rather than by the sweep that caused it:
    ever been.** Both had zero occurrences of D-009, D-010, D-011 and D-012 until the
    pass that wrote this section. §3's checklist had been directing reviewers at a
    scoping rule that D-010 had already made inert.
+4. **The same two files were then skipped again, by the two sweeps that followed —
+   and this time the rule had already been written, above, in this section.** D-013 and
+   D-014 both landed; both left this file and `DEPENDENCIES.md` at **zero** occurrences;
+   the miss was found each time, recorded each time as `L8` in `DECISIONS.md`'s open
+   list, graded *low*, and carried forward unfixed for **three passes**. The failure is
+   therefore not that the rule was unknown. It is that **a rule with no owner and a
+   *low* grade loses to whatever is graded high**, every time, and the document that
+   loses is the one nobody is editing that week. Two consequences are now written down
+   rather than trusted to attention: a sweep reports a **count** per document, before
+   and after (the practice `THREAT_MODEL.md` §9.2 and `CRYPTOGRAPHY.md`'s sweep record
+   now follow), and **a documentation defect that survives one pass is re-graded, not
+   re-deferred** — the second deferral is the evidence that *low* was the wrong grade.
 
 The arithmetic is not close. The cost of including a document that turns out to be
 unaffected is one reader reporting that they found nothing — and **reporting it, in
@@ -335,8 +370,8 @@ skipped the file. The cost of excluding one has three times been a blocking defe
 ## 3. Review checklist for a security-critical change
 
 Run through this before pushing. Each line is here because something in this corpus
-failed it, and the four decisions that shape it are **D-009, D-010, D-011 and
-D-012** — read them in `DECISIONS.md`, not from this summary.
+failed it, and the six decisions that shape it are **D-009, D-010, D-011, D-012,
+D-013 and D-014** — read them in `DECISIONS.md`, not from this summary.
 
 1. **Does a regression test reproduce the problem, and was it observed to fail
    first?** And if the change adds a standing gate, **was that gate made to fail on
@@ -367,14 +402,36 @@ D-012** — read them in `DECISIONS.md`, not from this summary.
    the integrated tree; §4.5 and `DEPENDENCIES.md` §5.4 are the standing examples.
 
 5. **Does the change move a chip, unseat a player, or block a peer on the strength
-   of a proof?** (D-010, and D-011 rule 3 for the transport layer.) An abort is
-   **neutral**: stacks are restored to their start-of-hand values, attribution is
-   recorded as evidence with no automatic consequence, and there is no automated
-   eviction at any layer — no `block_peer`, no unseating, no allow/block list driven
-   by a protocol proof. A proof is evidence for a human; the user may always decline
-   to play with someone, and the protocol may not decide that for them. D-010
+   of a proof?** (D-010, **narrowed by D-014**, and D-011 rule 3 for the transport
+   layer.) An abort is **neutral**: stacks are restored to their start-of-hand values,
+   attribution is recorded as evidence with no automatic consequence, and there is no
+   automated eviction at any layer — no `block_peer`, no unseating, no allow/block list
+   driven by a protocol proof. A proof is evidence for a human; the user may always
+   decline to play with someone, and the protocol may not decide that for them. D-010
    dissolved a four-pass attack class by removing the prize, so restoring a
-   consequence restores the class.
+   consequence restores the class. **The one exception D-014 opens is item 5a below and
+   it is narrow by construction: `chips` are never part of it.** A removal moves **no
+   chips at all** — the offender's stack stays on the table and blinds off — so a
+   change that moves a chip on the strength of a proof is still the defect this item
+   describes, whatever it is called.
+
+5a. **Does the change let one peer remove another?** (D-014.) Then four questions, and
+   a *no* to any of them means the removal is not admissible. **(i) Is the evidence a
+   message the accused signed, whose illegality this peer can decide alone from that
+   message plus state the peers provably share?** A timeout, a missing publication, an
+   `EquivocationProof`, an `attributed` field, a vote and a certificate are all excluded
+   **by name** — each is a judgement two honest peers can reach differently, and each
+   produced the forfeiture D-010 deleted. **(ii) If the illegality is decidable only
+   against game state — out of turn, below the minimum raise, larger than the stack —
+   is it judged against state fixed by a checkpoint both peers signed?** That is tier 2
+   and the precondition is not optional; before it, the violation is recorded and the
+   hand is voided and **nobody is removed**. **(iii) Is the exit one-way, the hand voided
+   neutrally, and the seat left dead and blinded off** so chip conservation holds with no
+   term moving? **(iv) Has the mirror test been run — under every legal interleaving, no
+   honest peer is evictable?** It is `DECISIONS.md` D-014-2, it blocks shipping the
+   feature rather than writing it, and it exists because D-014 makes the correctness of
+   every validator load-bearing against a *person*: a validator that is too strict no
+   longer rejects a message, it ejects a player.
 
 6. **Does the change restate something another document owns?** (D-011 rule 1.)
    `PROTOCOL.md` the wire, `STATE_MACHINE.md` transitions, `CRYPTOGRAPHY.md`
@@ -392,6 +449,17 @@ D-012** — read them in `DECISIONS.md`, not from this summary.
    the structure the state machine already separates for it. This is the shape a
    *fix* creates — H1 sat on the path P3's fix had newly made load-bearing — so it
    is checked hardest on the code a previous change just started to rely on.
+
+7a. **Does any progress path read a seat's *status* rather than what it signed?**
+    (D-013.) Liveness is inherited from the chain: a seat is required to emit in hand
+    `k+1` only if it signed at least one chained event during hand `k`. A required
+    emitter set, an end condition, a pause condition or a resume guard written on
+    `Active`, `SittingOut` or `Absent` re-creates the circularity D-013 removed — a
+    silent seat emits nothing, so nothing can change its status, so it is required
+    forever and the table plays no further hand while every phase still has an exit.
+    Two of these have been found *after* D-013 landed (`K-7`, `L7`), both in guards
+    that looked inert, so the test is not "does it deadlock" but "does it read a
+    status word".
 
 8. **Does anything new read the wall clock inside the state machine?**
    `STATE_MACHINE.md` I22 asserts replay determinism. This is item 7's most common

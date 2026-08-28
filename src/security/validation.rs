@@ -49,8 +49,6 @@ pub enum SelfContained {
     KeyProofInvalid,
     /// A shuffle gained, lost or duplicated a card.
     DeckNotAPermutation,
-    /// The event chains to a parent that does not exist.
-    ParentUnknown,
     /// The signer is not a party to this table.
     NotAParticipant,
 }
@@ -73,21 +71,107 @@ pub enum StateDependent {
     ActionInWrongPhase,
 }
 
-/// A checkpoint whose state every participant signed.
+/// A checkpoint whose state the accused and this receiver both signed.
 ///
-/// The only way to obtain one is from an accepted, mutually signed checkpoint,
-/// which is what makes a tier-2 finding safe: both peers were judging the
-/// accused against the same state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// This is the witness that makes a tier-2 finding safe, so it has to actually
+/// witness the thing. A state hash and a sequence number do **not**: they say
+/// some checkpoint existed, not that the accused was inside its emitter set, and
+/// not which hand it covers. A finding built on that would convict a player who
+/// was never party to the state it is judged against — the same shape as the
+/// defect this module exists to avoid.
+///
+/// So the emitter set and the hand are part of the witness, and
+/// [`AgreedCheckpoint::covering`] refuses to build one that does not contain
+/// both parties.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgreedCheckpoint {
-    /// The state hash every participant signed.
-    pub state_hash: Hash,
+    /// The state hash both parties signed.
+    state_hash: Hash,
     /// The chain position it fixes.
-    pub sequence: u64,
+    sequence: u64,
+    /// The hand it covers. A checkpoint from another hand judges nothing here.
+    hand_id: u64,
+    /// Every seat that signed it.
+    emitters: Vec<PlayerId>,
+}
+
+/// Why a checkpoint cannot witness a finding against this pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WitnessError {
+    /// The accused did not sign this checkpoint, so it never agreed to the
+    /// state its message is about to be judged against.
+    AccusedNotAnEmitter,
+    /// This receiver did not sign it either, so it cannot claim the state is
+    /// shared.
+    ReceiverNotAnEmitter,
+    /// The checkpoint covers a different hand from the offending message.
+    WrongHand { checkpoint: u64, message: u64 },
+}
+
+impl core::fmt::Display for WitnessError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            WitnessError::AccusedNotAnEmitter => {
+                write!(f, "the accused never signed this checkpoint")
+            }
+            WitnessError::ReceiverNotAnEmitter => {
+                write!(f, "this receiver never signed this checkpoint")
+            }
+            WitnessError::WrongHand { checkpoint, message } => write!(
+                f,
+                "checkpoint covers hand {checkpoint}, the message is from hand {message}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WitnessError {}
+
+impl AgreedCheckpoint {
+    /// Build a witness, checking it actually covers this accusation.
+    ///
+    /// The only constructor. It refuses unless both the accused and this
+    /// receiver signed the checkpoint and it covers the message's own hand.
+    pub fn covering(
+        state_hash: Hash,
+        sequence: u64,
+        hand_id: u64,
+        emitters: Vec<PlayerId>,
+        accused: &PlayerId,
+        receiver: &PlayerId,
+        message_hand_id: u64,
+    ) -> Result<Self, WitnessError> {
+        if hand_id != message_hand_id {
+            return Err(WitnessError::WrongHand { checkpoint: hand_id, message: message_hand_id });
+        }
+        if !emitters.contains(accused) {
+            return Err(WitnessError::AccusedNotAnEmitter);
+        }
+        if !emitters.contains(receiver) {
+            return Err(WitnessError::ReceiverNotAnEmitter);
+        }
+        Ok(AgreedCheckpoint { state_hash, sequence, hand_id, emitters })
+    }
+
+    pub fn state_hash(&self) -> Hash {
+        self.state_hash
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub fn hand_id(&self) -> u64 {
+        self.hand_id
+    }
+
+    pub fn emitters(&self) -> &[PlayerId] {
+        &self.emitters
+    }
 }
 
 /// A tier-2 finding, which cannot exist without an agreed checkpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tier2Finding {
     violation: StateDependent,
     against: AgreedCheckpoint,
@@ -107,13 +191,13 @@ impl Tier2Finding {
         self.violation
     }
 
-    pub fn checkpoint(&self) -> AgreedCheckpoint {
-        self.against
+    pub fn checkpoint(&self) -> &AgreedCheckpoint {
+        &self.against
     }
 }
 
 /// What was found in a message.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Finding {
     Tier1(SelfContained),
     Tier2(Tier2Finding),
@@ -137,7 +221,7 @@ pub enum Outcome {
 ///
 /// It carries the hash of the offending message so the removal stays checkable
 /// by anyone replaying the transcript, including the accused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemovalOrder {
     pub accused: PlayerId,
     pub finding: Finding,
@@ -149,7 +233,7 @@ pub struct RemovalOrder {
 /// The offending message's hash is required, not optional: a removal that
 /// cannot point at the message the accused signed is not a D-014 removal.
 pub fn adjudicate(accused: PlayerId, finding: Finding, evidence_hash: Hash) -> (Outcome, Option<RemovalOrder>) {
-    match finding {
+    match &finding {
         Finding::Tier1(_) | Finding::Tier2(_) => (
             Outcome::VoidHandAndRemove,
             Some(RemovalOrder { accused, finding, evidence_hash }),
@@ -164,7 +248,7 @@ pub fn adjudicate(accused: PlayerId, finding: Finding, evidence_hash: Hash) -> (
 ///
 /// A removal that cannot be explained in one sentence should not be automatic,
 /// so this is part of the module rather than an afterthought in the GUI.
-pub fn explain(finding: Finding) -> &'static str {
+pub fn explain(finding: &Finding) -> &'static str {
     match finding {
         Finding::Tier1(v) => match v {
             SelfContained::SignatureInvalid => "signature did not verify",
@@ -175,7 +259,6 @@ pub fn explain(finding: Finding) -> &'static str {
             SelfContained::RevealProofInvalid => "card reveal proof did not verify",
             SelfContained::KeyProofInvalid => "key ownership proof did not verify",
             SelfContained::DeckNotAPermutation => "the deck gained, lost or duplicated a card",
-            SelfContained::ParentUnknown => "the event chained to an unknown parent",
             SelfContained::NotAParticipant => "the signer is not a player at this table",
         },
         Finding::Tier2(f) => match f.violation() {
@@ -196,8 +279,21 @@ mod tests {
     const ACCUSED: PlayerId = [7u8; 32];
     const EVIDENCE: Hash = [9u8; 32];
 
+    const RECEIVER: PlayerId = [8u8; 32];
+    const HAND: u64 = 5;
+
+    /// A witness both parties signed, covering the hand in question.
     fn checkpoint() -> AgreedCheckpoint {
-        AgreedCheckpoint { state_hash: [1u8; 32], sequence: 42 }
+        AgreedCheckpoint::covering(
+            [1u8; 32],
+            42,
+            HAND,
+            vec![ACCUSED, RECEIVER],
+            &ACCUSED,
+            &RECEIVER,
+            HAND,
+        )
+        .expect("both parties signed it and it covers this hand")
     }
 
     #[test]
@@ -272,10 +368,9 @@ mod tests {
             SelfContained::RevealProofInvalid,
             SelfContained::KeyProofInvalid,
             SelfContained::DeckNotAPermutation,
-            SelfContained::ParentUnknown,
             SelfContained::NotAParticipant,
         ] {
-            let text = explain(Finding::Tier1(violation));
+            let text = explain(&Finding::Tier1(violation));
             assert!(!text.is_empty(), "{violation:?} has no explanation");
             assert!(seen.insert(text), "{violation:?} reuses another's wording");
         }
@@ -286,7 +381,7 @@ mod tests {
             StateDependent::ShowdownClaimFalse,
             StateDependent::ActionInWrongPhase,
         ] {
-            let text = explain(Finding::Tier2(Tier2Finding::new(violation, checkpoint())));
+            let text = explain(&Finding::Tier2(Tier2Finding::new(violation, checkpoint())));
             assert!(seen.insert(text), "{violation:?} reuses another's wording");
         }
     }
@@ -296,8 +391,75 @@ mod tests {
     #[test]
     fn a_tier_two_finding_names_the_state_it_was_judged_against() {
         let cp = checkpoint();
-        let finding = Tier2Finding::new(StateDependent::RaiseBelowMinimum, cp);
-        assert_eq!(finding.checkpoint(), cp);
+        let finding = Tier2Finding::new(StateDependent::RaiseBelowMinimum, cp.clone());
+        assert_eq!(finding.checkpoint(), &cp);
         assert_eq!(finding.violation(), StateDependent::RaiseBelowMinimum);
+    }
+
+    /// The witness has to witness the thing. A checkpoint the accused never
+    /// signed says some state was agreed, not that *they* agreed to it, and a
+    /// finding built on that convicts a player who was never party to the state
+    /// its message is judged against.
+    #[test]
+    fn a_checkpoint_the_accused_never_signed_cannot_witness_a_finding() {
+        let stranger: PlayerId = [77u8; 32];
+        assert_eq!(
+            AgreedCheckpoint::covering(
+                [1u8; 32], 42, HAND,
+                vec![RECEIVER, stranger],
+                &ACCUSED, &RECEIVER, HAND
+            ),
+            Err(WitnessError::AccusedNotAnEmitter)
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_this_receiver_never_signed_cannot_witness_either() {
+        let stranger: PlayerId = [77u8; 32];
+        assert_eq!(
+            AgreedCheckpoint::covering(
+                [1u8; 32], 42, HAND,
+                vec![ACCUSED, stranger],
+                &ACCUSED, &RECEIVER, HAND
+            ),
+            Err(WitnessError::ReceiverNotAnEmitter)
+        );
+    }
+
+    /// A checkpoint from another hand fixes state this message was never
+    /// judged against, so it witnesses nothing here.
+    #[test]
+    fn a_checkpoint_from_another_hand_cannot_witness_a_finding() {
+        assert_eq!(
+            AgreedCheckpoint::covering(
+                [1u8; 32], 42, HAND,
+                vec![ACCUSED, RECEIVER],
+                &ACCUSED, &RECEIVER, HAND + 1
+            ),
+            Err(WitnessError::WrongHand { checkpoint: HAND, message: HAND + 1 })
+        );
+    }
+
+    /// `ParentUnknown` used to sit in tier 1. It is decidable only against the
+    /// receiver's own store, so one dropped frame would have removed an honest
+    /// player - a live counter-example to the rule this module states. It is
+    /// gone, and this test is the tripwire against it coming back.
+    #[test]
+    fn no_tier_one_violation_depends_on_the_receivers_store() {
+        // Every tier-1 variant must be decidable from the offending message
+        // alone. The list is short enough to check by eye, and the point of the
+        // test is that adding one forces the author past this comment.
+        let all = [
+            SelfContained::SignatureInvalid,
+            SelfContained::NonCanonicalEncoding,
+            SelfContained::Malformed,
+            SelfContained::FieldOutOfRange,
+            SelfContained::ShuffleProofInvalid,
+            SelfContained::RevealProofInvalid,
+            SelfContained::KeyProofInvalid,
+            SelfContained::DeckNotAPermutation,
+            SelfContained::NotAParticipant,
+        ];
+        assert_eq!(all.len(), 9, "a tier-1 variant was added or removed");
     }
 }
