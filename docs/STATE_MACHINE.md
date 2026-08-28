@@ -21,6 +21,7 @@ Phase 0 specification document, required by `SPEC_CS.md` §29.
 | `DECISIONS.md` **D-010** | **an abort is neutral.** (1) Stacks are restored to their start-of-hand values; no chips move on an abort, in any direction, for any cause. (2) Attribution is recorded as evidence and has **no automatic consequence**. (3) **No automated eviction** — no seat is block-listed, unseated or penalised by the protocol on the strength of a proof. (4) Certificates and equivocation proofs are still *produced*, because they are how a human or a later version adjudicates, but consuming one never moves a chip or removes a player in this version. Revises D-005's chip rule on abort; the accepted cost is that the rage-quit escape returns and must be stated plainly (§8.6, §8.7, §12) |
 | `DECISIONS.md` **D-011** | **one normative owner per concept, and the slot key written down once.** **Rule 1:** `PROTOCOL.md` owns the wire — message shapes, the envelope, the chain, sequence numbers, the anti-replay slot, canonical bytes, receiver validation; **this document owns state and transitions** — phases, guards, legal actions, pots, invariants — and *references* the other's definitions by section number rather than restating them. Where the two disagreed, the owner won. **Rule 2:** the slot key is one literal tuple in `PROTOCOL.md` §5.2.1, `event_type` included, and no other document reproduces any part of it. **Rule 3:** D-010 point 3 binds every layer — no `block_peer`, no unseating, no allow/block list driven by a proof, anywhere. What it changed here: T55, T56 and T11's unseating deleted, §4.1's `stage_hash` formula and §5.2's restatement of the reconciliation round deleted and replaced by pointers, and every "blocked at the protocol layer" sentence removed (§13 items 20–26) |
 | `DECISIONS.md` **D-012** | **canonical state is never derived from a per-receiver quantity.** Nothing that enters a state hash, a roster hash, a chained event body or the next hand's genesis may come from a value that can differ between honest receivers; canonical state changes only through a chained event every participant accepted, and everything else is a local view. What it changed here: **T46 no longer sets `status := Absent` from the accepted `HAND_ABORT` copy's `attributed`** (H1) — the terminal stage is witness-independent and there is no abort-versus-abort precedence rule, so that field is per-receiver and `PROTOCOL.md` §4.10 already forbade deriving a seat's state from it; **I30** is added as the invariant whose absence was the defect; §2.4, §5.2, §8.6, §8.7, §11 (Q7), §12 and §12.1 follow it. The two surviving restatements the gate named are replaced by pointers, together with four more found in the same sweep (H8 — §3.2, §5.2's T9 and T10, §7.8, §7.9, §8.2), and every count in the document is reconciled, with the retired transition numbers listed (§5.1, §9.5, §10) |
+| `DECISIONS.md` **D-013** | **liveness is inherited from the chain, not from a seat's status.** *(J2)* **A seat is required to emit in hand `k+1` only if it signed at least one chained event during hand `k`; for the first hand the required set is the signers of `TABLE_READY`.** The wire half — `HAND_INIT`'s required emitter set — is `PROTOCOL.md` §4.4's and this document reproduces no part of it; **the engine half is `dealt_in`, and it is this document's** (§5.3 step 4, I31). What it changed here: `dealt_in` is gated on the same predicate, `signed_this_hand` is added as the canonical set that carries it (§2.6, §2.8), **I31** is added, **I30(c)**'s final clause is corrected from *"hence a `HAND_INIT` collective stage that completes"* to a byte-identity claim (J3), **Q7 is closed rather than widened again** and replaced by **Q8**, and every statement of the liveness cost in §5.2, §8.6, §8.7, §12 and §12.1 is rewritten, because the cost D-012 recorded — *"a stall that repeats every hand"* — was not the cost the machine had. D-013 also corrects that record: before it, **the table made no progress ever**, since every stack is restored at T46 so no seat could bust and no §9.3 condition could fire. The second half — `advert_hash` out of `GENESIS(0)`, `session_id` and `ctx` (J1) — is `PROTOCOL.md`'s and touches nothing here |
 | `docs/research/POKER_RULES.md` | every NLHE rule, the TDA citations, the `RATED_SNG_POKERTH_V1` preset |
 | `docs/research/MENTAL_POKER.md` | what the crypto layer can and cannot do, `n`-of-`n`, per-card reveal tokens |
 | `docs/research/CRYPTO_LIBS.md` | canonical bytes (`minicbor` arrays, no maps, no floats), BLAKE3, the canonicality gate |
@@ -205,14 +206,29 @@ in §5 branches on which of the two it is. That is deliberate: D-005 and D-006 �
 same chip behaviour for both, and an engine that treated them differently would be inferring
 liveness, which is not knowable deterministically.
 
-**`Absent` has no producing transition, and that is not an omission (H1, D-012).** T46 used to set
-it from the accepted `HAND_ABORT` copy's `attributed`; that line is deleted, because which copy a
-peer accepts is a quantity honest receivers can differ on and a seat's `status` is canonical state.
-The variant stays — it is the state D-005 describes, `PROTOCOL.md` §4.4 reads it in `bb_seat`'s
-constraint, and a future version that finds an agreed basis will set it — but in this version a
-seat reaches non-participation only through a chained event it or the table produced: its own
-`PlayerSitsOut` (T59), or `auto_action_limit` auto-actions marking it `SittingOut` (§8.5). See
-§5.2's note under T58/T59, §8.6 and I30.
+**`Absent` has no producing transition, that is not an omission (H1, D-012), and since D-013 it is
+not a gap either.** T46 used to set it from the accepted `HAND_ABORT` copy's `attributed`; that
+line is deleted, because which copy a peer accepts is a quantity honest receivers can differ on and
+a seat's `status` is canonical state. What changed under **D-013** is not that something now sets
+the variant — nothing does — but that **nothing needs to**. The question "what marks a seat
+`Absent`?" was asked for two passes as though the answer were what let the table keep playing; it
+never was (J2). A vanished seat is skipped because it stopped signing, not because a status field
+says so, and `dealt_in` reads the participation set directly (§5.3 step 4, I31). Status is now what
+it says it is — *a seat's own declaration about itself* — and the two routes into non-participation
+are both the seat's own chained events: `PlayerSitsOut` (T59), or `auto_action_limit` auto-actions
+marking it `SittingOut` (§8.5).
+
+**The variant stays, and it is a trap that must be labelled rather than tidied away (J5).**
+`SeatStatus::Absent` is **unreachable in this version, deliberately**, and five live mechanisms
+still read it: `PROTOCOL.md` §6.1's `absent` vector inside every `state_hash`, §4.4's `bb_seat`
+constraint, §5.3 step 4's `dealt_in` filter, §5.3 steps 6–7's ante and blind posting, and T59's
+sit-back-in guard. All five are correct with a permanently-false vector, and none of them is what
+keeps the table alive. **An implementer who finds a status the engine never sets and wires it to a
+local liveness signal — a dropped connection, a silent peer, a missed heartbeat — has forked the
+chain at every checkpoint**, because that signal is per-receiver and `status` is canonical
+(D-012, I30). Retiring the variant would remove `PublicTableState.absent` from `state_hash`, which
+is a wire change and `PROTOCOL.md`'s call, not a tidying this document may make. See §5.2's note
+under T58/T59, §8.6, I30 and I31.
 
 ### 2.5 `DeckState` — the crypto-waiting bookkeeping
 
@@ -283,6 +299,12 @@ pub struct TableState {
     pub deadline:            Option<Deadline>,
     pub certified_subjects:  SeatSet,   // seats named by a COMPLETED, VALID certificate
                                         // this hand; the only seats removable from V (D-008)
+
+    // ---- demonstrated participation (D-013) --------------------------------
+    pub signed_this_hand:    SeatSet,   // every seat that has signed an event this peer accepted
+                                        // as content of THIS hand. Cleared at hand init AFTER
+                                        // step 4 has read it. It is the liveness gate: §5.3
+                                        // step 4 and PROTOCOL.md §4.4's required emitter set
 
     // ---- the chip ledger (invariant I1, I28) -------------------------------
     pub ledger_in:           Chips,     // Σ buy-in of the seats Seating accepted; set once, at the
@@ -385,6 +407,7 @@ definition, so storing it is storing a fact twice.
 | `Seat::revealed_hole`, `Seat::mucked` | Showdown results are public and identical everywhere; a verifier re-computes the award from them. |
 | `deadline` | D-006 requires the deadline to be **explicit state**, not a wall-clock read inside the engine. |
 | `certified_subjects` | D-008: the required voter set `V` shrinks **only** by a completed, valid certificate, never by an assertion. Without this field the engine cannot compute the size of `V(subject)` deterministically, and "minus any seat already named" would have to be re-derived from unsigned local belief — which is exactly the assertion D-008 forbids. It is canonical state, entered only by §8.4 rule 7, so every peer derives it identically from the same accepted events. It is **not** a field of `PublicTableState` (`PROTOCOL.md` §6.1), so a disagreement about `V` is not visible at a checkpoint; what prevents one is rule 7 plus the fact that a certificate is a collective stage every peer validates for itself (§8.4), and what would expose one is that stage failing to complete. An earlier revision of this row said the field "must be inside `STATE_HASH`"; that claim is withdrawn rather than defended, because §6.1's list is canonical and does not carry it. Adding it there is `PROTOCOL.md`'s call and this document does not pre-empt it. |
+| `signed_this_hand` | **D-013.** The liveness gate is *demonstrated participation in the agreed chain*, and no other field expresses it. `status` cannot: a silent seat emits nothing, so nothing can change its status, so it stayed a required emitter forever (J2) — that circularity is the whole of what D-013 removes. It is maintained by one rule that is not attached to any single transition: **on accepting any event as content of hand `k`, `signed_this_hand ∪= {sender_seat}`**, applied by `step` before the transition table is consulted, for every accepted event of every kind including a rejected-then-superseded one's replacement. It is read exactly once, at §5.3 step 4, and cleared at §5.3 step 8. It is canonical state — a pure function of the events this peer accepted, with no clock, no timer and no per-message arrival fact in it. Like `certified_subjects` it is **not** a field of `PublicTableState` (`PROTOCOL.md` §6.1) and this document does not ask for one; unlike `certified_subjects`, a disagreement about it is not invisible, because it lands in `HAND_INIT`'s `n(8) dealt_in`, which every receiver of a collective stage recomputes and rejects on mismatch. The one input to it that is **not** agreed by construction is named in **Q8**, and I31 is what a harness asserts. |
 | `sequence`, `previous_event_hash` | §12/§13/§14: monotonic sequence and parent hash are what make replay, reordering and equivocation detectable. |
 | `level` | Tournament layer (§9); cached derivation of `hand_id`, asserted by I25. |
 | `deck` | The crypto-waiting bookkeeping. Hashes only; see §2.5. |
@@ -939,6 +962,28 @@ Both are one ruling, D-012's: *no canonical state may be derived from a quantity
 between honest receivers.* The pass also replaced two restatements with pointers (H8) and corrected
 the transition count in §9.5, neither of which changes anything the engine does.
 
+The sixth pass, under **D-013**, again adds and deletes **no transition** — the count stays at
+**56** — and takes the invariants from 30 to **31**:
+
+* **§5.3 step 4 gains a conjunct (J2).** `dealt_in[s]` now requires `s ∈ signed_this_hand` as of
+  the previous hand, which is D-013's rule applied to the one quantity this document owns. No row
+  of §5.2 changes: hand init is a procedure T10 and T47 run, not a transition.
+* **I31 is added**, and it is the counterpart of I30 rather than a second copy of it: I30 says a
+  *status* is chain-derived, I31 says the *participation set* is, and that the two are no longer
+  the same question.
+* **I30(c) loses its last clause (J3)**, which asserted that agreement on the status vector gives
+  "a `HAND_INIT` collective stage that completes". It does not: agreement makes the stage
+  *completable*. That clause is also what hid J2 for two passes, and it carried a test instruction,
+  so a harness built on it was unfalsifiable exactly where the defect lived.
+
+**And it corrects the record, which matters more than the edit.** D-012 recorded the cost of
+deleting T46's marking as *"a stall that repeats every hand"*. That is not what the machine did.
+Marking a seat `Absent` never removed it from `HAND_INIT`'s required emitter set — the set named
+absent and sitting-out seats in its *inclusion* clause — so the stall was never bounded by anything:
+T46 restores every stack, so no seat busts, so no §9.3 condition can fire, so the table repeated an
+identical ten-minute hand forever. **The table made no progress at all, and no participant could
+end it.** Every statement of that cost in this document is rewritten rather than annotated.
+
 ```rust
 pub enum Phase {
      1 Seating,                //  waiting for players
@@ -1373,8 +1418,11 @@ are byte-identical and the *derivation* still differs, which is a client disagre
 recur next hand and therefore must close the table; a `cause = 1` timeout inside `Diverged` is
 indistinguishable from an ordinary network stall and does not imply any such thing. The residual is
 that a table can be pushed through this path repeatedly — divergence, stall, neutral abort, next
-hand — at `hand_deadline_ms` per hand, which is the same liveness cost §12 already records for a
-stall anywhere else, and no worse.
+hand — at `hand_deadline_ms` per hand. That is the residual §12 records for an adversary that keeps
+*sending*, and it is unaffected by D-013: a peer that publishes a bad `state_hash` every hand is
+signing chained events every hand, so it never stops being a required emitter and never gets
+skipped. D-013 bounds the cost of a seat that goes **silent**; it does nothing about one that stays
+noisy, and this path is the clearest example of the difference.
 
 `Diverged` entered before any hand — from checkpoint 1, which `PROTOCOL.md` §6.2 places after
 `TABLE_READY` — has no hand deadline running, and is covered by T4 instead (see the note under the
@@ -1434,25 +1482,42 @@ that enters it. That is stated rather than tidied away, because `SittingOut` and
 identically to the engine (§2.4), so the *state* the deleted line produced is still reachable —
 what is gone is the ability to put a seat into it **without that seat's own signature**.
 
-**And that is a real loss, named rather than smoothed over.** A seat that has genuinely vanished
-cannot send `PlayerSitsOut`, which is exactly the case D-005 is about. Neither surviving route
-reaches it: T59 needs the seat, and §8.5's `auto_action_limit` route needs `|V| >= 2` and therefore
-never runs in the MVP's heads-up regime (§9.5). So a vanished seat is dealt in again every hand
-until a *human at another seat* leaves or the table empties. D-005's requirement is bent, not met:
-it asks that the game continue and that an absent seat be blinded off, and the second half now
-happens only when the absent player's own client is alive enough to say so. That is accepted here
-because the alternative is the H1 fork — a table that provably never completes another hand — and
-`SPEC_CS.md` §19 ranks integrity above finishing a hand conveniently. Closing it properly is
-**Q7**, and it needs an agreed basis that does not exist yet.
+**And a seat that has genuinely vanished can send neither, which is exactly the case D-005 is
+about.** T59 needs the seat; §8.5's `auto_action_limit` route needs `|V| >= 2` and therefore never
+runs in the MVP's heads-up regime (§9.5). For two passes this document treated that as the open
+problem and called it **Q7**: *what marks a seat `Absent`?*
 
-**What it costs, which is Q7's cost and not a new one.** A seat that goes silent is dealt in again
-next hand and stalls it again, for `hand_deadline_ms` each time, until a human sits it out or
-leaves. That was already the shipped behaviour on the MVP's only path — T57's `attributed` is empty
-by construction, so heads-up nothing was ever marked `Absent` (§9.5) — and this edit makes every
-table size behave as heads-up already did. **Q7 (§11) is widened accordingly**: it is no longer
-"what marks a seat `Absent` when the abort names nobody" but "what marks it at all", and its warning
-generalises from `owed` to every field of the abort. A slow table is a liveness cost; a forked chain
-is an integrity cost; `SPEC_CS.md` §19 ranks them in that order.
+**That was the wrong question, and D-013 answers the right one instead (J2).** Marking a seat
+`Absent` would never have helped, because `PROTOCOL.md` §4.4's required emitter set for `HAND_INIT`
+named absent and sitting-out seats **in its inclusion clause**. No status removed a seat from it.
+The status field was never the liveness gate, and asking what would set it was asking about the
+wrong mechanism — which is why two passes of correct reasoning about `Absent` left the table
+frozen. The right question is *what removes a seat from a collective stage's required emitter set*,
+and D-013's answer does not mention status at all:
+
+> **A seat is required to emit in hand `k+1` only if it signed at least one chained event during
+> hand `k`.** For the first hand, the required set is the signers of `TABLE_READY`.
+
+**What this document owns of that rule is `dealt_in`, and narrowing the emitter set alone would not
+have worked without it.** A seat that is not a required emitter of `HAND_INIT` but is still
+`dealt_in` is still a party to the hand's `n`-of-`n` key (§2.5, `deck.participants`), so the stall
+would simply move from `HAND_INIT` to `AwaitingKeySetup` and cost the same ten minutes. So §5.3
+step 4 reads the same predicate the wire does: `dealt_in[s]` requires `s ∈ signed_this_hand` as of
+the previous hand. One predicate, two consumers, no second definition (D-011 rule 1).
+
+**Why this is D-012-clean.** "Did seat `s` sign an event this peer accepted as content of hand `k`"
+is a function of the accepted chain, not of a timer, a connection state or a heartbeat. It is not
+`attributed`, not `owed`, not `observed_by`. Where the stage completed, it is exactly `stage_hash`
+membership (`PROTOCOL.md` §3.2) and every peer holding that prefix agrees on it by construction.
+The one input that is *not* agreed by construction is a contribution to the stage that stalled —
+no `stage_hash` ratifies it — and that residual is stated rather than hidden: it is **Q8** (§11), it
+is `PROTOCOL.md`'s to close, and its failure mode is a `HAND_INIT` stage that does not complete,
+which is loud and costs a hand, not a chain fork, which is silent and costs the table.
+
+**What it costs.** A seat that goes silent stalls the hand it went silent in and, if it went silent
+after signing something in that hand, the hand after it as well — one `hand_deadline_ms` each. From
+then on it is skipped: not dealt in, no cards, no key share, and the blinds and antes eat its stack
+until it busts, which is D-005 as the owner stated it. §12.1 derives the exact bound.
 
 T58 and T59 exist because the three seat-state messages are legal **only** at a hand boundary
 (`PROTOCOL.md` §4.10, M4) and this document previously had rows for them only mid-hand, where they
@@ -1676,8 +1741,35 @@ Pure, no events, no clock. In this exact order:
 3. Rotate the button per A1.3: `bb_seat := succ_active(bb_seat)`, `sb_pos := old bb_seat`,
    `button_pos := old sb_pos`; then apply the TDA 34-B heads-up adjustment if exactly two seats
    remain with chips.
-4. `dealt_in[s] := (status == Active)` for every seat with `stack > 0`.
-   `SittingOut`, `Absent` and `Busted` seats get `dealt_in = false`. (D-005, D-006 §4.)
+4. `dealt_in[s] := (status == Active ∧ s ∈ signed_this_hand)` for every seat with `stack > 0`.
+   `SittingOut`, `Absent` and `Busted` seats get `dealt_in = false` (D-005, D-006 §4), **and so does
+   a seat that signed nothing in the hand just ended (D-013, J2).** `signed_this_hand` still holds
+   hand `k`'s set at this point; step 8 clears it, which is why these two steps are in this order
+   and not the other.
+
+   **On the first hand (T10) the set is the signers of `TABLE_READY`**, which is D-013's base case;
+   the engine reaches it without a special case, because `TABLE_READY` is the collective stage that
+   ends `Seating` and its copies are accepted as chain content before T10 runs.
+
+   **This conjunct is the liveness gate, and it is the same predicate `PROTOCOL.md` §4.4 uses for
+   `HAND_INIT`'s required emitter set** — that document owns the emitter set and this one owns
+   `dealt_in`, and neither restates the other (D-011 rule 1). Narrowing only the emitter set would
+   not have worked: a seat that need not sign `HAND_INIT` but is still `dealt_in` is still in
+   `deck.participants` (§2.5), so the stall would move from `HAND_INIT` to `AwaitingKeySetup` and
+   cost the identical `hand_deadline_ms`. Narrowing only `dealt_in` would not have worked either,
+   because §4.4's set includes non-dealt-in occupied seats. Both are needed and they read one
+   predicate.
+
+   **The seat is skipped, not removed.** It keeps its seat, its `status`, its position in the ring
+   and its stack; step 3's `succ_active` still gives it the blinds in turn and steps 6 and 7 still
+   post them, so it drains exactly as D-005 requires and — unlike before D-013 — it genuinely
+   **busts**, at step 2 of some later hand, which is what makes §9.3's end conditions reachable
+   again (§12.1).
+
+   **It rejoins by signing.** No transition, no vote, no certificate and no human at another seat
+   puts it back: it is in hand `k+1`'s set iff it signed in hand `k`, so a client that reconnects
+   and signs a chained event is dealt in again at the next boundary, and a client that does not,
+   is not. That is the whole readmission rule.
 5. Per seat: `start_stack_this_hand := stack`; `committed_round := 0`;
    `committed_hand := 0`; `acted_this_round := false`; `folded := false`; `all_in := false`;
    `revealed_hole := None`; `mucked := false`.
@@ -1698,12 +1790,24 @@ Pure, no events, no clock. In this exact order:
    `|dealt_in| − 1` and can only be reduced again by a completed, valid certificate within that
    hand (D-008 point 3). Carrying it across a hand boundary would let exclusions accumulate over a
    session and reach `|V| < 2` without any single hand ever paying the floor.
+   **`signed_this_hand := ∅`** — the participation set is per hand, and step 4 has already read the
+   previous hand's. Clearing it earlier would deal nobody in; not clearing it at all would make
+   participation permanent and restore the frozen table D-013 removes.
 9. Branch:
    * `|dealt_in| == 0` → `Paused` (no blinds are posted; step 6 and 7 are skipped);
    * `|dealt_in| == 1` → the single dealt-in seat wins every posted blind and ante with no cards
      and no cryptography: go straight to `Settling`. This is how an absent field drains
-     correctly;
+     correctly, and **since D-013 it is the path a heads-up table takes on every hand after its
+     opponent has gone silent** — no key setup, no shuffle, no reveal, nothing that could wait on
+     the seat that is not there;
    * `|dealt_in| ≥ 2` → `AwaitingKeySetup`, `RequestKeySetup`, `ArmDeadline{Crypto}`.
+
+**Where `signed_this_hand` is accumulated.** Not in any transition row, because it is not any one
+transition's business: `step` adds `sender_seat` to it on **every** event it accepts as content of
+the current hand, before consulting §5.2's table. A `Rejection` adds nothing — a rejected event is
+not chain content, and admitting one would let a peer buy a seat's participation by sending it
+garbage. `HAND_INIT`'s own copies count, which is why a seat that vanishes mid-hand costs a second
+hand rather than one (§12.1).
 
 ### 5.4 Opening and resetting a betting round
 
@@ -2606,15 +2710,28 @@ to `start_stack_this_hand` (the rule above), `settlement.aborted` is set, and th
 transcript. Everything else about the next hand is a function of the previous hand boundary, which
 is what makes `GENESIS(k+1)` derivable from `GENESIS(k)` alone (`PROTOCOL.md` §3.1).
 
-**What that costs is a stall that repeats, and it is the cost the MVP already paid.** T57's
-`attributed` is empty by construction, so a heads-up stall marked nobody absent even before this
-edit: the next hand deals the silent seat in again and stalls for `hand_deadline_ms` too. §12
-already records that a stall "can be repeated every hand". What changes is that every table size now
-behaves as heads-up already did, and an implementer must not close it locally — not from the abort's
-`owed` list and not from its `attributed`, because both are quantities peers disagree about (§4.1,
-P3, D-012); deriving canonical state from either forks the chain, which is a strictly worse failure
-than a slow table. Closing it needs an agreed basis that does not exist yet, and it is carried as
-**Q7** in §11.
+**What that costs, and the cost this document stated wrongly for two passes.** The previous
+revision said the cost was *"a stall that repeats every hand"*, and read that as slow. It was not
+slow, it was **frozen**: nothing removed the silent seat from `HAND_INIT`'s required emitter set,
+T46 restores every stack so no seat could ever bust, and §9.3's end conditions all read a stack, a
+fault or an empty table — so none of them could fire. The table repeated one identical ten-minute
+hand, forever, and no participant had an action that changed it (`PLAYER_SIT_OUT` and
+`PLAYER_LEAVE` are single-writer by the seat itself, so the only human who could sit the silent
+seat out was the silent one). That was J2 and it is corrected here rather than annotated.
+
+**Under D-013 the cost is bounded and the seat drains.** The abort still changes exactly the three
+things above; what changed is *elsewhere*, at the next hand init, where `dealt_in` reads
+demonstrated participation instead of status (§5.3 step 4). The silent seat is skipped from the
+hand after it stops signing, keeps its seat and its stack, pays its blinds and antes, and busts.
+§12.1 gives the bound: one `hand_deadline_ms` if it vanished at a hand boundary, two if it vanished
+mid-hand, and normal speed thereafter.
+
+**What an implementer still must not do is close it locally.** Not from the abort's `owed` list and
+not from its `attributed`, because both are quantities peers disagree about (§4.1, P3, D-012), and
+not from a dropped connection or a missed heartbeat, because those are not chain content at all.
+Deriving canonical state from any of them forks the chain, which is a strictly worse failure than a
+slow table. The one basis that is admissible is the one D-013 names, and the single input to it
+that is not agreed by construction is **Q8** in §11.
 
 **One attribution path does not depend on `V` at all, and it is still correct that way:** the
 direct crypto verdicts T15, T21 and T48, where the artefact the seat published is itself invalid
@@ -2692,8 +2809,12 @@ keeping straight because it is the whole of the remaining deterrent:
   under the preset — and the stall, the stage it stalled at and the abort are all in the transcript.
 * **On a certificate path at `|V| >= 2`** the hand ends sooner and the quitter is *named* in
   `attributed`. It is named and nothing more: since H1 the naming no longer marks the seat `Absent`
-  either, because the copy a peer accepted is a per-receiver quantity (§8.6, D-012, I30). The seat
-  is dealt into the next hand exactly as it would have been had it not been named.
+  either, because the copy a peer accepted is a per-receiver quantity (§8.6, D-012, I30). Being
+  named changes nothing about the next hand. **What does change it, under D-013, is the quitter's
+  own silence**: it is dealt out of the hand after the one it stopped signing in, and thereafter
+  the blinds take its stack whether any abort ever named it or not (§5.3 step 4). That is not a
+  penalty the protocol applies to the record — it is the seat no longer being there, and no
+  attribution, certificate or proof is consulted to establish it.
 * **On the divergence path (T54)** a single peer that publishes a `state_hash` it did not derive
   ends the hand at once and also faults the table, so the escape is fast but costs the attacker the
   table it was playing at. `THREAT_MODEL.md` X29 carries it.
@@ -2887,7 +3008,11 @@ critical path even though no certificate ever is. Four consequences for the test
   `start_stack_this_hand` afterwards (I27, I2). Since P3 it must additionally assert that **the
   terminal stage closed against the silent seat's silence** — one peer's copy was enough, no peer
   waited for the seat that stalled, and both peers computed the identical `TERMINAL(k)`. A test that
-  only checks the stacks would have passed while T57 could never fire;
+  only checks the stacks would have passed while T57 could never fire. **Since D-013 it must run one
+  hand further, and that extension is the one that would have caught J2**: assert that hand `k+1`
+  deals *only* the remaining seat in, completes without waiting for anything, and that the silent
+  seat's stack is strictly smaller after it. A test that stops at the abort passes on a table that
+  never plays again;
 * a **restoration test that is not a heads-up test**: at `seats >= 4`, a certificate-borne abort at
   `|V| >= 2` naming a seat must leave that seat's stack equal to its `start_stack_this_hand` and
   every other stack likewise (D-010, §8.6). Asserting only that the abort happened would pass while
@@ -2919,7 +3044,7 @@ count seats — plus T34, which starts existing once a hand has `|V| >= 2`. That
 
 `SPEC_CS.md` §26 requires `proptest`/`quickcheck` invariants. Each is a predicate over
 `TableState` (and, where noted, over a `(state, event, state')` triple), asserted after **every**
-transition including rejected ones. **30 invariants**, I1–I30 with no gaps (§5.1).
+transition including rejected ones. **31 invariants**, I1–I31 with no gaps (§5.1).
 
 The nine §26 named invariants map to I1, I10, I9, I15, I6, I8, I7, I12 and I21 respectively; the
 eight of `POKER_RULES.md` A0 map to I1, I6, I10, I9, I4, I8, I7 and I14.
@@ -2955,7 +3080,8 @@ eight of `POKER_RULES.md` A0 map to I1, I6, I10, I9, I4, I8, I7 and I14.
 | **I27** | **No abort moves chips between seats** (D-010) | *every* abort, whatever its `AbortKind` and whatever its `attributed`, returns exactly `committed_hand[s]` to every seat `s`, so `stack[s] == start_stack_this_hand[s]` for every seat after the accepted `AbortSettle`, and no chip crosses between seats in any direction. The previous form was scoped on `attributed == []` and carved an exception out of a forfeiture formula; the formula is deleted (§8.6) and the scope is gone with it. Assert it after **T46**, on every path that reaches it — T15, T16, T21, T22, T27, T41, T44, T48, T54, T57 and T60 — not only on the two that used to restore |
 | **I28** | The ledger is monotone and moves only at a hand boundary | `ledger_in` is monotonically non-decreasing, `ledger_out` is monotonically non-decreasing, and both change **only in hand init step 0** (§5.3), which runs at T10 and T47 — never inside a hand, and never in T58, which only marks a seat `Leaving`. That is what keeps I1's right-hand side constant mid-hand, and it is what makes `PROTOCOL.md` §4.4's `ledger_delta` a complete record of every change |
 | **I29** | The voter-set floor (D-008) | two parts, both asserted after every transition. **(a)** `certified_subjects ⊆ deck.participants`, it is `∅` at hand init, and a seat enters it **only** on a certificate accepted under §8.4 rules 1–6 with `|V(subject)| ≥ 2` — so `|V|` is non-increasing within a hand and every decrement was paid for by a certificate that itself cleared the floor. **(b)** for every accepted `TimeoutCertificate`, `|V(subject)| ≥ 2` **and** `signers == V(subject)`. A certificate with `|V(subject)| < 2` is never accepted, of either `kind` (§8.4 rule 6, D-009 rule 2), so it produces no `AbortRecord`, no `FaultRecord`, no entry in `certified_subjects` and no stack change at all, and the post-state is bit-identical to the pre-state (I21). The previous form of this clause allowed a below-floor `kind == Crypto` certificate through with `attributed == []`; that carve-out is deleted, and the only `AbortRecord{kind: HandDeadline}` producer is now T57, whose `attributed` is empty by construction and which involves no certificate. **Under D-010 the stake in (b) is a false attribution record, not chips** — no certificate of any kind moves a chip any more — and the clause is kept for that reason and because `certified_subjects` still gates T34, which moves the action. Generate the adversarial case directly rather than by random play: a client that votes against `k` seats without completing a certificate against any of them must leave `certified_subjects` empty, so `|V|` must be unchanged — this is the N3 attack and a `proptest` over legal play never reaches it |
-| **I30** | **Seat status is agreed, and moves only through a chained event** (D-012, H1) | Three parts. **(a) Provenance.** `status[s]` changes only in a transition whose input is an event every participant accepted as chain content: T1/T2 (`Empty → Active` in `Seating`), T3 (`→ Empty`, before any chips exist), T58 (`→ Leaving`), T59 (`→ SittingOut` / `→ Active`), T34's `auto_action_limit` marking applied at the next hand boundary (§8.5), and hand init steps 0 and 2 — `Leaving → Empty` and `stack == 0 → Busted` — which run at T10 and T47, T45 having already marked the busts of the hand it settled. Every one of those is a pure function of state fixed at a hand boundary or of an event every participant accepted as chain content. **That list is exhaustive; a status assignment anywhere else is a defect**, and `Absent` appears nowhere in it, which is H1's edit seen from the invariant side. **(b) No derivation from a per-receiver quantity.** No transition derives a `status` from `abort.attributed`, from `abort.owed`, from `observed_by`, from a `Fault` record, from `deck.tokens`, or from any other value two honest receivers can hold differently — which is the whole of D-012 applied to this field, and which is why T46's `status := Absent` is deleted (§5.2, §8.6). **(c) Cross-peer agreement at a hand boundary.** Two peers that have accepted the same event prefix hold the **identical `status` vector** in `HandComplete`, hence identical `dealt_in` and `bb_seat` from §5.3 for hand `k+1`, hence a `HAND_INIT` collective stage that completes. This is the engine's half of `PROTOCOL.md` §6.1's rule that `sitting_out` and `absent` — which are in `PublicTableState` and therefore in every `state_hash` — *“must be a deterministic function of accepted chained events”*; §6.1 defers **which** events set them to this document, and (a) is that list. Because the two vectors are hashed, a violation surfaces twice: loudly at the next checkpoint as a `state_hash` mismatch (T50, `Diverged`), and — if the abort came after the last checkpoint of the hand, which is the H1 interleaving — as a `HAND_INIT` stage that never completes. (c) is the part no invariant asserted before, and **that absence was the H1 defect**: the fork it would have caught sat one link downstream of `TERMINAL(k)`, in a field §12.1's walk does not look at because the hand it belongs to does end. Assert (a) and (b) after every transition in the single-peer harness; assert (c) in the multi-peer harness at every `HandComplete`, and generate it directly rather than by random play — the interleaving needs one peer to complete the terminal stage on a certificate-borne abort while another completes it on T57's, which legal play produces only when a message is dropped |
+| **I30** | **Seat status is agreed, and moves only through a chained event** (D-012, H1) | Three parts. **(a) Provenance.** `status[s]` changes only in a transition whose input is an event every participant accepted as chain content: T1/T2 (`Empty → Active` in `Seating`), T3 (`→ Empty`, before any chips exist), T58 (`→ Leaving`), T59 (`→ SittingOut` / `→ Active`), T34's `auto_action_limit` marking applied at the next hand boundary (§8.5), and hand init steps 0 and 2 — `Leaving → Empty` and `stack == 0 → Busted` — which run at T10 and T47, T45 having already marked the busts of the hand it settled. Every one of those is a pure function of state fixed at a hand boundary or of an event every participant accepted as chain content. **That list is exhaustive; a status assignment anywhere else is a defect**, and `Absent` appears nowhere in it, which is H1's edit seen from the invariant side. **(b) No derivation from a per-receiver quantity.** No transition derives a `status` from `abort.attributed`, from `abort.owed`, from `observed_by`, from a `Fault` record, from `deck.tokens`, or from any other value two honest receivers can hold differently — which is the whole of D-012 applied to this field, and which is why T46's `status := Absent` is deleted (§5.2, §8.6). **(c) Cross-peer agreement at a hand boundary.** Two peers that have accepted the same event prefix hold the **identical `status` vector** in `HandComplete`, hence identical `dealt_in` and `bb_seat` from §5.3 for hand `k+1`. **The clause that used to follow — "hence a `HAND_INIT` collective stage that completes" — is deleted as false (J3).** Agreement on the body makes the stage *completable*; completing it additionally requires every member of the required emitter set to emit, which is a liveness property and is outside this invariant's scope — §12.1 is where it is discharged and D-013 is what makes it discharge. The two are worth keeping apart: identical `dealt_in` at every peer is perfectly consistent with a stage that never completes, and before D-013 that was the *normal* case rather than an edge one, so the deleted clause was not merely imprecise — it was the sentence that hid J2 for two passes, and because it carried a test instruction, a harness asserting it passed on every trace where the stage completed and was never run against the trace where it did not. An invariant that is unfalsifiable exactly where the defect lives is worse than no invariant. This is the engine's half of `PROTOCOL.md` §6.1's rule that `sitting_out` and `absent` — which are in `PublicTableState` and therefore in every `state_hash` — *“must be a deterministic function of accepted chained events”*; §6.1 defers **which** events set them to this document, and (a) is that list. Because the two vectors are hashed, a violation surfaces twice: loudly at the next checkpoint as a `state_hash` mismatch (T50, `Diverged`), and — if the abort came after the last checkpoint of the hand, which is the H1 interleaving — as a `HAND_INIT` stage that never completes. (c) is the part no invariant asserted before, and **that absence was the H1 defect**: the fork it would have caught sat one link downstream of `TERMINAL(k)`, in a field §12.1's walk does not look at because the hand it belongs to does end. Assert (a) and (b) after every transition in the single-peer harness; assert (c) in the multi-peer harness at every `HandComplete`, and generate it directly rather than by random play — the interleaving needs one peer to complete the terminal stage on a certificate-borne abort while another completes it on T57's, which legal play produces only when a message is dropped. **Assert (c) as byte-identity of the two peers' derived `HAND_INIT` bodies**, not as stage completion: that is what (c) actually establishes, it is checkable in a harness, and it is strictly stronger evidence about H1 than a claim about completion |
+| **I31** | **Participation is chain-derived, per hand, and is the liveness gate** (D-013, J2) | Four parts. **(a) Provenance.** `signed_this_hand` gains a seat **only** when this peer accepts an event of the current hand signed by that seat, and loses every member exactly once per hand, at §5.3 step 8. A `Rejection` adds nothing (I21 already requires the post-state to be bit-identical, and this field is part of it). No timer, no connection state, no heartbeat, no `observed_by` and no field of an abort ever writes it. **(b) It gates `dealt_in`, and nothing else gates it.** After every hand init, `dealt_in[s] ⇒ status[s] == Active ∧ stack[s] > 0 ∧ s ∈ signed_this_hand-as-of-the-previous-hand`, and no transition sets `dealt_in` outside hand init. This is the invariant form of §5.3 step 4 and it is what makes the skip checkable rather than argued. **(c) The terminal abort is excluded, and this is the part an implementer will get wrong.** A terminal `HAND_ABORT` enters no `stage_hash` (`PROTOCOL.md` §3.2), the stage it closes is witness-independent, and two honest peers routinely accept copies signed by different seats — so **counting a terminal `HAND_ABORT`'s signer as participation is a per-receiver derivation and a D-012 violation**, and it would put the whole liveness gate back on the quantity H1 was about. Assert directly: accept a terminal `HAND_ABORT` and require `signed_this_hand` unchanged. **(d) Cross-peer agreement.** Two peers that have accepted the same event prefix hold the identical `signed_this_hand`, hence identical `dealt_in` for hand `k+1`. Where the stage completed this holds by construction, since the set is exactly `stage_hash` membership; the residual case — a contribution to the stage that *stalled*, which no `stage_hash` ratifies — is **Q8** and is `PROTOCOL.md`'s to close. Assert (a), (b) and (c) after every transition in the single-peer harness; assert (d) in the multi-peer harness at every `HandComplete`, together with I30(c) and by the same byte-identity check on the derived `HAND_INIT` bodies |
 
 **I1 in full.** The old form — `total_chips = players_at_start × start_stack`, constant for the
 table's whole life — is **false in cash mode**, where a seat may buy in or cash out at a hand
@@ -2978,7 +3104,7 @@ I1  (ledger identity)
 I5 (`stack[s] + committed_hand[s] == start_stack_this_hand[s]`) is unchanged and is what makes I1
 checkable *within* a hand, since the right-hand side cannot move mid-hand.
 
-**Seven cases below** deserve dedicated adversarial tests rather than random generation, because a
+**Eight cases below** deserve dedicated adversarial tests rather than random generation, because a
 `proptest` generator that only produces legal actions will never reach them. The eleven named
 cheaters of `SPEC_CS.md` §25 are mapped to catalogue rows, test modules and asserted outcomes in
 one place — `THREAT_MODEL.md` §5.5 — and the three notes below are subordinate to that map rather
@@ -3011,9 +3137,26 @@ than a second one:
   stage, a `kind = 2` certificate completing at peer `A` while peer `B`'s copy of it is dropped and
   `B` reaches the same hand's terminal stage through T57 instead. Assert that both peers hold the
   identical `status` vector afterwards, that both compute the same `dealt_in` and `bb_seat` for hand
-  `k+1`, and that the `HAND_INIT` stage completes. Under the deleted T46 clause this test failed;
-  it is written here because the defect it catches was invisible to every single-peer assertion in
-  this table.
+  `k+1`, and that the two peers' derived `HAND_INIT` **bodies are byte-identical**. Under the
+  deleted T46 clause this test failed; it is written here because the defect it catches was
+  invisible to every single-peer assertion in this table. **The assertion is byte-identity, not
+  stage completion (J3)**: the previous wording asserted that the stage completes, which the stage
+  does not owe this invariant and — before D-013 — could not deliver, so the test would have been
+  written to pass on the traces where the defect is absent and never run on the one where it is
+  not. Whether the stage completes is §12.1's obligation and is tested by the case below;
+* **I31** against the case D-013 exists for, and it is the one test that would have caught J2:
+  three seats, one of which stops sending at a hand boundary and never sends again. Assert that
+  hand `k` stalls to `hand_deadline_ms` and aborts (T57 → T46 → T47); that hand `k+1` deals the
+  remaining two seats in and **completes normally**, with the silent seat `¬dealt_in`, absent from
+  `deck.participants` (I20) and posting its blinds and antes when the ring reaches it; that its
+  `stack` strictly decreases on every orbit; that it reaches `Busted` at §5.3 step 2 in a bounded
+  number of hands; and that §9.3 then fires. Run the same case with the seat going silent
+  **mid-hand** and assert the bound is **two** stalled hands rather than one — that difference is
+  real, it is `HAND_INIT`'s own copy counting as participation, and a harness that only tests the
+  boundary case will not see it. Then run it once more with the silent client **returning** and
+  signing one chained event, and assert it is dealt in again at the next boundary with no vote,
+  certificate or human intervention anywhere in the trace. None of this is reachable by random
+  legal play, because random legal play never stops sending.
 
 ---
 
@@ -3029,7 +3172,7 @@ guess what the engine does while a question is open, only know that the behaviou
 | Q3 | **Hand-deadline certificate signers when several seats are simultaneously unresponsive.** `V(subject)` is unachievable with two seats gone. A certificate naming a *set* of subjects is **not** adopted; neither is attributing every non-voting seat; and neither is **excluding** a seat from `V` for being the subject of an older unmet deadline, which D-008 deletes because it let `V` be shrunk by assertion. **Interim rule (§8.4), implemented and numbered: T57**, and since P3 it is a rule that can actually fire — the terminal stage is witness-independent (§4.1), so it does not wait for the seat whose silence caused it. The hand ends at `hand_deadline_ms` with `attributed = []` and no chip movement (I27). **D-010 shrinks what is left open:** attributing somebody would now put a name in the transcript rather than chips in a stack, so this no longer decides who pays, only what the record says. It is kept open because a later version may give attribution teeth again and the artefact has to be right before it does. Carried as **OQ-E** and blocking for Phase 4. | `PROTOCOL.md` Q-02, `THREAT_MODEL.md` §9.2 |
 | Q5 | **Rebuys, add-ons and late registration.** Out of scope for the MVP and absent from `RATED_SNG_POKERTH_V1`, but they would change §5.3 and §9.3 and should be designed for rather than retrofitted. **Named default: not supported.** No config parameter selects them, §9.3's end conditions do not admit a re-entry, and §9.3's end conditions do not admit a re-entry, and since P8 hand init step 0 has no seat-entry clause at all (Q6). | `DECISIONS.md` |
 | **Q6** | **May a seat be added after `Seating`?** Cash mode's whole difference from tournament mode is that `ledger_in` can move again, and nothing in the corpus can move it: there is no `PLAYER_SEAT` message in `PROTOCOL.md` §4.10 or §4.11, no hand-boundary stage for one, and `Event::PlayerSeated` is consumed only by T1 and T2 in `Seating` (P8). **Named default, implemented: not supported.** A cash table forms in `Seating` and thereafter only loses seats; §5.3 step 0 has no seat-entry clause and §9.4 no longer describes one; I1's right-hand side is non-increasing after the first hand in both modes. Adding it needs a message type, a stage kind under §3.2's principle, and a `HandComplete \| Paused × PlayerSeated` row — in that order, and not before a mode that needs it ships. | `PROTOCOL.md` §4.10/§4.11, `DECISIONS.md` |
-| **Q7** | **What marks a seat `Absent` at all?** *(Widened by H1. It formerly read "when the abort names nobody"; since T46 no longer marks anything, the general question is the one that is open.)* No transition in this document enters `SeatStatus::Absent`. A seat that goes silent is therefore dealt in again every hand and stalls each one for `hand_deadline_ms` until a human sits it out (T59) or leaves (T58). **Named default, implemented: nothing marks it**, and an implementer must not derive it from **any** field of the abort — not `owed`, and since H1 not `attributed` either. Both are quantities honest receivers can disagree about, and D-012 forbids canonical state being derived from one: `owed` would fork `TERMINAL(k)` (§4.1, P3) and `attributed` forks the next hand's `dealt_in` and `bb_seat` (§5.2, §8.6, I30). Closing this needs a basis every peer already agrees on, which does not exist yet; a slow table is a liveness cost, a forked chain is an integrity cost, and `SPEC_CS.md` §19 ranks them in that order. §12 records the cost. | `PROTOCOL.md` §4.10, `DECISIONS.md` |
+| **Q8** | **What ratifies a contribution to the stage that stalled?** D-013 gates both `HAND_INIT`'s required emitter set and `dealt_in` on *"seat `s` signed at least one chained event during hand `k`"*. For every stage that **completed**, that set is exactly `stage_hash` membership (`PROTOCOL.md` §3.2) and two peers holding the same prefix agree on it by construction. For the **one stage that stalled** — the reason the hand aborted — no `stage_hash` exists, so "seat `s` contributed there" is, strictly, *who was heard*, which is the quantity P3 refused when it built the terminal stage. It cannot simply be excluded: a hand that stalls at `HAND_INIT` completes no stage at all, so excluding it makes the next hand's set empty and the table `Paused` (§5.3 step 9) instead of playing. **Named default, implemented: a contribution to the stalled stage counts**, and the terminal `HAND_ABORT` does **not** (I31(c)) — that one exclusion is not optional, because the abort enters no `stage_hash` and its copies are routinely signed by different seats at different peers. The residual is bounded and loud rather than silent: two peers that disagree derive different `n(8) dealt_in`, each rejects the other's `HAND_INIT` copy, the stage does not complete and the hand aborts at the deadline — a hand lost and recoverable through §6.3's event request, not a chain fork. Closing it properly is a wire question — what ratifies a partial stage — and it is `PROTOCOL.md`'s. | `PROTOCOL.md` §3.2, §4.4, `DECISIONS.md` |
 | **Q-01** | **Is `showdown_policy = TDA_MUCK` offered at all?** This is `PROTOCOL.md` Q-01 seen from the engine, and it is listed here because §12 of that document names the engine's showdown path as what turns on it. It is *not* a second copy of Q1 above: Q1 asks which resolution the corpus should adopt, Q-01 asks whether the config value ships. **Named default, so no implementer has to guess what a build does with a value it does not implement:** §9.4's config validation is the gate, and a build validates `showdown_policy` against what it actually implements — a table whose value it does not implement **goes to `TableClosed` and is never played**, exactly as any other failing config parameter does, with no repair path. The MVP implements `MandatoryReveal` only, so an MVP client refuses a `TDA_MUCK` table rather than playing it with T43 silently missing. The value stays in the type (§7.7) and T43 stays specified. | `PROTOCOL.md` Q-01, `DECISIONS.md` |
 
 **A note on the letters, because two of the rows below carry labels that have since moved (R-2).**
@@ -3045,6 +3188,7 @@ scheme. `OQ-E` is `THREAT_MODEL.md`'s and is unchanged.
 
 | # | Question as it stood | The answer |
 |---|---|---|
+| **Q7** | **What marks a seat `Absent` at all?** Carried for two passes, widened once by H1, and asked on the assumption that marking a seat `Absent` was what let the table keep playing after a seat vanished. | **Closed by D-013, and closed by dissolving it rather than answering it (J2).** Marking a seat `Absent` would never have helped: `PROTOCOL.md` §4.4's required emitter set names absent and sitting-out seats **in its inclusion clause**, so no status ever removed a seat from it. The status field was not the liveness gate and the question was about the wrong mechanism — which is how two passes of correct reasoning about `Absent` left the table frozen rather than slow. D-013 puts the gate on demonstrated participation in the chain instead (§5.3 step 4, I31), and **nothing marks a seat `Absent`, nothing needs to, and the variant stays unreachable on purpose** (§2.4, J5). What is still open is not this question but the narrower **Q8** above, which is about the participation predicate's one unratified input, not about a status. |
 | Q4 | Whether `STATE_HASH` is exchanged at every phase boundary or only at hand boundaries. `SPEC_CS.md` §15 says "after critical transitions" without enumerating them, and this document made every phase hashable so that either policy would be implementable. | **Closed** by `PROTOCOL.md` §6.2, which enumerates them normatively — seven checkpoints, "at these points and no others": after `TABLE_READY`, after `DECK_COMMIT`, after each of the four betting rounds closes, and immediately before `SHOWDOWN_REVEAL`. It is neither of the two candidate policies but a third, chosen for a reason this document must not undo: **no checkpoint is placed after a hole card has been opened to anyone but its owner**, because a checkpoint after the cards are known is an abort trigger the loser can pull with full information (§6.3 case (c), `THREAT_MODEL.md` X29). The engine's part is unchanged — every phase is hashable — but the *placement* is settled and is `PROTOCOL.md`'s, not an open choice. |
 | **OQ-A** (as this document formerly used the letter; `DECISIONS.md` now uses `OQ-A` for the reference engine — see the note below) | Where `\|V\| < 2`, does an unfinishable hand restore stacks or forfeit? Restoration lets a losing player escape by going silent; forfeiture lets an opponent take an honest player's committed chips by asserting a deadline that did not pass. | **Closed by D-010**, and closed wider than the question was asked: an abort is neutral **on every path and at every table size**, not only below the floor, so there is no longer a configuration in which the two candidate answers differ. The escape D-010 reopens is its stated, accepted cost — §8.6 and §12 say so plainly rather than treating it as a residual. |
 | **OQ-D** (as this document formerly used the letter; it is now `PROTOCOL.md` **Q-07**) | `HAND_ABORT cause = 4` / `AbortKind::StateDivergence`: restore, forfeit an unnamed party's commitment, or settle from the last `STATE_ACK`-agreed checkpoint? | **Closed by D-010** for its chip half: restoration, like every other abort (T54, T57, T60, §8.6). Of what is left, the *settle-from-the-last-agreed-checkpoint* half is `PROTOCOL.md` **Q-07** and the *adjudication* half — there is no procedure by which anyone establishes which peer diverged — is **OQ-A**. |
@@ -3097,21 +3241,35 @@ Per `SPEC_CS.md` §18 and its closing paragraph, and per §36's instruction not 
   scoping it on the seat count was itself the defect (D-008). Since D-010 the same is true *above*
   the floor as well: a certificate at `|V| >= 2` names a seat and ends a hand, and that is the
   whole of its effect on chips, which is none.
-* **Liveness is not owed, and this document does not claim it.** There is no bound on how long a
-  table can be made to make no progress: a stall costs `hand_deadline_ms` per hand and can be
-  repeated every hand, and two colluding seats can do the same at any table size (Q3).
+* **Liveness is not owed in general, and this document still does not claim it in general.** An
+  adversary that keeps sending — voting, stalling, equivocating, diverging — can cost the table a
+  hand at a time, repeatedly, and two colluding seats can do it at any table size (Q3).
   `SPEC_CS.md` §19 ranks security above finishing a hand conveniently and D-009 rule 2 applies that
   ranking literally, in preference to an effect a single signature could manufacture.
-  **What *is* claimed is narrower, and it is checked phase by phase in §12.1: every phase has a
-  reachable exit under every adversarial behaviour, including a peer that simply stops.** Slow is
-  not the same as frozen.
-* **A stall repeats, at every table size.** Nothing in this document marks a seat `Absent` (H1):
-  T57 names nobody, and since H1 a certificate-borne abort that *does* name somebody does not mark
-  them either. The next hand deals the silent seat in and stalls again for `hand_deadline_ms`. This
-  is the cost of not deriving canonical state from a quantity honest peers disagree about (D-012),
-  it is recorded as **Q7** in §11, and an implementer must not close it locally — the local fix
-  forks the chain. It was already the behaviour heads-up, which is the MVP's regime (§9.5); what
-  changed is that three seats and six now behave the same way.
+  **What *is* claimed is checked phase by phase in §12.1: every phase has a reachable exit under
+  every adversarial behaviour, including a peer that simply stops — and, since D-013, the cycle
+  those exits form makes progress rather than repeating a fixed point.**
+* **A seat that goes silent costs at most two hands, and this is the claim the previous revision
+  got wrong in the other direction.** It said "a stall costs `hand_deadline_ms` per hand and can be
+  repeated every hand", which reads as a bound on grief and was not one: nothing removed the silent
+  seat from `HAND_INIT`'s required emitter set, T46 restores every stack so nothing could bust, and
+  no §9.3 condition could fire — **the table repeated one identical ten-minute hand forever, and no
+  participant had an action that could end it**, because `PLAYER_SIT_OUT` and `PLAYER_LEAVE` are
+  single-writer by the seat itself, so the only human who could sit the silent seat out was the
+  silent one. That was J2. Under **D-013** the corrected statement is:
+
+  > **A seat that goes silent stalls one hand — the hand it stopped signing in — and, if it stopped
+  > after signing something in that hand, the hand after it as well; from then on it is skipped.
+  > Every later hand is played among the seats that are actually there, at normal speed. The
+  > skipped seat keeps its seat and its stack, posts its blinds and antes when the ring reaches it,
+  > cannot win the money it posts, and busts. Its stack strictly decreases every orbit, so §9.3's
+  > end conditions become reachable and the table ends.**
+
+  The cost of one vanished seat is therefore **one `hand_deadline_ms` if it vanished at a hand
+  boundary, two if it vanished mid-hand** — 10 or 20 minutes under the preset — and nothing after
+  that. §12.1 derives it and gives the bust bound. An implementer must still not close the
+  remaining hand or two locally, from a dropped connection or a missed heartbeat: those are not
+  chain content, and the local fix forks the chain (D-012, I31).
 * **Conversely, the certificate's protection at `|V| >= 2` is not a protection against collusion.**
   It requires *every* seat still in the voter set to sign, so `|V|` colluders defeat it — two of
   them at a three-seat table. This document claims only that a certificate cannot be produced
@@ -3138,33 +3296,36 @@ Per `SPEC_CS.md` §18 and its closing paragraph, and per §36's instruction not 
   TDA rules** (D-005), forced by the fact that opening an absent player's cards at showdown would
   require exactly the mechanism `SPEC_CS.md` §19 forbids. The practical difference is small;
   the deviation is real and is stated rather than hidden.
-* **Nor is a seat blinded off automatically when its client vanishes, which is the other half of
-  D-005 and is now only partly met** (H1). Nothing in this document enters `SeatStatus::Absent`:
-  the marking that did was derived from the accepted abort copy's `attributed`, a per-receiver
-  quantity, and D-012 forbids that. What remains reaches the same seat state through the seat's own
-  `PlayerSitsOut` or §8.5's auto-action limit, neither of which a vanished client can trigger and
-  the second of which never runs heads-up. The consequence — a stall that repeats every hand until
-  a person intervenes — is stated here, in §5.2, §8.6 and §11's Q7, and is not to be closed locally:
-  the local fix forks the chain.
+* **A seat *is* blinded off automatically when its client vanishes, which is D-005's other half,
+  and it is met — but not through a status.** Nothing in this document enters `SeatStatus::Absent`
+  and nothing needs to (§2.4, J5): the marking that once did was derived from the accepted abort
+  copy's `attributed`, a per-receiver quantity D-012 forbids, and under D-013 the seat is skipped
+  because it stopped signing, not because a field says it is away. The effect D-005 asks for — the
+  seat keeps its stack, takes no cards, pays its blinds and antes, drains and busts — is delivered
+  by §5.3 step 4's `dealt_in` gate and steps 6 and 7's positional posting. What is **not** claimed
+  is that the seat's `SeatStatus` reflects its absence: to every reader of that field a vanished
+  seat is still `Active`, and the GUI must derive "away" from `dealt_in` and the participation set,
+  never from `status`. The two routes into `SittingOut` are unchanged and are still the seat's own
+  (`PlayerSitsOut`, §8.5's auto-action limit).
 * **Every recorded deviation is listed once**, in the register at `THREAT_MODEL.md` §9.1.1. This
   document is a source for four of its rows and restates none of them: the once-per-table randomness
   beacon (§7.9, row 2), no burn cards (§7.8, row 3), the absent seat that pays and cannot win
   (row 4 — implemented in §7.5's `dealt_in` filter since P7, which is where it previously was not;
-  since H1 the seat reaches that state through its own `PlayerSitsOut` rather than through an
-  abort's attribution, which changes who puts it there and nothing about what happens to it),
-  and the advisory deadline where `|V| < 2` (§8.4, §9.5, row 5 — recorded as the
-  "advisory heads-up deadline", which is that row's common case; D-008 widens its scope from the
+  since D-013 the seat reaches that state by having stopped signing, rather than through its own
+  `PlayerSitsOut` or an abort's attribution — which changes what puts it there and nothing about
+  what happens to it), and the advisory deadline where `|V| < 2` (§8.4, §9.5, row 5 — recorded as
+  the "advisory heads-up deadline", which is that row's common case; D-008 widens its scope from the
   seat count to the voter set and the register wording should follow). **A fifth row is now owed:
   the neutral abort of D-010**, which deviates from D-005's forfeiture rule and from the live-poker
-  analogue that a player who cannot act loses what they bet. **A sixth is owed with H1: no seat is
-  marked absent automatically.** D-005 reads that a disconnected player's seat is blinded off; in
-  this version nothing puts a seat into that state but the seat's own `PlayerSitsOut` (T59) or
-  §8.5's auto-action limit, which needs `|V| >= 2` and so never runs heads-up. A vanished player's
-  seat is therefore dealt in again every hand and stalls each one, and D-005's blinding-off happens
-  only where the absent client is alive enough to announce it. The reason is D-012 — the marking was
-  derived from a per-receiver quantity and forked the next hand (§5.2, §8.6) — and the residue is
-  **Q7**. A deviation that is not in that register has not been recorded, whatever any single
-  document says about it.
+  analogue that a player who cannot act loses what they bet. **The sixth row this bullet used to
+  ask for — "no seat is marked absent automatically" — is withdrawn rather than filed.** It was
+  written as a deviation from D-005 on the belief that D-005's blinding-off had been lost with
+  T46's marking. It had not: what D-005 asks for is that the game go on and the absent seat's stack
+  be eaten by the blinds, and D-013 delivers exactly that without any marking (§5.3 step 4). The
+  seat's `SeatStatus` not reflecting its absence is an internal fact about which field carries the
+  gate, not a deviation from a rule of poker, and filing it as one would have put a non-deviation
+  in a register whose value is that everything in it is real. A deviation that is not in that
+  register has not been recorded, whatever any single document says about it.
 * The open questions in §11 are open. Anything downstream that assumes an answer to one of them is
   assuming something this document did not say.
 
@@ -3231,16 +3392,39 @@ The phase numbers are this document's own (§5.1): **17 is `HandAborted` and 18 
    anything) or `TableClosed`. The cycle 4 → 17 → 16 → 4 makes progress on the one counter that
    matters: `hand_id` strictly increases across it, and §9.3's conditions are re-evaluated every
    time round.
-5. **The cycle's *next* hand can start, which is a separate claim and was false until H1 was
-   closed.** Every row above ends a *hand*; H1 was about what the next hand starts from, which is
-   why the walk could not see it. Two peers that completed hand `k`'s terminal stage on different
+5. **The cycle's *next* hand can start, and — since D-013 — the cycle is not a fixed point.**
+   These are two claims and both were false until this pass. Every row above ends a *hand*; what
+   the next hand starts from is a link the walk does not look at, which is why two separate defects
+   hid there.
+
+   **H1 was the first.** Two peers that completed hand `k`'s terminal stage on different
    `HAND_ABORT` copies held different `status` vectors under T46's deleted marking, so their
-   `HAND_INIT` copies for hand `k+1` differed in `dealt_in` and `bb_seat`, the collective stage
-   never completed, and row 4 was reached again with the same divergence — a passing row and a
-   table that never plays another hand. With the marking deleted, every field of `HAND_INIT` is a
-   function of the previous hand boundary, and **I30(c)** is the assertion that says so. Row 4's
-   exit is unchanged; what changed is that the phase it leads back to can now be left by something
-   other than the deadline.
+   `HAND_INIT` copies for hand `k+1` differed in `dealt_in` and `bb_seat`, each rejected the
+   other's, and row 4 was reached again with the same divergence. With the marking deleted, every
+   field of `HAND_INIT` is a function of the previous hand boundary, and **I30(c)** is the
+   assertion that says so.
+
+   **J2 was the second, and D-012's fix did not touch it.** Even with every peer agreeing on every
+   field, `HAND_INIT` is a *collective* stage: agreement makes it **completable**, not complete.
+   Completion needs every member of the required emitter set to emit, and `PROTOCOL.md` §4.4's set
+   was *"every seat that will be `dealt_in`, plus every occupied seat that is absent or sitting out"*
+   — which no status removes a seat from. So the silent seat was a required emitter of hand `k+1`
+   too, and of `k+2`, and so on. Each iteration cost `hand_deadline_ms`, T46 restored every stack,
+   nothing busted, and §9.3's conditions — every one of which reads a stack, the fault flag or an
+   empty table — could not fire. **Every row of the table above passed, and the table played no
+   further hand, ever.** That is the difference between a termination argument and a liveness one,
+   and it is why I30(c)'s final clause, which asserted completion, is deleted as false (J3): an
+   invariant that asserts the thing the table cannot deliver hides exactly the trace that would
+   have shown it.
+
+   **Under D-013 the cycle has a strictly decreasing measure.** A seat that stops signing is not in
+   hand `k+1`'s required emitter set (`PROTOCOL.md` §4.4) and is not `dealt_in` (§5.3 step 4), so
+   `HAND_INIT(k+1)` completes among the seats that are there; but it still holds a position in the
+   ring, so steps 6 and 7 still take its ante and its blind when the ring reaches it, and step 9's
+   award gives that money to a seat that is. Its `stack` therefore strictly decreases at least once
+   per orbit and is bounded below by zero, so step 2 marks it `Busted` in a finite number of hands
+   and §9.3 condition 1 (tournament) or the seat simply ceasing to post (cash) follows. **`hand_id`
+   was never the measure that mattered; a stack is.**
 
 **Two exits that are new in this revision, so the table is not read as unchanged.** Row 3's exit
 changed because T11 stopped unseating (G4): the previous revision left `AwaitingSeatRngReveal` on a
@@ -3250,11 +3434,91 @@ stalls to T4 like every other beacon failure. And the first row of 20 no longer 
 the table deals the next one (§5.2, T57's `Diverged` note), whereas a divergence that reconciles
 into case (c) closes the table through T54 and §9.3 condition 0.5.
 
-**What the table does not claim, said plainly.** It is a *termination* argument, not a liveness
-bound. Ten minutes a hand, every hand, forever is a passing row here and an unplayable table in
-practice. The bound on how bad it gets is `hand_deadline_ms` per hand with no limit on repetition,
-and closing that needs Q7's agreed basis for marking a seat absent, which does not exist. **Read
-the table as: nothing is frozen, and slow is the worst case.**
+**What the table does and does not claim, said plainly, and corrected.** It is a *termination*
+argument: every phase has a reachable exit. The previous revision then read that as "slow is the
+worst case", which was wrong — ten minutes a hand, every hand, **forever**, is a passing row here
+and it is not slow, it is a table that never plays again (J2). The table's rows were all true and
+the sentence drawn from them was not. Since **D-013** the stronger claim is available and is made
+below, and the honest scope of the table itself is: *no phase is frozen; whether the sequence of
+hands makes progress is a separate question, and it is answered in the two blocks that follow.*
+
+---
+
+#### 12.1.1 Progress under D-013 — the twenty phases re-derived, and the exit for each
+
+**The exits are unchanged.** D-013 adds no transition, deletes none, and changes no guard: it
+narrows `dealt_in` at §5.3 step 4 and narrows `PROTOCOL.md` §4.4's required emitter set on the
+same predicate. Neither is read by T4, T45, T46, T47 or T57, which are the whole of the *Exit*
+column. So every row of the table above stands exactly as written, and the re-derivation is a
+check, not a rewrite:
+
+| # | Phase | Exit under D-013 | Changed by D-013? |
+|---:|---|---|---|
+| 1 | `Seating` | **T4**, local lobby timer → `TableClosed` | no. D-013's base case (the required set for hand 1 is the signers of `TABLE_READY`) is fixed *in* this phase and read at T10 |
+| 2 | `AwaitingSeatRngCommit` | **T4**, guard `hand_id == 0 ∧ ledger_in == 0` → `TableClosed` | no |
+| 3 | `AwaitingSeatRngReveal` | **T4**, same → `TableClosed` | no |
+| 4 | `AwaitingKeySetup` (**includes a `HAND_INIT` that never completes**) | **T57** → `HandAborted` | **the exit is the same; what it leads back to is not.** This is the phase J2 lived in: the stage stalled here every hand, forever. Now it stalls at most twice for one silent seat, and hand `k+2` onward completes here in a round trip |
+| 5 | `AwaitingShuffle` | **T57** → `HandAborted` | no. A skipped seat is not in `deck.participants` (I20), so it is not in `shuffle_order` and cannot stall the chain |
+| 6 | `AwaitingDeal` | **T57** → `HandAborted` | no; same reason — it is owed no reveal token |
+| 7 | `BettingPreFlop` | **T57** → `HandAborted` | no. It is `¬dealt_in`, so it is never `player_to_act` (I14) |
+| 8 | `AwaitingFlopReveal` | **T57** → `HandAborted` | no |
+| 9 | `BettingFlop` | **T57** → `HandAborted` | no |
+| 10 | `AwaitingTurnReveal` | **T57** → `HandAborted` | no |
+| 11 | `BettingTurn` | **T57** → `HandAborted` | no |
+| 12 | `AwaitingRiverReveal` | **T57** → `HandAborted` | no |
+| 13 | `BettingRiver` | **T57** → `HandAborted` | no |
+| 14 | `AwaitingShowdownReveal` | **T57** → `HandAborted` | no |
+| 15 | `Settling` | **T57** → `HandAborted`, no award applied | no. `HAND_COMPLETE`'s required set narrows with the same predicate, so a seat that stopped signing last hand does not hold this stage open either |
+| 16 | `HandComplete` | **T47**, derived, immediate → `AwaitingKeySetup` \| `Paused` \| `TableClosed` | **§9.3's conditions become reachable.** Condition 1 needs exactly one seat with chips, and until D-013 no stack could ever change on a stalled table. Now the skipped seat's stack strictly decreases every orbit |
+| 17 | `HandAborted` | **T46**, derived, immediate → `HandComplete` | no |
+| 18 | `Paused` | idles; left by T59 on a `PlayerSitsIn`; nothing is owed to anybody | **one new way in, and it is correct.** If *every* seat stops signing, hand `k+1`'s `dealt_in` is empty and §5.3 step 9 goes to `Paused` — an abandoned table that idles instead of burning ten minutes a hand forever. It is not a new exit and it owes nobody anything |
+| 19 | `TableClosed` | absorbing; every event is a `Rejection` | no |
+| 20 | `Diverged`, hand live | **T57** — the hand deadline is not disarmed at T50 → `HandAborted`, `table_faulted` unchanged | no |
+| 20 | `Diverged`, no hand started | **T4**, guard `hand_id == 0 ∧ ledger_in == 0` → `TableClosed` | no |
+
+**None of the twenty exits reads `signed_this_hand`, `dealt_in`, a status, a certificate or `|V|`**
+— which is the same property note 2 above asserts, checked again against the new predicate. A seat
+that stops signing cannot hold a phase open, and now it cannot hold the *table* open either.
+
+#### 12.1.2 How long a table with one silent seat takes to make progress
+
+**Before D-013: never.** Derived above and in §12: ten minutes per hand, unbounded, no stack
+changes, no end condition fires, no participant has an action that ends it.
+
+**Under D-013, the bound is one or two hand deadlines, and then normal speed.** The two cases are
+distinguished by *when* the seat stopped, and the difference is `HAND_INIT`'s own copy counting as
+participation:
+
+* **Silent from a hand boundary** — the client is already gone when hand `k` begins. It signed
+  nothing in hand `k`; hand `k` stalls at `HAND_INIT` and aborts at `hand_deadline_ms`. Hand `k+1`
+  skips it. **One stalled hand: 600 000 ms under the preset.**
+* **Silent mid-hand** — it signed `HAND_INIT(k)`, then stopped. Hand `k` stalls at whatever stage
+  it reached and aborts. Hand `k+1` still requires it, because it *did* sign a chained event during
+  hand `k`; hand `k+1` stalls at `HAND_INIT` and aborts. Hand `k+2` skips it. **Two stalled hands:
+  1 200 000 ms.** D-013's own summary says "exactly one hand"; that is the first case, and the
+  second costs one more. It is recorded rather than rounded away, and it is worth one directed test
+  (§10, I31).
+
+**Then the table plays.** Every hand from that point completes among the seats that are there, at
+whatever speed they play. The skipped seat drains: heads-up under `RATED_SNG_POKERTH_V1` it posts
+one blind per hand, alternating SB and BB, so it loses `3 × small_blind(h)` every two hands, with
+`small_blind` doubling every eleven hands (§9.2). Against a 10 000 starting stack that is 825 chips
+over level 1, 1 650 over level 2, 3 300 over level 3 — 5 775 after 33 hands — and the remaining
+4 225 inside level 4 at 600 a hand. **It busts at about hand 40**, and §9.3 condition 1 then closes
+the table with the remaining player as the winner. Each of those hands is a `|dealt_in| == 1` drain
+hand: no key setup, no shuffle, no reveal, straight to `Settling` (§5.3 step 9), so the wall-clock
+cost is `hand_delay_sec` — 7 seconds — plus one round trip. **About five minutes.**
+
+So the whole cost of an opponent vanishing at a heads-up MVP table is **10 or 20 minutes of stall,
+then about five minutes of drain, then the tournament ends.** At larger tables the other seats play
+real poker throughout and only the vanished seat's chips move to them.
+
+**What is still not claimed.** This is a bound on one seat going silent and staying silent. It is
+not a bound against an adversary that keeps *sending*: a peer that stalls to the deadline, returns
+to sign one event, and stalls again costs a hand each time and never stops being a required
+emitter, and two colluding seats can do the same at any table size (Q3). D-013 removes the fixed
+point, not the ability to waste hands. `SPEC_CS.md` §19 and D-009 rule 2 both accept that trade
+knowingly, and §8.7 gives what is left in its place, which is visibility.
 
 **Where the previous revisions failed this check, recorded so the fix can be verified rather than
 believed.** The Phase 2 gate found phases 4–14 and 20 with **no reachable exit** — the whole of the
@@ -3265,6 +3529,14 @@ seat (P3). Three phases, three revisions, one class of defect: **a terminus that
 participation of the peer whose non-participation is the reason for it.** Every row above is
 checked against exactly that question, which is why the *Fires after* column names a timer or the
 word *immediately*, and never a peer.
+
+**And the fourth revision failed a check this table does not perform (J2).** Every row passed and
+the table never played again, because a *hand's* terminus and a *table's* progress are different
+obligations and only the first was ever written down. The class is one step out from the previous
+three: **a next hand that depends on the participation of the peer whose non-participation is the
+reason the last one ended.** §12.1.1 checks the rows against the first question and §12.1.2 against
+the second, and they are kept apart on purpose — collapsing them is what I30(c)'s deleted clause
+did, and it cost a pass.
 
 ## 13. Objections to the fix plan
 
@@ -3556,6 +3828,10 @@ and leave two declared events that no row consumes.
     table size now behaves as heads-up already did. `SeatStatus::Absent` keeps its variant and its
     definition and has **no producing transition** in this version, which is stated in §2.4 rather
     than tidied away.
+    **The cost sentence in this item is wrong and is corrected by item 32 below (J2).** It is left
+    standing as the record of what was believed at the time: the stall was not repetition, it was a
+    fixed point, because no status ever removed a seat from `HAND_INIT`'s required emitter set. The
+    *edit* this item describes was right and is untouched; only its cost model was wrong.
 30. **Six restatements replaced by pointers — H8's two, and four the gate did not find.** §7.9's
     `commitment_i` and `seed` go to `PROTOCOL.md` §4.4 and §2.8 — the previous revision printed them
     *and printed the argument against printing them*, that a copy is what made them diverge (C-2),
@@ -3588,6 +3864,59 @@ and leave two declared events that no row consumes.
     tests" is corrected to **seven** (it listed six before I30 was added), and the I7/I8 test
     construction is rewritten to build its non-participating seat through T59, since `Absent` is no
     longer reachable.
+
+---
+
+---
+
+**Applied in the third Phase 2 gate pass (`PHASE2_GATE3.md`), under D-013.**
+
+32. **`dealt_in` is gated on demonstrated participation, and the table can make progress again
+    (J2, blocking).** `PROTOCOL.md` §4.4's required emitter set for `HAND_INIT` was *"every seat
+    that will be `dealt_in`, plus every occupied seat that is absent or sitting out"*, so **no seat
+    status ever removed a seat from it** — which means the previous pass's cost model was wrong in
+    kind, not in degree: a silent seat did not make the table slow, it made the table **stop**, for
+    good, with no participant able to end it. D-013 replaces the status question with a
+    participation one, and §5.3 step 4 applies its engine half:
+    `dealt_in[s] := (status == Active ∧ s ∈ signed_this_hand)`. Narrowing the emitter set alone
+    would not have worked — a non-emitting seat that is still `dealt_in` is still in
+    `deck.participants` and the stall moves from `HAND_INIT` to `AwaitingKeySetup` — which is why
+    this half is this document's and is not a restatement of the other. Added: `signed_this_hand`
+    (§2.6, §2.8), its accumulation rule and its clearing at §5.3 step 8, and **I31**. No transition
+    is added, deleted or re-guarded.
+33. **I30(c)'s final clause is deleted as false (J3).** It read *"hence a `HAND_INIT` collective
+    stage that completes"*. Agreement on the body makes the stage **completable**; completion needs
+    every required emitter to emit. The clause is also what hid J2 for two passes, and it carried a
+    **test instruction**, so a harness asserting it would pass on every trace where the stage
+    completes and never be run against the trace where it does not — unfalsifiable exactly where
+    the defect lived. The invariant now ends at byte-identical `dealt_in` and `bb_seat`, states that
+    completion is a liveness property outside its scope, and **the test instruction is changed to
+    byte-identity of the two peers' derived `HAND_INIT` bodies** (§10, and the same correction in
+    the adversarial-test list).
+34. **Every statement of the liveness cost is rewritten rather than annotated** — §5.2's note under
+    T58/T59, §8.6, §8.7, §12's two bullets, §12.1's notes 4 and 5 and its closing paragraph. The
+    sentence *"slow is the worst case"* is withdrawn; §12.1 gains **§12.1.1**, the twenty phases
+    re-derived under D-013 with the exit for each, and **§12.1.2**, the bound on how long a table
+    with one silent seat takes to make progress. The bound is **one `hand_deadline_ms` if the seat
+    vanished at a hand boundary and two if it vanished mid-hand** — D-013's "exactly one hand" is
+    the first case; the second costs one more, because `HAND_INIT`'s own copy counts as
+    participation — then normal speed, then the seat busts in about forty hands heads-up under the
+    preset and §9.3 condition 1 closes the table.
+35. **Q7 is closed by dissolution, not answered, and Q8 replaces it.** *What marks a seat `Absent`?*
+    was the wrong question for two passes: marking a seat `Absent` never removed it from the emitter
+    set, so the answer would not have helped. Nothing marks it, nothing needs to, and
+    `SeatStatus::Absent` stays **unreachable on purpose** with the trap labelled at its declaration
+    (§2.4, J5) rather than retired — retiring it would remove `PublicTableState.absent` from
+    `state_hash`, which is a wire change and `PROTOCOL.md`'s call. **Q8** carries the one input to
+    the participation predicate that is not agreed by construction: a contribution to the stage that
+    *stalled*, which no `stage_hash` ratifies. It is filed against `PROTOCOL.md` and recorded in
+    `DECISIONS.md`'s open list in this pass, per D-013's process rule.
+36. **The `Absent`-deviation row this document owed the register is withdrawn (§12).** It was filed
+    on the belief that D-005's blinding-off had been lost with T46's marking. It had not: D-005 asks
+    that the game continue and the absent seat's stack be eaten by the blinds, and D-013 delivers
+    exactly that. Which field carries the gate is an internal fact, not a deviation from a rule of
+    poker, and filing it as one would put a non-deviation in a register whose whole value is that
+    everything in it is real.
 
 ---
 

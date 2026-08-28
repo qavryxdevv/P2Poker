@@ -5,80 +5,145 @@
 //! to be a **different** key from the libp2p `PeerId`, because a `PeerId` says
 //! which socket you are talking to, not who is playing.
 //!
-//! # The domain register is a closed enum, not a string
+//! # The register is closed, and it is `PROTOCOL.md` §2.8's
 //!
-//! Every signature and every hash in this protocol is bound to a purpose. If
-//! that purpose were a `&str` chosen at the call site, two call sites could
-//! disagree by a character and a value signed for one purpose would verify for
-//! another — which is a replay across constructions, not a typo.
+//! Every hash in this protocol is bound to a purpose. If that purpose were a
+//! `&str` chosen at the call site, two call sites could disagree by a character
+//! and a value hashed for one purpose could be replayed as another — a replay
+//! across constructions, not a typo.
 //!
-//! So [`Domain`] is a closed enum. Adding a purpose means adding a variant, and
-//! a test asserts every variant maps to a distinct string. The strings
-//! themselves are wire-visible and may never change once events carrying them
-//! exist.
+//! [`Domain`] is therefore a closed enum whose strings are copied from
+//! `PROTOCOL.md` §2.8, which owns the register for the whole corpus (D-011). A
+//! test asserts the strings are distinct; another walks this crate's own sources
+//! for the three strings §2.8 marks **retired, never valid**, in the shape
+//! [`crate::security::rng`] already uses for the generator rule.
+//!
+//! # The event signature prefix is not one of them
+//!
+//! `DOMAIN_EVENT` is a **literal 24-byte prefix**, not a `derive_key` domain,
+//! and its separators are slashes rather than spaces for exactly that reason
+//! (§2.4). It never goes through [`Domain`], and the string with spaces is one
+//! of the retired three.
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
 
 use crate::poker::state::{Hash, PlayerId};
 use crate::protocol::serialization;
 
-/// Every purpose a signature or a hash can be bound to.
+/// The 24-byte literal prefix of every signed event (`PROTOCOL.md` §2.4, §13).
 ///
-/// Closed on purpose: see the module note.
+/// `"p2p-poker/v1/event"` — eighteen ASCII bytes — NUL-padded to twenty-four.
+/// The hex is normative and is pinned by a test below.
+pub const DOMAIN_EVENT: [u8; 24] = [
+    0x70, 0x32, 0x70, 0x2d, 0x70, 0x6f, 0x6b, 0x65, 0x72, 0x2f, 0x76, 0x31, 0x2f, 0x65, 0x76, 0x65,
+    0x6e, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The domain strings of `protocol_version = 1`, from `PROTOCOL.md` §2.8.
+///
+/// Adding a variant is a minor protocol change; changing or removing one is a
+/// major change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Domain {
-    /// A signed protocol event in a table's chain.
-    Event,
-    /// The hash chaining one stage of the chain to the previous one.
-    StageHash,
-    /// The public state hash exchanged at a checkpoint.
-    StateHash,
-    /// The table advertisement published in the lobby.
-    TableAdvertisement,
-    /// The agreed table parameters, which enter the genesis.
-    ///
-    /// Replaces the advertisement hash, which was per-receiver because each
-    /// re-broadcast carries a later timestamp (D-013, blocker J1).
-    TableParameters,
-    /// A player's long-term application identity.
-    PlayerIdentity,
-    /// A mental-poker proof, bound to one hand at one table.
-    DeckProof,
+    /// `event_hash` (§3.2).
+    Transcript,
+    /// `stage_hash` (§3.2).
+    Stage,
+    /// The genesis hash of each chain (§3.1).
+    Genesis,
+    /// `ABORT_TERMINAL(k)`, the terminal value of an aborted chain (§3.1).
+    AbortTerminal,
+    /// `STATE_HASH` (§6).
+    State,
+    /// `roster_hash` (§3.1).
+    Roster,
+    /// The `RNG_COMMIT` commitment (§4.4).
+    RngCommit,
+    /// The combined seed from `RNG_REVEAL` (§4.4).
+    RngBeacon,
+    /// The `DECK_COMMIT` digest (§4.5).
+    DeckCommit,
+    /// The `ctx` byte string handed to the deck library (§4.5).
+    DeckCtx,
+    /// `session_id` (§4.3).
+    Session,
+    /// `table_params_hash` (§3.1) — what D-013 put in the genesis in place of
+    /// the per-receiver advertisement hash.
+    TableParams,
+    /// `connection_nonce` (§1.2).
+    Connection,
+    /// Reserved; `table_id` is currently the table public key itself (§4.1).
+    TableId,
+    /// Reserved; unused in version 1. Since D-013 the advertisement hash is a
+    /// lobby-layer pointer only and enters no chained hash.
+    Advert,
+    /// The certificate subject digest (§8.3).
+    TimeoutCert,
 }
 
 impl Domain {
-    /// The wire-visible context string.
-    ///
-    /// Versioned, so a future protocol revision cannot collide with this one.
-    /// These strings are part of the format: changing one invalidates every
-    /// event that carries it.
+    /// The wire-visible context string, verbatim from `PROTOCOL.md` §2.8.
     pub const fn context(self) -> &'static str {
         match self {
-            Domain::Event => "p2p-poker v1 event",
-            Domain::StageHash => "p2p-poker v1 stage-hash",
-            Domain::StateHash => "p2p-poker v1 state-hash",
-            Domain::TableAdvertisement => "p2p-poker v1 table-advertisement",
-            Domain::TableParameters => "p2p-poker v1 table-parameters",
-            Domain::PlayerIdentity => "p2p-poker v1 player-identity",
-            Domain::DeckProof => "p2p-poker v1 deck-proof",
+            Domain::Transcript => "p2p-poker v1 transcript",
+            Domain::Stage => "p2p-poker v1 stage",
+            Domain::Genesis => "p2p-poker v1 genesis",
+            Domain::AbortTerminal => "p2p-poker v1 abort-terminal",
+            Domain::State => "p2p-poker v1 state",
+            Domain::Roster => "p2p-poker v1 roster",
+            Domain::RngCommit => "p2p-poker v1 rng-commit",
+            Domain::RngBeacon => "p2p-poker v1 rng-beacon",
+            Domain::DeckCommit => "p2p-poker v1 deck-commit",
+            Domain::DeckCtx => "p2p-poker v1 deck-ctx",
+            Domain::Session => "p2p-poker v1 session",
+            Domain::TableParams => "p2p-poker v1 table-params",
+            Domain::Connection => "p2p-poker v1 connection",
+            Domain::TableId => "p2p-poker v1 table-id",
+            Domain::Advert => "p2p-poker v1 advert",
+            Domain::TimeoutCert => "p2p-poker v1 timeout-cert",
         }
     }
 
     /// Every variant, so tests and audits can enumerate the register.
-    pub const ALL: [Domain; 7] = [
-        Domain::Event,
-        Domain::StageHash,
-        Domain::StateHash,
-        Domain::TableAdvertisement,
-        Domain::TableParameters,
-        Domain::PlayerIdentity,
-        Domain::DeckProof,
+    pub const ALL: [Domain; 16] = [
+        Domain::Transcript,
+        Domain::Stage,
+        Domain::Genesis,
+        Domain::AbortTerminal,
+        Domain::State,
+        Domain::Roster,
+        Domain::RngCommit,
+        Domain::RngBeacon,
+        Domain::DeckCommit,
+        Domain::DeckCtx,
+        Domain::Session,
+        Domain::TableParams,
+        Domain::Connection,
+        Domain::TableId,
+        Domain::Advert,
+        Domain::TimeoutCert,
     ];
 }
 
-/// A hash bound to a purpose.
-pub fn hash(domain: Domain, bytes: &[u8]) -> Hash {
-    serialization::hash_domain(domain.context(), bytes)
+/// Hash length-prefixed parts under a registered domain.
+///
+/// A thin, typed front door onto [`serialization::h`], so no caller can pass a
+/// string the register does not contain.
+pub fn hash(domain: Domain, parts: &[&[u8]]) -> Hash {
+    serialization::h(domain.context(), parts)
+}
+
+/// The exact byte string that is signed (`PROTOCOL.md` §2.4).
+///
+/// `DOMAIN_EVENT ‖ u32_be(len(body_bytes)) ‖ body_bytes`. The length prefix is
+/// redundant given a fixed-length tag, but four bytes removes any argument
+/// about concatenation ambiguity.
+pub fn to_be_signed(body_bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(DOMAIN_EVENT.len() + 4 + body_bytes.len());
+    out.extend_from_slice(&DOMAIN_EVENT);
+    out.extend_from_slice(&(body_bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(body_bytes);
+    out
 }
 
 /// A detached Ed25519 signature.
@@ -107,8 +172,7 @@ impl core::fmt::Debug for Sig {
 pub enum VerifyError {
     /// The 32 bytes offered are not a valid Ed25519 public key.
     BadKey,
-    /// The signature does not verify over these bytes under this key and
-    /// domain.
+    /// The signature does not verify over these bytes under this key.
     BadSignature,
 }
 
@@ -123,28 +187,25 @@ impl core::fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
-/// Sign canonical bytes under a domain.
+/// Sign an event body.
 ///
-/// The domain is bound by hashing it in, so the same bytes signed for two
-/// purposes produce two unrelated signatures and neither verifies as the other.
-pub fn sign(key: &SigningKey, domain: Domain, message: &[u8]) -> Sig {
+/// `body_bytes` must already be canonical CBOR
+/// ([`serialization::to_canonical`]); this function does not encode.
+pub fn sign_event(key: &SigningKey, body_bytes: &[u8]) -> Sig {
     use ed25519_dalek::Signer;
-    let bound = hash(domain, message);
-    Sig(key.sign(&bound).to_bytes())
+    Sig(key.sign(&to_be_signed(body_bytes)).to_bytes())
 }
 
-/// Verify a signature over canonical bytes under a domain.
+/// Verify an event signature.
 ///
-/// Uses `verify_strict`, which rejects signatures that verify only because a
-/// small-order or non-canonically-encoded public key was used. Plain `verify`
-/// admits those, and one of them is a signature that verifies under two
-/// different keys — which in this protocol would mean one event attributable to
-/// two players.
-pub fn verify(player: &PlayerId, domain: Domain, message: &[u8], sig: &Sig) -> Result<(), VerifyError> {
+/// Uses `verify_strict`, never `verify`. Plain `verify` accepts signatures
+/// under small-order and non-canonical public keys, which permits signature
+/// malleability — and a malleable signature is an equivocation hole: two
+/// distinct byte strings validating for one logical event.
+pub fn verify_event(player: &PlayerId, body_bytes: &[u8], sig: &Sig) -> Result<(), VerifyError> {
     let key = VerifyingKey::from_bytes(player).map_err(|_| VerifyError::BadKey)?;
-    let bound = hash(domain, message);
     let signature = Signature::from_bytes(&sig.0);
-    key.verify_strict(&bound, &signature)
+    key.verify_strict(&to_be_signed(body_bytes), &signature)
         .map_err(|_| VerifyError::BadSignature)
 }
 
@@ -164,71 +225,153 @@ mod tests {
         SigningKey::from_bytes(&rng::secret_32().expect("the OS CSPRNG must be available"))
     }
 
+    /// The normative hex of `PROTOCOL.md` §2.4 and §13, pinned. These bytes are
+    /// the format; a change here invalidates every signature ever made.
+    #[test]
+    fn the_event_prefix_is_the_normative_twenty_four_bytes() {
+        assert_eq!(DOMAIN_EVENT.len(), 24);
+        assert_eq!(&DOMAIN_EVENT[..18], b"p2p-poker/v1/event");
+        assert_eq!(&DOMAIN_EVENT[18..], &[0u8; 6], "NUL-padded, not space-padded");
+        assert_eq!(
+            DOMAIN_EVENT,
+            [
+                0x70, 0x32, 0x70, 0x2d, 0x70, 0x6f, 0x6b, 0x65, 0x72, 0x2f, 0x76, 0x31, 0x2f, 0x65,
+                0x76, 0x65, 0x6e, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            ]
+        );
+    }
+
+    #[test]
+    fn to_be_signed_is_prefix_then_length_then_body() {
+        let body = b"body";
+        let signed = to_be_signed(body);
+        assert_eq!(&signed[..24], &DOMAIN_EVENT);
+        assert_eq!(&signed[24..28], &4u32.to_be_bytes());
+        assert_eq!(&signed[28..], body);
+        assert_eq!(signed.len(), 24 + 4 + body.len());
+    }
+
+    /// Without the length prefix, a shorter body followed by attacker-chosen
+    /// bytes would sign the same string as a longer one.
+    #[test]
+    fn the_length_prefix_separates_bodies_that_would_otherwise_concatenate() {
+        assert_ne!(to_be_signed(b"AB"), to_be_signed(b"A"));
+        assert_ne!(to_be_signed(b"ABC"), to_be_signed(b"AB"));
+    }
+
     #[test]
     fn the_domain_register_has_no_duplicates() {
-        // Two purposes sharing a context string would let a value signed for
-        // one verify as the other, which is a replay across constructions.
+        // Two purposes sharing a context string would let a value hashed for
+        // one be replayed as the other.
         let contexts: BTreeSet<&str> = Domain::ALL.iter().map(|d| d.context()).collect();
         assert_eq!(contexts.len(), Domain::ALL.len(), "a context string is reused");
     }
 
     #[test]
-    fn every_domain_string_is_versioned() {
+    fn every_domain_string_is_versioned_and_space_separated() {
         for domain in Domain::ALL {
             let context = domain.context();
             assert!(
                 context.starts_with("p2p-poker v1 "),
-                "{context} is not versioned, so a future revision could collide"
+                "{context} does not match the register's form"
+            );
+            assert!(
+                !context.contains('/'),
+                "{context} uses slashes, which belong to the literal event prefix alone"
             );
         }
     }
 
     #[test]
-    fn a_signature_verifies_over_the_bytes_it_was_made_for() {
-        let key = a_key();
-        let id = player_id(&key);
-        let message = b"canonical bytes of some event";
-
-        let sig = sign(&key, Domain::Event, message);
-        assert_eq!(verify(&id, Domain::Event, message, &sig), Ok(()));
+    fn hashing_under_two_domains_differs() {
+        let parts: &[&[u8]] = &[b"identical parts"];
+        assert_ne!(hash(Domain::State, parts), hash(Domain::Stage, parts));
+        assert_eq!(hash(Domain::State, parts), hash(Domain::State, parts));
     }
 
-    /// The property the whole register exists for.
+    /// `PROTOCOL.md` §2.8 lists three strings as retired and never valid. A
+    /// hash built under one of them is a non-conforming implementation, so the
+    /// rule is enforced over this crate's own sources rather than written down
+    /// and hoped for - the shape `security/rng.rs` uses for the generator rule.
     #[test]
-    fn a_signature_does_not_verify_under_another_domain() {
-        let key = a_key();
-        let id = player_id(&key);
-        let message = b"the very same bytes";
+    fn no_retired_domain_string_appears_in_our_sources() {
+        use std::fs;
+        use std::path::{Path, PathBuf};
 
-        let as_event = sign(&key, Domain::Event, message);
-        for domain in Domain::ALL {
-            let expected = if domain == Domain::Event { Ok(()) } else { Err(VerifyError::BadSignature) };
-            assert_eq!(
-                verify(&id, domain, message, &as_event),
-                expected,
-                "an event signature must not verify as {domain:?}"
-            );
+        fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).expect("src/ must be readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
         }
-    }
 
-    #[test]
-    fn a_changed_message_does_not_verify() {
-        let key = a_key();
-        let id = player_id(&key);
-        let sig = sign(&key, Domain::Event, b"the original");
-        assert_eq!(
-            verify(&id, Domain::Event, b"the originaL", &sig),
-            Err(VerifyError::BadSignature)
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        assert!(files.len() > 10, "the scan found suspiciously few sources");
+
+        // Split so this list does not itself match a naive grep of the tree.
+        let retired = [
+            concat!("p2p-poker v1 ", "rng-seed"),
+            concat!("p2p-poker/", "seat-beacon/v1"),
+            concat!("p2p-poker v1 ", "event"),
+        ];
+
+        let this_file = src.join("protocol").join("signatures.rs");
+        let mut offences = Vec::new();
+        for file in files {
+            if file == this_file {
+                continue;
+            }
+            let text = fs::read_to_string(&file).expect("a readable source file");
+            for (lineno, line) in text.lines().enumerate() {
+                for needle in retired {
+                    if line.contains(needle) {
+                        offences.push(format!(
+                            "{}:{}: {needle}",
+                            file.strip_prefix(&src).unwrap_or(&file).display(),
+                            lineno + 1
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            offences.is_empty(),
+            "PROTOCOL.md section 2.8 retires these domain strings; a hash under \
+             one is a non-conforming implementation:\n  {}",
+            offences.join("\n  ")
         );
+    }
+
+    #[test]
+    fn a_signature_verifies_over_the_body_it_was_made_for() {
+        let key = a_key();
+        let id = player_id(&key);
+        let body = b"canonical CBOR of an event body";
+        let sig = sign_event(&key, body);
+        assert_eq!(verify_event(&id, body, &sig), Ok(()));
+    }
+
+    #[test]
+    fn a_changed_body_does_not_verify() {
+        let key = a_key();
+        let id = player_id(&key);
+        let sig = sign_event(&key, b"the original");
+        assert_eq!(verify_event(&id, b"the originaL", &sig), Err(VerifyError::BadSignature));
     }
 
     #[test]
     fn another_players_key_does_not_verify() {
         let mine = a_key();
         let theirs = a_key();
-        let sig = sign(&mine, Domain::Event, b"mine");
+        let sig = sign_event(&mine, b"mine");
         assert_eq!(
-            verify(&player_id(&theirs), Domain::Event, b"mine", &sig),
+            verify_event(&player_id(&theirs), b"mine", &sig),
             Err(VerifyError::BadSignature)
         );
     }
@@ -237,13 +380,12 @@ mod tests {
     fn a_corrupted_signature_is_rejected_and_does_not_panic() {
         let key = a_key();
         let id = player_id(&key);
-        let good = sign(&key, Domain::Event, b"payload");
-
+        let good = sign_event(&key, b"payload");
         for bit in [0usize, 1, 31, 32, 63] {
             let mut bytes = good.to_bytes();
             bytes[bit] ^= 0x01;
             assert_eq!(
-                verify(&id, Domain::Event, b"payload", &Sig::from_bytes(bytes)),
+                verify_event(&id, b"payload", &Sig::from_bytes(bytes)),
                 Err(VerifyError::BadSignature),
                 "flipping a bit of byte {bit} must not verify"
             );
@@ -255,11 +397,10 @@ mod tests {
     #[test]
     fn a_malformed_public_key_is_an_error_not_a_panic() {
         let key = a_key();
-        let sig = sign(&key, Domain::Event, b"payload");
-        // All-zero is not a valid compressed Edwards point.
+        let sig = sign_event(&key, b"payload");
         let bad: PlayerId = [0u8; 32];
         assert!(matches!(
-            verify(&bad, Domain::Event, b"payload", &sig),
+            verify_event(&bad, b"payload", &sig),
             Err(VerifyError::BadKey) | Err(VerifyError::BadSignature)
         ));
     }
@@ -270,13 +411,11 @@ mod tests {
     }
 
     #[test]
-    fn signing_is_deterministic_for_the_same_key_and_message() {
+    fn signing_is_deterministic_for_the_same_key_and_body() {
         // Ed25519 is deterministic by construction, which matters here: a
         // re-transmitted event must be byte-identical, or it becomes a second
         // body in one anti-replay slot (D-009 rule 1).
         let key = a_key();
-        let a = sign(&key, Domain::Event, b"payload");
-        let b = sign(&key, Domain::Event, b"payload");
-        assert_eq!(a, b, "re-signing must reproduce the same bytes");
+        assert_eq!(sign_event(&key, b"payload"), sign_event(&key, b"payload"));
     }
 }

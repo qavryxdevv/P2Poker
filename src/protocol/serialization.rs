@@ -109,21 +109,28 @@ where
     Ok(value)
 }
 
-/// A domain-separated hash of a canonical byte string.
+/// The one hash constructor in the protocol (`PROTOCOL.md` §2.8).
 ///
-/// The domain string keeps one construction's hashes from ever being mistaken
-/// for another's, so a value signed as a shuffle proof can never be replayed as
-/// a state hash. BLAKE3's `derive_key` mode takes the context as a first-class
-/// input rather than as a prefix a caller might forget to write.
+/// Every protocol hash is domain-separated **and length-prefixed**.
+/// Concatenating variable-length fields without a length prefix is ambiguous —
+/// `"AB" ‖ "C"` and `"A" ‖ "BC"` are the same byte string — so two different
+/// logical events could collide to one transcript hash, which breaks the chain
+/// of `SPEC_CS.md` sections 13 and 14.
 ///
-/// The context must be a fixed string literal, unique per use, and must never
-/// change once events carrying it exist.
-pub fn hash_domain(context: &str, bytes: &[u8]) -> Hash {
-    let mut hasher = blake3::Hasher::new_derive_key(context);
-    // Length-prefixed, so that concatenating two inputs can never collide with
-    // a single longer one.
-    hasher.update(&(bytes.len() as u64).to_be_bytes());
-    hasher.update(bytes);
+/// The domain is bound through BLAKE3's `derive_key`, whose output keys the
+/// hasher. Taking the context as key material rather than as a prefix means a
+/// caller cannot forget to write it.
+///
+/// `domain` must come from `PROTOCOL.md` §2.8's register. A construction that
+/// invents its own string is a bug, and the register is closed for exactly that
+/// reason — see [`crate::protocol::signatures::Domain`].
+pub fn h(domain: &'static str, parts: &[&[u8]]) -> Hash {
+    let key = blake3::derive_key(domain, b"p2p-poker/v1");
+    let mut hasher = blake3::Hasher::new_keyed(&key);
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
     *hasher.finalize().as_bytes()
 }
 
@@ -247,25 +254,43 @@ mod tests {
         }
     }
 
+    const D1: &str = "p2p-poker v1 state";
+    const D2: &str = "p2p-poker v1 stage";
+
     #[test]
     fn domain_separation_changes_the_hash() {
-        let bytes = b"the same input";
-        let a = hash_domain("p2p-poker v1 state-hash", bytes);
-        let b = hash_domain("p2p-poker v1 shuffle-proof", bytes);
-        assert_ne!(a, b, "a value must not be reusable under another domain");
-        assert_eq!(a, hash_domain("p2p-poker v1 state-hash", bytes), "and it is stable");
+        let parts: &[&[u8]] = &[b"the same input"];
+        assert_ne!(h(D1, parts), h(D2, parts), "a value must not carry across domains");
+        assert_eq!(h(D1, parts), h(D1, parts), "and it is stable");
     }
 
-    /// Length prefixing: two inputs that concatenate to the same bytes must not
-    /// hash the same. Without the prefix, ("ab", "c") and ("a", "bc") collide.
+    /// The property PROTOCOL.md section 2.8 names explicitly, and the reason
+    /// the length prefix is there at all: without it, "AB" then "C" and "A"
+    /// then "BC" are the same byte string, so two different logical events
+    /// could collide to one transcript hash.
     #[test]
     fn length_prefixing_stops_concatenation_collisions() {
-        let d = "p2p-poker v1 test";
-        assert_ne!(hash_domain(d, b"ab"), hash_domain(d, b"a"));
-        // The property that matters: a hash commits to the length as well as
-        // the content, so no two distinct inputs share a digest by splitting.
-        let long = hash_domain(d, b"abc");
-        let short = hash_domain(d, b"ab");
-        assert_ne!(long, short);
+        let split_one: &[&[u8]] = &[b"AB", b"C"];
+        let split_two: &[&[u8]] = &[b"A", b"BC"];
+        assert_ne!(h(D1, split_one), h(D1, split_two));
+
+        // And the empty part is not free either.
+        let with_empty: &[&[u8]] = &[b"A", b"", b"BC"];
+        assert_ne!(h(D1, split_two), h(D1, with_empty));
+    }
+
+    #[test]
+    fn the_part_count_matters_not_just_the_bytes() {
+        let one: &[&[u8]] = &[b"abc"];
+        let three: &[&[u8]] = &[b"a", b"b", b"c"];
+        assert_ne!(h(D1, one), h(D1, three));
+    }
+
+    #[test]
+    fn no_parts_is_still_a_well_defined_hash() {
+        let none: &[&[u8]] = &[];
+        let empty_one: &[&[u8]] = &[b""];
+        assert_ne!(h(D1, none), h(D1, empty_one));
+        assert_eq!(h(D1, none), h(D1, none));
     }
 }
