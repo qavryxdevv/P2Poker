@@ -13,3 +13,4 @@
 .idea/
 Thumbs.db
 desktop.ini
+/vendor/**/target/

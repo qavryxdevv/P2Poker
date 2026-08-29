@@ -734,3 +734,60 @@ fn verify_tampered_shuffle_fails() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// FORK(b) regression — the reveal token must bind the whole ciphertext
+// ---------------------------------------------------------------------------
+
+/// Upstream's `RevealTokenProof::challenge` absorbed `c1` and discarded `c2`,
+/// so a token issued for one card verified against **every** card sharing that
+/// first coordinate.
+///
+/// `verify_reveal_token_wrong_card_fails` above does not catch it, because two
+/// cards drawn from a shuffled deck differ in both coordinates. The defect
+/// needs a collision in `c1` alone — which a malicious shuffler can arrange by
+/// reusing a re-masking scalar, and which was demonstrated end to end at 52
+/// cards: collide a card the protocol will legitimately open with a victim's
+/// hole card, and the honest players' tokens decrypt both.
+///
+/// This test builds the collision directly.
+#[test]
+fn fork_reveal_token_bound_to_a_sibling_sharing_c1_fails() {
+    let mut rng = ark_std::test_rng();
+
+    let shuffle = Shuffle::<10>::default();
+    let ctx = b"test::fork_reveal_token_sibling";
+
+    let (hal_sk, hal_pk, hal_id_proof) = shuffle.keygen(&mut rng, ctx);
+    let hal_vpk = hal_id_proof.verify(hal_pk, ctx).unwrap();
+    let (_bob_sk, bob_pk, bob_id_proof) = shuffle.keygen(&mut rng, ctx);
+    let bob_vpk = bob_id_proof.verify(bob_pk, ctx).unwrap();
+
+    let apk = AggregatePublicKey::new(&[hal_vpk, bob_vpk]);
+    let (deck, proof) = shuffle.shuffle_initial_deck(&mut rng, apk, ctx);
+    let vdeck = shuffle
+        .verify_initial_shuffle(apk, deck, proof, ctx)
+        .unwrap();
+
+    let card = vdeck.get(0).unwrap();
+    let MaskedCard((c1, c2)) = card;
+
+    // The sibling: the same first coordinate, a different second one. This is
+    // what a shuffler produces by reusing one re-masking scalar across two
+    // positions, and it is a different card.
+    let sibling = MaskedCard((c1, (c2.into_group() + GENERATOR).into_affine()));
+    assert_ne!(card, sibling);
+
+    let (rt, rt_proof) = card.reveal_token(&mut rng, &hal_sk, hal_pk, ctx);
+
+    // The token is for `card` and must verify only for `card`.
+    assert!(
+        rt_proof.verify(hal_vpk, rt, card, ctx).is_some(),
+        "an honest token must still verify against its own card"
+    );
+    assert!(
+        rt_proof.verify(hal_vpk, rt, sibling, ctx).is_none(),
+        "a token bound to c1 alone opens every card sharing it - the whole \
+         point of FORK(b)"
+    );
+}

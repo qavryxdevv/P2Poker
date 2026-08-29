@@ -201,8 +201,17 @@ struct Transcript([u8; 32]);
 impl Transcript {
     const SERIALIZE_BUFFER_SIZE: usize = 256;
 
+    /// FORK: the transcript is tagged and the context is length-prefixed.
+    ///
+    /// Upstream hashes `user_ctx` raw, so two callers using different context
+    /// conventions can collide, and nothing distinguishes this protocol's
+    /// transcripts from another's built on the same library.
     fn init(user_ctx: &[u8]) -> Self {
-        Self(Sha256::digest(user_ctx).into())
+        let mut h = Sha256::new();
+        h.update(b"p2p-poker/ziffle-fork/v1");
+        h.update((user_ctx.len() as u64).to_be_bytes());
+        h.update(user_ctx);
+        Self(h.finalize().into())
     }
 
     fn update_with_serialized<T: CanonicalSerialize>(h: &mut Sha256, label: &str, t: &T) {
@@ -215,14 +224,14 @@ impl Transcript {
         );
         t.serialize_compressed(&mut serialize_buffer[..serialized_size])
             .expect("infallible serialization");
-        h.update(serialized_size.to_be_bytes());
+        h.update((serialized_size as u64).to_be_bytes());  // FORK(a)
         h.update(&serialize_buffer[..serialized_size]);
     }
 
     fn append<T: CanonicalSerialize>(self, label: &str, t: &T) -> Self {
         let mut h = Sha256::new();
         h.update(self.0);
-        h.update(label.len().to_be_bytes());
+        h.update((label.len() as u64).to_be_bytes());  // FORK(a)
         h.update(label.as_bytes());
         Self::update_with_serialized(&mut h, label, t);
         Self(h.finalize().into())
@@ -231,11 +240,11 @@ impl Transcript {
     fn append_vec<T: CanonicalSerialize>(self, label: &str, v: &[T]) -> Self {
         let mut h = Sha256::new();
         h.update(self.0);
-        h.update(label.len().to_be_bytes());
+        h.update((label.len() as u64).to_be_bytes());  // FORK(a)
         h.update(label.as_bytes());
 
         for (i, t) in v.iter().enumerate() {
-            h.update(i.to_be_bytes());
+            h.update((i as u64).to_be_bytes());  // FORK(a)
             Self::update_with_serialized(&mut h, label, t);
         }
 
@@ -425,18 +434,33 @@ pub struct RevealTokenProof {
 impl RevealTokenProof {
     const DLEQ_DST: &[u8] = b"ziffle/DLEQ/v1";
 
+    /// FORK(b): the challenge binds the **whole** ciphertext.
+    ///
+    /// Upstream absorbed `c1` alone and discarded `c2`, so a token was valid
+    /// for **every** card sharing that first coordinate — and a malicious
+    /// shuffler can make two cards share one, by reusing a re-masking scalar.
+    /// The attack was demonstrated end to end at 52 cards: collide a card the
+    /// protocol will legitimately open with a victim's hole card, and the
+    /// honest players' tokens decrypt both.
+    ///
+    /// It is the same mistake — binding one coordinate of a ciphertext instead
+    /// of both — that would have forged the entire shuffle argument in one step
+    /// had it been made in the shuffle transcript. It was made here, where the
+    /// blast radius is a player's hole cards.
     fn challenge(
         pk: PublicKey,
         share: CurveAffine,
-        c1: CurveAffine,
+        card: Ciphertext,
         t_g: CurveAffine,
         t_c1: CurveAffine,
         ctx: &[u8],
     ) -> Scalar {
+        let (c1, c2) = card;
         let [e]: [_; 1] = Transcript::init(ctx)
             .append("pk", &pk)
             .append("share", &share)
             .append("c1", &c1)
+            .append("c2", &c2)
             .append("t_g", &t_g)
             .append("t_c1", &t_c1)
             .derive_challenge_scalars(Self::DLEQ_DST);
@@ -448,13 +472,14 @@ impl RevealTokenProof {
         sk: Scalar,
         pk: PublicKey,
         share: CurveAffine,
-        c1: CurveProj,
+        card: Ciphertext,   // FORK(b): was `c1: CurveProj`
         ctx: &[u8],
     ) -> Self {
+        let c1 = card.0.into_group();
         let w = Scalar::rand(rng);
         let t_g = (GENERATOR * w).into_affine();
         let t_c1 = (c1 * w).into_affine();
-        let e = Self::challenge(pk, share, c1.into_affine(), t_g, t_c1, ctx);
+        let e = Self::challenge(pk, share, card, t_g, t_c1, ctx);
         let z = w - (e * sk);
         Self { t_g, t_c1, z }
     }
@@ -481,10 +506,11 @@ impl RevealTokenProof {
     ) -> Option<Verified<RevealToken>> {
         let Verified(pk) = pk;
         let RevealToken(share) = token;
-        let MaskedCard((c1, _)) = card;
+        let MaskedCard(pair) = card;             // FORK(b): both coordinates
+        let (c1, _) = pair;
 
-        // Step 1: reproducde challenge scalar
-        let e = Self::challenge(pk, share, c1, self.t_g, self.t_c1, ctx);
+        // Step 1: reproduce the challenge scalar
+        let e = Self::challenge(pk, share, pair, self.t_g, self.t_c1, ctx);
 
         // Step 2: chec t_g == g·z + pk·e
         if self.t_g != ((GENERATOR * self.z) + (pk.0.into_group() * e)).into_affine() {
@@ -607,9 +633,10 @@ impl MaskedCard {
         ctx: &[u8],
     ) -> (RevealToken, RevealTokenProof) {
         let SecretKey(sk) = sk;
-        let c1 = self.0.0.into_group();
+        let card = self.0;                       // FORK(b): the whole pair
+        let c1 = card.0.into_group();
         let share = (c1 * sk).into_affine();
-        let proof = RevealTokenProof::new(rng, *sk, pk, share, c1, ctx);
+        let proof = RevealTokenProof::new(rng, *sk, pk, share, card, ctx);
         (RevealToken(share), proof)
     }
 }
@@ -1324,6 +1351,13 @@ impl<const N: usize> Shuffle<N> {
     const _N_GREATER_THAN_1: () = assert!(N > 1);
 
     fn initial_deck(&self) -> [Ciphertext; N] {
+        // FORK(c): reference the guard so it is monomorphised.
+        //
+        // An associated const is only evaluated where it is used, so upstream
+        // this assertion never fired: Shuffle::<1> and Shuffle::<0> compiled
+        // and then panicked at run time inside the argument. Touching it here,
+        // on the path every deck goes through, turns that into a build error.
+        let () = Self::_N_GREATER_THAN_1;
         array::from_fn(|i| (CurveAffine::identity(), self.open_deck[i]))
     }
 

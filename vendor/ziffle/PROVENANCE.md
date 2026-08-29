@@ -231,3 +231,94 @@ upstream release — must, in the same commit:
    break and needs a decision in `DECISIONS.md`, not a refreshed constant.
 
 Never edit a digest to make a check pass.
+
+---
+
+## The fork
+
+Applied 2026-08-29, on the owner's decision, under condition **C-12** of
+`docs/research/ZIFFLE_VERDICT.md`. The verdict's reasoning for doing it now:
+every item is a wire-format break, so it costs almost nothing before the first
+proof is persisted or exchanged and a great deal afterwards. **Fork once.**
+
+Each change is marked `FORK(x)` in the source.
+
+### FORK(a) — the transcript was a different function on 32-bit targets
+
+Four sites — not the three the review counted — framed lengths with
+`usize::to_be_bytes()`, which is eight bytes on x86-64 and **four on wasm32**.
+Two peers of different word widths derive different challenges from the same
+statement, so every cross-width proof is rejected and the table splits in two
+the day anything runs in a browser. No forgery: it fails closed. All four now
+use `u64`.
+
+Sites: `update_with_serialized`'s `serialized_size`, `append`'s `label.len()`,
+`append_vec`'s `label.len()` and its element index.
+
+### FORK(b) — the reveal token bound one ciphertext coordinate and dropped the other
+
+`RevealTokenProof::challenge` absorbed `c1` and discarded `c2`, so a token
+issued for one card was valid for **every** card sharing that first coordinate.
+A malicious shuffler arranges the collision by reusing a re-masking scalar, and
+the review demonstrated the attack end to end at 52 cards: collide a card the
+protocol will legitimately open with a victim's hole card, and the honest
+players' own tokens decrypt both.
+
+This is the same mistake — binding one coordinate of a ciphertext instead of
+both — that would have forged the **entire shuffle argument in one step** had it
+been made in the shuffle transcript. It was made here, where the blast radius is
+a player's hole cards rather than the deck's integrity.
+
+The challenge now absorbs the whole pair, and `new`, `reveal_token` and `verify`
+pass the card rather than a coordinate.
+
+**Carries its own regression test**, `fork_reveal_token_bound_to_a_sibling_sharing_c1_fails`
+in `src/test.rs`. The crate's existing `verify_reveal_token_wrong_card_fails`
+does not catch this, because two cards from a shuffled deck differ in *both*
+coordinates; the defect needs a collision in `c1` alone, so the test builds one
+directly.
+
+**Verified to reproduce the defect.** Reverting only the `c2` absorption makes
+the test fail with its own message and restoring it makes it pass — checked, not
+assumed.
+
+### FORK(c) — a guard that never fired, and a comment that misleads
+
+`Shuffle::<N>`'s `const _N_GREATER_THAN_1: () = assert!(N > 1)` was never
+referenced, and an associated const is only evaluated where it is used — so
+`Shuffle::<1>` and `Shuffle::<0>` compiled and then panicked at run time inside
+the argument. It is now touched in `initial_deck`, on the path every deck takes.
+
+*Honest limitation:* that the guard now fires is the standard idiom for forcing
+evaluation, but **it is not asserted by a test** — a compile-fail assertion would
+need `trybuild`, which the project does not depend on. It is reasoned, not
+measured, and is recorded that way rather than counted as covered.
+
+The step-5 comment read `a~(i + 2)` where the code computes `a~(i + 1)`, which is
+what the paper requires. **The code was right and the comment was wrong**, which
+is the dangerous direction: it is the comment that would lead a maintainer to
+"fix" correct code into an unsound state. Corrected.
+
+### The protocol tag
+
+`Transcript::init` hashed `user_ctx` raw, with no length prefix and no tag. It
+is now `"p2p-poker/ziffle-fork/v1"`, the context length, then the context — so
+two callers using different context conventions cannot collide, and this
+protocol's transcripts are distinguishable from another's built on the same
+library.
+
+### What was deliberately **not** changed
+
+The verdict listed, as optional, deriving both sub-challenges from one joint
+state instead of the forked transcript. **It is not done.** Two reviewers
+independently established that the fork is the paper's own parallel composition
+and binds every statement element the construction requires. Restructuring
+something a review found sound is risk without benefit, and the review is only
+worth having if its positive findings are respected as well as its negative
+ones.
+
+### Consequence
+
+Proofs made by this fork do not verify under upstream `ziffle` 0.1.0, and
+upstream's do not verify here. That is intended and is why the fork happens
+before anything is persisted.
