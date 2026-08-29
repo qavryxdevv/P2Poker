@@ -245,6 +245,26 @@ pub async fn run(
                         // setting cannot: a user who is wrong about their own NAT
                         // would advertise a way through that is not one.
                         let public = ev.result.is_ok();
+
+                        // A confirmed address is an **external** address, and
+                        // saying so is not bookkeeping.
+                        //
+                        // `libp2p-relay` fills a reservation from the relay's
+                        // external addresses and from nowhere else. A node that
+                        // never records one volunteers as a relay, accepts the
+                        // reservation, and hands back a list of no addresses —
+                        // so the peer that reserved has a circuit it cannot tell
+                        // anyone about, and the reservation is worse than a
+                        // refusal because it looks like it worked. That is what
+                        // `tests/relay_circuit.rs` found on the first run it was
+                        // ever given, and it had been true since the relay was
+                        // configured.
+                        if public {
+                            swarm.add_external_address(ev.tested_addr.clone());
+                        } else {
+                            swarm.remove_external_address(&ev.tested_addr);
+                        }
+
                         if public != state.is_public() {
                             state.set_public(public);
                             let _ = events.send(NodeEvent::Reachability { public }).await;
