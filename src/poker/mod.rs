@@ -8,5 +8,6 @@ pub mod actions;
 pub mod engine;
 pub mod evaluator;
 pub mod pots;
+pub mod seating;
 pub mod state;
 pub mod tournament;
