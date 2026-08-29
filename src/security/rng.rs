@@ -29,6 +29,29 @@
 //! [`tests::our_own_code_uses_no_generator_but_the_os_one`] enforces it by
 //! scanning this crate's source on every test run — so the rule fails the build
 //! rather than living in a document nobody re-reads.
+//!
+//! # The one exemption, and why it is counted rather than allowed
+//!
+//! Some library constructors take a **concrete** generator type rather than a
+//! generic one, so there is no way to hand them ours. `libp2p`'s AutoNAT is such
+//! a one: it wants `rand::rngs::OsRng` by name.
+//!
+//! Widening the deny-list would be the wrong fix and this module has always said
+//! so. Instead a line may carry the marker [`EXEMPT_MARKER`], and the scan
+//! **counts** the markers and asserts the count. Adding an exemption therefore
+//! fails the build until somebody edits the expected number, which is the point:
+//! it is a visible, deliberate act rather than a quiet one.
+//!
+//! Nothing is weakened cryptographically by the exemption that exists —
+//! `rand::rngs::OsRng` **is** the operating system's CSPRNG, and AutoNAT uses it
+//! for probe nonces. What the rule protects against is a self-seeded or
+//! non-cryptographic generator, and this is neither. The rule still holds; the
+//! exemption is about an API's shape, not about the quality of its randomness.
+
+/// The marker a line must carry to be exempt from the source scan.
+///
+/// Split so that this definition does not itself match the scan.
+pub const EXEMPT_MARKER: &str = concat!("RNG-", "EXEMPT");
 
 pub use getrandom::SysRng;
 
@@ -160,25 +183,48 @@ mod tests {
 
         let this_file = src.join("security").join("rng.rs");
         let mut offences = Vec::new();
+        let mut exemptions = Vec::new();
 
         for file in files {
             if file == this_file {
                 continue;
             }
             let text = fs::read_to_string(&file).expect("a readable source file");
-            for (lineno, line) in text.lines().enumerate() {
+            let lines: Vec<&str> = text.lines().collect();
+            for (lineno, line) in lines.iter().enumerate() {
+                // The marker counts on the offending line or on the one
+                // immediately above it, so a formatter that wraps the call does
+                // not silently turn an exemption back into an offence.
+                let marked = line.contains(EXEMPT_MARKER)
+                    || (lineno > 0 && lines[lineno - 1].contains(EXEMPT_MARKER));
                 for needle in forbidden {
-                    if line.contains(needle) {
-                        offences.push(format!(
-                            "{}:{}: {}",
-                            file.strip_prefix(&src).unwrap_or(&file).display(),
-                            lineno + 1,
-                            needle
-                        ));
+                    if !line.contains(needle) {
+                        continue;
+                    }
+                    let where_ = format!(
+                        "{}:{}: {}",
+                        file.strip_prefix(&src).unwrap_or(&file).display(),
+                        lineno + 1,
+                        needle
+                    );
+                    if marked {
+                        exemptions.push(where_);
+                    } else {
+                        offences.push(where_);
                     }
                 }
             }
         }
+
+        // Counted, not merely allowed. A new exemption fails here until somebody
+        // edits this number, which is the whole difference between a rule with a
+        // hole in it and a rule with a door.
+        assert_eq!(
+            exemptions.len(),
+            2,
+            "the exemptions are counted so that adding one is deliberate; found:\n  {}",
+            exemptions.join("\n  ")
+        );
 
         assert!(
             offences.is_empty(),

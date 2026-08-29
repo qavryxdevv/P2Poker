@@ -1658,6 +1658,136 @@ The fork makes the library fit for the play-money MVP under conditions C-1 to
 C-15. It does not move the other bar an inch, and no amount of engineering time
 buys items 1, 2, 3 and 6 of that list.
 
+## D-017 — Surviving a disconnection mid-hand: **analysed, and withdrawn**
+
+**Status: WITHDRAWN by the owner on 2026-08-29, the same day it was raised.
+Nothing here is to be built.** What ships is the fallback that already exists:
+heads-up needs no mechanism at all, and multi-way the hand aborts with `T46`
+restoring every stack to its start-of-hand value.
+
+The analysis is kept rather than deleted for two reasons. It records that
+sharing **key** shares with outside nodes is unsafe, so nobody arrives at it
+again by the obvious route; and it records the one correction that would make a
+variant of it sound, so if the question returns the work does not start from
+nothing.
+
+Raised by the owner as two proposals. The first would have been adoptable with
+one correction that is the whole of why it is safe; the second is declined
+outright and would stay declined.
+
+### What was already solved, and is worth stating first
+
+**Heads-up, a rage quit needs no cryptography at all.** The absent seat auto
+check/folds (D-006), `only_one_live` awards the pot, and — in that function's own
+words — *the survivor wins every pot it is eligible for and never reveals a
+card*. Nothing is decrypted because nothing has to be.
+
+The gap is narrower than it first looks: **three or more seats, one gone, two
+still in at showdown.** The board needs a reveal token from every key in the
+aggregate, and one of them has left. That is where `n`-of-`n` bites, and it is the
+only place it does.
+
+### The correction: share tokens, not key shares
+
+The proposal was to give outside nodes `t`-of-`n` shares of the **deck key**. That
+does not work and `SPEC_CS.md` §35 already says so — *n-of-n stands; abort
+neutrally*. The reason is worth writing down rather than citing:
+
+**A share of the key is a share of the key.** Every card sits under one aggregate
+key, so there is no construction that grants the ability to open index 12 and
+withholds index 3. *"They only decrypt the board"* is a policy, and the nodes hold
+what is needed to ignore it. Three colluding helpers read hole cards. And §18
+places Sybil-without-identity outside the threat model, so an attacker may
+simply **be** all five helpers.
+
+**Sharing the five board reveal tokens instead inverts every one of those
+properties:**
+
+| | shares of the key | shares of the board tokens |
+|---|---|---|
+| three colluding helpers get | the key, hence hole cards | five values that open nothing alone |
+| helpers plus one seated player | everything | still nothing — the other seat's token is missing |
+| Sybil across all helpers | fatal | **harmless** |
+
+The remaining players still gate each other: `n`-of-`n` among those **present**
+holds unchanged. Even helpers who publish their shares at hand start achieve
+nothing, because the board still cannot open before its street without the other
+seat's token. And the departing player's own hole cards are untouched — the
+helpers hold nothing about them, by construction rather than by promise.
+
+### Why this and not simply "publish your tokens as you leave"
+
+The simpler form — a client publishes its five board tokens as its last act —
+handles a **graceful** exit and nothing else. A power cut, a crash or a killed
+process publishes nothing, and those are exactly the cases the rule exists for.
+Shares distributed at hand **start** survive all of them.
+
+### The condition, which is the owner's, and it is load-bearing rather than tidy
+
+**Only when helpers are reachable, and only helpers who are not seated in this
+hand.** Both halves are the owner's and the second is the one that carries
+weight, so it is worth being precise about why — the first reading of it was that
+it is good hygiene, and it is not: without it the scheme is a break.
+
+**Seated helpers collapse the gate.** Suppose seats `A`, `B` and `C`, and `C`
+shares its board tokens with `A` and `B`. `A` and `B` between them now hold their
+own tokens **and** `C`'s, which is every token the board needs. They can open the
+flop, the turn and the river **before a single bet is made**, while `C` is still
+sitting at the table playing. That is not a degradation of the property; it is
+`SPEC_CS.md` §35's main invariant — *no participant may learn the future board* —
+failing outright.
+
+Two further reasons, either sufficient on its own:
+
+* **A seated helper shares the failure domain.** The common cause of a
+  disconnection is a router, an ISP or a Wi-Fi link, and the whole point of the
+  helpers is to survive the event that removed the player. Helpers inside the
+  same table are hit by the same table's trouble.
+* **A seated helper has an interest in the outcome.** A player-helper can decline
+  to reconstruct precisely when reconstructing would hand the pot to somebody
+  else. A disinterested node has no reason to withhold, which is the only sense
+  in which it is more trustworthy — and it is enough.
+
+**With no eligible helpers, the fallback is the one already built:** the hand
+aborts and `T46` restores every stack to its start-of-hand value, so no chip
+crosses between seats and the tournament plays on. A mechanism that cannot be
+attempted is not a mechanism that fails.
+
+### What it still needs, and it is not optional
+
+Verifiable secret sharing — Feldman or Pedersen over the same group — so that a
+malicious departing player cannot distribute garbage and reach the same abort by
+a longer route. That is an established, peer-reviewed construction and is
+therefore admissible under §36; a hand-rolled sharing scheme here would not be.
+
+### The second proposal is declined: time-lock puzzles
+
+**The puzzle protects a *board* token, and sequential-squaring difficulty is
+measured in the fastest available multiplier, not in the holder's.** An opponent
+with better hardware opens the lock before that street arrives, and knowing the
+river during flop betting is a total break of the game. The mechanism hands the
+advantage to whoever has the faster processor, which is the opposite of its
+purpose.
+
+Two further reasons, either sufficient on its own:
+
+* The modulus is generated by the party asserting the difficulty. A cheat picks
+  one with a shortcut. Provable difficulty needs a VDF with a trusted setup or
+  class groups, which is research-grade work.
+* It is not needed for the case that motivated it. Heads-up is already solved by
+  D-006, and multi-way is solved above without any new cryptographic assumption.
+
+**No mechanism here is claimed to make cheating impossible.** What was claimed,
+had it been built, is narrower and checkable: a disconnection stops costing the
+hand when eligible helpers are present, and costs exactly one aborted hand with
+every chip restored when they are not.
+
+### What actually ships, since this is withdrawn
+
+The second half of that sentence, and only it. A disconnection costs one hand.
+Every chip goes back. The tournament plays on, and no seat is removed for it —
+which is D-010, and is why the cost of the withdrawal is small.
+
 ## Open decisions
 
 ### How to read the identifiers in this list (`Q5`) — two live `P` series, and which is which
