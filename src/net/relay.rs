@@ -56,23 +56,23 @@
 
 use std::time::Duration;
 
-/// One compressed point, and one ElGamal ciphertext.
-const POINT: u64 = 33;
-const CIPHERTEXT: u64 = 2 * POINT;
+// The wire sizes, **taken from the module that defines them** rather than
+// copied. The first version declared its own literals under a comment claiming
+// they "move when the cryptography does" — they did not, because they were a
+// second copy, and a second copy of a number is a number that drifts. The
+// difference is not academic: this file decides whether a relay can carry a
+// hand, so a stale figure here is a table that drops mid-street.
+use crate::mental_poker::backend::{
+    DECK_BYTES, KEY_PROOF_BYTES, POINT as POINT_USIZE, SHUFFLE_PROOF_BYTES, TOKEN_PROOF_BYTES,
+};
 
-/// A masked deck, as measured: 52 × 66.
-const DECK: u64 = 52 * CIPHERTEXT;
-
-/// A Bayer–Groth shuffle argument, as measured.
-const SHUFFLE_PROOF: u64 = 5_547;
-
-/// A per-hand deck key and its ownership proof, as measured.
+const POINT: u64 = POINT_USIZE as u64;
+const DECK: u64 = DECK_BYTES as u64;
+const SHUFFLE_PROOF: u64 = SHUFFLE_PROOF_BYTES as u64;
 const DECK_KEY: u64 = POINT;
-const KEY_PROOF: u64 = 65;
-
-/// One decryption share and its DLEQ proof, as measured.
+const KEY_PROOF: u64 = KEY_PROOF_BYTES as u64;
 const TOKEN: u64 = POINT;
-const TOKEN_PROOF: u64 = 98;
+const TOKEN_PROOF: u64 = TOKEN_PROOF_BYTES as u64;
 
 /// What a signed envelope costs on top of a payload.
 ///
@@ -86,8 +86,9 @@ const ENVELOPE: u64 = 220;
 /// What one hand of `seats` players costs on the table mesh, in bytes, as seen
 /// by one peer.
 ///
-/// Every term is a measured wire size, so this moves when the cryptography does
-/// rather than staying true by luck.
+/// Every term comes from `mental_poker::backend`, which is where the wire sizes
+/// are declared — so this moves when the cryptography does instead of staying
+/// true by luck. It said so before it was true: the terms were a hand copy.
 ///
 /// * `seats` deck keys with ownership proofs — `DECK_INIT`.
 /// * `seats` links of the shuffle chain, each a whole deck and its argument.
@@ -219,6 +220,18 @@ mod tests {
             "heads-up fits, which is exactly why a two-player test proves nothing \
              about a six-player table"
         );
+    }
+
+    /// The sizes are the deck module's, not this one's. A copy here would drift,
+    /// and the comment on `per_hand_bytes` claimed otherwise before it was true.
+    #[test]
+    fn the_wire_sizes_are_the_deck_modules() {
+        use crate::mental_poker::backend;
+        assert_eq!(POINT as usize, backend::POINT);
+        assert_eq!(DECK as usize, backend::DECK_BYTES);
+        assert_eq!(SHUFFLE_PROOF as usize, backend::SHUFFLE_PROOF_BYTES);
+        assert_eq!(KEY_PROOF as usize, backend::KEY_PROOF_BYTES);
+        assert_eq!(TOKEN_PROOF as usize, backend::TOKEN_PROOF_BYTES);
     }
 
     /// The cost is dominated by the shuffle chain, which is `seats` whole decks

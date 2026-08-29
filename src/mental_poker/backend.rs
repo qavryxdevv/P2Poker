@@ -62,10 +62,26 @@ use super::reveal::SoundnessFault;
 pub const DECK: usize = 52;
 
 /// One compressed secp256k1 point.
-const POINT: usize = 33;
+///
+/// Public because it is the wire size other layers budget against, and a second
+/// copy elsewhere is a number that drifts. `tests/deck_constants.rs` pins it
+/// against what arkworks actually emits.
+pub const POINT: usize = 33;
 
 /// One ElGamal ciphertext: a pair of points.
-const CIPHERTEXT: usize = 2 * POINT;
+pub const CIPHERTEXT: usize = 2 * POINT;
+
+/// A whole masked deck on the wire.
+pub const DECK_BYTES: usize = DECK * CIPHERTEXT;
+
+/// A Bayer–Groth shuffle argument, measured.
+pub const SHUFFLE_PROOF_BYTES: usize = 5_547;
+
+/// A key-ownership proof, measured.
+pub const KEY_PROOF_BYTES: usize = 65;
+
+/// A reveal token's DLEQ proof, measured.
+pub const TOKEN_PROOF_BYTES: usize = 98;
 
 // ---------------------------------------------------------------------------
 // The wire types
@@ -116,7 +132,7 @@ wire!(
 wire!(
     WireShuffleProof,
     ShuffleProof<DECK>,
-    5_547,
+    SHUFFLE_PROOF_BYTES,
     "A Bayer-Groth shuffle argument, as it crosses the network."
 );
 wire!(
@@ -128,7 +144,7 @@ wire!(
 wire!(
     WireKeyProof,
     OwnershipProof,
-    65,
+    KEY_PROOF_BYTES,
     "A proof of knowing the secret behind a [`WireKey`]."
 );
 wire!(
@@ -140,7 +156,7 @@ wire!(
 wire!(
     WireTokenProof,
     RevealTokenProof,
-    98,
+    TOKEN_PROOF_BYTES,
     "A DLEQ proof that a [`WireToken`] was computed with the claimed key."
 );
 

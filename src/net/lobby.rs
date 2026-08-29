@@ -424,16 +424,23 @@ impl LobbyStore {
     ) -> Result<(), NotTaken> {
         match self.tables.get_mut(&table_key) {
             Some(held) => {
-                // Rule 6.
-                if ad.timestamp_unix_ms <= held.ad.timestamp_unix_ms {
-                    return Err(NotTaken::NotNewer);
-                }
-                // Rule 7. The advert is discarded and the table is marked, which
-                // is the whole remedy: a table whose parameters changed under a
-                // live advert is not one this client can join safely.
+                // Rule 7 **first**, and the order is the fix. Rule 6 used to run
+                // ahead of it and return `NotNewer` for anything not strictly
+                // later — so a founder that signed two adverts with the SAME
+                // timestamp and different parameters had the second silently
+                // dropped, and the table was never marked. Two joiners who saw
+                // them in different orders then held two rule sets and neither
+                // knew.
+                //
+                // An equivocation is a finding about the table whatever order it
+                // arrives in, so it is tested whatever the timestamps say.
                 if params_hash != held.params_hash {
                     held.unjoinable = true;
                     return Err(NotTaken::ParametersChanged);
+                }
+                // Rule 6, now that the parameters are known to agree.
+                if ad.timestamp_unix_ms <= held.ad.timestamp_unix_ms {
+                    return Err(NotTaken::NotNewer);
                 }
                 held.ad = ad;
                 held.received_at_ms = now_ms;
@@ -572,22 +579,35 @@ impl RateLimiter {
         Self::default()
     }
 
-    /// Whether an advert from this peer, for this table key, may be processed.
+    /// Whether an advert from this **peer** may be processed at all.
     ///
-    /// Checked **before** the signature, which is the expensive part: a limiter
+    /// Charged **before** the signature, which is the expensive part: a limiter
     /// that ran after verification would let a peer spend this client's CPU at
     /// will, which is the thing the limit exists to prevent.
-    pub fn admit_ad(&mut self, peer: [u8; 32], table_key: [u8; 32], now_ms: u64) -> bool {
-        // Both are charged, and the peer's is charged first so that a peer
-        // cannot spread its budget over many table keys.
-        let peer_ok = self
-            .per_peer
+    ///
+    /// The peer identity is safe to charge this early because the transport
+    /// authenticated it. The **table** key is not, and is charged separately.
+    pub fn admit_peer(&mut self, peer: [u8; 32], now_ms: u64) -> bool {
+        self.per_peer
             .entry(peer)
             .or_default()
-            .admit(now_ms, MAX_ADS_PER_PEER_PER_MIN);
-        if !peer_ok {
-            return false;
-        }
+            .admit(now_ms, MAX_ADS_PER_PEER_PER_MIN)
+    }
+
+    /// Whether this **table key** may advertise again.
+    ///
+    /// **Charged only after the signature verifies**, and the first version got
+    /// this wrong in a way that handed away the lobby. It read `table_key` out
+    /// of the envelope and charged it eighteen lines before `verify_strict` — so
+    /// anyone could name any table, four messages a minute, and burn that
+    /// table's whole allowance. The real founder's re-broadcast was then rate
+    /// limited out, the advert expired, and the table vanished from every lobby
+    /// that had heard the forgeries. It cost the attacker four unsigned messages
+    /// a minute per table.
+    ///
+    /// A key that has not been verified is a claim, and a claim must not spend a
+    /// budget that belongs to whoever actually holds it.
+    pub fn admit_table(&mut self, table_key: [u8; 32], now_ms: u64) -> bool {
         self.per_table
             .entry(table_key)
             .or_default()
@@ -973,6 +993,53 @@ mod tests {
         );
     }
 
+
+    /// The equivocation rule 6 used to hide.
+    ///
+    /// A founder signs two adverts with the **same timestamp** and different
+    /// parameters. Rule 6 ran first and returned `NotNewer` for the second, so
+    /// nothing compared the parameters and nothing was marked — and two joiners
+    /// who saw the pair in different orders held two different rule sets, each
+    /// believing it held the only one.
+    #[test]
+    fn an_equal_timestamp_equivocation_is_caught_and_not_dropped() {
+        let mut store = LobbyStore::new();
+        let key = [1u8; 32];
+
+        let first = legal_custom();
+        store.offer(key, first.clone(), h(1), NOW).unwrap();
+
+        // Same timestamp, different parameters.
+        let mut second = first;
+        second.small_blind = 25;
+        assert_eq!(
+            store.offer(key, second, h(2), NOW),
+            Err(NotTaken::ParametersChanged),
+            "not NotNewer: the timestamps are equal and the game is not"
+        );
+        assert!(store.get(&key).unwrap().unjoinable);
+    }
+
+    /// And an OLDER advert with different parameters is equivocation too. The
+    /// order a receiver happens to see them in is not a property of the founder.
+    #[test]
+    fn an_older_advert_with_other_parameters_is_still_equivocation() {
+        let mut store = LobbyStore::new();
+        let key = [1u8; 32];
+
+        let mut newer = legal_custom();
+        newer.timestamp_unix_ms = NOW + 10_000;
+        store.offer(key, newer, h(1), NOW).unwrap();
+
+        let mut older = legal_custom();
+        older.small_blind = 25;
+        assert_eq!(
+            store.offer(key, older, h(2), NOW),
+            Err(NotTaken::ParametersChanged)
+        );
+        assert!(store.get(&key).unwrap().unjoinable);
+    }
+
     /// A legitimate re-broadcast refreshes the advert and the clock.
     #[test]
     fn a_rebroadcast_refreshes_the_table() {
@@ -1115,7 +1182,7 @@ mod tests {
         for i in 0..100u32 {
             let mut table = [0u8; 32];
             table[..4].copy_from_slice(&i.to_be_bytes());
-            if rl.admit_ad(peer, table, NOW) {
+            if rl.admit_peer(peer, NOW) && rl.admit_table(table, NOW) {
                 admitted += 1;
             }
         }
@@ -1135,7 +1202,7 @@ mod tests {
         for i in 0..20u32 {
             let mut peer = [0u8; 32];
             peer[..4].copy_from_slice(&i.to_be_bytes());
-            if rl.admit_ad(peer, table, NOW) {
+            if rl.admit_peer(peer, NOW) && rl.admit_table(table, NOW) {
                 admitted += 1;
             }
         }
@@ -1150,12 +1217,12 @@ mod tests {
         let mut rl = RateLimiter::new();
         let peer = [1u8; 32];
         let table = [2u8; 32];
-        assert!(rl.admit_ad(peer, table, NOW));
+        assert!(rl.admit_peer(peer, NOW) && rl.admit_table(table, NOW));
         for _ in 0..MAX_ADS_PER_TABLE_KEY_PER_MIN {
-            rl.admit_ad(peer, table, NOW);
+            rl.admit_table(table, NOW);
         }
-        assert!(!rl.admit_ad(peer, table, NOW));
-        assert!(rl.admit_ad(peer, table, NOW + 60_000));
+        assert!(!rl.admit_table(table, NOW));
+        assert!(rl.admit_table(table, NOW + 60_000));
     }
 
     /// The limiter must not itself be a growth surface.
@@ -1165,7 +1232,8 @@ mod tests {
         for i in 0..1_000u32 {
             let mut peer = [0u8; 32];
             peer[..4].copy_from_slice(&i.to_be_bytes());
-            rl.admit_ad(peer, [9u8; 32], NOW);
+            rl.admit_peer(peer, NOW);
+            rl.admit_table([9u8; 32], NOW);
         }
         assert_eq!(rl.tracked().0, 1_000);
         rl.sweep(NOW + 120_000);

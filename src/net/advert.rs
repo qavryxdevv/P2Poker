@@ -10,10 +10,15 @@
 //! Each step is cheaper than the one after it, and each is a gate the next one
 //! would otherwise have to trust:
 //!
-//! 1. **Rate limit**, by sending peer and by table key. Free, and it runs
-//!    **before** the signature — a limiter that ran after verification would let
-//!    a peer spend this client's CPU at will, which is the thing it exists to
-//!    prevent.
+//! 1. **Rate limit the sending peer.** Free, and it runs **before** the
+//!    signature — a limiter that ran after verification would let a peer spend
+//!    this client's CPU at will, which is the thing it exists to prevent. The
+//!    peer identity is safe to charge here because the transport authenticated
+//!    it.
+//!    Then, **after step 3 and not before**, rate limit the **table key**.
+//!    Before the signature that key is a *claim*, and charging a budget against
+//!    a claim let anyone evict any table from every lobby for four unsigned
+//!    messages a minute. See [`lobby::RateLimiter::admit_table`].
 //! 2. **Decode**, canonically. The bytes are re-encoded and compared, so one
 //!    advert is one byte string and the duplicate cache and the message id mean
 //!    what they say.
@@ -391,8 +396,9 @@ pub fn receive(
 
     let table_key = envelope.sender_public_key;
 
-    // Before the signature, which is the expensive part.
-    if !limits.admit_ad(from_peer, table_key, now_ms) {
+    // The **peer's** budget, before the signature: the transport authenticated
+    // this identity, and the signature is the expensive part.
+    if !limits.admit_peer(from_peer, now_ms) {
         return Err(NotAccepted::RateLimited);
     }
 
@@ -412,6 +418,14 @@ pub fn receive(
     verifying
         .verify_strict(&to_be_signed(&signed.body), &signature)
         .map_err(|_| NotAccepted::BadSignature)?;
+
+    // The **table's** budget, now that the key is more than a claim. Charging it
+    // earlier let anyone name any table and burn its allowance four messages a
+    // minute, after which the real founder's re-broadcast was rate limited out
+    // and the table vanished from every lobby that had heard the forgeries.
+    if !limits.admit_table(table_key, now_ms) {
+        return Err(NotAccepted::RateLimited);
+    }
 
     let body: AdBody = from_canonical(&envelope.payload, TABLE_AD_MAX)
         .map_err(|_| NotAccepted::Malformed("not a canonical advert body"))?;
@@ -599,6 +613,50 @@ mod tests {
             Err(NotAccepted::BadSignature)
         );
         assert!(store.is_empty(), "a table nobody signed reached the lobby");
+    }
+
+
+    /// The attack the split fixes, end to end on the wire.
+    ///
+    /// A hostile peer names somebody else's table key in an advert it cannot
+    /// sign. Before the split, that spent the real table's four-per-minute
+    /// budget, so the founder's own re-broadcast was refused, the held advert
+    /// expired, and the table left every lobby that had heard the forgeries —
+    /// for the price of four unsigned messages a minute.
+    #[test]
+    fn a_forged_key_cannot_spend_the_real_tables_budget() {
+        let real = key(1);
+        let real_key = real.verifying_key().to_bytes();
+        let mut store = LobbyStore::new();
+        let mut limits = RateLimiter::new();
+
+        // The attacker signs with its own key and claims to be the table by
+        // putting the victim's key in the envelope. That fails `verify_strict`.
+        let honest = publish(&ad(), &real).unwrap();
+        let mut forged: SignedEvent = from_canonical(&honest, LOBBY_MSG_MAX).unwrap();
+        forged.signature[0] ^= 0x01;
+        let forged = to_canonical(&forged).unwrap();
+
+        for i in 0..20u32 {
+            // A fresh peer each time, so the per-peer limit is not what stops it.
+            let mut attacker = [0u8; 32];
+            attacker[..4].copy_from_slice(&i.to_be_bytes());
+            assert_eq!(
+                receive(&forged, attacker, NOW, &mut limits, &mut store),
+                Err(NotAccepted::BadSignature),
+                "the forgery is refused, which was never in doubt"
+            );
+        }
+
+        // And the real founder can still advertise, which is the point.
+        let mut later = ad();
+        later.timestamp_unix_ms += 1_000;
+        let fresh = publish(&later, &real).unwrap();
+        assert_eq!(
+            receive(&fresh, [0xAA; 32], NOW, &mut limits, &mut store),
+            Ok(real_key),
+            "twenty forgeries must not have spent the real table's allowance"
+        );
     }
 
     /// The rate limit runs before the signature, so a flood costs this client

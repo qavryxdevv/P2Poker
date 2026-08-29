@@ -279,7 +279,7 @@ mod tests {
         for i in 0..10u32 {
             let mut peer = [0u8; 32];
             peer[..4].copy_from_slice(&i.to_be_bytes());
-            state.limits.admit_ad(peer, [9u8; 32], 0);
+            state.limits.admit_peer(peer, 0);
         }
         assert_eq!(state.limits.tracked().0, 10);
 
