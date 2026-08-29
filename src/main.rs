@@ -9,6 +9,7 @@
 //! p2p-poker --headless           the node only, printing what happens
 //! p2p-poker --headless --host N  and offering a table called N
 //! p2p-poker --for 120            stop after 120 seconds, for a scripted run
+//! p2p-poker --table              open on the table rather than the lobby
 //! ```
 //!
 //! The headless mode is not a lesser client. It is what a scripted two-machine
@@ -18,7 +19,7 @@
 use std::time::Duration;
 
 use p2p_poker::app::AppState;
-use p2p_poker::gui::render;
+use p2p_poker::gui::{render, table};
 use p2p_poker::net::node::NodeEvent;
 
 fn main() {
@@ -62,7 +63,16 @@ fn main() {
     if has("--headless") {
         headless(identity, hosted, bounded);
     } else {
-        windowed(identity, hosted, bounded);
+        windowed(
+            identity,
+            hosted,
+            bounded,
+            if has("--table") {
+                Screen::Table
+            } else {
+                Screen::Lobby
+            },
+        );
     }
 }
 
@@ -120,6 +130,7 @@ fn windowed(
     identity: libp2p::identity::Keypair,
     hosted: Option<p2p_poker::net::run::Hosted>,
     bounded: Option<u64>,
+    screen: Screen,
 ) {
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -149,7 +160,9 @@ fn windowed(
             render::install(&cc.egui_ctx);
             Ok(Box::new(Client {
                 state: AppState::new(),
+                screen,
                 ui: Default::default(),
+                table_ui: Default::default(),
                 events: rx,
                 bounded,
                 started,
@@ -163,10 +176,23 @@ fn windowed(
     }
 }
 
+/// Which of the two windows the one window is showing.
+///
+/// One viewport rather than two: a second operating-system window is a second
+/// thing to lose behind the first, and the table has a way back to the lobby on
+/// it. Multi-tabling will want real windows and will get them then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Lobby,
+    Table,
+}
+
 struct Client {
     state: AppState,
+    screen: Screen,
     /// What the user is typing, which must survive the snapshot being replaced.
     ui: p2p_poker::gui::render::LobbyUi,
+    table_ui: p2p_poker::gui::table::TableUi,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
     bounded: Option<u64>,
     started: std::time::Instant,
@@ -195,16 +221,36 @@ impl eframe::App for Client {
             }
         }
 
-        let view = self.state.view();
-        match render::lobby(ui, &view, &mut self.ui) {
-            render::LobbyAction::Select(key) => self.state.selected = Some(key),
-            render::LobbyAction::None => {}
-            // Nothing below is wired to the transport yet, and saying so is
-            // better than a button that appears to work.
-            other => self
-                .state
-                .log
-                .push_back(format!("{other:?} is not wired to the transport yet")),
+        match self.screen {
+            Screen::Lobby => {
+                let view = self.state.view();
+                match render::lobby(ui, &view, &mut self.ui) {
+                    render::LobbyAction::Select(key) => self.state.selected = Some(key),
+                    render::LobbyAction::None => {}
+                    render::LobbyAction::OpenTableWindow => self.screen = Screen::Table,
+                    // The rest is not wired to the transport yet, and saying so
+                    // is better than a button that appears to work.
+                    other => self
+                        .state
+                        .log
+                        .push_back(format!("{other:?} is not wired to the transport yet")),
+                }
+            }
+            Screen::Table => {
+                // No hand can be in progress until formation and the engine are
+                // wired, so the table shows a sample and says that it is one.
+                // §22 forbids passing an unverified card off as a real one, and
+                // a preview that admits what it is does not.
+                let view = table::TableView::sample();
+                match table::draw(ui, &view, &mut self.table_ui) {
+                    table::TableAction::BackToLobby => self.screen = Screen::Lobby,
+                    table::TableAction::None => {}
+                    other => self
+                        .state
+                        .log
+                        .push_back(format!("{other:?} is not wired to the engine yet")),
+                }
+            }
         }
 
         // The node pushes events whether or not the window is being interacted

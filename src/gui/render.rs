@@ -20,9 +20,14 @@
 //! # Text sizes are set, not inherited
 //!
 //! egui's default body is 12.5 pixels, which on a high-resolution screen is what
-//! *illegible* meant. The sizes here are the Python client's stylesheet: a
-//! 14-pixel body, 19 for the title, 15 for a group heading, 12 for the things
-//! the eye should skip.
+//! *illegible* meant. Fourteen was the next answer and it was still called too
+//! small. What is here now is a 16.5-pixel body, 24 for the title, 17 for a
+//! group heading and 14 for the things the eye is meant to skip — the smallest
+//! text in the client is larger than the largest text the first version had for
+//! a row of the table list.
+//!
+//! The floors are asserted at the bottom of this file. A size is one careless
+//! line away from drifting back down, and this has already happened twice.
 //!
 //! # The one rule that shows up as code rather than prose
 //!
@@ -83,34 +88,60 @@ pub fn install(ctx: &egui::Context) {
     for theme_kind in [egui::Theme::Dark, egui::Theme::Light] {
         let mut style = (*ctx.style_of(theme_kind)).clone();
         style.text_styles = [
-            (TextStyle::Heading, FontId::new(19.0, FontFamily::Proportional)),
-            (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
-            (TextStyle::Button, FontId::new(14.0, FontFamily::Proportional)),
-            (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
-            (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+            (TextStyle::Heading, FontId::new(24.0, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(16.5, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(16.5, FontFamily::Proportional)),
+            (TextStyle::Small, FontId::new(14.0, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(15.0, FontFamily::Monospace)),
         ]
         .into();
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(12.0, 6.0);
-        style.spacing.interact_size.y = 26.0;
+        // Air. A dense list of rows is harder to read than a small one, and the
+        // complaint that started this was about reading, not about size alone.
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(16.0, 9.0);
+        style.spacing.interact_size.y = 32.0;
+        style.spacing.scroll.bar_width = 11.0;
+        style.visuals.widgets.inactive.corner_radius = 7.into();
+        style.visuals.widgets.hovered.corner_radius = 7.into();
+        style.visuals.widgets.active.corner_radius = 7.into();
+        style.visuals.widgets.noninteractive.corner_radius = 7.into();
         ctx.set_style_of(theme_kind, style);
     }
 }
 
+/// A column, drawn as a card floating on the window rather than as a region of
+/// it. The outer margin is what makes the three columns read as three things;
+/// without it they share edges and the eye sees one grey field, which is what
+/// the version this replaced looked like.
 fn frame() -> egui::Frame {
     egui::Frame::new()
         .fill(theme::PANEL)
         .stroke(Stroke::new(1.0, theme::LINE))
-        .corner_radius(8.0)
-        .inner_margin(10.0)
+        .corner_radius(10.0)
+        .inner_margin(13.0)
+        .outer_margin(egui::Margin {
+            left: 5,
+            right: 5,
+            top: 4,
+            bottom: 5,
+        })
 }
 
 /// A titled group inside a column, the way the Python client frames each one.
 fn group<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.label(RichText::new(title).color(theme::TEXT_DIM).size(15.0).strong());
-    ui.add_space(3.0);
+    ui.label(RichText::new(title).color(theme::TEXT).size(17.0).strong());
+    ui.add_space(4.0);
+    // A rule rather than a box: the column already has a border, and a second
+    // one inside it is a frame around a frame.
+    let line = ui.available_rect_before_wrap();
+    ui.painter().hline(
+        line.left()..=line.right(),
+        line.top(),
+        Stroke::new(1.0, theme::LINE),
+    );
+    ui.add_space(7.0);
     let r = add(ui);
-    ui.add_space(8.0);
+    ui.add_space(14.0);
     r
 }
 
@@ -119,22 +150,38 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     let mut action = LobbyAction::None;
 
     egui::Panel::top("header")
-        .frame(egui::Frame::new().inner_margin(egui::Margin {
-            left: 4,
-            right: 4,
-            top: 2,
-            bottom: 8,
-        }))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .stroke(Stroke::new(1.0, theme::LINE))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin {
+                    left: 16,
+                    right: 16,
+                    top: 11,
+                    bottom: 11,
+                })
+                .outer_margin(egui::Margin {
+                    left: 5,
+                    right: 5,
+                    top: 5,
+                    bottom: 1,
+                }),
+        )
         .show(ui, |ui| header(ui, view));
 
     egui::Panel::bottom("network")
         .frame(frame())
         .show(ui, |ui| network_strip(ui, view));
 
+    // Proportions rather than pixel counts: 560 and 280 are answers to one
+    // window size only, and on a wide one they left the middle column too narrow
+    // to fit the words "Players in the lobby" on a single line.
+    let across = ui.available_width();
     egui::Panel::left("tables")
         .resizable(true)
-        .default_size(560.0)
-        .min_size(380.0)
+        .default_size((across * 0.46).clamp(380.0, 900.0))
+        .min_size(340.0)
         .frame(frame())
         .show(ui, |ui| {
             action = tables_column(ui, view, state);
@@ -142,8 +189,8 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
 
     egui::Panel::right("info")
         .resizable(true)
-        .default_size(280.0)
-        .min_size(200.0)
+        .default_size((across * 0.24).clamp(230.0, 460.0))
+        .min_size(210.0)
         .frame(frame())
         .show(ui, |ui| info_column(ui, view));
 
@@ -156,25 +203,46 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
 
 fn header(ui: &mut egui::Ui, view: &LobbyView) {
     ui.horizontal(|ui| {
+        // A felt-green stripe: the one place the table's colour appears in the
+        // lobby, and what makes the window read as a poker client rather than
+        // as a file manager.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(5.0, 30.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.5, theme::SELECTED);
+        ui.add_space(6.0);
+
         ui.label(
-            RichText::new("Decentralised poker lobby")
+            RichText::new("Decentralised poker")
                 .color(theme::TEXT)
-                .size(19.0)
+                .size(24.0)
                 .strong(),
         );
-        ui.add_space(14.0);
+        ui.add_space(16.0);
         let open = view.tables.iter().filter(|r| r.state.joinable()).count();
-        ui.label(
-            RichText::new(format!(
-                "{} tables, {} open, {} peers",
-                view.tables.len(),
-                open,
-                view.status.peers
-            ))
-            .color(theme::TEXT_DIM)
-            .size(15.0),
-        );
+        for (n, what, colour) in [
+            (view.tables.len(), "tables", theme::TEXT_DIM),
+            (open, "open", theme::OK),
+            (view.status.peers, "peers", theme::ACCENT),
+        ] {
+            pill(ui, &format!("{n} {what}"), colour);
+        }
     });
+}
+
+/// A counter, in a rounded chip.
+///
+/// Three numbers inside one sentence are three numbers nobody reads; three
+/// chips are three things, and the eye finds the one it wants.
+fn pill(ui: &mut egui::Ui, text: &str, colour: Color32) {
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_string(), egui::FontId::proportional(15.0), colour);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + 22.0, 27.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 13.0, theme::PANEL_LIGHT);
+    ui.painter()
+        .galley(rect.center() - galley.size() * 0.5, galley, colour);
 }
 
 fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyAction {
@@ -186,7 +254,7 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
     ui.label(
         RichText::new("Lobby: public")
             .color(theme::TEXT_DIM)
-            .size(15.0)
+            .size(17.0)
             .strong(),
     );
     ui.add_space(4.0);
@@ -222,15 +290,23 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
             bottom: 0,
         }))
         .show(ui, |ui| {
+            // Two rows, not one.
+            //
+            // The first version put the two main buttons on the left of a line
+            // and the two secondary ones on the right of the same line, and
+            // when the column was narrowed they were drawn on top of each
+            // other: two opposed layouts in one row have no idea the other
+            // exists. Two rows always fit, and they say which pair matters.
             ui.horizontal(|ui| {
                 if ui
                     .add(
                         egui::Button::new(
                             RichText::new("Create table")
-                                .color(Color32::from_rgb(6, 18, 29))
+                                .color(Color32::from_rgb(4, 16, 26))
                                 .strong(),
                         )
-                        .fill(theme::ACCENT),
+                        .fill(theme::ACCENT)
+                        .min_size(egui::vec2(140.0, 34.0)),
                     )
                     .clicked()
                 {
@@ -238,7 +314,11 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
                 }
 
                 let can_join = view.can_join();
-                let join = ui.add_enabled(can_join, egui::Button::new("Join table"));
+                let join = ui.add_enabled(
+                    can_join,
+                    egui::Button::new(RichText::new("Join table").strong())
+                        .min_size(egui::vec2(140.0, 34.0)),
+                );
                 if join.clicked() {
                     if let Some(row) = view.selected_row() {
                         action = LobbyAction::Join(row.key);
@@ -253,15 +333,15 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
                         .unwrap_or("Select a table first.");
                     join.on_hover_text(why);
                 }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Leave table").clicked() {
-                        action = LobbyAction::LeaveTable;
-                    }
-                    if ui.button("Show table window").clicked() {
-                        action = LobbyAction::OpenTableWindow;
-                    }
-                });
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Show table window").clicked() {
+                    action = LobbyAction::OpenTableWindow;
+                }
+                if ui.button("Leave table").clicked() {
+                    action = LobbyAction::LeaveTable;
+                }
             });
         });
 
@@ -275,15 +355,23 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
                     egui::Grid::new("table-list")
                         .num_columns(8)
                         .striped(true)
-                        .spacing([12.0, 5.0])
-                        .min_col_width(40.0)
+                        .spacing([10.0, 6.0])
+                        .min_col_width(32.0)
                         .show(ui, |ui| {
                             for h in [
                                 "Table", "Players", "Type", "Stack", "Blinds", "Timing", "Host",
                                 "State",
                             ] {
-                                ui.label(
-                                    RichText::new(h).color(theme::TEXT_DIM).size(12.0).strong(),
+                                let r = ui.label(
+                                    RichText::new(h.to_uppercase())
+                                        .color(theme::TEXT_DIM)
+                                        .size(13.0)
+                                        .strong(),
+                                );
+                                ui.painter().hline(
+                                    r.rect.left()..=r.rect.right(),
+                                    r.rect.bottom() + 4.0,
+                                    Stroke::new(1.0, theme::LINE),
                                 );
                             }
                             ui.end_row();
@@ -398,12 +486,12 @@ fn info_column(ui: &mut egui::Ui, view: &LobbyView) {
                         field(ui, "State", r.state.label(), state_colour(&r.state));
                         if let Some(why) = r.state.why_not() {
                             ui.add_space(4.0);
-                            ui.label(RichText::new(why).color(theme::WARN).size(12.0));
+                            ui.label(RichText::new(why).color(theme::WARN).size(14.0));
                         }
                         if r.password_required {
                             ui.add_space(4.0);
                             ui.label(
-                                RichText::new(PASSWORD_WARNING).color(theme::WARN).size(12.0),
+                                RichText::new(PASSWORD_WARNING).color(theme::WARN).size(14.0),
                             );
                         }
                     }
@@ -429,7 +517,7 @@ fn info_column(ui: &mut egui::Ui, view: &LobbyView) {
                         RichText::new(line)
                             .color(theme::TEXT_DIM)
                             .monospace()
-                            .size(11.5),
+                            .size(13.5),
                     );
                 }
             });
@@ -438,7 +526,7 @@ fn info_column(ui: &mut egui::Ui, view: &LobbyView) {
 
 fn field(ui: &mut egui::Ui, label: &str, value: &str, colour: Color32) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(theme::TEXT_DIM).size(12.0));
+        ui.label(RichText::new(label).color(theme::TEXT_DIM).size(14.0));
         ui.label(RichText::new(value).color(colour));
     });
 }
@@ -461,7 +549,7 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView) {
             } else {
                 theme::TEXT_DIM
             })
-            .size(12.0),
+            .size(14.0),
         );
 
         ui.label(
@@ -475,7 +563,7 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView) {
                 Some(r) if r.adequate => theme::OK,
                 Some(_) => theme::WARN,
             })
-            .size(12.0),
+            .size(14.0),
         );
 
         if s.failed_dials > 0 {
@@ -485,7 +573,7 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView) {
             ui.label(
                 RichText::new(format!("{} dials failed", s.failed_dials))
                     .color(theme::TEXT_DIM)
-                    .size(12.0),
+                    .size(14.0),
             );
         }
     });
@@ -608,13 +696,17 @@ mod tests {
         install(&ctx);
         let style = ctx.style_of(egui::Theme::Dark);
         assert!(
-            style.text_styles[&TextStyle::Body].size >= 14.0,
-            "the body text is back to the size that was called illegible"
+            style.text_styles[&TextStyle::Body].size >= 16.0,
+            "the body text is back down to a size that was called illegible"
         );
-        assert!(style.text_styles[&TextStyle::Heading].size >= 18.0);
+        assert!(style.text_styles[&TextStyle::Heading].size >= 22.0);
         assert!(
-            style.text_styles[&TextStyle::Small].size >= 12.0,
-            "even the small text has a floor"
+            style.text_styles[&TextStyle::Small].size >= 14.0,
+            "even the smallest text in the client has a floor, and it is the              size the body text used to be"
+        );
+        assert!(
+            style.spacing.interact_size.y >= 30.0,
+            "a row too short to click comfortably reads as cramped however              large the letters in it are"
         );
     }
 

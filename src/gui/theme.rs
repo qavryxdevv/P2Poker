@@ -2,13 +2,14 @@
 //!
 //! Two sources, and they answer different questions.
 //!
-//! **The lobby's colours are the Python client's**, ported from
-//! `p2p_poker/gui/theme.py`. The first version of this file used the table
-//! photograph's palette for the lobby too, and the result was nearly unreadable:
-//! a near-black window with grey-on-grey text, no panel separation and no line
-//! colour, because the photograph is of green felt and has nothing to say about
-//! how a list of tables should look. The Python client had already solved that
-//! and the answer is imported rather than re-derived.
+//! **The lobby's colours started as the Python client's** and were then opened
+//! up: brighter text, deeper and more separated surfaces, a felt-green selection
+//! and a blue accent. Two earlier versions were rejected as hard to read — the
+//! first used the table photograph's palette for the lobby, which is a
+//! photograph of green felt and has nothing to say about how a list should look;
+//! the second was legible but flat and cold. What is here now is checked by the
+//! tests at the bottom rather than by eye, because "looks fine to me" is exactly
+//! what was wrong with both of them.
 //!
 //! **The table's colours stay sampled from the reference image**
 //! (`docs/research/GUI_STACK.md` measured them off
@@ -34,38 +35,46 @@ const fn rgb(hex: u32) -> Color32 {
 // The lobby, from the Python client
 // ---------------------------------------------------------------------------
 
-/// The window behind everything.
-pub const WINDOW: Color32 = rgb(0x12181D);
+/// The window behind everything. Neutral and deep rather than black: a pure
+/// black field makes every panel on it look like a hole.
+pub const WINDOW: Color32 = rgb(0x090E12);
 /// A panel: the three columns and the network strip sit on this.
-pub const PANEL: Color32 = rgb(0x1A2228);
-/// A raised panel — headers, buttons, the selected row.
-pub const PANEL_LIGHT: Color32 = rgb(0x243038);
+pub const PANEL: Color32 = rgb(0x18222A);
+/// A raised panel — headers, buttons, a hovered row.
+pub const PANEL_LIGHT: Color32 = rgb(0x25333D);
 /// The inside of a list or a text field, darker than the panel it sits in.
-pub const FIELD: Color32 = rgb(0x0E1418);
-/// Every other row of a list.
-pub const FIELD_ALT: Color32 = rgb(0x121A1F);
-/// A selected row.
-pub const SELECTED: Color32 = rgb(0x1D3F5C);
+pub const FIELD: Color32 = rgb(0x0D141A);
+/// Every other row of a list. The stripe is faint on purpose: enough to follow
+/// a row across eight columns, not enough to read as a highlight.
+pub const FIELD_ALT: Color32 = rgb(0x121B22);
+/// A selected row — a deep felt green, so the one row the player has chosen is
+/// the same colour as the table they are choosing.
+pub const SELECTED: Color32 = rgb(0x12513C);
 /// Borders and separators. Without one, panels do not read as panels.
-pub const LINE: Color32 = rgb(0x2C3A44);
+pub const LINE: Color32 = rgb(0x31434F);
 
-/// Ordinary text. Bright enough to read on [`PANEL`], which the first version's
-/// was not.
-pub const TEXT: Color32 = rgb(0xE8EEF2);
+/// Ordinary text. Near-white: the two versions this replaced were grey on grey
+/// and grey on slate, and both were called illegible.
+pub const TEXT: Color32 = rgb(0xF3F7F9);
 /// Secondary text: column headings, units, anything the eye should skip.
-pub const TEXT_DIM: Color32 = rgb(0x9FB0BB);
+pub const TEXT_DIM: Color32 = rgb(0xA9BCC8);
 
 /// The one colour that draws the eye, used for the primary action and nothing
 /// else.
-pub const ACCENT: Color32 = rgb(0x4EA3FF);
+///
+/// Blue rather than green, though the felt is green and the selection is green:
+/// a green button beside a green "connected" light beside a green selected row
+/// is three different meanings in one colour, and the eye stops believing any of
+/// them.
+pub const ACCENT: Color32 = rgb(0x3FA9F5);
 /// A chip count.
-pub const STACK: Color32 = rgb(0x7EC9FF);
+pub const STACK: Color32 = rgb(0x7FD4FF);
 /// Money.
-pub const MONEY: Color32 = rgb(0xFFD35C);
+pub const MONEY: Color32 = rgb(0xFFCB57);
 
-pub const OK: Color32 = rgb(0x3FAE6A);
-pub const WARN: Color32 = rgb(0xE0A03A);
-pub const DANGER: Color32 = rgb(0xD33B3B);
+pub const OK: Color32 = rgb(0x35C48C);
+pub const WARN: Color32 = rgb(0xF2A63B);
+pub const DANGER: Color32 = rgb(0xEF5B5B);
 
 // ---------------------------------------------------------------------------
 // The table, sampled from the reference photograph
@@ -78,6 +87,15 @@ pub const FELT_MID: Color32 = rgb(0x004A24);
 pub const FELT_CENTRE: Color32 = rgb(0x006C3A);
 /// The thin dark keyline where the wood meets the felt.
 pub const FELT_KEYLINE: Color32 = rgb(0x0D4A2A);
+/// The table's name on the felt: a shade lighter than the felt under it, the
+/// way lettering on a real table is stitched rather than printed.
+pub const FELT_LETTERING: Color32 = rgb(0x2E8A55);
+
+/// The room the table stands in — the dark warm surround outside the rail.
+///
+/// Warm, not the lobby's cool slate: a wooden rail on a blue-grey ground looks
+/// like two applications in one window.
+pub const ROOM: Color32 = rgb(0x140F0E);
 
 /// The rail, lit from below in the reference: dark at the top, a warm band at
 /// the bottom.
@@ -314,6 +332,26 @@ mod tests {
         let sum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
         assert!(sum(RAIL_TOP) < sum(RAIL_SIDE));
         assert!(sum(RAIL_SIDE) < sum(RAIL_BOTTOM));
+    }
+
+    /// The table's name has to be readable against the felt it is stitched into
+    /// and must not compete with a card.
+    #[test]
+    fn the_lettering_reads_on_the_felt_without_shouting() {
+        assert!(separation(FELT_CENTRE, FELT_LETTERING) >= 40);
+        assert!(
+            separation(FELT_CENTRE, FELT_LETTERING) < separation(FELT_CENTRE, CARD_FACE),
+            "the table's name must not be louder than a card"
+        );
+    }
+
+    /// The room outside the rail is warm and darker than the wood, or the rail
+    /// stops looking like wood.
+    #[test]
+    fn the_room_is_darker_than_the_rail() {
+        let sum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+        assert!(sum(ROOM) < sum(RAIL_TOP));
+        assert!(ROOM.r() >= ROOM.b(), "the surround is warm, not cool");
     }
 
     /// The lobby does not share the felt's colour, so two windows do not read as
