@@ -281,7 +281,8 @@ fn windowed(
             // client could not show what it is for.
             .with_inner_size([1_180.0, 760.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("p2p-poker"),
+            .with_title("p2p-poker")
+            .with_icon(window_icon()),
         ..Default::default()
     };
 
@@ -313,6 +314,38 @@ fn windowed(
     if let Err(e) = result {
         eprintln!("the window could not open: {e}");
         eprintln!("run with --headless if this machine has no display");
+    }
+}
+
+/// The icon both windows wear.
+///
+/// Decoded from the same file the executable's own icon is compiled from, so
+/// the taskbar, the title bar and the file in Explorer cannot show three
+/// different pictures. Decoded once per window rather than cached: it happens
+/// twice in the life of the process.
+///
+/// A failure yields no icon rather than no client. The picture is not worth
+/// refusing to start over.
+fn window_icon() -> std::sync::Arc<eframe::egui::IconData> {
+    const PNG: &[u8] = include_bytes!("../assets/icon-256.png");
+    let empty = || {
+        std::sync::Arc::new(eframe::egui::IconData {
+            rgba: Vec::new(),
+            width: 0,
+            height: 0,
+        })
+    };
+    match image::load_from_memory(PNG) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (width, height) = rgba.dimensions();
+            std::sync::Arc::new(eframe::egui::IconData {
+                rgba: rgba.into_raw(),
+                width,
+                height,
+            })
+        }
+        Err(_) => empty(),
     }
 }
 
@@ -384,6 +417,7 @@ impl Client {
             ViewportId::from_hash_of("p2p-poker-table"),
             ViewportBuilder::default()
                 .with_title(title)
+                .with_icon(window_icon())
                 .with_inner_size([1_000.0, 720.0])
                 .with_min_inner_size([760.0, 560.0]),
             |ctx, _class| {
