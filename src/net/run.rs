@@ -54,7 +54,10 @@ use super::relay;
 use super::lobby::{LobbyStore, RateLimiter, TableAd};
 use super::node::{quic_dial_addr, worth_parsing, NodeCommand, NodeEvent, NodeState, REBROADCAST};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
-use crate::protocol::constants::{AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX, MAX_SEATS};
+use super::joinwire::DISPLAY_NAME_MAX;
+use crate::protocol::constants::{
+    PresetId, AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX, MAX_SEATS,
+};
 
 /// How long to wait for the DHT to bootstrap before giving up on this cycle.
 const BOOTSTRAP_PATIENCE: Duration = Duration::from_secs(20);
@@ -153,6 +156,9 @@ pub async fn run(
     // own advertisement. It is charged the same rate limit as anybody else,
     // which at one re-broadcast every thirty seconds is half the allowance.
     let my_app_key = app_key.verifying_key().to_bytes();
+    // Until the interface says otherwise, eight characters of this player's own
+    // key: stable, theirs, and never confusable with somebody else's.
+    let mut nickname = crate::storage::profile::short_name(&my_app_key);
 
     // The table this client is forming or sitting at, and the mesh it is formed
     // on. One table at a time in this loop; multi-tabling is more than one
@@ -322,6 +328,7 @@ pub async fn run(
                                                 seat,
                                             }).await;
                                         }
+                                        report_params(&events, f).await;
                                         report_roster(&events, f).await;
                                     }
                                     Err(Failed::Refused { reason, .. }) => {
@@ -529,6 +536,43 @@ pub async fn run(
                                 }
                             }
                         }
+
+                        // The first peer on the **lobby** topic, and this client
+                        // is hosting a table nothing has heard yet.
+                        //
+                        // A client that founds a table before anybody is on the
+                        // topic publishes into an empty mesh: not an error, and
+                        // not a delivery. The table then waited for the next
+                        // housekeeping tick — up to half a minute in which the
+                        // founder's own lobby, and everybody else's, showed
+                        // nothing. The failure was "no peers subscribed", so the
+                        // repair is "publish when one subscribes", and it is the
+                        // moment rather than a shorter timer.
+                        if t == topics.lobby.hash() {
+                            if let Some(f) = table.as_mut().filter(|f| f.is_founder()) {
+                                let now = super::node::now_unix_ms();
+                                if !state.lobby.tables().any(|l| *l.key == f.table_id()) {
+                                    if let Ok(bytes) = f.readvertise(now, AD_TTL_MS) {
+                                        if swarm
+                                            .behaviour_mut()
+                                            .gossipsub
+                                            .publish(topics.lobby.clone(), bytes.clone())
+                                            .is_ok()
+                                        {
+                                            show_own_table(
+                                                &bytes,
+                                                &my_app_key,
+                                                now,
+                                                &mut state.limits,
+                                                &mut state.lobby,
+                                                &events,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let _ = events.send(NodeEvent::MeshPeer(peer_id)).await;
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
@@ -694,7 +738,9 @@ pub async fn run(
             Some(command) = commands.recv() => {
                 let now = super::node::now_unix_ms();
                 match command {
-                    NodeCommand::CreateTable { name, seats, min_players, buyin, password } => {
+                    NodeCommand::CreateTable {
+                        preset, name, seats, min_players, buyin, password,
+                    } => {
                         // A fresh key per table, and that freshness is the only
                         // thing making two tables with the same players and the
                         // same rules different games (§4.3's `session_id`).
@@ -707,16 +753,42 @@ pub async fn run(
                             }
                         };
                         let table_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-                        let ad = new_table(
-                            name,
-                            seats,
-                            min_players,
-                            buyin,
-                            password.is_some(),
-                            app_key.verifying_key().to_bytes(),
-                            my_peer_bytes.clone(),
-                            now,
-                        );
+                        let rated = preset == PresetId::RatedSngPokerthV1;
+                        // A preset settles every parameter, so a rated table
+                        // ignores the four the dialog collects for a custom one.
+                        // The password is dropped rather than carried: §13 has
+                        // none, and `rated_values_match` refuses a rated advert
+                        // that demands one.
+                        let (ad, password) = if rated {
+                            (
+                                TableAd::rated_sng(
+                                    trim_to_bytes(&name, TABLE_NAME_MAX),
+                                    app_key.verifying_key().to_bytes(),
+                                    my_peer_bytes.clone(),
+                                    now,
+                                ),
+                                None,
+                            )
+                        } else {
+                            (
+                                new_table(
+                                    name,
+                                    seats,
+                                    min_players,
+                                    buyin,
+                                    password.is_some(),
+                                    app_key.verifying_key().to_bytes(),
+                                    my_peer_bytes.clone(),
+                                    now,
+                                ),
+                                password,
+                            )
+                        };
+                        // A tournament pays every entrant the same stack, so the
+                        // founder's own seat takes the start stack and not what
+                        // the dialog offered — `SeatEntry::admissible` admits
+                        // exactly one value there.
+                        let buyin = if rated { ad.start_stack } else { buyin };
                         match advert::publish(&ad, &table_key) {
                             Ok(bytes) => {
                                 let hash = advert_hash_of(&bytes);
@@ -728,7 +800,7 @@ pub async fn run(
                                     hash,
                                     password,
                                     my_peer_bytes.clone(),
-                                    display_name(&app_key),
+                                    nickname.clone(),
                                     buyin,
                                 ) {
                                     Ok(f) => {
@@ -738,6 +810,7 @@ pub async fn run(
                                         table_topic = Some(topic);
                                         table = Some(f);
                                         let _ = events.send(NodeEvent::Hosting { key }).await;
+                                        report_params(&events, table.as_ref().unwrap()).await;
                                         report_roster(&events, table.as_ref().unwrap()).await;
                                         // Published first, shown second: a table
                                         // appears in its founder's own lobby when
@@ -820,7 +893,7 @@ pub async fn run(
                             held.advert_hash,
                             key,
                             my_peer_bytes.clone(),
-                            display_name(&app_key),
+                            nickname.clone(),
                             buyin,
                             seat,
                             password.as_deref(),
@@ -839,6 +912,20 @@ pub async fn run(
                                     why: format!("cannot ask to join: {e:?}"),
                                 }).await;
                             }
+                        }
+                    }
+
+                    NodeCommand::SetNickname(name) => {
+                        // Bounded here as well as where it is chosen. §4.3's
+                        // limit is on what a roster will take, and the roster is
+                        // built here — a name that arrived by any other path
+                        // must not be able to make a seat entry this client's
+                        // own rules would refuse.
+                        nickname = trim_to_bytes(&name, DISPLAY_NAME_MAX);
+                        if nickname.trim().is_empty() {
+                            nickname = crate::storage::profile::short_name(
+                                &app_key.verifying_key().to_bytes(),
+                            );
                         }
                     }
 
@@ -911,6 +998,24 @@ pub async fn run(
     }
 }
 
+/// Tell the interface what table this is.
+///
+/// Sent whenever this client joins one or founds one, because the window that
+/// draws it must not have to guess a seat count.
+async fn report_params(events: &mpsc::Sender<NodeEvent>, f: &Formation) {
+    let ad = f.advert();
+    let _ = events
+        .send(NodeEvent::TableParams {
+            key: f.table_id(),
+            name: ad.table_name.clone(),
+            seats: ad.max_players,
+            needed: ad.min_players_to_start,
+            small_blind: ad.small_blind,
+            big_blind: ad.big_blind,
+        })
+        .await;
+}
+
 /// Tell the interface who is seated.
 ///
 /// The whole roster every time rather than a difference: a difference is only
@@ -967,17 +1072,6 @@ pub fn trim_to_bytes(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
-/// A player's name, until there is a place to set one.
-///
-/// Eight characters of their own key. Not an identifier and never treated as
-/// one — §4.3 is explicit that a display name is untrusted display data forever
-/// — but it is stable, it is theirs, and two players are never confused.
-fn display_name(app_key: &ed25519_dalek::SigningKey) -> String {
-    app_key.verifying_key().to_bytes()[..4]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
 
 /// The advertisement for a table this client is founding.
 ///

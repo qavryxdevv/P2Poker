@@ -210,7 +210,9 @@ fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView) {
 
     // The pot, then the board, then the seats — back to front, so a shadow is
     // always cast on something already drawn.
-    if view.pot > 0 || view.preview {
+    // The pot plaque only when there is a pot. An empty one is a box with a
+    // zero in it, and it is where the note about waiting goes instead.
+    if view.pot > 0 {
         paint::plaque(p, l.pot, Color32::from_black_alpha(150), theme::FELT_KEYLINE);
         paint::centred(
             p,
@@ -318,11 +320,15 @@ fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView) {
     }
 
     if let Some(note) = &view.note {
+        // Where the pot sits, because a table with no pot has nothing there and
+        // it is the one band of felt the layout guarantees is empty. The first
+        // version put it near the bottom edge, where it landed across the hero's
+        // own plate — the one seat that is always occupied.
         paint::centred(
             p,
-            egui::pos2(l.centre.x, l.felt.bottom() - l.metrics.rail * 2.0),
+            l.pot.center(),
             note,
-            l.metrics.board_card.x * 0.34,
+            l.metrics.board_card.x * 0.30,
             theme::WARN,
         );
     }

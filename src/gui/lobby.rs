@@ -323,6 +323,8 @@ impl NetworkStatus {
 /// the shape that keeps it true — the pane reads a snapshot and never a lock.
 #[derive(Debug, Clone, Default)]
 pub struct LobbyView {
+    /// This player's own name, as they chose it.
+    pub me: String,
     pub tables: Vec<TableRow>,
     pub status: NetworkStatus,
     pub selected: Option<[u8; 32]>,
@@ -345,6 +347,7 @@ pub struct ChatLine {
 impl LobbyView {
     pub fn from(store: &LobbyStore, status: NetworkStatus) -> Self {
         LobbyView {
+            me: String::new(),
             tables: rows(store),
             status,
             selected: None,

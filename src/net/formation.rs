@@ -382,6 +382,14 @@ impl Formation {
         self.early.len()
     }
 
+    /// The advertisement this table was formed under.
+    ///
+    /// Pinned at the moment this client committed to it, so it is the game this
+    /// client agreed to and not whatever the founder is advertising now.
+    pub fn advert(&self) -> &TableAd {
+        &self.under.ad
+    }
+
     /// The parameter hash every later comparison is against.
     pub fn under_params(&self) -> Hash {
         self.under.params

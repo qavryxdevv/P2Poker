@@ -38,6 +38,10 @@
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, TextStyle};
 
 use super::lobby::{empty_explanation, visible, Filter, LobbyView, TableState, PASSWORD_WARNING};
+use crate::protocol::constants::{
+    PresetId, RATED_BLIND_EVERY_N_HANDS, RATED_SEATS, RATED_SMALL_BLIND, RATED_START_STACK,
+};
+use crate::storage::settings::Settings;
 use super::theme;
 
 /// What the user did this frame.
@@ -48,6 +52,8 @@ use super::theme;
 pub enum LobbyAction {
     None,
     Select([u8; 32]),
+    /// Keep these settings.
+    Save(Settings),
     /// Found a table with these settings.
     Create(NewTable),
     /// Sit down at a table this client has seen advertised.
@@ -68,6 +74,8 @@ pub enum LobbyAction {
 /// under `CUSTOM` are asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewTable {
+    /// Which game. A preset settles every field below it.
+    pub preset: PresetId,
     pub name: String,
     pub seats: u8,
     pub min_players: u8,
@@ -76,8 +84,16 @@ pub struct NewTable {
 }
 
 impl Default for NewTable {
+    /// The rated Sit-and-Go, because it is the one two strangers can agree on.
+    ///
+    /// A custom table is a set of numbers one founder chose; a rated one is the
+    /// same game for everybody, and every client derives the same
+    /// `table_params_hash` from the name alone. In a lobby of people who have
+    /// never spoken, that is the difference between a table anyone will sit down
+    /// at and a table they have to read first.
     fn default() -> Self {
         NewTable {
+            preset: PresetId::RatedSngPokerthV1,
             name: "New table".into(),
             seats: 6,
             min_players: 2,
@@ -104,6 +120,8 @@ pub struct SitDown {
 pub enum Dialog {
     Create(NewTable),
     Sit(SitDown),
+    /// The player's own name and how big the text is.
+    Settings(Settings),
 }
 
 /// The parts of the pane the user types into.
@@ -111,12 +129,30 @@ pub enum Dialog {
 /// Separate from [`LobbyView`], which is a snapshot of what the node knows: a
 /// search box is what the *user* is doing, and it has to survive the snapshot
 /// being replaced several times a second.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LobbyUi {
     pub search: String,
     pub filter: Filter,
     /// The dialog the player has open, if any.
     pub dialog: Option<Dialog>,
+    /// What the player has chosen, as the dialogs read it.
+    pub settings: Settings,
+}
+
+impl LobbyUi {
+    /// The pane's own state, for a player whose settings have been loaded.
+    ///
+    /// No `Default`: the settings default to a name derived from **this
+    /// player's key**, and a `Default::default()` would have to invent one — a
+    /// name that is nobody's is worse than no default at all.
+    pub fn new(settings: Settings) -> Self {
+        LobbyUi {
+            search: String::new(),
+            filter: Filter::default(),
+            dialog: None,
+            settings,
+        }
+    }
 }
 
 /// Install the palette and the text sizes.
@@ -222,7 +258,11 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
                     bottom: 1,
                 }),
         )
-        .show(ui, |ui| header(ui, view));
+        .show(ui, |ui| {
+            if header(ui, view) {
+                state.dialog = Some(Dialog::Settings(state.settings.clone()));
+            }
+        });
 
     egui::Panel::bottom("network")
         .frame(frame())
@@ -273,6 +313,7 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
     let title = match &open {
         Dialog::Create(_) => "Create a table",
         Dialog::Sit(_) => "Sit down",
+        Dialog::Settings(_) => "Settings",
     };
 
     egui::Window::new(RichText::new(title).size(19.0).strong())
@@ -293,32 +334,80 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                     field_row(ui, "Name", |ui| {
                         ui.add(egui::TextEdit::singleline(&mut f.name).char_limit(32));
                     });
-                    field_row(ui, "Seats", |ui| {
-                        ui.add(egui::Slider::new(&mut f.seats, 2..=10));
-                    });
-                    field_row(ui, "Start with", |ui| {
-                        ui.add(egui::Slider::new(&mut f.min_players, 2..=f.seats.max(2)));
-                    });
-                    field_row(ui, "Buy-in", |ui| {
-                        ui.add(egui::DragValue::new(&mut f.buyin).range(200..=2_000));
-                    });
-                    field_row(ui, "Password", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut f.password)
-                                .password(true)
-                                .hint_text("optional"),
+                    field_row(ui, "Game", |ui| {
+                        ui.selectable_value(
+                            &mut f.preset,
+                            PresetId::RatedSngPokerthV1,
+                            "Sit & Go",
                         );
+                        ui.selectable_value(&mut f.preset, PresetId::Custom, "Cash game");
                     });
-                    if !f.password.is_empty() {
-                        // §4.3 requires this to be said: the proof is per join
-                        // and does not replay, but a weak table password is
-                        // guessable offline by anyone who sees one proof.
+
+                    let rated = f.preset == PresetId::RatedSngPokerthV1;
+                    if rated {
+                        // The numbers, stated rather than offered. A preset is a
+                        // claim about values: every client derives the same
+                        // parameters from the name, which is what lets two
+                        // people who have never spoken agree on the game before
+                        // either sits down. Offering a field here would be
+                        // offering a way to make a table nobody could join.
+                        preset_row(ui, "Stack", &RATED_START_STACK.to_string(), theme::STACK);
+                        preset_row(
+                            ui,
+                            "Blinds",
+                            &format!("{} / {}", RATED_SMALL_BLIND, RATED_SMALL_BLIND * 2),
+                            theme::MONEY,
+                        );
+                        preset_row(
+                            ui,
+                            "Blinds double",
+                            &format!("every {RATED_BLIND_EVERY_N_HANDS} hands"),
+                            theme::TEXT,
+                        );
+                        preset_row(
+                            ui,
+                            "Seats",
+                            &format!("{RATED_SEATS}, and it starts when all {RATED_SEATS} are in"),
+                            theme::TEXT,
+                        );
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new(super::lobby::PASSWORD_WARNING)
-                                .color(theme::WARN)
-                                .size(14.0),
+                            RichText::new(
+                                "Every one of these is fixed by the preset, so every client \
+                                 computes the same table. No password.",
+                            )
+                            .color(theme::TEXT_DIM)
+                            .size(14.0),
                         );
+                    } else {
+                        field_row(ui, "Seats", |ui| {
+                            ui.add(egui::Slider::new(&mut f.seats, 2..=10));
+                        });
+                        field_row(ui, "Start with", |ui| {
+                            ui.add(egui::Slider::new(&mut f.min_players, 2..=f.seats.max(2)));
+                        });
+                        field_row(ui, "Buy-in", |ui| {
+                            ui.add(egui::DragValue::new(&mut f.buyin).range(200..=2_000));
+                        });
+                        field_row(ui, "Password", |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut f.password)
+                                    .password(true)
+                                    .hint_text("optional"),
+                            );
+                        });
+                        if !f.password.is_empty() {
+                            // §4.3 requires this to be said: the proof is per
+                            // join and does not replay, but a weak table
+                            // password is guessable offline by anyone who sees
+                            // one proof.
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(super::lobby::PASSWORD_WARNING)
+                                    .color(theme::WARN)
+                                    .size(14.0),
+                            );
+                        }
                     }
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
@@ -335,6 +424,65 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                             .clicked()
                         {
                             action = Some(LobbyAction::Create(f.clone()));
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::Settings(f) => {
+                    field_row(ui, "Name", |ui| {
+                        // Bounded by characters here and by bytes where it is
+                        // saved. This one is only to stop a player typing a
+                        // paragraph; §4.3's real limit is 32 **bytes** and
+                        // `Settings::repair` is what enforces it.
+                        ui.add(
+                            egui::TextEdit::singleline(&mut f.nickname)
+                                .char_limit(super::super::storage::settings::NAME_MAX),
+                        );
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Shown to other players. It is never how you are identified — \
+                             two people may pick the same one.",
+                        )
+                        .color(theme::TEXT_DIM)
+                        .size(14.0),
+                    );
+                    ui.add_space(10.0);
+
+                    field_row(ui, "Text size", |ui| {
+                        ui.add(
+                            egui::Slider::new(
+                                &mut f.text_percent,
+                                super::super::storage::settings::SCALE_MIN
+                                    ..=super::super::storage::settings::SCALE_MAX,
+                            )
+                            .suffix(" %"),
+                        );
+                    });
+                    ui.label(
+                        RichText::new("Applies to both windows, at once.")
+                            .color(theme::TEXT_DIM)
+                            .size(14.0),
+                    );
+
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Save")
+                                        .color(Color32::from_rgb(4, 16, 26))
+                                        .strong(),
+                                )
+                                .fill(theme::ACCENT)
+                                .min_size(egui::vec2(120.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            action = Some(LobbyAction::Save(f.clone()));
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -396,6 +544,18 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
     action
 }
 
+/// A value the preset settles, shown rather than offered.
+fn preset_row(ui: &mut egui::Ui, label: &str, value: &str, colour: Color32) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(96.0, 24.0),
+            egui::Label::new(RichText::new(label).color(theme::TEXT_DIM)),
+        );
+        ui.label(RichText::new(value).color(colour).strong());
+    });
+    ui.add_space(6.0);
+}
+
 /// A labelled row in a dialog, so the labels line up without a grid.
 fn field_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
@@ -408,7 +568,8 @@ fn field_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(6.0);
 }
 
-fn header(ui: &mut egui::Ui, view: &LobbyView) {
+fn header(ui: &mut egui::Ui, view: &LobbyView) -> bool {
+    let mut opened = false;
     ui.horizontal(|ui| {
         // A felt-green stripe: the one place the table's colour appears in the
         // lobby, and what makes the window read as a poker client rather than
@@ -432,7 +593,20 @@ fn header(ui: &mut egui::Ui, view: &LobbyView) {
         ] {
             pill(ui, &format!("{n} {what}"), colour);
         }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Settings").clicked() {
+                opened = true;
+            }
+            ui.label(
+                RichText::new(&view.me)
+                    .color(theme::TEXT)
+                    .size(16.0)
+                    .strong(),
+            );
+        });
     });
+    opened
 }
 
 /// A counter, in a rounded chip.

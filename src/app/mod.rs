@@ -64,6 +64,10 @@ pub struct AppState {
     pub selected: Option<[u8; 32]>,
     /// The table this client is at or forming, if any.
     pub seated: Option<Seat>,
+    /// This player's own name, as they chose it. Display data, never an
+    /// identifier — §4.3 says that of a name received from the network, and it
+    /// is no less true of one's own.
+    pub me: String,
     /// The latest advertisement timestamp this client has seen.
     ///
     /// Used as the clock for this store's own expiry. Not this machine's clock:
@@ -90,6 +94,12 @@ pub struct Seat {
     /// The session identity, once the table is real. `None` means the table has
     /// **not** started, whatever else is filled in.
     pub session: Option<[u8; 32]>,
+    /// The table's name and shape, from the node rather than from the lobby.
+    pub name: String,
+    pub seats: u8,
+    pub needed: u8,
+    pub small_blind: u64,
+    pub big_blind: u64,
 }
 
 impl AppState {
@@ -215,6 +225,21 @@ impl AppState {
                 self.table(key).roster = seats;
                 self.note(format!("{n} seated"));
             }
+            NodeEvent::TableParams {
+                key,
+                name,
+                seats,
+                needed,
+                small_blind,
+                big_blind,
+            } => {
+                let t = self.table(key);
+                t.name = name;
+                t.seats = seats;
+                t.needed = needed;
+                t.small_blind = small_blind;
+                t.big_blind = big_blind;
+            }
             NodeEvent::TableReal { key, session } => {
                 self.table(key).session = Some(session);
                 self.note(format!("the table is set: session {}", short(&session)));
@@ -279,6 +304,7 @@ impl AppState {
         let mut v = LobbyView::from(&self.lobby, self.status.clone());
         v.selected = self.selected;
         v.log = self.log.iter().cloned().collect();
+        v.me = self.me.clone();
         v
     }
 }

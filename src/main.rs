@@ -13,6 +13,8 @@
 //! p2p-poker --headless --join N  sit down at the first table called N
 //! p2p-poker --profile DIR        keep the profile somewhere other than beside
 //!                                the binary
+//! p2p-poker --host N --seats 2   a custom table of that size instead of a
+//!                                rated Sit-and-Go, which needs all ten
 //! ```
 //!
 //! `--profile` exists because two clients on one machine must be two players.
@@ -29,7 +31,8 @@
 use std::time::Duration;
 
 use p2p_poker::app::AppState;
-use p2p_poker::gui::{render, table};
+use p2p_poker::gui::lobby::short_key;
+use p2p_poker::gui::render;
 use p2p_poker::net::node::{NodeCommand, NodeEvent};
 
 fn main() {
@@ -79,24 +82,48 @@ fn main() {
     // advertisement built by hand — two ways to start a table is two places for
     // the advertisement and the roster to disagree about what table it is.
     let hosted = value_of("--host").map(|name| {
+        use p2p_poker::protocol::constants::{PresetId, RATED_START_STACK};
+        // A rated Sit-and-Go by default, which is what the button founds — and
+        // a custom table when `--seats` is given, because a rated one needs all
+        // ten seats before it deals and a two-process test would never form one.
+        let seats = value_of("--seats").and_then(|v| v.parse::<u8>().ok());
         println!("hosting  {name}");
-        NodeCommand::CreateTable {
-            name,
-            seats: 6,
-            min_players: 2,
-            buyin: 1_000,
-            password: None,
+        match seats {
+            None => NodeCommand::CreateTable {
+                preset: PresetId::RatedSngPokerthV1,
+                name,
+                seats: 10,
+                min_players: 10,
+                buyin: RATED_START_STACK,
+                password: None,
+            },
+            Some(n) => NodeCommand::CreateTable {
+                preset: PresetId::Custom,
+                name,
+                seats: n.clamp(2, 10),
+                min_players: value_of("--min")
+                    .and_then(|v| v.parse::<u8>().ok())
+                    .unwrap_or(2)
+                    .clamp(2, n.clamp(2, 10)),
+                buyin: 1_000,
+                password: None,
+            },
         }
     });
+
+    let settings = p2p_poker::storage::settings::load(&dir, &app_key);
+    println!("name     {}", settings.nickname);
 
     let bounded = value_of("--for").and_then(|v| v.parse::<u64>().ok());
 
     if has("--headless") {
-        headless(identity, app_key, hosted, bounded, value_of("--join"));
+        headless(identity, app_key, settings, hosted, bounded, value_of("--join"));
     } else {
         windowed(
             identity,
             app_key,
+            dir,
+            settings,
             hosted,
             bounded,
             if has("--table") {
@@ -112,6 +139,7 @@ fn main() {
 fn headless(
     identity: libp2p::identity::Keypair,
     app_key: ed25519_dalek::SigningKey,
+    settings: p2p_poker::storage::settings::Settings,
     hosted: Option<NodeCommand>,
     bounded: Option<u64>,
     join: Option<String>,
@@ -128,6 +156,10 @@ fn headless(
                 eprintln!("node stopped: {e}");
             }
         });
+        // The name first, so a table founded a moment later carries it.
+        let _ = commands
+            .send(NodeCommand::SetNickname(settings.nickname.clone()))
+            .await;
         if let Some(command) = hosted {
             let _ = commands.send(command).await;
         }
@@ -211,6 +243,8 @@ fn headless(
 fn windowed(
     identity: libp2p::identity::Keypair,
     app_key: ed25519_dalek::SigningKey,
+    profile_dir: std::path::PathBuf,
+    settings: p2p_poker::storage::settings::Settings,
     hosted: Option<NodeCommand>,
     bounded: Option<u64>,
     screen: Screen,
@@ -226,11 +260,16 @@ fn windowed(
     // share a channel and nothing else, which is what keeps `SPEC_CS.md` §33
     // true: a 95 ms shuffle proof on the paint thread is six dropped frames.
     let opening = commands.clone();
+    let opening_name = settings.nickname.clone();
+    // The window keeps a copy: it saves the settings, and the defaults a
+    // settings file falls back to are derived from this key.
+    let node_key = app_key.clone();
     rt.spawn(async move {
+        let _ = opening.send(NodeCommand::SetNickname(opening_name)).await;
         if let Some(command) = hosted {
             let _ = opening.send(command).await;
         }
-        if let Err(e) = p2p_poker::net::run::run(identity, app_key, tx, command_rx).await {
+        if let Err(e) = p2p_poker::net::run::run(identity, node_key, tx, command_rx).await {
             eprintln!("node stopped: {e}");
         }
     });
@@ -253,11 +292,17 @@ fn windowed(
         options,
         Box::new(move |cc| {
             render::install(&cc.egui_ctx);
+            let mut state = AppState::new();
+            state.me = settings.nickname.clone();
+            cc.egui_ctx.set_zoom_factor(settings.zoom());
             Ok(Box::new(Client {
-                state: AppState::new(),
+                state,
                 screen,
-                ui: Default::default(),
+                table_closed: false,
+                ui: render::LobbyUi::new(settings),
                 table_ui: Default::default(),
+                profile_dir,
+                app_key,
                 commands,
                 events: rx,
                 bounded,
@@ -272,11 +317,13 @@ fn windowed(
     }
 }
 
-/// Which of the two windows the one window is showing.
+/// Which screen the client opened on.
 ///
-/// One viewport rather than two: a second operating-system window is a second
-/// thing to lose behind the first, and the table has a way back to the lobby on
-/// it. Multi-tabling will want real windows and will get them then.
+/// The table is its **own operating-system window**, beside the lobby rather
+/// than instead of it — a player watching seats fill up wants to see the lobby
+/// at the same time, and switching between them was the first version and was
+/// wrong. `--table` opens it at start-up; otherwise it opens by itself the
+/// moment this client has a seat somewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Lobby,
@@ -286,6 +333,12 @@ enum Screen {
 struct Client {
     state: AppState,
     screen: Screen,
+    /// The player shut the table window. It does not re-open by itself until
+    /// they sit down somewhere else, or ask for it.
+    table_closed: bool,
+    /// Where the settings are saved, and the key their defaults come from.
+    profile_dir: std::path::PathBuf,
+    app_key: ed25519_dalek::SigningKey,
     /// What the user is typing, which must survive the snapshot being replaced.
     ui: p2p_poker::gui::render::LobbyUi,
     table_ui: p2p_poker::gui::table::TableUi,
@@ -303,6 +356,128 @@ impl Client {
     /// `try_send` and not `send`: this runs on the paint thread, and a paint
     /// thread that blocks on a channel is a frozen window. A full queue means
     /// the node is busy, which is worth saying and is not worth stopping for.
+    /// The table, in its own operating-system window.
+    ///
+    /// `show_viewport_immediate` and not the deferred form: the deferred one
+    /// wants a `'static` closure and this needs `&mut self`, which is the whole
+    /// state the table is drawn from. Immediate costs a nested paint of this
+    /// window inside the parent's frame, which for one table is nothing.
+    ///
+    /// Closing it does not leave the table — a player who shuts the window is
+    /// still in the hand, and unseating them because they wanted the screen back
+    /// would be the worst possible reading of a click. **Leave table** does
+    /// that, in the lobby, deliberately.
+    fn table_window(&mut self, ctx: &eframe::egui::Context) {
+        use eframe::egui::{ViewportBuilder, ViewportId};
+
+        let title = self
+            .state
+            .seated
+            .as_ref()
+            .map(|s| format!("p2p-poker — table {}", short_key(&s.key)))
+            .unwrap_or_else(|| "p2p-poker — table".into());
+
+        let view = self.table_view();
+        let mut action = p2p_poker::gui::table::TableAction::None;
+        let mut closed = false;
+
+        ctx.show_viewport_immediate(
+            ViewportId::from_hash_of("p2p-poker-table"),
+            ViewportBuilder::default()
+                .with_title(title)
+                .with_inner_size([1_000.0, 720.0])
+                .with_min_inner_size([760.0, 560.0]),
+            |ctx, _class| {
+                // `EmbeddedWindow` means the platform gave us a panel inside the
+                // lobby rather than a window of its own. The table is drawn
+                // either way — half of what was asked for beats none — and the
+                // difference is only whether it has a frame of its own.
+                eframe::egui::CentralPanel::default()
+                    .frame(eframe::egui::Frame::NONE)
+                    .show(ctx, |ui| {
+                        action = p2p_poker::gui::table::draw(ui, &view, &mut self.table_ui);
+                    });
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    closed = true;
+                }
+            },
+        );
+
+        if closed || action == p2p_poker::gui::table::TableAction::BackToLobby {
+            self.screen = Screen::Lobby;
+            self.table_closed = true;
+        }
+        match action {
+            p2p_poker::gui::table::TableAction::None
+            | p2p_poker::gui::table::TableAction::BackToLobby => {}
+            other => self
+                .state
+                .log
+                .push_back(format!("{other:?} is not wired to the engine yet")),
+        }
+    }
+
+    /// What the table window draws.
+    ///
+    /// The **real** roster while this client has a seat, so a player watches the
+    /// others arrive; the sample only when there is no table at all and the
+    /// player asked for a look. §22's rule is kept by construction either way —
+    /// a seated view has no cards in it, because no hand has been dealt.
+    fn table_view(&self) -> p2p_poker::gui::table::TableView {
+        use p2p_poker::gui::table::{Facing, SeatView, TableView};
+
+        let Some(seat) = self.state.seated.as_ref() else {
+            return TableView::sample();
+        };
+
+        // From the node, which knows them, and not from this client's own lobby
+        // — a founder's table is not in its own lobby until the network has
+        // taken the advertisement, and a table window showing invented defaults
+        // for those thirty seconds is worse than one showing nothing.
+        let name = if seat.name.is_empty() {
+            format!("table {}", short_key(&seat.key))
+        } else {
+            seat.name.clone()
+        };
+        let blinds = format!("{} / {}", seat.small_blind, seat.big_blind);
+        let max_seats = seat.seats.max(1);
+        let needed = seat.needed;
+
+        let seats = seat
+            .roster
+            .iter()
+            .map(|(n, who, stack)| SeatView {
+                seat: *n,
+                name: who.clone(),
+                stack: *stack,
+                // No hand has been dealt, so there is nothing to draw and
+                // nothing to claim. §22 is kept by there being no card rather
+                // than by a check.
+                cards: [Facing::Empty, Facing::Empty],
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        let seated = seats.len();
+        TableView {
+            name,
+            blinds,
+            street: if seat.session.is_some() {
+                "ready".into()
+            } else {
+                "waiting".into()
+            },
+            seats,
+            hero: seat.seat.unwrap_or(0),
+            max_seats,
+            note: Some(match seat.session {
+                Some(_) => "everybody has ratified the roster; the table is set".into(),
+                None => format!("waiting for players — {seated} of {needed}"),
+            }),
+            ..Default::default()
+        }
+    }
+
     fn tell(&mut self, command: NodeCommand) {
         if self.commands.try_send(command).is_err() {
             self.state
@@ -333,14 +508,34 @@ impl eframe::App for Client {
             }
         }
 
-        match self.screen {
-            Screen::Lobby => {
+        // The table's own window, beside the lobby. It opens the moment this
+        // client has a seat — founding a table or being given one — and it is
+        // where the roster fills up in front of the player.
+        if self.state.seated.is_some() && !self.table_closed {
+            self.screen = Screen::Table;
+        }
+        if self.state.seated.is_none() {
+            // Left the table, or was refused a seat. The window has nothing to
+            // show and closing it is not a decision the player has to make.
+            self.screen = Screen::Lobby;
+            self.table_closed = false;
+        }
+        if self.screen == Screen::Table {
+            self.table_window(&ctx);
+        }
+
+        {
+            {
                 let view = self.state.view();
                 match render::lobby(ui, &view, &mut self.ui) {
                     render::LobbyAction::Select(key) => self.state.selected = Some(key),
                     render::LobbyAction::None => {}
-                    render::LobbyAction::OpenTableWindow => self.screen = Screen::Table,
+                    render::LobbyAction::OpenTableWindow => {
+                        self.screen = Screen::Table;
+                        self.table_closed = false;
+                    }
                     render::LobbyAction::Create(t) => self.tell(NodeCommand::CreateTable {
+                        preset: t.preset,
                         name: t.name,
                         seats: t.seats,
                         min_players: t.min_players,
@@ -362,21 +557,27 @@ impl eframe::App for Client {
                         password,
                     }),
                     render::LobbyAction::LeaveTable => self.tell(NodeCommand::LeaveTable),
-                }
-            }
-            Screen::Table => {
-                // No hand can be in progress until formation and the engine are
-                // wired, so the table shows a sample and says that it is one.
-                // §22 forbids passing an unverified card off as a real one, and
-                // a preview that admits what it is does not.
-                let view = table::TableView::sample();
-                match table::draw(ui, &view, &mut self.table_ui) {
-                    table::TableAction::BackToLobby => self.screen = Screen::Lobby,
-                    table::TableAction::None => {}
-                    other => self
-                        .state
-                        .log
-                        .push_back(format!("{other:?} is not wired to the engine yet")),
+                    render::LobbyAction::Save(mut settings) => {
+                        settings.repair(&self.app_key);
+                        ctx.set_zoom_factor(settings.zoom());
+                        self.state.me = settings.nickname.clone();
+                        self.tell(NodeCommand::SetNickname(settings.nickname.clone()));
+                        // Saved to disk, and said either way. A setting that
+                        // silently did not persist is one the player changes
+                        // again next time and blames the client for.
+                        match p2p_poker::storage::settings::save(
+                            &self.profile_dir,
+                            &settings,
+                            &self.app_key,
+                        ) {
+                            Ok(()) => self.state.log.push_back("settings saved".into()),
+                            Err(e) => self
+                                .state
+                                .log
+                                .push_back(format!("the settings did not save: {e}")),
+                        }
+                        self.ui.settings = settings;
+                    }
                 }
             }
         }

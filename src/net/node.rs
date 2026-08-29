@@ -46,6 +46,11 @@ use crate::protocol::constants::AD_REBROADCAST_MS;
 pub enum NodeCommand {
     /// Found a table and advertise it.
     CreateTable {
+        /// Which game. `RatedSngPokerthV1` settles every other field in this
+        /// command and the four below it are ignored — a preset is a claim
+        /// about values, and a client that let a founder mix the two would be
+        /// advertising a table its own admission rules refuse.
+        preset: crate::protocol::constants::PresetId,
         name: String,
         seats: u8,
         min_players: u8,
@@ -60,6 +65,12 @@ pub enum NodeCommand {
         seat: Option<u8>,
         password: Option<Vec<u8>>,
     },
+    /// The name this client sits down under.
+    ///
+    /// A command rather than a parameter to `run`, because a player may change
+    /// it while the node is running — and the node must have it, since it is
+    /// the node that builds a `JOIN_REQUEST` and a roster entry.
+    SetNickname(String),
     /// Stop hosting or stop waiting. Formation only; leaving a table that has
     /// started is a `PLAYER_LEAVE` and is not this.
     LeaveTable,
@@ -98,6 +109,23 @@ pub enum NodeEvent {
     Reachability { public: bool },
     /// This client is hosting a table under this key.
     Hosting { key: [u8; 32] },
+    /// The parameters of the table this client is at.
+    ///
+    /// Carried rather than looked up. The obvious source is this client's own
+    /// lobby store, and for a founder it is the wrong one: a founder's table
+    /// enters its own lobby only once the network has taken the advertisement,
+    /// which is right for the *list* and useless for the table window — for the
+    /// first thirty seconds, or for as long as this client is alone, the founder
+    /// would be sitting at a table whose blinds and seat count it displayed as
+    /// defaults it made up.
+    TableParams {
+        key: [u8; 32],
+        name: String,
+        seats: u8,
+        needed: u8,
+        small_blind: u64,
+        big_blind: u64,
+    },
     /// This client has a seat at a table being formed.
     Seated { key: [u8; 32], seat: u8 },
     /// The roster this client currently believes, newest first in the list.
