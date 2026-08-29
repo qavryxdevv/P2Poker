@@ -331,7 +331,8 @@ fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
     //
     // The audit is the same one §13 prescribes for itself: diff this list
     // against §3.1's twenty-five parts and require every part to be pinned
-    // either here or by rule 2. `every_part_of_the_hash_is_pinned` does it.
+    // either here or by rule 2.
+    // `every_part_of_the_hash_is_pinned_by_the_rated_name` does it.
     let expected: [(&'static str, u64, u64); 13] = [
         ("mode", ad.mode as u64, Mode::TournamentSngPlayMoney.code() as u64),
         ("max_players", ad.max_players as u64, RATED_SEATS as u64),
@@ -389,6 +390,19 @@ fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
     }
     if ad.hand_delay_ms != 7_000 {
         return Err(AdRejected::Preset("the rated preset pauses 7 s between hands"));
+    }
+    // §13: `n(23) password_required = false`, stated there only so its absence
+    // is not read as an omission — and enforced nowhere until now. PokerTH
+    // refuses a ranked game with a password for the same reason: a rated table
+    // is one anybody may sit down at, and a password is the opposite of that.
+    //
+    // **This is the only rated check on a field that is not part of
+    // `table_params_hash`**, so unlike the other thirteen it cannot make two
+    // honest clients derive different digests. It is a policy check, and it is
+    // here because a password-gated table calling itself rated is a claim about
+    // what it is that happens not to be true.
+    if ad.password_required {
+        return Err(AdRejected::Preset("a rated table has no password"));
     }
     Ok(())
 }
@@ -999,6 +1013,34 @@ mod tests {
                  fail to join each other with neither of them wrong"
             );
         }
+    }
+
+    /// A rated table has no password, which §13 states and PokerTH enforces.
+    ///
+    /// The **only** rated check on a field that is not part of
+    /// `table_params_hash`, so it cannot make two honest clients disagree about
+    /// the digest. It is a policy check: a password-gated table calling itself
+    /// rated is making a claim about itself that is not true.
+    #[test]
+    fn a_rated_table_has_no_password() {
+        let mut ad = TableAd::rated_sng("Rated".into(), [1u8; 32], vec![2u8; 38], NOW);
+        assert_eq!(admit(&ad, NOW), Ok(()));
+        ad.password_required = true;
+        assert!(admit(&ad, NOW).is_err(), "a rated table demanded a password");
+
+        // And it really is outside the digest, or the claim above is wrong.
+        let mut open = TableAd::rated_sng("Rated".into(), [1u8; 32], vec![2u8; 38], NOW);
+        let with = {
+            let mut a = open.clone();
+            a.password_required = true;
+            a
+        };
+        assert_eq!(
+            crate::net::advert::table_params_hash(&open),
+            crate::net::advert::table_params_hash(&with),
+            "password_required is not a part of table_params_hash"
+        );
+        open.password_required = false;
     }
 
     /// The four things the constructor takes are the four §13 does not pin, and

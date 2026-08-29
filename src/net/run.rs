@@ -51,7 +51,7 @@ use super::joinrpc;
 use super::joinwire;
 use super::dht::{self, PeerHints, Swarm as DhtSwarm, REANNOUNCE_INTERVAL};
 use super::relay;
-use super::lobby::TableAd;
+use super::lobby::{LobbyStore, RateLimiter, TableAd};
 use super::node::{quic_dial_addr, worth_parsing, NodeCommand, NodeEvent, NodeState, REBROADCAST};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
 use crate::protocol::constants::{AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX, MAX_SEATS};
@@ -149,6 +149,10 @@ pub async fn run(
     let mut state = NodeState::new();
     let mut hints = PeerHints::new();
     let my_peer_bytes = swarm.local_peer_id().to_bytes();
+    // This node's own application key, used as the "from peer" when it files its
+    // own advertisement. It is charged the same rate limit as anybody else,
+    // which at one re-broadcast every thirty seconds is half the allowance.
+    let my_app_key = app_key.verifying_key().to_bytes();
 
     // The table this client is forming or sitting at, and the mesh it is formed
     // on. One table at a time in this loop; multi-tabling is more than one
@@ -354,7 +358,11 @@ pub async fn run(
                         }).await;
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
-                        gossipsub::Event::Message { message, .. },
+                        gossipsub::Event::Message {
+                            message,
+                            propagation_source,
+                            message_id,
+                        },
                     )) if table_topic
                         .as_ref()
                         .is_some_and(|t| message.topic == t.hash()) =>
@@ -363,6 +371,35 @@ pub async fn run(
                         // founder's proposal or a seat's ratification of one,
                         // and which it is is decided by what it decodes as
                         // rather than by what was hoped for.
+                        //
+                        // **This arm must answer, exactly like the lobby's.**
+                        // With `validate_messages()` set, GossipSub forwards
+                        // nothing until the application reports a verdict, and
+                        // this arm reported none — so every client was a black
+                        // hole for its own table's traffic. Two seats did not
+                        // notice, because they are directly meshed and delivery
+                        // to a direct peer does not need forwarding; at ten
+                        // seats a ratification that has to travel through a
+                        // third seat simply never arrives, and the table never
+                        // starts with nobody able to say why.
+                        let verdict = match table.as_mut() {
+                            None => {
+                                // No table here to judge it against. `Ignore`
+                                // and not `Reject`: nothing about the message is
+                                // known to be wrong, this client just cannot
+                                // tell, and blaming a sender for that would cost
+                                // an honest peer its score.
+                                let _ = swarm.behaviour_mut().gossipsub
+                                    .report_message_validation_result(
+                                        &message_id,
+                                        &propagation_source,
+                                        gossipsub::MessageAcceptance::Ignore,
+                                    );
+                                continue;
+                            }
+                            Some(_) => gossipsub::MessageAcceptance::Accept,
+                        };
+                        let _ = verdict;
                         let Some(f) = table.as_mut() else { continue };
                         let now = super::node::now_unix_ms();
                         let result = if joinwire::receive_player_list(&message.data).is_ok() {
@@ -370,6 +407,7 @@ pub async fn run(
                         } else {
                             f.on_table_ready(&message.data)
                         };
+                        let refused = result.is_err();
                         match result {
                             Ok(sends) => {
                                 if let Some(t) = &table_topic {
@@ -400,6 +438,20 @@ pub async fn run(
                                     .await;
                             }
                         }
+
+                        // A signed message that failed a rule is the sender's
+                        // fault and costs it peer score; one this client took is
+                        // passed on.
+                        let _ = swarm.behaviour_mut().gossipsub
+                            .report_message_validation_result(
+                                &message_id,
+                                &propagation_source,
+                                if refused {
+                                    gossipsub::MessageAcceptance::Reject
+                                } else {
+                                    gossipsub::MessageAcceptance::Accept
+                                },
+                            );
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Dcutr(ev)) => {
                         match ev.result {
@@ -685,10 +737,43 @@ pub async fn run(
                                         let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
                                         table_topic = Some(topic);
                                         table = Some(f);
-                                        let _ = swarm.behaviour_mut().gossipsub
-                                            .publish(topics.lobby.clone(), bytes);
                                         let _ = events.send(NodeEvent::Hosting { key }).await;
                                         report_roster(&events, table.as_ref().unwrap()).await;
+                                        // Published first, shown second: a table
+                                        // appears in its founder's own lobby when
+                                        // the network has taken it, and not when
+                                        // it was signed.
+                                        match swarm
+                                            .behaviour_mut()
+                                            .gossipsub
+                                            .publish(topics.lobby.clone(), bytes.clone())
+                                        {
+                                            Ok(_) => {
+                                                show_own_table(
+                                                    &bytes,
+                                                    &my_app_key,
+                                                    now,
+                                                    &mut state.limits,
+                                                    &mut state.lobby,
+                                                    &events,
+                                                )
+                                                .await;
+                                            }
+                                            Err(e) => {
+                                                // No mesh peer yet is the
+                                                // ordinary case at start-up. The
+                                                // table is real and will be
+                                                // advertised again in thirty
+                                                // seconds; it is not in anybody's
+                                                // lobby until then, including
+                                                // this one.
+                                                let _ = events
+                                                    .send(NodeEvent::Warning(format!(
+                                                        "the table is not on the network yet: {e}"
+                                                    )))
+                                                    .await;
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         let _ = events.send(NodeEvent::Warning(
@@ -786,18 +871,32 @@ pub async fn run(
                     match f.readvertise(now, AD_TTL_MS) {
                         Ok(bytes) => {
                             let n = bytes.len();
-                            if let Err(e) = swarm
+                            match swarm
                                 .behaviour_mut()
                                 .gossipsub
-                                .publish(topics.lobby.clone(), bytes)
+                                .publish(topics.lobby.clone(), bytes.clone())
                             {
-                                // No mesh peer yet is the ordinary case at
-                                // start-up, not a fault.
-                                let _ = events
-                                    .send(NodeEvent::Warning(format!("not published: {e}")))
+                                Ok(_) => {
+                                    let _ = events.send(NodeEvent::Published { bytes: n }).await;
+                                    // And into this node's own lobby, so a
+                                    // founder sees the table it is sitting at.
+                                    show_own_table(
+                                        &bytes,
+                                        &my_app_key,
+                                        now,
+                                        &mut state.limits,
+                                        &mut state.lobby,
+                                        &events,
+                                    )
                                     .await;
-                            } else {
-                                let _ = events.send(NodeEvent::Published { bytes: n }).await;
+                                }
+                                Err(e) => {
+                                    // No mesh peer yet is the ordinary case at
+                                    // start-up, not a fault.
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!("not published: {e}")))
+                                        .await;
+                                }
                             }
                         }
                         Err(e) => {
@@ -847,6 +946,27 @@ fn advert_hash_of(bytes: &[u8]) -> [u8; 32] {
     }
 }
 
+/// §7.2's bound on a table name, in **bytes**.
+pub const TABLE_NAME_MAX: usize = 64;
+
+/// Cut a string to at most `max` bytes, without cutting a character in half.
+///
+/// The obvious `chars().take(n)` counts the wrong thing and `&s[..n]` panics on
+/// a boundary. This is the only correct shape and it is worth having once:
+/// every bound the protocol states on a display field is a bound in bytes,
+/// because that is what goes on the wire, while every bound a person has in mind
+/// is in characters.
+pub fn trim_to_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 /// A player's name, until there is a place to set one.
 ///
 /// Eight characters of their own key. Not an identifier and never treated as
@@ -887,7 +1007,14 @@ fn new_table(
         // Trimmed rather than refused: §7.2 caps it, and a table that will not
         // advertise because its name is long is a worse answer than one that
         // advertises under a shorter name.
-        table_name: name.chars().take(32).collect(),
+        //
+        // **By bytes, and the first version counted characters.** §7.2's bound
+        // is 64 *bytes*; thirty-two characters of anything outside ASCII is up
+        // to a hundred and twenty-eight of them, so a Czech or an emoji table
+        // name passed this trim and was then refused by this client's own
+        // admission rules — the table would have appeared in nobody's lobby,
+        // including its founder's.
+        table_name: trim_to_bytes(&name, TABLE_NAME_MAX),
         small_blind: 10,
         big_blind: 20,
         ante: 0,
@@ -926,6 +1053,60 @@ fn new_table(
         founder_peer_id,
         timestamp_unix_ms: now_ms,
         expires_at_unix_ms: now_ms + AD_TTL_MS,
+    }
+}
+
+/// Show this node its **own** table, once the network has actually taken it.
+///
+/// GossipSub does not deliver a message back to whoever published it, so the
+/// founder's own advertisement never reached the founder's own lobby: a player
+/// created a table and it appeared in everybody's list except theirs.
+///
+/// It is fed through `advert::receive` — the same path a stranger's advert takes,
+/// with the same rate limiter and the same §7.2 admission — rather than inserted.
+/// That is deliberate and it buys a real check: **this client's table appears in
+/// this client's lobby only if this client's own advertisement would have been
+/// accepted by anybody else.** An advert that its own author refuses is a table
+/// nobody will ever see, and this is the cheapest possible place to find that out.
+///
+/// Called only after `publish` returned `Ok`, which is what the request was: a
+/// table shows up once it is on the network, not once it is signed. `publish`
+/// fails with `NoPeersSubscribedToTopic` when nothing heard it, and a table that
+/// nothing heard is not in a lobby anywhere.
+async fn show_own_table(
+    bytes: &[u8],
+    me: &[u8; 32],
+    now: u64,
+    limits: &mut RateLimiter,
+    store: &mut LobbyStore,
+    events: &mpsc::Sender<NodeEvent>,
+) {
+    match advert::receive(bytes, *me, now, limits, store) {
+        Ok(key) => {
+            if let Some(held) = store.get(&key) {
+                let _ = events
+                    .send(NodeEvent::TableSeen {
+                        key,
+                        ad: Box::new(held.ad.clone()),
+                        params_hash: held.params_hash,
+                        advert_hash: held.advert_hash,
+                    })
+                    .await;
+            }
+        }
+        // `NotNewer` is the ordinary case on a re-broadcast this node has
+        // already filed, and is not worth a line in anybody's log.
+        Err(super::advert::NotAccepted::NotTaken(super::lobby::NotTaken::NotNewer)) => {}
+        Err(e) => {
+            // This client's own advert, refused by this client's own rules. It
+            // is worth saying loudly, because every other client will refuse it
+            // too and the table will simply never appear anywhere.
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "this client refuses its own advertisement: {e:?}"
+                )))
+                .await;
+        }
     }
 }
 
@@ -1048,6 +1229,70 @@ pub fn bootstrap_addresses() -> Vec<std::net::SocketAddrV4> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table name is bounded in **bytes**, because that is what goes on the
+    /// wire, and the first version counted characters.
+    ///
+    /// Thirty-two characters of Czech is up to sixty-four bytes and of emoji up
+    /// to a hundred and twenty-eight, so a name a person would call short passed
+    /// the trim and was then refused by this client's own §7.2 admission — the
+    /// table appeared in nobody's lobby, its founder's included, and the only
+    /// symptom was a warning about this client's own advertisement.
+    #[test]
+    fn a_name_is_trimmed_by_bytes_and_stays_text() {
+        let cards = "\u{1F0A1}".repeat(40);
+        let rs = "\u{159}".repeat(60);
+        let xs = "x".repeat(200);
+        for source in [
+            "Riverside",
+            "Riverside u Pepy na Zizkove s dlouhym nazvem, ktery se sem nevejde",
+            cards.as_str(),
+            rs.as_str(),
+            xs.as_str(),
+        ] {
+            let cut = trim_to_bytes(source, TABLE_NAME_MAX);
+            assert!(
+                cut.len() <= TABLE_NAME_MAX,
+                "{source:?} trimmed to {} bytes",
+                cut.len()
+            );
+            assert!(source.starts_with(&cut), "the trim changed the text");
+            // Still text. `is_char_boundary` is the whole point: a byte-wise cut
+            // would have produced something that is not.
+            assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+        }
+        assert_eq!(trim_to_bytes("Riverside", TABLE_NAME_MAX), "Riverside");
+    }
+
+    /// And the table this client founds passes this client's **own** admission
+    /// rules, whatever name it is given. An advertisement its own author refuses
+    /// is a table nobody will ever see.
+    #[test]
+    fn a_table_this_client_founds_is_one_it_would_accept() {
+        const NOW: u64 = 1_700_000_000_000;
+        let cards = "\u{1F0A1}".repeat(40);
+        for name in [
+            "Riverside",
+            "Riverside u Pepy na Zizkove s velmi dlouhym nazvem stolu ktery je moc dlouhy",
+            cards.as_str(),
+        ] {
+            let ad = new_table(
+                name.to_string(),
+                6,
+                2,
+                1_000,
+                false,
+                [1u8; 32],
+                vec![2u8; 38],
+                NOW,
+            );
+            assert_eq!(
+                super::super::lobby::admit(&ad, NOW),
+                Ok(()),
+                "this client would refuse its own table called {name:?}"
+            );
+        }
+    }
 
     /// The announce carries a port, and announcing one nothing is bound to
     /// publishes an unreachable address to a hundred strangers every ten

@@ -95,26 +95,47 @@ impl std::error::Error for ConfigError {}
 
 /// PokerTH's rated Sit-and-Go, `GAME_TYPE_RANKING`.
 ///
-/// Sources, all in `the PokerTH source tree`:
+/// # What PokerTH fixes for a ranked game, and what it merely defaults to
+///
+/// The distinction matters and this table used not to draw it. Everything in
+/// the first group is a `RANKING_GAME_*` constant — a ranked game cannot be
+/// created with any other value. Everything in the second is a **general
+/// configuration default** that a host may change freely, and calling those
+/// "PokerTH's ranked values" was wrong.
+///
+/// **Fixed by PokerTH for a ranked game** (`src/game_defs.h`, read at v2.1.8;
+/// the constants were at `:79-82` when this was first written and are at
+/// `:91-94` now — same values, drifted lines, which is why the names matter
+/// more than the numbers):
 ///
 /// | Value | Source |
 /// |---|---|
-/// | seats 10 | `src/game_defs.h:80` `RANKING_GAME_NUMBER_OF_PLAYERS` |
-/// | stack 10000 | `src/game_defs.h:79` `RANKING_GAME_START_CASH` |
-/// | small blind 50 | `src/game_defs.h:81` `RANKING_GAME_START_SBLIND` |
-/// | every 11 hands | `src/game_defs.h:82` `RANKING_GAME_RAISE_EVERY_HAND` |
-/// | doubling | `src/net/servergame.cpp:1267` `DOUBLE_BLINDS` |
-/// | cap seats*stack/2 | `src/engine/game.cpp:318` |
-/// | action timeout 20 s | `src/gamedata.h:80`, `src/config/configfile.cpp:233` |
-/// | hand delay 7 s | `src/config/configfile.cpp:232` |
+/// | seats 10 | `RANKING_GAME_NUMBER_OF_PLAYERS` |
+/// | stack 10000 | `RANKING_GAME_START_CASH` |
+/// | small blind 50 | `RANKING_GAME_START_SBLIND` |
+/// | every 11 hands | `RANKING_GAME_RAISE_EVERY_HAND` |
+/// | doubling | `RAISE_ON_HANDNUMBER` + `DOUBLE_BLINDS`, `ServerGame::CheckSettings` |
+/// | big blind = 2x small | `ServerGame::CheckSettings` |
+/// | cap seats*stack/2 | `src/engine/game.cpp` |
+/// | starts only when full | `ServerGame::CheckSettings` |
 ///
-/// PokerTH has no ante, no per-hand time limit and no payout structure — it
-/// records the finishing place only. The grace period, the hand and join
-/// deadlines and `min_players_to_start` are ours; PokerTH leaves them free and
-/// `SPEC_CS.md` sections 4 and 19 require them. The grace is 5 s rather than
-/// PokerTH's 2 s because PokerTH's only has to cover one client-to-server hop
-/// on a trusted clock, while here every peer times out independently with no
-/// shared clock.
+/// **Ours, not PokerTH's**, and each is a part of `table_params_hash` — so each
+/// had to be pinned here or two clients would derive different digests:
+///
+/// | Value | Why |
+/// |---|---|
+/// | action timeout 20 s | PokerTH's *general* default (`NetTimeOutPlayerAction`); ranked requires only >= 5 s. Twenty because here every peer times out independently with no shared clock, where PokerTH has a server and one |
+/// | hand delay 7 s | PokerTH's *general* default (`NetDelayBetweenHands`), also free per game |
+/// | grace 5 s | no PokerTH analogue at all; PokerTH's 2 s covers one client-to-server hop on a trusted clock |
+/// | hand and join deadlines | PokerTH has no per-hand time limit; `SPEC_CS.md` sections 4 and 19 require one |
+///
+/// PokerTH also has no ante and no payout structure — it records the finishing
+/// place only.
+///
+/// **What PokerTH enforces for a ranked game that this protocol cannot.** No
+/// password (this one is enforced, in `lobby::rated_values_match`); spectators
+/// allowed, no guests, no kicking, no two players from one address. The last
+/// four have no meaning without a server and are not claimed.
 pub const RATED_SNG_POKERTH_V1: Preset = Preset {
     id: "RATED_SNG_POKERTH_V1",
     seats: 10,
