@@ -149,6 +149,9 @@ pub async fn run(
     // cycle does not ask the same relay again every minute.
     let mut asked_relays: HashSet<SocketAddrV4> = HashSet::new();
     let mut have_reservation = false;
+    // Counted so that "no relay" is reported as a finding rather than as
+    // impatience: three cycles is three minutes of looking.
+    let mut relay_searches: u32 = 0;
     // Checked often, acted on rarely. The listen address arrives a moment after
     // the swarm starts, so a timer whose period **is** the re-announce interval
     // misses its first tick and then says nothing for ten minutes — which is
@@ -376,10 +379,18 @@ pub async fn run(
                     // relay swarm is asked whenever there is no reservation yet,
                     // whatever AutoNAT has said so far.
                     if !have_reservation {
+                        relay_searches += 1;
                         let mut relays = PeerHints::new();
                         let mut stream = dht.get_peers(relay_hash);
                         while let Some(batch) = DhtStreamExt::next(&mut stream).await {
                             relays.absorb(batch.as_ref());
+                        }
+                        if relays.is_empty() && relay_searches >= 3 {
+                            let _ = events
+                                .send(NodeEvent::NoRelayFound {
+                                    cycles: relay_searches,
+                                })
+                                .await;
                         }
                         for addr in relays.peers() {
                             if !asked_relays.insert(*addr) {

@@ -109,6 +109,9 @@ async fn main() {
                     seconds.map(|s| s.to_string()).unwrap_or_else(|| "none".into()),
                     if adequate { "usable for a table" } else { "TOO SMALL for a hand" }
                 ),
+                NodeEvent::NoRelayFound { cycles } => println!(
+                    "relay    none found after {cycles} searches - if nobody anywhere is                      publicly reachable there is no game"
+                ),
                 NodeEvent::HolePunched(p) => println!("punch    {p} is now direct"),
                 NodeEvent::StillRelayed(p) => println!("punch    {p} stays relayed"),
             },

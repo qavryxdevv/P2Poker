@@ -91,6 +91,14 @@ pub enum NodeEvent {
         seconds: Option<u64>,
         adequate: bool,
     },
+    /// No relay could be found, after looking for long enough that this is a
+    /// finding rather than impatience.
+    ///
+    /// Reported because the alternative is a lobby listing tables nobody can sit
+    /// at and a user who concludes the software is broken. If nobody anywhere is
+    /// publicly reachable there is no game, and a client in that position has to
+    /// say so.
+    NoRelayFound { cycles: u32 },
     /// A relayed connection was upgraded to a direct one by hole punching.
     HolePunched(PeerId),
     /// Hole punching gave up. The connection stays relayed, which is a normal

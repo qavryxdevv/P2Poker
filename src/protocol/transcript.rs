@@ -177,9 +177,26 @@ pub fn abort_terminal(table_id: &Hash, hand_id: u64, genesis: &Hash) -> Hash {
 /// The session identifier, derived from the roster's ratification.
 ///
 /// Every later `GENESIS(k)` carries it, so every hand event is bound to this
-/// exact ratification. Two tables with the same participants and the same
-/// advertisement still get different session ids, because the handshake and
-/// join nonces feed the events hashed here.
+/// exact ratification.
+///
+/// # Where the uniqueness actually comes from
+///
+/// From `table_id`, which is the table's public key and is fresh for every
+/// table. **Not** from any nonce, and this is worth stating because both this
+/// comment and `PROTOCOL.md` §4.3 previously said otherwise: *"the `HELLO`
+/// nonces feed the connections and the `join_nonce`s feed the join requests
+/// whose hashes are in the roster chain"*.
+///
+/// They do not. The four inputs are `table_id`, `table_params_hash`,
+/// `roster_hash(0)` — seat index, application key and starting stack, per §3.1 —
+/// and the `TABLE_READY` bodies, which carry a roster hash, a serial, a
+/// parameters hash, a seat and a capability set. No nonce is in any of them.
+/// `join_nonce` reaches `JOIN_REQUEST` alone, which is unchained and enters
+/// nothing downstream.
+///
+/// The claim was wrong in the dangerous direction: an editor who believed the
+/// nonces carried the uniqueness could weaken the freshness of `table_id` on the
+/// grounds that something else covered it, and nothing does.
 pub fn session_id(
     table_id: &Hash,
     table_params_hash: &Hash,

@@ -2360,9 +2360,23 @@ session_id = h("p2p-poker v1 session",
 
 Every subsequent hand's `GENESIS(k)` contains `session_id`, so every hand event is
 bound to this exact roster ratification. Two tables with the same participants and
-the same advertisement still get different `session_id`s, because the `HELLO`
-nonces feed the connections and the `join_nonce`s feed the join requests whose
-hashes are in the roster chain.
+the same parameters still get different `session_id`s — **because `table_id` is a
+fresh key for every table, and for no other reason.**
+
+**Corrected.** This paragraph said the uniqueness came from *"the `HELLO` nonces
+[which] feed the connections and the `join_nonce`s [which] feed the join requests
+whose hashes are in the roster chain"*. **No nonce enters this construction.**
+Enumerating the four inputs settles it: `table_id` and `table_params_hash` carry
+none; `roster_hash(0)` is `u8(seat) ‖ app_public_key ‖ u64_be(stack)` per §3.1 and
+carries none; and a `TABLE_READY` body is `roster_hash`, `list_serial`,
+`table_params_hash`, `my_seat` and `capability_set`, which carries none. A
+`join_nonce` reaches `JOIN_REQUEST` alone, and that message is unchained and enters
+nothing downstream — which §4.3 states in the same breath as the reason it is
+unchained.
+
+The correction matters in one direction in particular: an editor who believed a
+nonce carried the uniqueness could relax the freshness requirement on `table_id`
+on the grounds that something else covered it. Nothing else does.
 
 **`advert_hash` is gone from this construction (J1, D-013)** and §3.1's
 `table_params_hash` stands in its place. `session_id` is a component of every

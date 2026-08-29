@@ -39,6 +39,20 @@
 //! compare it against a real hand, and **refuse to seat the player** rather than
 //! starting one that will drop. Do not assume; the protocol reports the server's
 //! real limits back, so there is nothing to guess.
+//!
+//! # The case this cannot fix, said plainly
+//!
+//! **If nobody anywhere is publicly reachable, there is no game.** Not a slow
+//! game or a degraded one — none. Every peer needs a relay to be reached
+//! through, DCUtR needs a relayed connection to upgrade, and neither exists in a
+//! network where every participant is behind a NAT that admits nothing.
+//!
+//! D-004 asks that clients play when *they* are all behind NAT, and that is
+//! satisfiable: it needs one reachable host somewhere, and it does not have to
+//! be a player. What it cannot survive is a network with no reachable host at
+//! all. A client in that position must **say so**, because the alternative is a
+//! lobby that lists tables nobody can sit at and a user who concludes the
+//! software is broken.
 
 use std::time::Duration;
 
