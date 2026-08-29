@@ -2855,6 +2855,32 @@ deal order, small blind first.
 `index_map_hash = h("p2p-poker v1 deck-commit", [ u8(m), for i in 0..2m+5:
 u8(i) || u8(role_code(i)) || u8(owner_seat_or_0xFF(i)) ])`.
 
+**`role_code` and `owner_seat_or_0xFF`, normatively.** This block used `role_code`
+for seven passes without ever saying what the numbers are, which is the same
+defect the burn-card paragraph below describes and with the same consequence:
+two conforming clients that each pick a reasonable encoding produce a different
+`index_map_hash` for an identical table, hence a guaranteed `DECK_COMMIT`
+mismatch every hand, hence a manufactured section 15 dispute that after section
+6.3 faults the table. The gap survived because the construction *reads* complete
+- the term looks like it is defined elsewhere, and no document defines it.
+
+| Role | `role_code` |
+|---|---|
+| reserved, never emitted | 0 |
+| first hole card | 1 |
+| second hole card | 2 |
+| flop | 3 |
+| turn | 4 |
+| river | 5 |
+
+Codes start at 1 so that a zeroed buffer is not a valid map. `role_code` has no
+value for an unused index, and needs none: the product runs over `0..2m+5` and an
+unused index is never hashed.
+
+`owner_seat_or_0xFF(i)` is the **seat index** - the seat's position at the table,
+not its position `d_j` in deal order - for the two hole-card ranges, and `0xFF`
+for the five board indices.
+
 **There are no burn cards.** A burn exists to defeat physical marked-card and
 edge-sorting attacks; there are no physical cards here. A burn that is never
 opened is indistinguishable from an unused index, so burning is a no-op that only

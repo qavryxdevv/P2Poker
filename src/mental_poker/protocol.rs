@@ -40,6 +40,8 @@
 use std::collections::HashSet;
 
 use crate::poker::state::Hash;
+use crate::protocol::serialization::h;
+use crate::protocol::signatures::Domain;
 
 /// The 32-byte context binding every proof is made under.
 ///
@@ -63,6 +65,101 @@ impl DeckCtx {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Build the context of `PROTOCOL.md` §4.5.
+    ///
+    /// **This is the construction site the review named (C-5), and the shape is
+    /// not a stylistic choice.** Simplifying it to a concatenation reintroduces
+    /// a *measured* proof-transfer attack: without the length prefixes, a
+    /// context whose fields differ can produce the same byte string, and a proof
+    /// made in one session then verifies in another. It is hashed, not
+    /// concatenated, because that makes the input fixed-length and reuses the
+    /// one length-prefixed, domain-separated hasher the corpus has.
+    ///
+    /// Field order is part of the protocol. The parameters are a struct rather
+    /// than seven positional arguments because `table_id`, `session_id` and
+    /// `sender_public_key` are all `[u8; 32]`: a transposition would compile,
+    /// would produce a perfectly well-formed context, and would be found only by
+    /// two clients failing to agree.
+    pub fn build(f: &CtxFields) -> Self {
+        let version = f.protocol_version.to_be_bytes();
+        let hand = f.hand_id.to_be_bytes();
+        let sequence = f.sequence.to_be_bytes();
+        let round = [f.position.round_byte()];
+
+        DeckCtx(h(
+            Domain::DeckCtx.context(),
+            &[
+                &version,
+                &f.table_id,
+                &f.session_id,
+                &hand,
+                &sequence,
+                &round,
+                &f.sender_public_key,
+            ],
+        ))
+    }
+}
+
+/// Where in the protocol a proof sits, which is what stops a shuffle proof and
+/// a reveal proof from ever sharing a context.
+///
+/// `PROTOCOL.md` §4.5 spends one byte on this: the 0-based position in the
+/// shuffle chain, or `0xFF` for everything that is not a shuffle step —
+/// `DECK_INIT` ownership proofs and reveal-token DLEQ proofs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofPosition {
+    /// The `round`-th shuffler in the chain.
+    ShuffleStep(u8),
+    /// Not a step of the chain, and so must not share a context with one.
+    NotAShuffleStep,
+}
+
+impl ProofPosition {
+    /// The `round` of a shuffle step, refusing `0xFF`.
+    ///
+    /// `0xFF` is the sentinel meaning "not a shuffle step", so a step claiming
+    /// it would produce a context indistinguishable from a reveal proof of the
+    /// same hand — which is exactly the separation §4.5 spends the byte to buy.
+    /// Unreachable at ten seats, and refused rather than assumed away, because
+    /// the round is an index into a chain whose length arrives from the network.
+    pub const fn shuffle_step(round: u8) -> Option<Self> {
+        if round == NOT_A_SHUFFLE_STEP {
+            None
+        } else {
+            Some(ProofPosition::ShuffleStep(round))
+        }
+    }
+
+    const fn round_byte(self) -> u8 {
+        match self {
+            ProofPosition::ShuffleStep(r) => r,
+            ProofPosition::NotAShuffleStep => NOT_A_SHUFFLE_STEP,
+        }
+    }
+}
+
+/// §4.5's sentinel for a context that is not a shuffle-chain step.
+const NOT_A_SHUFFLE_STEP: u8 = 0xFF;
+
+/// The seven fields of §4.5, named.
+///
+/// Three of them are `[u8; 32]` and would transpose silently as positional
+/// arguments.
+#[derive(Debug, Clone, Copy)]
+pub struct CtxFields {
+    pub protocol_version: u16,
+    /// The table's Ed25519 public key.
+    pub table_id: [u8; 32],
+    /// `session_id` — the session nonce of `SPEC_CS.md` §14/§20.
+    pub session_id: [u8; 32],
+    pub hand_id: u64,
+    /// The chain stage index of the event carrying the proof.
+    pub sequence: u64,
+    pub position: ProofPosition,
+    /// The emitter's application Ed25519 key.
+    pub sender_public_key: [u8; 32],
 }
 
 /// Our verified typestate, not the library's.
@@ -855,6 +952,117 @@ mod tests {
         }
         assert_eq!(admission.len(), 100);
         assert!(admission.admit(0, 0, 10).is_err());
+    }
+
+
+    fn fields() -> CtxFields {
+        CtxFields {
+            protocol_version: 1,
+            table_id: [1u8; 32],
+            session_id: [2u8; 32],
+            hand_id: 7,
+            sequence: 19,
+            position: ProofPosition::NotAShuffleStep,
+            sender_public_key: [3u8; 32],
+        }
+    }
+
+    /// Every field is bound. A field that fell out of the hash would be a field
+    /// a proof is not bound to, and the whole purpose of the context is that a
+    /// proof made in one place does not verify in another.
+    #[test]
+    fn every_field_of_the_context_changes_it() {
+        let base = DeckCtx::build(&fields());
+
+        let mut mutations: Vec<(&str, CtxFields)> = Vec::new();
+        let mut f = fields();
+        f.protocol_version = 2;
+        mutations.push(("protocol_version", f));
+        let mut f = fields();
+        f.table_id = [9u8; 32];
+        mutations.push(("table_id", f));
+        let mut f = fields();
+        f.session_id = [9u8; 32];
+        mutations.push(("session_id", f));
+        let mut f = fields();
+        f.hand_id = 8;
+        mutations.push(("hand_id", f));
+        let mut f = fields();
+        f.sequence = 20;
+        mutations.push(("sequence", f));
+        let mut f = fields();
+        f.position = ProofPosition::ShuffleStep(0);
+        mutations.push(("position", f));
+        let mut f = fields();
+        f.sender_public_key = [9u8; 32];
+        mutations.push(("sender_public_key", f));
+
+        assert_eq!(mutations.len(), 7, "all seven fields of section 4.5");
+        for (name, m) in mutations {
+            assert_ne!(base, DeckCtx::build(&m), "{name} is not bound into ctx");
+        }
+    }
+
+    /// The replay the protocol requires be impossible: seat 2 rebroadcasting
+    /// its own valid proof as seat 3, and the same proof carried into the next
+    /// hand.
+    #[test]
+    fn a_proof_context_does_not_transfer_between_seats_or_hands() {
+        let seat_2 = DeckCtx::build(&CtxFields {
+            position: ProofPosition::shuffle_step(2).unwrap(),
+            ..fields()
+        });
+        let seat_3 = DeckCtx::build(&CtxFields {
+            position: ProofPosition::shuffle_step(3).unwrap(),
+            ..fields()
+        });
+        assert_ne!(seat_2, seat_3);
+
+        let next_hand = DeckCtx::build(&CtxFields {
+            position: ProofPosition::shuffle_step(2).unwrap(),
+            hand_id: 8,
+            ..fields()
+        });
+        assert_ne!(seat_2, next_hand);
+    }
+
+    /// A shuffle step and a reveal proof of the same hand must never share a
+    /// context, which is the one byte section 4.5 spends on the distinction.
+    #[test]
+    fn a_shuffle_step_never_shares_a_context_with_a_reveal() {
+        let reveal = DeckCtx::build(&CtxFields {
+            position: ProofPosition::NotAShuffleStep,
+            ..fields()
+        });
+        for round in 0..=254u8 {
+            let step = DeckCtx::build(&CtxFields {
+                position: ProofPosition::shuffle_step(round).unwrap(),
+                ..fields()
+            });
+            assert_ne!(step, reveal, "round {round} collided with the sentinel");
+        }
+    }
+
+    /// And the sentinel cannot be claimed as a round, which is how that
+    /// separation is enforced rather than hoped for.
+    #[test]
+    fn the_sentinel_is_not_a_round() {
+        assert_eq!(ProofPosition::shuffle_step(0xFF), None);
+        assert_eq!(
+            ProofPosition::shuffle_step(0),
+            Some(ProofPosition::ShuffleStep(0))
+        );
+        assert_eq!(
+            ProofPosition::shuffle_step(254),
+            Some(ProofPosition::ShuffleStep(254))
+        );
+    }
+
+    /// The construction is deterministic, or two honest peers disagree about
+    /// every proof.
+    #[test]
+    fn the_context_is_a_function_of_its_fields() {
+        assert_eq!(DeckCtx::build(&fields()), DeckCtx::build(&fields()));
     }
 
     #[test]
