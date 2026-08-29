@@ -264,6 +264,15 @@ pub enum AcceptRefused {
     ParametersMismatch,
     /// The seat given is not in the roster, or is somebody else's.
     SeatNotOurs { seat: u8 },
+    /// The roster seats this client with a different buy-in from the one it
+    /// asked for.
+    ///
+    /// Not a rounding difference to shrug at: D-018 made `SeatEntry.buyin` this
+    /// seat's `stack_at_hand_start` in `roster_hash(0)`, which feeds
+    /// `session_id` and every hand's `GENESIS(k)`. A founder that seats you with
+    /// a number you did not choose has changed your stack and the identity of
+    /// every hand the table will play.
+    BuyinNotOurs { asked: u64, given: u64 },
     /// The roster is not well formed.
     Roster(RosterRejected),
 }
@@ -274,6 +283,7 @@ pub enum AcceptRefused {
 /// `advert_event` — decoded, signature-checked and admitted. Passing them in
 /// rather than re-deriving them here keeps this function about §4.3's rules and
 /// leaves §4.0's pipeline in one place.
+#[allow(clippy::too_many_arguments)]
 pub fn admit_accept(
     accept: &JoinAccept,
     sender_public_key: &[u8; 32],
@@ -282,6 +292,7 @@ pub fn admit_accept(
     ad_of_echo: &TableAd,
     under: &JoinedUnder,
     our_key: &[u8; 32],
+    our_buyin: u64,
 ) -> Result<Roster, AcceptRefused> {
     if sender_public_key != &under.table_id {
         return Err(AcceptRefused::NotTheTableKey);
@@ -299,10 +310,25 @@ pub fn admit_accept(
     let roster =
         Roster::form(accept.roster_so_far.clone(), &under.ad, false).map_err(AcceptRefused::Roster)?;
 
-    match roster.seat_of(our_key) {
-        Some(s) if s == accept.seat => Ok(roster),
-        _ => Err(AcceptRefused::SeatNotOurs { seat: accept.seat }),
+    let ours = roster
+        .seats()
+        .iter()
+        .find(|e| &e.app_public_key == our_key)
+        .ok_or(AcceptRefused::SeatNotOurs { seat: accept.seat })?;
+
+    if ours.seat != accept.seat {
+        return Err(AcceptRefused::SeatNotOurs { seat: accept.seat });
     }
+    // The buy-in is this seat's starting stack in `roster_hash(0)`, so a founder
+    // that seated us with a different one changed our stack and the identity of
+    // every hand the table will play.
+    if ours.buyin != our_buyin {
+        return Err(AcceptRefused::BuyinNotOurs {
+            asked: our_buyin,
+            given: ours.buyin,
+        });
+    }
+    Ok(roster)
 }
 
 /// The founder's proposal of who is at the table.
@@ -376,6 +402,14 @@ pub enum ReadyRefused {
     ParametersMismatch,
     /// A different list than the one this client holds.
     WrongList { got: u64, held: u64 },
+    /// The roster being ratified is smaller than the table needs to start.
+    ///
+    /// `Roster::form`'s `require_minimum` existed from the beginning and **no
+    /// caller ever passed true**, so `min_players_to_start` was a field the
+    /// advert carried, the admission rules range-checked, and nothing enforced.
+    /// A founder could ratify a two-seat roster for a table advertised as
+    /// needing ten.
+    TooFewToStart { seated: usize, need: u8 },
 }
 
 /// The check on somebody else's `TABLE_READY`.
@@ -386,6 +420,14 @@ pub fn admit_ready(
     list_serial: u64,
     under: &JoinedUnder,
 ) -> Result<(), ReadyRefused> {
+    // `TABLE_READY` is where a proposal becomes a fact, and it is therefore the
+    // one place `min_players_to_start` can be enforced. Nothing enforced it.
+    if roster.len() < under.ad.min_players_to_start as usize {
+        return Err(ReadyRefused::TooFewToStart {
+            seated: roster.len(),
+            need: under.ad.min_players_to_start,
+        });
+    }
     match roster.seat_of(sender_public_key) {
         Some(s) if s == ready.my_seat => {}
         _ => {
@@ -795,6 +837,7 @@ mod tests {
             &ad(),
             &u,
             &[1u8; 32],
+            500,
         )
         .expect("the founder answered honestly");
         assert_eq!(r.seat_of(&[1u8; 32]), Some(1));
@@ -820,7 +863,8 @@ mod tests {
                 &[0xAA; 32],
                 &different,
                 &u,
-                &[1u8; 32]
+                &[1u8; 32],
+                500
             ),
             Err(AcceptRefused::ParametersMismatch)
         );
@@ -837,7 +881,8 @@ mod tests {
                 &[0xAA; 32],
                 &ad(),
                 &u,
-                &[1u8; 32]
+                &[1u8; 32],
+                500
             ),
             Err(AcceptRefused::NotTheTableKey)
         );
@@ -849,7 +894,8 @@ mod tests {
                 &[0xAA; 32],
                 &ad(),
                 &u,
-                &[1u8; 32]
+                &[1u8; 32],
+                500
             ),
             Err(AcceptRefused::WrongRequest)
         );
@@ -861,7 +907,8 @@ mod tests {
                 &[0xCC; 32],
                 &ad(),
                 &u,
-                &[1u8; 32]
+                &[1u8; 32],
+                500
             ),
             Err(AcceptRefused::AdvertMismatch)
         );
@@ -880,7 +927,8 @@ mod tests {
                 &[0xAA; 32],
                 &ad(),
                 &u,
-                &[1u8; 32]
+                &[1u8; 32],
+                500
             ),
             Err(AcceptRefused::SeatNotOurs { seat: 4 })
         );
@@ -901,7 +949,8 @@ mod tests {
                 &[0xAA; 32],
                 &ad(),
                 &u,
-                &[1u8; 32]
+                &[1u8; 32],
+                500
             ),
             Err(AcceptRefused::SeatNotOurs { seat: 0 })
         );
@@ -980,6 +1029,59 @@ mod tests {
             capability_set: vec![b"nlhe/2-6".to_vec()],
         };
         assert_eq!(admit_ready(&ready, &[1u8; 32], &roster, 7, &u), Ok(()));
+    }
+
+
+    /// The buy-in is this seat's starting stack in `roster_hash(0)`, so a
+    /// founder that seats you with a number you did not choose has changed your
+    /// stack and the identity of every hand the table will play. Nothing
+    /// checked it.
+    #[test]
+    fn a_seat_with_the_wrong_buyin_is_refused() {
+        let u = under();
+        let mut cheated = me();
+        cheated.buyin = 250;
+
+        assert_eq!(
+            admit_accept(
+                &accept_for(1, vec![cheated]),
+                &[0xBB; 32],
+                &[0x11; 32],
+                &[0xAA; 32],
+                &ad(),
+                &u,
+                &[1u8; 32],
+                500
+            ),
+            Err(AcceptRefused::BuyinNotOurs {
+                asked: 500,
+                given: 250
+            })
+        );
+    }
+
+    /// `min_players_to_start` was a field the advert carried, the admission
+    /// rules range-checked, and **nothing enforced** — `Roster::form`'s
+    /// `require_minimum` existed and no caller ever passed true. A founder could
+    /// ratify a two-seat roster for a table advertised as needing more.
+    #[test]
+    fn a_roster_below_the_minimum_cannot_be_ratified() {
+        let mut small = ad();
+        small.min_players_to_start = 4;
+        let u = JoinedUnder::pin(small, [0xAA; 32], [0xBB; 32]);
+
+        let roster = seated(two());
+        let ready = TableReady {
+            roster_hash: roster.hash_at_zero(),
+            list_serial: 7,
+            table_params_hash: u.params,
+            my_seat: 1,
+            capability_set: Vec::new(),
+        };
+        assert_eq!(
+            admit_ready(&ready, &[1u8; 32], &roster, 7, &u),
+            Err(ReadyRefused::TooFewToStart { seated: 2, need: 4 })
+        );
     }
 
     /// Every way a ratification can fail to be about the same table, one at a

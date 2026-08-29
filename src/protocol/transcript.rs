@@ -207,16 +207,40 @@ pub fn session_id(
     table_id: &Hash,
     table_params_hash: &Hash,
     roster_zero: &Hash,
-    table_ready_hashes: &[Hash],
+    ratifications: &[Ratification],
 ) -> Hash {
-    let mut parts: Vec<&[u8]> = Vec::with_capacity(3 + table_ready_hashes.len());
+    // §4.3 says *"for each seat s **ascending**"*, and the first version took a
+    // flat list in whatever order the caller had. Two peers that collected the
+    // `TABLE_READY` events as they arrived would then compute two `session_id`s
+    // — and this value is in every subsequent `GENESIS(k)`, so the divergence is
+    // every event of every hand, silently.
+    //
+    // Asserted rather than sorted here. Sorting would hide a caller that had the
+    // order wrong, and a caller with the order wrong has a bug somewhere else
+    // too: the seats it thinks it has are not the seats it has.
+    assert!(
+        ratifications.windows(2).all(|w| w[0].seat < w[1].seat),
+        "the ratifications must be in ascending seat order, without repeats"
+    );
+
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(3 + ratifications.len());
     parts.push(table_id);
     parts.push(table_params_hash);
     parts.push(roster_zero);
-    for h in table_ready_hashes {
-        parts.push(h);
+    for r in ratifications {
+        parts.push(&r.event_hash);
     }
     hash(Domain::Session, &parts)
+}
+
+/// One seat's `TABLE_READY`, for [`session_id`].
+///
+/// The seat travels with the hash so that the ordering §4.3 requires is a
+/// property of the value rather than of the caller's memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ratification {
+    pub seat: SeatIdx,
+    pub event_hash: Hash,
 }
 
 #[cfg(test)]
@@ -359,21 +383,69 @@ mod tests {
         assert_ne!(peer_a, abort_terminal(&TABLE, 4, &[0x99; 32]));
     }
 
+    fn ratified(pairs: &[(u8, u8)]) -> Vec<Ratification> {
+        pairs
+            .iter()
+            .map(|(seat, tag)| Ratification {
+                seat: *seat,
+                event_hash: [*tag; 32],
+            })
+            .collect()
+    }
+
     #[test]
     fn the_session_id_binds_the_roster_and_every_ratification() {
         let roster0 = roster_hash(&roster(&[(0, 10_000), (1, 10_000)]));
-        let ready = [[0xA1; 32], [0xA2; 32]];
+        let ready = ratified(&[(0, 0xA1), (1, 0xA2)]);
         let base = session_id(&TABLE, &PARAMS, &roster0, &ready);
 
         assert_eq!(base, session_id(&TABLE, &PARAMS, &roster0, &ready));
-        assert_ne!(base, session_id(&TABLE, &PARAMS, &roster0, &[[0xA1; 32], [0xFF; 32]]));
+        assert_ne!(
+            base,
+            session_id(&TABLE, &PARAMS, &roster0, &ratified(&[(0, 0xA1), (1, 0xFF)]))
+        );
         assert_ne!(base, session_id(&TABLE, &PARAMS, &[0x99; 32], &ready));
         assert_ne!(base, session_id(&TABLE, &[0x99; 32], &roster0, &ready));
 
-        // Two tables with the same participants get different sessions, because
-        // the ratification events carry the handshake and join nonces.
-        let other_ready = [[0xB1; 32], [0xB2; 32]];
-        assert_ne!(base, session_id(&TABLE, &PARAMS, &roster0, &other_ready));
+        // Two tables with the same participants get different sessions — from
+        // `table_id` being a fresh key per table, and from nothing else. See the
+        // function's own note.
+        assert_ne!(
+            base,
+            session_id(&TABLE, &PARAMS, &roster0, &ratified(&[(0, 0xB1), (1, 0xB2)]))
+        );
+    }
+
+    /// §4.3 says *"for each seat s ascending"*, and the first version of this
+    /// function took a flat list in the caller's order.
+    ///
+    /// Two peers that collected the `TABLE_READY` events as they arrived would
+    /// have computed two different `session_id`s — and that value is in every
+    /// subsequent `GENESIS(k)`, so the divergence would be every event of every
+    /// hand, with nothing to attribute it to.
+    #[test]
+    #[should_panic(expected = "ascending seat order")]
+    fn ratifications_out_of_seat_order_are_refused() {
+        let roster0 = roster_hash(&roster(&[(0, 10_000), (1, 10_000)]));
+        session_id(
+            &TABLE,
+            &PARAMS,
+            &roster0,
+            &ratified(&[(1, 0xA2), (0, 0xA1)]),
+        );
+    }
+
+    /// And the same seat twice is not a roster of two.
+    #[test]
+    #[should_panic(expected = "ascending seat order")]
+    fn a_repeated_seat_is_refused() {
+        let roster0 = roster_hash(&roster(&[(0, 10_000), (1, 10_000)]));
+        session_id(
+            &TABLE,
+            &PARAMS,
+            &roster0,
+            &ratified(&[(0, 0xA1), (0, 0xA2)]),
+        );
     }
 
     /// Every construction in this module is domain-separated, so the same parts
