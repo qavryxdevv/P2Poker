@@ -28,6 +28,10 @@ libp2p = { version = "0.56.0", features = [
     "ed25519", "serde",
 ] }
 libp2p-stream = "0.4.0-alpha"
+# Only so this crate can implement `libp2p::request_response::Codec`, whose
+# trait is `#[async_trait]`. Already in the graph via that crate; this makes the
+# edge direct rather than adding anything to build.
+async-trait = "0.1"
 
 # --- global discovery: docs/research/MAINLINE_DHT.md ----------------------
 mainline = { version = "=8.0.0", default-features = false, features = ["async"] }

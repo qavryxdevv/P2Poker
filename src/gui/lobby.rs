@@ -44,6 +44,11 @@ pub struct TableRow {
     pub seated: u8,
     /// How many the table needs before it can start.
     pub needed: u8,
+    /// What the sit-down dialog should offer: the maximum a cash table allows,
+    /// or the one stack a tournament pays. Offered rather than imposed — the
+    /// founder checks it either way — but a dialog that opened on a number the
+    /// table would refuse is a dialog that wastes a round trip.
+    pub default_buyin: u64,
     /// The starting stack for a tournament, or the buy-in range for cash.
     pub stack: String,
     /// "20 s + 5 s", the clock a player gets to act.
@@ -138,6 +143,11 @@ pub fn row(key: [u8; 32], held: &Held) -> TableRow {
         occupancy: format!("{} / {}", ad.players, ad.max_players),
         seated: ad.players,
         needed: ad.min_players_to_start,
+        default_buyin: if Mode::parse(ad.mode).is_some_and(|m| m.is_tournament()) {
+            ad.start_stack
+        } else {
+            ad.max_buyin
+        },
         stack,
         timing: format!(
             "{} s + {} s",
@@ -449,6 +459,7 @@ mod tests {
         Held {
             ad: ad(players),
             params_hash: [0u8; 32],
+            advert_hash: [0u8; 32],
             received_at_ms: NOW,
             unjoinable,
         }
@@ -581,10 +592,10 @@ mod tests {
         let mut alpha = ad(1);
         alpha.table_name = "Alpha".into();
 
-        a.offer([1u8; 32], zebra.clone(), [0u8; 32], NOW).unwrap();
-        a.offer([2u8; 32], alpha.clone(), [0u8; 32], NOW).unwrap();
-        b.offer([2u8; 32], alpha, [0u8; 32], NOW).unwrap();
-        b.offer([1u8; 32], zebra, [0u8; 32], NOW).unwrap();
+        a.offer([1u8; 32], zebra.clone(), [0u8; 32], [0u8; 32], NOW).unwrap();
+        a.offer([2u8; 32], alpha.clone(), [0u8; 32], [0u8; 32], NOW).unwrap();
+        b.offer([2u8; 32], alpha, [0u8; 32], [0u8; 32], NOW).unwrap();
+        b.offer([1u8; 32], zebra, [0u8; 32], [0u8; 32], NOW).unwrap();
 
         let ra = rows(&a);
         let rb = rows(&b);
@@ -597,7 +608,7 @@ mod tests {
     #[test]
     fn a_selection_that_expired_is_simply_gone() {
         let mut store = LobbyStore::new();
-        store.offer([1u8; 32], ad(1), [0u8; 32], NOW).unwrap();
+        store.offer([1u8; 32], ad(1), [0u8; 32], [0u8; 32], NOW).unwrap();
         let mut view = LobbyView::from(&store, NetworkStatus::default());
 
         view.selected = Some([1u8; 32]);

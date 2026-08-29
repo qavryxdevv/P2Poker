@@ -35,7 +35,10 @@ use std::time::Duration;
 // libp2p's for the swarm - so both are named rather than glob-imported. A `next`
 // that resolved to the wrong one compiles until it does not.
 use futures_lite::StreamExt as DhtStreamExt;
-use libp2p::{futures::StreamExt as SwarmStreamExt, gossipsub, identity, swarm::SwarmEvent, Multiaddr};
+use libp2p::{
+    futures::StreamExt as SwarmStreamExt, gossipsub, identity, request_response, swarm::SwarmEvent,
+    Multiaddr, PeerId,
+};
 use mainline::{Dht, Id};
 use tokio::sync::mpsc;
 
@@ -43,10 +46,12 @@ use std::collections::HashSet;
 use std::net::SocketAddrV4;
 
 use super::advert;
+use super::formation::{Failed, Formation, Send};
+use super::joinrpc;
 use super::dht::{self, PeerHints, Swarm as DhtSwarm, REANNOUNCE_INTERVAL};
 use super::relay;
 use super::lobby::TableAd;
-use super::node::{quic_dial_addr, worth_parsing, NodeEvent, NodeState, REBROADCAST};
+use super::node::{quic_dial_addr, worth_parsing, NodeCommand, NodeEvent, NodeState, REBROADCAST};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
 use crate::protocol::constants::{AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX, MAX_SEATS};
 
@@ -117,7 +122,9 @@ pub struct Hosted {
 
 pub async fn run(
     identity: identity::Keypair,
+    app_key: ed25519_dalek::SigningKey,
     events: mpsc::Sender<NodeEvent>,
+    mut commands: mpsc::Receiver<NodeCommand>,
     mut hosted: Option<Hosted>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut swarm = swarm::build(NodeConfig {
@@ -141,6 +148,14 @@ pub async fn run(
 
     let mut state = NodeState::new();
     let mut hints = PeerHints::new();
+    let my_peer_bytes = swarm.local_peer_id().to_bytes();
+
+    // The table this client is forming or sitting at, and the mesh it is formed
+    // on. One table at a time in this loop; multi-tabling is more than one
+    // client, which is what §4.3's per-roster `peer_id` rule already allows and
+    // what the lobby's own rules are written for.
+    let mut table: Option<Formation> = None;
+    let mut table_topic: Option<gossipsub::IdentTopic> = None;
 
     // The DHT socket. Port 0, never 6881 - see `dht`.
     let dht = Dht::builder()
@@ -225,6 +240,110 @@ pub async fn run(
                                 ),
                             })
                             .await;
+                    }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Join(
+                        request_response::Event::Message { peer, message, .. },
+                    )) => {
+                        let now = super::node::now_unix_ms();
+                        match message {
+                            request_response::Message::Request { request, channel, .. } => {
+                                // `peer` is what the **transport** authenticated,
+                                // and it is what §4.3 compares the request's own
+                                // claim against. The whole of `U17` — one node,
+                                // one seat — rests on using this and not the
+                                // value in the payload.
+                                let authenticated = peer.to_bytes();
+                                let Some(f) = table.as_mut() else {
+                                    // No table here to join. Saying nothing is
+                                    // right: an answer would confirm that this
+                                    // client is a founder of something.
+                                    continue;
+                                };
+                                match f.on_join_request(&request, &authenticated, now) {
+                                    Ok(sends) => {
+                                        for send in sends {
+                                            match send {
+                                                Send::Reply(bytes) => {
+                                                    let _ = swarm
+                                                        .behaviour_mut()
+                                                        .join
+                                                        .send_response(channel, bytes);
+                                                    break;
+                                                }
+                                                Send::Broadcast(bytes) => {
+                                                    if let Some(t) = &table_topic {
+                                                        let _ = swarm
+                                                            .behaviour_mut()
+                                                            .gossipsub
+                                                            .publish(t.clone(), bytes);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // The reply is taken above; the rest of
+                                        // the sends are the list and this
+                                        // client's own ratification.
+                                        report_roster(&events, f).await;
+                                        if let Some(session) = f.session() {
+                                            let _ = events.send(NodeEvent::TableReal {
+                                                key: f.table_id(),
+                                                session,
+                                            }).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // A structurally invalid request gets no
+                                        // answer at all, which is what
+                                        // `Formation` returns an error for.
+                                        let _ = events.send(NodeEvent::Warning(
+                                            format!("a join request was dropped: {e:?}"))).await;
+                                    }
+                                }
+                            }
+                            request_response::Message::Response { response, .. } => {
+                                let Some(f) = table.as_mut() else { continue };
+                                match f.on_join_answer(&response, now) {
+                                    Ok(_) => {
+                                        if let Some(seat) = f.my_seat() {
+                                            let _ = events.send(NodeEvent::Seated {
+                                                key: f.table_id(),
+                                                seat,
+                                            }).await;
+                                        }
+                                        report_roster(&events, f).await;
+                                    }
+                                    Err(Failed::Refused { reason, .. }) => {
+                                        table = None;
+                                        if let Some(t) = table_topic.take() {
+                                            let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
+                                        }
+                                        let _ = events
+                                            .send(NodeEvent::JoinRefused { reason })
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        table = None;
+                                        let _ = events.send(NodeEvent::LeftTable {
+                                            why: format!("the acceptance did not hold: {e:?}"),
+                                        }).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Join(
+                        request_response::Event::OutboundFailure { error, .. },
+                    )) => {
+                        // A join that goes unanswered has to say so. Silence
+                        // here is a player looking at a button that appears to
+                        // have done nothing.
+                        table = None;
+                        if let Some(t) = table_topic.take() {
+                            let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
+                        }
+                        let _ = events.send(NodeEvent::LeftTable {
+                            why: format!("the founder did not answer: {error}"),
+                        }).await;
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Dcutr(ev)) => {
                         match ev.result {
@@ -449,6 +568,142 @@ pub async fn run(
                 }
             }
 
+            Some(command) = commands.recv() => {
+                let now = super::node::now_unix_ms();
+                match command {
+                    NodeCommand::CreateTable { name, seats, min_players, buyin, password } => {
+                        // A fresh key per table, and that freshness is the only
+                        // thing making two tables with the same players and the
+                        // same rules different games (§4.3's `session_id`).
+                        let seed = match crate::security::rng::secret_32() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                let _ = events.send(NodeEvent::Warning(
+                                    format!("no randomness for a table key: {e}"))).await;
+                                continue;
+                            }
+                        };
+                        let table_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+                        let ad = new_table(
+                            name,
+                            seats,
+                            min_players,
+                            buyin,
+                            password.is_some(),
+                            app_key.verifying_key().to_bytes(),
+                            my_peer_bytes.clone(),
+                            now,
+                        );
+                        match advert::publish(&ad, &table_key) {
+                            Ok(bytes) => {
+                                let hash = advert_hash_of(&bytes);
+                                match Formation::found(
+                                    app_key.clone(),
+                                    table_key.clone(),
+                                    ad.clone(),
+                                    bytes.clone(),
+                                    hash,
+                                    password,
+                                    my_peer_bytes.clone(),
+                                    display_name(&app_key),
+                                    buyin,
+                                ) {
+                                    Ok(f) => {
+                                        let key = f.table_id();
+                                        let topic = joinrpc::table_topic(&key);
+                                        let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                                        table_topic = Some(topic);
+                                        table = Some(f);
+                                        // Kept for the housekeeping
+                                        // re-broadcast, which is what stops the
+                                        // table vanishing from every lobby after
+                                        // ninety seconds.
+                                        hosted = Some(Hosted { ad, key: table_key });
+                                        let _ = swarm.behaviour_mut().gossipsub
+                                            .publish(topics.lobby.clone(), bytes);
+                                        let _ = events.send(NodeEvent::Hosting { key }).await;
+                                        report_roster(&events, table.as_ref().unwrap()).await;
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(NodeEvent::Warning(
+                                            format!("the table does not form: {e:?}"))).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = events.send(NodeEvent::Warning(
+                                    format!("the advert does not publish: {e}"))).await;
+                            }
+                        }
+                    }
+
+                    NodeCommand::JoinTable { key, buyin, seat, password } => {
+                        let Some(held) = state.lobby.get(&key).cloned() else {
+                            let _ = events.send(NodeEvent::Warning(
+                                "that table is no longer advertised".into())).await;
+                            continue;
+                        };
+                        // The founder's PeerId comes from the advert, which was
+                        // signed by the table key. Dialling anything else would
+                        // be taking routing advice from whoever spoke last.
+                        let founder = match PeerId::from_bytes(&held.ad.founder_peer_id) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                let _ = events.send(NodeEvent::Warning(
+                                    "that table advertises a peer id this client cannot read"
+                                        .into())).await;
+                                continue;
+                            }
+                        };
+                        let nonce = match crate::security::rng::secret_32() {
+                            Ok(n) => n,
+                            Err(e) => {
+                                let _ = events.send(NodeEvent::Warning(
+                                    format!("no randomness for a join nonce: {e}"))).await;
+                                continue;
+                            }
+                        };
+                        match Formation::join(
+                            app_key.clone(),
+                            held.ad.clone(),
+                            held.advert_hash,
+                            key,
+                            my_peer_bytes.clone(),
+                            display_name(&app_key),
+                            buyin,
+                            seat,
+                            password.as_deref(),
+                            nonce,
+                            now,
+                        ) {
+                            Ok((f, request)) => {
+                                let topic = joinrpc::table_topic(&key);
+                                let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                                table_topic = Some(topic);
+                                table = Some(f);
+                                swarm.behaviour_mut().join.send_request(&founder, request);
+                            }
+                            Err(e) => {
+                                let _ = events.send(NodeEvent::LeftTable {
+                                    why: format!("cannot ask to join: {e:?}"),
+                                }).await;
+                            }
+                        }
+                    }
+
+                    NodeCommand::LeaveTable => {
+                        if let Some(t) = table_topic.take() {
+                            let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
+                        }
+                        table = None;
+                        hosted = None;
+                        let _ = events.send(NodeEvent::LeftTable {
+                            why: "left the table".into(),
+                        }).await;
+                    }
+                }
+            }
+
             _ = housekeeping.tick() => {
                 let now = super::node::now_unix_ms();
                 state.tick(now);
@@ -487,6 +742,123 @@ pub async fn run(
                 }
             }
         }
+    }
+}
+
+/// Tell the interface who is seated.
+///
+/// The whole roster every time rather than a difference: a difference is only
+/// correct if the receiver never missed one, and this channel is bounded and
+/// drops under load by design.
+async fn report_roster(events: &mpsc::Sender<NodeEvent>, f: &Formation) {
+    let seats = f
+        .roster()
+        .seats()
+        .iter()
+        .map(|e| (e.seat, e.display_name.clone(), e.buyin))
+        .collect();
+    let _ = events
+        .send(NodeEvent::Roster {
+            key: f.table_id(),
+            seats,
+        })
+        .await;
+}
+
+/// The `event_hash` of an advert this client just published.
+///
+/// Taken from the bytes rather than recomputed from the value, because it is the
+/// bytes a joiner will name and the founder will look up.
+fn advert_hash_of(bytes: &[u8]) -> [u8; 32] {
+    use crate::protocol::messages::SignedEvent;
+    match crate::protocol::serialization::from_canonical::<SignedEvent>(bytes, LOBBY_MSG_MAX) {
+        Ok(signed) => crate::protocol::transcript::event_hash(&signed.body),
+        // Unreachable for bytes this client produced a moment ago; a zero hash
+        // simply makes every join request name an advert nobody signed, which
+        // fails closed.
+        Err(_) => [0u8; 32],
+    }
+}
+
+/// A player's name, until there is a place to set one.
+///
+/// Eight characters of their own key. Not an identifier and never treated as
+/// one — §4.3 is explicit that a display name is untrusted display data forever
+/// — but it is stable, it is theirs, and two players are never confused.
+fn display_name(app_key: &ed25519_dalek::SigningKey) -> String {
+    app_key.verifying_key().to_bytes()[..4]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The advertisement for a table this client is founding.
+///
+/// `CUSTOM` and not a name of its own: §7.2 rule 3 admits exactly two preset
+/// identifiers, and a name that asserts values nothing checks is how two clients
+/// ship different tables under one identity.
+#[allow(clippy::too_many_arguments)]
+fn new_table(
+    name: String,
+    seats: u8,
+    min_players: u8,
+    buyin: u64,
+    password_required: bool,
+    founder_app_key: [u8; 32],
+    founder_peer_id: Vec<u8>,
+    now_ms: u64,
+) -> TableAd {
+    use super::lobby::{BlindSchedule, DECK_SUITE_V1};
+    use crate::protocol::constants::hand_deadline_min_ms;
+
+    let seats = seats.clamp(2, MAX_SEATS);
+    let (action, grace, crypto, delay) = (20_000u32, 5_000u32, 30_000u32, 7_000u32);
+    TableAd {
+        game: 1,
+        mode: 1,
+        preset_id: "CUSTOM".into(),
+        // Trimmed rather than refused: §7.2 caps it, and a table that will not
+        // advertise because its name is long is a worse answer than one that
+        // advertises under a shorter name.
+        table_name: name.chars().take(32).collect(),
+        small_blind: 10,
+        big_blind: 20,
+        ante: 0,
+        // The buy-in the founder chose is inside the range it advertises, which
+        // is what `SeatEntry::admissible` checks its own seat against.
+        min_buyin: buyin.min(200),
+        max_buyin: buyin.max(2_000),
+        start_stack: 0,
+        players: 1,
+        max_players: seats,
+        min_players_to_start: min_players.clamp(2, seats),
+        blind_schedule: BlindSchedule {
+            mode: 1,
+            every_n_hands: 20,
+            first_small_blind: 10,
+            small_blind_cap: 1_000,
+        },
+        action_timeout_ms: action,
+        action_grace_ms: grace,
+        crypto_step_timeout_ms: crypto,
+        hand_deadline_ms: hand_deadline_min_ms(
+            seats,
+            action as u64,
+            grace as u64,
+            crypto as u64,
+            delay as u64,
+        ) as u32,
+        join_deadline_ms: 120_000,
+        hand_delay_ms: delay,
+        button_rule: 1,
+        odd_chip_rule: 1,
+        showdown_policy: 1,
+        password_required,
+        deck_suite: DECK_SUITE_V1.into(),
+        founder_app_key,
+        founder_peer_id,
+        timestamp_unix_ms: now_ms,
+        expires_at_unix_ms: now_ms + AD_TTL_MS,
     }
 }
 

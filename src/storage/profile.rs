@@ -86,6 +86,50 @@ pub fn load_or_create_identity(dir: &Path) -> io::Result<libp2p::identity::Keypa
     Ok(key)
 }
 
+/// Where this client's **application** key lives.
+///
+/// A second file, deliberately. §20 keeps the two identities apart: a `PeerId`
+/// says which socket you are talking to, an application key says who is playing.
+/// One file holding both would make them one secret, and a client that had to
+/// rotate its network identity would be a different player.
+pub fn app_key_path(dir: &Path) -> PathBuf {
+    dir.join("player.key")
+}
+
+/// Load the application key, creating one on first run.
+///
+/// The same shape as the identity for the same reason: 32 raw bytes, nothing to
+/// parse, and an existing file that is not one is never overwritten.
+///
+/// This is the key that signs `JOIN_REQUEST` and `TABLE_READY`, that appears in
+/// every roster, and that a table's `roster_hash(0)` is computed over. It must
+/// survive a restart or a player rejoining their own table is a stranger.
+pub fn load_or_create_app_key(dir: &Path) -> io::Result<ed25519_dalek::SigningKey> {
+    let path = app_key_path(dir);
+
+    if let Ok(bytes) = fs::read(&path) {
+        if bytes.len() == 32 {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            return Ok(ed25519_dalek::SigningKey::from_bytes(&seed));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exists and is not a 32-byte key; move it aside rather than \
+                 letting this overwrite it",
+                path.display()
+            ),
+        ));
+    }
+
+    fs::create_dir_all(dir)?;
+    let seed = crate::security::rng::secret_32()
+        .map_err(|e| io::Error::other(format!("no operating system randomness: {e}")))?;
+    fs::write(&path, seed)?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +138,54 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("p2p-poker-test-{name}"));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// The player's own key survives a restart too, or rejoining your own table
+    /// makes you a stranger to it.
+    #[test]
+    fn the_application_key_survives_a_restart() {
+        let dir = scratch("app-key");
+        let first = load_or_create_app_key(&dir).unwrap();
+        let again = load_or_create_app_key(&dir).unwrap();
+        assert_eq!(
+            first.verifying_key().to_bytes(),
+            again.verifying_key().to_bytes()
+        );
+    }
+
+    /// And it is a **different** key from the network identity. §20 keeps the
+    /// two apart, and one file holding both would make them one secret.
+    #[test]
+    fn the_two_identities_are_two_keys() {
+        let dir = scratch("two-keys");
+        let node = load_or_create_identity(&dir).unwrap();
+        let player = load_or_create_app_key(&dir).unwrap();
+        let node_bytes = node.clone().try_into_ed25519().unwrap().to_bytes();
+        assert_ne!(
+            &node_bytes[..32],
+            &player.to_bytes()[..],
+            "the network identity and the player identity are the same secret"
+        );
+        assert_ne!(
+            identity_path(&dir),
+            app_key_path(&dir),
+            "one file cannot hold two identities"
+        );
+    }
+
+    /// A file that is there and is not a key is left alone. It might be
+    /// somebody's data in the wrong place.
+    #[test]
+    fn an_unrecognised_file_is_never_overwritten() {
+        let dir = scratch("not-a-key");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(app_key_path(&dir), b"this is not a key").unwrap();
+        assert!(load_or_create_app_key(&dir).is_err());
+        assert_eq!(
+            fs::read(app_key_path(&dir)).unwrap(),
+            b"this is not a key",
+            "the file was overwritten"
+        );
     }
 
     /// The point of persisting it: the same directory is the same client.

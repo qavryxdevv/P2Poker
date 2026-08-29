@@ -48,10 +48,62 @@ use super::theme;
 pub enum LobbyAction {
     None,
     Select([u8; 32]),
-    Join([u8; 32]),
-    CreateTable,
+    /// Found a table with these settings.
+    Create(NewTable),
+    /// Sit down at a table this client has seen advertised.
+    Sit {
+        key: [u8; 32],
+        buyin: u64,
+        password: Option<Vec<u8>>,
+    },
     OpenTableWindow,
     LeaveTable,
+}
+
+/// What the create dialog collects.
+///
+/// Everything else about a table is fixed by this version: the blinds, the
+/// clock, the button rule. A field the client offers and the protocol does not
+/// check is a field two clients can disagree about, so only the ones §7.2 admits
+/// under `CUSTOM` are asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTable {
+    pub name: String,
+    pub seats: u8,
+    pub min_players: u8,
+    pub buyin: u64,
+    pub password: String,
+}
+
+impl Default for NewTable {
+    fn default() -> Self {
+        NewTable {
+            name: "New table".into(),
+            seats: 6,
+            min_players: 2,
+            buyin: 1_000,
+            password: String::new(),
+        }
+    }
+}
+
+/// What the sit-down dialog collects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SitDown {
+    pub key: [u8; 32],
+    pub buyin: u64,
+    pub password: String,
+    /// Whether the table said it wants one. Shown, not enforced: the founder
+    /// decides, and a client that hid the field would make a joinable table look
+    /// unjoinable.
+    pub wants_password: bool,
+}
+
+/// Which dialog is open, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dialog {
+    Create(NewTable),
+    Sit(SitDown),
 }
 
 /// The parts of the pane the user types into.
@@ -63,6 +115,8 @@ pub enum LobbyAction {
 pub struct LobbyUi {
     pub search: String,
     pub filter: Filter,
+    /// The dialog the player has open, if any.
+    pub dialog: Option<Dialog>,
 }
 
 /// Install the palette and the text sizes.
@@ -198,7 +252,156 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
         .frame(frame())
         .show(ui, |ui| people_column(ui, view));
 
+    if let Some(what) = dialog(ui, state) {
+        action = what;
+    }
+
     action
+}
+
+/// The create and sit-down dialogs, which are the only two places this client
+/// asks a player for anything.
+fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
+    let mut action = None;
+    let mut close = false;
+    let mut open = state.dialog.take()?;
+
+    let title = match &open {
+        Dialog::Create(_) => "Create a table",
+        Dialog::Sit(_) => "Sit down",
+    };
+
+    egui::Window::new(RichText::new(title).size(19.0).strong())
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .stroke(Stroke::new(1.0, theme::LINE))
+                .corner_radius(12.0)
+                .inner_margin(18.0),
+        )
+        .show(ui.ctx(), |ui| {
+            ui.set_min_width(340.0);
+            match &mut open {
+                Dialog::Create(f) => {
+                    field_row(ui, "Name", |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut f.name).char_limit(32));
+                    });
+                    field_row(ui, "Seats", |ui| {
+                        ui.add(egui::Slider::new(&mut f.seats, 2..=10));
+                    });
+                    field_row(ui, "Start with", |ui| {
+                        ui.add(egui::Slider::new(&mut f.min_players, 2..=f.seats.max(2)));
+                    });
+                    field_row(ui, "Buy-in", |ui| {
+                        ui.add(egui::DragValue::new(&mut f.buyin).range(200..=2_000));
+                    });
+                    field_row(ui, "Password", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut f.password)
+                                .password(true)
+                                .hint_text("optional"),
+                        );
+                    });
+                    if !f.password.is_empty() {
+                        // §4.3 requires this to be said: the proof is per join
+                        // and does not replay, but a weak table password is
+                        // guessable offline by anyone who sees one proof.
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(super::lobby::PASSWORD_WARNING)
+                                .color(theme::WARN)
+                                .size(14.0),
+                        );
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Create")
+                                        .color(Color32::from_rgb(4, 16, 26))
+                                        .strong(),
+                                )
+                                .fill(theme::ACCENT)
+                                .min_size(egui::vec2(120.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            action = Some(LobbyAction::Create(f.clone()));
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::Sit(f) => {
+                    field_row(ui, "Buy-in", |ui| {
+                        ui.add(egui::DragValue::new(&mut f.buyin));
+                    });
+                    if f.wants_password {
+                        field_row(ui, "Password", |ui| {
+                            ui.add(egui::TextEdit::singleline(&mut f.password).password(true));
+                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(super::lobby::PASSWORD_WARNING)
+                                .color(theme::WARN)
+                                .size(14.0),
+                        );
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Sit down")
+                                        .color(Color32::from_rgb(4, 16, 26))
+                                        .strong(),
+                                )
+                                .fill(theme::ACCENT)
+                                .min_size(egui::vec2(120.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            action = Some(LobbyAction::Sit {
+                                key: f.key,
+                                buyin: f.buyin,
+                                password: if f.password.is_empty() {
+                                    None
+                                } else {
+                                    Some(f.password.as_bytes().to_vec())
+                                },
+                            });
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+            }
+        });
+
+    if !close {
+        state.dialog = Some(open);
+    }
+    action
+}
+
+/// A labelled row in a dialog, so the labels line up without a grid.
+fn field_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(96.0, 24.0),
+            egui::Label::new(RichText::new(label).color(theme::TEXT_DIM)),
+        );
+        add(ui);
+    });
+    ui.add_space(6.0);
 }
 
 fn header(ui: &mut egui::Ui, view: &LobbyView) {
@@ -310,7 +513,7 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
                     )
                     .clicked()
                 {
-                    action = LobbyAction::CreateTable;
+                    state.dialog = Some(Dialog::Create(NewTable::default()));
                 }
 
                 let can_join = view.can_join();
@@ -321,7 +524,12 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
                 );
                 if join.clicked() {
                     if let Some(row) = view.selected_row() {
-                        action = LobbyAction::Join(row.key);
+                        state.dialog = Some(Dialog::Sit(SitDown {
+                            key: row.key,
+                            buyin: row.default_buyin,
+                            password: String::new(),
+                            wants_password: row.password_required,
+                        }));
                     }
                 }
                 if !can_join {

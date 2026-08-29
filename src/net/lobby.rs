@@ -368,6 +368,22 @@ pub struct Held {
     pub ad: TableAd,
     /// The parameter hash rule 7 compares against.
     pub params_hash: Hash,
+    /// The `event_hash` of the advertisement this record came from.
+    ///
+    /// Kept because **a joiner cannot build a `JOIN_REQUEST` without it**:
+    /// §4.3's `n(0) advert_hash` names the advert being joined, and it is the
+    /// hash of bytes the store had already thrown away. The lobby was complete
+    /// as a list of tables and unusable as a way to sit down at one, which is
+    /// the kind of gap that only appears when the two halves are finally joined.
+    ///
+    /// Unlike `params_hash` this is **per re-broadcast** — every re-broadcast
+    /// carries a strictly greater timestamp and therefore hashes differently —
+    /// so it is the hash of the copy this client accepted and of no other. That
+    /// is exactly right for `JOIN_REQUEST`, which the founder answers by looking
+    /// up an advert it signed, and exactly wrong for anything that must be
+    /// agreed between joiners, which is why D-013 put `table_params_hash` in
+    /// those places instead.
+    pub advert_hash: Hash,
     /// When this client accepted it, by its own clock. A local view, never
     /// canonical state.
     pub received_at_ms: u64,
@@ -420,6 +436,7 @@ impl LobbyStore {
         table_key: [u8; 32],
         ad: TableAd,
         params_hash: Hash,
+        advert_hash: Hash,
         now_ms: u64,
     ) -> Result<(), NotTaken> {
         match self.tables.get_mut(&table_key) {
@@ -443,6 +460,11 @@ impl LobbyStore {
                     return Err(NotTaken::NotNewer);
                 }
                 held.ad = ad;
+                // The hash follows the copy actually held, because that is what
+                // a `JOIN_REQUEST` names and the founder looks up. Leaving the
+                // first one behind would have every joiner naming an advert the
+                // founder had already replaced.
+                held.advert_hash = advert_hash;
                 held.received_at_ms = now_ms;
                 Ok(())
             }
@@ -488,6 +510,7 @@ impl LobbyStore {
                     Held {
                         ad,
                         params_hash,
+                        advert_hash,
                         received_at_ms: now_ms,
                         unjoinable: false,
                     },
@@ -952,11 +975,11 @@ mod tests {
         let key = [1u8; 32];
         let mut ad = legal_custom();
         ad.timestamp_unix_ms = NOW + 1_000;
-        store.offer(key, ad.clone(), h(9), NOW).unwrap();
+        store.offer(key, ad.clone(), h(9), [0u8; 32], NOW).unwrap();
 
         ad.timestamp_unix_ms = NOW;
         assert_eq!(
-            store.offer(key, ad.clone(), h(9), NOW),
+            store.offer(key, ad.clone(), h(9), [0u8; 32], NOW),
             Err(NotTaken::NotNewer)
         );
         assert_eq!(
@@ -974,13 +997,13 @@ mod tests {
         let mut store = LobbyStore::new();
         let key = [1u8; 32];
         let mut ad = legal_custom();
-        store.offer(key, ad.clone(), h(1), NOW).unwrap();
+        store.offer(key, ad.clone(), h(1), [0u8; 32], NOW).unwrap();
         assert_eq!(store.joinable().count(), 1);
 
         ad.timestamp_unix_ms += 1;
         ad.small_blind = 25;
         assert_eq!(
-            store.offer(key, ad, h(2), NOW),
+            store.offer(key, ad, h(2), [0u8; 32], NOW),
             Err(NotTaken::ParametersChanged)
         );
 
@@ -1007,13 +1030,13 @@ mod tests {
         let key = [1u8; 32];
 
         let first = legal_custom();
-        store.offer(key, first.clone(), h(1), NOW).unwrap();
+        store.offer(key, first.clone(), h(1), [0u8; 32], NOW).unwrap();
 
         // Same timestamp, different parameters.
         let mut second = first;
         second.small_blind = 25;
         assert_eq!(
-            store.offer(key, second, h(2), NOW),
+            store.offer(key, second, h(2), [0u8; 32], NOW),
             Err(NotTaken::ParametersChanged),
             "not NotNewer: the timestamps are equal and the game is not"
         );
@@ -1029,12 +1052,12 @@ mod tests {
 
         let mut newer = legal_custom();
         newer.timestamp_unix_ms = NOW + 10_000;
-        store.offer(key, newer, h(1), NOW).unwrap();
+        store.offer(key, newer, h(1), [0u8; 32], NOW).unwrap();
 
         let mut older = legal_custom();
         older.small_blind = 25;
         assert_eq!(
-            store.offer(key, older, h(2), NOW),
+            store.offer(key, older, h(2), [0u8; 32], NOW),
             Err(NotTaken::ParametersChanged)
         );
         assert!(store.get(&key).unwrap().unjoinable);
@@ -1046,11 +1069,11 @@ mod tests {
         let mut store = LobbyStore::new();
         let key = [1u8; 32];
         let mut ad = legal_custom();
-        store.offer(key, ad.clone(), h(1), NOW).unwrap();
+        store.offer(key, ad.clone(), h(1), [0u8; 32], NOW).unwrap();
 
         ad.timestamp_unix_ms += 30_000;
         ad.players = 4;
-        store.offer(key, ad, h(1), NOW + 30_000).unwrap();
+        store.offer(key, ad, h(1), [0u8; 32], NOW + 30_000).unwrap();
 
         let held = store.get(&key).unwrap();
         assert_eq!(held.ad.players, 4);
@@ -1066,7 +1089,7 @@ mod tests {
         let mut store = LobbyStore::new();
         let mut ad = legal_custom();
         ad.expires_at_unix_ms = NOW + MAX_AD_LIFETIME_MS;
-        store.offer([1u8; 32], ad, h(1), NOW).unwrap();
+        store.offer([1u8; 32], ad, h(1), [0u8; 32], NOW).unwrap();
 
         assert_eq!(store.expire(NOW + AD_TTL_MS - 1), 0);
         assert_eq!(store.expire(NOW + AD_TTL_MS), 1, "no re-broadcast heard");
@@ -1078,7 +1101,7 @@ mod tests {
         let mut store = LobbyStore::new();
         let mut ad = legal_custom();
         ad.expires_at_unix_ms = NOW + 1_000;
-        store.offer([1u8; 32], ad, h(1), NOW).unwrap();
+        store.offer([1u8; 32], ad, h(1), [0u8; 32], NOW).unwrap();
         assert_eq!(store.expire(NOW + 2_000), 1);
     }
 
@@ -1096,7 +1119,7 @@ mod tests {
         for i in 0..MAX_TRACKED_TABLES as u32 {
             let mut key = [0u8; 32];
             key[..4].copy_from_slice(&i.to_be_bytes());
-            assert_eq!(store.offer(key, legal_custom(), h(1), NOW), Ok(()));
+            assert_eq!(store.offer(key, legal_custom(), h(1), [0u8; 32], NOW), Ok(()));
         }
         assert_eq!(store.len(), MAX_TRACKED_TABLES);
 
@@ -1104,7 +1127,7 @@ mod tests {
         let mut honest = legal_custom();
         honest.table_name = "arrived late".into();
         honest.expires_at_unix_ms = NOW + MAX_AD_LIFETIME_MS;
-        assert_eq!(store.offer([0xFF; 32], honest, h(1), NOW), Ok(()));
+        assert_eq!(store.offer([0xFF; 32], honest, h(1), [0u8; 32], NOW), Ok(()));
         assert_eq!(store.len(), MAX_TRACKED_TABLES);
         assert!(
             store.get(&[0xFF; 32]).is_some(),
@@ -1122,12 +1145,12 @@ mod tests {
             let mut ad = legal_custom();
             // Table 0 expires first by a whole second.
             ad.expires_at_unix_ms = NOW + 60_000 + i as u64;
-            assert_eq!(store.offer(key, ad, h(1), NOW), Ok(()));
+            assert_eq!(store.offer(key, ad, h(1), [0u8; 32], NOW), Ok(()));
         }
 
         let mut fresh = legal_custom();
         fresh.expires_at_unix_ms = NOW + MAX_AD_LIFETIME_MS;
-        store.offer([0xFF; 32], fresh, h(1), NOW).unwrap();
+        store.offer([0xFF; 32], fresh, h(1), [0u8; 32], NOW).unwrap();
 
         assert!(
             store.get(&[0u8; 32]).is_none(),
@@ -1146,7 +1169,7 @@ mod tests {
         for i in 0..MAX_TRACKED_TABLES as u32 {
             let mut key = [0u8; 32];
             key[..4].copy_from_slice(&i.to_be_bytes());
-            assert_eq!(store.offer(key, legal_custom(), h(1), NOW), Ok(()));
+            assert_eq!(store.offer(key, legal_custom(), h(1), [0u8; 32], NOW), Ok(()));
         }
 
         // Long enough that every held advert has expired on its own terms.
@@ -1154,7 +1177,7 @@ mod tests {
         let mut fresh = legal_custom();
         fresh.timestamp_unix_ms = later;
         fresh.expires_at_unix_ms = later + 90_000;
-        store.offer([0xFF; 32], fresh, h(1), later).unwrap();
+        store.offer([0xFF; 32], fresh, h(1), [0u8; 32], later).unwrap();
 
         assert_eq!(store.len(), 1, "the corpses went, not a live table");
         assert!(store.get(&[0xFF; 32]).is_some());
@@ -1163,7 +1186,7 @@ mod tests {
     #[test]
     fn a_table_can_withdraw_itself() {
         let mut store = LobbyStore::new();
-        store.offer([1u8; 32], legal_custom(), h(1), NOW).unwrap();
+        store.offer([1u8; 32], legal_custom(), h(1), [0u8; 32], NOW).unwrap();
         assert!(store.remove(&[1u8; 32]));
         assert!(!store.remove(&[1u8; 32]));
         assert!(store.is_empty());

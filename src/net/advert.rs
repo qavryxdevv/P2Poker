@@ -434,8 +434,12 @@ pub fn receive(
     lobby::admit(&ad, now_ms).map_err(NotAccepted::Refused)?;
 
     let params = table_params_hash(&ad);
+    // The hash of the bytes that arrived, not of a re-encoding: it is what a
+    // `JOIN_REQUEST` names, and the founder looks it up against an advert it
+    // signed itself.
+    let advert_hash = crate::protocol::transcript::event_hash(&signed.body);
     store
-        .offer(table_key, ad, params, now_ms)
+        .offer(table_key, ad, params, advert_hash, now_ms)
         .map_err(NotAccepted::NotTaken)?;
     Ok(table_key)
 }
@@ -552,6 +556,38 @@ mod tests {
 
     /// The whole loop, which is what D-003 needs and what did not exist: a table
     /// is signed, put on the wire, and arrives at another client as a table.
+    /// The hash the lobby keeps is the hash a joiner puts in its
+    /// `JOIN_REQUEST`.
+    ///
+    /// Without it the lobby was a complete list of tables and no way to sit down
+    /// at one: §4.3's `n(0) advert_hash` names the advert being joined, and the
+    /// store had thrown the bytes away. A gap that only appears when the two
+    /// halves are finally joined up.
+    #[test]
+    fn the_store_keeps_the_hash_a_join_request_needs() {
+        let table = key(7);
+        let wire = publish(&ad(), &table).unwrap();
+        let mut store = LobbyStore::new();
+        let mut limits = RateLimiter::new();
+        let seen = receive(&wire, [9u8; 32], NOW, &mut limits, &mut store).unwrap();
+
+        let signed: SignedEvent = from_canonical(&wire, LOBBY_MSG_MAX).unwrap();
+        let expected = crate::protocol::transcript::event_hash(&signed.body);
+        assert_eq!(store.get(&seen).unwrap().advert_hash, expected);
+
+        // And it is the hash of the copy this client accepted: a re-broadcast
+        // carries a later timestamp and therefore a different hash, which is
+        // exactly why the *parameters* hash is the one joiners must agree on.
+        let mut later = ad();
+        later.timestamp_unix_ms += 30_000;
+        later.expires_at_unix_ms += 30_000;
+        let again = publish(&later, &table).unwrap();
+        receive(&again, [9u8; 32], NOW + 30_000, &mut limits, &mut store).unwrap();
+        let held = store.get(&seen).unwrap();
+        assert_ne!(held.advert_hash, expected, "the hash follows the copy held");
+        assert_eq!(held.params_hash, table_params_hash(&ad()), "the parameters do not");
+    }
+
     /// The echoed advert in a `JOIN_ACCEPT` is verified from its own bytes, and
     /// one altered byte anywhere in it is refused. A joiner that took the
     /// founder's word here would be sitting down to whatever the founder said.

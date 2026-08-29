@@ -36,6 +36,35 @@ use libp2p::{gossipsub, multiaddr::Protocol, Multiaddr, PeerId};
 use super::lobby::{LobbyStore, RateLimiter};
 use crate::protocol::constants::AD_REBROADCAST_MS;
 
+/// What the interface asks the node to do.
+///
+/// One direction only. The paint loop never touches the swarm and the swarm
+/// never touches a widget — `SPEC_CS.md` §33 — so everything the player does
+/// arrives here as a value and everything the node learns goes back as a
+/// [`NodeEvent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeCommand {
+    /// Found a table and advertise it.
+    CreateTable {
+        name: String,
+        seats: u8,
+        min_players: u8,
+        buyin: u64,
+        password: Option<Vec<u8>>,
+    },
+    /// Ask to sit down at a table this client has seen advertised.
+    JoinTable {
+        /// The table key, which is the table's identity.
+        key: [u8; 32],
+        buyin: u64,
+        seat: Option<u8>,
+        password: Option<Vec<u8>>,
+    },
+    /// Stop hosting or stop waiting. Formation only; leaving a table that has
+    /// started is a `PLAYER_LEAVE` and is not this.
+    LeaveTable,
+}
+
 /// What the loop reports upwards, for the GUI and the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeEvent {
@@ -52,6 +81,22 @@ pub enum NodeEvent {
     TableRefused { reason: String },
     /// AutoNAT decided.
     Reachability { public: bool },
+    /// This client is hosting a table under this key.
+    Hosting { key: [u8; 32] },
+    /// This client has a seat at a table being formed.
+    Seated { key: [u8; 32], seat: u8 },
+    /// The roster this client currently believes, newest first in the list.
+    Roster {
+        key: [u8; 32],
+        seats: Vec<(u8, String, u64)>,
+    },
+    /// Every seat has ratified: the table is real and has a session identity.
+    TableReal { key: [u8; 32], session: [u8; 32] },
+    /// The founder refused. **Advisory** — a founder may lie, so the reason is
+    /// carried as the claim it is.
+    JoinRefused { reason: u16 },
+    /// Formation was abandoned, either by this client or by a rule.
+    LeftTable { why: String },
     /// Something in the transport went wrong and the node carried on.
     ///
     /// Separate from [`TableRefused`](NodeEvent::TableRefused), which is a

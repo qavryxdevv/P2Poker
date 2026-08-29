@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use p2p_poker::app::AppState;
 use p2p_poker::gui::{render, table};
-use p2p_poker::net::node::NodeEvent;
+use p2p_poker::net::node::{NodeCommand, NodeEvent};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -44,6 +44,24 @@ fn main() {
     };
     println!("peer id  {}", libp2p::PeerId::from(identity.public()));
 
+    // The **player's** identity, which is not the network's. §20 keeps the two
+    // apart: a peer id says which socket you are talking to, this says who is
+    // playing, and it is what appears in every roster this client ever joins.
+    let app_key = match p2p_poker::storage::profile::load_or_create_app_key(&dir) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("player key at {}: {e}", dir.display());
+            return;
+        }
+    };
+    println!(
+        "player   {}",
+        app_key.verifying_key().to_bytes()[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+
     let hosted = value_of("--host").map(|name| {
         // Seeded from this crate's one randomness source. `ed25519-dalek` 3.0
         // wants `rand_core` 0.10's trait and our handle speaks `rand` 0.8's, and
@@ -61,10 +79,11 @@ fn main() {
     let bounded = value_of("--for").and_then(|v| v.parse::<u64>().ok());
 
     if has("--headless") {
-        headless(identity, hosted, bounded);
+        headless(identity, app_key, hosted, bounded);
     } else {
         windowed(
             identity,
+            app_key,
             hosted,
             bounded,
             if has("--table") {
@@ -79,14 +98,20 @@ fn main() {
 /// The node, printing what happens. No window.
 fn headless(
     identity: libp2p::identity::Keypair,
+    app_key: ed25519_dalek::SigningKey,
     hosted: Option<p2p_poker::net::run::Hosted>,
     bounded: Option<u64>,
 ) {
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     rt.block_on(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        // Headless takes no commands, but the node needs the receiving end to
+        // exist or its `select!` arm completes immediately and spins.
+        let (_commands, command_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
-            if let Err(e) = p2p_poker::net::run::run(identity, tx, hosted).await {
+            if let Err(e) =
+                p2p_poker::net::run::run(identity, app_key, tx, command_rx, hosted).await
+            {
                 eprintln!("node stopped: {e}");
             }
         });
@@ -128,18 +153,25 @@ fn headless(
 /// The client, with its window.
 fn windowed(
     identity: libp2p::identity::Keypair,
+    app_key: ed25519_dalek::SigningKey,
     hosted: Option<p2p_poker::net::run::Hosted>,
     bounded: Option<u64>,
     screen: Screen,
 ) {
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     let (tx, rx) = tokio::sync::mpsc::channel(256);
+    // The other direction. Bounded, and the window never blocks on it: a full
+    // queue means the node is busy, and a paint loop that waited for it would
+    // freeze the client rather than drop a button press.
+    let (commands, command_rx) = tokio::sync::mpsc::channel(16);
 
     // The node runs on the tokio runtime and the window on this thread. They
     // share a channel and nothing else, which is what keeps `SPEC_CS.md` §33
     // true: a 95 ms shuffle proof on the paint thread is six dropped frames.
     rt.spawn(async move {
-        if let Err(e) = p2p_poker::net::run::run(identity, tx, hosted).await {
+        if let Err(e) =
+            p2p_poker::net::run::run(identity, app_key, tx, command_rx, hosted).await
+        {
             eprintln!("node stopped: {e}");
         }
     });
@@ -163,6 +195,7 @@ fn windowed(
                 screen,
                 ui: Default::default(),
                 table_ui: Default::default(),
+                commands,
                 events: rx,
                 bounded,
                 started,
@@ -194,10 +227,26 @@ struct Client {
     ui: p2p_poker::gui::render::LobbyUi,
     table_ui: p2p_poker::gui::table::TableUi,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
+    commands: tokio::sync::mpsc::Sender<NodeCommand>,
     bounded: Option<u64>,
     started: std::time::Instant,
     /// Kept alive: dropping the runtime would stop the node.
     _rt: tokio::runtime::Runtime,
+}
+
+impl Client {
+    /// Hand a command to the node, without ever waiting for it.
+    ///
+    /// `try_send` and not `send`: this runs on the paint thread, and a paint
+    /// thread that blocks on a channel is a frozen window. A full queue means
+    /// the node is busy, which is worth saying and is not worth stopping for.
+    fn tell(&mut self, command: NodeCommand) {
+        if self.commands.try_send(command).is_err() {
+            self.state
+                .log
+                .push_back("the node is busy; try that again".into());
+        }
+    }
 }
 
 impl eframe::App for Client {
@@ -228,12 +277,28 @@ impl eframe::App for Client {
                     render::LobbyAction::Select(key) => self.state.selected = Some(key),
                     render::LobbyAction::None => {}
                     render::LobbyAction::OpenTableWindow => self.screen = Screen::Table,
-                    // The rest is not wired to the transport yet, and saying so
-                    // is better than a button that appears to work.
-                    other => self
-                        .state
-                        .log
-                        .push_back(format!("{other:?} is not wired to the transport yet")),
+                    render::LobbyAction::Create(t) => self.tell(NodeCommand::CreateTable {
+                        name: t.name,
+                        seats: t.seats,
+                        min_players: t.min_players,
+                        buyin: t.buyin,
+                        password: if t.password.is_empty() {
+                            None
+                        } else {
+                            Some(t.password.into_bytes())
+                        },
+                    }),
+                    render::LobbyAction::Sit {
+                        key,
+                        buyin,
+                        password,
+                    } => self.tell(NodeCommand::JoinTable {
+                        key,
+                        buyin,
+                        seat: None,
+                        password,
+                    }),
+                    render::LobbyAction::LeaveTable => self.tell(NodeCommand::LeaveTable),
                 }
             }
             Screen::Table => {

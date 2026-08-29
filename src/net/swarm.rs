@@ -45,12 +45,13 @@ use std::hash::{Hash, Hasher as _};
 use std::time::Duration;
 
 use libp2p::{
-    autonat, connection_limits, dcutr, gossipsub, identify, identity, kad,
+    autonat, connection_limits, dcutr, gossipsub, identify, identity, kad, request_response,
     kad::store::MemoryStore, noise, ping, relay,
     swarm::NetworkBehaviour,
     tcp, tls, yamux, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 
+use super::joinrpc::JoinCodec;
 use crate::protocol::constants::{
     GOSSIP_MAX_TRANSMIT, IDLE_CONNECTION_TIMEOUT_MS, LOBBY_CHAT_TOPIC, LOBBY_TOPIC,
     MDNS_QUERY_INTERVAL_MS,
@@ -106,6 +107,14 @@ pub const RELAY_MAX_CIRCUIT_BYTES: u64 =
 /// How many circuits one peer may hold on this client at once.
 pub const RELAY_MAX_CIRCUITS_PER_PEER: usize = 4;
 
+/// How long a join request may go unanswered before it is a failure.
+///
+/// A founder that has to be dialled through a relay is slow, and a joiner that
+/// gives up at five seconds gives up on a table it could have sat down at. Thirty
+/// is long enough for a relayed round trip and short enough that a player is not
+/// left looking at a button that appears to have done nothing.
+pub const JOIN_RPC_TIMEOUT_MS: u64 = 30_000;
+
 /// The behaviours this node runs.
 #[derive(NetworkBehaviour)]
 pub struct PokerBehaviour {
@@ -130,6 +139,12 @@ pub struct PokerBehaviour {
     pub mem_limits: libp2p::memory_connection_limits::Behaviour,
     /// Port mapping, for the router that will do it.
     pub upnp: libp2p::upnp::tokio::Behaviour,
+    /// The join RPC: one request, one answer, on `/p2p-poker/join/1`.
+    ///
+    /// Request-response rather than the mesh, because a join happens between two
+    /// peers who are not yet at a table together: there is no mesh to carry it,
+    /// and an unanswered request has to become a timeout rather than silence.
+    pub join: request_response::Behaviour<JoinCodec>,
     /// Local-network discovery.
     ///
     /// Not an optimisation. Two clients on one LAN get each other's **external**
@@ -242,6 +257,15 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                         .with_max_pending_incoming(Some(32))
                         .with_max_established_incoming(Some(256))
                         .with_max_established_per_peer(Some(2)),
+                ),
+                join: request_response::Behaviour::with_codec(
+                    JoinCodec,
+                    [(
+                        super::joinrpc::protocol(),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_millis(JOIN_RPC_TIMEOUT_MS)),
                 ),
                 mem_limits: libp2p::memory_connection_limits::Behaviour::with_max_percentage(0.25),
                 upnp: libp2p::upnp::tokio::Behaviour::default(),
