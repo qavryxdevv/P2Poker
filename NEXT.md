@@ -1,33 +1,56 @@
 # Where to pick up
 
-Updated 2026-08-29, evening. Tree is clean, everything committed.
+Updated 2026-08-29, late. Tree clean, everything committed.
 
     cargo clippy --all-targets                  0 warnings
-    cargo test --release -- --test-threads=19   363 unit + 42 harness, 0 failed
+    cargo test --release -- --test-threads=19   460 unit + 43 harness, 0 failed
+    tools/check-portable.ps1                    6/6
 
-## D-003 is demonstrated, not argued
-
-Two processes on one machine, no server, no shared state:
+## It runs, and it is portable
 
 ```bash
-./target/release/p2p-poker --host Riverside
+cargo build --release
+```
+
+```bash
+./target/release/p2p-poker --headless --host Riverside
 ```
 
 ```bash
 ./target/release/p2p-poker
 ```
 
-The watcher prints `table bfbf8a1e…`. It found the host over mDNS, completed a
-libp2p handshake, received a 337-byte advert over GossipSub, checked
-`verify_strict` under the table key, put it through §7.2's admission rules and
-filed it under the key that signed it.
+The window opens on the lobby. `--headless` is the same client without one, and
+both fold the node's events through the same state so they cannot disagree.
 
-**Two instances on one machine is the hardest case for NAT, not the easiest.**
-The DHT dials in that run fail — both nodes get each other's *external* address
-and dialling it inwards is hairpinning, which many routers do not do. The DHT
-half is proven separately: both nodes announce under `LOBBY_INFOHASH` and each
-discovers the other's address. What has **not** been run is two machines on two
-different networks, which is where relay and DCUtR earn their place.
+One 20 MB file, copied into an empty folder, runs and creates exactly
+`profile/identity.key` beside itself. Two folders are two clients; the identity
+survives a restart. `tools/check-portable.ps1` checks all of that by
+measurement, including that the binary imports no C runtime — it did, until
+today, which would have made "copy it and it runs" true here and false on a
+fresh machine.
+
+## What has been demonstrated, and what has not
+
+**Demonstrated.** Two processes, no server: mDNS discovery, a QUIC handshake, a
+GossipSub mesh, a 337-byte signed table advert crossing it, and the receiver
+running §7.2's admission rules on bytes that actually travelled. Both nodes also
+announce under `LOBBY_INFOHASH` and find each other's addresses through the
+public DHT. `tests/two_nodes.rs` runs the transport half automatically on every
+`cargo test`.
+
+**Not demonstrated, and this is the first item below.** Two machines on two
+networks. The relay and DCUtR are configured, `net::relay` decides adequacy from
+measured per-hand bytes, and **no circuit has ever carried anything.** Two
+instances on one machine are the *hardest* case for NAT rather than the easiest:
+both learn the same external address, and dialling it inwards is hairpinning.
+
+`tools/two-network-test.ps1` runs one node here and one in a Hyper-V VM on a
+different subnet. It must be run elevated — the Hyper-V cmdlets return an empty
+list under a UAC-filtered token, which reads exactly like "there are no VMs" —
+and its header says what it proves and what it does not. The second list is
+longer: the VM can reach this host directly, so no hole needs punching, and a
+real test of that needs **one endpoint outside this house**.
 
 ## What is built
 
@@ -36,53 +59,59 @@ different networks, which is where relay and DCUtR earn their place.
 | Poker engine | complete — blinds, order, dead button, pots, TDA reopening, ~120 000 random hands |
 | Protocol | envelopes, canonical CBOR, signatures, transcript, anti-replay, checkpoints, staleness |
 | Mental poker | complete — the forked `ziffle`, the chain, reveal gating, `n`-of-`n` |
-| The seam | `table::dealing` — deck to engine, three peers, one hand to showdown |
-| Discovery | Mainline announce/lookup, mDNS, libp2p QUIC + TCP, GossipSub |
-| Lobby | signed adverts across the wire, §7.2 rules 2–7, rate limits |
-| GUI | **not started** |
+| The seam | `table::dealing` — three peers, one hand from deck to pot |
+| Discovery | Mainline, mDNS, QUIC + TCP, GossipSub, relay adequacy |
+| Lobby | signed adverts across the wire, §7.2 rules 2–7, rate limits, eviction |
+| Formation | roster, join messages and every admission rule — **not wired to the transport** |
+| GUI | lobby pane and network status; **the table window is not started** |
 
 ## Next actions, in order
 
-1. **Two machines on two networks.** The one claim in the table above that rests
-   on a single-host run. Relay and DCUtR are configured and have never carried a
-   connection.
-
-2. **The join handshake.** A table is visible; nothing sits down at one.
-   `JOIN_REQUEST` / `JOIN_ACCEPT`, the seat allocation, and `DECK_INIT`'s key
-   exchange — after which `table::dealing` already works.
-
-3. **The GUI**, which is `SPEC_CS.md` §22 and the thing that makes it a client
-   rather than a demonstration.
-
+1. **Two machines on two networks.** The one claim above that rests on nothing.
+2. **Wire formation to the transport.** Every rule is written and tested;
+   nothing carries the messages, and the Join button says so rather than
+   pretending.
+3. **The table window** — `SPEC_CS.md` §22's second half, and the place where
+   *never display an unverified card as valid* has to be obeyed rather than
+   avoided.
 4. Phase 11's audit.
 
 ## Open items
 
-`docs/DECISIONS.md` carries D-001 to D-017.
+`docs/DECISIONS.md` carries D-001 to D-018.
 
-**D-017 is withdrawn** — the owner raised two ways to survive a mid-hand
-disconnection and withdrew the request the same day. Nothing from it is built;
-the fallback stands, which is that heads-up needs no mechanism at all and
-multi-way the hand aborts with every stack restored. The analysis is kept because
-it records why sharing *key* shares with outside nodes is unsafe.
+**D-018** lists twenty-three normative terms used and defined nowhere. Four are
+closed; **nineteen remain**, seven of them High. Three of those block work that
+is otherwise ready: what *"payload bytes, verbatim"* means in
+`table_params_hash`, what *"input deck bytes"* are, and where the canonical
+52-card ordering lives — which is circular, with two documents deferring to each
+other.
 
-**F-1** is still open: D-015 removed the timeout machinery, which made `Q-01`'s
-answer load-bearing. If the answer is `TDA_MUCK`, showdown gains a human decision
-with no automatic rule behind it.
+**D-017** is withdrawn. **F-1** is open: D-015 made `Q-01`'s answer load-bearing.
+**The project licence** has never been chosen and gates `deny.toml`.
 
-**The project licence** has never been chosen. It is the owner's, and it gates
-`deny.toml` and `ZR-4(a)`.
+## Three habits that paid, and one that cost
 
-## Two habits that have paid, kept here so they survive a context break
-
-**Every guard is verified to bite.** A check is disabled, the test that claims to
-cover it is run, and it must fail — then the check is restored. This has caught
-four things today that would otherwise have shipped as covered: `is_identity_c1`
-tested a flag bit nobody had compared against arkworks, `worth_parsing` was
-written and never called, a `verify_strict` comment was folklore that no test
-distinguished, and a token set was sized `n - 1`.
+**Every guard is verified to bite.** Disable the check, run the test that claims
+to cover it, require a failure, restore. Today that caught `is_identity_c1`
+testing an unmeasured flag bit, `worth_parsing` written and never called, a
+`verify_strict` comment that was folklore, and a token set sized `n - 1`.
 
 **A measurement beats a recollection.** The relay defaults, the deck sizes, the
-proof timings, the identity encoding and the two signature checks were all
-measured rather than quoted, and three of the five turned out to differ from what
-the surrounding text said.
+proof timings, the identity encoding, the two signature checks, the import
+table, the folder size — measured, and several disagreed with the surrounding
+text.
+
+**Read every normative source independently, then reconcile.** One parallel
+reading of the formation path found a live bug — `table_params_hash` hashed
+`table_name`, which §3.1 excludes by name, so a founder fixing a typo made the
+table permanently unjoinable — plus twenty-three undefined terms. Do it for the
+hand path and the dispute path before building either.
+
+**And the one that cost.** `git add -A` while a review workflow was running
+committed two of its verify agents' mutations: `ValidationMode::Permissive` in
+place of `Strict`, and two domains mapped to one context string. Both sat under
+doc comments asserting the opposite; the domain guard would have caught its half
+and my process defeated it, and the gossip settings had no guard at all until
+now. **Never `git add -A` while anything else can write to the tree, and read
+`git status` for foreign modifications before every commit.**
