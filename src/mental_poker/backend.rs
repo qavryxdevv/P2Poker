@@ -168,6 +168,26 @@ pub struct VerifiedKey {
 #[derive(Debug, Clone, Copy)]
 pub struct VerifiedToken(LibVerified<RevealToken>);
 
+/// This peer's per-hand deck secret.
+///
+/// Opaque, and deliberately **not** a [`DeckWire`] type even though the library
+/// makes its inner value one: the per-hand deck secret must not be reachable
+/// from the wire, and the way to guarantee that is for there to be no encoding
+/// of it at all.
+///
+/// It also exists so that no module outside `src/mental_poker/` names a library
+/// type (`CONTRIBUTING.md` §4.4). The first draft of `table::dealing` took a
+/// `ziffle::SecretKey` in a public signature, which put the library's name in
+/// the one place the boundary exists to keep it out of.
+pub struct HandSecret(SecretKey);
+
+impl core::fmt::Debug for HandSecret {
+    /// Never prints the key.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("HandSecret(<redacted>)")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The parameters, once per process
 // ---------------------------------------------------------------------------
@@ -190,9 +210,9 @@ impl DeckParams {
     }
 
     /// A fresh per-hand key and the proof that its owner holds the secret.
-    pub fn keygen(&self, ctx: &DeckCtx) -> (SecretKey, WireKey, WireKeyProof) {
+    pub fn keygen(&self, ctx: &DeckCtx) -> (HandSecret, WireKey, WireKeyProof) {
         let (sk, pk, proof) = self.shuffle.keygen(&mut OsRng, ctx.as_bytes());
-        (sk, WireKey(pk), WireKeyProof(proof))
+        (HandSecret(sk), WireKey(pk), WireKeyProof(proof))
     }
 }
 
@@ -287,7 +307,7 @@ impl HandDeck {
     /// verified deck or there is no share.
     pub fn token(
         &self,
-        sk: &SecretKey,
+        sk: &HandSecret,
         key: &VerifiedKey,
         deck: &Final<Verified<Vec<Ciphertext>>>,
         index: CardIndex,
@@ -298,7 +318,7 @@ impl HandDeck {
             .get(index.get() as usize)
             .ok_or(VerifyOutcome::Invalid(InvalidReason::ArgumentFailed))?;
         let (token, proof) =
-            card.reveal_token(&mut OsRng, sk, key.raw, ctx.as_bytes());
+            card.reveal_token(&mut OsRng, &sk.0, key.raw, ctx.as_bytes());
         Ok((WireToken(token), WireTokenProof(proof)))
     }
 

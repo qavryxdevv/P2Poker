@@ -238,10 +238,21 @@ pub struct TokenSet<T> {
 }
 
 impl<T> TokenSet<T> {
-    /// Open a set for one card, over the seats that owe a token towards it.
+    /// Open a set for one card, over the seats whose share it needs.
     ///
-    /// For a board card that is every seat; for a hole card it is every seat but
-    /// the owner, who holds the last share itself.
+    /// **Every seat, always — a hole card included.** Decryption is `n`-of-`n`
+    /// over the aggregate key, so the owner's own share is one of the `n` and the
+    /// set is not complete without it. What is different about a hole card is
+    /// only *where the owner's share comes from*: the owner computes it locally
+    /// and never publishes it, which is why nobody else can complete the set and
+    /// why the card is private.
+    ///
+    /// Getting this wrong is worse than it looks, and the first draft of this
+    /// module did: a set sized `n - 1` calls itself complete one share early,
+    /// `open` then fails, and C-10 says a **complete** verified set that fails to
+    /// open is a soundness fault — distinct, loud and non-resumable. A mis-sized
+    /// set turns an ordinary "not yet" into exactly the fault that must never be
+    /// raised without cause.
     pub fn awaiting(index: CardIndex, expected: Vec<SeatIdx>) -> Self {
         TokenSet {
             index,
@@ -497,22 +508,45 @@ mod tests {
         assert_eq!(set.complete().unwrap(), vec![&0, &1, &2, &3]);
     }
 
-    /// A hole card is `n - 1` tokens, because the owner holds the last share.
+    /// A hole card needs **every** share, the owner's included. Decryption is
+    /// `n`-of-`n`; what makes the card private is that the owner's share is
+    /// computed locally and never published, not that it is not needed.
+    ///
+    /// The first draft of this module sized the set at `n - 1`. It would have
+    /// called itself complete one share early, failed to open, and raised a
+    /// soundness fault — the one outcome that is meant to be unreachable without
+    /// a real failure of the construction.
     #[test]
-    fn a_hole_card_set_does_not_wait_on_its_owner() {
+    fn a_hole_card_needs_every_share_including_its_owners() {
         let m = map(4, 0);
         let owner = m.deal_order()[0];
         let [card, _] = m.hole_cards(owner).unwrap();
-        let others: Vec<SeatIdx> = (0..4u8).filter(|&s| s != owner).collect();
+        let everyone: Vec<SeatIdx> = (0..4u8).collect();
 
-        let mut set: TokenSet<u8> = TokenSet::awaiting(card, others.clone());
-        for &seat in &others {
+        let mut set: TokenSet<u8> = TokenSet::awaiting(card, everyone);
+        for seat in (0..4u8).filter(|&s| s != owner) {
             set.add(seat, card, seat).unwrap();
         }
+        assert!(
+            !set.is_complete(),
+            "n-1 shares is not n, and calling it complete would raise a fault"
+        );
+        assert_eq!(set.outstanding(), vec![owner]);
+
+        // The owner's own share, computed locally and never sent anywhere.
+        set.add(owner, card, owner).unwrap();
         assert!(set.is_complete());
+    }
+
+    /// A seat that is not at the table owes nothing and cannot fill a slot.
+    #[test]
+    fn a_seat_outside_the_expected_set_cannot_contribute() {
+        let m = map(4, 0);
+        let card = m.turn();
+        let mut set: TokenSet<u8> = TokenSet::awaiting(card, vec![0, 1, 2, 3]);
         assert_eq!(
-            set.add(owner, card, owner),
-            Err(SetError::NotExpected { seat: owner })
+            set.add(9, card, 9),
+            Err(SetError::NotExpected { seat: 9 })
         );
     }
 
