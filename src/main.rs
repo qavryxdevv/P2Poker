@@ -149,6 +149,7 @@ fn windowed(
             render::install(&cc.egui_ctx);
             Ok(Box::new(Client {
                 state: AppState::new(),
+                ui: Default::default(),
                 events: rx,
                 bounded,
                 started,
@@ -164,6 +165,8 @@ fn windowed(
 
 struct Client {
     state: AppState,
+    /// What the user is typing, which must survive the snapshot being replaced.
+    ui: p2p_poker::gui::render::LobbyUi,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
     bounded: Option<u64>,
     started: std::time::Instant,
@@ -193,17 +196,15 @@ impl eframe::App for Client {
         }
 
         let view = self.state.view();
-        let action = render::lobby(ui, &view);
-        match action {
+        match render::lobby(ui, &view, &mut self.ui) {
             render::LobbyAction::Select(key) => self.state.selected = Some(key),
-            render::LobbyAction::Join(_) | render::LobbyAction::CreateTable => {
-                // Neither is wired yet, and saying so is better than a button
-                // that appears to work.
-                self.state
-                    .log
-                    .push_back("joining and creating are not wired to the transport yet".into());
-            }
             render::LobbyAction::None => {}
+            // Nothing below is wired to the transport yet, and saying so is
+            // better than a button that appears to work.
+            other => self
+                .state
+                .log
+                .push_back(format!("{other:?} is not wired to the transport yet")),
         }
 
         // The node pushes events whether or not the window is being interacted

@@ -40,6 +40,10 @@ pub struct TableRow {
     pub blinds: String,
     /// "2 / 6".
     pub occupancy: String,
+    /// How many are seated, as a number rather than as text.
+    pub seated: u8,
+    /// How many the table needs before it can start.
+    pub needed: u8,
     /// The starting stack for a tournament, or the buy-in range for cash.
     pub stack: String,
     /// "20 s + 5 s", the clock a player gets to act.
@@ -132,6 +136,8 @@ pub fn row(key: [u8; 32], held: &Held) -> TableRow {
         game,
         blinds: format!("{} / {}", ad.small_blind, ad.big_blind),
         occupancy: format!("{} / {}", ad.players, ad.max_players),
+        seated: ad.players,
+        needed: ad.min_players_to_start,
         stack,
         timing: format!(
             "{} s + {} s",
@@ -152,6 +158,86 @@ pub fn rows(store: &LobbyStore) -> Vec<TableRow> {
     let mut out: Vec<TableRow> = store.tables().map(|l| row(*l.key, l.held)).collect();
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.key.cmp(&b.key)));
     out
+}
+
+/// The list filters, as the Python client offers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Filter {
+    #[default]
+    All,
+    Open,
+    SitAndGo,
+    Cash,
+    WaitingForPlayers,
+}
+
+impl Filter {
+    pub const ALL: [Filter; 5] = [
+        Filter::All,
+        Filter::Open,
+        Filter::SitAndGo,
+        Filter::Cash,
+        Filter::WaitingForPlayers,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Filter::All => "all tables",
+            Filter::Open => "open tables",
+            Filter::SitAndGo => "sit & go",
+            Filter::Cash => "cash game",
+            Filter::WaitingForPlayers => "waiting for players",
+        }
+    }
+
+    fn keeps(self, row: &TableRow) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Open => row.state.joinable(),
+            Filter::SitAndGo => row.game.contains("Sit & Go"),
+            Filter::Cash => row.game.contains("cash"),
+            // A table nobody can start yet, which is the one a player can
+            // usefully do something about by sitting down.
+            Filter::WaitingForPlayers => row.state.joinable() && row.seated < row.needed,
+        }
+    }
+}
+
+/// Which rows survive the search box and the filter.
+///
+/// The search matches the table's **name or its host**, which is what the
+/// Python client's placeholder promises, and it is case-insensitive because a
+/// search that is not is a search that finds nothing.
+pub fn visible<'a>(rows: &'a [TableRow], search: &str, filter: Filter) -> Vec<&'a TableRow> {
+    let needle = search.trim().to_lowercase();
+    rows.iter()
+        .filter(|r| filter.keeps(r))
+        .filter(|r| {
+            needle.is_empty()
+                || r.name.to_lowercase().contains(&needle)
+                || r.host.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
+/// What to say when the list is empty, which is two different things.
+///
+/// *"This lobby is quiet"* and *"your filter hides everything"* look identical
+/// on screen and need opposite reactions, so the message says which. The Python
+/// client makes the same distinction and for the same reason.
+pub fn empty_explanation(total: usize, shown: usize, peers: usize) -> Option<&'static str> {
+    if shown > 0 {
+        return None;
+    }
+    Some(if total > 0 {
+        "Every table is hidden by the search or the filter. Clear them to see the rest."
+    } else if peers == 0 {
+        "No peers yet. This client is still looking for others; nothing can be \
+         advertised to it until it finds some."
+    } else {
+        "Connected, and nobody is advertising a table. Create one and it will \
+         appear in the other clients' lobbies."
+    })
 }
 
 /// What a password-protected table's dialog must say.
@@ -366,6 +452,64 @@ mod tests {
             received_at_ms: NOW,
             unjoinable,
         }
+    }
+
+
+    /// The search matches the name or the host, case-insensitively — a search
+    /// that is case-sensitive is a search that finds nothing.
+    #[test]
+    fn the_search_matches_the_name_or_the_host() {
+        let mut a = row([1u8; 32], &held(2, false));
+        a.name = "Riverside".into();
+        a.host = "deadbeef".into();
+        let mut b = row([2u8; 32], &held(2, false));
+        b.name = "Riverside".into();
+        b.host = "cafebabe".into();
+        let rows = vec![a, b];
+
+        assert_eq!(visible(&rows, "", Filter::All).len(), 2);
+        assert_eq!(visible(&rows, "pepy", Filter::All).len(), 1, "lower case");
+        assert_eq!(visible(&rows, "  PEPY  ", Filter::All).len(), 1, "trimmed");
+        assert_eq!(visible(&rows, "cafe", Filter::All).len(), 1, "by host");
+        assert_eq!(visible(&rows, "nothing", Filter::All).len(), 0);
+    }
+
+    #[test]
+    fn each_filter_keeps_what_it_says() {
+        let open = row([1u8; 32], &held(2, false));
+        let full = row([2u8; 32], &held(6, false));
+        let broken = row([3u8; 32], &held(2, true));
+        let rows = vec![open, full, broken];
+
+        assert_eq!(visible(&rows, "", Filter::All).len(), 3);
+        assert_eq!(visible(&rows, "", Filter::Open).len(), 1);
+        assert_eq!(visible(&rows, "", Filter::Cash).len(), 3, "all three are cash");
+        assert_eq!(visible(&rows, "", Filter::SitAndGo).len(), 0);
+    }
+
+    /// A table that cannot start yet is the one a player can do something about.
+    #[test]
+    fn waiting_for_players_means_short_of_the_minimum() {
+        let mut short = row([1u8; 32], &held(1, false));
+        short.needed = 2;
+        short.seated = 1;
+        let mut ready = row([2u8; 32], &held(3, false));
+        ready.needed = 2;
+        ready.seated = 3;
+
+        let rows = vec![short, ready];
+        let waiting = visible(&rows, "", Filter::WaitingForPlayers);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].key, [1u8; 32]);
+    }
+
+    /// An empty list means two opposite things and the message says which.
+    #[test]
+    fn an_empty_list_says_which_silence_it_is() {
+        assert!(empty_explanation(3, 0, 5).unwrap().contains("hidden by the search"));
+        assert!(empty_explanation(0, 0, 0).unwrap().contains("No peers yet"));
+        assert!(empty_explanation(0, 0, 4).unwrap().contains("nobody is advertising"));
+        assert!(empty_explanation(3, 3, 5).is_none(), "a list explains itself");
     }
 
     #[test]
