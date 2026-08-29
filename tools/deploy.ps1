@@ -5,7 +5,7 @@
 # over. This script never touches `profile\`: it replaces the binary and leaves
 # the player's keys, settings and the tables they have joined alone.
 #
-#   tools\deploy.ps1                     build, check, copy to ~\Games\P2Poker
+#   tools\deploy.ps1                     build, check, copy to <profile>\Games\P2Poker
 #   tools\deploy.ps1 -To D:\Elsewhere    somewhere else
 #   tools\deploy.ps1 -SkipChecks         copy what is already built
 #
@@ -13,7 +13,7 @@
 # with a file-in-use error that leaves the folder in neither state.
 
 param(
-    [string]$To = "~\Games\P2Poker",
+    [string]$To = "$env:USERPROFILE\Games\P2Poker",
     [switch]$SkipChecks,
     [switch]$SkipClean
 )

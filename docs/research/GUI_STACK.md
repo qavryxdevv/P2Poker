@@ -14,7 +14,7 @@ nothing else:
 Probe crates (never inside the repo):
 
 ```
-~/AppData/Local/Temp/claude/<session>/
+<scratchpad>
   <session-id>/scratchpad/
     probe-gui-egui/        eframe 0.36.1 + glow  (full probe: 2 windows, painter, images, worker)
     probe-gui-egui-wgpu/   same source, eframe wgpu renderer (size comparison only)

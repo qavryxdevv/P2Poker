@@ -21,7 +21,7 @@ Probe crate (outside the repo):
 ```
 
 `<scratch>` =
-`~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad`.
+`<scratchpad>`.
 Crate source read at
 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ziffle-0.1.0/src/lib.rs`.
 

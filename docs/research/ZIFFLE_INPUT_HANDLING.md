@@ -794,7 +794,7 @@ depends on getting the chain ordering right and one that does not.
 ## Appendix — probe inventory
 
 All under
-`~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad/zr-input/`.
+`<scratchpad>`.
 
 | File | What it establishes |
 |---|---|

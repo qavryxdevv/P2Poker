@@ -23,7 +23,7 @@ Probe crates (outside the repo):
 | `probe-libp2p-stream` | `…/scratchpad/probe-libp2p-stream/` | `libp2p-stream` + `request-response/cbor` |
 | `probe-quic-only` | `…/scratchpad/probe-quic-only/` | QUIC-only stack, no `tcp` feature |
 
-(`…/scratchpad/` = `~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad/`)
+(`…/scratchpad/` = `<scratchpad>`)
 
 ---
 
@@ -277,7 +277,7 @@ Exact `cargo check` output:
 
 ```
 $ cargo check
-    Checking probe-libp2p v0.1.0 (~\AppData\Local\Temp\claude\...\scratchpad\probe-libp2p)
+    Checking probe-libp2p v0.1.0 (<scratchpad>)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.72s
 ```
 
@@ -285,8 +285,8 @@ Zero warnings, zero errors. And it actually runs and binds both transports:
 
 ```
 $ cargo run
-circuit dial addr: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit/p2p/12D3KooWAhuYp5H7722UQ3EzuZvoU1XNMy6Ezq6rqEQxJQ73grS5
-reservation listen addr: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit
+circuit dial addr: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7…/p2p-circuit/p2p/12D3KooWAhuY…
+reservation listen addr: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7…/p2p-circuit
 listen /ip4/192.168.1.21/tcp/18811
 listen /ip4/127.0.0.1/tcp/18811
 listen /ip4/172.20.160.1/tcp/18811
@@ -495,8 +495,8 @@ Runtime proof (asserted string round-trip through `Multiaddr::to_string()` and
 `str::parse::<Multiaddr>()`):
 
 ```
-circuit dial addr: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit/p2p/12D3KooWAhuYp5H7722UQ3EzuZvoU1XNMy6Ezq6rqEQxJQ73grS5
-reservation listen addr: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit
+circuit dial addr: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7…/p2p-circuit/p2p/12D3KooWAhuY…
+reservation listen addr: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7…/p2p-circuit
 ```
 
 **Verification:** compiled + executed (`probe-libp2p`, `assert_eq!` on the round-trip).

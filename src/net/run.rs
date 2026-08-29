@@ -1365,7 +1365,7 @@ mod tests {
         let xs = "x".repeat(200);
         for source in [
             "Riverside",
-            "Riverside u Pepy na Zizkove s dlouhym nazvem, ktery se sem nevejde",
+            "A table whose name is long enough that it will not fit in the field",
             cards.as_str(),
             rs.as_str(),
             xs.as_str(),
@@ -1393,7 +1393,7 @@ mod tests {
         let cards = "\u{1F0A1}".repeat(40);
         for name in [
             "Riverside",
-            "Riverside u Pepy na Zizkove s velmi dlouhym nazvem stolu ktery je moc dlouhy",
+            "A table whose name is very much longer than the sixty-four bytes allowed",
             cards.as_str(),
         ] {
             let ad = new_table(

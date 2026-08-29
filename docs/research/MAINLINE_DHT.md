@@ -27,7 +27,7 @@ number was re-read in the unpacked crate; and the BEP 5 quotes were re-fetched f
 have been widened to cover both. Nothing was contradicted.
 
 Probe sources (kept, not in the repo):
-`~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad/probe-dht/`
+`<scratchpad>`
 — `live/` (mainline 8.0.0), `dht7/` (dht 7.0.0), `n0probe/` (n0-mainline 0.6.0),
 `krpc/` (hand-rolled KRPC), `cfg/` (config/socket probes), `negcheck*/` (dead crates),
 `final/` (the recommended Cargo.toml, compiled and run).

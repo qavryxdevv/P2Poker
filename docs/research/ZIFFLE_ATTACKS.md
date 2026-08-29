@@ -854,7 +854,7 @@ gaps.
 
 ```bash
 export PATH="~/.cargo/bin:$PATH"
-cd "~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad/zr-break"
+cd "<scratchpad>"
 cargo build --release -j 19
 ./target/release/zr-break.exe                        # all sections
 ./target/release/zr-break.exe a12 a16 a18            # the three that succeeded

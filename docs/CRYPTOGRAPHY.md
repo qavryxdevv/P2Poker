@@ -2579,7 +2579,7 @@ New probe written for this document:
 ```
 
 where `<scratchpad>` is
-`~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad`.
+`<scratchpad>`.
 
 `cargo run --release`, rustc 1.95.0, x86_64-pc-windows-msvc, verbatim output:
 

@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Decentralised No-Limit Texas Hold'em over libp2p and BitTorrent Mainline DHT"
-repository = "https://github.com/example/p2p-poker"
+# No `repository`, `authors` or `homepage`. The crate is `publish = false`, so
+# none of them reaches a registry, and each is a place for somebody's name to
+# end up in a file that gets copied about. Set `repository` if this is ever
+# published.
 publish = false
 
 # ---------------------------------------------------------------------------

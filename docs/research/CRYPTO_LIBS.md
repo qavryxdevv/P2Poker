@@ -56,7 +56,7 @@ host: x86_64-pc-windows-msvc, Windows 10, 24 cores
 | `probe-crypto-final` (bin `allocbound`) | `…/scratchpad/probe-crypto-final/src/bin/allocbound.rs` | Spec §27 allocation bounding |
 
 Scratchpad root:
-`~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad/`
+`<scratchpad>`
 
 Throughout, **Verification** is one of:
 

@@ -30,7 +30,7 @@ Probe crates written for this report (all outside the repo):
 ```
 
 where `<scratch>` is
-`~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad`.
+`<scratchpad>`.
 
 ---
 

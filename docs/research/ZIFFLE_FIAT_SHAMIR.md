@@ -16,7 +16,7 @@ fork legitimate?**
   web.archive.org, since `www0.cs.ucl.ac.uk` is unreachable from here). §5.3 —
   the single value product argument that ziffle actually implements — appears
   only in the full version.
-- Probe crate: `~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad/zr-fiatshamir/probe/`
+- Probe crate: `<scratchpad>`
   — an independent re-implementation of the transcript and of both
   sub-argument verifiers, used to confirm by execution (not by reading) what is
   absorbed and in what order.

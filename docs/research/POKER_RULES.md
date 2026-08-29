@@ -28,17 +28,17 @@ Primary rules source:
 > Downloaded from `https://holdemhive.com/TDA%20Rules-2024-V1.pdf`
 > (310.7 KB PDF, 22 pages), text extracted locally with `pypdf`.
 > Verification: (primary text). Extracted text kept at
-> `~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad/tda.txt`.
+> `<scratchpad>`.
 > Note: `pokertda.com` itself refused the connection (`ECONNREFUSED
 > 18.236.22.145:443`) at the time of writing; the mirror above was used and its
 > header self-identifies as the 2024 v1.0 official longform text.
 
 Secondary source for the preset: the PokerTH checkout at
-`the PokerTH source tree`. All PokerTH claims cite `file:line`.
+`~/src/pokerth`. All PokerTH claims cite `file:line`.
 Verification: (source).
 
 Probe crate used for the evaluator section (all results reproducible):
-`~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad/probe-pokerrules/`
+`<scratchpad>`
 
 Where this document deliberately departs from TDA, the departure is marked
 **[OUR CHOICE]** with the reason. Where a value could not be found in the source
@@ -997,7 +997,7 @@ The authoritative definition in PokerTH is `ServerGame::CheckSettings`, which
 strongest possible evidence of what "the rated preset" means: these are not
 defaults a user can change, they are enforced.
 
-`the PokerTH source tree/src/net/servergame.cpp:1258-1273`:
+`~/src/pokerth/src/net/servergame.cpp:1258-1273`:
 
 ```cpp
 if (mode != SERVER_MODE_LAN) {

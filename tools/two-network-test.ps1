@@ -39,7 +39,7 @@
 
 [CmdletBinding()]
 param(
-    [string] $VMName = 'WIN 10 THC',
+    [string] $VMName = 'p2p-poker-test',
     [int]    $Seconds = 240,
     [string] $Binary  = "$PSScriptRoot\..\target\release\p2p-poker.exe"
 )

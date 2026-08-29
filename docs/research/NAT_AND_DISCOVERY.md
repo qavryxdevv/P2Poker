@@ -170,10 +170,10 @@ is then established by the QUIC/TLS (or Noise) handshake, and `ConnectionEstabli
 reports the `PeerId` that was cryptographically proven. Measured end to end:
 
 ```
-LOCAL PEER ID: 12D3KooWQRHfYjSHE8SaiYZR9zNpKBmcwPebEZr8UPZ7g1vbhMJd
+LOCAL PEER ID: 12D3KooWQRHf…
 DIALING /ip4/192.168.1.21/udp/63240/quic-v1  (contains /p2p PeerId component: false)
   dial() accepted the address without a PeerId
-CONNECTED peer=12D3KooWN1VUXvnPL6wgrWNikY36H1tcYrNqDkpJHUDujLueJQ1J n=1
+CONNECTED peer=12D3KooWN1VU… n=1
           addr="/ip4/192.168.1.21/udp/63240/quic-v1"
 ```
 
@@ -570,7 +570,7 @@ same LAN, same NAT.
 
 ```
 DIALING /ip4/192.168.1.21/udp/63240/quic-v1  (contains /p2p PeerId component: false)
-CONNECTED peer=12D3KooWN1VUXvnPL6wgrWNikY36H1tcYrNqDkpJHUDujLueJQ1J n=1
+CONNECTED peer=12D3KooWN1VU… n=1
 ```
 
 **(ii) mDNS** — `libp2p::mdns::tokio::Behaviour` found the peer on all interfaces:

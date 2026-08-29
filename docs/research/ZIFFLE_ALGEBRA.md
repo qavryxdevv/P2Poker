@@ -14,7 +14,7 @@ the proof are named only where they touch the algebra; they are other reviews' s
   Relevant sections: **§3** (shuffle argument), **§4** (multi-exponentiation argument),
   **§5.3** (single value product argument). Note that the multi-exponentiation argument
   is the paper's **§4**, not §5 — the task brief's "§5" is §5.3 plus §5's framing.
-- Probe crate: `~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad/zr-algebra/probe/`
+- Probe crate: `<scratchpad>`
   — a vendored copy of `lib.rs` with `verify` split into per-check booleans, plus
   forgery attempts. Built with `rustc 1.95.0`, `cargo test --release -j 19`.
 
@@ -560,7 +560,7 @@ Stated plainly, per the brief.
 
 ```bash
 export PATH="~/.cargo/bin:$PATH"
-cd "~/AppData/Local/Temp/claude/<session>/<session-id>/scratchpad/zr-algebra/probe"
+cd "<scratchpad>"
 cargo test --release -j 19 -- --nocapture --test-threads=1
 ```
 

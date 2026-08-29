@@ -484,13 +484,13 @@ mod tests {
         a.name = "Riverside".into();
         a.host = "deadbeef".into();
         let mut b = row([2u8; 32], &held(2, false));
-        b.name = "Riverside".into();
+        b.name = "The Kitchen".into();
         b.host = "cafebabe".into();
         let rows = vec![a, b];
 
         assert_eq!(visible(&rows, "", Filter::All).len(), 2);
-        assert_eq!(visible(&rows, "pepy", Filter::All).len(), 1, "lower case");
-        assert_eq!(visible(&rows, "  PEPY  ", Filter::All).len(), 1, "trimmed");
+        assert_eq!(visible(&rows, "river", Filter::All).len(), 1, "lower case");
+        assert_eq!(visible(&rows, "  RIVER  ", Filter::All).len(), 1, "trimmed");
         assert_eq!(visible(&rows, "cafe", Filter::All).len(), 1, "by host");
         assert_eq!(visible(&rows, "nothing", Filter::All).len(), 0);
     }
