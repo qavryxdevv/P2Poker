@@ -91,7 +91,13 @@ pub fn stage_hash_collective(sequence: u64, stage_type: u16, emitters: &[StageEm
 /// the chain, in which case hashing it again buys nothing, or it is a local
 /// view, in which case hashing it forks the genesis (D-012).
 pub fn roster_hash(seats: &[RosterSeat]) -> Hash {
-    debug_assert!(
+    // A `debug_assert` stood here, and a roster arrives from the network: in a
+    // release build the check was absent on exactly the path that needs it.
+    // `table::formation::Roster` refuses an unsorted roster before it can reach
+    // this function, so this is the second gate rather than the only one — but
+    // an order-dependent hash whose order is unchecked is two peers hashing two
+    // values from the same members, and that must not be reachable at all.
+    assert!(
         seats.windows(2).all(|w| w[0].seat < w[1].seat),
         "the roster must be in ascending seat order, without repeats"
     );

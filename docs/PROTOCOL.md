@@ -2336,12 +2336,24 @@ carried-and-never-checked shape this corpus names as a defect class in its own
 right, because a field nothing validates is a field every reader assumes
 somebody else validates.
 
-What the rule buys, stated exactly. It stops **one node** holding several seats:
-`n(2) peer_id` must equal the connection's authenticated remote PeerId, so a
-second seat from the same node is caught at the founder and again at every
-receiver of the `PLAYER_LIST`. It stops the accidental case outright — two copies
-of the client on one machine, one person joining a table twice — and it costs a
-determined attacker one more process.
+What the rule buys, stated exactly. It stops **one node holding two seats at one
+table**: `n(2) peer_id` must equal the connection's authenticated remote PeerId,
+so a second seat from the same node is caught at the founder and again at every
+receiver of that table's `PLAYER_LIST`. It stops the accidental case outright —
+two copies of the client on one machine, one person joining a table twice — and
+it costs a determined attacker one more process.
+
+**The rule is per roster, and multi-tabling is therefore unaffected and
+intended.** Each table checks its own roster and no other, so one client may hold
+a seat at as many different tables as it likes; what it may not do is hold two
+seats at the same one. That is the distinction the rule is drawn on, and reading
+it as *one node, one table* would forbid the ordinary way people play.
+
+One consequence worth stating rather than leaving to be discovered: a client that
+multi-tables under one `app_public_key` links those tables to any observer of the
+lobby. Using a distinct application key per table unlinks them and costs nothing
+in this protocol, since the key is per-table already by §4.3's *"not already
+seated"* rule.
 
 What it does not buy, and this is not a gap that closing it would fix. **It is
 not one person per seat.** A person with two machines, or two containers, or one

@@ -5,3 +5,4 @@
 //! defect between two well-tested halves has nowhere else to live.
 
 pub mod dealing;
+pub mod formation;
