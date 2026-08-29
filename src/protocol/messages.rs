@@ -433,6 +433,42 @@ impl EventBody {
         }
     }
 
+    /// Build an **unchained** envelope, with every sentinel §2.3 requires.
+    ///
+    /// The counterpart of [`check_envelope`](Self::check_envelope), and here so
+    /// that the two cannot disagree. A publisher that restated `chain_scope`,
+    /// `event_class` and the four sentinels by hand had six chances to differ
+    /// from the checker, and the first one written took three of them: it set a
+    /// class of 2 where the catalogue says 0, and gave a sequence to an event
+    /// that has none.
+    ///
+    /// Returns `None` for a chained type, because a chained event's envelope is
+    /// not this shape and there is no sensible sentinel for it.
+    pub fn unchained(
+        event_type: EventType,
+        sender_public_key: [u8; 32],
+        payload: Vec<u8>,
+        emitted_at_unix_ms: u64,
+    ) -> Option<Self> {
+        if event_type.chain_scope() != 0 {
+            return None;
+        }
+        Some(EventBody {
+            protocol_version: PROTOCOL_VERSION,
+            table_id: ZERO32,
+            hand_id: UNCHAINED_HAND_ID,
+            sequence: 0,
+            sender_public_key,
+            event_type: event_type.code(),
+            payload,
+            previous_event_hash: ZERO32,
+            emitted_at_unix_ms,
+            next_deadline_ms: 0,
+            chain_scope: event_type.chain_scope(),
+            event_class: Self::expected_class(event_type),
+        })
+    }
+
     /// Check the envelope against the catalogue, before the payload is parsed
     /// and before any signature is checked.
     ///
