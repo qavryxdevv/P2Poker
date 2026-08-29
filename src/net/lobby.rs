@@ -441,7 +441,40 @@ impl LobbyStore {
             }
             None => {
                 if self.tables.len() >= MAX_TRACKED_TABLES {
-                    return Err(NotTaken::LobbyFull);
+                    // A hard refusal here was a **lockout**: the first 4 096
+                    // table keys to arrive kept their slots for ever, and every
+                    // honest table advertised afterwards was invisible. The
+                    // bound was real and the policy behind it was
+                    // first-come-keeps-it, which hands a squatter the whole
+                    // lobby for the price of 4 096 signatures.
+                    //
+                    // So room is made, in two steps. Anything already dead goes
+                    // first — a store that is full of expired adverts is not
+                    // full. If every slot is still live, the one that expires
+                    // soonest is displaced, because it is the entry with the
+                    // least left to lose and because a squatter must then keep
+                    // re-signing to hold ground rather than claiming it once.
+                    //
+                    // **What this does not fix**: a peer that keeps re-signing
+                    // 4 096 tables holds them legitimately, and no eviction rule
+                    // reaches that. It is Sybil without an identity layer, which
+                    // `SPEC_CS.md` §18 places outside the threat model. What is
+                    // fixed is the version that cost one message per slot and
+                    // then nothing at all.
+                    self.expire(now_ms);
+                    if self.tables.len() >= MAX_TRACKED_TABLES {
+                        let victim = self
+                            .tables
+                            .iter()
+                            .min_by_key(|(_, h)| h.ad.expires_at_unix_ms)
+                            .map(|(k, _)| *k);
+                        match victim {
+                            Some(k) => {
+                                self.tables.remove(&k);
+                            }
+                            None => return Err(NotTaken::LobbyFull),
+                        }
+                    }
                 }
                 self.tables.insert(
                     table_key,
@@ -982,21 +1015,82 @@ mod tests {
         assert_eq!(store.expire(NOW + 2_000), 1);
     }
 
-    /// The advert stream is open to strangers, so the lobby is bounded.
+    /// The advert stream is open to strangers, so the lobby is bounded — and the
+    /// bound makes room rather than locking the door.
+    ///
+    /// The first version refused every new key once full, which is not a bound
+    /// but a **lockout**: the first 4 096 keys to arrive kept their slots for
+    /// ever and every honest table advertised afterwards was invisible. A
+    /// squatter bought the whole lobby for 4 096 signatures and then paid
+    /// nothing.
     #[test]
-    fn the_lobby_is_bounded() {
+    fn a_full_lobby_makes_room_rather_than_locking_the_door() {
         let mut store = LobbyStore::new();
-        for i in 0..(MAX_TRACKED_TABLES + 10) as u32 {
+        for i in 0..MAX_TRACKED_TABLES as u32 {
             let mut key = [0u8; 32];
             key[..4].copy_from_slice(&i.to_be_bytes());
-            let r = store.offer(key, legal_custom(), h(1), NOW);
-            if i as usize >= MAX_TRACKED_TABLES {
-                assert_eq!(r, Err(NotTaken::LobbyFull));
-            } else {
-                assert_eq!(r, Ok(()));
-            }
+            assert_eq!(store.offer(key, legal_custom(), h(1), NOW), Ok(()));
         }
         assert_eq!(store.len(), MAX_TRACKED_TABLES);
+
+        // An honest table arriving now is seen, and the store stays bounded.
+        let mut honest = legal_custom();
+        honest.table_name = "arrived late".into();
+        honest.expires_at_unix_ms = NOW + MAX_AD_LIFETIME_MS;
+        assert_eq!(store.offer([0xFF; 32], honest, h(1), NOW), Ok(()));
+        assert_eq!(store.len(), MAX_TRACKED_TABLES);
+        assert!(
+            store.get(&[0xFF; 32]).is_some(),
+            "the late arrival is in the lobby, which is the whole point"
+        );
+    }
+
+    /// And what it displaces is the entry with the least left to lose.
+    #[test]
+    fn the_soonest_to_expire_is_the_one_displaced() {
+        let mut store = LobbyStore::new();
+        for i in 0..MAX_TRACKED_TABLES as u32 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_be_bytes());
+            let mut ad = legal_custom();
+            // Table 0 expires first by a whole second.
+            ad.expires_at_unix_ms = NOW + 60_000 + i as u64;
+            assert_eq!(store.offer(key, ad, h(1), NOW), Ok(()));
+        }
+
+        let mut fresh = legal_custom();
+        fresh.expires_at_unix_ms = NOW + MAX_AD_LIFETIME_MS;
+        store.offer([0xFF; 32], fresh, h(1), NOW).unwrap();
+
+        assert!(
+            store.get(&[0u8; 32]).is_none(),
+            "the one closest to expiry went"
+        );
+        let mut second = [0u8; 32];
+        second[..4].copy_from_slice(&1u32.to_be_bytes());
+        assert!(store.get(&second).is_some(), "and only that one");
+    }
+
+    /// A store full of dead adverts is not full. Expiry runs before anything is
+    /// displaced, so a live table is never evicted while a corpse holds a slot.
+    #[test]
+    fn dead_adverts_are_cleared_before_a_live_one_is_displaced() {
+        let mut store = LobbyStore::new();
+        for i in 0..MAX_TRACKED_TABLES as u32 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_be_bytes());
+            assert_eq!(store.offer(key, legal_custom(), h(1), NOW), Ok(()));
+        }
+
+        // Long enough that every held advert has expired on its own terms.
+        let later = NOW + 200_000;
+        let mut fresh = legal_custom();
+        fresh.timestamp_unix_ms = later;
+        fresh.expires_at_unix_ms = later + 90_000;
+        store.offer([0xFF; 32], fresh, h(1), later).unwrap();
+
+        assert_eq!(store.len(), 1, "the corpses went, not a live table");
+        assert!(store.get(&[0xFF; 32]).is_some());
     }
 
     #[test]

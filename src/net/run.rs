@@ -53,6 +53,13 @@ use crate::protocol::constants::{AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX,
 /// How long to wait for the DHT to bootstrap before giving up on this cycle.
 const BOOTSTRAP_PATIENCE: Duration = Duration::from_secs(20);
 
+/// How many relay addresses to remember having asked.
+///
+/// The set exists so a discovery cycle does not re-ask the same relay every
+/// minute, and it is fed from the DHT — so it is bounded like everything else
+/// that is. The bound empties it rather than freezing it: see where it is used.
+const MAX_ASKED_RELAYS: usize = 512;
+
 /// How often to ask whether an announce is due.
 ///
 /// Not the same thing as how often to announce. The check is cheap and the
@@ -147,6 +154,12 @@ pub async fn run(
     let mut announced_port: Option<u16> = None;
     // Relays this node has asked for a reservation from, so a repeated discovery
     // cycle does not ask the same relay again every minute.
+    //
+    // Bounded, because it is fed from the DHT and the DHT is whatever strangers
+    // say. When it fills it is emptied rather than frozen: asking a relay twice
+    // costs one message, and never asking a NEW one costs the connection this
+    // client needs — so the failure this bound must not have is the one a frozen
+    // set would give it.
     let mut asked_relays: HashSet<SocketAddrV4> = HashSet::new();
     let mut have_reservation = false;
     // Counted so that "no relay" is reported as a finding rather than as
@@ -349,6 +362,14 @@ pub async fn run(
 
             _ = discover_timer.tick() => {
                 if bootstrapped(&dht).await {
+                    // Cleared first, and this is not tidiness. `absorb` drops the
+                    // INCOMING address once the list holds its cap, so a list
+                    // that is never cleared freezes on whatever the first
+                    // stranger supplied — for the whole life of the process. The
+                    // DHT returns a fresh view every cycle and this takes it;
+                    // re-dialling is prevented by `fresh_dials`, which is where
+                    // that belongs.
+                    hints.clear();
                     let mut stream = dht.get_peers(lobby_hash);
                     while let Some(batch) = DhtStreamExt::next(&mut stream).await {
                         hints.absorb(batch.as_ref());
@@ -384,6 +405,9 @@ pub async fn run(
                                     cycles: relay_searches,
                                 })
                                 .await;
+                        }
+                        if asked_relays.len() >= MAX_ASKED_RELAYS {
+                            asked_relays.clear();
                         }
                         for addr in relays.peers() {
                             if !asked_relays.insert(*addr) {
