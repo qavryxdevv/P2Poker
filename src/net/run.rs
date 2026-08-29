@@ -63,6 +63,49 @@ use crate::protocol::constants::{
 /// How long to wait for the DHT to bootstrap before giving up on this cycle.
 const BOOTSTRAP_PATIENCE: Duration = Duration::from_secs(20);
 
+/// The way on to the public libp2p network, when no player is reachable.
+///
+/// **This is a dependency on somebody else's machines, and it is deliberate.**
+/// `NAT_AND_DISCOVERY.md` §3.3 rejects a hardcoded list of relays, and it is
+/// right to: a relay sees who plays with whom. But D-004's layers 2 and 3 are
+/// built on public relays, and without a way to reach one this client had none
+/// at all — the status line read `relay: none` and it was the truth. Most
+/// people are behind a NAT that blocks unsolicited traffic. A client they
+/// cannot use is not a more decentralised client, it is an unused one.
+///
+/// Three things keep it honest:
+///
+/// * **A relay is a fallback, never the game.** DCUtR upgrades the connection
+///   to a direct one as soon as it can, and a public relay's two minutes and
+///   128 KiB are sized for exactly that: carry the introduction, then get out
+///   of the way. A hand is played peer to peer or over a *volunteer's* relay
+///   (D-002), never over these.
+/// * **A name, not addresses.** One `/dnsaddr/` resolves through TXT records to
+///   whatever the operators currently run — measured 2026-08-29, four nodes in
+///   Amsterdam, New York, Singapore and Silicon Valley. Nothing is compiled in
+///   that can go stale, and any node found through them that speaks the hop
+///   protocol will do.
+/// * **Volunteers come first.** This is consulted only after the DHT's own
+///   relay swarm has been asked and answered with nobody.
+const PUBLIC_ENTRY: &[&str] = &["/dnsaddr/bootstrap.libp2p.io"];
+
+/// The namespace relay hosts advertise themselves under, as a DHT key.
+///
+/// Derived, not copied: go-libp2p's routing discovery turns a namespace string
+/// into `CIDv1(raw, sha2-256(ns))` and go-libp2p-kad-dht keys the provider
+/// record on that CID's **multihash**, so the key is `0x12 0x20` — sha2-256,
+/// thirty-two bytes — followed by the digest. Computing it here rather than
+/// pasting thirty-four bytes means the derivation is visible and the test can
+/// check it against the published value.
+fn relay_namespace() -> libp2p::kad::RecordKey {
+    use sha2::{Digest, Sha256};
+    let mut key = Vec::with_capacity(34);
+    key.push(0x12);
+    key.push(0x20);
+    key.extend_from_slice(&Sha256::digest(b"/libp2p/relay"));
+    libp2p::kad::RecordKey::new(&key)
+}
+
 /// How many relay addresses to remember having asked.
 ///
 /// The set exists so a discovery cycle does not re-ask the same relay every
@@ -150,6 +193,30 @@ pub async fn run(
         swarm.listen_on(addr)?;
     }
 
+    // Reach for the public network at once, rather than after the first
+    // housekeeping tick. Two things depend on having *any* peer at all and both
+    // are stuck without one: AutoNAT cannot decide whether this client is
+    // reachable until somebody agrees to dial it back, and a reservation cannot
+    // be asked of a relay this node has never met. Sitting on a home connection
+    // with no other player running, the client could reach neither conclusion —
+    // which is exactly what `relay: none` was reporting.
+    for entry in PUBLIC_ENTRY {
+        match entry.parse::<libp2p::Multiaddr>() {
+            Ok(addr) => {
+                if let Err(e) = swarm.dial(addr) {
+                    let _ = events
+                        .send(NodeEvent::Warning(format!("{entry}: {e}")))
+                        .await;
+                }
+            }
+            Err(e) => {
+                let _ = events
+                    .send(NodeEvent::Warning(format!("{entry} is not an address: {e}")))
+                    .await;
+            }
+        }
+    }
+
     let mut state = NodeState::new();
     let mut hints = PeerHints::new();
     let my_peer_bytes = swarm.local_peer_id().to_bytes();
@@ -203,6 +270,16 @@ pub async fn run(
     // client needs — so the failure this bound must not have is the one a frozen
     // set would give it.
     let mut asked_relays: HashSet<SocketAddrV4> = HashSet::new();
+
+    // Peers already asked for a reservation because identify said they relay.
+    // Asking twice is not harmful, only noisy, and the noise is a log line per
+    // identify push — which arrives every time the peer's addresses change.
+    let mut asked_hops: HashSet<libp2p::PeerId> = HashSet::new();
+
+    // Whether the public DHT has been asked who the relays are. Once is enough
+    // to start: the answer arrives as providers, and each of those is then
+    // dialled and asked for a reservation on its own account.
+    let mut asked_public_dht = false;
     let mut have_reservation = false;
     // Counted so that "no relay" is reported as a finding rather than as
     // impatience: three cycles is three minutes of looking.
@@ -519,7 +596,18 @@ pub async fn run(
                         // AutoNAT is the only thing that may decide this. A
                         // setting cannot: a user who is wrong about their own NAT
                         // would advertise a way through that is not one.
-                        let public = ev.result.is_ok();
+                        // ...and the address it confirmed has to be one the
+                        // rest of the world could dial. `NAT_AND_DISCOVERY.md`
+                        // §2.4(ii) calls this mitigation mandatory and upstream
+                        // does not do it: there is no private-range check
+                        // anywhere in `libp2p-autonat`'s v2 client. Two clients
+                        // behind one router - a laptop and a virtual machine on
+                        // it, which is how this gets tested - dial each other
+                        // successfully on `192.168.x`, and without this guard
+                        // both would conclude they are publicly reachable, both
+                        // would volunteer as relays, and both would advertise a
+                        // port that nobody outside the house can open.
+                        let public = ev.result.is_ok() && reachable(&ev.tested_addr);
 
                         // A confirmed address is an **external** address, and
                         // saying so is not bookkeeping.
@@ -545,10 +633,139 @@ pub async fn run(
                             let _ = events.send(NodeEvent::Reachability { public }).await;
                         }
                     }
+                    // A relay that advertises the hop protocol and then says no.
+                    // Reported rather than swallowed: measured against the four
+                    // public `bootstrap.libp2p.io` nodes, all four advertise it
+                    // and all four refuse, and a client that hid that would look
+                    // identical to one whose request never went out.
+                    SwarmEvent::ListenerClosed { reason: Err(e), addresses, .. } => {
+                        // A circuit listener that closes is a reservation that
+                        // is gone - refused now, or expired later. Either way
+                        // the flag has to come back down, or one bad minute
+                        // leaves this client believing it has a way in for the
+                        // rest of the process and never looking for another.
+                        if addresses.iter().any(|a| {
+                            a.iter()
+                                .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+                        }) {
+                            have_reservation = false;
+                        }
+                        let _ = events
+                            .send(NodeEvent::Warning(format!("relay said no: {e}")))
+                            .await;
+                    }
                     SwarmEvent::OutgoingConnectionError { error, .. } => {
                         let _ = events
                             .send(NodeEvent::DialFailed { reason: error.to_string() })
                             .await;
+                    }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Identify(
+                        libp2p::identify::Event::Received { peer_id, info, .. },
+                    )) => {
+                        // Identify is how a relay is recognised, rather than by
+                        // being on a list. The hop protocol's name is a
+                        // compile-time constant in `libp2p-relay` and is not
+                        // namespaced per application, so a public node that
+                        // offers it will serve this client the same as any
+                        // other — which is what makes a list of relay addresses
+                        // unnecessary (§3.3) even while an entry point is not.
+                        // What the world says our address is. Not proof of
+                        // reachability - only AutoNAT can say that - but enough
+                        // to stop dialling our own past announcements out of the
+                        // DHT, which is where most failed dials came from.
+                        if let Some(libp2p::multiaddr::Protocol::Ip4(ip)) =
+                            info.observed_addr.iter().next()
+                        {
+                            state.set_external(ip);
+                        }
+
+                        // A peer on the public DHT is a way into it. Its
+                        // addresses go into the public routing table so that
+                        // `get_providers` has somewhere to start; without this
+                        // the second Kademlia knows nobody and every query
+                        // fails before it leaves the process.
+                        if info
+                            .protocols
+                            .iter()
+                            .any(|p| p.as_ref() == "/ipfs/kad/1.0.0")
+                        {
+                            for a in &info.listen_addrs {
+                                if reachable(a) {
+                                    swarm
+                                        .behaviour_mut()
+                                        .ipfs_kad
+                                        .add_address(&peer_id, a.clone());
+                                }
+                            }
+                            if !asked_public_dht {
+                                asked_public_dht = true;
+                                swarm
+                                    .behaviour_mut()
+                                    .ipfs_kad
+                                    .get_providers(relay_namespace());
+                            }
+                        }
+
+                        let relays = info.protocols.contains(&libp2p::relay::HOP_PROTOCOL_NAME);
+                        if relays && !have_reservation && !asked_hops.contains(&peer_id) {
+                            // Their own address, with their identity and the
+                            // circuit suffix. Listening on that IS the
+                            // reservation request; there is no separate call.
+                            //
+                            // Only a globally routable address: a relay
+                            // advertising `192.168.x` is advertising its own
+                            // network, and a reservation taken over an address
+                            // this client cannot reach from outside would be a
+                            // reservation nobody could use to reach it.
+                            // Marked only once there is something to ask with.
+                            // Identify arrives more than once and the first one
+                            // often carries nothing but private addresses; a
+                            // peer written off then would never be asked again,
+                            // however reachable it turned out to be a second
+                            // later.
+                            if let Some(addr) = info.listen_addrs.iter().find(|a| reachable(a)) {
+                                asked_hops.insert(peer_id);
+                                let circuit = addr
+                                    .clone()
+                                    .with(libp2p::multiaddr::Protocol::P2p(peer_id))
+                                    .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                                if let Err(e) = swarm.listen_on(circuit) {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "no reservation from {peer_id}: {e}"
+                                        )))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::IpfsKad(
+                        libp2p::kad::Event::OutboundQueryProgressed { result, .. },
+                    )) => {
+                        use libp2p::kad::{GetProvidersOk, QueryResult};
+                        if let QueryResult::GetProviders(Ok(
+                            GetProvidersOk::FoundProviders { providers, .. },
+                        )) = result
+                        {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "{} relay(s) advertised in the DHT",
+                                    providers.len()
+                                )))
+                                .await;
+                            for peer in providers {
+                                // By peer id: the addresses came with the query
+                                // and live in the routing table, and asking for
+                                // them by hand would be asking a second time
+                                // for what is already known.
+                                let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
+                                    .condition(
+                                        libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing,
+                                    )
+                                    .build();
+                                let _ = swarm.dial(opts);
+                            }
+                        }
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Mdns(
                         libp2p::mdns::Event::Discovered(found),
@@ -773,6 +990,14 @@ pub async fn run(
                                     cycles: relay_searches,
                                 })
                                 .await;
+                            // No volunteer, and still no reservation: reach for
+                            // the public network again. Only here, so a network
+                            // that has volunteers of its own never touches it.
+                            for entry in PUBLIC_ENTRY {
+                                if let Ok(addr) = entry.parse::<libp2p::Multiaddr>() {
+                                    let _ = swarm.dial(addr);
+                                }
+                            }
                         }
                         if asked_relays.len() >= MAX_ASKED_RELAYS {
                             asked_relays.clear();
@@ -1357,6 +1582,29 @@ async fn handle_gossip(
 /// Both the announce and the discovery need this, and they needed it separately
 /// — which is how the announce came to fire at `t = 0` with nowhere to send a
 /// store request.
+/// Whether an address is one the rest of the internet could dial.
+///
+/// A relay is only useful if the address it was reached on is reachable from
+/// anywhere, because that address becomes part of this client's own circuit
+/// address and is what other players will dial. Loopback and the private ranges
+/// are somebody's own network; `0.0.0.0` is a wildcard bind and not an address
+/// at all.
+fn reachable(addr: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().any(|p| match p {
+        Protocol::Ip4(ip) => {
+            !ip.is_loopback()
+                && !ip.is_private()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_broadcast()
+                && !ip.is_documentation()
+        }
+        Protocol::Ip6(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+        _ => false,
+    })
+}
+
 async fn bootstrapped(dht: &mainline::async_dht::AsyncDht) -> bool {
     tokio::time::timeout(BOOTSTRAP_PATIENCE, dht.bootstrapped())
         .await

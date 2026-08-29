@@ -123,6 +123,24 @@ pub struct PokerBehaviour {
     /// Peer routing. **Not** the global lobby — that is Mainline, under
     /// `LOBBY_INFOHASH`, and lives in [`super::dht`].
     pub kademlia: kad::Behaviour<MemoryStore>,
+    /// The **public** Kademlia, and the only reason it exists is relays.
+    ///
+    /// `kademlia` above speaks `/p2p-poker/kad/1`, which is right: this
+    /// project's records are its own and have no business in anybody else's
+    /// routing table. But it also means this client is invisible to, and blind
+    /// to, the network where relays actually advertise themselves — and a peer
+    /// behind a NAT with no relay cannot be reached at all.
+    ///
+    /// libp2p's answer to "where are the relays" is not a file. A relay host
+    /// advertises itself in the DHT under the namespace `/libp2p/relay`, and
+    /// AutoRelay looks it up there; that is the list, and it maintains itself.
+    /// Reading it means speaking `/ipfs/kad/1.0.0`.
+    ///
+    /// In **client mode**: this node queries and does not answer. Serving other
+    /// people's routing queries is a service to a network this client is only
+    /// visiting, and it would be paid for with the bandwidth of somebody trying
+    /// to play poker.
+    pub ipfs_kad: kad::Behaviour<MemoryStore>,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
     /// Asks other peers whether this client is reachable, which is what decides
@@ -223,6 +241,15 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                 kad_cfg,
             );
 
+            let mut ipfs_cfg = kad::Config::new(StreamProtocol::new("/ipfs/kad/1.0.0"));
+            ipfs_cfg.set_query_timeout(Duration::from_secs(60));
+            let mut ipfs_kad = kad::Behaviour::with_config(
+                local_peer_id,
+                MemoryStore::new(local_peer_id),
+                ipfs_cfg,
+            );
+            ipfs_kad.set_mode(Some(kad::Mode::Client));
+
             let identify = identify::Behaviour::new(
                 identify::Config::new("/p2p-poker/1".into(), key.public())
                     .with_agent_version(format!("p2p-poker/{}", env!("CARGO_PKG_VERSION")))
@@ -232,6 +259,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
             Ok(PokerBehaviour {
                 gossipsub,
                 kademlia,
+                ipfs_kad,
                 identify,
                 ping: ping::Behaviour::new(ping::Config::new()),
                 // AutoNAT's constructor names the concrete OS generator type

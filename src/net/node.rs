@@ -297,6 +297,10 @@ pub struct NodeState {
     /// Whether AutoNAT has confirmed this node is reachable, which is what D-002
     /// gates relay volunteering on.
     public: bool,
+
+    /// This client's own address, as other peers report seeing it. See
+    /// [`fresh_dials`](NodeState::fresh_dials).
+    external: Option<std::net::Ipv4Addr>,
 }
 
 impl Default for NodeState {
@@ -311,6 +315,7 @@ impl NodeState {
             lobby: LobbyStore::new(),
             limits: RateLimiter::new(),
             dialled: HashSet::new(),
+            external: None,
             public: false,
         }
     }
@@ -320,12 +325,35 @@ impl NodeState {
     /// Already-dialled addresses are dropped, because the DHT returns the same
     /// peers every cycle and re-dialling all of them every ten minutes would be
     /// a self-inflicted connection storm.
+    ///
+    /// **And so is this client's own address.** An announcement in the DHT
+    /// outlives the process that made it, and every run announces a fresh
+    /// ephemeral port, so after a dozen runs the swarm holds a dozen entries all
+    /// pointing at this household — every one of them a port nothing is
+    /// listening on any more. Measured on a developer machine: of the addresses
+    /// one cycle returned, the great majority were this node's own past selves,
+    /// and dialling them is where "46 dials failed" came from.
+    ///
+    /// A peer that genuinely shares this external address is behind the same
+    /// router, and mDNS is how those two find each other — a route out and back
+    /// in through one's own NAT is hairpinning, which many routers do not do at
+    /// all.
     pub fn fresh_dials(&mut self, batch: &[SocketAddrV4]) -> Vec<SocketAddrV4> {
         batch
             .iter()
             .copied()
+            .filter(|a| Some(*a.ip()) != self.external)
             .filter(|a| self.dialled.insert(*a))
             .collect()
+    }
+
+    /// Remember what the world says this client's address is.
+    ///
+    /// Learned from `identify`: every peer reports the address it saw us come
+    /// from. It is not a claim that the address is reachable — only AutoNAT can
+    /// say that — but it is enough to recognise our own reflection in the DHT.
+    pub fn set_external(&mut self, addr: std::net::Ipv4Addr) {
+        self.external = Some(addr);
     }
 
     pub fn set_public(&mut self, public: bool) {

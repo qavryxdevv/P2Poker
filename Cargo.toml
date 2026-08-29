@@ -28,7 +28,16 @@ libp2p = { version = "0.56.0", features = [
     "gossipsub", "kad", "identify", "ping", "autonat", "dcutr", "relay", "mdns",
     "request-response", "cbor",
     "upnp", "metrics", "memory-connection-limits",
-    "ed25519", "serde",
+    "ed25519",
+    # RSA identities, which this project uses for nothing and needs anyway.
+    # The public entry points onto the libp2p network still have `Qm...` peer
+    # ids - multihashes of RSA public keys, from before Ed25519 was the default -
+    # and without this feature their TLS certificate cannot be verified. It fails
+    # as `invalid peer certificate: UnknownIssuer`, which reads like a broken
+    # certificate rather than a key type this build cannot parse. Measured
+    # against `/dnsaddr/bootstrap.libp2p.io`.
+    "rsa",
+    "serde",
 ] }
 libp2p-stream = "0.4.0-alpha"
 # Only so this crate can implement `libp2p::request_response::Codec`, whose
