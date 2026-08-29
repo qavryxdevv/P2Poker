@@ -42,6 +42,7 @@ use libp2p::{
 
 use crate::protocol::constants::{
     GOSSIP_MAX_TRANSMIT, IDLE_CONNECTION_TIMEOUT_MS, LOBBY_CHAT_TOPIC, LOBBY_TOPIC,
+    MDNS_QUERY_INTERVAL_MS,
 };
 
 /// Whether this client offers its line to other people's games.
@@ -98,6 +99,14 @@ pub struct PokerBehaviour {
     pub mem_limits: libp2p::memory_connection_limits::Behaviour,
     /// Port mapping, for the router that will do it.
     pub upnp: libp2p::upnp::tokio::Behaviour,
+    /// Local-network discovery.
+    ///
+    /// Not an optimisation. Two clients on one LAN get each other's **external**
+    /// address from the DHT and would have to dial it inwards through their own
+    /// router, which is NAT hairpinning and which many routers simply do not do.
+    /// The DHT is the wrong tool for a peer that is one hop away, and mDNS is
+    /// the right one.
+    pub mdns: libp2p::mdns::tokio::Behaviour,
 }
 
 /// The topics this node subscribes to.
@@ -206,6 +215,13 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                 ),
                 mem_limits: libp2p::memory_connection_limits::Behaviour::with_max_percentage(0.25),
                 upnp: libp2p::upnp::tokio::Behaviour::default(),
+                mdns: libp2p::mdns::tokio::Behaviour::new(
+                    libp2p::mdns::Config {
+                        query_interval: Duration::from_millis(MDNS_QUERY_INTERVAL_MS),
+                        ..Default::default()
+                    },
+                    local_peer_id,
+                )?,
             })
         })?
         .with_swarm_config(|c| {

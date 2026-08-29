@@ -22,7 +22,7 @@ publish = false
 libp2p = { version = "0.56.0", features = [
     "tokio", "macros",
     "quic", "tcp", "noise", "tls", "yamux", "dns",
-    "gossipsub", "kad", "identify", "ping", "autonat", "dcutr", "relay",
+    "gossipsub", "kad", "identify", "ping", "autonat", "dcutr", "relay", "mdns",
     "request-response", "cbor",
     "upnp", "metrics", "memory-connection-limits",
     "ed25519", "serde",
