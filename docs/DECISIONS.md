@@ -1788,6 +1788,63 @@ The second half of that sentence, and only it. A disconnection costs one hand.
 Every chip goes back. The tournament plays on, and no seat is removed for it —
 which is D-010, and is why the cost of the withdrawal is small.
 
+## D-018 — Twenty-three normative terms used and never defined, and what happens to each
+
+Found 2026-08-29 by reading every normative source for the table-formation path
+in parallel and checking each against the code, rather than implementing from a
+single reading.
+
+### Why this is a decision and not a bug list
+
+`role_code` was normative, undefined, and unnoticed for seven passes, because
+the construction that used it **reads complete**. So does every entry below. A
+term that looks defined elsewhere is invisible to a reader and fatal to a second
+implementation, and the failure it produces — two conforming clients that cannot
+agree and cannot say why — has no error message and nothing to attribute.
+
+The rule this establishes: **a normative term is defined in its owning document
+before code depends on it.** Where the code has to move first, the guess is
+written down as a guess.
+
+### Closed here, with the reasoning in the owning document
+
+| Term | Disposition |
+|---|---|
+| **U1** `stack_at_hand_start[s]` at `k = 0` | **The ratified roster's `SeatEntry.buyin`** (§3.1). The severe one: it was defined only as `TERMINAL(k-1)`'s final stacks, `TERMINAL(-1)` does not exist, and the value feeds `roster_hash(0)` → `session_id` → every hand's `GENESIS(k)`. Two guesses diverge on every event of every hand, silently. `SeatEntry.buyin` is not chosen by elimination: it is signed under the table key, ratified by a collective stage, and in a tournament forced to a single value by §7.2. |
+| **U4** `next_deadline_ms` for formation messages | **`0` for the unchained ones, `crypto_step_timeout_ms` for `TABLE_READY`** (§8.2). The field is normative and a wrong value is an invalid event, and the stage-kind table had no row covering any of them. `0` because they arm nothing: the join RPC has its own transport timeout, the handshake is covered once by `HELLO`, and a `PLAYER_LIST` obliges nobody. `TABLE_READY` is the exception because the beacon follows it — which also gains the row it never had. |
+| **U8** `SeatEntry.buyin`'s admissible range | **Within the advert's `[min_buyin, max_buyin]`, and equal to `start_stack` in a tournament** (§3.1, in the same paragraph as U1). It had to be closed with U1: an unconstrained buy-in in the roster is an unconstrained starting stack inside `roster_hash(0)`. |
+| **U17** `peer_id` uniqueness in a roster | **Required** (§4.3). Every `SeatEntry` carried it and no rule read it — carried and never checked. It stops one node holding several seats, and therefore the accidental case of one person joining a table twice. **It is not one person per seat**, and that is stated where the rule is: two machines present two PeerIds and are indistinguishable from two people, which is Sybil without an identity layer and is outside `SPEC_CS.md` §18. One key per seat and one node per seat are enforceable and enforced; one person per seat is neither claimed nor achievable. |
+
+### Open, and blocking the named work
+
+| Term | Blocks | Severity |
+|---|---|---|
+| **U5** `password_utf8` — no encoding, length, normalisation or trim rule | password-protected tables | High. Two clients normalising differently produce different proofs and the join fails as *bad password*, which is the one diagnosis that will send a user looking at their keyboard. |
+| **U11** *"the parameters it joined under"* — never pinned to a stored object | three of §4.3's comparisons | High. `LobbyStore` overwrites the held advert on every accepted re-broadcast, so *"the advert"* is a moving target unless the joiner retains its own copy. |
+| **U13** `stage_type` in `stage_hash` | every chained stage | High. The tests already pass event codes, which is a resolution with no documentary backing. |
+| **U16** `P(0)` on a `TABLE_READY` stage that has not completed | the whole setup chain | High. Three sections give three readings, one of which is per-receiver. |
+| **U18** *"payload bytes, verbatim"* in `table_params_hash` | the digest itself | High. Decoded content or the CBOR byte string as encoded? The implementation here takes the decoded content, which is a guess and is recorded as one. |
+| **U19** *"input deck bytes"* / *"final deck bytes"* | `SHUFFLE_PROOF`, `DECK_COMMIT` | High. No serialisation named, and the open deck never appears on the wire. |
+| **U20** the canonical 52-card ordering | anything that names a card | High, and circular: `PROTOCOL.md` defers to `CRYPTOGRAPHY.md` and back. `src/poker/state.rs` fixes `rank*4 + suit` and `tests/deck_constants.rs` pins ziffle's open deck; neither is a document. |
+| **U2** `banned`, **U3** capability mismatch | two `JOIN_REJECT` reason codes | Low. Both are advisory and a rejection proves nothing. |
+| **U6** *"established connection"* | `JOIN_REQUEST` legality | Medium, and circular: it is defined as the post-`CAPABILITIES` state of the very stream the join RPC exists to avoid opening. |
+| **U7** seat allocation when `requested_seat` is absent | the founder's own rule | Medium. Nothing binds `JOIN_ACCEPT n(1)` to a request that asked for a seat. |
+| **U9** *"a capability covering `max_players`"* | `TABLE_READY` | Medium. `nlhe/2-6` and `nlhe/7-10` exist; no rule maps a seat count onto them. |
+| **U10** retention for the seen-`join_nonce` set and the last `list_serial` | anti-replay | Medium, and it is a growth surface: remotely growable at `JOIN_REQ_MAX` per request, in the one part of the pipeline §5.3 does not bound. |
+| **U12** `TABLE_READY n(4) capability_set` element rules | `TABLE_READY` | Medium. Only a count; `HELLO n(5)` spells out everything this one omits. |
+| **U14** *"the first `JOIN_ACCEPT`"* as the abandonment anchor | formation timeout | Medium. Founder's first issued or each joiner's first received — the two give peers different absolute deadlines. |
+| **U15** *"the table does not start"* | two failure paths | Medium. No message, state or terminal value, and §4.1 ends the table key's authority at `TABLE_READY`, so there is nothing left to re-form with. |
+| **U21** *"occupied seat"* | `HAND_INIT` | Medium. Used normatively three times against a status vocabulary that changed when `Absent` was deleted. |
+| **U22** *person*, *identity layer*, *per-identity abort count* | the threat model's own scope | Medium. The absence of an identity layer is the stated reason an attack class is out of scope, and nothing says what one would provide. The abort count is named as the entire remaining sanction with no field behind it. |
+| **U23** the formation vocabulary of `STATE_MACHINE.md` | the engine's formation phases | Medium. |
+
+### What this does not claim
+
+That the list is complete. It is what six parallel readings of five documents
+found, and the method that found it — read every source independently, then
+reconcile — is the method that should be repeated for the hand path and the
+dispute path before either is built.
+
 ## Open decisions
 
 ### How to read the identifiers in this list (`Q5`) — two live `P` series, and which is which

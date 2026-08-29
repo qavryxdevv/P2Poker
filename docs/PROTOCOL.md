@@ -931,6 +931,33 @@ roster_hash(k) = h("p2p-poker v1 roster",
                        u8(s) || app_public_key[s] || u64_be(stack_at_hand_start[s]) ])
 ```
 
+**`stack_at_hand_start[s]` at `k = 0` is the ratified roster's `SeatEntry.buyin`,
+and this sentence closes `U1`.** The field was defined only as `TERMINAL(k-1)`'s
+`n(5) final_stacks`, and for the first hand there is no `TERMINAL(-1)`;
+`TERMINAL(0)` is a `stage_hash` and carries no fields at all. So the construction
+that every hand's `GENESIS(k)` depends on had, for `k = 0`, **no defined value** —
+and `roster_hash(0)` feeds `session_id`, which feeds every subsequent
+`GENESIS(k)`. Two implementers guessing differently would diverge on every event
+of every hand, silently and with nothing to attribute it to. That is the
+`role_code` class of defect with a larger blast radius: a term used normatively
+and defined nowhere, in a construction that *reads* complete.
+
+`SeatEntry.buyin` is the only candidate that exists, and it is the right one for
+three reasons rather than by elimination. It is **signed** — it travels in
+`PLAYER_LIST n(0)`, under the table key, and again in every `TABLE_READY` that
+ratifies that roster, so every seat hashes a value it has verified rather than
+one it inferred. It is **agreed** — `TABLE_READY` is a collective stage over the
+same roster, so a seat that read a different buy-in cannot ratify. And in a
+tournament it is **forced**: §7.2 pins `min_buyin == max_buyin == start_stack`, so
+there is exactly one admissible value and no room for a founder to vary it per
+seat.
+
+`SeatEntry.buyin` must therefore lie within the advert's `[min_buyin, max_buyin]`,
+and must equal `start_stack` in a tournament mode — the check belongs with the
+other `JOIN_ACCEPT` and `PLAYER_LIST` validations, and closes `U8` in the same
+breath, because an unconstrained buy-in in the roster is an unconstrained
+starting stack in `roster_hash(0)`.
+
 **The two forms have the same six parts in the same slots, and slot 4 of
 `GENESIS(0)` is `ZERO32` (K5).** It carried `table_public_key`, and §4.1 is
 normative that `table_id` **is** `table_public_key` — the same 32 bytes — so
@@ -2302,7 +2329,31 @@ before `TABLE_READY`.
 | `n(1) table_params_hash` | `bytes[32]` | §3.1's box, over the parameters this table is being formed under. **This field was `advert_hash` and is replaced (J1, D-013)** |
 | `n(2) list_serial` | `u64` | strictly increasing per table |
 
-*Receiver must validate:* signature by the table key; sorted, unique;
+**Roster uniqueness is on three keys and not two, and the third closes `U17`:
+`seat`, `app_public_key` **and `peer_id`**.** The field was carried in every
+`SeatEntry` from the beginning and no rule ever read it — which is the
+carried-and-never-checked shape this corpus names as a defect class in its own
+right, because a field nothing validates is a field every reader assumes
+somebody else validates.
+
+What the rule buys, stated exactly. It stops **one node** holding several seats:
+`n(2) peer_id` must equal the connection's authenticated remote PeerId, so a
+second seat from the same node is caught at the founder and again at every
+receiver of the `PLAYER_LIST`. It stops the accidental case outright — two copies
+of the client on one machine, one person joining a table twice — and it costs a
+determined attacker one more process.
+
+What it does not buy, and this is not a gap that closing it would fix. **It is
+not one person per seat.** A person with two machines, or two containers, or one
+machine and a virtual one, presents two PeerIds and two application keys and is
+indistinguishable from two people. That is Sybil without an identity layer, which
+`SPEC_CS.md` §18 places outside the threat model, and no roster rule reaches it.
+The distinction is worth keeping sharp: *one key per seat* and *one node per seat*
+are enforceable and now enforced; *one person per seat* is not enforceable and is
+not claimed.
+
+*Receiver must validate:* signature by the table key; sorted, unique on `seat`,
+on `app_public_key` **and on `peer_id`**;
 `list_serial` strictly greater than the last accepted one (this is the anti-replay
 for a message that is not yet in a hash chain); **`n(1) table_params_hash` equals
 this client's own recomputation under §3.1 from the advertisement it joined under**
@@ -6104,9 +6155,31 @@ deterministic function of the table parameters and the kind of the next stage:
 | any cryptographic contribution (`DECK_INIT`, `SHUFFLE_*`, `DECK_COMMIT`, `DEAL_PRIVATE`, `BOARD_REVEAL`, `SHOWDOWN_*`) | `crypto_step_timeout_ms` |
 | `STATE_HASH` / `STATE_ACK` | `crypto_step_timeout_ms` |
 | a hand boundary (`HAND_INIT` after `hand_delay_ms`) | `hand_delay_ms + crypto_step_timeout_ms` |
+| the seat-order beacon (`RNG_COMMIT`, `RNG_REVEAL`) | `crypto_step_timeout_ms` |
+| **anything in table formation** — `CAPABILITIES`, `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST` | `0`, meaning *this event arms no deadline* |
+| `TABLE_READY` | `crypto_step_timeout_ms`, because the next stage is the beacon |
 
 A peer that writes a different value emits an invalid event. There is nothing to
 negotiate and nothing to game.
+
+**The last three rows close `U4`.** The table had four rows and none of them
+covered a formation message, while this paragraph declares the field normative
+and a wrong value invalid — so every join message was an invalid event under one
+reading and an unconstrained one under another, and an implementer had to guess
+in the one constructor the whole join path runs through.
+
+`0` is the right value for the unchained formation messages because **they arm
+nothing**. The join RPC carries its own 20-second timeout at the transport
+(§1.4); the handshake is covered by `HELLO`'s `HANDSHAKE_DEADLINE_MS`, which is
+armed once for the whole exchange rather than by each message in it; and a
+`PLAYER_LIST` is a proposal that obliges no one to answer within any time. A
+deadline field that named a duration nothing would measure against would be a
+value two peers could disagree about for no purpose, which is exactly what this
+paragraph exists to prevent.
+
+`TABLE_READY` is the exception because it is the one formation message that *is*
+a chained stage, and what follows it is `RNG_COMMIT` — a cryptographic
+contribution, and now a row of its own rather than a type absent from the list.
 
 **The whole-hand limit `hand_deadline_ms` runs on the same relative basis from
 `TERMINAL(k-1)` — normative, and this is R-1's disposition.** The timer for hand
