@@ -99,7 +99,9 @@ try {
     else { Fail "did not start when copied alone" }
 
     $madeA = Get-ChildItem $a -Recurse -File | ForEach-Object { $_.FullName.Substring($a.Length + 1) }
-    $expectedFiles = @('p2p-poker.exe', 'profile\identity.key')
+    # Two keys, not one. Section 20 keeps the network identity and the player
+    # identity apart, and one file holding both would make them one secret.
+    $expectedFiles = @('p2p-poker.exe', 'profile\identity.key', 'profile\player.key')
     $extra = $madeA | Where-Object { $expectedFiles -notcontains $_ }
     if ($extra) {
         Fail "created files it should not have: $($extra -join ', ')"
@@ -112,6 +114,26 @@ try {
         Pass "two directories are two clients"
     } else {
         Fail "two copies share an identity - the profile is not local to the folder"
+    }
+
+    # And the two identities in one profile are two different secrets.
+    $node   = [System.IO.File]::ReadAllBytes((Join-Path $a 'profile\identity.key'))
+    $player = [System.IO.File]::ReadAllBytes((Join-Path $a 'profile\player.key'))
+    if ($node.Length -eq 32 -and $player.Length -eq 32 -and
+        [System.Convert]::ToBase64String($node) -ne [System.Convert]::ToBase64String($player)) {
+        Pass "the network identity and the player identity are two keys"
+    } else {
+        Fail "the two identities are one secret, or are not 32-byte keys"
+    }
+
+    $playerA = (& (Join-Path $a 'p2p-poker.exe') --headless --for 3 2>&1 |
+        Select-String '^player').ToString()
+    $playerB = (& (Join-Path $b 'p2p-poker.exe') --headless --for 3 2>&1 |
+        Select-String '^player').ToString()
+    if ($playerA -and $playerB -and $playerA -ne $playerB) {
+        Pass "two directories are two players"
+    } else {
+        Fail "two copies share a player identity"
     }
 
     # The identity must survive a restart, or the client is a stream of strangers.
