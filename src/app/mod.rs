@@ -385,7 +385,7 @@ mod tests {
 
         s.apply(NodeEvent::Roster {
             key: [7u8; 32],
-            seats: vec![(0, "Alice".into(), 1_000), (1, "Dana".into(), 1_000)],
+            seats: vec![(0, "Alice".into(), 1_000), (1, "Bob".into(), 1_000)],
         });
         assert!(!s.at_a_real_table(), "a roster is a proposal, not a table");
 

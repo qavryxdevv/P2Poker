@@ -1,4 +1,4 @@
-# Build and test parallelism for this machine: 24 cores, 19 given to cargo so
+# Build and test parallelism: a few cores are left free so the box stays usable and
 # the box stays usable and so a runaway job cannot starve everything else.
 [build]
 jobs = 19

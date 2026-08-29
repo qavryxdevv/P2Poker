@@ -19,7 +19,7 @@ never a reason to leave a measured number wrong.
 to be inferred, because this is the document where a claimed absence does the most
 damage.
 
-**Measured on:** 2026-08-28, Windows 10, `x86_64-pc-windows-msvc`, 24 cores with
+**Measured on:** 2026-08-28, `x86_64-pc-windows-msvc`, with
 cargo held to **19** by `.cargo/config.toml` (`[build] jobs = 19`; the test harness
 has its own pool and needs `--test-threads=19` passed separately),
 `rustc 1.95.0 (59807616e 2026-04-14)` / `cargo 1.95.0 (f2d3ce0bd 2026-03-21)`,
@@ -1023,7 +1023,7 @@ reproducer's build is slower than 24 cores would suggest rather than differently
 resolved. `cargo test` ignores `jobs` and needs `--test-threads=19` passed by hand.
 
 ```bash
-export PATH="~/.cargo/bin:$PATH"      # cargo is not on the Bash PATH
+export PATH="$HOME/.cargo/bin:$PATH"      # cargo is not on the Bash PATH
 
 cargo check                                        # the whole stack builds
 

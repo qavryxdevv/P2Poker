@@ -37,13 +37,13 @@ decision of the whole network layer, not an optional fallback.
 ### 1.1 Addresses
 
 ```
-LAN adapter "LAN adapter" : 192.168.1.21/24, gateway 192.168.1.1
+LAN adapter                   : 192.168.1.21/24, gateway 192.168.1.1
 Hyper-V "Default Switch"      : 172.20.160.1/20        <- virtual, see §5.3
-IPv6                          : fd00:0:0::/64 only — ULA, NOT globally routable
+IPv6                          : a ULA /64 only —, NOT globally routable
 External IPv4                 : 198.51.100.17
 ```
 
-`198.51.100.17` is in `198.51.100.0 – 198.51.100.255`, `RIPE-registered`, country CZ, type
+`198.51.100.17` is in a RIPE-registered range, type
 `ASSIGNED PA`, remark *"This prefix is used for residential broadband ISP services."*
 
 **Not CGNAT.** The reflexive address is a public, RIPE-registered residential address; it
@@ -125,7 +125,7 @@ does. Unsolicited inbound is impossible, so a peer can never be reached cold.
 ### 1.4 Honest caveat about generalising this
 
 This is **one** measurement of **one** network — a friendly one. It says nothing about
-the user's opponents. The Czech residential market includes CGNAT deployments, and the
+the user's opponents. European residential markets include CGNAT deployments, and the
 measurement campaign in §4 finds ~30% of hole punches fail in the wild. **Do not treat
 this result as evidence that the relay path is optional.** It is evidence that *this*
 machine will not be the one that fails.
@@ -561,7 +561,7 @@ results from 154 clients against 47,000 peers and reported 60–90%.
 
 ## 5. Two clients behind the same router (MEASURED)
 
-This has bitten this user before, so it was tested directly: two processes on this host,
+This is a known failure mode, so it was tested directly: two processes on one host,
 same LAN, same NAT.
 
 ### 5.1 It works, by two independent mechanisms
@@ -620,7 +620,7 @@ DIAL FAIL peer=Some(PeerId("12D3KooWN1VU…"))
 
 The peer is genuinely listening on that address, but it is on an isolated virtual switch,
 so the dial cannot complete and burns a full handshake timeout. On a developer machine
-(Hyper-V, WSL, Docker, VPN adapters — this host has three OpenVPN adapters too) this adds
+(Hyper-V, WSL, Docker and VPN adapters are all common on a developer machine) this adds
 several dead candidates to every dial. **Mitigation:** dial candidates concurrently and
 take the first success (libp2p already races them), cap per-address timeout, and consider
 excluding known-virtual interface prefixes from what we *publish*.

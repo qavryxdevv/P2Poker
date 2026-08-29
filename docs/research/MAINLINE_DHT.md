@@ -13,8 +13,8 @@ of scope here.
   `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/<crate>-<version>/`.
 
 docs.rs and prior knowledge were used only as leads. Toolchain: `rustc 1.95.0`,
-`cargo 1.95.0`, `x86_64-pc-windows-msvc`, Windows 10. Measurements taken
-2026-08-28, 07:37–09:20 UTC, from a residential IPv4 line behind a consumer NAT,
+`cargo 1.95.0`, `x86_64-pc-windows-msvc`. Measurements taken
+2026-08-28, from a residential IPv4 line behind a consumer NAT,
 public IPv4 `198.51.100.17`.
 
 **Independent re-verification pass, 08:25–09:20 UTC.** Every load-bearing claim in
@@ -854,7 +854,7 @@ this.
 **Measured proof that strangers are watching, not just that they could.** During the
 TTL experiment (§3.5, sample B) the infohash `2f59ec56c7dd…` was **20 random bytes
 generated on this machine**. Nobody else on Earth had any reason to know it existed;
-the only event that ever referenced it was our single `announce_peer` at 08:03:44
+the only event that ever referenced it was our single `announce_peer`
 UTC. Twenty-four minutes later, a lookup returned **two** peers:
 
 ```

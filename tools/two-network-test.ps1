@@ -188,7 +188,7 @@ try {
     Write-Host 'Read the result against the header of this script.' -ForegroundColor White
     Write-Host 'A missing hole punch here is EXPECTED: the VM can reach this host' -ForegroundColor DarkGray
     Write-Host 'directly, so there is no hole to punch. That case needs an endpoint' -ForegroundColor DarkGray
-    Write-Host 'outside this house and nothing on one machine can stand in for it.' -ForegroundColor DarkGray
+    Write-Host 'outside this network and nothing on one machine can stand in for it.' -ForegroundColor DarkGray
 }
 finally {
     Remove-PSSession $session

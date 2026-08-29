@@ -105,8 +105,7 @@ One commit does one thing and leaves the tree building and green. The unit is a
   4 failed (random_hands, pre-existing, see §5)`. A red suite is recorded as red,
   with the failures named. Rounding a run up to "tests pass" is the same failure as
   claiming a lint that did not run.
-* Commits are in English. So is the code, and so are the documents. (Conversation is
-  in Czech; the repository is not.)
+* Commits are in English. So is the code, and so are the documents.
 
 ### 1.2 Never rewrite or delete large parts of a working implementation without justification
 
@@ -561,7 +560,7 @@ bites.
 
 ## 5. Build and test
 
-`.cargo/config.toml` holds cargo to **19 of this machine's 24 cores** so the box stays
+`.cargo/config.toml` holds cargo below the machine's core count so the box stays
 usable and a runaway job cannot starve everything else:
 
 ```toml
@@ -573,7 +572,7 @@ jobs = 19
 the same ceiling has to be passed explicitly every time:
 
 ```bash
-export PATH="~/.cargo/bin:$PATH"   # cargo is not on the Bash PATH
+export PATH="$HOME/.cargo/bin:$PATH"   # cargo is not on the Bash PATH
 
 cargo check                                    # fast type check, does NOT link
 cargo build                                    # a real build

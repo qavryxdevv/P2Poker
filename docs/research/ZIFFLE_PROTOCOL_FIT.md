@@ -636,7 +636,7 @@ Stated plainly, per `SPEC_CS.md` §36.
 ## 10. Reproduction
 
 ```bash
-export PATH="~/.cargo/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$PATH"
 cd <scratch>/zr-protofit
 cargo run --release -j 19                 # selective opening, n-of-n, ctx, degenerate keys
 cargo run --release -j 19 --bin cost      # per-stage cost against the budget

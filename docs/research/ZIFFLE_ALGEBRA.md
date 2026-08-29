@@ -559,7 +559,7 @@ Stated plainly, per the brief.
 ## 8. Reproducing this
 
 ```bash
-export PATH="~/.cargo/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$PATH"
 cd "<scratchpad>"
 cargo test --release -j 19 -- --nocapture --test-threads=1
 ```

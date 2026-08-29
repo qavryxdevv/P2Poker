@@ -3,9 +3,12 @@
 **/*.rs.bk
 
 # Local player profile: identity keys, settings, hand history.
-# The client is portable, so the profile lives next to the binary -
-# it must never be committed.
-/profile/
+#
+# The client is portable, so the profile lives next to the binary - which
+# means it can appear at any depth, wherever somebody ran one. Unanchored
+# for exactly that reason: `/profile/` matched the root only, and a client
+# run from a tracked subdirectory would have written an unignored key pair.
+profile/
 /dist/
 
 # Editor / OS noise

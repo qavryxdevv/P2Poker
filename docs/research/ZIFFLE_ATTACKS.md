@@ -853,7 +853,7 @@ gaps.
 ## 11. Reproducing this
 
 ```bash
-export PATH="~/.cargo/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$PATH"
 cd "<scratchpad>"
 cargo build --release -j 19
 ./target/release/zr-break.exe                        # all sections

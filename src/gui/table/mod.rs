@@ -486,7 +486,7 @@ impl TableView {
                 },
                 SeatView {
                     seat: 2,
-                    name: "Dana".into(),
+                    name: "Carol".into(),
                     stack: 2_310,
                     bet: 40,
                     cards: [Facing::Down, Facing::Down],
