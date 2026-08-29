@@ -1,5 +1,6 @@
 //! The versioned wire protocol. See `docs/PROTOCOL.md`.
 
+pub mod antireplay;
 pub mod constants;
 pub mod messages;
 pub mod serialization;
