@@ -26,6 +26,9 @@ use crate::net::lobby::{Held, LobbyStore, Mode};
 use crate::table::formation::Roster;
 
 /// One row of the table list.
+///
+/// The columns are the Python client's — Table, Players, Type, Stack, Blinds,
+/// Timing, Host — because that layout has been used and this one had not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRow {
     /// The table's key, which is its identity. Shown truncated; used whole.
@@ -37,6 +40,12 @@ pub struct TableRow {
     pub blinds: String,
     /// "2 / 6".
     pub occupancy: String,
+    /// The starting stack for a tournament, or the buy-in range for cash.
+    pub stack: String,
+    /// "20 s + 5 s", the clock a player gets to act.
+    pub timing: String,
+    /// The founder, as eight characters of its key.
+    pub host: String,
     pub state: TableState,
     pub password_required: bool,
 }
@@ -111,12 +120,25 @@ pub fn row(key: [u8; 32], held: &Held) -> TableRow {
         TableState::Open
     };
 
+    let stack = if Mode::parse(ad.mode).is_some_and(|m| m.is_tournament()) {
+        format!("{}", ad.start_stack)
+    } else {
+        format!("{} - {}", ad.min_buyin, ad.max_buyin)
+    };
+
     TableRow {
         key,
         name: ad.table_name.clone(),
         game,
         blinds: format!("{} / {}", ad.small_blind, ad.big_blind),
         occupancy: format!("{} / {}", ad.players, ad.max_players),
+        stack,
+        timing: format!(
+            "{} s + {} s",
+            ad.action_timeout_ms / 1_000,
+            ad.action_grace_ms / 1_000
+        ),
+        host: short_key(&ad.founder_app_key),
         state,
         password_required: ad.password_required,
     }
@@ -206,6 +228,8 @@ pub struct LobbyView {
     pub selected: Option<[u8; 32]>,
     pub chat: Vec<ChatLine>,
     pub seated: Vec<String>,
+    /// What has happened, newest last. A local view and never canonical state.
+    pub log: Vec<String>,
 }
 
 /// One line of lobby chat.
@@ -226,6 +250,7 @@ impl LobbyView {
             selected: None,
             chat: Vec::new(),
             seated: Vec::new(),
+            log: Vec::new(),
         }
     }
 
@@ -350,7 +375,22 @@ mod tests {
         assert_eq!(r.game, "NLHE cash");
         assert_eq!(r.blinds, "10 / 20");
         assert_eq!(r.occupancy, "2 / 6");
+        assert_eq!(r.stack, "200 - 2000", "a cash table shows the buy-in range");
+        assert_eq!(r.timing, "20 s + 5 s");
+        assert_eq!(r.host, "07070707");
         assert_eq!(r.state, TableState::Open);
+    }
+
+    /// A tournament pays every entrant the same stack, so the column shows one
+    /// number rather than a range that cannot vary.
+    #[test]
+    fn a_tournament_row_shows_the_stack_and_not_a_range() {
+        let mut h = held(2, false);
+        h.ad.mode = Mode::TournamentSngPlayMoney.code();
+        h.ad.start_stack = 10_000;
+        let r = row([1u8; 32], &h);
+        assert_eq!(r.game, "NLHE Sit & Go");
+        assert_eq!(r.stack, "10000");
     }
 
     /// The rule the whole lobby exists to enforce at the last moment: a table

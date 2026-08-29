@@ -206,11 +206,6 @@ impl eframe::App for Client {
             render::LobbyAction::None => {}
         }
 
-        ui.separator();
-        ui.collapsing("What has happened", |ui| {
-            render::log(ui, self.state.log.iter());
-        });
-
         // The node pushes events whether or not the window is being interacted
         // with, so the window is repainted on a timer rather than only on input.
         ctx.request_repaint_after(Duration::from_millis(250));

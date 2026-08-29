@@ -135,6 +135,7 @@ impl AppState {
     pub fn view(&self) -> LobbyView {
         let mut v = LobbyView::from(&self.lobby, self.status.clone());
         v.selected = self.selected;
+        v.log = self.log.iter().cloned().collect();
         v
     }
 }
