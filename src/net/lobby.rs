@@ -45,7 +45,8 @@ use crate::poker::state::Hash;
 use crate::protocol::constants::{
     hand_deadline_min_ms, PresetId, AD_TTL_MS, HAND_DEADLINE_CAP_MS, MAX_ADS_PER_PEER_PER_MIN,
     MAX_ADS_PER_TABLE_KEY_PER_MIN, MAX_AD_LIFETIME_MS, MAX_CLOCK_SKEW_MS, MAX_SEATS,
-    MAX_TRACKED_TABLES, RATED_HAND_DEADLINE_MS, RATED_START_STACK,
+    MAX_TRACKED_TABLES, RATED_BLIND_EVERY_N_HANDS, RATED_HAND_DEADLINE_MS, RATED_SEATS,
+    RATED_SMALL_BLIND, RATED_SMALL_BLIND_CAP, RATED_START_STACK,
 };
 
 /// The deck suite version 1 speaks, and the only one.
@@ -317,15 +318,41 @@ pub fn admit(ad: &TableAd, now_unix_ms: u64) -> Result<(), AdRejected> {
 /// A preset name that does not carry the preset's values is a lie about what
 /// game is being offered, and it is the failure this project has shipped twice.
 fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
-    let expected: [(&'static str, u64, u64); 11] = [
+    // Every part of `table_params_hash` that §13 pins and rule 2 leaves free.
+    //
+    // **Twenty-five parts, and this list plus rule 2 must cover all of them.**
+    // Two did not: `join_deadline_ms` (n(18)) and `showdown_policy` (n(22)) are
+    // both parts of the hash, both fixed by §13's block, and rule 2 gives each
+    // only a range — so two clients both correctly implementing this preset
+    // could pick 60 000 and 120 000, or policy 1 and policy 2, compute two
+    // different `table_params_hash` values, and be unable to join each other's
+    // table with **neither of them wrong**. That is `G7-S3` exactly, a fourth
+    // time, and this time in the code rather than in the document.
+    //
+    // The audit is the same one §13 prescribes for itself: diff this list
+    // against §3.1's twenty-five parts and require every part to be pinned
+    // either here or by rule 2. `every_part_of_the_hash_is_pinned` does it.
+    let expected: [(&'static str, u64, u64); 13] = [
         ("mode", ad.mode as u64, Mode::TournamentSngPlayMoney.code() as u64),
-        ("max_players", ad.max_players as u64, 10),
-        ("min_players_to_start", ad.min_players_to_start as u64, 10),
+        ("max_players", ad.max_players as u64, RATED_SEATS as u64),
+        (
+            "min_players_to_start",
+            ad.min_players_to_start as u64,
+            RATED_SEATS as u64,
+        ),
         ("start_stack", ad.start_stack, RATED_START_STACK),
-        ("small_blind", ad.small_blind, 50),
+        ("small_blind", ad.small_blind, RATED_SMALL_BLIND),
         ("ante", ad.ante, 0),
-        ("every_n_hands", ad.blind_schedule.every_n_hands as u64, 11),
-        ("small_blind_cap", ad.blind_schedule.small_blind_cap, 50_000),
+        (
+            "every_n_hands",
+            ad.blind_schedule.every_n_hands as u64,
+            RATED_BLIND_EVERY_N_HANDS as u64,
+        ),
+        (
+            "small_blind_cap",
+            ad.blind_schedule.small_blind_cap,
+            RATED_SMALL_BLIND_CAP,
+        ),
         ("action_timeout_ms", ad.action_timeout_ms as u64, 20_000),
         ("action_grace_ms", ad.action_grace_ms as u64, 5_000),
         (
@@ -333,6 +360,8 @@ fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
             ad.hand_deadline_ms as u64,
             RATED_HAND_DEADLINE_MS,
         ),
+        ("join_deadline_ms", ad.join_deadline_ms as u64, 120_000),
+        ("showdown_policy", ad.showdown_policy as u64, 1),
     ];
     for (name, got, want) in expected {
         if got != want {
@@ -347,6 +376,8 @@ fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
                 "small_blind_cap" => "the rated preset caps the small blind at 50 000",
                 "action_timeout_ms" => "the rated preset gives 20 s to act",
                 "action_grace_ms" => "the rated preset gives 5 s of grace",
+                "join_deadline_ms" => "the rated preset gives 120 s to form",
+                "showdown_policy" => "the rated preset reveals at showdown",
                 _ => "the rated preset's whole-hand deadline is 3 300 000 ms",
             }));
         }
@@ -360,6 +391,76 @@ fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
         return Err(AdRejected::Preset("the rated preset pauses 7 s between hands"));
     }
     Ok(())
+}
+
+impl TableAd {
+    /// The rated Sit-and-Go, exactly as `PROTOCOL.md` §13 fixes it.
+    ///
+    /// Every one of `table_params_hash`'s twenty-five parts is settled here and
+    /// **none of them is a choice**: a `preset_id` is a claim about values, and
+    /// §7.2 rule 3 rejects an advert carrying this name with any other value in
+    /// it. A founder who wants different numbers wants a `CUSTOM` table.
+    ///
+    /// The four arguments are the four things §13 does not pin, and none of them
+    /// is a part of the hash: the name is display data, the founder's key and
+    /// peer id are identity and routing, and the timestamps are what make the
+    /// advertisement fresh rather than what make the game.
+    ///
+    /// # What "rated" buys, and what it does not
+    ///
+    /// It buys the thing a lobby full of strangers needs: **every client derives
+    /// the same `table_params_hash` from the same name**, so two players who have
+    /// never spoken agree on the game before either sits down. It does not buy a
+    /// ranking, a ladder or a record — there is no such thing in this protocol
+    /// and the name is inherited from the configuration it copies.
+    pub fn rated_sng(
+        table_name: String,
+        founder_app_key: [u8; 32],
+        founder_peer_id: Vec<u8>,
+        now_ms: u64,
+    ) -> TableAd {
+        TableAd {
+            game: 1,
+            mode: Mode::TournamentSngPlayMoney.code(),
+            preset_id: PresetId::RatedSngPokerthV1.as_str().into(),
+            table_name,
+            small_blind: RATED_SMALL_BLIND,
+            big_blind: RATED_SMALL_BLIND * 2,
+            ante: 0,
+            // A Sit-and-Go's buy-in **is** its starting stack: every entrant
+            // gets an equal stack, so the two bounds and the stack are one
+            // number. Rule 2 enforces it in tournament modes.
+            min_buyin: RATED_START_STACK,
+            max_buyin: RATED_START_STACK,
+            start_stack: RATED_START_STACK,
+            players: 1,
+            max_players: RATED_SEATS,
+            // Ten of ten. A rated table deals its first hand when it is full and
+            // not before, which is what makes every one of them the same game.
+            min_players_to_start: RATED_SEATS,
+            blind_schedule: BlindSchedule {
+                mode: 1,
+                every_n_hands: RATED_BLIND_EVERY_N_HANDS,
+                first_small_blind: RATED_SMALL_BLIND,
+                small_blind_cap: RATED_SMALL_BLIND_CAP,
+            },
+            action_timeout_ms: 20_000,
+            action_grace_ms: 5_000,
+            crypto_step_timeout_ms: 30_000,
+            hand_deadline_ms: RATED_HAND_DEADLINE_MS as u32,
+            join_deadline_ms: 120_000,
+            hand_delay_ms: 7_000,
+            button_rule: 1,
+            odd_chip_rule: 1,
+            showdown_policy: 1,
+            password_required: false,
+            deck_suite: DECK_SUITE_V1.into(),
+            founder_app_key,
+            founder_peer_id,
+            timestamp_unix_ms: now_ms,
+            expires_at_unix_ms: now_ms + AD_TTL_MS,
+        }
+    }
 }
 
 /// One advertisement this client is holding.
@@ -736,6 +837,209 @@ mod tests {
         ad.hand_deadline_ms = RATED_HAND_DEADLINE_MS as u32;
         ad
     }
+
+    /// **Every one of `table_params_hash`'s twenty-five parts is pinned by the
+    /// rated preset**, and this test is the audit §13 prescribes for itself.
+    ///
+    /// A `preset_id` is a claim about values: two clients that both implement
+    /// this name must derive the *same* `table_params_hash`, or they cannot join
+    /// each other's table and §7.2 rule 3 has nothing to imply. A part the name
+    /// leaves free breaks that with **neither client wrong**, and it is invisible
+    /// by reading, because a missing check looks like an omission rather than a
+    /// contradiction.
+    ///
+    /// Two were free when this was written — `join_deadline_ms` and
+    /// `showdown_policy`, both parts of the hash and both fixed by §13 — and
+    /// rule 2 gave each only a range. That is `G7-S3` a fourth time, in the code
+    /// instead of the document.
+    ///
+    /// The test mutates each part in turn and requires the advert to be
+    /// **refused**. A part that survives its mutation is a part nothing pins.
+    #[test]
+    fn every_part_of_the_hash_is_pinned_by_the_rated_name() {
+        let base = TableAd::rated_sng("Rated".into(), [1u8; 32], vec![2u8; 38], NOW);
+        assert_eq!(admit(&base, NOW), Ok(()), "the preset itself must be legal");
+
+        // One mutation per part of §3.1's box, in its order. Each moves the part
+        // to a value that is legal on its own terms, so the only thing that can
+        // refuse it is the preset.
+        let parts: Vec<Mutation> = vec![
+            ("n(0) game", Box::new(|a: &mut TableAd| a.game = 2)),
+            (
+                "n(1) mode",
+                Box::new(|a: &mut TableAd| {
+                    a.mode = Mode::CashPlayMoney.code();
+                    a.start_stack = 0;
+                }),
+            ),
+            (
+                "n(4) small_blind",
+                Box::new(|a: &mut TableAd| {
+                    a.small_blind = 25;
+                    a.big_blind = 50;
+                    a.blind_schedule.first_small_blind = 25;
+                }),
+            ),
+            (
+                "n(5) big_blind",
+                Box::new(|a: &mut TableAd| a.big_blind = 150),
+            ),
+            ("n(6) ante", Box::new(|a: &mut TableAd| a.ante = 5)),
+            (
+                "n(7) min_buyin",
+                Box::new(|a: &mut TableAd| a.min_buyin = 5_000),
+            ),
+            (
+                "n(8) max_buyin",
+                Box::new(|a: &mut TableAd| a.max_buyin = 20_000),
+            ),
+            (
+                "n(9) start_stack",
+                Box::new(|a: &mut TableAd| {
+                    a.start_stack = 20_000;
+                    a.min_buyin = 20_000;
+                    a.max_buyin = 20_000;
+                }),
+            ),
+            (
+                "n(11) max_players",
+                Box::new(|a: &mut TableAd| a.max_players = 9),
+            ),
+            (
+                "n(12) min_players_to_start",
+                Box::new(|a: &mut TableAd| a.min_players_to_start = 2),
+            ),
+            (
+                "n(13.0) schedule mode",
+                Box::new(|a: &mut TableAd| a.blind_schedule.mode = 2),
+            ),
+            (
+                "n(13.1) every_n_hands",
+                Box::new(|a: &mut TableAd| a.blind_schedule.every_n_hands = 20),
+            ),
+            (
+                "n(13.2) first_small_blind",
+                Box::new(|a: &mut TableAd| a.blind_schedule.first_small_blind = 25),
+            ),
+            (
+                "n(13.3) small_blind_cap",
+                Box::new(|a: &mut TableAd| a.blind_schedule.small_blind_cap = 60_000),
+            ),
+            (
+                "n(14) action_timeout_ms",
+                Box::new(|a: &mut TableAd| a.action_timeout_ms = 30_000),
+            ),
+            (
+                "n(15) action_grace_ms",
+                Box::new(|a: &mut TableAd| a.action_grace_ms = 10_000),
+            ),
+            (
+                "n(16) crypto_step_timeout_ms",
+                Box::new(|a: &mut TableAd| a.crypto_step_timeout_ms = 60_000),
+            ),
+            (
+                "n(17) hand_deadline_ms",
+                Box::new(|a: &mut TableAd| a.hand_deadline_ms = 3_400_000),
+            ),
+            (
+                "n(18) join_deadline_ms",
+                Box::new(|a: &mut TableAd| a.join_deadline_ms = 60_000),
+            ),
+            (
+                "n(19) hand_delay_ms",
+                Box::new(|a: &mut TableAd| a.hand_delay_ms = 10_000),
+            ),
+            (
+                "n(20) button_rule",
+                Box::new(|a: &mut TableAd| a.button_rule = 2),
+            ),
+            (
+                "n(21) odd_chip_rule",
+                Box::new(|a: &mut TableAd| a.odd_chip_rule = 2),
+            ),
+            (
+                "n(22) showdown_policy",
+                Box::new(|a: &mut TableAd| a.showdown_policy = 2),
+            ),
+            (
+                "n(24) deck_suite",
+                Box::new(|a: &mut TableAd| a.deck_suite = "bs-bg12-secp256k1/2".into()),
+            ),
+        ];
+
+        // Twenty-four mutations for twenty-five parts, because `n(2) preset_id`
+        // is not pinned by a **rule** — it is pinned by being the name. It is
+        // itself a part of the hash, so an advert carrying a different name is a
+        // different game by construction and there is nothing for a receiver to
+        // check. Changing it to `CUSTOM` produces a perfectly legal custom
+        // table, which is the right answer and not a hole; what must hold is
+        // that the hash moves with it, and the assertion below is that.
+        assert_eq!(parts.len(), 24, "twenty-four rules for twenty-five parts");
+
+        let mut renamed = base.clone();
+        renamed.preset_id = "CUSTOM".into();
+        assert_eq!(admit(&renamed, NOW), Ok(()), "it is a legal custom table");
+        assert_ne!(
+            crate::net::advert::table_params_hash(&renamed),
+            crate::net::advert::table_params_hash(&base),
+            "n(2) preset_id is in the hash, so a different name is a different game"
+        );
+
+        for (name, change) in parts {
+            let mut ad = base.clone();
+            change(&mut ad);
+            assert_ne!(
+                ad, base,
+                "{name}: the mutation changed nothing, so the test proves nothing"
+            );
+            assert!(
+                admit(&ad, NOW).is_err(),
+                "{name} is not pinned: two clients implementing this preset could \
+                 choose differently, derive different table_params_hash values, and \
+                 fail to join each other with neither of them wrong"
+            );
+        }
+    }
+
+    /// The four things the constructor takes are the four §13 does not pin, and
+    /// **none of them is a part of the hash** — so two rated tables founded by
+    /// two different people, at two different moments, under two different names
+    /// are still provably the same game.
+    #[test]
+    fn what_the_founder_chooses_is_not_part_of_the_game() {
+        let a = TableAd::rated_sng("Riverside".into(), [1u8; 32], vec![2u8; 38], NOW);
+        let b = TableAd::rated_sng(
+            "Somewhere else".into(),
+            [9u8; 32],
+            vec![7u8; 20],
+            NOW + 45_000,
+        );
+        assert_ne!(a, b, "they are different advertisements");
+        assert_eq!(
+            crate::net::advert::table_params_hash(&a),
+            crate::net::advert::table_params_hash(&b),
+            "two rated tables are the same game or the name means nothing"
+        );
+        assert_eq!(admit(&b, NOW + 45_000), Ok(()));
+    }
+
+    /// The numbers, written out, so a change to one of them is a change to this
+    /// test and therefore a decision rather than a slip.
+    #[test]
+    fn the_rated_numbers_are_the_ones_written_down() {
+        let a = TableAd::rated_sng("R".into(), [0u8; 32], vec![0u8; 4], NOW);
+        assert_eq!(a.start_stack, 10_000, "every seat starts with 10 000");
+        assert_eq!((a.small_blind, a.big_blind), (50, 100), "blinds 50/100");
+        assert_eq!(a.min_buyin, a.start_stack, "the buy-in is the stack");
+        assert_eq!(a.max_buyin, a.start_stack);
+        assert_eq!(a.max_players, 10);
+        assert_eq!(a.min_players_to_start, 10, "ten of ten");
+        assert_eq!(a.blind_schedule.first_small_blind, a.small_blind);
+        assert_eq!(a.blind_schedule.small_blind_cap, 50_000);
+        assert_eq!(a.ante, 0);
+        assert_eq!(a.preset_id, "RATED_SNG_POKERTH_V1");
+    }
+
 
     #[test]
     fn an_honest_advert_is_admitted() {

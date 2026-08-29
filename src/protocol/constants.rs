@@ -217,6 +217,27 @@ pub const RATED_HAND_DEADLINE_MS: u64 = 3_300_000;
 /// Chips the rated preset starts every seat with.
 pub const RATED_START_STACK: Chips = 10_000;
 
+/// The rated preset's opening small blind. The big blind is twice it, by §7.2,
+/// and the schedule's first level **is** it, also by §7.2.
+pub const RATED_SMALL_BLIND: Chips = 50;
+
+/// How many hands the rated preset plays before the blinds double.
+pub const RATED_BLIND_EVERY_N_HANDS: u16 = 11;
+
+/// Where the doubling stops: the whole table's chips, halved.
+///
+/// `RATED_SEATS * RATED_START_STACK / 2`, which is a small blind no hand can be
+/// played past — every seat is all in before it is posted. Stated as the product
+/// rather than as 50 000 so that changing a seat count or a stack cannot leave a
+/// cap that means something different.
+pub const RATED_SMALL_BLIND_CAP: Chips = RATED_SEATS as Chips * RATED_START_STACK / 2;
+
+/// Seats at a rated table, and also the number needed to start one.
+///
+/// Ten of ten: a rated table deals its first hand when it is full and not
+/// before, which is what makes every rated table the same game.
+pub const RATED_SEATS: u8 = 10;
+
 
 // ---------------------------------------------------------------------------
 // Compile-time relationships between the constants
@@ -252,6 +273,12 @@ const _: () = assert!(RELAY_INFOHASH.len() == 20);
 
 /// The rated deadline is inside the range every advert must satisfy.
 const _: () = assert!(RATED_HAND_DEADLINE_MS <= HAND_DEADLINE_CAP_MS);
+
+/// The rated preset seats no more than the protocol allows, and starts full.
+const _: () = assert!(RATED_SEATS <= MAX_SEATS);
+/// The cap is a small blind that cannot be posted: every seat is already all in.
+const _: () = assert!(RATED_SMALL_BLIND_CAP == 50_000);
+const _: () = assert!(RATED_SMALL_BLIND_CAP > RATED_START_STACK);
 const _: () = assert!(
     RATED_HAND_DEADLINE_MS >= hand_deadline_min_ms(MAX_SEATS, 20_000, 5_000, 30_000, 7_000)
 );
