@@ -6,3 +6,4 @@
 
 pub mod dealing;
 pub mod formation;
+pub mod join;
