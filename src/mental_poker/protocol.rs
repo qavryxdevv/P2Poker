@@ -37,6 +37,8 @@
 //! from the proof. Every seated player shuffles, in a fixed committed order,
 //! and cards are dealt only from the last deck of the chain.
 
+use std::collections::HashSet;
+
 use crate::poker::state::Hash;
 
 /// The 32-byte context binding every proof is made under.
@@ -146,6 +148,12 @@ pub enum InvalidReason {
     CardNotRemasked { position: usize },
     /// The output deck equals the input deck. A valid proof, and not a shuffle.
     DeckUnchanged,
+    /// A deck is not the length the game plays with.
+    ///
+    /// Checked first and separately, because everything after it is a claim
+    /// about a permutation of a fixed set — and because the length arrives from
+    /// the network.
+    WrongDeckLength { expected: usize, got: usize },
     /// A public key is the group identity, for which an ownership proof anyone
     /// can write verifies.
     IdentityPublicKey { seat: usize },
@@ -196,8 +204,12 @@ fn is_identity_c1(ct: &Ciphertext) -> bool {
 /// scalars are unconstrained, so leaving chosen slots in plaintext, reusing one
 /// scalar for every card, and shuffling a deck to itself are all valid.
 ///
-/// Four conditions, each closing a measured attack:
+/// Five conditions, checked cheapest first:
 ///
+/// 0. **Both decks are exactly `expected` cards.** First, because everything
+///    after it is a claim about a permutation of a fixed set, and because the
+///    length arrives from the network — without this gate the loops below run
+///    on an attacker's number.
 /// 1. **No position is the identity.** Such a card is in the clear.
 /// 2. **The coordinates are pairwise distinct.** A collision is what lets a
 ///    reveal token issued for one card open another.
@@ -205,10 +217,22 @@ fn is_identity_c1(ct: &Ciphertext) -> bool {
 ///    trackable straight through the shuffle.
 /// 4. **The deck changed.** The identity permutation verifies otherwise.
 ///
-/// Runs in microseconds against the argument's tens of milliseconds, so it also
-/// makes a bogus proof cheap to reject rather than expensive.
-pub fn structural_check(prev: &[Ciphertext], next: &[Ciphertext]) -> Result<(), InvalidReason> {
-    if prev.len() == next.len() && prev == next {
+/// Linear in the deck size, and microseconds against the argument's tens of
+/// milliseconds — so it also makes a bogus proof cheap to reject rather than
+/// expensive, which is the ordering §4.0 requires and which an earlier version
+/// of this function inverted by being quadratic on a length it never checked.
+pub fn structural_check(
+    prev: &[Ciphertext],
+    next: &[Ciphertext],
+    expected: usize,
+) -> Result<(), InvalidReason> {
+    for deck in [prev, next] {
+        if deck.len() != expected {
+            return Err(InvalidReason::WrongDeckLength { expected, got: deck.len() });
+        }
+    }
+
+    if prev == next {
         return Err(InvalidReason::DeckUnchanged);
     }
 
@@ -218,16 +242,23 @@ pub fn structural_check(prev: &[Ciphertext], next: &[Ciphertext]) -> Result<(), 
         }
     }
 
-    for i in 0..next.len() {
-        for j in (i + 1)..next.len() {
-            if c1_of(&next[i]) == c1_of(&next[j]) {
-                return Err(InvalidReason::DuplicateCiphertext { first: i, second: j });
-            }
+    // Sets rather than nested loops: the input length is checked above, but a
+    // check whose whole purpose is to be cheap should not be quadratic even
+    // when it is safe.
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(next.len());
+    for (i, ct) in next.iter().enumerate() {
+        if !seen.insert(c1_of(ct)) {
+            let first = next
+                .iter()
+                .position(|o| c1_of(o) == c1_of(ct))
+                .expect("the duplicate has an earlier occurrence");
+            return Err(InvalidReason::DuplicateCiphertext { first, second: i });
         }
     }
 
+    let previous: HashSet<&[u8]> = prev.iter().map(c1_of).collect();
     for (i, ct) in next.iter().enumerate() {
-        if prev.iter().any(|p| c1_of(p) == c1_of(ct)) {
+        if previous.contains(c1_of(ct)) {
             return Err(InvalidReason::CardNotRemasked { position: i });
         }
     }
@@ -289,7 +320,7 @@ pub trait DeckCrypto {
         proof: &[u8],
         ctx: &DeckCtx,
     ) -> Result<Verified<Vec<Ciphertext>>, VerifyOutcome> {
-        structural_check(prev, next).map_err(VerifyOutcome::Invalid)?;
+        structural_check(prev, next, Self::DECK_LEN).map_err(VerifyOutcome::Invalid)?;
         self.verify_argument(prev, next, proof, ctx)?;
         Ok(Verified::new(next.to_vec()))
     }
@@ -314,11 +345,15 @@ mod tests {
         seeds.iter().map(|&s| ct(s)).collect()
     }
 
+    /// The deck size the tests below use, so a length gate does not have to
+    /// mean building 52 cards in every case.
+    const N: usize = 4;
+
     #[test]
     fn an_honest_looking_shuffle_passes_the_structural_check() {
         let prev = deck(&[1, 2, 3, 4]);
         let next = deck(&[10, 11, 12, 13]);
-        assert_eq!(structural_check(&prev, &next), Ok(()));
+        assert_eq!(structural_check(&prev, &next, N), Ok(()));
     }
 
     /// A valid proof, and not a shuffle. Bayer–Groth verifies the identity
@@ -327,7 +362,7 @@ mod tests {
     fn a_deck_shuffled_to_itself_is_refused() {
         let prev = deck(&[1, 2, 3, 4]);
         assert_eq!(
-            structural_check(&prev, &prev.clone()),
+            structural_check(&prev, &prev.clone(), N),
             Err(InvalidReason::DeckUnchanged)
         );
     }
@@ -340,7 +375,7 @@ mod tests {
         let mut next = deck(&[10, 11, 12, 13]);
         next[2] = [0u8; 66];
         assert_eq!(
-            structural_check(&prev, &next),
+            structural_check(&prev, &next, N),
             Err(InvalidReason::IdentityCiphertext { position: 2 })
         );
 
@@ -348,7 +383,7 @@ mod tests {
         let mut flagged = deck(&[10, 11, 12, 13]);
         flagged[1][32] |= 0x40;
         assert_eq!(
-            structural_check(&prev, &flagged),
+            structural_check(&prev, &flagged, N),
             Err(InvalidReason::IdentityCiphertext { position: 1 })
         );
     }
@@ -365,7 +400,7 @@ mod tests {
         let shared = c1_of(&next[0]).to_vec();
         next[3][..33].copy_from_slice(&shared);
         assert_eq!(
-            structural_check(&prev, &next),
+            structural_check(&prev, &next, N),
             Err(InvalidReason::DuplicateCiphertext { first: 0, second: 3 })
         );
     }
@@ -378,8 +413,78 @@ mod tests {
         let mut next = deck(&[10, 11, 12, 13]);
         next[1] = prev[2];
         assert_eq!(
-            structural_check(&prev, &next),
+            structural_check(&prev, &next, N),
             Err(InvalidReason::CardNotRemasked { position: 1 })
+        );
+    }
+
+
+    /// The gate an earlier version of this function did not have. Without it a
+    /// deck of three cards was accepted against a deck of fifty-two - so a
+    /// non-permutation passed the boundary - and the loops ran on a length the
+    /// attacker chose, in a function whose whole purpose is to be the cheap
+    /// check that runs before the expensive one.
+    #[test]
+    fn a_deck_of_the_wrong_length_is_refused_before_anything_else() {
+        let full = deck(&[1, 2, 3, 4]);
+        let short = deck(&[10, 11, 12]);
+
+        assert_eq!(
+            structural_check(&full, &short, N),
+            Err(InvalidReason::WrongDeckLength { expected: N, got: 3 })
+        );
+        assert_eq!(
+            structural_check(&short, &full, N),
+            Err(InvalidReason::WrongDeckLength { expected: N, got: 3 })
+        );
+
+        // An empty deck is the degenerate case, and it must not read as an
+        // unchanged deck or as a clean permutation.
+        assert_eq!(
+            structural_check(&[], &[], N),
+            Err(InvalidReason::WrongDeckLength { expected: N, got: 0 })
+        );
+    }
+
+    /// The length is checked before the identity scan, so a long attacker deck
+    /// full of degenerate cards costs one comparison rather than a walk.
+    #[test]
+    fn the_length_gate_runs_first() {
+        let prev = deck(&[1, 2, 3, 4]);
+        let mut huge = vec![[0u8; 66]; 10_000];
+        huge[0][0] = 0x02;
+        assert_eq!(
+            structural_check(&prev, &huge, N),
+            Err(InvalidReason::WrongDeckLength { expected: N, got: 10_000 }),
+            "the length, not the first degenerate card"
+        );
+    }
+
+    #[test]
+    fn the_default_deck_length_is_the_one_the_game_plays_with() {
+        struct Any;
+        impl DeckCrypto for Any {
+            fn verify_argument(
+                &self,
+                _p: &[Ciphertext],
+                _n: &[Ciphertext],
+                _pr: &[u8],
+                _c: &DeckCtx,
+            ) -> Result<(), VerifyOutcome> {
+                Ok(())
+            }
+        }
+        assert_eq!(Any::DECK_LEN, 52);
+
+        // And the provided method passes it, so a four-card deck is refused
+        // even though it is otherwise sound.
+        let ctx = DeckCtx::from_hash([1u8; 32]);
+        assert_eq!(
+            Any.verify_shuffle(&deck(&[1, 2, 3, 4]), &deck(&[9, 8, 7, 6]), b"", &ctx),
+            Err(VerifyOutcome::Invalid(InvalidReason::WrongDeckLength {
+                expected: 52,
+                got: 4
+            }))
         );
     }
 
@@ -432,7 +537,7 @@ mod tests {
         }
 
         let ctx = DeckCtx::from_hash([7u8; 32]);
-        let prev = deck(&[1, 2, 3, 4]);
+        let prev: Vec<Ciphertext> = (0..52u8).map(ct).collect();
 
         // A deck that would pass any argument, and must not pass this.
         assert_eq!(
@@ -441,7 +546,7 @@ mod tests {
         );
 
         // And an honest one still gets through.
-        let next = deck(&[10, 11, 12, 13]);
+        let next: Vec<Ciphertext> = (100..152u8).map(ct).collect();
         assert!(AlwaysAccepts.verify_shuffle(&prev, &next, b"", &ctx).is_ok());
     }
 
@@ -466,8 +571,8 @@ mod tests {
         }
 
         let ctx = DeckCtx::from_hash([7u8; 32]);
-        let prev = deck(&[1, 2, 3, 4]);
-        let next = deck(&[10, 11, 12, 13]);
+        let prev: Vec<Ciphertext> = (0..52u8).map(ct).collect();
+        let next: Vec<Ciphertext> = (100..152u8).map(ct).collect();
 
         let outcome = Unavailable_.verify_shuffle(&prev, &next, b"", &ctx);
         assert_eq!(
@@ -501,10 +606,12 @@ mod tests {
             }
         }
         let ctx = DeckCtx::from_hash([1u8; 32]);
+        let prev: Vec<Ciphertext> = (0..52u8).map(ct).collect();
+        let next: Vec<Ciphertext> = (100..152u8).map(ct).collect();
         let verified = Ok_
-            .verify_shuffle(&deck(&[1, 2]), &deck(&[9, 8]), b"", &ctx)
+            .verify_shuffle(&prev, &next, b"", &ctx)
             .expect("structurally sound and the argument accepted");
-        assert_eq!(verified.as_ref().len(), 2);
+        assert_eq!(verified.as_ref().len(), 52);
     }
 
     #[test]

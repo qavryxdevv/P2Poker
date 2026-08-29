@@ -77,6 +77,20 @@ the failure mode all three misses share.
   §5.2.1's alone.
 * **D-009 rule 2** — a below-floor certificate is inert everywhere. Carried in §2.10,
   and re-checked at §2.8 item 2, §2.9 and §5.2 item 8.
+* **D-015** — `TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` are defined on
+  the wire and **not produced in version 1**. **The sweep of this document found one
+  occurrence, not zero, and it is edited rather than reported clean: §2.10's
+  disconnect analysis** branched on whether `|V| >= 2` let a certificate form and
+  therefore whether the abort carried a name. It does not, at any `|V|`. Everything
+  else in this document was checked and is genuinely untouched, for a reason worth
+  stating because it is D-011 rule 1 paying off: this document owns constructions,
+  and **no construction here takes a certificate or a proof as an input**. `apk`,
+  the shuffle argument, `ctx`, the DLEQ proofs, the beacon and the key hierarchy are
+  all functions of chained deck content, and the two domain strings are separate
+  (`"p2p-poker v1 deck-ctx"` against `"p2p-poker v1 timeout-cert"`, `PROTOCOL.md`
+  §2.8), so a change to the second cannot reach the first. §8.1's D-014 analysis is
+  likewise untouched: its evidence is a **failed proof**, self-authenticating from
+  the offending event's own bytes, and D-014 excludes an equivocation proof by name.
 * **D-009 rule 3** — state the discipline, never an absence in the dependency tree.
   Carried in §7.2, §11 OQ-8 and §12 item 6.
 * **D-010** — the paragraph above; every consequence in this document.
@@ -589,11 +603,16 @@ token for the river index during the pre-flop betting round. Our rules:
    is the load-bearing observation behind **D-006**: a player who walks away from the
    keyboard still cooperates cryptographically, so the board opens on schedule, the
    showdown works, and the hand plays to the end. The only thing missing is a betting
-   decision, and the answer to that is an auto check/fold via a timeout certificate
-   **when the required voter set `V` (`PROTOCOL.md` §8.3) has at least two members;
-   when `|V| < 2` the deadline is advisory (D-007, D-008)** — never an abort, and
-   never anything that ends the tournament. The scope is `|V|`, never the seat count
-   `n`: see §2.10. An auto check/fold is **not** a penalty and D-010 does not remove
+   decision, and the answer to that is an auto check/fold **emitted by that player's
+   own client** — an ordinary signed action by the seat that owed one, single-writer,
+   needing no vote, no voter set and no shared clock (D-015). It is never an abort and
+   never anything that ends the tournament. **The sentence that stood here said the
+   auto check/fold came *via a timeout certificate* when `|V| >= 2`, and was advisory
+   below that; no certificate is produced in version 1** (`PROTOCOL.md`'s header box),
+   so the `|V|` branch is gone and the same thing happens at every table size. The
+   observation this item rests on is unchanged and is now doing more work than before:
+   the client that publishes tokens automatically is the same client that folds
+   automatically, which is why removing the certificate strands nobody. See §2.10. An auto check/fold is **not** a penalty and D-010 does not remove
    it: it is the ordinary poker treatment of a missed decision, identical to the live
    rule, and it moves chips only as normal play does — never as a sanction, never
    beyond what the player had already committed.
@@ -620,8 +639,10 @@ DEAL_PRIVATE         broadcast: each dealt-in seat emits one message carrying it
                      per sender, one message per sender, one collective stage
                                                                         (131 B per token)
   ↓
-betting …            auto check/fold on a timeout certificate when |V| >= 2 (D-006);
-                     when |V| < 2 the deadline is advisory (D-007, D-008)
+betting …            auto check/fold emitted by the away seat's OWN client when its own
+                     timer expires: an ordinary ACTION_CHECK / ACTION_FOLD, single-writer,
+                     no vote and no certificate at any table size (D-015; was "on a
+                     timeout certificate when |V| >= 2", D-006 to D-008)
 FLOP_REVEAL          tokens for 3 indices, broadcast
 betting … TURN_REVEAL … betting … RIVER_REVEAL … betting …
   ↓
@@ -673,30 +694,37 @@ Per **D-005**, **D-010** and `SPEC_CS.md` §19:
   record is still signed and verifiable — but it is **evidence with no automatic
   consequence** (D-010 point 2). Nothing block-lists, unseats or penalises the named
   peer (D-010 point 3).
-* **This is the same outcome whatever `|V|` is, and that is the point.** The abort is
-  neutral when the required voter set `V` (`PROTOCOL.md` §8.3) has two or more members
-  and neutral when it has fewer, so `|V|` no longer selects between two chip outcomes —
-  there is only one. What `|V|` still selects is whether a peer gets **named**:
-  * With `|V| >= 2` a complete, valid certificate can form, and the abort carries the
-    name of the peer that failed. That name is a record.
+* **This is the same outcome whatever `|V|` is, and since D-015 `|V|` selects nothing
+  at all.** The abort is neutral at every `|V|`, so `|V|` never selected between two
+  chip outcomes; what it used to select was whether a peer got **named**, and
+  **nothing names anybody now**. No `TIMEOUT_CERT` is produced (`PROTOCOL.md`'s header
+  box, §4.8), so no certificate can form at any `|V|`, and **every abort of this
+  version that follows a stalled cryptographic stage carries `attributed = []`**. The
+  hand ends at `hand_deadline_ms` under `PROTOCOL.md` §8.4, on a local timer expiry
+  every peer reaches from the same signed `HAND_INIT` and the same relative duration.
+  Liveness is not owed in between: `SPEC_CS.md` §19 ranks security above finishing a
+  hand conveniently.
+
+  **The `|V|` branch is retained below as the specification a later version restores**,
+  and the M1 discipline inside it is the part that must survive intact:
+  * With `|V| >= 2` a complete, valid certificate could form and the abort carried the
+    name of the peer that failed. That name was a record and nothing more (D-010).
   * With `|V| < 2` **the certificate is inert, and the two halves of that must not be
     run together into one sentence** (D-009 rule 2, finding M1). First: the certificate
     itself has *no effect at all* — it is not chained, it is not evidence, it produces
-    no `AbortRecord`, it terminates nothing. It is silently ignored, at every table size
-    and for `kind = Crypto` as much as for anything else. The hand does **not** end
-    there. Second, and separately: the hand ends later, at `hand_deadline_ms` under
-    `PROTOCOL.md` §8.4, on a local timer expiry that every peer reaches from the same
-    signed `HAND_INIT` and the same relative duration rather than on anybody's
-    certificate — and *that* abort names nobody (`attributed = []`). Liveness is not
-    owed in between: `SPEC_CS.md` §19 ranks security above finishing a hand
-    conveniently.
+    no `AbortRecord`, it terminates nothing. Second, and separately: the hand ends
+    later, at `hand_deadline_ms`, on a timer and not on anybody's certificate. **D-015
+    generalises the second half to every `|V|` and makes the first half moot**, which
+    is why the paragraph above states the timer path without a condition on it.
 
   The reason a below-floor certificate stays inert even though it can no longer take
   anything is unchanged and is not about chips: it rests on one peer's unilateral
   assertion that a deadline passed — or, at `|V| = 0`, on nobody at all — and no peer
   can check that assertion, because there is no trusted clock and no third party. A
   claim nobody can check does not belong in the chain whether or not it pays.
-* **The scope is `|V|`, never the seat count `n` (D-008).** Heads-up is the case where
+* **The scope is `|V|`, never the seat count `n` (D-008) — and under D-015 no live rule
+  in this corpus is scoped on either, which is why the rule survives only as a bar on
+  future edits.** Heads-up is the case where
   `|V| = 1` always — the voter set is the one opponent — but it is not the only one.
   `V` is the dealt-in seats minus the subject minus every seat a *completed, valid*
   certificate has already named, so at a larger table enough completed attributions
@@ -704,15 +732,21 @@ Per **D-005**, **D-010** and `SPEC_CS.md` §19:
   exclusion, which is what stops `V` being collapsed by assertion. Any rule in this
   corpus still written on `n` is a defect. D-010 shrinks what this scoping protects —
   a collapsed `V` no longer wins anybody's chips — but it does not retire it: a
-  manufactured certificate can still put a false name in the transcript, and the floor
-  is what stops that.
+  manufactured certificate could still put a false name in the transcript, and the
+  floor is what stops that. **D-015 retires it in this version by removing the
+  message**, and the floor is kept in `PROTOCOL.md` §8.3 for the version that brings
+  the message back. A rule written on `n` remains a defect even now that nothing is
+  written on `|V|` either.
 * From the **next** hand a seat that is outside that hand's `dealt_in` is simply not in
   `apk` (§2.1), and nothing waits for it. **D-012: `dealt_in` is settled by the next
   hand's chained `HAND_INIT`, never derived from the `attributed` field of the abort
   that ended this one.** Two honest peers can hold different copies of the same abort —
-  the certificate path carries a name, the hand-deadline path carries none, and there
+  the certificate path carried a name, the hand-deadline path carries none, and there
   is no abort-versus-abort precedence rule (finding H1) — so `attributed` is a
-  per-receiver quantity. Reading a key-set membership from it would put a per-receiver
+  per-receiver quantity. **Under D-015 only the second path exists, so the two copies
+  now agree by construction** — and the prohibition stands unchanged anyway, because
+  a rule that is currently unfalsifiable is exactly the kind this corpus has twice
+  found reintroduced by an editor who noticed it never fired. Reading a key-set membership from it would put a per-receiver
   quantity into `apk`, which is hashed into every shuffle challenge, and the next hand
   would simply never verify for somebody. The name in an abort is evidence and nothing
   else, which is what **D-010** already says it is.
@@ -721,8 +755,12 @@ Per **D-005**, **D-010** and `SPEC_CS.md` §19:
 ElGamal with Feldman or Pedersen VSS, so a quorum can finish without the missing
 player. We do **not** do this: with `t < n`, any `t` colluding players can decrypt
 *every* hole card at the table. That is precisely the trade `SPEC_CS.md` §19 forbids
-and it breaks the §35 main invariant. n-of-n stands; abort neutrally, and name the
-failing peer where `|V| >= 2` allows a certificate to form.
+and it breaks the §35 main invariant. n-of-n stands; **abort neutrally, and name
+nobody** — the clause that stood here, *"name the failing peer where `|V| >= 2`
+allows a certificate to form"*, is withdrawn by D-015: no certificate forms at any
+`|V|`, so every abort that follows a stalled cryptographic stage carries
+`attributed = []`. What the transcript still shows is the stage that stalled and whose
+token is missing from it, unsigned and legible to anyone holding it.
 
 **The cost, stated plainly, because D-010 requires it and `SPEC_CS.md` §18 requires
 it.** **The rage-quit escape is back, at every table size.** A player who is losing a
@@ -739,9 +777,12 @@ silent, and always recovers its own commitment when it does.** It cannot steal c
 that property is cryptographic and is untouched — and it cannot take another player's
 chips either, because nothing moves. What it gets is a free exit from a losing pot and
 a line in the transcript. The mitigations are social and not cryptographic: the
-attribution is visible to everyone and permanent where a certificate formed, the client
-should show a per-identity abort count in the lobby, and sitting a repeat aborter out
-is a **user** decision, never a protocol action (D-010).
+**missing contribution** is visible to everyone and permanent in the transcript — the
+clause *"the attribution is visible to everyone and permanent where a certificate
+formed"* is withdrawn, because no certificate forms (D-015) and the visibility is now
+a gap in a stage rather than a signed name — the client should show a per-identity
+abort count in the lobby, and sitting a repeat aborter out is a **user** decision,
+never a protocol action (D-010).
 
 ---
 
@@ -875,7 +916,7 @@ serialising. None of it invents a primitive.
 | 5 | **Street gating and index entitlement checks** on reveal tokens (§2.7, §2.8) | Policy: *when*, and *for which index*, a legitimate library operation may be applied. It adds no primitive; it constrains one |
 | 6 | **The signed, hash-chained event envelope** (§12/§13 of the spec) | Deterministic CBOR + Ed25519 + BLAKE3, all library primitives, composed in the standard way: length-prefixed, domain-separated, `previous_event_hash` chained. The signature prefix is `p2p-poker/v1/event`, defined byte-for-byte in `PROTOCOL.md` §13; this document does not restate it |
 | 7 | **The `DeckCrypto` trait boundary** (§9) | A Rust trait. No cryptographic content at all; it exists so ziffle can be swapped |
-| 8 | **Timeout certificates** (D-006) | `\|V\|`-of-`\|V\|` Ed25519 signatures — one from every member of the required voter set `V` (`PROTOCOL.md` §8.3) — over a canonical CBOR body naming seat, sequence and `previous_event_hash`. A multi-signature by concatenation, not an aggregate signature scheme — no new algebra. D-008's floor `\|V\| >= 2` is a protocol rule and not a cryptographic one: one signature is a perfectly valid multi-signature over one key, so nothing in this row rejects it and nothing here may be scoped on the seat count `n`. Under **D-010** a certificate may still be *produced* — it is how a human or a later version adjudicates — but consuming one never moves a chip and never removes a player. Whether it should still be produced at all in the MVP is `DECISIONS.md` OQ-F, and it is `PROTOCOL.md`'s to settle, not this document's; the cryptography is the same multi-signature either way |
+| 8 | **Timeout certificates** (D-006) — **not produced in version 1 (D-015); this row is the retained specification** | `\|V\|`-of-`\|V\|` Ed25519 signatures — one from every member of the required voter set `V` (`PROTOCOL.md` §8.3) — over a canonical CBOR body naming seat, sequence and `previous_event_hash`. A multi-signature by concatenation, not an aggregate signature scheme — no new algebra. D-008's floor `\|V\| >= 2` is a protocol rule and not a cryptographic one: one signature is a perfectly valid multi-signature over one key, so nothing in this row rejects it and nothing here may be scoped on the seat count `n`. Under **D-010** a certificate may still be *produced* — it is how a human or a later version adjudicates — but consuming one never moves a chip and never removes a player. Whether it should still be produced at all in the MVP is `DECISIONS.md` OQ-F, and it is `PROTOCOL.md`'s to settle, not this document's; the cryptography is the same multi-signature either way |
 | 9 | **The profile key-slot file format** (§10) | An envelope around library AEAD and library KDF. The AEAD's associated data binds the header, so no slot can be stripped or swapped |
 
 **Nothing in this table defines a cipher, a hash function, an RNG, a zero-knowledge
@@ -2429,11 +2470,13 @@ like cryptography problems and are not:
 * **Denial of service, including the abort attack of §2.10.** A silent player always
   forces a hand to abort. Detected, never prevented — and under **D-010** never
   punished: the abort is neutral, stacks return to their start-of-hand values, and the
-  attribution is a record with no automatic consequence. Whether the failing peer is
-  *named* still depends on `|V|` (named when a certificate can form at `|V| >= 2`, not
-  named at `|V| < 2`, where the hand ends on the `hand_deadline_ms` timer instead), and
-  the scope is `|V|`, never the seat count. What no longer depends on `|V|` is the chip
-  outcome: it is restoration in both cases.
+  transcript records the missing contribution. **Since D-015 the failing peer is never
+  *named*, at any `|V|`**: the clause that stood here made naming depend on whether a
+  certificate could form at `|V| >= 2`, and none forms. Every such hand ends on the
+  `hand_deadline_ms` timer with `attributed = []` and every stack restored, so neither
+  the chip outcome nor the naming depends on `|V|` any more — which is one fewer thing
+  for this bullet to be wrong about, and one less signed artefact for a human to read
+  (`THREAT_MODEL.md` §9.1.0 item 5(b)).
 * **Escaping a losing pot by going silent — the rage-quit escape.** This is *not*
   solved, at any table size, and D-010 reopened it deliberately. A player about to lose
   a big pot can stop publishing tokens and get their chips back. The alternative,

@@ -3875,6 +3875,11 @@ name = "p2p-poker"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "ark-ec",
+ "ark-ff",
+ "ark-secp256k1",
+ "ark-serialize",
+ "ark-std",
  "blake3",
  "chacha20poly1305 0.11.0",
  "curve25519-dalek 5.0.0",
@@ -6417,8 +6422,6 @@ dependencies = [
 [[package]]
 name = "ziffle"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba79285194a16b02512566a9a64d885567646045b144bb0efeef662001cd83a5"
 dependencies = [
  "ark-ec",
  "ark-ff",

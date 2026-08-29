@@ -1,7 +1,7 @@
 # PROTOCOL.md — the versioned wire protocol
 
 Phase 1 output. Binding spec sections: `SPEC_CS.md` §4, §12, §13, §14, §15, §16,
-§17, §20, §27. Binding owner decisions: `DECISIONS.md` D-001 … **D-013**.
+§17, §20, §27. Binding owner decisions: `DECISIONS.md` D-001 … **D-015**.
 
 **D-013 is the decision that shapes this revision, and it lands in two places.**
 Liveness is inherited from **demonstrated participation in the agreed chain**, not
@@ -46,11 +46,15 @@ that no later section has to repeat it and no reader has to assemble it:
 >    block-lists, unseats, refuses a seat to, or otherwise penalises a peer on
 >    the strength of an `EquivocationProof`, a `TIMEOUT_CERT`, a `DISPUTE` or an
 >    attribution. Sitting out a repeat offender is a **user** decision.
-> 4. Proofs and certificates are still **produced** — they are how a human, or a
->    later version, adjudicates — but no consumer of one moves a chip or removes
->    a player. Whether they should be produced at all in the MVP is an open
->    question the owner has not answered; §12 records it and does not answer it
->    either.
+> 4. **Superseded by D-015, and the supersession is recorded rather than the
+>    clause rewritten.** This point read: *"Proofs and certificates are still
+>    **produced** — they are how a human, or a later version, adjudicates — but
+>    no consumer of one moves a chip or removes a player. Whether they should be
+>    produced at all in the MVP is an open question the owner has not answered."*
+>    That question was `OQ-F`, and **D-015 answers it: they are not produced**
+>    (the box below, §12). Points 1–3 are untouched and remain in force — they
+>    are about what a *consumer* may do, and a later version reinstating the
+>    producer does not reinstate a consumer.
 >
 > **The accepted cost, stated plainly rather than hidden (`SPEC_CS.md` §18).**
 > The rage-quit escape returns, and not only below D-008's floor: at every table
@@ -85,6 +89,60 @@ had left to another document or to a later pass.**
 >    transition takes one as input, no `cause` value carries one, and no
 >    block-list, allow-list, unseating or seat refusal is driven by one — in this
 >    document or in any other (D-010 point 3, D-011 rule 3).
+
+**D-015 is the decision that closes the deadline machinery, and it is stated here
+because every later section is read against it.** `OQ-F` asked whether the
+machinery should be *produced* at all now that D-010 gives it no effect. The
+answer is no.
+
+> **Normative, canonical for this document. `TIMEOUT_VOTE` (`0x0601`),
+> `TIMEOUT_CERT` (`0x0602`) and the `EquivocationProof` object of §5.2.4 are
+> defined but not produced in version 1.**
+>
+> 1. **Nothing conforming emits one.** No client of this version signs a
+>    `TIMEOUT_VOTE`, assembles a `TIMEOUT_CERT`, or constructs an
+>    `EquivocationProof`. There is no legal emission path for any of the three.
+> 2. **A receiver rejects one.** A `SignedEvent` whose `event_type` is `0x0601`
+>    or `0x0602` is **rejected at §4.0 step 6** — the known-and-legal-on-this-
+>    channel gate — before its signature is verified, before its body is
+>    decoded, and before any store is touched. A `DISPUTE` whose `n(0) kind` is
+>    `2 EQUIVOCATION` is rejected at **step 11**, the first step at which the
+>    payload's `kind` exists, and its `n(3) payload` is never decoded as an
+>    `EquivocationProof`. In both cases the message is dropped: not buffered,
+>    not chained, not retained, not counted into
+>    `MAX_DISPUTES_PER_SENDER_PER_HAND`, and not forwarded under §1.5. It is
+>    **not** a protocol violation — the sender may be a later version — so no
+>    `Fault` is recorded, nothing is attributed, and no `DISPUTE` is raised
+>    about it. The disposition is the drop §1.1 gives any message this version
+>    does not implement, and it is a *drop*, never a *violation*, precisely
+>    because a receiver cannot tell a future version from a modified client.
+> 3. **The definitions stay, and so do the code points.** §4.8's two message
+>    shapes, §5.2.4's proof object, the `event_class` values `1` and `2` in
+>    §2.3's envelope, the `subject` arm of §5.2.1's slot key, and
+>    `DISPUTE kind = 2` are all retained exactly as written. Adding the
+>    machinery in a later version is then a **capability**, not a wire break
+>    (§10.1): the codes are already reserved and already mean what they will
+>    mean. **Narrowing any of those definitions is a defect**, and §5.2.1's key
+>    in particular keeps both subject axes — five passes went wrong narrowing
+>    it, and a key that is right costs nothing while nothing populates it.
+> 4. **No state is allocated for them.** §5.3's two subject-class structures are
+>    not created; §5.3 records the bound they would have needed and why it is
+>    the evidence D-015 rests on.
+>
+> **What replaces them, so that nothing is left waiting.** A player whose human
+> has walked away is still running a cooperating client: it publishes its
+> decryption shares automatically and it emits **its own** auto check/fold when
+> its own timer expires — a single-writer `ACTION_CHECK` or `ACTION_FOLD` by the
+> seat itself, needing no vote, no quorum and no shared clock. A client that
+> emits nothing at all stalls one hand to `hand_deadline_ms` (§8.4), which needs
+> no certificate from anybody, and is then outside `P(k+1)` under D-013 (§3.2).
+> The certificate sat between those two cases and covered neither.
+>
+> **What it costs is stated in `THREAT_MODEL.md` §9.1.0 and not softened here.**
+> The load-bearing one for this document: an equivocation is still **detected**
+> — two bodies in one slot, by §5.2.2's predicate, which is unchanged — and is
+> still no longer **provable to a third party who was not present**, because the
+> object that carried the two bodies to them is not produced.
 
 **This document owns the wire and nothing else** (D-011 rule 1): message shapes,
 the event envelope, the chain, sequence numbers, the anti-replay slot, canonical
@@ -1645,14 +1703,21 @@ Everything that a verifier needs and nothing that could open a card.
   §3.4 for exactly which tokens those are;
 * every betting action, with the actor, the amount, and the stage;
 * every `STATE_HASH` and `STATE_ACK`;
-* every timeout vote and certificate;
+* every timeout vote and certificate — **none in version 1 (D-015)**: nothing
+  emits either, so this line describes a class the transcript of this version is
+  always empty of. It is kept because a transcript reader must not treat the
+  absence of the class as a corrupted transcript, and because a later version
+  puts them back in exactly this position;
 * the final `HAND_COMPLETE` or `HAND_ABORT` with the per-seat chip deltas.
 
 **Kept beside the transcript, but not part of it:** every `DISPUTE` received for
 the hand. A dispute is unchained (§2.3, §4.9), so it occupies no stage and enters
 no `stage_hash`; it is stored alongside the chain because §6.4's divergence report
-needs it and because a dispute's *contents* — an `EquivocationProof`, a signed
-`STATE_HASH` — are verifiable on their own. Nothing about the chain's integrity
+needs it and because a dispute's *contents* — a signed `STATE_HASH`, a
+`kind = 3` `SignedEvent` — are verifiable on their own. **The
+`EquivocationProof` that stood third in that list is deleted under D-015**: no
+dispute of this version carries one, and a `kind = 2` dispute is dropped rather
+than stored, so it is never kept beside anything. Nothing about the chain's integrity
 depends on which disputes were kept.
 
 **Out — never, under any circumstance:**
@@ -2995,9 +3060,21 @@ a state transition, and it never becomes one.** The receiver does not "correct" 
 
 Codes `0x0600`–`0x06FF`. Full semantics in §8.
 
+> **Normative — this whole group is defined but not produced in version 1
+> (D-015).** Both message types below keep their fields, their code points,
+> their `event_class` values and their place in §5.2.1's slot key, and **no
+> conforming client of this version emits either one**. A receiver drops both at
+> §4.0 step 6, as the header box states, and records no fault for it. Everything
+> from here to the end of §4.8 is the definition a later version implements, and
+> the conditions in it are the conditions that version must satisfy — read them
+> as the specification of a message, never as a description of traffic this
+> version carries. §8.3 and §8.4 carry the same mark; §8.1's two-case table is
+> what governs a stalled stage in this version, and its two answers are the
+> seat's own auto check/fold and `hand_deadline_ms`.
+
 ---
 
-**`0x0601 TIMEOUT_VOTE`**
+**`0x0601 TIMEOUT_VOTE`** — *defined, not produced in version 1 (D-015)*
 
 *Direction:* any seat in the required voter set → all.
 *Legal:* only when the local monotonic timer for the subject stage has expired
@@ -3070,7 +3147,7 @@ emitter gate above states, in the same words.
 
 ---
 
-**`0x0602 TIMEOUT_CERT`**
+**`0x0602 TIMEOUT_CERT`** — *defined, not produced in version 1 (D-015)*
 
 *Direction:* **collective stage**; the required emitter set is `V(subject)`, the
 same set that had to vote. Each voter emits its own certificate.
@@ -3570,7 +3647,7 @@ is dropped at §4.0 step 11 like any other out-of-range field:
 | `kind` | Name | Carries | Defined in |
 |---|---|---|---|
 | `1` | `STATE_DIVERGENCE` | this peer's own `STATE_HASH` for the disputed checkpoint | §6.3 step 2 |
-| `2` | `EQUIVOCATION` | an `EquivocationProof` (§5.2) | §5.2 |
+| `2` | `EQUIVOCATION` | an `EquivocationProof` (§5.2) — **not produced in version 1 (D-015); a `DISPUTE` carrying this `kind` is dropped at §4.0 step 11 and its payload is never decoded** | §5.2 |
 | `3` | `CHEAT_EVIDENCE` | **exactly one** `SignedEvent`, signed by the seat named in `n(1) accused`, which the emitter holds to be provably illegal under **D-014** | the box below |
 
 `kind = 2` is written as `EQUIVOCATION` in §5.2 and carried no number until this
@@ -3805,7 +3882,7 @@ receiver's own state**:
 
 | `cause` | The receiver's own trigger | Before that trigger |
 |---|---|---|
-| `1`, certified-subject path (`cert_hash = Some`) | it holds, or `n(3) evidence` carries, the named `kind = 2` `TIMEOUT_CERT` with `\|V\| >= 2` | reject |
+| `1`, certified-subject path (`cert_hash = Some`) — **unreachable in version 1 (D-015)**: no certificate is produced, so no conforming emitter can populate `cert_hash`, and the trigger can never be present. The row is retained as the gate a later version restores; in this version its disposition is *reject*, on the same rule that governs every abort whose trigger is absent | it holds, or `n(3) evidence` carries, the named `kind = 2` `TIMEOUT_CERT` with `\|V\| >= 2` | reject |
 | `1`, uncertified path (`attributed = []`, `cert_hash = None`) — the hand-deadline path and §6.3 case (b) are **one row**, see below | its **own** `hand_deadline_ms` has expired (§8.2), **or** it has itself reached §6.3 case (b) | **buffer, do not reject** |
 | `2`, `3` | `n(3) evidence` verifies — the failing `SHUFFLE_PROOF` or reveal proof carries its own disproof | accept at once |
 | `4` | it is itself in the §6.3 case (c) terminus | **buffer, do not reject** |
@@ -3973,7 +4050,7 @@ adjudicator:
 
 | `cause` | Ends the hand when | `attributed` |
 |---|---|---|
-| `1` failure to publish | a `kind = 2` `TIMEOUT_CERT` with `\|V\| >= 2` closed a stage (§8.3); **or** `hand_deadline_ms` expired with no certificate that had an effect (§8.4); **or** §6.3 case (b) — a peer is missing events no holder will serve | the certified subject on the first path, **empty** on the other two |
+| `1` failure to publish | a `kind = 2` `TIMEOUT_CERT` with `\|V\| >= 2` closed a stage (§8.3) — **not produced in version 1, so this first path is unreachable here (D-015)**; **or** `hand_deadline_ms` expired with no certificate that had an effect (§8.4); **or** §6.3 case (b) — a peer is missing events no holder will serve | the certified subject on the first path, **empty** on the other two — and therefore **empty on every `cause = 1` abort this version produces** |
 | `2` invalid shuffle proof | a `SHUFFLE_PROOF` failed verification (§4.0 step 14, `INVALID_SHUFFLE_PROOF`) | the shuffler |
 | `3` invalid reveal proof | a Chaum–Pedersen DLEQ failed at `DEAL_PRIVATE`, `BOARD_REVEAL` or `SHOWDOWN_REVEAL` — the hand aborts here rather than stalling into a deadline (`CRYPTOGRAPHY.md` §8 rule 1) | the revealer |
 | `4` unresolvable divergence | §6.3 case (c): transcripts byte-identical after reconciliation and derived states still differ | **empty, always** |
@@ -3983,6 +4060,17 @@ Three of the five paths therefore carry `attributed = []`, which is no longer
 worth a table of exceptions: an abort that names nobody and an abort that names
 someone have identical effects **on the chips**, which is the only thing
 `attributed` was ever read for and is now read for nowhere.
+
+**Under D-015 it is four of the five, and `cause = 1` names nobody at all.** The
+certified-subject path is the only `cause = 1` path that ever populated
+`attributed`, and it needs a certificate this version does not produce. So the
+non-empty cases this version can reach are exactly `cause = 2` (the shuffler),
+`cause = 3` (the revealer) and `cause = 6` (the offender) — all three
+self-authenticating from the offending event's own bytes, none of them a claim
+about a deadline. **That is the first of D-015's stated costs made concrete in
+this document: there is no signed record naming who timed out**, only the
+transcript's visible gap at the stalled stage, which is what a human or a later
+version would have read anyway (D-010 point 2).
 
 **`cause = 6` is the one cause a seat's removal follows, and it does not follow
 from this message.** The abort voids the hand — stacks restored to their
@@ -4286,8 +4374,8 @@ means it does not and never can be.
 | `0x0503` | `ACTION_BET` | table mesh | 1 | single | `player_to_act` |
 | `0x0504` | `ACTION_RAISE` | table mesh | 1 | single | `player_to_act` |
 | `0x0505` | `ACTION_FOLD` | table mesh | 1 | single | `player_to_act` |
-| `0x0601` | `TIMEOUT_VOTE` | table mesh | 1 (`event_class = 1`, keyed also on `subject_seat`) | — | required voters |
-| `0x0602` | `TIMEOUT_CERT` | table mesh | 1 (`event_class = 2`, keyed also on `subject_digest`) | collective | required voters |
+| `0x0601` | `TIMEOUT_VOTE` | table mesh | 1 (`event_class = 1`, keyed also on `subject_seat`) | — | **none in version 1 (D-015)** — defined emitter is the required voters |
+| `0x0602` | `TIMEOUT_CERT` | table mesh | 1 (`event_class = 2`, keyed also on `subject_digest`) | collective | **none in version 1 (D-015)** — defined emitter is the required voters |
 | `0x0701` | `STATE_HASH` | table mesh | 1 | collective | required of `P(k-1)` at checkpoints 2–7; `P(0)` at checkpoint 1; **`P(k)` at checkpoint 8, and there accepted and compared from any occupied seat, in-set or not**; in a **reconciliation round**, `R(c) ∪ W` — never fewer than two seats — §4.9 |
 | `0x0702` | `STATE_ACK` | table mesh | 1 | collective | the set of the `STATE_HASH` stage it confirms, at every checkpoint including 8 and in every reconciliation round; **at checkpoint 8 it is accepted until `TERMINAL(k+1)` and not only until `HAND_INIT(k+1)`** — §4.9 |
 | `0x0703` | `DISPUTE` | table mesh | **0** | out-of-stage | any participant |
@@ -4300,6 +4388,17 @@ means it does not and never can be.
 39 message types. Lobby chat is on `/p2p-poker/lobby-chat/1` and not on the lobby
 topic, so §1.4's "a message on the wrong channel is dropped" rule covers it like
 any other.
+
+**Two of the 39 rows have no emitter in version 1, and the count stays 39
+(D-015).** `0x0601` and `0x0602` keep their rows, their codes, their
+`chain_scope`, their `event_class` and their stage kinds, so the table remains
+the complete register of the wire and a later version adds an emitter rather
+than a row. **The remaining 37 are the whole of the traffic this version
+produces**, and the two exceptions are marked in the `Emitter` column rather
+than deleted from the table, because a deleted row is how a code point gets
+reused. The interleaving table below keeps its rows 31 and 32 for the same
+reason and for one more: a verdict that has been wrong twice is worth keeping
+correct while nothing exercises it.
 
 **The `Emitter` column carries no status word, and that is now a rule.** Every
 collective row names either a set fixed by chained content (`dealt_in`, the
@@ -4356,8 +4455,8 @@ when some key component changes with it.
 | 24 | `SHOWDOWN_REVEAL` | one per showdown seat | — | **Clean** |
 | 25 | `SHOWDOWN_MUCK` | one per showdown seat, mutually exclusive with row 24 by `showdown_policy` (§4.6) | `event_type`, if a seat emits both | **Clean.** Since `event_type` entered the key the pair is two slots, so a seat emitting both is a **stage violation** under §4.0 step 12, not an equivocation. §4.6's exclusivity stays normative and is what rejects the second (§5.2.1) |
 | 26–30 | `ACTION_CHECK`, `ACTION_CALL`, `ACTION_BET`, `ACTION_RAISE`, `ACTION_FOLD` | one per turn, single-writer | `event_type`, if a seat claims two actions for one turn | **Clean.** Same change as row 25 and the same price: two *different* action types at one `sequence` are a stage violation, not a proof; two bodies of the **same** type — two `ACTION_RAISE` with different amounts — are still an equivocation (§5.2.1) |
-| 31 | `TIMEOUT_VOTE` | one per subject per stage; two simultaneous subjects are **normal** (§8.4) | `subject_seat` | **Clean since M2**, by the subject axis in the key |
-| 32 | `TIMEOUT_CERT` | one per `subject_digest` per stage | `subject_digest` | **Clean since M2**, by the subject axis. Its one variable field `n(1) votes` is pinned by the receiver check of §4.8 |
+| 31 | `TIMEOUT_VOTE` | **none in version 1 (D-015)**; the defined emission is one per subject per stage, and two simultaneous subjects are **normal** (§8.4) | `subject_seat` | **Vacuously clean in version 1** — an honest peer emits none, so it emits no pair. **Clean since M2 for the defined behaviour**, by the subject axis in the key; the verdict is retained because the axis is retained (D-015 point 3) |
+| 32 | `TIMEOUT_CERT` | **none in version 1 (D-015)**; the defined emission is one per `subject_digest` per stage | `subject_digest` | **Vacuously clean in version 1**, same reason. **Clean since M2 for the defined behaviour**, by the subject axis; its one variable field `n(1) votes` is pinned by the receiver check §4.8 defines |
 | 33 | `STATE_HASH` | one per checkpoint, **plus one per reconciliation round** — a required re-emission with *changed* content, the only one in the corpus — plus, at **checkpoint 8**, one from a seat outside the required set, which §4.9 admits | `sequence`, and only because §4.9 gives each reconciliation round its own — `s_ckpt + r` inside a hand, `BOUNDARY_CHECKPOINT_BASE + 2r` at checkpoint 8 | **Clean since P1, and clean by that rule alone.** Not by the stage rule: an editor who deletes §4.9's normative boxes reopens P1 the same day. The checkpoint-8 admission does not touch this verdict — the key contains `sender_public_key`, so an out-of-set emitter fills **its own** slot at that `sequence` and one honest peer still emits one body per slot |
 | 34 | `STATE_ACK` | one per checkpoint and one per reconciliation round; **not** widened at checkpoint 8 | `sequence`, same rule | **Clean since P1**, same reason |
 | 35 | `HAND_COMPLETE` | one derived copy per seat of `P(k-1)`, at a fresh `sequence` — the last stage completed, so nothing occupies it | — | **Clean** |
@@ -4699,18 +4798,48 @@ is withdrawn in full.
 Stated so nothing is left to infer, and this is also the route by which the two
 cross-type conflicts §5.2.1 no longer labels as equivocation are caught.
 
+> **Normative — the proof object is defined but not produced in version 1
+> (D-015), and the detection is not.** §5.2.1's key and §5.2.2's predicate are
+> untouched and run on every chained event: a receiver still finds two bodies in
+> one slot, still rejects the second at §4.0 step 10a or step 12, still diverges
+> from a peer that accepted the other first, and the hand still ends through the
+> chained path below. **What is not produced is the `EquivocationProof` object
+> and the `DISPUTE kind = 2` that carried it.** No client of this version
+> constructs one, broadcasts one, or accepts one — a `DISPUTE` arriving with
+> `kind = 2` is dropped at §4.0 step 11 (header box, point 2). The object's
+> definition, its `DISPUTE kind` code point and its verification procedure stay
+> exactly as written below, so a later version reinstates it without a wire
+> break.
+>
+> **The cost, and it is the one D-015 records as unsettled.** Equivocation is
+> **detected and no longer provable to a third party who was not present.** The
+> detector still knows; the two peers who diverge still stop; the transcript
+> still shows it. What is gone is the self-contained artefact that carried the
+> two signed bodies to somebody who was not at the table, and with it every
+> claim in this section about evidence "usable by anyone, forever". Nothing else
+> is lost, because under D-010 nothing consumed the proof anyway: it ended no
+> hand, moved no chip and unseated nobody. `THREAT_MODEL.md` §9.1.0 carries the
+> loss as a standing limitation and `DECISIONS.md` D-015-2 is the decision that
+> must revisit it before real money.
+
 The two conflicting events share a slot — or, when they differ in `event_type`,
 the same stage cell — so §4.0 step 10a or step 12 rejects whichever
 reaches each peer second, as a violation; peers that accepted different first
 copies now hold different state; the next checkpoint (§6.2) shows two `state_hash`
 values; §6.3 runs; and the hand ends through that **chained** path, neutrally,
 like every other abort. **The outcome is identical either way**, which is what
-makes the labelling difference §5.2.1 accepts affordable. The proof is still built, still broadcast in a `DISPUTE`,
-still retained forever and still shown to the user. What it no longer does is
-decide anything. And if no peer ever diverges, there was nothing to decide — an
-equivocation nobody's state disagreed about cost nobody anything.
+makes the labelling difference §5.2.1 accepts affordable. **Under D-015 that
+chained path is the whole of what happens** — the sentence that stood here,
+*"The proof is still built, still broadcast in a `DISPUTE`, still retained
+forever and still shown to the user"*, is withdrawn: none of the four happens in
+version 1. What the detector does instead is what it did before the object was
+ever consulted — reject the second body, diverge, and end the hand chained and
+neutrally — and it may show the user what it found, from its own two retained
+copies, without an object to hand anybody else. And if no peer ever diverges,
+there was nothing to decide — an equivocation nobody's state disagreed about
+cost nobody anything.
 
-**The proof object.**
+**The proof object, defined and not produced (D-015).**
 
 ```
 EquivocationProof  #[cbor(array)]
@@ -4719,9 +4848,12 @@ EquivocationProof  #[cbor(array)]
   n(2) event_b    : bytes         complete SignedEvent, <= 32768 B
 ```
 
-Carried as the payload of a `DISPUTE` with `kind = EQUIVOCATION`. Whether it is
-also broadcast on the lobby topic, so that peers who were never at the table hold
-durable evidence, is **OPEN QUESTION Q-05**.
+Carried as the payload of a `DISPUTE` with `kind = EQUIVOCATION` — **in the
+version that produces it. Version 1 produces neither**, and a `DISPUTE` arriving
+with that `kind` is dropped (D-015). Whether, in that later version, it is also
+broadcast on the lobby topic so that peers who were never at the table hold
+durable evidence, is **OPEN QUESTION Q-05**, which D-015 makes moot for this
+version without answering.
 
 **Verification is self-contained.** A checker needs nothing but the two byte
 strings and Ed25519: gate both, verify both signatures under `accused`, check that
@@ -4742,10 +4874,12 @@ source and the client must make it impossible to run two instances against one
 profile directory. Conclusions drawn beyond "this key signed two conflicting
 things" are unwarranted, and the UI must not draw them.
 
-**Consequence, under D-010: none that is automatic.** The proof is retained, kept
-beside the transcript (§3.3), broadcast in a `DISPUTE`, and shown to the user. The
-hand does **not** abort on it, no chip moves, the accused is not unseated, and no
-key is added to any block list. The sentence this paragraph carried — *"The hand
+**Consequence, under D-010: none that is automatic. Under D-015 there is no
+object to have a consequence.** In the version that produces it the proof is
+retained, kept beside the transcript (§3.3), broadcast in a `DISPUTE`, and shown
+to the user; the hand does **not** abort on it, no chip moves, the accused is not
+unseated, and no key is added to any block list. In **this** version none of that
+happens, because nothing builds one. The sentence this paragraph carried — *"The hand
 aborts with `cause = 5`, the accused is attributed, the peer is added to
 `libp2p::allow_block_list` [LIBP2P §1], and the proof is retained"* — specified
 three consequences and two of them are deleted: the abort by the ordering rule
@@ -4758,16 +4892,23 @@ ever have delivered anyway — a public, permanent, independently verifiable rec
 every other document references §5.2 and reproduces none of it. It is the single
 answer to G2, and it is stated as a plain negative because that is what it is.**
 
-> A verifying `EquivocationProof` is **retained as evidence, in every phase, at
-> every table, and is never silently discarded** — whether or not a hand is live,
-> whether or not the accused is a seated participant, and whether or not anyone
-> has diverged. Verification needs no table state, no transcript and no knowledge
-> of the game, so there is never a reason to refuse to hold one.
+> **Nothing produces it (D-015).** No client of this version constructs an
+> `EquivocationProof`, and no receiver accepts one: a `DISPUTE` with
+> `kind = 2 EQUIVOCATION` is dropped at §4.0 step 11, unopened, with no fault
+> recorded. The retention rule that stood here — *"retained as evidence, in
+> every phase, at every table, and never silently discarded"* — is the rule of
+> the version that produces one, and it is kept in this box for that version
+> rather than deleted, because the reason it was stated this widely still holds
+> and would have to be restated otherwise.
 >
 > **Nothing consumes it.** There is no transition, in any document, that takes an
 > `EquivocationProof` as its input event. It ends no hand, moves no chip, unseats
 > nobody, block-lists nobody, refuses nobody a seat, and produces no
-> `AbortRecord`. Whether it is forwarded beyond the table is Q-05.
+> `AbortRecord`. That sentence is now true twice over — once because D-010 and
+> D-011 rule 3 removed every consumer, and once because D-015 removed the
+> producer — and **it is the first half that is load-bearing**: a later version
+> may reinstate the object, and reinstating it must not reinstate a consumer.
+> Whether it is forwarded beyond the table is Q-05, moot in this version.
 >
 > **There is no wire representation for an equivocation-caused abort and none
 > will be added.** §4.10's `cause` enumeration is `1`–`4` and `6`; value `5` is
@@ -4780,7 +4921,9 @@ answer to G2, and it is stated as a plain negative because that is what it is.**
 > `AbortKind::Equivocation`, or a transition producing one, names an outcome no
 > legal `HAND_ABORT` can carry, and is a defect in that document.
 
-Why retention is stated this widely, even though nothing follows from it:
+Why retention is stated this widely **in the version that produces a proof**,
+even though nothing follows from it — and it is also why D-015's cost is stated
+as loudly as it is:
 equivocation is *detected* precisely when things look fine to the detector — it is
 two peers comparing what they each received, which is §1.5's forwarding rule
 working as designed — so the common case is a proof arriving with no divergence in
@@ -4837,23 +4980,58 @@ derivation; this section defines no key of its own.
   `MAX_SEATS = 10`, against 40 960. The bound stated here before this pass was
   computed over indices below 2 048 only and was short by exactly those entries. Sparse rather than dense for the same reason as the classes below: a
   dense `u16` axis would be 65 536 cells per `(stage, seat)` for a pair.
-* **`event_class` 1 and 2.** A per-stage map keyed by `(seat, subject_seat)` for
-  votes and `(seat, subject_digest)` for certificates, **allocated only for a
-  stage at which such an event has actually been accepted**. At most `MAX_SEATS ×
-  (MAX_SEATS − 1) = 90` entries per stage per class, and the number of stages is
-  bounded as above. `event_type` needs no axis here because each class holds
-  exactly one type. **The subject axis is not optional**: without it two votes by
-  one honest voter about two seats at one stage collide, which is defect M2.
-  Sparse rather than dense because the dense form is `MAX_STAGES_PER_HAND ×
-  MAX_SEATS × 2 × MAX_SEATS` slots for a structure a legitimate hand populates a
-  handful of times — the deadline classes only ever touch a stage that stalled.
+* **`event_class` 1 and 2 — not allocated in version 1 (D-015), and this is the
+  measurement the decision rests on.** No structure exists for either class,
+  because nothing conforming emits either class and §4.0 step 6 drops both types
+  before any store is reached. There is no per-stage map, no lazy allocation,
+  and no code path an incoming frame can take to create one.
 
-**Why the three structures are separate rather than one map (R-4).** The
-sentence that stood here said the `event_class` axis "is what lets a seat hold
-both its own contribution at stage `s` and a `TIMEOUT_VOTE` about stage `s`",
-immediately after an index that did not contain `event_class`. That was true in
-effect and wrong in wording: the class axis is expressed by *these being three
-structures*, not by a component of any one index. The separation is the axis.
+  **The bound they would have needed, recorded because a later version needs the
+  number and because it is the evidence D-015 rests on.** The structures were a
+  per-stage map keyed by `(seat, subject_seat)` for votes and
+  `(seat, subject_digest)` for certificates, allocated only for a stage at which
+  such an event had actually been accepted, at most
+  `MAX_SEATS × (MAX_SEATS − 1) = 90` entries per stage per class. Measured over
+  `MAX_STAGES_PER_HAND` at `MAX_SEATS = 10`, worst case per hand:
+
+  | class | entries | resident |
+  |---|---:|---:|
+  | ordinary events (`event_class == 0`, the bullet above) | 41 130 | 2.2 MiB |
+  | timeout votes | 184 320 | 9.8 MiB |
+  | timeout certificates | 184 320 | 16.3 MiB |
+  | **total, had both been allocated** | | **28.3 MiB** |
+
+  At the protocol's limit of eight concurrent table sessions that is ~226 MiB,
+  **of which 26 MiB per hand are the two classes above** — the client's largest
+  attacker-influenced allocation, held for machinery D-010 had already made
+  consequence-free. Not allocating them is the whole of the reduction: the
+  section's resident worst case is **2.2 MiB per hand**, the `event_class == 0`
+  store plus the constants named in the bullets around it.
+
+  **What a later version must restore with them, stated so it is not
+  re-derived.** The certificate map is the larger of the two because its key
+  carries a 32-byte `subject_digest` where the vote map carries a `u8`. Both
+  must be **sparse** — the dense form is
+  `MAX_STAGES_PER_HAND × MAX_SEATS × 2 × MAX_SEATS` slots for a structure a
+  legitimate hand populates a handful of times, since the deadline classes only
+  ever touch a stage that stalled. And **the subject axis is not optional**:
+  without it two votes by one honest voter about two seats at one stage collide,
+  which is defect M2 and which §5.2.1's key still carries the axis to prevent.
+  §5.2.1 is unchanged by D-015 for exactly that reason — the key stays right
+  while nothing populates it, because narrowing it is how five passes went wrong.
+
+**Why the structures are separate rather than one map (R-4), and why that still
+matters when only one of them exists.** The sentence that stood here said the
+`event_class` axis "is what lets a seat hold both its own contribution at stage
+`s` and a `TIMEOUT_VOTE` about stage `s`", immediately after an index that did
+not contain `event_class`. That was true in effect and wrong in wording: the
+class axis is expressed by *these being separate structures*, not by a component
+of any one index. The separation is the axis. **Under D-015 one of the three is
+built and two are not**, which is why the `event_class == 0` store's index above
+still omits `event_class`: it is the only structure, so the separation is
+trivially satisfied, and a later version that adds the other two adds structures
+rather than an index component. An implementer who "simplifies" by folding the
+class into a single map has pre-committed the version-2 defect.
 * Per table, per hand, per sender: a count of accepted distinct `DISPUTE`s and
   their `event_hash`es, bounded by `MAX_DISPUTES_PER_SENDER_PER_HAND = 8`
   (§4.9). `DISPUTE` is unchained, so it has no slot in the array above and needs
@@ -6087,11 +6265,19 @@ attribute-every-non-voting-seat rule that §8.4 deletes, and it is withdrawn. Th
 hand deadline is scoped on nothing, because it attributes nobody; that is what
 makes it safe at every `|V|` (§8.4, D-008 point 4).
 
-**The engine contains no clock.** Time enters the state machine only as a signed
-`TIMEOUT_CERT`. `STATE_MACHINE.md` must carry the deadline as explicit state
-rather than as a wall-clock read inside the engine (D-006). Since the certificate
-stage became collective (§4.8) this is true without exception: `CERT_SETTLE_MS`
-was the one wall-clock read left inside the chain-building rule and it is gone.
+**The engine contains no clock, and under D-015 it takes no signed artefact of
+time at all.** The sentence that stood here — *"Time enters the state machine
+only as a signed `TIMEOUT_CERT`"* — is corrected: no certificate is produced, so
+time reaches the engine as **the seat's own ordinary action** (an
+`ACTION_CHECK` / `ACTION_FOLD` its client emitted when its own timer expired, a
+single-writer event indistinguishable in the chain from a human's) and as **the
+terminal `HAND_ABORT` of §4.10** on the whole-hand limit. Both are ordinary
+chained events; neither is a claim about a clock. `STATE_MACHINE.md` must still
+carry the deadline as explicit state rather than as a wall-clock read inside the
+engine (D-006), and the rule is now easier to hold rather than harder, because
+the one construction that ever put an agreed time inside the chain is not built.
+`CERT_SETTLE_MS` was the last wall-clock read in the chain-building rule and it
+was already gone (§4.8).
 
 **One residual, stated rather than hidden.** A stage can close two ways — by the
 subject's own event, or by certificates — and which one happened is chain content.
@@ -6101,7 +6287,35 @@ assumption already in force. Where `|V| < 2` there is no such voter, and D-008's
 floor applies, so the ambiguity cannot arise: no certificate of either kind takes
 effect at all (§8.3).
 
-### 8.3 The timeout certificate
+### 8.3 The timeout certificate — defined, not produced in version 1 (D-015)
+
+> **Normative. No certificate exists in version 1, so no rule in this section
+> fires.** Nothing emits a `TIMEOUT_VOTE`, so no `V(subject)` is ever assembled,
+> no certificate ever completes, `consecutive_auto_actions` is never incremented
+> by a deadline, and no seat is ever marked sitting out by this path. The
+> `|V| >= 2` floor, the inductive exclusion rule and the effect table below are
+> **retained in full** as the specification a later version implements; they are
+> the part of this machinery that took five passes to get right, and deleting
+> them would mean deriving them a sixth time.
+>
+> **What governs a missed deadline in this version.** An **action** deadline is
+> answered by the seat itself: the client whose human has walked away emits its
+> own `ACTION_CHECK` — or `ACTION_FOLD` when facing a bet — as an ordinary
+> single-writer event at `player_to_act`'s own stage (§4.7, §8.1). That is a
+> real signed event by the seat that owed one, so it needs no vote, no voter
+> set, no unanimity and no shared clock, and §4.11 row 26–30's verdict covers it
+> unchanged. A **cryptographic-step** deadline has no such answer, because no
+> peer may publish another's decryption share: the stage stalls, and the hand
+> ends at `hand_deadline_ms` under §8.4 with `cause = 1`, `attributed = []`,
+> `cert_hash = None` and stacks restored — which is exactly what §8.3 already
+> prescribed below the `|V| >= 2` floor, now applied at every `|V|`.
+>
+> **So the certificate's whole remaining content in this version is its
+> absence**, and the two consequences of that absence are stated once here:
+> **(a)** `attributed` is empty on every abort this version can produce, since
+> §4.10's only non-empty path is the certified-subject path; and **(b)** there
+> is no signed record of *who* timed out, only the transcript's visible gap at
+> the stage that stalled. `THREAT_MODEL.md` §9.1.0 carries both as costs.
 
 One peer asserting "time is up" cannot be enough — it would let anyone steal the
 action from a player who was about to act.
@@ -6296,6 +6510,16 @@ supersede D-006 and there is no auto-action event of any kind.
 
 ### 8.4 Simultaneous failures
 
+> **D-015 dissolves this section's problem rather than answering it.** No
+> certificate is produced, so there is no unanimity to fail to reach and no
+> deadlock to resolve: **every** stall — one subject, two, or ten — takes the one
+> path this section already identified as the safe one, the whole-hand limit. The
+> analysis below is retained because it is the argument for that path and because
+> a later version reinstating the certificate meets the same deadlock; **the
+> normative content for this version is the `hand_deadline_ms` boxes below,
+> which need no certificate from anybody and are unchanged by D-015.** `Q-02`
+> stays open for that later version and blocks nothing here (§12).
+
 If two seats become subjects at once, neither certificate can reach unanimity,
 because each required voter set contains the other subject.
 
@@ -6351,7 +6575,8 @@ weaker and the correct reason, and it is enough. Every abort returns exactly
 whether it names anybody or not.
 
 **This abort path is the one piece of the deadline machinery that is safe at
-every `|V|`, including `|V| = 0`,** because it names nobody and moves nothing
+every `|V|`, including `|V| = 0`, and under D-015 it is the only piece that
+exists,** because it names nobody and moves nothing
 between seats. It needs no voter set, no certificate and no unanimity; it is a
 local timer expiry that every peer reaches from the same signed `HAND_INIT` and
 the same relative duration. That is why D-008's scoping rule has nothing to
@@ -6403,7 +6628,25 @@ Q-02** stays open with the above as its written interim behaviour; the same
 question is `STATE_MACHINE.md` Q3 and is carried as blocking in
 `THREAT_MODEL.md` §9.2 (OQ-E).
 
-### 8.5 How a timeout becomes evidence
+### 8.5 How a timeout becomes evidence — nothing does, in version 1 (D-015)
+
+> **Normative.** No certificate is produced, so **no timeout becomes evidence in
+> this version.** The offline verifier specified below has nothing to verify,
+> and the two costs D-015 accepts are exactly the two things this section used to
+> deliver: there is **no signed record of who timed out**, and **a later version
+> cannot adjudicate today's transcripts** for timeout questions, because the
+> evidence was never produced. Both are accepted rather than mitigated — under
+> D-010 the evidence had no consequence, so nothing was going to be adjudicated
+> from it. What a transcript still shows is the stage that stalled and whose
+> event is missing from it, unsigned and legible to anyone holding the
+> transcript, which is what a human would have read in any case.
+>
+> The verifier below is retained as the specification a later version
+> implements. It is also the reason §9.6's fuzz target 5 is retained: a receiver
+> of **this** version must still refuse a `TIMEOUT_CERT` without being harmed by
+> its contents, and it refuses at §4.0 step 6 — before the nested `SignedEvent`s
+> are decoded — which is a shallower and safer path than the one that target was
+> written for, not a deeper one.
 
 The certificate is a permanent, self-contained artefact. A third party with the
 transcript can check, with no table state: every embedded vote's canonicality and
@@ -6434,10 +6677,16 @@ claiming more.
 **And under D-010 no protocol action follows from any of it.** A completed
 certificate closes the stage it was about, and its attribution is written to the
 transcript; that is the end of what this document does with it. It costs the
-subject no chips and does not remove it from the table. The certificate is
-produced because it is the artefact a human or a later version adjudicates from —
-whether producing it is worth its cost while nothing consumes it is the open
-question §12 records.
+subject no chips and does not remove it from the table.
+
+**The last sentence of this section used to defer to an open question and now
+answers it.** It read: *"The certificate is produced because it is the artefact a
+human or a later version adjudicates from — whether producing it is worth its
+cost while nothing consumes it is the open question §12 records."* **D-015
+answers it: it is not worth its cost, and it is not produced** (§12, `OQ-F`
+closed). The cost was measured — 26 MiB of a 28.3 MiB per-hand anti-replay
+worst case, the client's largest attacker-influenced allocation (§5.3) — against
+a benefit D-010 had already reduced to a record nothing reads.
 
 ---
 
@@ -6512,8 +6761,8 @@ reading the body.
 | `SHOWDOWN_REVEAL` | 512 | 264 |
 | `SHOWDOWN_MUCK` | 64 | ~10 |
 | `ACTION_*` | 64 | ~20 |
-| `TIMEOUT_VOTE` | 256 | ~60 |
-| `TIMEOUT_CERT` | 8 192 | ≤ 9 × ~250 |
+| `TIMEOUT_VOTE` | 256 | **n/a — not produced in version 1 (D-015)**; the defined body is ~60 |
+| `TIMEOUT_CERT` | 8 192 | **n/a — not produced in version 1 (D-015)**; the defined body is ≤ 9 × ~250 |
 | `STATE_HASH` | 128 | 70 |
 | `STATE_ACK` | 128 | 102 |
 | `DISPUTE` | 140 000 | ≤ 4 × 32 768 = 131 072 plus envelope overhead |
@@ -6576,7 +6825,7 @@ processed.
 | `pots` | `MAX_SEATS` | at most one side pot per all-in level |
 | `RevealEntry` per message | 25 | `2 × MAX_SEATS + 5` |
 | `deck_index` | < 52 | |
-| votes in `TIMEOUT_CERT` | `MAX_SEATS - 1` = 9 | ascending by voter seat, unique |
+| votes in `TIMEOUT_CERT` | `MAX_SEATS - 1` = 9 | ascending by voter seat, unique. **Never reached in version 1 (D-015)** — the message is dropped at §4.0 step 6, before its payload is decoded, so this bound is the one a later version restores rather than one this version enforces |
 | `evidence` in `DISPUTE` | 4 | each ≤ `MAX_EMBEDDED_EVENT` = 32 768 B |
 | `MAX_DISPUTES_PER_SENDER_PER_HAND` | 8 | accepted distinct `DISPUTE`s from one sender for one hand; `DISPUTE` is unchained and has no stage slot to bound it (§4.9, §5.3) |
 | `capabilities` | 32 | each name ≤ 32 B, sorted, unique |
@@ -6651,7 +6900,14 @@ Required `cargo-fuzz` targets:
    unreachable for 33-byte points, but a panic on network-derived data. [MENTAL
    §4.1, §9 risk 5] Deserialise everything with the library's validating mode.
 5. The `TIMEOUT_CERT` verifier, which decodes nested `SignedEvent`s and is the
-   deepest recursion the protocol has.
+   deepest recursion the protocol has. **Retained under D-015 with its target
+   changed rather than deleted**: this version never runs that verifier, so what
+   the target must now establish is that a `0x0601` or `0x0602` frame, however
+   malformed, is **dropped at §4.0 step 6 without its payload being decoded at
+   all** — the nested-decode path must be unreachable, not merely safe. A fuzz
+   target deleted because its subject was deferred is how a deferred subject
+   comes back unfuzzed; a later version restores the deep target beside this
+   shallow one.
 
 **One standing test that is not a fuzz target, required by D-009 rule 1.**
 `SPEC_CS.md` §25 already requires a `CheaterEquivocation` peer. The mirror of it
@@ -6679,6 +6935,19 @@ clients interoperate.
   an unknown `event_type` is still a violation, because the roster's capability
   set already established what everyone speaks.
 * **New capability names.** Unknown names are ignored by construction (§1.3).
+* **An emitter for a type that is defined but not produced — and this is the
+  route D-015 leaves open.** `0x0601`, `0x0602` and `DISPUTE kind = 2` already
+  have code points, shapes, `event_class` values, slot-key arms and §4.11 rows,
+  and this version drops all three unopened. A later minor version may begin
+  emitting them **behind a negotiated capability**, and nothing about the wire
+  has to change for it: the receiver rule this version states — drop, no fault —
+  is exactly the rule that lets a v1 client sit at a table with a client that
+  emits them and keep playing. **Two obligations come with that route.** The
+  definitions may not be narrowed in the meantime (header box, point 3), and the
+  emitting version may not treat a v1 client's silence as a vote: a `V(subject)`
+  computed over peers who negotiated the capability is a `V` shrunk by
+  something other than a completed certificate, which is the N3 attack under a
+  new name (§8.3).
 * **New `preset_id` values and new parameter values within the declared ranges.**
   Presets are carried by value in the advertisement, so a new preset is data, not
   schema.
@@ -6815,13 +7084,13 @@ about the wire and not about the threat model:**
 | # | Question | Blocks | Owner |
 |---|---|---|---|
 | **Q-01** | Is `showdown_policy = TDA_MUCK` offered at all, or is `MANDATORY_REVEAL` the only permitted value? Mucking preserves live poker's strategic value but weakens §13 verification from "the award was correct" to "the award was correct given who did not forfeit" — a colluding pair could have one player muck a winner. Mandatory reveal is fully verifiable but leaks strictly more than real poker does, which is itself a long-run edge. [RULES A8] | `STATE_MACHINE.md`, the engine's showdown path | project owner; belongs in `DECISIONS.md` |
-| **Q-02** | **How is a multi-subject deadline certificate constructed, and whom does it attribute?** `signers == participants \ {subject}` is unachievable when two or more seats are simultaneously unresponsive, because each required voter set contains the other subject. **Interim behaviour, written into §8.4 and revised by D-008:** the exclusion rule that removed already-subject seats from `V` is **deleted** — it let one modified client shrink `V` to itself at any table size (N3) — so simultaneous subjects now deadlock until `hand_deadline_ms`, when the hand aborts with `cause = 1`, `attributed = []`, `cert_hash = None`, stacks restored. Two colluding seats can still void a hand for free. D-006 specified unanimity for the single-subject case only. Same question as `STATE_MACHINE.md` Q3; carried as blocking in `THREAT_MODEL.md` §9.2 as OQ-E. | `STATE_MACHINE.md`, Phase 4 | project owner |
+| **Q-02** | **Not blocking version 1 (D-015): no certificate is produced, so no multi-subject case arises; the question returns with the machinery.** **How is a multi-subject deadline certificate constructed, and whom does it attribute?** `signers == participants \ {subject}` is unachievable when two or more seats are simultaneously unresponsive, because each required voter set contains the other subject. **Interim behaviour, written into §8.4 and revised by D-008:** the exclusion rule that removed already-subject seats from `V` is **deleted** — it let one modified client shrink `V` to itself at any table size (N3) — so simultaneous subjects now deadlock until `hand_deadline_ms`, when the hand aborts with `cause = 1`, `attributed = []`, `cert_hash = None`, stacks restored. Two colluding seats can still void a hand for free. D-006 specified unanimity for the single-subject case only. Same question as `STATE_MACHINE.md` Q3; carried as blocking in `THREAT_MODEL.md` §9.2 as OQ-E. | `STATE_MACHINE.md`, Phase 4 | project owner |
 | **Q-03** | Should `TABLE_READY` require every participant to have completed a §1.2 handshake with every other, or is founder-mediated introduction acceptable when a pair cannot connect directly? Requiring a full mesh is the safe answer and is what §1.5 specifies, but it means one unreachable pair prevents a table that would otherwise form. Relates to D-004's symmetric-NAT case. | `NETWORK_STACK.md`, §1.5 | project owner |
 | **Q-04** | **CLOSED.** Should the certificate stage be collective instead of a `CERT_SETTLE_MS` timer with a lowest-seat tie-break? **Answer: collective** (§4.8). A certificate's body is a pure function of the votes, so by §3.2's stage-kind principle it carries no choice and must not have a single writer; the emitter set is `V(subject)`; the timer, the tie-break and the chain fork all disappear together, and `CERT_SETTLE_MS` is deleted from §13. | — | closed by the Phase 0 fix plan, C-10 |
-| **Q-05** | Does a `DISPUTE` need to be gossiped to the whole lobby, or only within the table mesh? Lobby-wide gossip gives non-participants durable evidence of equivocation, which is the only reputational pressure play money has; it also creates a defamation and spam vector, since a `DISPUTE` is cheap to emit and its `note` is attacker-controlled text. | `THREAT_MODEL.md`, §7.6 | project owner |
+| **Q-05** | **Moot for `kind = 2` in version 1 (D-015), which is not produced; live for `kind = 1` and `kind = 3`.** Does a `DISPUTE` need to be gossiped to the whole lobby, or only within the table mesh? Lobby-wide gossip gives non-participants durable evidence of equivocation, which is the only reputational pressure play money has; it also creates a defamation and spam vector, since a `DISPUTE` is cheap to emit and its `note` is attacker-controlled text. | `THREAT_MODEL.md`, §7.6 | project owner |
 | **Q-06** | Should the per-hand transcript be persisted in full to the profile directory by default? It is the only artefact behind §6.3 case (c)'s diagnostic claim — the transcript is necessary for it, and, pending **OQ-A**, not sufficient — and it is small (~20 KB heads-up, ~60 KB six-handed). But it is also a permanent record of every hand every opponent played, which has its own privacy cost. | `storage/`, `THREAT_MODEL.md` | project owner |
 | **Q-07** | On `HAND_ABORT cause = 4` (unresolvable divergence) the chips are restored, because no peer can be attributed, so any single peer has a free escape from a losing pot at the price of the table (§6.4). The alternatives — forfeiting an unnamed party's commitment, or settling from the last `STATE_ACK`-agreed checkpoint — each need a numbered decision and neither is adopted here. D-010 decides the first half **against** for the MVP; what stays open is whether settling from the last agreed checkpoint is worth building. Formerly this document's `OQ-D` (R-2). | §6.4, `STATE_MACHINE.md` | project owner |
-| **Q-08** | Should a required voter be obliged to publish a signed `ACTION_SEEN { sequence, event_hash }` before it may vote, so that vote-and-seen are two events by one key in one slot and a lying voter becomes provable (§8.3)? A design change with a cost in messages and latency; not adopted. Formerly this document's `OQ-C` (R-2). | §8.3, §8.4 | project owner |
+| **Q-08** | **Moot in version 1 (D-015): there are no votes.** Should a required voter be obliged to publish a signed `ACTION_SEEN { sequence, event_hash }` before it may vote, so that vote-and-seen are two events by one key in one slot and a lying voter becomes provable (§8.3)? A design change with a cost in messages and latency; not adopted. Formerly this document's `OQ-C` (R-2). | §8.3, §8.4 | project owner |
 | **Q-09** | **CLOSED (K2), and closed a second time in this pass for a second message (L1).** *Which chain does an event that sits between two hands belong to, and at what `sequence`?* It was asked of the hand-boundary single-writer events and answered for them; **checkpoint 8** arrived at the same position from `STATE_MACHINE.md` with the same four quantities undefined, and §4.9's checkpoint-8 box answers it in the same shape — chain `k`, `hand_id = k`, parent `TERMINAL(k)`, `sequence` in the reserved band `BOUNDARY_CHECKPOINT_BASE … +15`, total order by the collective stage rule. **The reusable finding is that the position between `TERMINAL(k)` and `HAND_INIT(k+1)` needs a rule per message that occupies it, not one rule**, and the next message placed there will need a third. **Answer for the boundary events, in §4.10's boundary-window box:** chain `k`, `hand_id = k`, `sequence = BOUNDARY_SEQUENCE_BASE + sender_seat`, `previous_event_hash = TERMINAL(k)` for every event of the window, total order ascending seat index, one event per seat per boundary, window closing at this receiver's acceptance of a complete `HAND_INIT(k+1)`. The grade this row carried — *"a placement decision, not a wire change"* — **was wrong**: `hand_id` and `sequence` are inside `TO_BE_SIGNED` (§2.4) and in the slot key (§5.2.1), so two placements are two signed byte strings for one intent. Chain `k+1` is refused because a boundary event would then chain from a `GENESIS(k+1)` that a `PLAYER_LEAVE` is an input to. | — | closed in this pass |
 | **Q-10** | **What ratifies a contribution to the stage that stalled?** For every stage that completed, `P(k)` (§3.2) is exactly `stage_hash` membership and two peers holding the same prefix agree by construction. For the one stage that stalled — the reason the hand aborted — no `stage_hash` exists, so "seat `s` contributed there" is strictly *who was heard*, the quantity P3 refused. **Named default, adopted in §3.2: a contribution to the stalled stage counts; a terminal `HAND_ABORT` and a `PLAYER_LEAVE` never do; and a peer's own emission does (K1's sub-question, answered).** It cannot simply be excluded: a hand that stalls at `HAND_INIT` completes no stage, so excluding it empties the next hand's set. **The claim that the residual was "loud rather than silent" is withdrawn and was K1**: it costs a hand at the deadline on the *first* iteration and a permanent silent fork on the second, because both peers then narrow to `{self}` and every collective stage self-completes. What replaces it is not a ratification but a detection — §3.2's **solitary-stage rule**, which makes a peer whose `P` has narrowed to itself freeze on the first contradicting event instead of playing on. **That rule could not fire as first written and now can (L4):** its trigger is a property of the hand the event names, answered from §5.3's retained record at §4.0 step 10b, because a solitary hand completes in microseconds and the contradicting event is late by construction. A second detection route was added with it: §6.2's checkpoint 8, compared over a wider set than it is required of (§4.9), with `signed_this_hand` inside `state_hash` (§6.1) so that agreement there is agreement about `P` itself. `Q-10` itself stays open: nothing ratifies the stalled stage, and no construction can, because agreeing it needs a collective step at the point collectivity failed. Same question as `STATE_MACHINE.md` **Q8**, which filed it here; referenced, never redefined there. | §3.2, §4.4 | project owner |
 
@@ -6881,20 +7150,35 @@ Where this document depends on it: §6.3 case (b), whose whole disposition rests
 on that circularity, and §4.10's note that no adjudication of a withholding is
 specified and none is claimed.
 
-**OQ-F** — whether the machinery is produced at all. `DECISIONS.md`'s wording:
+**OQ-F** — whether the machinery is produced at all. **CLOSED by D-015: it is
+not.** The question was:
 
 > Whether `TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` should still be
 > *produced* in the MVP now that D-010 gives them no effect, or be deferred
 > wholesale until the machinery is sound. Producing them keeps the transcript
 > adjudicable later; deferring them removes four passes' worth of surface.
 
-What deferring would remove **from this document**, listed so the scope of the
-decision is visible: the two deadline classes and their subject axes in §5.2.1's
-key, the matching structures in §5.3, `V(subject)` and its inductive exclusion
-rule in §8.3, §8.5's offline verifier, and the `EquivocationProof` object in
-§5.2. No transition in this version consumes any of them. It is recorded and
-**not answered**: it is a scope decision for the owner, and it changes what
-ships rather than what is true.
+**The answer, and what it did and did not touch in this document.** Nothing
+emits or consumes any of the three in version 1 (header box). What was
+**deferred**: every emission path, and §5.3's two subject-class structures,
+which are not allocated. What was **kept**, deliberately, so that a later
+version is a capability rather than a wire break: the two deadline classes and
+both subject axes in §5.2.1's key, `V(subject)` and its inductive exclusion rule
+in §8.3, §8.5's offline verifier, the `EquivocationProof` object and its
+`DISPUTE kind` in §5.2.4, and both rows of §4.11. **The measurement that decided
+it is §5.3's table** — 26 MiB of a 28.3 MiB per-hand worst case were the two
+timeout classes, against a benefit D-010 had already reduced to a record nothing
+reads.
+
+**What the closure moved rather than settled**, recorded here so no reader takes
+D-015 for more than it is:
+
+| Was blocked on the machinery | Now |
+|---|---|
+| `Q-02` — the multi-subject certificate | **not blocking version 1.** Every stall takes the `hand_deadline_ms` path (§8.4), so there is no simultaneous-subject case to construct. Stays open for the version that reinstates the certificate |
+| `Q-08` — an obligatory `ACTION_SEEN` before a vote | **moot in version 1**, since there are no votes. Returns with the certificate |
+| `Q-05` — lobby-wide gossip of a `DISPUTE` | **moot for `kind = 2`**, which is not produced; still live for `kind = 1` and `kind = 3` |
+| whether an equivocation is provable to a third party | **it is not, and that is a cost rather than a question** — carried as `D-015-2` in `DECISIONS.md`'s open list and as a standing limitation in `THREAT_MODEL.md` §9.1.0, to be decided before real money |
 
 
 ### Closed elsewhere, recorded here so the answer is not lost
@@ -7510,8 +7794,11 @@ a special case for one proof.
 
 The cost is that an equivocator is no longer stopped mid-hand. It is bounded: the
 divergence the equivocation causes still ends the hand through §6.3's chained
-path, the proof is still produced and retained, and under D-010 stopping the hand
-sooner would have moved no chips anyway. **`STATE_MACHINE.md` must follow**: the
+path, and under D-010 stopping the hand
+sooner would have moved no chips anyway. **The clause *"the proof is still
+produced and retained"* is withdrawn by D-015** — it is not, in this version —
+and the bound survives without it, because the bound was always the chained
+divergence path and never the proof. **`STATE_MACHINE.md` must follow**: the
 transition that consumes an `EquivocationProof` into a hand abort has no
 counterpart here any more, and an engine alphabet containing a variant no wire
 rule produces is the defect class N9(b) and P4 both closed.

@@ -196,14 +196,29 @@ separated only by the domain tags `ziffle/BG12MultiExpArgX/v1` and
 OQ-2; and the absence of fuzzing over `ark-serialize`'s deserialisers on hostile
 input, which `SPEC_CS.md` §27 requires — OQ-5.
 
-**State of the mitigation, stated honestly.** `CRYPTOGRAPHY.md` §9 says ziffle is
-"vendored into the repository at `vendor/ziffle/` with a `[patch.crates.io]` entry".
-**That is the plan and it is not yet done.** There is no `vendor/` directory, no
-`[patch.crates.io]` section in `Cargo.toml`, and `Cargo.lock` resolves ziffle from
-`registry+https://github.com/rust-lang/crates.io-index` with checksum
-`ba79285194a16b02512566a9a64d885567646045b144bb0efeef662001cd83a5`. **(a)(b)** Until
-vendoring lands, a yank or a repository deletion upstream is an unmitigated
-availability risk, and the review has no frozen artefact to be a review *of*. See §8.
+**State of the mitigation — vendored 2026-08-29, and the risk rating does not move.**
+`CRYPTOGRAPHY.md` §9 says ziffle is "vendored into the repository at `vendor/ziffle/`
+with a `[patch.crates.io]` entry". **That is now done**, as `ZIFFLE_VERDICT.md`
+condition **C-0**. `vendor/ziffle/` holds the nine files of the crates.io 0.1.0
+tarball, byte-identical to the registry checkout, and `Cargo.toml` carries
+`[patch.crates-io] ziffle = { path = "vendor/ziffle" }`. The crates.io sha256
+`ba79285194a16b02512566a9a64d885567646045b144bb0efeef662001cd83a5` was recomputed from
+the archive and agreed with the pre-vendoring `Cargo.lock` checksum and with the
+verdict. **(a)(b)**
+
+**Read `vendor/ziffle/PROVENANCE.md` before touching anything under `vendor/`.** It
+owns the digests, the upstream git sha `bcb8e61651cd6d4140c895a414d7ed8bc06d32bd`, and
+the licence choice — **we rely on the Apache-2.0 branch**, because the shipped
+`LICENSE-MIT` names *"The cargo-readme Developers"*, a copy-paste defect present
+upstream that makes the MIT branch unusable as shipped (§6 note 5).
+
+**Two things this changed and two it did not.** It closes the availability risk — a
+yank or a repository deletion upstream can no longer take the deck away — and it gives
+the review a frozen artefact to be a review *of*, which is what made the review worth
+commissioning. It does **not** audit the crate and it does not soften one word of the
+rating above: one author, one release, unaudited, and its own README says not to play
+for non-trivial money. Vendoring freezes bytes; that is the whole claim. See §8, and
+§11 for the fallback if the bytes ever have to be replaced.
 
 ### 3.2 `hickory-proto 0.25.2` — two open advisories, one with no fix
 
@@ -468,7 +483,7 @@ audited, and it does not mean reviewed by us.
 
 | Name | Version | Purpose | Repository | Licence | Security status |
 |---|---|---|---|---|---|
-| `ziffle` | 0.1.0 | Barnett–Smart mental poker; Bayer–Groth 2012 shuffle proof, DLEQ, Schnorr | `github.com/v26-solutions/ziffle` | MIT OR Apache-2.0 | **unaudited, semver-unstable (0.x, one release, one author); its own README says not to play for non-trivial money.** In-house review of `MultiExpArg` / `SingleValueProductArg` is a **prerequisite** (§3.1, OQ-1). Not yet vendored. |
+| `ziffle` | 0.1.0 | Barnett–Smart mental poker; Bayer–Groth 2012 shuffle proof, DLEQ, Schnorr | `github.com/v26-solutions/ziffle` | declared `MIT OR Apache-2.0`; **effective: Apache-2.0** — §6 note 5 | **unaudited, semver-unstable (0.x, one release, one author); its own README says not to play for non-trivial money.** In-house review of `MultiExpArg` / `SingleValueProductArg` is a **prerequisite** (§3.1, OQ-1). **Vendored** at `vendor/ziffle/`, sha256 `ba79285…` verified — `vendor/ziffle/PROVENANCE.md`. Designated fallback: §11 |
 | `ark-ec` | 0.5.0 | elliptic-curve group traits | `github.com/arkworks-rs/algebra` | MIT OR Apache-2.0 | no open advisory; **not audited** |
 | `ark-ff` | 0.5.0 | finite-field arithmetic, `DefaultFieldHasher` | `github.com/arkworks-rs/algebra` | MIT OR Apache-2.0 | no open advisory; **pulls `paste 1.0.15` (RUSTSEC-2024-0436) into the runtime tree** — §3.4 |
 | `ark-ff-asm` | 0.5.0 | assembly backend macros for `ark-ff` | `github.com/arkworks-rs/algebra` | MIT OR Apache-2.0 | no open advisory; proc-macro, build time |
@@ -766,7 +781,7 @@ groups sum to 425 exactly. **(a)**
 | `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0` | 1 | `epaint_default_fonts` — font licences, not code |
 | **`MPL-2.0`** | **1** | **`attohttpc`** |
 
-Four things a `deny.toml` has to handle, all verified:
+Five things a `deny.toml` has to handle, all verified:
 
 1. **`attohttpc 0.30.1` is MPL-2.0** — the only copyleft licence in the tree, weak
    and file-scoped. It arrives via `igd-next ← libp2p-upnp ← libp2p`, so dropping
@@ -783,6 +798,23 @@ Four things a `deny.toml` has to handle, all verified:
 4. **`ring 0.17.14` is `Apache-2.0 AND ISC`** — a conjunction, not a choice, and it
    also carries BoringSSL/OpenSSL-derived files. It needs a clarification entry, not
    a plain allow.
+5. **`ziffle 0.1.0` declares `MIT OR Apache-2.0` but only the Apache-2.0 branch is
+   usable, and this is the one row in the sweep where the declared expression and the
+   effective licence differ.** The crate ships both texts; its `LICENSE-MIT` opens
+   *"Copyright (c) 2015 The cargo-readme Developers"* — an unrelated project, and a
+   year that predates the crate by a decade. A licence file names the party granting
+   the rights, so an MIT grant issued in the name of someone who does not hold the
+   copyright in this work grants nothing; **that is a compliance defect, not a typo**,
+   and it is present upstream, inside the published tarball covered by the sha256 in
+   §3.1. The Apache-2.0 branch is the stock text with no such defect, `Cargo.toml`'s
+   own `MIT OR Apache-2.0` is the author's offer of either branch, so
+   **`vendor/ziffle/PROVENANCE.md` §4 takes Apache-2.0 and relies on it alone.**
+   Consequences: a `deny.toml` clarification pinning ziffle to `Apache-2.0` rather
+   than accepting the dual expression; Apache-2.0 §4's obligation to redistribute the
+   licence text (`vendor/ziffle/LICENSE-APACHE`; upstream ships no `NOTICE`); and
+   **the broken file is not to be edited** — a third party's licence text stays
+   byte-identical to what was published, including when it is wrong. The counts in
+   the table above are of *declared* expressions and are unchanged.
 
 **Our own licence is undecided.** `Cargo.toml` has no `license` field, and the choice
 (MIT / Apache-2.0 / dual / GPL-3.0 / AGPL-3.0) is on `DECISIONS.md`'s open list,
@@ -805,7 +837,9 @@ Recorded as obligations rather than quietly omitted, because §28 asks for
 | `Cargo.lock` committed | **done** | repository root |
 | `cargo audit` clean or explicitly justified | **runs; 4 findings, all justified in §4**; no CI job | Phase 7 |
 | `cargo deny` configured | **`deny.toml` does not exist.** With no config its allow-list is empty, so `cargo deny check licenses` emits 588 `rejected` errors over the graph it walks — every crate, including MIT — plus one `unlicensed` error for `p2p-poker`. It is installed but is not currently a usable gate | Phase 7 |
-| `ziffle` vendored with `[patch.crates.io]` | **not done** — §3.1 | before the OQ-1 review |
+| `ziffle` vendored with `[patch.crates.io]` | **done 2026-08-29** — §3.1, `vendor/ziffle/PROVENANCE.md`; `cargo build` and `cargo test` clean against the vendored copy | landed |
+| The vendored digest survives its own lockfile | **done, and it needed doing.** Patching ziffle to a path makes cargo drop the `source` and `checksum` lines from its `Cargo.lock` entry, so `ba79285…` is now in **no** machine-checked file. `PROVENANCE.md` §2.2's per-file sha256 table is the replacement and is what a re-audit compares against | landed; §8.2 |
+| A designated fallback for ziffle, with a rev | **done** — §11, `paritytech/mental-poker` @ `e05744b4…` | landed |
 | Register generated from `cargo metadata` and checked in CI | **not done**; this document is hand-written from measured output | Phase 7 |
 | Fuzzing of the deserialisers (`SPEC_CS.md` §27) | **not done** — OQ-5 | Phase 6 |
 
@@ -1022,6 +1056,22 @@ is the expected figure.
 
 Licence and repository cells: read `license` and `repository` from
 `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/<crate>-<version>/Cargo.toml`.
+
+**Two carve-outs a matcher must know about, or it reports drift that is not there.**
+`ziffle 0.1.0` is patched to `vendor/ziffle`, so (i) its `Cargo.lock` entry has no
+`source` and no `checksum` line — compare `vendor/ziffle/PROVENANCE.md` §2.2's per-file
+sha256 table instead, and against `vendor/ziffle/Cargo.toml` for the licence and
+repository cells rather than the registry checkout, which is a different copy of the
+same bytes and may be evicted; and (ii) its §5.1 licence cell deliberately carries both
+the declared expression and the narrower effective one (§6 note 5), so an exact-string
+comparison against `license` fails and a containment check is what is wanted.
+
+Vendored bytes, independently of the register:
+
+```bash
+cd vendor/ziffle && find . -type f ! -name PROVENANCE.md | sort | xargs sha256sum
+cargo test --test deck_constants -- --test-threads=19   # C-7: the deck did not move
+```
 Advisories: `~/.cargo/advisory-db/crates/<crate>/RUSTSEC-*.md`, whose `[versions]`
 block carries the authoritative `patched` and `unaffected` ranges — `cargo audit`'s
 one-line "Solution" is a summary of them, not a substitute.
@@ -1032,6 +1082,98 @@ crates.io metadata (release count, owners, newest version) needs a User-Agent:
 curl -s -H "User-Agent: p2p-poker-dependency-register (<your-email>)" \
      https://crates.io/api/v1/crates/<crate>
 ```
+
+---
+
+## 11. The designated fallback for `ziffle`
+
+`ZIFFLE_VERDICT.md` condition **C-14**. This section registers a dependency the
+project **does not compile** and is not proposing to adopt. It is here because §3.1's
+crate has one author and one release, and "what do we do if that stops being viable"
+is a question that is cheap to answer now and expensive to answer in the week it is
+asked. Nothing below is a recommendation to swap — `ZIFFLE_ALTERNATIVES.md` §8 says
+plainly **no**, because swapping trades 1 779 unreviewed lines for 7 764 unreviewed
+lines. It is a recommendation to have the answer written down.
+
+### 11.1 The entry
+
+| | |
+|---|---|
+| Project | `paritytech/mental-poker` |
+| Repository | `https://github.com/paritytech/mental-poker` |
+| **Rev** | **`e05744b4cc431088ec2fda769a73b067b4664893`** |
+| Crates we would take | `proofs`, `protocol`, `deck`, `deck-secp256k1` — ~8 530 lines, ~280 KB (`ez` is 31 lines and needed by none of them; `play` is optional) |
+| Distribution | **not on crates.io**, no tags, no releases. Consumption is by git `rev` or by vendoring — and if adopted it is **vendored**, for the reasons in §3.1 and in `ZIFFLE_ALTERNATIVES.md` §7.4 |
+| Declared licence | `MIT OR Apache-2.0` in every crate — **with two open questions, §11.3** |
+| Lineage | forked from `geometryxyz/mental-poker` (Kobi Gurkan, Nicolas Mohnblatt); maintained by Jeff Burdges with `coax1d` as second committer |
+| Status | **unaudited.** Nothing in this space is audited. Adopting it does not retire `MENTAL_POKER.md` §9 risk 1; it moves it onto a surface **4.4×** larger |
+
+**The rev is the entry.** A short rev is not enough — `ZIFFLE_ALTERNATIVES.md` §4.2
+measured cargo rejecting `rev = "e05744b4"` with *"revision e05744b4 not found"*; the
+full 40-hex sha is required. And the rev is not a version number: the project has no
+tags, so `e05744b4…` is the **only** durable name for the reviewed state. It was
+measured to build clean on `rustc 1.95.0` in 21.4 s with 30 tests passing, and to
+resolve and build as a pinned git dependency from a cold cache over plain HTTPS. **(a)**
+
+Cost of adoption, so the entry is not read as free: **+6 lockfile packages**
+(`ark-poly`, `ark-transcript`, `sha3`, `keccak`, `generic-array`, `rand 0.8.8`), with
+**no arkworks version split** — the tree stays on a single `ark-* 0.5.0` reused from
+ziffle. Roughly 300–500 lines of adapter, 2–4 days, most of it two specific things:
+`AggregatedPublicKeys<'p, C>` borrows its parameters and so cannot sit behind a plain
+associated type, and parity has **no `Verified<T>` typestate** — which is ziffle's best
+API idea and the one place a swap makes a safety property weaker unless the typestate
+is rebuilt in our own layer. `ZIFFLE_ALTERNATIVES.md` §4.5 owns those numbers.
+
+### 11.2 A migration would be differential, not blind — and that is measured
+
+The two libraries were **built into one binary and run together**: ziffle,
+`cards-protocol`, `deck-secp256k1`, `ed25519-dalek 3`, `curve25519-dalek 5`,
+`sha2 0.11`, `blake3`, `minicbor` and `getrandom 0.4`, all linked, all executing.
+**(a)** `ZIFFLE_ALTERNATIVES.md` §4.5.
+
+This is the property that makes the fallback worth registering rather than merely
+naming. A swap does not have to be a cut-over: both implementations can run side by
+side over the same decks, the same contexts and the same adversarial inputs, and
+disagree loudly, before either becomes the one the client ships. Given that a false
+*reject* now ejects a player (§3.1, D-014), being able to compare two verifiers on the
+same input is not a convenience — it is the only cheap way to tell a bug in the new
+one from a bug in the old.
+
+It also has an expiry date. The co-linking was measured at ziffle 0.1.0 against
+`e05744b4…` on `ark-* 0.5.0`. If either side moves major arkworks versions the split
+returns and this paragraph stops being true; that is a §8.1 re-audit trigger for this
+section specifically.
+
+### 11.3 Two licence questions to ask upstream **now**
+
+`ZIFFLE_ALTERNATIVES.md` §4.6 found both. Neither is a reason not to adopt, and both
+are the kind of thing that takes one GitHub issue and a fortnight's patience when
+nothing is on fire, and is a blocker when something is. **They are recorded here as
+work to do now, not as findings to file.** One issue, two questions:
+
+1. **Where is the grant for the four crates that ship no licence text?** Every crate
+   declares `license = "MIT OR Apache-2.0"` in its own `Cargo.toml`, and `proofs/` and
+   `protocol/` ship both licence texts — but `deck/`, `deck-secp256k1/`, `ez/` and
+   `play/` ship **none**, and there is **no LICENSE file at the repository root**. Two
+   of the four unlicensed crates, `deck/` and `deck-secp256k1/`, are crates we would
+   actually take. A manifest field is a declaration; the licence file is the grant. Ask
+   for the texts to be added at the root or per crate.
+2. **What does "Through 2025" mean in the README?** The README reads *"Through 2025,
+   this crate is licensed under either of…"*. That is almost certainly a copyright-year
+   statement and not a term limit on the grant — but "almost certainly" is not a
+   licence, and the sentence can be read as a permission that expired. Ask for it to be
+   rephrased.
+
+**Why now and not at adoption.** The project has already moved organisation twice:
+`[workspace.package] homepage` still says `github.com/w3f/mental-poker` (301-redirects)
+and in-source comments in `protocol/src/shuffle.rs` cite a `peer3to/mental-poker` URL
+that **404s**. A maintainer who answers a licence question today may be unreachable on
+the day this fallback is needed, and the answer is worth nothing if it arrives after
+the decision. Two committers is better than one, but "in Parity's GitHub organisation"
+is not "Parity supports this": zero stars, zero forks, no CI badge, no release process.
+
+Record the answers **in this section** when they arrive, with the issue URL and the
+date, so the next reader sees the resolution and not the question.
 
 ---
 
@@ -1071,7 +1213,15 @@ that pattern costs and §2.5 item 4 there now carries it as a numbered failure o
 ---
 
 *This register is complete for the 122 security-critical dependencies it names and
-for the licence status of all 425 compiled crates. It is **not** an audit: no crate
-in it has been reviewed line by line by us, and the one review `SPEC_CS.md` §36 and
-`MENTAL_POKER.md` §9 both call a prerequisite — ziffle's `MultiExpArg` and
-`SingleValueProductArg` against Bayer–Groth 2012 — has not been done.*
+for the licence status of all 425 compiled crates. §11 registers one project that is
+deliberately **not** compiled and adds no row to §5. It is **not** an audit: of the
+crates it names, exactly one has been read line by line by us — ziffle, whose
+`MultiExpArg` and `SingleValueProductArg` were reviewed against Bayer–Groth 2012 in
+`docs/research/ZIFFLE_VERDICT.md`, and whose reviewed bytes are now in the tree at
+`vendor/ziffle/`. That review is **not** a clean bill: it found fourteen defects
+around the argument, sets fifteen conditions, and says the crate is fit for the
+play-money MVP only and **not fit for real money**. Whether it fully discharges
+`SPEC_CS.md` §36's and `MENTAL_POKER.md` §9's prerequisite is `DECISIONS.md`'s open
+item `ZR-1` and is not settled here — witness-extended emulation and the soundness
+bound at `m = 1`, which `CRYPTOGRAPHY.md` OQ-1 asked for by name, were not proved.
+Every other crate in this register is unreviewed.*

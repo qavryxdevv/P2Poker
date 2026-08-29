@@ -70,3 +70,28 @@ rand = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+
+# --- dev-only: the arkworks types the vendored ziffle is built on --------
+# Present so tests/deck_constants.rs (ZIFFLE_VERDICT.md C-7) can recompute
+# ziffle's two nothing-up-my-sleeve constants independently of ziffle, whose
+# `open_deck` and Pedersen key are `pub(crate)` with no accessor. Versions are
+# ziffle's own, so this adds no crate to the lockfile and nothing to the
+# shipped binary. `rand 0.8` for `StdRng` is already a normal dependency.
+[dev-dependencies]
+ark-ec        = { version = "=0.5.0", default-features = false }
+ark-ff        = { version = "=0.5.0", default-features = false }
+ark-secp256k1 = { version = "=0.5.0", default-features = false }
+ark-serialize = { version = "=0.5.0", default-features = false }
+ark-std       = { version = "=0.5.0", default-features = false }
+
+# ---------------------------------------------------------------------------
+# Vendored ziffle - ZIFFLE_VERDICT.md condition C-0.
+#
+# The bytes reviewed by the ziffle review are in the tree, so the review has a
+# frozen artefact to be a review *of*, and an upstream yank or repository
+# deletion cannot take the deck out from under us. vendor/ziffle/ is the
+# unmodified crates.io 0.1.0 tarball; vendor/ziffle/PROVENANCE.md records the
+# digest, the upstream git sha and the licence choice.
+# ---------------------------------------------------------------------------
+[patch.crates-io]
+ziffle = { path = "vendor/ziffle" }

@@ -121,6 +121,22 @@ registered in §15; nothing in this pass changed them.
 > unseat anybody.** A proof is evidence for a human. The user may always choose
 > not to play with someone; the protocol may not choose for them.
 >
+> **D-015 makes two of the four objects named above objects that never arrive, and
+> the prohibition is kept in full anyway.** `TIMEOUT_VOTE`, `TIMEOUT_CERT` and
+> `EquivocationProof` are defined on the wire and **not produced in version 1**
+> (`PROTOCOL.md`'s header box, §4.8, §5.2.4), so no certificate and no equivocation
+> proof reaches this layer to be ignored. **The sweep of this document for anything
+> that *assumes the machinery exists* found no such assumption**: every occurrence of
+> the two objects here is a **prohibition** — a list of things that must not cause a
+> `block_peer`, a disconnect, a dial refusal, a persisted mark or a list entry — and a
+> prohibition over a set that has shrunk is still binding over what remains. Nothing
+> at this layer *waits for*, *counts*, *forwards specially*, *sizes a buffer for* or
+> *derives a tier from* either object, which is what a real dependency would have
+> looked like. **The two names stay in the box on purpose**: a later version may
+> reinstate the producer, and this layer's answer to it must already be written down
+> when it does — deleting the names now and re-deriving them then is exactly how
+> `block_peer` survived D-010 in two places here for a whole pass.
+>
 > **The one exception is not this layer's, and it takes nothing away from this
 > box (D-014).** A **tier-1** finding — an event **signed by the accused**, whose
 > illegality any peer decides alone from that event's own bytes — removes its
@@ -2689,6 +2705,15 @@ document was missing, and D-011 named its absence a blocker.
 > (`PROTOCOL.md` §8.3), a `HAND_ABORT` attribution, a `DISPUTE`, an invalid
 > application signature, a `STATE_HASH` divergence, or a count of any of them.
 
+**That box is unchanged by D-015 as well, and the reason is worth one line rather
+than a sweep note.** Two of the seven items it enumerates — an `EquivocationProof`
+and a timeout certificate — are objects nothing produces in version 1, so those two
+clauses are vacuously satisfied. They are **not** deleted: a vacuous prohibition costs
+nothing, and the alternative is that a later version reinstating the object finds this
+box silent about it. The five items that remain — a `HAND_ABORT` attribution, a
+`DISPUTE`, an invalid application signature, a `STATE_HASH` divergence, and a count of
+any of them — are all still produced, so the box is load-bearing today.
+
 **That box is unchanged by D-014, and this is the paragraph an implementer who
 has just read `STATE_MACHINE.md` T64 needs.** D-014 permits one automated
 removal, on a tier-1 self-authenticating finding, and every item in the box above
@@ -2797,7 +2822,10 @@ makes cheating impossible.**
 shuffle proofs; card secrecy; board reveal timing; poker rule legality; pot and
 side-pot arithmetic; showdown; who won; the hash-chain transcript; replay and
 equivocation detection; the disconnect/abort handling of D-005 and the timeout
-certificate of D-006. The network layer carries the bytes and nothing else.
+certificate of D-006 — which since **D-015** is a specification the higher layer keeps
+and does not implement, a fact that changes nothing here, because this layer never
+carried the object's semantics, only its bytes. The network layer carries the bytes and
+nothing else.
 **And it does nothing with the verdicts those layers produce**: under D-010 and
 D-011 a proof is evidence for a human, so it reaches this layer as no input at
 all (§0.1, §11.5.1).
