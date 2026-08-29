@@ -20,6 +20,12 @@
 #   tools\clean.ps1 -Deep        also drop dependency builds nothing uses
 #   tools\clean.ps1 -WhatIf      say what would go, and touch nothing
 #   tools\clean.ps1 -KeepDebug   leave the debug tree alone
+#   tools\clean.ps1 -StopOrphans stop anything still running out of this tree
+#
+# It always reports processes running from the build directory, by **path**
+# rather than by name: a hung networking test is called `two_nodes-<hash>.exe`,
+# which nobody recognises in a task list, and it holds a UDP port and its own
+# file open until somebody notices.
 #
 # `-Deep` is where the gigabytes are, and it does not guess. Cargo is asked, in
 # JSON, which files the current build actually consists of; everything else in
@@ -30,7 +36,8 @@
 param(
     [switch]$WhatIf,
     [switch]$KeepDebug,
-    [switch]$Deep
+    [switch]$Deep,
+    [switch]$StopOrphans
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,10 +49,32 @@ if (-not (Test-Path $target)) { Write-Host "nothing at $target"; exit 0 }
 function Size($items) { ($items | Measure-Object -Property Length -Sum).Sum }
 function Mb($bytes) { "{0:N0} MB" -f ($bytes / 1MB) }
 
-$running = Get-Process p2p-poker -ErrorAction SilentlyContinue
-if ($running) {
-    Write-Host "p2p-poker is running (pid $($running.Id -join ', ')); close it first" -ForegroundColor Red
-    exit 1
+# Anything at all running out of this tree, not just a process called
+# `p2p-poker`.
+#
+# `cargo test` builds one executable per test target and runs them; a networking
+# test that hung would leave one alive, holding a UDP port and its own file open,
+# and it would be invisible — the name is `two_nodes-<hash>.exe`, which nobody
+# recognises in a task list. Reported by path rather than by name for exactly
+# that reason.
+$orphans = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.ExecutablePath -and
+                   $_.ExecutablePath.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase) })
+
+if ($orphans) {
+    Write-Host ("{0} process(es) are running out of this tree:" -f $orphans.Count) -ForegroundColor Yellow
+    foreach ($o in $orphans) {
+        $age = if ($o.CreationDate) { "{0:N0} min" -f ((Get-Date) - $o.CreationDate).TotalMinutes } else { "?" }
+        Write-Host ("      {0,6}  {1,-44} {2}" -f $o.ProcessId, $o.Name, $age) -ForegroundColor DarkGray
+    }
+    if ($StopOrphans) {
+        $orphans | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 500
+        Write-Host "stopped them" -ForegroundColor Green
+    } else {
+        Write-Host "close them, or re-run with -StopOrphans" -ForegroundColor Red
+        exit 1
+    }
 }
 
 $before = Size (Get-ChildItem $target -Recurse -File -ErrorAction SilentlyContinue)
