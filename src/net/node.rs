@@ -76,7 +76,22 @@ pub enum NodeEvent {
     /// The DHT returned addresses. Most will not be poker clients.
     Discovered { hints: usize, dropped: usize },
     /// An advert was accepted into the lobby.
-    TableSeen { key: [u8; 32] },
+    ///
+    /// The whole record travels, not just the key.
+    ///
+    /// It used to be the key alone, and the consequence was quiet and total:
+    /// the interface keeps its own [`LobbyStore`](super::lobby::LobbyStore) and
+    /// nothing ever put anything in it, so the table list was empty on every
+    /// client no matter how many tables were being advertised. A key with no
+    /// record is a row the list cannot draw.
+    TableSeen {
+        key: [u8; 32],
+        /// Boxed: this is by far the largest variant, and every other event
+        /// would otherwise be as big as this one.
+        ad: Box<super::lobby::TableAd>,
+        params_hash: [u8; 32],
+        advert_hash: [u8; 32],
+    },
     /// An advert was refused, with the reason as text for the log.
     TableRefused { reason: String },
     /// AutoNAT decided.

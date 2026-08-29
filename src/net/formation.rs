@@ -30,13 +30,14 @@
 //! every single time, and a founder that changes them is left rather than
 //! followed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use ed25519_dalek::SigningKey;
 
 use super::joinwire::{self, WireError};
 use super::lobby::TableAd;
 use crate::poker::state::Hash;
+use crate::protocol::constants::{MAX_AD_LIFETIME_MS, MAX_SEATS};
 use crate::protocol::transcript::{genesis_setup, session_id, Ratification};
 use crate::table::formation::{password_proof, Roster, SeatEntry};
 use crate::table::join::{
@@ -80,16 +81,54 @@ impl From<WireError> for Failed {
     }
 }
 
+/// One advertisement this founder has signed for this table.
+struct Issued {
+    hash: Hash,
+    /// The complete `SignedEvent`, echoed verbatim into an acceptance so the
+    /// joiner re-verifies the table key's own signature rather than trusting a
+    /// gossip copy or the founder's word.
+    event: Vec<u8>,
+    at_ms: u64,
+}
+
 /// The founder's extra half.
 struct FounderPart {
     /// The table's identity. Nothing else is.
     key: SigningKey,
-    /// The signed advert, echoed verbatim into every acceptance so a joiner
-    /// re-verifies the table key's own signature instead of trusting a gossip
-    /// copy.
-    advert_event: Vec<u8>,
+    /// **Every** advertisement this founder has signed for this table that could
+    /// still be held somewhere, newest last.
+    ///
+    /// Not just the current one, and the reason is the defect the first
+    /// two-instance run found. §7.2 obliges a re-broadcast every thirty seconds
+    /// with a strictly greater timestamp, so every copy has a different
+    /// `event_hash`; §4.3's receiver rule is that the hash names an advert this
+    /// founder **actually signed**, not the newest one. The first version
+    /// compared against the newest, so an honest joiner naming the copy it had
+    /// heard was refused with *"the advertisement has expired"* — which was both
+    /// wrong and unfixable from the joiner's side.
+    ///
+    /// Bounded by the advertisement's own lifetime rather than by a count:
+    /// §7.2 puts `MAX_AD_LIFETIME_MS` on how long any receiver may still hold
+    /// one, so anything older is a hash nobody can legitimately name.
+    issued: VecDeque<Issued>,
     /// The table password, if it has one.
     password: Option<Vec<u8>>,
+}
+
+impl FounderPart {
+    fn remember(&mut self, event: Vec<u8>, hash: Hash, now_ms: u64) {
+        self.issued
+            .retain(|i| now_ms.saturating_sub(i.at_ms) <= MAX_AD_LIFETIME_MS);
+        self.issued.push_back(Issued {
+            hash,
+            event,
+            at_ms: now_ms,
+        });
+    }
+
+    fn find(&self, hash: &Hash) -> Option<&Issued> {
+        self.issued.iter().find(|i| &i.hash == hash)
+    }
 }
 
 /// One client's view of a table being formed.
@@ -114,6 +153,44 @@ pub struct Formation {
     sent_ready: bool,
     session: Option<Hash>,
     capabilities: Vec<Vec<u8>>,
+    /// The last `PLAYER_LIST` this founder signed, and this client's own
+    /// `TABLE_READY`, kept so they can be **said again**.
+    ///
+    /// GossipSub delivers to the peers on a topic at the moment of publishing
+    /// and to nobody else. A founder that answers a join and announces the new
+    /// roster in the same breath announces it to an empty topic — the joiner
+    /// subscribed a moment ago and the mesh has not formed — so the message is
+    /// not lost in transit, it is never sent. The first two-instance run seated
+    /// the joiner and then sat there: both sides agreed on two seats and neither
+    /// ever saw the other's ratification.
+    ///
+    /// Formation is short and these are two small messages. Repeating them
+    /// whenever somebody new appears on the topic costs nothing and removes a
+    /// class of silent stall that no amount of waiting fixes.
+    said: Said,
+    /// Ratifications that arrived before the roster they ratify.
+    ///
+    /// A GossipSub mesh does not order two messages against each other, and the
+    /// founder sends the roster and its own ratification of it in the same
+    /// breath. The second overtaking the first is not unusual — it happened on
+    /// the first two-instance run — and the joiner then refused an honest
+    /// ratification with *"too few to start: 0 seated"*, having no roster yet,
+    /// and both sides sat waiting for each other for ever.
+    ///
+    /// A `TABLE_READY` is signed and names the serial it ratifies, so holding
+    /// one costs nothing and gives up nothing: it is checked in full when the
+    /// list it belongs to arrives, and if it was never honest it fails then.
+    ///
+    /// Bounded by the number of seats a table can have. Formation is short and
+    /// there is exactly one ratification per seat per serial.
+    early: VecDeque<Vec<u8>>,
+}
+
+/// What this client may need to say again.
+#[derive(Debug, Clone, Default)]
+pub struct Said {
+    pub list: Option<Vec<u8>>,
+    pub ready: Option<Vec<u8>>,
 }
 
 impl Formation {
@@ -146,13 +223,16 @@ impl Formation {
         let roster =
             Roster::form(vec![me], &under.ad, false).map_err(|e| Failed::List(ListRefused::Roster(e)))?;
 
+        let mut part = FounderPart {
+            key: table_key,
+            issued: VecDeque::new(),
+            password,
+        };
+        part.remember(advert_event, advert_hash, under.ad.timestamp_unix_ms);
+
         Ok(Formation {
             app,
-            founder: Some(FounderPart {
-                key: table_key,
-                advert_event,
-                password,
-            }),
+            founder: Some(part),
             under,
             roster,
             serial: 0,
@@ -163,6 +243,8 @@ impl Formation {
             sent_ready: false,
             session: None,
             capabilities: vec![DECK_CAPABILITY.to_vec()],
+            said: Said::default(),
+            early: VecDeque::new(),
         })
     }
 
@@ -227,15 +309,82 @@ impl Formation {
                 sent_ready: false,
                 session: None,
                 capabilities: vec![DECK_CAPABILITY.to_vec()],
+                said: Said::default(),
+                early: VecDeque::new(),
             },
             bytes,
         ))
+    }
+
+    /// Re-sign this table's advertisement, and remember the copy.
+    ///
+    /// §7.2 obliges a re-broadcast every thirty seconds, and the timestamps are
+    /// what rule 6 compares while the parameters are what rule 7 compares — so
+    /// the advertisement is edited **only here** and only in time. A
+    /// re-broadcast that changed a parameter would mark this table unjoinable at
+    /// every receiver.
+    ///
+    /// Remembering it is not bookkeeping: a joiner names the copy it heard, and
+    /// a founder that has forgotten that copy refuses an honest join.
+    pub fn readvertise(&mut self, now_ms: u64, ttl_ms: u64) -> Result<Vec<u8>, Failed> {
+        let f = self.founder.as_mut().ok_or(Failed::NotTheFounder)?;
+        let mut ad = self.under.ad.clone();
+        ad.timestamp_unix_ms = now_ms;
+        ad.expires_at_unix_ms = now_ms + ttl_ms;
+        ad.players = self.roster.len() as u8;
+
+        let event = super::advert::publish(&ad, &f.key)
+            .map_err(|e| Failed::Wire(WireError::Unencodable(e)))?;
+        let hash = super::advert::verify_echoed(&event)
+            .map(|(_, h)| h)
+            .map_err(|_| Failed::Wire(WireError::Unencodable("the advert does not verify")))?;
+        f.remember(event.clone(), hash, now_ms);
+
+        // The advert this client holds moves with it; the parameters do not, and
+        // `params` is what every later comparison is against.
+        self.under.ad = ad;
+        self.under.advert_hash = hash;
+        Ok(event)
     }
 
     /// `GENESIS(0)` — the setup chain's genesis, which every `TABLE_READY` is
     /// chained to and which is therefore where a parameter fork is caught.
     pub fn genesis(&self) -> Hash {
         genesis_setup(&self.under.table_id, &self.under.params)
+    }
+
+    /// Everything this client should repeat to somebody who has just appeared
+    /// on the table's topic.
+    ///
+    /// The list first and the ratification second, because a ratification names
+    /// the serial of a list its receiver may not have yet.
+    pub fn say_again(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(l) = &self.said.list {
+            out.push(l.clone());
+        }
+        if let Some(r) = &self.said.ready {
+            out.push(r.clone());
+        }
+        out
+    }
+
+    /// Whether this client founded the table, and therefore answers joins and
+    /// re-signs the advertisement.
+    pub fn is_founder(&self) -> bool {
+        self.founder.is_some()
+    }
+
+    /// How many ratifications are waiting for a roster. For the test that
+    /// bounds it.
+    #[cfg(test)]
+    pub fn held_early(&self) -> usize {
+        self.early.len()
+    }
+
+    /// The parameter hash every later comparison is against.
+    pub fn under_params(&self) -> Hash {
+        self.under.params
     }
 
     pub fn table_id(&self) -> Hash {
@@ -273,11 +422,37 @@ impl Formation {
         let f = self.founder.as_ref().ok_or(Failed::NotTheFounder)?;
         let (req, sender, request_hash) = joinwire::receive_join_request(bytes)?;
 
+        // The copy **this joiner** heard, which is very unlikely to be the
+        // newest one. Every field but the hash is identical across
+        // re-broadcasts — §7.2 rule 7 refuses one that changed a parameter — so
+        // this is the advertisement they joined under, exactly as `JoinedUnder`
+        // means it.
+        let under = match f.find(&req.advert_hash) {
+            Some(i) => JoinedUnder {
+                advert_hash: i.hash,
+                ..self.under.clone()
+            },
+            None => {
+                let reply = joinwire::publish_join_reject(
+                    request_hash,
+                    RejectReason::AdvertExpired,
+                    0,
+                    &f.key,
+                    now_ms,
+                )?;
+                return Ok(vec![Send::Reply(reply)]);
+            }
+        };
+        let advert_event = f
+            .find(&req.advert_hash)
+            .map(|i| i.event.clone())
+            .unwrap_or_default();
+
         match admit_join(
             &req,
             &sender,
             connection_peer_id,
-            &self.under,
+            &under,
             &self.roster,
             f.password.as_deref(),
         ) {
@@ -288,10 +463,14 @@ impl Formation {
                 self.roster = Roster::form(seats, &self.under.ad, false)
                     .map_err(|e| Failed::List(ListRefused::Roster(e)))?;
 
+                // The copy the joiner named, echoed back. Sending the
+                // newest instead would fail the joiner's own check that the
+                // echo is the advertisement it asked under — which is the check
+                // that stops a founder swapping the game after the fact.
                 let accept = JoinAccept {
                     request_hash,
                     seat: entry.seat,
-                    advert_event: f.advert_event.clone(),
+                    advert_event,
                     roster_so_far: self.roster.seats().to_vec(),
                 };
                 let reply = joinwire::publish_join_accept(&accept, &f.key, now_ms)?;
@@ -309,6 +488,7 @@ impl Formation {
                     list_serial: self.serial,
                 };
                 let list_bytes = joinwire::publish_player_list(&list, &f.key, now_ms)?;
+                self.said.list = Some(list_bytes.clone());
 
                 let mut out = vec![Send::Reply(reply), Send::Broadcast(list_bytes)];
                 // The founder is a seat like any other and ratifies its own
@@ -424,6 +604,7 @@ impl Formation {
         };
 
         if self.sent_ready || self.roster.len() < self.under.ad.min_players_to_start as usize {
+            self.replay_early();
             return Ok(vec![]);
         }
 
@@ -448,19 +629,56 @@ impl Formation {
             joinwire::receive_table_ready(&bytes, &self.under.table_id, &self.genesis())?;
         self.ratified.insert(seat, event_hash);
         self.sent_ready = true;
+        self.said.ready = Some(bytes.clone());
         self.settle();
+        // Whatever arrived before this roster did.
+        self.replay_early();
         Ok(vec![Send::Broadcast(bytes)])
     }
 
     /// Somebody else's ratification.
+    ///
+    /// One that does not fit the roster this client holds is **kept**, not
+    /// refused: on a mesh the ratification and the roster it ratifies race, and
+    /// the loser is usually the roster. See [`Formation::early`].
     pub fn on_table_ready(&mut self, bytes: &[u8]) -> Result<Vec<Send>, Failed> {
+        match self.take_ratification(bytes) {
+            Ok(()) => Ok(vec![]),
+            Err(Failed::Ready(_)) => {
+                // Held rather than dropped. Everything about it is signed and
+                // self-contained, so it is judged again — in full — when the
+                // list it names arrives.
+                if self.early.len() >= MAX_SEATS as usize {
+                    self.early.pop_front();
+                }
+                self.early.push_back(bytes.to_vec());
+                Ok(vec![])
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One ratification, checked in full against the roster this client holds.
+    fn take_ratification(&mut self, bytes: &[u8]) -> Result<(), Failed> {
         let (ready, sender, event_hash) =
             joinwire::receive_table_ready(bytes, &self.under.table_id, &self.genesis())?;
         admit_ready(&ready, &sender, &self.roster, self.serial, &self.under)
             .map_err(Failed::Ready)?;
         self.ratified.insert(ready.my_seat, event_hash);
         self.settle();
-        Ok(vec![])
+        Ok(())
+    }
+
+    /// Judge everything that was waiting for a roster, now that there is one.
+    ///
+    /// Anything that still does not fit is dropped rather than held again: it
+    /// has now been seen against the list it named, and holding it a second time
+    /// would be holding it for ever.
+    fn replay_early(&mut self) {
+        let waiting: Vec<Vec<u8>> = self.early.drain(..).collect();
+        for bytes in waiting {
+            let _ = self.take_ratification(&bytes);
+        }
     }
 
     /// If every seat has ratified, the table is real and has a `session_id`.
@@ -697,6 +915,210 @@ mod tests {
                 "a seat computed a different session identity"
             );
         }
+    }
+
+    /// A joiner names the copy of the advertisement **it** heard, and a founder
+    /// re-broadcasts every thirty seconds under a new timestamp and therefore a
+    /// new hash.
+    ///
+    /// This is the defect the first two-instance run found. Everything passed in
+    /// memory and in the wire test, because both formed a table faster than the
+    /// first re-broadcast; on two real processes the joiner heard the second
+    /// copy, named it, and was refused with *"the advertisement has expired"* —
+    /// which was wrong, unfixable from the joiner's side, and invisible to every
+    /// test that finished inside thirty seconds.
+    #[test]
+    fn a_joiner_may_name_any_copy_the_founder_signed() {
+        let (mut t, _, a, hash) = found(6, 2);
+        let table_id = t.founder.table_id();
+
+        // The joiner keeps the copy it first heard.
+        let (mut j, request) = Formation::join(
+            key(2),
+            a,
+            hash,
+            table_id,
+            peer(2),
+            "two".into(),
+            1_000,
+            None,
+            None,
+            [2u8; 32],
+            NOW,
+        )
+        .unwrap();
+
+        // The founder re-broadcasts twice before the request arrives.
+        let later = t.founder.readvertise(NOW + 30_000, 90_000).unwrap();
+        let newest = t.founder.readvertise(NOW + 60_000, 90_000).unwrap();
+        let (_, later_hash) = super::super::advert::verify_echoed(&later).unwrap();
+        let (_, newest_hash) = super::super::advert::verify_echoed(&newest).unwrap();
+        assert_ne!(later_hash, hash, "a re-broadcast is a different hash");
+        assert_ne!(newest_hash, later_hash);
+
+        let out = t
+            .founder
+            .on_join_request(&request, &peer(2), NOW + 61_000)
+            .expect("a request naming an older copy is still honest");
+        let Send::Reply(reply) = &out[0] else {
+            panic!("an acceptance is a reply")
+        };
+        assert!(
+            joinwire::receive_join_accept(reply).is_ok(),
+            "the founder refused a copy it signed itself"
+        );
+
+        // And the echo is the copy the joiner asked under, not the newest, or
+        // the joiner's own check on the echo would fail.
+        j.on_join_answer(reply, NOW + 61_000)
+            .expect("the acceptance holds at the joiner");
+        assert_eq!(j.my_seat(), Some(1));
+    }
+
+    /// But not for ever. An advertisement older than any receiver may still hold
+    /// is a hash nobody can legitimately name, and keeping every copy a
+    /// long-lived table ever signed is an unbounded list fed by a timer.
+    #[test]
+    fn a_copy_older_than_any_receiver_holds_is_forgotten() {
+        let (mut t, _, a, hash) = found(6, 2);
+        let table_id = t.founder.table_id();
+        let (_, request) = Formation::join(
+            key(2),
+            a,
+            hash,
+            table_id,
+            peer(2),
+            "two".into(),
+            1_000,
+            None,
+            None,
+            [2u8; 32],
+            NOW,
+        )
+        .unwrap();
+
+        let stale = NOW + crate::protocol::constants::MAX_AD_LIFETIME_MS + 1_000;
+        t.founder.readvertise(stale, 90_000).unwrap();
+
+        let out = t.founder.on_join_request(&request, &peer(2), stale).unwrap();
+        let Send::Reply(reply) = &out[0] else {
+            panic!("a refusal is a reply")
+        };
+        let (_, reason, _, _) = joinwire::receive_join_reject(reply).unwrap();
+        assert_eq!(reason, RejectReason::AdvertExpired.code());
+    }
+
+    /// A re-broadcast moves the timestamp and the seat count and **nothing
+    /// else**: the timestamps are what §7.2 rule 6 compares and the parameters
+    /// are what rule 7 compares, so a re-broadcast that changed one would mark
+    /// this table unjoinable at every receiver that had it.
+    #[test]
+    fn a_rebroadcast_changes_only_what_it_may() {
+        let (mut t, _, _, _) = found(6, 2);
+        let before = t.founder.under_params();
+        t.founder.readvertise(NOW + 30_000, 90_000).unwrap();
+        assert_eq!(
+            before,
+            t.founder.under_params(),
+            "a re-broadcast changed a parameter and unjoined its own table"
+        );
+    }
+
+    /// A ratification that overtakes the roster it ratifies is held and judged
+    /// when the roster arrives, not refused.
+    ///
+    /// This is the second defect the two-instance run found, and it is a
+    /// property of the medium rather than of anybody's code: GossipSub does not
+    /// order two messages against each other, and the founder sends the roster
+    /// and its own ratification of it in the same breath. Refusing the early one
+    /// left both sides waiting for each other for ever.
+    #[test]
+    fn a_ratification_that_arrives_first_is_kept() {
+        let (mut t, _, a, hash) = found(6, 2);
+        let table_id = t.founder.table_id();
+
+        let (mut j, request) = Formation::join(
+            key(2),
+            a,
+            hash,
+            table_id,
+            peer(2),
+            "two".into(),
+            1_000,
+            None,
+            None,
+            [2u8; 32],
+            NOW,
+        )
+        .unwrap();
+
+        let mut list = None;
+        let mut ready = None;
+        for send in t.founder.on_join_request(&request, &peer(2), NOW).unwrap() {
+            match send {
+                Send::Reply(b) => j.on_join_answer(&b, NOW).unwrap(),
+                Send::Broadcast(b) => {
+                    if joinwire::receive_player_list(&b).is_ok() {
+                        list = Some(b);
+                    } else {
+                        ready = Some(b);
+                    }
+                    vec![]
+                }
+            };
+        }
+        let list = list.expect("a roster is announced");
+        let ready = ready.expect("the founder ratifies its own roster");
+
+        // The wrong way round, on purpose.
+        j.on_table_ready(&ready)
+            .expect("an early ratification is not an error");
+        assert_eq!(j.session(), None, "nothing is settled without a roster");
+
+        for send in j.on_player_list(&list, NOW).unwrap() {
+            if let Send::Broadcast(b) = send {
+                t.founder.on_table_ready(&b).unwrap();
+            }
+        }
+
+        assert!(
+            j.session().is_some(),
+            "the held ratification was never judged"
+        );
+        assert_eq!(
+            j.session(),
+            t.founder.session(),
+            "the two seats disagree about the session"
+        );
+    }
+
+    /// What is held is bounded, and what has been judged is not held again.
+    #[test]
+    fn nothing_is_held_for_ever() {
+        let (mut t, _, _, _) = found(6, 2);
+        // Twenty ratifications of a roster that will never exist.
+        let junk = {
+            let ready = TableReady {
+                roster_hash: [1u8; 32],
+                list_serial: 99,
+                table_params_hash: t.founder.under_params(),
+                my_seat: 3,
+                capability_set: vec![],
+            };
+            joinwire::publish_table_ready(
+                &ready,
+                &t.founder.table_id(),
+                &t.founder.genesis(),
+                &key(5),
+                NOW,
+                0,
+            )
+            .unwrap()
+        };
+        for _ in 0..20 {
+            t.founder.on_table_ready(&junk).unwrap();
+        }
+        assert!(t.founder.held_early() <= MAX_SEATS as usize);
     }
 
     /// Below the minimum nobody ratifies, so there is no session and no table.

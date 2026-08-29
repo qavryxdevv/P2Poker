@@ -64,6 +64,12 @@ pub struct AppState {
     pub selected: Option<[u8; 32]>,
     /// The table this client is at or forming, if any.
     pub seated: Option<Seat>,
+    /// The latest advertisement timestamp this client has seen.
+    ///
+    /// Used as the clock for this store's own expiry. Not this machine's clock:
+    /// the two stores must agree about which adverts are alive, and a client
+    /// whose clock ran fast would expire tables the node still held.
+    pub newest_seen: u64,
 }
 
 /// Where this client is sitting, as the panes read it.
@@ -157,8 +163,31 @@ impl AppState {
             NodeEvent::LocalPeer(p) => self.note(format!("found {p} on this network")),
             NodeEvent::MeshPeer(p) => self.note(format!("{p} joined the lobby mesh")),
             NodeEvent::Published { bytes } => self.note(format!("advertised, {bytes} bytes")),
-            NodeEvent::TableSeen { key } => {
-                self.note(format!("table {}", crate::gui::lobby::short_key(&key)));
+            NodeEvent::TableSeen {
+                key,
+                ad,
+                params_hash,
+                advert_hash,
+            } => {
+                let name = ad.table_name.clone();
+                // Offered rather than inserted, so this store applies §7.2's
+                // rules 6 and 7 for itself. It is a **second** copy of the
+                // lobby — the node has its own — and a copy that took the
+                // node's word would drift from it silently the first time a
+                // message was dropped, which this channel is allowed to do.
+                let now = ad.timestamp_unix_ms.max(self.newest_seen);
+                self.newest_seen = now;
+                self.lobby.expire(now);
+                match self.lobby.offer(key, *ad, params_hash, advert_hash, now) {
+                    Ok(()) => self.note(format!(
+                        "table {} ({name})",
+                        crate::gui::lobby::short_key(&key)
+                    )),
+                    // Not newer is the ordinary case: a table re-broadcasts
+                    // every thirty seconds and this client already has it.
+                    Err(crate::net::lobby::NotTaken::NotNewer) => {}
+                    Err(e) => self.note(format!("table {}: {e:?}", crate::gui::lobby::short_key(&key))),
+                }
             }
             NodeEvent::TableRefused { reason } => self.note(format!("advert refused: {reason}")),
             // Kept out of the log by default. Most dials fail on an open DHT and
@@ -178,33 +207,16 @@ impl AppState {
                 self.note(format!("hosting {}", short(&key)));
             }
             NodeEvent::Seated { key, seat } => {
-                let s = self.seated.get_or_insert_with(|| Seat {
-                    key,
-                    ..Default::default()
-                });
-                s.key = key;
-                s.seat = Some(seat);
+                self.table(key).seat = Some(seat);
                 self.note(format!("seat {seat} at {}", short(&key)));
             }
             NodeEvent::Roster { key, seats } => {
                 let n = seats.len();
-                let mine = match self.seated.as_mut() {
-                    Some(s) if s.key == key => {
-                        s.roster = seats;
-                        true
-                    }
-                    _ => false,
-                };
-                if mine {
-                    self.note(format!("{n} seated"));
-                }
+                self.table(key).roster = seats;
+                self.note(format!("{n} seated"));
             }
             NodeEvent::TableReal { key, session } => {
-                if let Some(s) = self.seated.as_mut() {
-                    if s.key == key {
-                        s.session = Some(session);
-                    }
-                }
+                self.table(key).session = Some(session);
                 self.note(format!("the table is set: session {}", short(&session)));
             }
             NodeEvent::JoinRefused { reason } => {
@@ -219,6 +231,31 @@ impl AppState {
                 self.note(why);
             }
         }
+    }
+
+    /// This client's record for a table, created if there is not one yet.
+    ///
+    /// The three table events are a stream and their order is not guaranteed:
+    /// a seat can be ratified from the founder's roster announcement on the mesh
+    /// **before** the answer to the join RPC arrives, and it does exactly that on
+    /// a fast local network. An earlier version dropped anything that arrived
+    /// before the seat, so a table that had genuinely formed was reported as no
+    /// table at all — by the client that was sitting at it.
+    ///
+    /// A record for a different table replaces this one. One table per client
+    /// here; multi-tabling is more than one client, which is what §4.3's
+    /// per-roster rules are written for.
+    fn table(&mut self, key: [u8; 32]) -> &mut Seat {
+        match &self.seated {
+            Some(s) if s.key == key => {}
+            _ => {
+                self.seated = Some(Seat {
+                    key,
+                    ..Default::default()
+                })
+            }
+        }
+        self.seated.as_mut().expect("just set")
     }
 
     /// Whether this client is at a table that has actually started.
@@ -258,6 +295,57 @@ mod tests {
     /// A seat is not a table. Until every seat has ratified there is no session
     /// identity, and a client that treated the two as one would deal a hand at a
     /// table nobody agreed to.
+    /// The three table events arrive in whatever order the network gives them,
+    /// and on a fast local network the ratification really does beat the answer
+    /// to the join request. An earlier version dropped everything that arrived
+    /// before the seat, and a client sitting at a formed table reported no
+    /// table at all.
+    #[test]
+    fn the_table_events_may_arrive_in_any_order() {
+        let orders: [&[NodeEvent]; 3] = [
+            &[
+                NodeEvent::Seated { key: [7u8; 32], seat: 1 },
+                NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "a".into(), 1), (1, "b".into(), 1)] },
+                NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] },
+            ],
+            &[
+                NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] },
+                NodeEvent::Seated { key: [7u8; 32], seat: 1 },
+                NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "a".into(), 1), (1, "b".into(), 1)] },
+            ],
+            &[
+                NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "a".into(), 1), (1, "b".into(), 1)] },
+                NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] },
+                NodeEvent::Seated { key: [7u8; 32], seat: 1 },
+            ],
+        ];
+        for order in orders {
+            let mut s = AppState::new();
+            for e in order {
+                s.apply(e.clone());
+            }
+            let seat = s.seated.as_ref().expect("a seat");
+            assert_eq!(seat.seat, Some(1));
+            assert_eq!(seat.roster.len(), 2);
+            assert_eq!(seat.session, Some([9u8; 32]));
+            assert!(s.at_a_real_table());
+        }
+    }
+
+    /// A record for another table replaces this one rather than merging into
+    /// it. Two tables' rosters in one record is two tables nobody is at.
+    #[test]
+    fn another_table_replaces_this_one() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::Seated { key: [8u8; 32], seat: 4 });
+        let seat = s.seated.as_ref().unwrap();
+        assert_eq!(seat.key, [8u8; 32]);
+        assert_eq!(seat.seat, Some(4));
+        assert_eq!(seat.session, None, "the old session followed us to a new table");
+    }
+
     #[test]
     fn a_seat_without_a_session_is_not_a_table() {
         let mut s = AppState::new();
@@ -276,19 +364,6 @@ mod tests {
             session: [9u8; 32],
         });
         assert!(s.at_a_real_table());
-    }
-
-    /// A roster for a different table is ignored rather than adopted. A client
-    /// multi-tabling hears more than one.
-    #[test]
-    fn a_roster_for_another_table_is_ignored() {
-        let mut s = AppState::new();
-        s.apply(NodeEvent::Hosting { key: [7u8; 32] });
-        s.apply(NodeEvent::Roster {
-            key: [8u8; 32],
-            seats: vec![(0, "somebody else".into(), 1)],
-        });
-        assert!(s.seated.as_ref().unwrap().roster.is_empty());
     }
 
     /// A refusal clears the seat and reaches the log as a **claim**.

@@ -10,7 +10,17 @@
 //! p2p-poker --headless --host N  and offering a table called N
 //! p2p-poker --for 120            stop after 120 seconds, for a scripted run
 //! p2p-poker --table              open on the table rather than the lobby
+//! p2p-poker --headless --join N  sit down at the first table called N
+//! p2p-poker --profile DIR        keep the profile somewhere other than beside
+//!                                the binary
 //! ```
+//!
+//! `--profile` exists because two clients on one machine must be two players.
+//! The profile lives beside the executable so the whole folder can be copied,
+//! and two copies of one folder are one identity — which §4.3's `peer_id` rule
+//! then correctly refuses a second seat to. Pointing the second instance at its
+//! own directory is what makes a two-instance test a test of two players rather
+//! than of one player joining twice.
 //!
 //! The headless mode is not a lesser client. It is what a scripted two-machine
 //! test drives and what a volunteer relay runs, and it prints the same events
@@ -34,7 +44,9 @@ fn main() {
 
     println!("p2p-poker {}", env!("CARGO_PKG_VERSION"));
 
-    let dir = p2p_poker::storage::profile::profile_dir();
+    let dir = value_of("--profile")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(p2p_poker::storage::profile::profile_dir);
     let identity = match p2p_poker::storage::profile::load_or_create_identity(&dir) {
         Ok(k) => k,
         Err(e) => {
@@ -62,24 +74,25 @@ fn main() {
             .collect::<String>()
     );
 
+    // Hosting is a command like any other, taken by the same path the button
+    // takes. It used to be a second construction here, with its own table
+    // advertisement built by hand — two ways to start a table is two places for
+    // the advertisement and the roster to disagree about what table it is.
     let hosted = value_of("--host").map(|name| {
-        // Seeded from this crate's one randomness source. `ed25519-dalek` 3.0
-        // wants `rand_core` 0.10's trait and our handle speaks `rand` 0.8's, and
-        // threading a second generator in to bridge that is the exact thing
-        // `security::rng` exists to prevent.
-        let seed = p2p_poker::security::rng::secret_32()
-            .expect("the operating system CSPRNG is available");
         println!("hosting  {name}");
-        p2p_poker::net::run::Hosted {
-            ad: demo_table(name),
-            key: ed25519_dalek::SigningKey::from_bytes(&seed),
+        NodeCommand::CreateTable {
+            name,
+            seats: 6,
+            min_players: 2,
+            buyin: 1_000,
+            password: None,
         }
     });
 
     let bounded = value_of("--for").and_then(|v| v.parse::<u64>().ok());
 
     if has("--headless") {
-        headless(identity, app_key, hosted, bounded);
+        headless(identity, app_key, hosted, bounded, value_of("--join"));
     } else {
         windowed(
             identity,
@@ -99,22 +112,25 @@ fn main() {
 fn headless(
     identity: libp2p::identity::Keypair,
     app_key: ed25519_dalek::SigningKey,
-    hosted: Option<p2p_poker::net::run::Hosted>,
+    hosted: Option<NodeCommand>,
     bounded: Option<u64>,
+    join: Option<String>,
 ) {
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     rt.block_on(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        // Headless takes no commands, but the node needs the receiving end to
-        // exist or its `select!` arm completes immediately and spins.
-        let (_commands, command_rx) = tokio::sync::mpsc::channel(16);
+        // The receiving end must outlive the loop whether or not anything is
+        // ever sent: an `mpsc::Receiver` whose senders are all gone completes
+        // immediately and for ever, and its `select!` arm would spin.
+        let (commands, command_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
-            if let Err(e) =
-                p2p_poker::net::run::run(identity, app_key, tx, command_rx, hosted).await
-            {
+            if let Err(e) = p2p_poker::net::run::run(identity, app_key, tx, command_rx).await {
                 eprintln!("node stopped: {e}");
             }
         });
+        if let Some(command) = hosted {
+            let _ = commands.send(command).await;
+        }
 
         let mut state = AppState::new();
         let deadline = async {
@@ -139,12 +155,53 @@ fn headless(
                 Some(event) = rx.recv() => {
                     // Folded through the same state the window uses, so the two
                     // modes cannot disagree about what happened.
+                    let seen = matches!(event, NodeEvent::TableSeen { .. });
                     state.apply(event);
                     if let Some(line) = state.log.back() {
                         println!("{line}");
                     }
+
+                    // A table this run was told to sit down at, recognised by
+                    // the name in its advertisement. The name is **display data
+                    // and never an identifier** (§4.3) — two tables may share
+                    // one, and this takes the first that arrives. That is fine
+                    // for a scripted run and would not be fine in a client,
+                    // which is why it is only here.
+                    //
+                    // Checked **after** the fold, not before: the store is what
+                    // the fold fills, and the first version asked it a question
+                    // one event too early and never joined anything.
+                    if let (Some(want), true, None) = (&join, seen, state.seated.as_ref()) {
+                        let found = state
+                            .lobby
+                            .tables()
+                            .find(|l| &l.held.ad.table_name == want)
+                            .map(|l| (*l.key, l.held.ad.max_buyin));
+                        if let Some((key, buyin)) = found {
+                            println!("asking to join {want}");
+                            let _ = commands
+                                .send(NodeCommand::JoinTable {
+                                    key,
+                                    buyin,
+                                    seat: None,
+                                    password: None,
+                                })
+                                .await;
+                        }
+                    }
                 }
             }
+        }
+        // The one line a scripted run reads back. A table with a session is a
+        // table that formed; anything else is not, and saying which is the whole
+        // point of running two of these.
+        match state.seated.as_ref().and_then(|s| s.session) {
+            Some(session) => println!(
+                "TABLE FORMED session={} seats={}",
+                session[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                state.seated.as_ref().map(|s| s.roster.len()).unwrap_or(0)
+            ),
+            None => println!("NO TABLE"),
         }
         println!("done");
     });
@@ -154,7 +211,7 @@ fn headless(
 fn windowed(
     identity: libp2p::identity::Keypair,
     app_key: ed25519_dalek::SigningKey,
-    hosted: Option<p2p_poker::net::run::Hosted>,
+    hosted: Option<NodeCommand>,
     bounded: Option<u64>,
     screen: Screen,
 ) {
@@ -168,10 +225,12 @@ fn windowed(
     // The node runs on the tokio runtime and the window on this thread. They
     // share a channel and nothing else, which is what keeps `SPEC_CS.md` §33
     // true: a 95 ms shuffle proof on the paint thread is six dropped frames.
+    let opening = commands.clone();
     rt.spawn(async move {
-        if let Err(e) =
-            p2p_poker::net::run::run(identity, app_key, tx, command_rx, hosted).await
-        {
+        if let Some(command) = hosted {
+            let _ = opening.send(command).await;
+        }
+        if let Err(e) = p2p_poker::net::run::run(identity, app_key, tx, command_rx).await {
             eprintln!("node stopped: {e}");
         }
     });
@@ -321,60 +380,5 @@ impl eframe::App for Client {
         // The node pushes events whether or not the window is being interacted
         // with, so the window is repainted on a timer rather than only on input.
         ctx.request_repaint_after(Duration::from_millis(250));
-    }
-}
-
-/// A `CUSTOM` six-seat table, with a deadline derived from its own shape.
-///
-/// `CUSTOM` and not a name of its own: §7.2 rule 3 admits exactly two preset
-/// identifiers, and a name that asserts values nothing checks is how two clients
-/// ship different tables under one identity.
-fn demo_table(name: String) -> p2p_poker::net::lobby::TableAd {
-    use p2p_poker::net::lobby::{BlindSchedule, TableAd, DECK_SUITE_V1};
-    use p2p_poker::protocol::constants::hand_deadline_min_ms;
-
-    let (action, grace, crypto, delay) = (20_000u32, 5_000u32, 30_000u32, 7_000u32);
-    let seats = 6u8;
-    TableAd {
-        game: 1,
-        mode: 1,
-        preset_id: "CUSTOM".into(),
-        table_name: name,
-        small_blind: 10,
-        big_blind: 20,
-        ante: 0,
-        min_buyin: 200,
-        max_buyin: 2_000,
-        start_stack: 0,
-        players: 1,
-        max_players: seats,
-        min_players_to_start: 2,
-        blind_schedule: BlindSchedule {
-            mode: 1,
-            every_n_hands: 20,
-            first_small_blind: 10,
-            small_blind_cap: 1_000,
-        },
-        action_timeout_ms: action,
-        action_grace_ms: grace,
-        crypto_step_timeout_ms: crypto,
-        hand_deadline_ms: hand_deadline_min_ms(
-            seats,
-            action as u64,
-            grace as u64,
-            crypto as u64,
-            delay as u64,
-        ) as u32,
-        join_deadline_ms: 120_000,
-        hand_delay_ms: delay,
-        button_rule: 1,
-        odd_chip_rule: 1,
-        showdown_policy: 1,
-        password_required: false,
-        deck_suite: DECK_SUITE_V1.into(),
-        founder_app_key: [0u8; 32],
-        founder_peer_id: Vec::new(),
-        timestamp_unix_ms: 0,
-        expires_at_unix_ms: 0,
     }
 }

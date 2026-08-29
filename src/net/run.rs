@@ -48,6 +48,7 @@ use std::net::SocketAddrV4;
 use super::advert;
 use super::formation::{Failed, Formation, Send};
 use super::joinrpc;
+use super::joinwire;
 use super::dht::{self, PeerHints, Swarm as DhtSwarm, REANNOUNCE_INTERVAL};
 use super::relay;
 use super::lobby::TableAd;
@@ -125,7 +126,6 @@ pub async fn run(
     app_key: ed25519_dalek::SigningKey,
     events: mpsc::Sender<NodeEvent>,
     mut commands: mpsc::Receiver<NodeCommand>,
-    mut hosted: Option<Hosted>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut swarm = swarm::build(NodeConfig {
         identity,
@@ -261,14 +261,25 @@ pub async fn run(
                                 };
                                 match f.on_join_request(&request, &authenticated, now) {
                                     Ok(sends) => {
+                                        // The channel is consumed by the one
+                                        // reply and the rest of the sends go to
+                                        // the table's topic. An earlier version
+                                        // stopped at the reply, which threw away
+                                        // the roster announcement and this
+                                        // client's own ratification — the joiner
+                                        // took its seat and then both sides sat
+                                        // waiting for a message that had been
+                                        // dropped on the floor here.
+                                        let mut channel = Some(channel);
                                         for send in sends {
                                             match send {
                                                 Send::Reply(bytes) => {
-                                                    let _ = swarm
-                                                        .behaviour_mut()
-                                                        .join
-                                                        .send_response(channel, bytes);
-                                                    break;
+                                                    if let Some(c) = channel.take() {
+                                                        let _ = swarm
+                                                            .behaviour_mut()
+                                                            .join
+                                                            .send_response(c, bytes);
+                                                    }
                                                 }
                                                 Send::Broadcast(bytes) => {
                                                     if let Some(t) = &table_topic {
@@ -280,9 +291,6 @@ pub async fn run(
                                                 }
                                             }
                                         }
-                                        // The reply is taken above; the rest of
-                                        // the sends are the list and this
-                                        // client's own ratification.
                                         report_roster(&events, f).await;
                                         if let Some(session) = f.session() {
                                             let _ = events.send(NodeEvent::TableReal {
@@ -345,6 +353,54 @@ pub async fn run(
                             why: format!("the founder did not answer: {error}"),
                         }).await;
                     }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
+                        gossipsub::Event::Message { message, .. },
+                    )) if table_topic
+                        .as_ref()
+                        .is_some_and(|t| message.topic == t.hash()) =>
+                    {
+                        // The table mesh. Everything on it is either the
+                        // founder's proposal or a seat's ratification of one,
+                        // and which it is is decided by what it decodes as
+                        // rather than by what was hoped for.
+                        let Some(f) = table.as_mut() else { continue };
+                        let now = super::node::now_unix_ms();
+                        let result = if joinwire::receive_player_list(&message.data).is_ok() {
+                            f.on_player_list(&message.data, now)
+                        } else {
+                            f.on_table_ready(&message.data)
+                        };
+                        match result {
+                            Ok(sends) => {
+                                if let Some(t) = &table_topic {
+                                    for send in sends {
+                                        if let Send::Broadcast(bytes) = send {
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .gossipsub
+                                                .publish(t.clone(), bytes);
+                                        }
+                                    }
+                                }
+                                report_roster(&events, f).await;
+                                if let Some(session) = f.session() {
+                                    let _ = events
+                                        .send(NodeEvent::TableReal {
+                                            key: f.table_id(),
+                                            session,
+                                        })
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "a table message was refused: {e:?}"
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Dcutr(ev)) => {
                         match ev.result {
                             Ok(_) => {
@@ -404,8 +460,23 @@ pub async fn run(
                         }
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
-                        gossipsub::Event::Subscribed { peer_id, .. },
+                        gossipsub::Event::Subscribed { peer_id, topic: t },
                     )) => {
+                        // Somebody new on this table's topic. GossipSub
+                        // delivers to whoever is on a topic when a message is
+                        // published and to nobody afterwards, so a roster
+                        // announced a moment before they arrived was never sent
+                        // to them at all. Say it again.
+                        if let (Some(f), Some(mine)) = (table.as_ref(), table_topic.as_ref()) {
+                            if t == mine.hash() {
+                                for bytes in f.say_again() {
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .gossipsub
+                                        .publish(mine.clone(), bytes);
+                                }
+                            }
+                        }
                         let _ = events.send(NodeEvent::MeshPeer(peer_id)).await;
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
@@ -614,11 +685,6 @@ pub async fn run(
                                         let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
                                         table_topic = Some(topic);
                                         table = Some(f);
-                                        // Kept for the housekeeping
-                                        // re-broadcast, which is what stops the
-                                        // table vanishing from every lobby after
-                                        // ninety seconds.
-                                        hosted = Some(Hosted { ad, key: table_key });
                                         let _ = swarm.behaviour_mut().gossipsub
                                             .publish(topics.lobby.clone(), bytes);
                                         let _ = events.send(NodeEvent::Hosting { key }).await;
@@ -696,7 +762,6 @@ pub async fn run(
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
                         table = None;
-                        hosted = None;
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
                         }).await;
@@ -708,15 +773,17 @@ pub async fn run(
                 let now = super::node::now_unix_ms();
                 state.tick(now);
 
-                // Re-broadcast this node's own table. The timestamps move every
-                // time, which is what rule 6 compares; the parameters do not,
-                // which is what rule 7 compares. A re-broadcast that changed a
-                // parameter would mark this node's own table unjoinable at every
-                // receiver, so the advert is edited only here and only in time.
-                if let Some(h) = hosted.as_mut() {
-                    h.ad.timestamp_unix_ms = now;
-                    h.ad.expires_at_unix_ms = now + AD_TTL_MS;
-                    match advert::publish(&h.ad, &h.key) {
+                // Re-broadcast this node's own table.
+                //
+                // Through the `Formation`, which owns the table key and the
+                // advertisement together. It used to be published from a
+                // separate copy here, and the founder's own record of what it
+                // had signed then went stale: a joiner naming the copy it heard
+                // was refused with "the advertisement has expired", which is the
+                // defect the first two-instance run found and which no unit test
+                // could have, because it needs thirty seconds to appear.
+                if let Some(f) = table.as_mut().filter(|f| f.is_founder()) {
+                    match f.readvertise(now, AD_TTL_MS) {
                         Ok(bytes) => {
                             let n = bytes.len();
                             if let Err(e) = swarm
@@ -735,7 +802,7 @@ pub async fn run(
                         }
                         Err(e) => {
                             let _ = events
-                                .send(NodeEvent::Warning(format!("own advert: {e}")))
+                                .send(NodeEvent::Warning(format!("own advert: {e:?}")))
                                 .await;
                         }
                     }
@@ -912,7 +979,19 @@ async fn handle_gossip(
     let now = super::node::now_unix_ms();
     match advert::receive(&message.data, peer, now, &mut state.limits, &mut state.lobby) {
         Ok(key) => {
-            let _ = events.send(NodeEvent::TableSeen { key }).await;
+            // The record the interface needs to draw a row and to build a
+            // join request, taken from this node's own store rather than
+            // re-derived — one place decides what was accepted.
+            if let Some(held) = state.lobby.get(&key) {
+                let _ = events
+                    .send(NodeEvent::TableSeen {
+                        key,
+                        ad: Box::new(held.ad.clone()),
+                        params_hash: held.params_hash,
+                        advert_hash: held.advert_hash,
+                    })
+                    .await;
+            }
             gossipsub::MessageAcceptance::Accept
         }
         Err(e) => {
