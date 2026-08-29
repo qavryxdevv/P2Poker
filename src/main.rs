@@ -54,6 +54,21 @@ fn main() {
             .cloned()
     };
 
+    // libp2p says a great deal through `tracing` and, without a subscriber,
+    // says it to nobody. Every network question asked of this client so far has
+    // been answered by adding a temporary `eprintln!` and rebuilding, which is
+    // slow and leaves nothing behind. Off unless `RUST_LOG` is set, so it costs
+    // an environment lookup at start-up and nothing else.
+    //
+    //     RUST_LOG=libp2p_kad=debug,libp2p_relay=debug p2p-poker --headless
+    if std::env::var_os("RUST_LOG").is_some() {
+        use tracing_subscriber::{fmt, EnvFilter};
+        let _ = fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+
     println!("p2p-poker {}", env!("CARGO_PKG_VERSION"));
 
     let dir = value_of("--profile")

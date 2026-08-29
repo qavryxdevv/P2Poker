@@ -98,11 +98,39 @@ const PUBLIC_ENTRY: &[&str] = &["/dnsaddr/bootstrap.libp2p.io"];
 /// pasting thirty-four bytes means the derivation is visible and the test can
 /// check it against the published value.
 fn relay_namespace() -> libp2p::kad::RecordKey {
+    namespace(b"/libp2p/relay")
+}
+
+/// The lobby, as a rendezvous on the public DHT.
+///
+/// Every client announces itself a provider of this one key and asks who else
+/// is. That is the whole lobby: a place all clients agree on, where each finds
+/// the others' addresses, after which table advertisements travel over gossip
+/// exactly as they did before.
+///
+/// **Why this replaces announcing in Mainline.** A BitTorrent announcement can
+/// say one thing — `IP:port` — and a player behind a NAT does not have one
+/// worth saying. What they have is a circuit address through a relay, which is
+/// a multiaddr and does not fit in four bytes and a port. A provider record
+/// carries whatever addresses the node has, so the same mechanism serves the
+/// reachable player and the unreachable one, and that is the difference between
+/// a lobby most people can be seen in and a lobby only a minority can.
+fn lobby_namespace() -> libp2p::kad::RecordKey {
+    namespace(b"/p2p-poker/lobby/1")
+}
+
+/// A namespace string as the DHT key its provider records live under.
+///
+/// go-libp2p's routing discovery maps a namespace to `CIDv1(raw, sha2-256(ns))`
+/// and go-libp2p-kad-dht keys the provider record on that CID's multihash, so
+/// the key is `0x12 0x20` — sha2-256, thirty-two bytes — and then the digest.
+/// Derived here rather than pasted, so the derivation is visible and testable.
+fn namespace(ns: &[u8]) -> libp2p::kad::RecordKey {
     use sha2::{Digest, Sha256};
     let mut key = Vec::with_capacity(34);
     key.push(0x12);
     key.push(0x20);
-    key.extend_from_slice(&Sha256::digest(b"/libp2p/relay"));
+    key.extend_from_slice(&Sha256::digest(ns));
     libp2p::kad::RecordKey::new(&key)
 }
 
@@ -280,6 +308,10 @@ pub async fn run(
     // to start: the answer arrives as providers, and each of those is then
     // dialled and asked for a reservation on its own account.
     let mut asked_public_dht = false;
+
+    // Whether this client's own record is in the public lobby. Set once the
+    // announcement has an address in it, because one without is discarded.
+    let mut in_public_lobby = false;
     let mut have_reservation = false;
     // Counted so that "no relay" is reported as a finding rather than as
     // impatience: three cycles is three minutes of looking.
@@ -315,6 +347,28 @@ pub async fn run(
         tokio::select! {
             event = SwarmStreamExt::select_next_some(&mut swarm) => {
                 match event {
+                    SwarmEvent::NewListenAddr { address, .. }
+                        if address
+                            .iter()
+                            .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)) =>
+                    {
+                        // A circuit address is external by construction: a relay
+                        // accepted the reservation and handed back the address
+                        // it will accept traffic for. Saying so is what makes
+                        // this client findable, because `libp2p-kad` publishes
+                        // a provider record carrying the swarm's **external**
+                        // addresses and nothing else — a NATed player who never
+                        // records one announces themselves to the lobby with no
+                        // way to be reached, which is indistinguishable from not
+                        // announcing at all.
+                        //
+                        // This does not weaken the rule that only AutoNAT may
+                        // call this client publicly reachable. It is not a claim
+                        // about this machine; it is a claim about a relay's
+                        // address, made by that relay.
+                        swarm.add_external_address(address.clone());
+                        let _ = events.send(NodeEvent::Listening(address)).await;
+                    }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         // Announce only a port something is actually bound to.
                         if announced_port.is_none() {
@@ -698,11 +752,18 @@ pub async fn run(
                                 }
                             }
                             if !asked_public_dht {
+                                // The first way in. A routing table with four
+                                // entries can start a query but finishes very
+                                // few, so the walk outwards comes first and the
+                                // questions follow on the discovery timer.
                                 asked_public_dht = true;
-                                swarm
-                                    .behaviour_mut()
-                                    .ipfs_kad
-                                    .get_providers(relay_namespace());
+                                if let Err(e) = swarm.behaviour_mut().ipfs_kad.bootstrap() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "public DHT has no peers yet: {e}"
+                                        )))
+                                        .await;
+                                }
                             }
                         }
 
@@ -743,15 +804,60 @@ pub async fn run(
                         libp2p::kad::Event::OutboundQueryProgressed { result, .. },
                     )) => {
                         use libp2p::kad::{GetProvidersOk, QueryResult};
+                        // A query that fails is worth a line. Without one, a
+                        // routing table too thin to answer anything looks
+                        // exactly like a lobby with nobody in it.
+                        match &result {
+                            QueryResult::GetProviders(Err(e)) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!("DHT lookup failed: {e}")))
+                                    .await;
+                            }
+                            QueryResult::StartProviding(r) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(match r {
+                                        Ok(_) => "announced in the public lobby".to_owned(),
+                                        Err(e) => format!("could not announce: {e}"),
+                                    }))
+                                    .await;
+                            }
+                            QueryResult::Bootstrap(Err(e)) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!("DHT bootstrap: {e}")))
+                                    .await;
+                            }
+                            _ => {}
+                        }
                         if let QueryResult::GetProviders(Ok(
-                            GetProvidersOk::FoundProviders { providers, .. },
+                            GetProvidersOk::FinishedWithNoAdditionalRecord { .. },
                         )) = result
                         {
+                            // Said out loud. An answer of nobody and a question
+                            // never asked look the same in a log that only
+                            // reports findings, and the first is a working lobby
+                            // with no players in it.
+                            if !in_public_lobby {
+                                let _ = events
+                                    .send(NodeEvent::Warning(
+                                        "public lobby: nobody else yet".into(),
+                                    ))
+                                    .await;
+                            }
+                        }
+                        if let QueryResult::GetProviders(Ok(
+                            GetProvidersOk::FoundProviders { key, providers, .. },
+                        )) = result
+                        {
+                            // The same handler for both keys: a relay and a
+                            // fellow player are both peers to be dialled, and
+                            // what differs is only what is said about them.
+                            let lobby = key == lobby_namespace();
                             let _ = events
-                                .send(NodeEvent::Warning(format!(
-                                    "{} relay(s) advertised in the DHT",
-                                    providers.len()
-                                )))
+                                .send(NodeEvent::Warning(if lobby {
+                                    format!("{} player(s) in the public lobby", providers.len())
+                                } else {
+                                    format!("{} relay(s) advertised in the DHT", providers.len())
+                                }))
                                 .await;
                             for peer in providers {
                                 // By peer id: the addresses came with the query
@@ -852,7 +958,19 @@ pub async fn run(
                                 }
                             }
                         }
-                        let _ = events.send(NodeEvent::MeshPeer(peer_id)).await;
+                        // Only for the topics this client is actually in.
+                        //
+                        // The event fires for **every** topic a peer subscribes
+                        // to, and since this node joined the public libp2p
+                        // network that includes strangers announcing IPFS
+                        // topics it has never heard of. The log filled with
+                        // hundreds of "joined the lobby mesh" lines about peers
+                        // who had done nothing of the kind, and the lines that
+                        // mattered were pushed out of a bounded log before
+                        // anyone could read them.
+                        if t == topics.lobby.hash() || Some(&t) == table_topic.as_ref().map(|x| x.hash()).as_ref() {
+                            let _ = events.send(NodeEvent::MeshPeer(peer_id)).await;
+                        }
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
                         gossipsub::Event::Message {
@@ -946,6 +1064,43 @@ pub async fn run(
             }
 
             _ = discover_timer.tick() => {
+                // The public lobby: announce, then read.
+                //
+                // **Announce only with an address to announce.** A provider
+                // record carries the swarm's external addresses, and
+                // go-libp2p-kad-dht drops one that arrives with none —
+                // `handlers.go`, `if len(pi.Addrs) < 1 { continue }`. A
+                // client behind a NAT has no external address until a relay
+                // gives it a circuit, so announcing before then is a packet
+                // sent to be discarded, and the lobby it thinks it joined
+                // has never heard of it.
+                if asked_public_dht {
+                    let reachable_here = swarm.external_addresses().next().is_some();
+                    if reachable_here && !in_public_lobby {
+                        match swarm.behaviour_mut().ipfs_kad.start_providing(lobby_namespace())
+                        {
+                            Ok(_) => in_public_lobby = true,
+                            Err(e) => {
+                                let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "could not join the public lobby: {e}"
+                                )))
+                                .await;
+                            }
+                        }
+                    }
+                    // Read it every cycle either way: a client with nothing
+                    // to announce can still see who is there, and a table it
+                    // can reach is a table it can sit at.
+                    swarm.behaviour_mut().ipfs_kad.get_providers(lobby_namespace());
+                }
+
+                // Everything below waits on the **BitTorrent** DHT having
+                // bootstrapped. The public lobby above must not: it is on the
+                // libp2p DHT and has nothing to do with Mainline, and putting
+                // it behind that gate meant one slow network kept the other
+                // from ever being asked - which is how the lobby stayed empty
+                // while the relays it needs were being found perfectly well.
                 if bootstrapped(&dht).await {
                     // Cleared first, and this is not tidiness. `absorb` drops the
                     // INCOMING address once the list holds its cap, so a list
@@ -998,6 +1153,7 @@ pub async fn run(
                                     let _ = swarm.dial(addr);
                                 }
                             }
+                            swarm.behaviour_mut().ipfs_kad.get_providers(relay_namespace());
                         }
                         if asked_relays.len() >= MAX_ASKED_RELAYS {
                             asked_relays.clear();
