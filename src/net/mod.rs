@@ -3,6 +3,7 @@
 
 pub mod advert;
 pub mod dht;
+pub mod formation;
 pub mod joinwire;
 pub mod lobby;
 pub mod node;

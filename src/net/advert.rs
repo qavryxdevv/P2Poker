@@ -440,6 +440,54 @@ pub fn receive(
     Ok(table_key)
 }
 
+/// Re-verify an advertisement handed over **outside** the lobby.
+///
+/// §4.3 has `JOIN_ACCEPT` repeat the whole `SignedEvent` of the advert verbatim,
+/// for one reason: the joiner must not be relying on a gossip copy or on the
+/// founder's word for what it is sitting down to. So this is not a convenience
+/// wrapper on [`receive`] — it is the second, independent check, and it
+/// deliberately shares only the parts that are about the bytes:
+///
+/// * it takes **no rate limiter and no store**. Those answer lobby questions —
+///   who may spend this client's CPU, which advert is the current one — and
+///   neither is a question about an advert somebody handed us directly.
+/// * it runs **no §7.2 admission**. `lobby::admit` decides what belongs in a
+///   list of tables; an accepted echo has already been decided on.
+///
+/// What it does do is everything the signature covers: canonical decode,
+/// envelope catalogue, the unchained sentinel, `verify_strict` under the key in
+/// the envelope, and a canonical body. It returns the advert and its
+/// `event_hash`, which is what §4.3's comparison against `advert_hash` needs.
+pub fn verify_echoed(bytes: &[u8]) -> Result<(TableAd, [u8; 32]), NotAccepted> {
+    let signed: SignedEvent = from_canonical(bytes, LOBBY_MSG_MAX)
+        .map_err(|_| NotAccepted::Malformed("not a canonical signed event"))?;
+    let envelope: EventBody = from_canonical(&signed.body, LOBBY_MSG_MAX)
+        .map_err(|_| NotAccepted::Malformed("not a canonical envelope"))?;
+
+    match envelope.check_envelope() {
+        Ok(EventType::LobbyTableAd) => {}
+        Ok(_) => return Err(NotAccepted::WrongType),
+        Err(_) => return Err(NotAccepted::Malformed("the envelope is not conforming")),
+    }
+    if envelope.table_id != ZERO32 {
+        return Err(NotAccepted::Malformed(
+            "a lobby advert carries the unchained sentinel",
+        ));
+    }
+
+    let verifying = VerifyingKey::from_bytes(&envelope.sender_public_key)
+        .map_err(|_| NotAccepted::BadSignature)?;
+    let signature = Signature::from_bytes(&signed.signature);
+    verifying
+        .verify_strict(&to_be_signed(&signed.body), &signature)
+        .map_err(|_| NotAccepted::BadSignature)?;
+
+    let body: AdBody = from_canonical(&envelope.payload, TABLE_AD_MAX)
+        .map_err(|_| NotAccepted::Malformed("not a canonical advert body"))?;
+    let ad: TableAd = body.try_into()?;
+    Ok((ad, crate::protocol::transcript::event_hash(&signed.body)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +552,42 @@ mod tests {
 
     /// The whole loop, which is what D-003 needs and what did not exist: a table
     /// is signed, put on the wire, and arrives at another client as a table.
+    /// The echoed advert in a `JOIN_ACCEPT` is verified from its own bytes, and
+    /// one altered byte anywhere in it is refused. A joiner that took the
+    /// founder's word here would be sitting down to whatever the founder said.
+    #[test]
+    fn an_echoed_advert_is_verified_from_its_own_bytes() {
+        let table = key(7);
+        let wire = publish(&ad(), &table).unwrap();
+        let (back, hash) = verify_echoed(&wire).expect("an honest echo verifies");
+        assert_eq!(back.table_name, "Riverside");
+        assert_ne!(hash, ZERO32);
+
+        let mut refused = 0;
+        for i in 0..wire.len() {
+            let mut bad = wire.clone();
+            bad[i] ^= 0x01;
+            if verify_echoed(&bad).is_err() {
+                refused += 1;
+            }
+        }
+        assert_eq!(refused, wire.len(), "an altered echo was accepted");
+    }
+
+    /// And its hash is the same one the lobby computes for the same bytes, or
+    /// §4.3's comparison against `advert_hash` compares two different things.
+    #[test]
+    fn the_echoed_hash_is_the_lobbys_hash() {
+        let table = key(7);
+        let wire = publish(&ad(), &table).unwrap();
+        let (_, echoed) = verify_echoed(&wire).unwrap();
+        let signed: SignedEvent = from_canonical(&wire, LOBBY_MSG_MAX).unwrap();
+        assert_eq!(
+            echoed,
+            crate::protocol::transcript::event_hash(&signed.body)
+        );
+    }
+
     #[test]
     fn a_table_travels_from_one_client_to_another() {
         let table = key(1);
