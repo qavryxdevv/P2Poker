@@ -86,6 +86,15 @@ pub fn load_or_create_identity(dir: &Path) -> io::Result<libp2p::identity::Keypa
     Ok(key)
 }
 
+/// Eight characters of a key: what a person can compare at a glance, and what
+/// this client calls a player who has not chosen a name.
+///
+/// Stable and theirs. An empty name or a "Player 1" would be neither, and two
+/// of them would be indistinguishable.
+pub fn short_name(key: &[u8; 32]) -> String {
+    key[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Where this client's **application** key lives.
 ///
 /// A second file, deliberately. §20 keeps the two identities apart: a `PeerId`
