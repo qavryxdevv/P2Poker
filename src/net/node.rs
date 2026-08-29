@@ -106,6 +106,13 @@ pub enum NodeEvent {
     TableRefused { reason: String },
     /// AutoNAT decided.
     Reachability { public: bool },
+    /// The router opened a port, or would not.
+    ///
+    /// **Not** a statement about reachability. A router behind a carrier NAT
+    /// confirms a mapping happily while the port stays shut from outside, so
+    /// this says only that the door was opened — AutoNAT is still the only
+    /// thing that may decide whether anybody can walk through it.
+    PortMapped { how: &'static str, external: u16 },
     /// This client is hosting a table under this key.
     Hosting { key: [u8; 32] },
     /// The parameters of the table this client is at.

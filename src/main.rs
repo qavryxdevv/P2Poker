@@ -187,8 +187,14 @@ fn headless(
                     // Folded through the same state the window uses, so the two
                     // modes cannot disagree about what happened.
                     let seen = matches!(event, NodeEvent::TableSeen { .. });
+                    // What the log had before, so only new lines are printed.
+                    // Most events add none — a re-broadcast this client already
+                    // holds, a peer count — and printing `log.back()` after
+                    // every one of them reprinted the previous line instead,
+                    // which read as the same thing happening five times.
+                    let before = state.log.len();
                     state.apply(event);
-                    if let Some(line) = state.log.back() {
+                    for line in state.log.iter().skip(before) {
                         println!("{line}");
                     }
 

@@ -49,6 +49,7 @@ use super::advert;
 use super::formation::{Failed, Formation, Send};
 use super::joinrpc;
 use super::joinwire;
+use super::portmap;
 use super::dht::{self, PeerHints, Swarm as DhtSwarm, REANNOUNCE_INTERVAL};
 use super::relay;
 use super::lobby::{LobbyStore, RateLimiter, TableAd, TableKind};
@@ -194,6 +195,24 @@ pub async fn run(
     // the swarm starts, so a timer whose period **is** the re-announce interval
     // misses its first tick and then says nothing for ten minutes — which is
     // what the first run of this binary did, silently.
+    // The router, asked to open the port this client is listening on. PCP and
+    // NAT-PMP, beside the UPnP already in the behaviour: a router that speaks
+    // one of the three is a player who does not need a relay, and a hand over a
+    // relay costs somebody else's bandwidth.
+    //
+    // Held so that renewing it is possible and so that dropping this task drops
+    // the mapping — a client that exits without releasing leaves a hole in a
+    // stranger's router until it expires.
+    // The router, asked to open the port this client listens on: PCP and
+    // NAT-PMP, beside the UPnP already in the behaviour. A router that speaks
+    // one of the three is a player who does not need a relay, and a hand over a
+    // relay costs somebody else's bandwidth.
+    //
+    // In **its own task**, because both protocols are UDP to an address that may
+    // not answer and asking inside this loop stops the whole node while a router
+    // that is not there fails to reply. It ends by itself when the event channel
+    // closes, and hands the port back on the way out.
+
     let mut announce_timer = tokio::time::interval(ANNOUNCE_CHECK);
     let mut last_announce: Option<tokio::time::Instant> = None;
     let mut discover_timer = tokio::time::interval(Duration::from_secs(60));
@@ -207,6 +226,12 @@ pub async fn run(
                         // Announce only a port something is actually bound to.
                         if announced_port.is_none() {
                             announced_port = quic_port(&address);
+                            // And ask the router to open it, once, in its own
+                            // task. Started here rather than on a timer because
+                            // this is the moment there is something to ask about.
+                            if let Some(port) = announced_port {
+                                tokio::spawn(portmap::keep_open(port, events.clone()));
+                            }
                         }
                         let _ = events.send(NodeEvent::Listening(address)).await;
                     }

@@ -36,7 +36,7 @@ observer, can see a card they are not entitled to.
 | **Mental poker** | Barnett–Smart with Bayer–Groth shuffle proofs over secp256k1. `n`-of-`n` threshold ElGamal: every seat holds a share, and a card opens only when all of them are given. |
 | **Transcript** | Every event is canonical CBOR, signed Ed25519, and hash-chained. Two players who disagree about what happened can prove which of them is wrong. |
 | **Discovery** | BitTorrent Mainline DHT for finding strangers on the open internet; libp2p (QUIC, TCP, Noise/TLS, GossipSub, Kademlia) for talking to them; mDNS for the ones on your own network. |
-| **NAT** | AutoNAT v2 decides whether this client is reachable, Circuit Relay v2 carries a hand when it is not, and DCUtR upgrades a relayed connection to a direct one. Relay capacity is judged against **measured** per-hand bytes rather than against a guess. |
+| **NAT** | Three ways to open a port: UPnP IGD, and PCP and NAT-PMP for the routers that speak those instead. AutoNAT v2 then decides whether this client is *actually* reachable — a router's confirmation is not the same claim. Circuit Relay v2 carries a hand when nothing opens, and DCUtR upgrades a relayed connection to a direct one. Relay capacity is judged against **measured** per-hand bytes rather than against a guess. |
 | **Poker** | A complete No-Limit Hold'em engine: blinds, dead button, side pots, TDA reopening rules. Around 120 000 random hands run in the test suite. |
 
 Nothing is a service. Every one of those runs inside the same executable on
@@ -128,6 +128,15 @@ the thing it guards exists is worse than no test.
 **A measurement beats a recollection.** The relay defaults, the proof sizes, the
 import table — measured, and several of them disagreed with the text written
 around them.
+
+## Tools
+
+| | |
+|---|---|
+| `tools/deploy.ps1` | test, build, copy to where it is played from — never touching the profile |
+| `tools/clean.ps1 -Deep` | sweep the build directory of what cargo never deletes. It reached 5 GB; 2.7 of that was dead |
+| `tools/check-portable.ps1` | prove the binary is still one portable file with two separate identities |
+| `tools/two-network-test.ps1` | one node here, one in a VM on another subnet |
 
 ## Documentation
 

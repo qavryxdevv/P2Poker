@@ -14,7 +14,8 @@
 
 param(
     [string]$To = "~\Games\P2Poker",
-    [switch]$SkipChecks
+    [switch]$SkipChecks,
+    [switch]$SkipClean
 )
 
 $ErrorActionPreference = 'Stop'
@@ -108,3 +109,13 @@ if ($LASTEXITCODE -ne 0) { $out | Select-Object -Last 10; Die 'the deployed bina
 $peer = ($out | Select-String '^peer id').ToString()
 if (-not $peer) { $out | Select-Object -Last 10; Die 'it started but printed no identity' }
 Ok $peer.Trim()
+
+# And sweep. `cargo build` never deletes anything, so every deployment otherwise
+# leaves another copy of every test binary and another set of dependency builds
+# behind — it reached five gigabytes before this was written, of which two and a
+# half were dead. Done here because a deployment is exactly the moment the
+# previous build stopped mattering.
+if (-not $SkipClean) {
+    Write-Host ''
+    & (Join-Path $PSScriptRoot 'clean.ps1') -Deep
+}

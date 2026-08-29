@@ -76,6 +76,8 @@ futures = "0.3"
 # code must never draw cryptographic randomness from it - spec section 7
 # forbids SmallRng and self-seeded generators. See CRYPTO_LIBS.md section 1.2.
 rand = "0.8"
+crab_nat = "0.8"
+netdev = { version = "0.46", default-features = false, features = ["gateway"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }

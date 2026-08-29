@@ -275,6 +275,9 @@ pub fn short_key(key: &[u8; 32]) -> String {
 /// The state of this client's own connection, for the network-status pane.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkStatus {
+    /// Which protocol opened a port, if one did. `"PCP"`, `"NAT-PMP"`, or
+    /// `None` — and `None` is the ordinary case rather than a fault.
+    pub port_mapped: Option<&'static str>,
     pub peers: usize,
     pub listening: Vec<String>,
     pub dht_announced: bool,

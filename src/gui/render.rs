@@ -972,6 +972,14 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView) {
             .size(14.0),
         );
 
+        if let Some(how) = s.port_mapped {
+            ui.label(
+                RichText::new(format!("{how}: port open"))
+                    .color(theme::OK)
+                    .size(14.0),
+            );
+        }
+
         if s.failed_dials > 0 {
             // Counted rather than listed: most dials fail on an open DHT, and a
             // log of them buries what matters — but with no count at all, "most

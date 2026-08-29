@@ -207,6 +207,10 @@ impl AppState {
             NodeEvent::DialFailed { .. } => self.status.failed_dials += 1,
             NodeEvent::Warning(w) => self.note(w),
 
+            NodeEvent::PortMapped { how, external } => {
+                self.status.port_mapped = Some(how);
+                self.note(format!("{how} opened port {external}"));
+            }
             NodeEvent::Hosting { key } => {
                 self.seated = Some(Seat {
                     key,

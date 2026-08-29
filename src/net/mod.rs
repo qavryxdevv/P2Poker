@@ -9,6 +9,7 @@ pub mod joinrpc;
 pub mod joinwire;
 pub mod lobby;
 pub mod node;
+pub mod portmap;
 pub mod relay;
 pub mod run;
 pub mod streams;
