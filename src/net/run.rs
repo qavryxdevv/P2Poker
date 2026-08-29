@@ -252,55 +252,48 @@ pub async fn run(
                         }
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
-                        gossipsub::Event::Message { message, .. },
-                    )) if !worth_parsing(&message, LOBBY_MSG_MAX) => {
-                        // Size first: it is free, the cap is the protocol's, and
-                        // a message over it cannot be a conforming one — so
-                        // there is nothing to gain by looking inside.
-                        let _ = events
-                            .send(NodeEvent::TableRefused {
-                                reason: format!(
-                                    "over the lobby cap: {} bytes",
-                                    message.data.len()
-                                ),
-                            })
-                            .await;
-                    }
-                    SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
                         gossipsub::Event::Subscribed { peer_id, .. },
                     )) => {
                         let _ = events.send(NodeEvent::MeshPeer(peer_id)).await;
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
-                        gossipsub::Event::Message { message, propagation_source, .. },
+                        gossipsub::Event::Message {
+                            message,
+                            propagation_source,
+                            message_id,
+                        },
                     )) => {
-                        // The sending peer, which is **not** the table key: a
-                        // peer relaying somebody else's advert is the ordinary
-                        // case, and the two are rate limited separately.
-                        let mut from = [0u8; 32];
-                        let peer_bytes = propagation_source.to_bytes();
-                        let take = peer_bytes.len().min(32);
-                        from[..take].copy_from_slice(&peer_bytes[..take]);
+                        // **Every path out of here must end in a
+                        // `report_message_validation_result`.** With
+                        // `validate_messages()` set, GossipSub forwards nothing
+                        // until the application answers — so a path that returns
+                        // without answering makes this client a black hole: it
+                        // takes adverts and relays none, invisibly, because
+                        // delivery to *itself* still works and a two-node test
+                        // still passes.
+                        //
+                        // The three answers are not interchangeable, and the
+                        // distinction is the one the whole protocol turns on.
+                        // `Reject` says *this sender is at fault* and costs it
+                        // peer score; `Ignore` says *this client will not pass it
+                        // on* and blames nobody.
+                        let verdict = handle_gossip(
+                            &message,
+                            propagation_source,
+                            &topics,
+                            &mut state,
+                            &events,
+                        )
+                        .await;
 
-                        let now = super::node::now_unix_ms();
-                        match advert::receive(
-                            &message.data,
-                            from,
-                            now,
-                            &mut state.limits,
-                            &mut state.lobby,
-                        ) {
-                            Ok(key) => {
-                                let _ = events.send(NodeEvent::TableSeen { key }).await;
-                            }
-                            Err(e) => {
-                                let _ = events
-                                    .send(NodeEvent::TableRefused {
-                                        reason: format!("{e:?}"),
-                                    })
-                                    .await;
-                            }
-                        }
+                        let _ = swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .report_message_validation_result(
+                                &message_id,
+                                &propagation_source,
+                                verdict,
+                            );
                     }
                     _ => {}
                 }
@@ -448,6 +441,79 @@ pub async fn run(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Judge one gossip message, and say what GossipSub should do with it.
+///
+/// Returns the acceptance rather than reporting it, so the answer is given in
+/// one place and no branch can forget to give it.
+///
+/// # Why the topic is checked here, and was not checked at all
+///
+/// This node subscribes to two topics and the old arm read neither, so a chat
+/// message was handed to the advert parser — which rejected it as malformed and
+/// blamed the sender for speaking correctly on the other channel. That is
+/// `PROTOCOL.md` §4.0 step 6, and it was missing.
+async fn handle_gossip(
+    message: &gossipsub::Message,
+    from: libp2p::PeerId,
+    topics: &Topics,
+    state: &mut NodeState,
+    events: &mpsc::Sender<NodeEvent>,
+) -> gossipsub::MessageAcceptance {
+    // Size first: free, the cap is the protocol's, and a message over it cannot
+    // be a conforming one. `Reject`, because the sender chose the size.
+    if !worth_parsing(message, LOBBY_MSG_MAX) {
+        let _ = events
+            .send(NodeEvent::TableRefused {
+                reason: format!("over the lobby cap: {} bytes", message.data.len()),
+            })
+            .await;
+        return gossipsub::MessageAcceptance::Reject;
+    }
+
+    if message.topic != topics.lobby.hash() {
+        return if message.topic == topics.lobby_chat.hash() {
+            // Chat is not parsed yet, and forwarding a message this client has
+            // not judged would be asserting something about it.
+            gossipsub::MessageAcceptance::Ignore
+        } else {
+            // A topic this node never subscribed to has no business arriving.
+            gossipsub::MessageAcceptance::Reject
+        };
+    }
+
+    // The sending peer, which is **not** the table key: a peer relaying somebody
+    // else's advert is the ordinary case.
+    let mut peer = [0u8; 32];
+    let bytes = from.to_bytes();
+    let take = bytes.len().min(32);
+    peer[..take].copy_from_slice(&bytes[..take]);
+
+    let now = super::node::now_unix_ms();
+    match advert::receive(&message.data, peer, now, &mut state.limits, &mut state.lobby) {
+        Ok(key) => {
+            let _ = events.send(NodeEvent::TableSeen { key }).await;
+            gossipsub::MessageAcceptance::Accept
+        }
+        Err(e) => {
+            let _ = events
+                .send(NodeEvent::TableRefused {
+                    reason: format!("{e:?}"),
+                })
+                .await;
+            // The same distinction as everywhere else: only a finding about the
+            // **sender** costs it anything. A rate limit is about this client's
+            // own budget and a full lobby is about its own memory; neither is
+            // evidence the peer did wrong.
+            match e {
+                advert::NotAccepted::RateLimited | advert::NotAccepted::NotTaken(_) => {
+                    gossipsub::MessageAcceptance::Ignore
+                }
+                _ => gossipsub::MessageAcceptance::Reject,
             }
         }
     }

@@ -95,7 +95,7 @@ const ENVELOPE: u64 = 220;
 ///
 /// The count is what **one** peer sees: it receives every other seat's
 /// contribution and sends its own, and a relayed circuit carries both.
-pub fn per_hand_bytes(seats: u8) -> u64 {
+pub const fn per_hand_bytes(seats: u8) -> u64 {
     let n = seats as u64;
     let cards = 2 * n + 5;
 

@@ -74,17 +74,34 @@ pub enum RelayRole {
 
 /// How long a relayed circuit may live.
 ///
-/// Ten minutes against the library default of two. A poker hand at ten seats has
-/// a whole-hand deadline of up to an hour, so this does not cover a session — it
-/// covers a hand and then some, and a circuit that ends is re-established rather
-/// than being a game-ending event.
-pub const RELAY_RESERVATION: Duration = Duration::from_secs(600);
+/// **The whole-hand cap, because anything less refuses itself.** The first
+/// version was ten minutes, on the reasoning that it "covers a hand and then
+/// some" — while [`adequate`](super::relay::adequate), the function that decides
+/// whether a relay is usable, judges against `HAND_DEADLINE_CAP_MS`, an hour. So
+/// every p2p-poker relay was declared inadequate by every p2p-poker client, and
+/// the two halves of this project's own NAT story cancelled each other out.
+/// Neither number was wrong alone; nothing compared them, and now a test does.
+///
+/// An hour is a long circuit to lend a stranger and it is the honest number: a
+/// legal hand may take that long under §7.2's cap, and a circuit that dies
+/// mid-street is the engineered abort `SPEC_CS.md` §19 treats as a security
+/// problem rather than a hiccup. A volunteer who will not lend it declines
+/// outright with [`RelayRole::Declined`], rather than by offering a circuit that
+/// cannot carry a hand.
+pub const RELAY_RESERVATION: Duration =
+    Duration::from_millis(crate::protocol::constants::HAND_DEADLINE_CAP_MS);
 
 /// How much data one relayed circuit may carry.
 ///
-/// 16 MiB against the library default of 128 KiB. The default is sized for
-/// hole-punch coordination and would cut a relayed table off mid-hand.
-pub const RELAY_MAX_CIRCUIT_BYTES: u64 = 16 * 1024 * 1024;
+/// Derived from what a hand actually costs rather than picked: a full table's
+/// `per_hand_bytes`, times the headroom the adequacy rule demands, times four
+/// for the hands after the first. A literal would be a second number to keep in
+/// step with the first, and those drift — which is exactly how the duration
+/// above came to refuse itself.
+pub const RELAY_MAX_CIRCUIT_BYTES: u64 =
+    super::relay::per_hand_bytes(crate::protocol::constants::MAX_SEATS)
+        * super::relay::HAND_HEADROOM
+        * 4;
 
 /// How many circuits one peer may hold on this client at once.
 pub const RELAY_MAX_CIRCUITS_PER_PEER: usize = 4;
@@ -361,6 +378,27 @@ mod tests {
         assert_eq!(off.max_reservations, 0);
         assert_eq!(off.max_circuits, 0);
         assert_eq!(off.max_circuits_per_peer, 0);
+    }
+
+    /// The relay this client offers must pass the test this client applies.
+    ///
+    /// The first version failed it — 600 seconds offered against an hour
+    /// demanded — so every p2p-poker relay was refused by every p2p-poker
+    /// client and the two halves of the NAT story cancelled out. Neither number
+    /// was wrong on its own; nothing compared them.
+    #[test]
+    fn our_own_relay_is_one_our_own_client_would_accept() {
+        let c = relay_config(RelayRole::Volunteer);
+        assert_eq!(
+            crate::net::relay::adequate(
+                crate::protocol::constants::MAX_SEATS,
+                Duration::from_millis(crate::protocol::constants::HAND_DEADLINE_CAP_MS),
+                Some(c.max_circuit_bytes),
+                Some(c.max_circuit_duration),
+            ),
+            crate::net::relay::Adequacy::Adequate,
+            "a relay this client would not use is a relay it should not offer"
+        );
     }
 
     /// The library defaults are sized for hole-punch coordination — two minutes
