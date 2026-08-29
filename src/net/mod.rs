@@ -5,6 +5,7 @@ pub mod advert;
 pub mod dht;
 pub mod lobby;
 pub mod node;
+pub mod relay;
 pub mod run;
 pub mod streams;
 pub mod swarm;

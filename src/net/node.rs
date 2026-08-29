@@ -80,6 +80,23 @@ pub enum NodeEvent {
     MeshPeer(PeerId),
     /// This node's own advert went out.
     Published { bytes: usize },
+    /// A relay accepted a reservation, and what it will carry.
+    ///
+    /// The limits are **read**, not assumed: the protocol reports the server's
+    /// real ones back precisely so the decision can be made before committing,
+    /// and `NAT_AND_DISCOVERY.md` says in so many words to use them.
+    Reserved {
+        relay: PeerId,
+        bytes: Option<u64>,
+        seconds: Option<u64>,
+        adequate: bool,
+    },
+    /// A relayed connection was upgraded to a direct one by hole punching.
+    HolePunched(PeerId),
+    /// Hole punching gave up. The connection stays relayed, which is a normal
+    /// steady state and not an error — upstream allows three attempts and then
+    /// stops.
+    StillRelayed(PeerId),
 }
 
 /// Turn a discovered `SocketAddrV4` into something the swarm can dial.

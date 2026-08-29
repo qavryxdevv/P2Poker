@@ -39,12 +39,16 @@ use libp2p::{futures::StreamExt as SwarmStreamExt, gossipsub, identity, swarm::S
 use mainline::{Dht, Id};
 use tokio::sync::mpsc;
 
+use std::collections::HashSet;
+use std::net::SocketAddrV4;
+
 use super::advert;
 use super::dht::{self, PeerHints, Swarm as DhtSwarm, REANNOUNCE_INTERVAL};
+use super::relay;
 use super::lobby::TableAd;
 use super::node::{quic_dial_addr, worth_parsing, NodeEvent, NodeState, REBROADCAST};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
-use crate::protocol::constants::{AD_TTL_MS, LOBBY_MSG_MAX};
+use crate::protocol::constants::{AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX, MAX_SEATS};
 
 /// How long to wait for the DHT to bootstrap before giving up on this cycle.
 const BOOTSTRAP_PATIENCE: Duration = Duration::from_secs(20);
@@ -111,9 +115,10 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut swarm = swarm::build(NodeConfig {
         identity,
-        // Closed until AutoNAT says otherwise (D-002). A user who is wrong about
-        // their own NAT would otherwise advertise a way through that is not one.
-        relay_role: RelayRole::None,
+        // Capacity from the start; the ANNOUNCE is what AutoNAT gates (D-002).
+        // `relay::Config` cannot be changed after the swarm is built, and
+        // capacity nobody can reach costs nothing.
+        relay_role: RelayRole::Volunteer,
     })?;
 
     let topics = Topics::default();
@@ -137,8 +142,13 @@ pub async fn run(
         .build()?
         .as_async();
     let lobby_hash = Id::from_bytes(DhtSwarm::Lobby.infohash())?;
+    let relay_hash = Id::from_bytes(DhtSwarm::Relay.infohash())?;
 
     let mut announced_port: Option<u16> = None;
+    // Relays this node has asked for a reservation from, so a repeated discovery
+    // cycle does not ask the same relay again every minute.
+    let mut asked_relays: HashSet<SocketAddrV4> = HashSet::new();
+    let mut have_reservation = false;
     // Checked often, acted on rarely. The listen address arrives a moment after
     // the swarm starts, so a timer whose period **is** the re-announce interval
     // misses its first tick and then says nothing for ten minutes — which is
@@ -164,6 +174,65 @@ pub async fn run(
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                         let _ = events.send(NodeEvent::PeerDisconnected(peer_id)).await;
+                    }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::RelayClient(
+                        libp2p::relay::client::Event::ReservationReqAccepted {
+                            relay_peer_id,
+                            limit,
+                            ..
+                        },
+                    )) => {
+                        have_reservation = true;
+                        let bytes = limit.as_ref().and_then(|l| l.data_in_bytes());
+                        let seconds = limit
+                            .as_ref()
+                            .and_then(|l| l.duration())
+                            .map(|d| d.as_secs());
+                        // The decision `NAT_AND_DISCOVERY.md` asks for by name:
+                        // compare the relay's own reported limits against what a
+                        // hand actually costs, before anything is committed to
+                        // this circuit.
+                        let verdict = relay::adequate(
+                            MAX_SEATS,
+                            Duration::from_millis(HAND_DEADLINE_CAP_MS),
+                            bytes,
+                            limit.as_ref().and_then(|l| l.duration()),
+                        );
+                        let _ = events
+                            .send(NodeEvent::Reserved {
+                                relay: relay_peer_id,
+                                bytes,
+                                seconds,
+                                adequate: matches!(
+                                    verdict,
+                                    relay::Adequacy::Adequate | relay::Adequacy::Unlimited
+                                ),
+                            })
+                            .await;
+                    }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Dcutr(ev)) => {
+                        match ev.result {
+                            Ok(_) => {
+                                let _ = events
+                                    .send(NodeEvent::HolePunched(ev.remote_peer_id))
+                                    .await;
+                            }
+                            Err(_) => {
+                                let _ = events
+                                    .send(NodeEvent::StillRelayed(ev.remote_peer_id))
+                                    .await;
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::AutonatClient(ev)) => {
+                        // AutoNAT is the only thing that may decide this. A
+                        // setting cannot: a user who is wrong about their own NAT
+                        // would advertise a way through that is not one.
+                        let public = ev.result.is_ok();
+                        if public != state.is_public() {
+                            state.set_public(public);
+                            let _ = events.send(NodeEvent::Reachability { public }).await;
+                        }
                     }
                     SwarmEvent::OutgoingConnectionError { error, .. } => {
                         let _ = events
@@ -252,6 +321,23 @@ pub async fn run(
                             Ok(_) => {
                                 last_announce = Some(tokio::time::Instant::now());
                                 let _ = events.send(NodeEvent::Announced { port }).await;
+
+                                // And, only when AutoNAT says this client can
+                                // actually be reached, offer the line to other
+                                // people's games (D-002). Announcing this from
+                                // behind a NAT is the harm the role separation
+                                // exists to avoid.
+                                if state.is_public() {
+                                    if let Err(e) =
+                                        dht.announce_peer(relay_hash, Some(port)).await
+                                    {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "relay announce failed: {e}"
+                                            )))
+                                            .await;
+                                    }
+                                }
                             }
                             Err(e) => {
                                 let _ = events
@@ -282,6 +368,35 @@ pub async fn run(
                     for addr in state.fresh_dials(hints.peers()) {
                         // A failed dial is the ordinary case, not an error.
                         let _ = swarm.dial(quic_dial_addr(addr));
+                    }
+
+                    // A relay is needed when this client cannot be reached
+                    // directly — and DCUtR needs one too, since it upgrades an
+                    // existing relayed connection and cannot start one. So the
+                    // relay swarm is asked whenever there is no reservation yet,
+                    // whatever AutoNAT has said so far.
+                    if !have_reservation {
+                        let mut relays = PeerHints::new();
+                        let mut stream = dht.get_peers(relay_hash);
+                        while let Some(batch) = DhtStreamExt::next(&mut stream).await {
+                            relays.absorb(batch.as_ref());
+                        }
+                        for addr in relays.peers() {
+                            if !asked_relays.insert(*addr) {
+                                continue;
+                            }
+                            // Listening on a relay's circuit address IS the
+                            // reservation request; there is no separate call.
+                            let circuit = quic_dial_addr(*addr)
+                                .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                            if let Err(e) = swarm.listen_on(circuit) {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "no reservation from {addr}: {e}"
+                                    )))
+                                    .await;
+                            }
+                        }
                     }
                 }
             }

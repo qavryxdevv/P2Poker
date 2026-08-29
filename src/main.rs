@@ -17,10 +17,17 @@ use p2p_poker::net::node::NodeEvent;
 async fn main() {
     println!("p2p-poker {}", env!("CARGO_PKG_VERSION"));
 
-    // A fresh identity per run for now. The persistent one belongs with the
-    // profile directory, and giving it a temporary key is better than giving it
-    // a key that looks persistent and is not.
-    let identity = libp2p::identity::Keypair::generate_ed25519();
+    // The profile beside the executable, so the peer id is the same client
+    // tomorrow. A client that changes identity on restart cannot be reconnected
+    // to and appears to the network as an endless stream of strangers.
+    let dir = p2p_poker::storage::profile::profile_dir();
+    let identity = match p2p_poker::storage::profile::load_or_create_identity(&dir) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("profile at {}: {e}", dir.display());
+            return;
+        }
+    };
     let peer_id = libp2p::PeerId::from(identity.public());
     println!("peer id  {peer_id}");
 
@@ -50,12 +57,32 @@ async fn main() {
         }
     });
 
-    // Report for a while, then stop. A long-running client is the GUI's job.
-    let deadline = tokio::time::sleep(Duration::from_secs(180));
+    // Runs until Ctrl-C. `--for <seconds>` bounds it, which is what a scripted
+    // two-machine test wants; a fixed 180 seconds was neither.
+    let bounded = std::env::args()
+        .position(|a| a == "--for")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(secs) = bounded {
+        println!("running  {secs} s");
+    } else {
+        println!("running  until Ctrl-C");
+    }
+
+    let deadline = async {
+        match bounded {
+            Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
     tokio::pin!(deadline);
 
     loop {
         tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("done");
+                break;
+            }
             Some(event) = rx.recv() => match event {
                 NodeEvent::Listening(addr) => println!("listen   {addr}"),
                 NodeEvent::PeerConnected(p) => println!("connect  {p}"),
@@ -76,6 +103,14 @@ async fn main() {
                 NodeEvent::LocalPeer(p) => println!("lan      {p}"),
                 NodeEvent::MeshPeer(p) => println!("mesh     {p}"),
                 NodeEvent::Published { bytes } => println!("publish  {bytes} bytes"),
+                NodeEvent::Reserved { relay, bytes, seconds, adequate } => println!(
+                    "relay    {relay} limit {} bytes / {} s -> {}",
+                    bytes.map(|b| b.to_string()).unwrap_or_else(|| "none".into()),
+                    seconds.map(|s| s.to_string()).unwrap_or_else(|| "none".into()),
+                    if adequate { "usable for a table" } else { "TOO SMALL for a hand" }
+                ),
+                NodeEvent::HolePunched(p) => println!("punch    {p} is now direct"),
+                NodeEvent::StillRelayed(p) => println!("punch    {p} stays relayed"),
             },
             _ = &mut deadline => {
                 println!("done");

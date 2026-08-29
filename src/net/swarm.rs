@@ -11,11 +11,22 @@
 //! without relays two clients that are both behind symmetric NAT cannot reach
 //! each other at all — which D-004 says must still work.
 //!
-//! It is **conditional on being publicly reachable**, and that is not a
-//! politeness. A relay server behind NAT accepts reservations it cannot honour:
-//! it advertises itself as a way through and then is not one, so a peer that
-//! picks it has spent its attempt on nothing. AutoNAT is what decides, and
-//! [`RelayRole`] is what carries the decision.
+//! It is **conditional on being publicly reachable** — but the condition is on
+//! *advertising*, not on capacity, and the first draft of this module conflated
+//! the two.
+//!
+//! The harm in a relay behind NAT is that it announces itself as a way through
+//! and is not one, so a peer that picks it has spent an attempt on nothing. The
+//! harm is in the announcement. Capacity that nobody can reach costs nothing and
+//! is never used, and `relay::Config` cannot be changed after the swarm is
+//! built — so a client that had to become a volunteer later would have to be
+//! rebuilt.
+//!
+//! So the limits are always the volunteer ones, and **AutoNAT gates the announce
+//! under `RELAY_INFOHASH`** ([`super::dht::Swarm::Relay`]). A client behind NAT
+//! is then exactly as useless as a relay as it would have been with zero limits,
+//! and becomes useful the moment AutoNAT says it is reachable, with nothing to
+//! rebuild.
 //!
 //! # The relay limits are set explicitly, and the defaults are the reason
 //!
@@ -48,14 +59,17 @@ use crate::protocol::constants::{
 /// Whether this client offers its line to other people's games.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayRole {
-    /// Publicly reachable, and volunteering (D-002).
-    Volunteer,
-    /// Behind NAT, or the user declined. Accepts no reservations.
+    /// Volunteering (D-002), if and when AutoNAT says this client is reachable.
     ///
-    /// A relay behind NAT is worse than no relay: it advertises a way through
-    /// and is not one, so every peer that picks it has spent an attempt for
-    /// nothing.
-    None,
+    /// Carries capacity from the start. Whether that capacity is ever *announced*
+    /// is a separate decision made later, and it is the announcement that would
+    /// do harm from behind a NAT.
+    Volunteer,
+    /// The user declined to relay at all.
+    ///
+    /// Zero capacity, so a reservation is refused even if this client turns out
+    /// to be reachable. This is a preference, not a reachability finding.
+    Declined,
 }
 
 /// How long a relayed circuit may live.
@@ -127,12 +141,11 @@ impl Default for Topics {
 /// What a node needs to know before it starts.
 pub struct NodeConfig {
     pub identity: identity::Keypair,
-    /// Whether to accept other people's circuits (D-002).
+    /// Whether this client is willing to relay at all (D-002).
     ///
-    /// Starts as [`RelayRole::None`] and is raised once AutoNAT confirms this
-    /// client is reachable — never assumed from a configuration file, because a
-    /// user who is wrong about their own NAT would advertise a way through that
-    /// is not one.
+    /// A **preference**, not a reachability finding. Reachability is AutoNAT's
+    /// and it gates the announce rather than the capacity; see the module
+    /// documentation for why the two were separated.
     pub relay_role: RelayRole,
 }
 
@@ -296,7 +309,7 @@ pub fn relay_config(role: RelayRole) -> relay::Config {
             max_circuit_bytes: RELAY_MAX_CIRCUIT_BYTES,
             ..Default::default()
         },
-        RelayRole::None => relay::Config {
+        RelayRole::Declined => relay::Config {
             max_reservations: 0,
             max_reservations_per_peer: 0,
             max_circuits: 0,
@@ -321,17 +334,17 @@ mod tests {
     async fn the_node_builds() {
         let swarm = build(NodeConfig {
             identity: keypair(),
-            relay_role: RelayRole::None,
+            relay_role: RelayRole::Declined,
         })
         .expect("the stack builds");
         assert_eq!(swarm.connected_peers().count(), 0);
     }
 
-    /// D-002, and the honest form of declining: a client behind NAT accepts no
-    /// reservations at all rather than accepting ones it cannot honour.
+    /// A user who declines to relay accepts nothing, whatever AutoNAT later
+    /// says. That is a preference and it outranks a measurement.
     #[test]
-    fn a_client_behind_nat_advertises_no_way_through() {
-        let off = relay_config(RelayRole::None);
+    fn a_client_that_declined_accepts_no_reservations() {
+        let off = relay_config(RelayRole::Declined);
         assert_eq!(off.max_reservations, 0);
         assert_eq!(off.max_circuits, 0);
         assert_eq!(off.max_circuits_per_peer, 0);

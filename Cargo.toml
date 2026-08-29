@@ -66,7 +66,7 @@ rust-embed  = "8.12.0"
 image       = { version = "0.25.10", default-features = false, features = ["png"] }
 
 # --- runtime --------------------------------------------------------------
-tokio   = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio   = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 futures = "0.3"
 # Present only because libp2p-autonat needs rand_core 0.6's OsRng. Our own
 # code must never draw cryptographic randomness from it - spec section 7
