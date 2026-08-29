@@ -1,2 +1,1080 @@
-//! The GossipSub lobby: signed table advertisements, snapshot sync for a newly
-//! joined client, heartbeat and TTL.
+//! The lobby: signed table advertisements, and what a receiver does with one.
+//!
+//! `PROTOCOL.md` §7. This is the half of discovery that answers **what tables
+//! are open**; [`super::dht`] answers *where to try*, and neither does the
+//! other's job.
+//!
+//! # The admission rules are the joiner's, and that is the point
+//!
+//! Every value in an advert is the **founder's**, signed into
+//! `table_params_hash`. A founder who wants a table where nothing can ever be
+//! won needs no attack — only a small number in one field. So the checks below
+//! run at the joiner, before the advert is shown to a user or stored, and a
+//! client that joins anyway and applies its own bound locally has made two peers
+//! disagree about whether a hand aborted, which §8.2 classes as a consensus
+//! fault.
+//!
+//! # Rule 3, and why an unknown preset name is refused rather than ignored
+//!
+//! `preset_id` is a **closed two-value enum**. `RATED_SNG_POKERTH_V1` asserts
+//! §13's exact values or the advert is a lie about what game is being offered;
+//! `CUSTOM` asserts nothing and carries every value in its own fields.
+//!
+//! **Any third value is rejected on sight, whether or not this client recognises
+//! the name.** A receiver that accepts an unknown name has accepted a table
+//! whose identity it cannot check: the name asserts values by this very rule,
+//! the advert asserts values in its fields, and nothing says the two agree. Two
+//! clients shipping different tables under one name is a defect this project has
+//! already produced twice — `hand_deadline_ms` alone is signed into
+//! `table_params_hash`, so they cannot join each other and neither can say why.
+//!
+//! # Rule 7, and the difference between a stale advert and a changed table
+//!
+//! Rule 6 compares two adverts on their timestamp and on nothing else, which
+//! blunts replay. It does not stop a founder re-signing with a different
+//! `small_blind` and handing two joiners two **rule sets** — and that forks
+//! `HAND_INIT`, a collective stage whose bodies must be byte-identical.
+//!
+//! So an advert whose parameters changed under a live one is discarded **and the
+//! table is marked unjoinable**. A founder who wants to change the game forms a
+//! new table under a new key, which is what changing the game means.
+
+use std::collections::BTreeMap;
+
+use crate::poker::state::Hash;
+use crate::protocol::constants::{
+    hand_deadline_min_ms, PresetId, AD_TTL_MS, HAND_DEADLINE_CAP_MS, MAX_ADS_PER_PEER_PER_MIN,
+    MAX_ADS_PER_TABLE_KEY_PER_MIN, MAX_AD_LIFETIME_MS, MAX_CLOCK_SKEW_MS, MAX_SEATS,
+    MAX_TRACKED_TABLES, RATED_HAND_DEADLINE_MS, RATED_START_STACK,
+};
+
+/// The deck suite version 1 speaks, and the only one.
+pub const DECK_SUITE_V1: &str = "bs-bg12-secp256k1/1";
+
+/// What kind of game an advert offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    CashPlayMoney,
+    TournamentSngPlayMoney,
+}
+
+impl Mode {
+    pub const fn code(self) -> u16 {
+        match self {
+            Mode::CashPlayMoney => 1,
+            Mode::TournamentSngPlayMoney => 2,
+        }
+    }
+
+    pub fn parse(code: u16) -> Option<Mode> {
+        match code {
+            1 => Some(Mode::CashPlayMoney),
+            2 => Some(Mode::TournamentSngPlayMoney),
+            _ => None,
+        }
+    }
+
+    /// A tournament pays every entrant the same stack, so the buy-in **is** the
+    /// stack.
+    pub const fn is_tournament(self) -> bool {
+        matches!(self, Mode::TournamentSngPlayMoney)
+    }
+}
+
+/// §7.2's blind schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlindSchedule {
+    /// `1` = `DOUBLE_EVERY_N_HANDS`, and nothing else in version 1.
+    pub mode: u16,
+    pub every_n_hands: u16,
+    pub first_small_blind: u64,
+    pub small_blind_cap: u64,
+}
+
+/// A table advertisement, as §7.2 defines it.
+///
+/// The envelope's `table_id` is the unchained sentinel; the advert's identity is
+/// its **signing key**, which is the table's public key. That is why there is no
+/// `table_id` field here: an advert that carried one could disagree with the key
+/// that signed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableAd {
+    pub game: u16,
+    pub mode: u16,
+    pub preset_id: String,
+    pub table_name: String,
+    pub small_blind: u64,
+    pub big_blind: u64,
+    pub ante: u64,
+    pub min_buyin: u64,
+    pub max_buyin: u64,
+    pub start_stack: u64,
+    pub players: u8,
+    pub max_players: u8,
+    pub min_players_to_start: u8,
+    pub blind_schedule: BlindSchedule,
+    pub action_timeout_ms: u32,
+    pub action_grace_ms: u32,
+    pub crypto_step_timeout_ms: u32,
+    pub hand_deadline_ms: u32,
+    pub join_deadline_ms: u32,
+    pub hand_delay_ms: u32,
+    pub button_rule: u16,
+    pub odd_chip_rule: u16,
+    pub showdown_policy: u16,
+    pub password_required: bool,
+    pub deck_suite: String,
+    pub founder_app_key: [u8; 32],
+    pub founder_peer_id: Vec<u8>,
+    pub timestamp_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+/// Why an advert was not admitted.
+///
+/// Each variant names the §7.2 rule it comes from, because the rules are cited
+/// by number across the corpus and a message that says only "invalid" costs the
+/// next reader the walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdRejected {
+    /// Rule 2: a numeric range, `big_blind == 2 * small_blind`, the buy-in
+    /// ordering, the seat bounds, or the tournament buy-in identity.
+    Range(&'static str),
+    /// Rule 2a: below the **derived** whole-hand deadline minimum.
+    ///
+    /// The one range check that is not a literal. Below the floor, every legal
+    /// hand at this table aborts on its own deadline with nobody named; between
+    /// the floor and the minimum the table buys the walk and no reopening, so the
+    /// **first re-raise** reaches that same abort.
+    DeadlineTooShort { given: u32, minimum: u64 },
+    /// Rule 3: a `preset_id` that is neither of the two, or a named preset whose
+    /// values are not the preset's.
+    Preset(&'static str),
+    /// Rule 4: a deck suite this client does not speak.
+    UnknownDeckSuite,
+    /// Rule 5: an expiry beyond the lifetime cap, or a timestamp too far ahead.
+    Timing(&'static str),
+    /// The name or another display field is not something this client will show.
+    Display(&'static str),
+}
+
+/// §7.2 rules 2, 2a, 3, 4 and 5.
+///
+/// Rule 1 — `verify_strict` under the sending key — belongs to the signature
+/// layer and has run before this is called. Rules 6 and 7 need the advert this
+/// client already holds and are [`LobbyStore`]'s.
+pub fn admit(ad: &TableAd, now_unix_ms: u64) -> Result<(), AdRejected> {
+    // ---- rule 3 first, because it decides what the rest must equal ---------
+    let preset = PresetId::parse(&ad.preset_id).ok_or(AdRejected::Preset(
+        "preset_id is a closed two-value enum; a third name is rejected on sight",
+    ))?;
+
+    // ---- rule 4 ------------------------------------------------------------
+    if ad.deck_suite != DECK_SUITE_V1 {
+        return Err(AdRejected::UnknownDeckSuite);
+    }
+
+    // ---- display bounds ----------------------------------------------------
+    if ad.table_name.len() > 64 {
+        return Err(AdRejected::Display("table_name is over 64 bytes"));
+    }
+    if ad.table_name.chars().any(|c| c.is_control()) {
+        return Err(AdRejected::Display("table_name holds a control character"));
+    }
+    if ad.founder_peer_id.len() > 42 {
+        return Err(AdRejected::Display("founder_peer_id is over 42 bytes"));
+    }
+
+    // ---- rule 2 ------------------------------------------------------------
+    let mode = Mode::parse(ad.mode).ok_or(AdRejected::Range("mode is not a version 1 mode"))?;
+    if ad.game != 1 {
+        return Err(AdRejected::Range("game is not NLHE"));
+    }
+    if ad.small_blind < 1 {
+        return Err(AdRejected::Range("small_blind is below 1"));
+    }
+    if ad.big_blind != 2 * ad.small_blind {
+        return Err(AdRejected::Range("big_blind is not twice small_blind"));
+    }
+    if ad.ante != 0 {
+        return Err(AdRejected::Range("ante is not 0 in version 1"));
+    }
+    if ad.small_blind != ad.blind_schedule.first_small_blind {
+        return Err(AdRejected::Range(
+            "small_blind is not the schedule's first level",
+        ));
+    }
+    if ad.min_buyin < ad.big_blind {
+        return Err(AdRejected::Range("min_buyin is below one big blind"));
+    }
+    if ad.max_buyin < ad.min_buyin {
+        return Err(AdRejected::Range("max_buyin is below min_buyin"));
+    }
+    if !(2..=MAX_SEATS).contains(&ad.max_players) {
+        return Err(AdRejected::Range("max_players is outside 2 to 10"));
+    }
+    if ad.min_players_to_start < 2 || ad.min_players_to_start > ad.max_players {
+        return Err(AdRejected::Range(
+            "min_players_to_start is outside 2 to max_players",
+        ));
+    }
+    if ad.players > ad.max_players {
+        return Err(AdRejected::Range("players exceeds max_players"));
+    }
+    if mode.is_tournament() {
+        // A tournament pays every entrant the same stack, so the buy-in is the
+        // stack. Without this the two buy-in fields are free parts of
+        // `table_params_hash` that a named configuration has to pin one at a
+        // time, which is how `G7-S3` happened.
+        if ad.min_buyin != ad.start_stack || ad.max_buyin != ad.start_stack {
+            return Err(AdRejected::Range(
+                "a tournament buy-in is the start stack, both bounds",
+            ));
+        }
+    } else if ad.start_stack != 0 {
+        return Err(AdRejected::Range("start_stack is set on a cash table"));
+    }
+    if !(5_000..=300_000).contains(&ad.action_timeout_ms) {
+        return Err(AdRejected::Range("action_timeout_ms is outside 5s to 300s"));
+    }
+    if ad.action_grace_ms > 30_000 {
+        return Err(AdRejected::Range("action_grace_ms is over 30s"));
+    }
+    if !(1_000..=120_000).contains(&ad.crypto_step_timeout_ms) {
+        return Err(AdRejected::Range(
+            "crypto_step_timeout_ms is outside 1s to 120s",
+        ));
+    }
+    if ad.join_deadline_ms as u64 > HAND_DEADLINE_CAP_MS {
+        return Err(AdRejected::Range("join_deadline_ms is over an hour"));
+    }
+    if ad.hand_delay_ms > 60_000 {
+        return Err(AdRejected::Range("hand_delay_ms is over 60s"));
+    }
+    if ad.button_rule != 1 {
+        return Err(AdRejected::Range("button_rule is not DEAD_BUTTON"));
+    }
+    if ad.odd_chip_rule != 1 {
+        return Err(AdRejected::Range(
+            "odd_chip_rule is not FIRST_SEAT_LEFT_OF_BUTTON",
+        ));
+    }
+    if !(1..=2).contains(&ad.showdown_policy) {
+        return Err(AdRejected::Range("showdown_policy is not 1 or 2"));
+    }
+    if ad.blind_schedule.mode != 1 {
+        return Err(AdRejected::Range(
+            "blind schedule mode is not DOUBLE_EVERY_N_HANDS",
+        ));
+    }
+    if ad.blind_schedule.small_blind_cap < ad.blind_schedule.first_small_blind {
+        return Err(AdRejected::Range("the blind cap is below the first level"));
+    }
+
+    // ---- rule 2a: the derived bound ---------------------------------------
+    if ad.hand_deadline_ms as u64 > HAND_DEADLINE_CAP_MS {
+        return Err(AdRejected::Range("hand_deadline_ms is over an hour"));
+    }
+    let minimum = hand_deadline_min_ms(
+        ad.max_players,
+        ad.action_timeout_ms as u64,
+        ad.action_grace_ms as u64,
+        ad.crypto_step_timeout_ms as u64,
+        ad.hand_delay_ms as u64,
+    );
+    if (ad.hand_deadline_ms as u64) < minimum {
+        return Err(AdRejected::DeadlineTooShort {
+            given: ad.hand_deadline_ms,
+            minimum,
+        });
+    }
+
+    // ---- rule 3's second half: a name asserts values -----------------------
+    if preset == PresetId::RatedSngPokerthV1 {
+        rated_values_match(ad)?;
+    }
+
+    // ---- rule 5 ------------------------------------------------------------
+    if ad.expires_at_unix_ms <= ad.timestamp_unix_ms {
+        return Err(AdRejected::Timing("expires_at is not after timestamp"));
+    }
+    if ad.expires_at_unix_ms > now_unix_ms.saturating_add(MAX_AD_LIFETIME_MS) {
+        // Without this bound a malicious peer pins a table into every lobby
+        // forever, which is free spam.
+        return Err(AdRejected::Timing(
+            "expires_at is more than the lifetime cap ahead of local time",
+        ));
+    }
+    if ad.timestamp_unix_ms > now_unix_ms.saturating_add(MAX_CLOCK_SKEW_MS) {
+        return Err(AdRejected::Timing("timestamp is too far in the future"));
+    }
+
+    Ok(())
+}
+
+/// The named preset asserts §13's values, so they are checked.
+///
+/// A preset name that does not carry the preset's values is a lie about what
+/// game is being offered, and it is the failure this project has shipped twice.
+fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
+    let expected: [(&'static str, u64, u64); 11] = [
+        ("mode", ad.mode as u64, Mode::TournamentSngPlayMoney.code() as u64),
+        ("max_players", ad.max_players as u64, 10),
+        ("min_players_to_start", ad.min_players_to_start as u64, 10),
+        ("start_stack", ad.start_stack, RATED_START_STACK),
+        ("small_blind", ad.small_blind, 50),
+        ("ante", ad.ante, 0),
+        ("every_n_hands", ad.blind_schedule.every_n_hands as u64, 11),
+        ("small_blind_cap", ad.blind_schedule.small_blind_cap, 50_000),
+        ("action_timeout_ms", ad.action_timeout_ms as u64, 20_000),
+        ("action_grace_ms", ad.action_grace_ms as u64, 5_000),
+        (
+            "hand_deadline_ms",
+            ad.hand_deadline_ms as u64,
+            RATED_HAND_DEADLINE_MS,
+        ),
+    ];
+    for (name, got, want) in expected {
+        if got != want {
+            return Err(AdRejected::Preset(match name {
+                "mode" => "the rated preset is a tournament",
+                "max_players" => "the rated preset seats ten",
+                "min_players_to_start" => "the rated preset starts at ten",
+                "start_stack" => "the rated preset starts every seat with 10 000",
+                "small_blind" => "the rated preset opens at 50",
+                "ante" => "the rated preset has no ante",
+                "every_n_hands" => "the rated preset raises every 11 hands",
+                "small_blind_cap" => "the rated preset caps the small blind at 50 000",
+                "action_timeout_ms" => "the rated preset gives 20 s to act",
+                "action_grace_ms" => "the rated preset gives 5 s of grace",
+                _ => "the rated preset's whole-hand deadline is 3 300 000 ms",
+            }));
+        }
+    }
+    if ad.crypto_step_timeout_ms != 30_000 {
+        return Err(AdRejected::Preset(
+            "the rated preset gives 30 s to a cryptographic step",
+        ));
+    }
+    if ad.hand_delay_ms != 7_000 {
+        return Err(AdRejected::Preset("the rated preset pauses 7 s between hands"));
+    }
+    Ok(())
+}
+
+/// One advertisement this client is holding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub ad: TableAd,
+    /// The parameter hash rule 7 compares against.
+    pub params_hash: Hash,
+    /// When this client accepted it, by its own clock. A local view, never
+    /// canonical state.
+    pub received_at_ms: u64,
+    /// The founder changed the game under a live advert. The table stays visible
+    /// and is not joinable.
+    pub unjoinable: bool,
+}
+
+/// Why a re-broadcast was not taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotTaken {
+    /// Rule 6: not newer than the advert already held.
+    NotNewer,
+    /// Rule 7: the parameters changed under a live advert. The table is now
+    /// marked unjoinable, and this is not a rejection of the advert so much as a
+    /// finding about the table.
+    ParametersChanged,
+    /// The lobby is full. A bound, because the advert stream is open to
+    /// strangers.
+    LobbyFull,
+}
+
+/// One row of the lobby, as a caller reads it.
+///
+/// A named pair rather than a tuple, because the key is the table's identity and
+/// a caller that had to remember which half of a tuple that was would eventually
+/// get it wrong.
+#[derive(Debug, Clone, Copy)]
+pub struct Listing<'a> {
+    pub key: &'a [u8; 32],
+    pub held: &'a Held,
+}
+
+/// The table adverts this client holds.
+#[derive(Debug, Clone, Default)]
+pub struct LobbyStore {
+    tables: BTreeMap<[u8; 32], Held>,
+}
+
+impl LobbyStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take an advert that has passed [`admit`] and its signature check.
+    ///
+    /// `table_key` is the key that signed it, which **is** the table's identity.
+    pub fn offer(
+        &mut self,
+        table_key: [u8; 32],
+        ad: TableAd,
+        params_hash: Hash,
+        now_ms: u64,
+    ) -> Result<(), NotTaken> {
+        match self.tables.get_mut(&table_key) {
+            Some(held) => {
+                // Rule 6.
+                if ad.timestamp_unix_ms <= held.ad.timestamp_unix_ms {
+                    return Err(NotTaken::NotNewer);
+                }
+                // Rule 7. The advert is discarded and the table is marked, which
+                // is the whole remedy: a table whose parameters changed under a
+                // live advert is not one this client can join safely.
+                if params_hash != held.params_hash {
+                    held.unjoinable = true;
+                    return Err(NotTaken::ParametersChanged);
+                }
+                held.ad = ad;
+                held.received_at_ms = now_ms;
+                Ok(())
+            }
+            None => {
+                if self.tables.len() >= MAX_TRACKED_TABLES {
+                    return Err(NotTaken::LobbyFull);
+                }
+                self.tables.insert(
+                    table_key,
+                    Held {
+                        ad,
+                        params_hash,
+                        received_at_ms: now_ms,
+                        unjoinable: false,
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Drop adverts that have gone quiet or expired.
+    ///
+    /// Two clocks, deliberately: the founder's `expires_at`, which is what the
+    /// table itself claims, and this client's own TTL since it last heard a
+    /// re-broadcast. A table whose founder went away without withdrawing its
+    /// advert is caught by the second even though the first has not lapsed.
+    pub fn expire(&mut self, now_ms: u64) -> usize {
+        let before = self.tables.len();
+        self.tables.retain(|_, h| {
+            let claimed_alive = h.ad.expires_at_unix_ms > now_ms;
+            let heard_recently = now_ms.saturating_sub(h.received_at_ms) < AD_TTL_MS;
+            claimed_alive && heard_recently
+        });
+        before - self.tables.len()
+    }
+
+    /// Withdraw a table, on a `LOBBY_TABLE_REMOVE` from its own key.
+    pub fn remove(&mut self, table_key: &[u8; 32]) -> bool {
+        self.tables.remove(table_key).is_some()
+    }
+
+    pub fn get(&self, table_key: &[u8; 32]) -> Option<&Held> {
+        self.tables.get(table_key)
+    }
+
+    /// Every table, in key order.
+    pub fn tables(&self) -> impl Iterator<Item = Listing<'_>> {
+        self.tables.iter().map(|(k, h)| Listing { key: k, held: h })
+    }
+
+    /// The tables a user may actually sit at.
+    pub fn joinable(&self) -> impl Iterator<Item = Listing<'_>> {
+        self.tables()
+            .filter(|listing| !listing.held.unjoinable)
+    }
+
+    pub fn len(&self) -> usize {
+        self.tables.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tables.is_empty()
+    }
+}
+
+/// §7.6's per-peer rate limits, as a sliding count over one minute.
+///
+/// Two separate limits because they answer different questions: how often one
+/// **peer** may speak at all, and how often one **table key** may re-advertise.
+/// A peer relaying a busy lobby is legitimate; a table key re-signing four times
+/// a minute is not.
+#[derive(Debug, Clone, Default)]
+pub struct RateLimiter {
+    per_peer: BTreeMap<[u8; 32], Window>,
+    per_table: BTreeMap<[u8; 32], Window>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Window {
+    started_ms: u64,
+    count: u32,
+}
+
+impl Window {
+    fn admit(&mut self, now_ms: u64, cap: u32) -> bool {
+        if now_ms.saturating_sub(self.started_ms) >= 60_000 {
+            self.started_ms = now_ms;
+            self.count = 0;
+        }
+        if self.count >= cap {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
+
+impl RateLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether an advert from this peer, for this table key, may be processed.
+    ///
+    /// Checked **before** the signature, which is the expensive part: a limiter
+    /// that ran after verification would let a peer spend this client's CPU at
+    /// will, which is the thing the limit exists to prevent.
+    pub fn admit_ad(&mut self, peer: [u8; 32], table_key: [u8; 32], now_ms: u64) -> bool {
+        // Both are charged, and the peer's is charged first so that a peer
+        // cannot spread its budget over many table keys.
+        let peer_ok = self
+            .per_peer
+            .entry(peer)
+            .or_default()
+            .admit(now_ms, MAX_ADS_PER_PEER_PER_MIN);
+        if !peer_ok {
+            return false;
+        }
+        self.per_table
+            .entry(table_key)
+            .or_default()
+            .admit(now_ms, MAX_ADS_PER_TABLE_KEY_PER_MIN)
+    }
+
+    /// Forget windows nothing has used for a while, so the limiter is not itself
+    /// a growth surface.
+    pub fn sweep(&mut self, now_ms: u64) {
+        let stale = |w: &Window| now_ms.saturating_sub(w.started_ms) >= 120_000;
+        self.per_peer.retain(|_, w| !stale(w));
+        self.per_table.retain(|_, w| !stale(w));
+    }
+
+    pub fn tracked(&self) -> (usize, usize) {
+        (self.per_peer.len(), self.per_table.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 1_700_000_000_000;
+
+    /// One named change to an otherwise legal advert.
+    type Mutation = (&'static str, Box<dyn Fn(&mut TableAd)>);
+
+    fn custom_ad() -> TableAd {
+        TableAd {
+            game: 1,
+            mode: Mode::CashPlayMoney.code(),
+            preset_id: "CUSTOM".into(),
+            table_name: "Kitchen table".into(),
+            small_blind: 10,
+            big_blind: 20,
+            ante: 0,
+            min_buyin: 200,
+            max_buyin: 2_000,
+            start_stack: 0,
+            players: 2,
+            max_players: 6,
+            min_players_to_start: 2,
+            blind_schedule: BlindSchedule {
+                mode: 1,
+                every_n_hands: 20,
+                first_small_blind: 10,
+                small_blind_cap: 1_000,
+            },
+            action_timeout_ms: 20_000,
+            action_grace_ms: 5_000,
+            crypto_step_timeout_ms: 30_000,
+            hand_deadline_ms: 0, // filled in below
+            join_deadline_ms: 120_000,
+            hand_delay_ms: 7_000,
+            button_rule: 1,
+            odd_chip_rule: 1,
+            showdown_policy: 1,
+            password_required: false,
+            deck_suite: DECK_SUITE_V1.into(),
+            founder_app_key: [7u8; 32],
+            founder_peer_id: vec![1, 2, 3],
+            timestamp_unix_ms: NOW,
+            expires_at_unix_ms: NOW + 90_000,
+        }
+    }
+
+    /// A `CUSTOM` advert with a legal deadline for its own shape.
+    fn legal_custom() -> TableAd {
+        let mut ad = custom_ad();
+        ad.hand_deadline_ms = hand_deadline_min_ms(
+            ad.max_players,
+            ad.action_timeout_ms as u64,
+            ad.action_grace_ms as u64,
+            ad.crypto_step_timeout_ms as u64,
+            ad.hand_delay_ms as u64,
+        ) as u32;
+        ad
+    }
+
+    fn rated_ad() -> TableAd {
+        let mut ad = legal_custom();
+        ad.preset_id = "RATED_SNG_POKERTH_V1".into();
+        ad.mode = Mode::TournamentSngPlayMoney.code();
+        ad.max_players = 10;
+        ad.min_players_to_start = 10;
+        ad.players = 0;
+        ad.start_stack = RATED_START_STACK;
+        ad.min_buyin = RATED_START_STACK;
+        ad.max_buyin = RATED_START_STACK;
+        ad.small_blind = 50;
+        ad.big_blind = 100;
+        ad.blind_schedule = BlindSchedule {
+            mode: 1,
+            every_n_hands: 11,
+            first_small_blind: 50,
+            small_blind_cap: 50_000,
+        };
+        ad.action_timeout_ms = 20_000;
+        ad.action_grace_ms = 5_000;
+        ad.crypto_step_timeout_ms = 30_000;
+        ad.hand_delay_ms = 7_000;
+        ad.hand_deadline_ms = RATED_HAND_DEADLINE_MS as u32;
+        ad
+    }
+
+    #[test]
+    fn an_honest_advert_is_admitted() {
+        assert_eq!(admit(&legal_custom(), NOW), Ok(()));
+        assert_eq!(admit(&rated_ad(), NOW), Ok(()));
+    }
+
+    /// Rule 3, and the half that matters: a **third** name is rejected on sight,
+    /// whether or not this client recognises it. A receiver that accepted one
+    /// would have accepted a table whose identity it cannot check.
+    #[test]
+    fn a_third_preset_name_is_refused_even_if_it_looks_familiar() {
+        for name in [
+            "HEADS_UP_CUSTOM_2P", // a name this very repository uses
+            "RATED_SNG_POKERTH_V2",
+            "rated_sng_pokerth_v1", // case matters
+            "",
+        ] {
+            let mut ad = legal_custom();
+            ad.preset_id = name.into();
+            assert!(
+                matches!(admit(&ad, NOW), Err(AdRejected::Preset(_))),
+                "{name} was admitted"
+            );
+        }
+    }
+
+    /// Rule 3's other half: a named preset that does not carry the preset's
+    /// values is a lie about what game is being offered. `hand_deadline_ms`
+    /// alone is signed into `table_params_hash`, so two clients disagreeing
+    /// about it cannot join each other and neither can say why.
+    #[test]
+    fn a_rated_advert_must_carry_the_rated_values() {
+        let mutations: Vec<Mutation> = vec![
+            (
+                "hand_deadline_ms",
+                Box::new(|a: &mut TableAd| a.hand_deadline_ms = 2_700_000),
+            ),
+            (
+                // Both, so the advert stays internally consistent and only the
+                // preset rule can catch it. Changing one alone trips rule 2
+                // first and would have tested the wrong thing.
+                "max_players",
+                Box::new(|a: &mut TableAd| {
+                    a.max_players = 6;
+                    a.min_players_to_start = 6;
+                }),
+            ),
+            (
+                "small_blind",
+                Box::new(|a: &mut TableAd| {
+                    a.small_blind = 25;
+                    a.big_blind = 50;
+                    a.blind_schedule.first_small_blind = 25;
+                }),
+            ),
+            (
+                "every_n_hands",
+                Box::new(|a: &mut TableAd| a.blind_schedule.every_n_hands = 10),
+            ),
+            (
+                "start_stack",
+                Box::new(|a: &mut TableAd| {
+                    a.start_stack = 5_000;
+                    a.min_buyin = 5_000;
+                    a.max_buyin = 5_000;
+                }),
+            ),
+            (
+                "crypto_step_timeout_ms",
+                Box::new(|a: &mut TableAd| a.crypto_step_timeout_ms = 20_000),
+            ),
+        ];
+        for (what, mutate) in mutations {
+            let mut ad = rated_ad();
+            mutate(&mut ad);
+            assert!(
+                matches!(admit(&ad, NOW), Err(AdRejected::Preset(_))),
+                "a rated advert with the wrong {what} was admitted"
+            );
+        }
+    }
+
+    /// Rule 2a, the one derived bound. Below it every legal hand at this table
+    /// aborts on its own deadline with nobody named — a founder who wants a table
+    /// where nothing can ever be won needs no attack, only a small number.
+    #[test]
+    fn a_deadline_below_the_derived_minimum_is_refused() {
+        let mut ad = legal_custom();
+        let minimum = hand_deadline_min_ms(
+            ad.max_players,
+            ad.action_timeout_ms as u64,
+            ad.action_grace_ms as u64,
+            ad.crypto_step_timeout_ms as u64,
+            ad.hand_delay_ms as u64,
+        );
+        assert!(minimum > 0);
+
+        ad.hand_deadline_ms = (minimum - 1) as u32;
+        assert_eq!(
+            admit(&ad, NOW),
+            Err(AdRejected::DeadlineTooShort {
+                given: (minimum - 1) as u32,
+                minimum
+            })
+        );
+
+        ad.hand_deadline_ms = minimum as u32;
+        assert_eq!(admit(&ad, NOW), Ok(()), "and exactly the minimum is legal");
+    }
+
+    /// The bound is a function of the advert's own shape, not a constant. A
+    /// value legal at two seats is not legal at ten, which is the whole reason
+    /// it is derived.
+    #[test]
+    fn the_minimum_moves_with_the_table() {
+        let mut small = legal_custom();
+        small.max_players = 2;
+        small.min_players_to_start = 2;
+        let at_two = hand_deadline_min_ms(2, 20_000, 5_000, 30_000, 7_000);
+        let at_ten = hand_deadline_min_ms(10, 20_000, 5_000, 30_000, 7_000);
+        assert!(at_ten > at_two, "more seats, more time");
+
+        small.hand_deadline_ms = at_two as u32;
+        assert_eq!(admit(&small, NOW), Ok(()));
+
+        let mut big = legal_custom();
+        big.max_players = 10;
+        big.hand_deadline_ms = at_two as u32;
+        assert!(matches!(
+            admit(&big, NOW),
+            Err(AdRejected::DeadlineTooShort { .. })
+        ));
+    }
+
+    /// Rule 5's first half. Without it a malicious peer pins a table into every
+    /// lobby forever, which is free spam.
+    #[test]
+    fn an_advert_cannot_pin_itself_into_the_lobby() {
+        let mut ad = legal_custom();
+        ad.expires_at_unix_ms = NOW + MAX_AD_LIFETIME_MS + 1;
+        assert!(matches!(admit(&ad, NOW), Err(AdRejected::Timing(_))));
+
+        ad.expires_at_unix_ms = NOW + MAX_AD_LIFETIME_MS;
+        assert_eq!(admit(&ad, NOW), Ok(()));
+
+        ad.expires_at_unix_ms = ad.timestamp_unix_ms;
+        assert!(matches!(admit(&ad, NOW), Err(AdRejected::Timing(_))));
+    }
+
+    #[test]
+    fn an_advert_from_the_future_is_refused() {
+        let mut ad = legal_custom();
+        ad.timestamp_unix_ms = NOW + MAX_CLOCK_SKEW_MS + 1;
+        ad.expires_at_unix_ms = ad.timestamp_unix_ms + 1;
+        assert!(matches!(admit(&ad, NOW), Err(AdRejected::Timing(_))));
+    }
+
+    /// Rule 2's arithmetic, one field at a time. Each of these is a table that
+    /// could not be played.
+    #[test]
+    fn the_numeric_rules_hold() {
+        let cases: Vec<Mutation> = vec![
+            ("big blind", Box::new(|a: &mut TableAd| a.big_blind = 30)),
+            ("zero small blind", Box::new(|a: &mut TableAd| { a.small_blind = 0; a.big_blind = 0; a.blind_schedule.first_small_blind = 0; })),
+            ("schedule disagrees", Box::new(|a: &mut TableAd| a.blind_schedule.first_small_blind = 5)),
+            ("buyin order", Box::new(|a: &mut TableAd| a.max_buyin = 100)),
+            ("eleven seats", Box::new(|a: &mut TableAd| a.max_players = 11)),
+            ("one seat", Box::new(|a: &mut TableAd| { a.max_players = 1; a.min_players_to_start = 1; })),
+            ("start above max", Box::new(|a: &mut TableAd| a.min_players_to_start = 7)),
+            ("players above max", Box::new(|a: &mut TableAd| a.players = 7)),
+            ("an ante", Box::new(|a: &mut TableAd| a.ante = 5)),
+            ("not NLHE", Box::new(|a: &mut TableAd| a.game = 2)),
+            ("stack on cash", Box::new(|a: &mut TableAd| a.start_stack = 1_000)),
+            ("a four second clock", Box::new(|a: &mut TableAd| a.action_timeout_ms = 4_999)),
+            ("a live button rule", Box::new(|a: &mut TableAd| a.button_rule = 2)),
+            ("an odd chip rule", Box::new(|a: &mut TableAd| a.odd_chip_rule = 2)),
+            ("a third showdown policy", Box::new(|a: &mut TableAd| a.showdown_policy = 3)),
+            ("a schedule mode", Box::new(|a: &mut TableAd| a.blind_schedule.mode = 2)),
+            ("a cap below the first level", Box::new(|a: &mut TableAd| a.blind_schedule.small_blind_cap = 1)),
+        ];
+        for (what, mutate) in cases {
+            let mut ad = legal_custom();
+            mutate(&mut ad);
+            assert!(admit(&ad, NOW).is_err(), "{what} was admitted");
+        }
+    }
+
+    /// A tournament pays every entrant the same stack, so the buy-in **is** the
+    /// stack. Without the rule the two buy-in fields are free parts of
+    /// `table_params_hash` that a named configuration has to pin one at a time.
+    #[test]
+    fn a_tournament_buyin_is_the_stack() {
+        let mut ad = legal_custom();
+        ad.mode = Mode::TournamentSngPlayMoney.code();
+        ad.start_stack = 5_000;
+        ad.min_buyin = 5_000;
+        ad.max_buyin = 5_000;
+        assert_eq!(admit(&ad, NOW), Ok(()));
+
+        ad.max_buyin = 6_000;
+        assert!(matches!(admit(&ad, NOW), Err(AdRejected::Range(_))));
+    }
+
+    #[test]
+    fn an_unknown_deck_suite_is_refused() {
+        let mut ad = legal_custom();
+        ad.deck_suite = "bs-bg12-secp256k1/2".into();
+        assert_eq!(admit(&ad, NOW), Err(AdRejected::UnknownDeckSuite));
+    }
+
+    #[test]
+    fn a_display_field_is_bounded_and_printable() {
+        let mut ad = legal_custom();
+        ad.table_name = "x".repeat(65);
+        assert!(matches!(admit(&ad, NOW), Err(AdRejected::Display(_))));
+
+        let mut ad = legal_custom();
+        ad.table_name = "line\u{0}break".into();
+        assert!(matches!(admit(&ad, NOW), Err(AdRejected::Display(_))));
+
+        let mut ad = legal_custom();
+        ad.founder_peer_id = vec![0u8; 43];
+        assert!(matches!(admit(&ad, NOW), Err(AdRejected::Display(_))));
+    }
+
+    // -- the store ----------------------------------------------------------
+
+    fn h(b: u8) -> Hash {
+        [b; 32]
+    }
+
+    /// Rule 6: a stale advert is not a re-broadcast.
+    #[test]
+    fn an_older_advert_does_not_replace_a_newer_one() {
+        let mut store = LobbyStore::new();
+        let key = [1u8; 32];
+        let mut ad = legal_custom();
+        ad.timestamp_unix_ms = NOW + 1_000;
+        store.offer(key, ad.clone(), h(9), NOW).unwrap();
+
+        ad.timestamp_unix_ms = NOW;
+        assert_eq!(
+            store.offer(key, ad.clone(), h(9), NOW),
+            Err(NotTaken::NotNewer)
+        );
+        assert_eq!(
+            store.get(&key).unwrap().ad.timestamp_unix_ms,
+            NOW + 1_000
+        );
+    }
+
+    /// Rule 7, which is J1(b). Rule 6 compares two adverts on their timestamp
+    /// and nothing else, so nothing stopped a founder re-signing with a
+    /// different `small_blind` and handing two joiners two rule sets — which
+    /// forks `HAND_INIT`, a collective stage whose bodies must be byte-identical.
+    #[test]
+    fn a_table_whose_parameters_changed_becomes_unjoinable() {
+        let mut store = LobbyStore::new();
+        let key = [1u8; 32];
+        let mut ad = legal_custom();
+        store.offer(key, ad.clone(), h(1), NOW).unwrap();
+        assert_eq!(store.joinable().count(), 1);
+
+        ad.timestamp_unix_ms += 1;
+        ad.small_blind = 25;
+        assert_eq!(
+            store.offer(key, ad, h(2), NOW),
+            Err(NotTaken::ParametersChanged)
+        );
+
+        assert!(store.get(&key).unwrap().unjoinable);
+        assert_eq!(store.joinable().count(), 0, "and it stays visible");
+        assert_eq!(
+            store.get(&key).unwrap().ad.small_blind,
+            10,
+            "the changed advert was discarded, not applied"
+        );
+    }
+
+    /// A legitimate re-broadcast refreshes the advert and the clock.
+    #[test]
+    fn a_rebroadcast_refreshes_the_table() {
+        let mut store = LobbyStore::new();
+        let key = [1u8; 32];
+        let mut ad = legal_custom();
+        store.offer(key, ad.clone(), h(1), NOW).unwrap();
+
+        ad.timestamp_unix_ms += 30_000;
+        ad.players = 4;
+        store.offer(key, ad, h(1), NOW + 30_000).unwrap();
+
+        let held = store.get(&key).unwrap();
+        assert_eq!(held.ad.players, 4);
+        assert_eq!(held.received_at_ms, NOW + 30_000);
+        assert!(!held.unjoinable);
+    }
+
+    /// Two clocks: what the table claims, and how long since this client heard
+    /// from it. A founder that went away without withdrawing is caught by the
+    /// second even though the first has not lapsed.
+    #[test]
+    fn a_table_that_went_quiet_expires_even_before_it_claims_to() {
+        let mut store = LobbyStore::new();
+        let mut ad = legal_custom();
+        ad.expires_at_unix_ms = NOW + MAX_AD_LIFETIME_MS;
+        store.offer([1u8; 32], ad, h(1), NOW).unwrap();
+
+        assert_eq!(store.expire(NOW + AD_TTL_MS - 1), 0);
+        assert_eq!(store.expire(NOW + AD_TTL_MS), 1, "no re-broadcast heard");
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn an_expired_advert_goes_even_if_it_was_just_heard() {
+        let mut store = LobbyStore::new();
+        let mut ad = legal_custom();
+        ad.expires_at_unix_ms = NOW + 1_000;
+        store.offer([1u8; 32], ad, h(1), NOW).unwrap();
+        assert_eq!(store.expire(NOW + 2_000), 1);
+    }
+
+    /// The advert stream is open to strangers, so the lobby is bounded.
+    #[test]
+    fn the_lobby_is_bounded() {
+        let mut store = LobbyStore::new();
+        for i in 0..(MAX_TRACKED_TABLES + 10) as u32 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_be_bytes());
+            let r = store.offer(key, legal_custom(), h(1), NOW);
+            if i as usize >= MAX_TRACKED_TABLES {
+                assert_eq!(r, Err(NotTaken::LobbyFull));
+            } else {
+                assert_eq!(r, Ok(()));
+            }
+        }
+        assert_eq!(store.len(), MAX_TRACKED_TABLES);
+    }
+
+    #[test]
+    fn a_table_can_withdraw_itself() {
+        let mut store = LobbyStore::new();
+        store.offer([1u8; 32], legal_custom(), h(1), NOW).unwrap();
+        assert!(store.remove(&[1u8; 32]));
+        assert!(!store.remove(&[1u8; 32]));
+        assert!(store.is_empty());
+    }
+
+    // -- the rate limits ----------------------------------------------------
+
+    /// Charged before the signature check, which is the expensive part. A
+    /// limiter that ran after verification would let a peer spend this client's
+    /// CPU at will, which is the thing it exists to prevent.
+    #[test]
+    fn a_peer_cannot_flood_the_lobby() {
+        let mut rl = RateLimiter::new();
+        let peer = [1u8; 32];
+        let mut admitted = 0;
+        for i in 0..100u32 {
+            let mut table = [0u8; 32];
+            table[..4].copy_from_slice(&i.to_be_bytes());
+            if rl.admit_ad(peer, table, NOW) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, MAX_ADS_PER_PEER_PER_MIN,
+            "and a fresh table key each time does not buy more"
+        );
+    }
+
+    /// A peer relaying a busy lobby is legitimate; one table key re-signing five
+    /// times a minute is not. Two limits, two questions.
+    #[test]
+    fn one_table_key_cannot_resign_faster_than_the_cap() {
+        let mut rl = RateLimiter::new();
+        let table = [9u8; 32];
+        let mut admitted = 0;
+        for i in 0..20u32 {
+            let mut peer = [0u8; 32];
+            peer[..4].copy_from_slice(&i.to_be_bytes());
+            if rl.admit_ad(peer, table, NOW) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, MAX_ADS_PER_TABLE_KEY_PER_MIN,
+            "and relaying through fresh peers does not buy more"
+        );
+    }
+
+    #[test]
+    fn the_window_reopens_after_a_minute() {
+        let mut rl = RateLimiter::new();
+        let peer = [1u8; 32];
+        let table = [2u8; 32];
+        assert!(rl.admit_ad(peer, table, NOW));
+        for _ in 0..MAX_ADS_PER_TABLE_KEY_PER_MIN {
+            rl.admit_ad(peer, table, NOW);
+        }
+        assert!(!rl.admit_ad(peer, table, NOW));
+        assert!(rl.admit_ad(peer, table, NOW + 60_000));
+    }
+
+    /// The limiter must not itself be a growth surface.
+    #[test]
+    fn the_limiter_forgets_what_stopped_speaking() {
+        let mut rl = RateLimiter::new();
+        for i in 0..1_000u32 {
+            let mut peer = [0u8; 32];
+            peer[..4].copy_from_slice(&i.to_be_bytes());
+            rl.admit_ad(peer, [9u8; 32], NOW);
+        }
+        assert_eq!(rl.tracked().0, 1_000);
+        rl.sweep(NOW + 120_000);
+        assert_eq!(rl.tracked(), (0, 0));
+    }
+}
