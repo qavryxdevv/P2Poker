@@ -46,11 +46,10 @@ use crate::protocol::constants::AD_REBROADCAST_MS;
 pub enum NodeCommand {
     /// Found a table and advertise it.
     CreateTable {
-        /// Which game. `RatedSngPokerthV1` settles every other field in this
-        /// command and the four below it are ignored — a preset is a claim
-        /// about values, and a client that let a founder mix the two would be
-        /// advertising a table its own admission rules refuse.
-        preset: crate::protocol::constants::PresetId,
+        /// Which game. A Sit-and-Go reads `seats` and `name` and nothing else
+        /// — its structure is settled, and whether it carries the rated name
+        /// follows from the seat count rather than from a separate choice.
+        kind: crate::net::lobby::TableKind,
         name: String,
         seats: u8,
         min_players: u8,

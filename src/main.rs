@@ -13,8 +13,8 @@
 //! p2p-poker --headless --join N  sit down at the first table called N
 //! p2p-poker --profile DIR        keep the profile somewhere other than beside
 //!                                the binary
-//! p2p-poker --host N --seats 2   a custom table of that size instead of a
-//!                                rated Sit-and-Go, which needs all ten
+//! p2p-poker --host N --seats 6   a six-handed Sit-and-Go
+//! p2p-poker --host N --cash      a cash table, which deals with two
 //! ```
 //!
 //! `--profile` exists because two clients on one machine must be two players.
@@ -82,32 +82,31 @@ fn main() {
     // advertisement built by hand — two ways to start a table is two places for
     // the advertisement and the roster to disagree about what table it is.
     let hosted = value_of("--host").map(|name| {
-        use p2p_poker::protocol::constants::{PresetId, RATED_START_STACK};
-        // A rated Sit-and-Go by default, which is what the button founds — and
-        // a custom table when `--seats` is given, because a rated one needs all
-        // ten seats before it deals and a two-process test would never form one.
-        let seats = value_of("--seats").and_then(|v| v.parse::<u8>().ok());
+        use p2p_poker::net::lobby::TableKind;
+        use p2p_poker::protocol::constants::{RATED_START_STACK, RATED_SEATS};
+        // A Sit-and-Go by default, ten-handed and therefore rated — the same
+        // table the button founds. `--seats` sizes it; `--cash` makes it a cash
+        // table instead, which is what a two-process test wants because a
+        // Sit-and-Go deals only when every seat is full.
+        let seats = value_of("--seats")
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(RATED_SEATS)
+            .clamp(2, RATED_SEATS);
         println!("hosting  {name}");
-        match seats {
-            None => NodeCommand::CreateTable {
-                preset: PresetId::RatedSngPokerthV1,
-                name,
-                seats: 10,
-                min_players: 10,
-                buyin: RATED_START_STACK,
-                password: None,
+        NodeCommand::CreateTable {
+            kind: if has("--cash") {
+                TableKind::Cash
+            } else {
+                TableKind::SitAndGo
             },
-            Some(n) => NodeCommand::CreateTable {
-                preset: PresetId::Custom,
-                name,
-                seats: n.clamp(2, 10),
-                min_players: value_of("--min")
-                    .and_then(|v| v.parse::<u8>().ok())
-                    .unwrap_or(2)
-                    .clamp(2, n.clamp(2, 10)),
-                buyin: 1_000,
-                password: None,
-            },
+            name,
+            seats,
+            min_players: value_of("--min")
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(2)
+                .clamp(2, seats),
+            buyin: RATED_START_STACK,
+            password: None,
         }
     });
 
@@ -535,7 +534,7 @@ impl eframe::App for Client {
                         self.table_closed = false;
                     }
                     render::LobbyAction::Create(t) => self.tell(NodeCommand::CreateTable {
-                        preset: t.preset,
+                        kind: t.kind,
                         name: t.name,
                         seats: t.seats,
                         min_players: t.min_players,

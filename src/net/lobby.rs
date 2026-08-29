@@ -45,8 +45,9 @@ use crate::poker::state::Hash;
 use crate::protocol::constants::{
     hand_deadline_min_ms, PresetId, AD_TTL_MS, HAND_DEADLINE_CAP_MS, MAX_ADS_PER_PEER_PER_MIN,
     MAX_ADS_PER_TABLE_KEY_PER_MIN, MAX_AD_LIFETIME_MS, MAX_CLOCK_SKEW_MS, MAX_SEATS,
-    MAX_TRACKED_TABLES, RATED_BLIND_EVERY_N_HANDS, RATED_HAND_DEADLINE_MS, RATED_SEATS,
-    RATED_SMALL_BLIND, RATED_SMALL_BLIND_CAP, RATED_START_STACK,
+    sng_hand_deadline_ms, sng_small_blind_cap, MAX_TRACKED_TABLES, RATED_BLIND_EVERY_N_HANDS,
+    RATED_HAND_DEADLINE_MS, RATED_SEATS, RATED_SMALL_BLIND, RATED_SMALL_BLIND_CAP,
+    RATED_START_STACK,
 };
 
 /// The deck suite version 1 speaks, and the only one.
@@ -407,7 +408,90 @@ fn rated_values_match(ad: &TableAd) -> Result<(), AdRejected> {
     Ok(())
 }
 
+/// What kind of game a founder is starting.
+///
+/// A client concept, not a protocol one: the protocol has a `mode` and a
+/// `preset_id`, and this is the choice a person makes that settles both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKind {
+    /// Everybody starts together with the same stack, and it deals when the
+    /// table is full.
+    SitAndGo,
+    /// Deals with two, and people arrive and leave between hands.
+    Cash,
+}
+
 impl TableAd {
+    /// A Sit-and-Go of `seats` seats, with the rated structure.
+    ///
+    /// **Ten seats is `RATED_SNG_POKERTH_V1`; anything else is `CUSTOM`.** That
+    /// is not a limitation of this function, it is what a preset name means:
+    /// §7.2 rule 3 says the name asserts §13's exact values, and §13 says ten.
+    /// A six-handed table carrying the rated name would be refused by every
+    /// receiver — including this client — so it carries `CUSTOM` and its own
+    /// numbers instead, which is exactly what `CUSTOM` is for.
+    ///
+    /// Everything else is the rated structure: 10 000 chips, blinds 50/100
+    /// doubling every eleven hands, and it deals when every seat is full. The
+    /// two values that depend on the seat count — the blind cap and the
+    /// whole-hand deadline — are derived by §13's own formulae rather than
+    /// invented, so a nine-handed Sit-and-Go is the same game with one fewer
+    /// chair.
+    pub fn sng(
+        seats: u8,
+        table_name: String,
+        founder_app_key: [u8; 32],
+        founder_peer_id: Vec<u8>,
+        now_ms: u64,
+    ) -> TableAd {
+        let seats = seats.clamp(2, MAX_SEATS);
+        TableAd {
+            game: 1,
+            mode: Mode::TournamentSngPlayMoney.code(),
+            preset_id: if seats == RATED_SEATS {
+                PresetId::RatedSngPokerthV1.as_str().into()
+            } else {
+                PresetId::Custom.as_str().into()
+            },
+            table_name,
+            small_blind: RATED_SMALL_BLIND,
+            big_blind: RATED_SMALL_BLIND * 2,
+            ante: 0,
+            // A Sit-and-Go's buy-in **is** its starting stack: every entrant
+            // gets an equal stack, so the two bounds and the stack are one
+            // number. Rule 2 enforces it in tournament modes.
+            min_buyin: RATED_START_STACK,
+            max_buyin: RATED_START_STACK,
+            start_stack: RATED_START_STACK,
+            players: 1,
+            max_players: seats,
+            // Full, and not before. That is what makes it a Sit-and-Go rather
+            // than a cash table that happens to pay equal stacks.
+            min_players_to_start: seats,
+            blind_schedule: BlindSchedule {
+                mode: 1,
+                every_n_hands: RATED_BLIND_EVERY_N_HANDS,
+                first_small_blind: RATED_SMALL_BLIND,
+                small_blind_cap: sng_small_blind_cap(seats),
+            },
+            action_timeout_ms: 20_000,
+            action_grace_ms: 5_000,
+            crypto_step_timeout_ms: 30_000,
+            hand_deadline_ms: sng_hand_deadline_ms(seats) as u32,
+            join_deadline_ms: 120_000,
+            hand_delay_ms: 7_000,
+            button_rule: 1,
+            odd_chip_rule: 1,
+            showdown_policy: 1,
+            password_required: false,
+            deck_suite: DECK_SUITE_V1.into(),
+            founder_app_key,
+            founder_peer_id,
+            timestamp_unix_ms: now_ms,
+            expires_at_unix_ms: now_ms + AD_TTL_MS,
+        }
+    }
+
     /// The rated Sit-and-Go, exactly as `PROTOCOL.md` §13 fixes it.
     ///
     /// Every one of `table_params_hash`'s twenty-five parts is settled here and
@@ -433,47 +517,16 @@ impl TableAd {
         founder_peer_id: Vec<u8>,
         now_ms: u64,
     ) -> TableAd {
-        TableAd {
-            game: 1,
-            mode: Mode::TournamentSngPlayMoney.code(),
-            preset_id: PresetId::RatedSngPokerthV1.as_str().into(),
+        // The general one at ten seats, and there is a test that the two agree
+        // field for field. Two constructors that were supposed to produce the
+        // same table would be two places for it to change.
+        TableAd::sng(
+            RATED_SEATS,
             table_name,
-            small_blind: RATED_SMALL_BLIND,
-            big_blind: RATED_SMALL_BLIND * 2,
-            ante: 0,
-            // A Sit-and-Go's buy-in **is** its starting stack: every entrant
-            // gets an equal stack, so the two bounds and the stack are one
-            // number. Rule 2 enforces it in tournament modes.
-            min_buyin: RATED_START_STACK,
-            max_buyin: RATED_START_STACK,
-            start_stack: RATED_START_STACK,
-            players: 1,
-            max_players: RATED_SEATS,
-            // Ten of ten. A rated table deals its first hand when it is full and
-            // not before, which is what makes every one of them the same game.
-            min_players_to_start: RATED_SEATS,
-            blind_schedule: BlindSchedule {
-                mode: 1,
-                every_n_hands: RATED_BLIND_EVERY_N_HANDS,
-                first_small_blind: RATED_SMALL_BLIND,
-                small_blind_cap: RATED_SMALL_BLIND_CAP,
-            },
-            action_timeout_ms: 20_000,
-            action_grace_ms: 5_000,
-            crypto_step_timeout_ms: 30_000,
-            hand_deadline_ms: RATED_HAND_DEADLINE_MS as u32,
-            join_deadline_ms: 120_000,
-            hand_delay_ms: 7_000,
-            button_rule: 1,
-            odd_chip_rule: 1,
-            showdown_policy: 1,
-            password_required: false,
-            deck_suite: DECK_SUITE_V1.into(),
             founder_app_key,
             founder_peer_id,
-            timestamp_unix_ms: now_ms,
-            expires_at_unix_ms: now_ms + AD_TTL_MS,
-        }
+            now_ms,
+        )
     }
 }
 
@@ -1013,6 +1066,105 @@ mod tests {
                  fail to join each other with neither of them wrong"
             );
         }
+    }
+
+    /// A Sit-and-Go of any size is a legal table, and the same game with a
+    /// different number of chairs.
+    ///
+    /// Everything that does not depend on the seat count is identical across
+    /// them; the two that do — the blind cap and the whole-hand deadline — are
+    /// derived by §13's own formulae rather than invented.
+    #[test]
+    fn a_sit_and_go_of_any_size_is_admissible() {
+        for seats in 2..=MAX_SEATS {
+            let ad = TableAd::sng(seats, "SNG".into(), [1u8; 32], vec![2u8; 38], NOW);
+            assert_eq!(
+                admit(&ad, NOW),
+                Ok(()),
+                "a {seats}-seat Sit-and-Go was refused"
+            );
+
+            assert_eq!(ad.mode, Mode::TournamentSngPlayMoney.code());
+            assert_eq!(ad.max_players, seats);
+            assert_eq!(
+                ad.min_players_to_start, seats,
+                "a Sit-and-Go deals when it is full and not before"
+            );
+            // A tournament pays every entrant the same stack, so the buy-in is
+            // the stack — rule 2 refuses anything else in a tournament mode.
+            assert_eq!(ad.start_stack, RATED_START_STACK);
+            assert_eq!(ad.min_buyin, ad.start_stack);
+            assert_eq!(ad.max_buyin, ad.start_stack);
+            // The structure, unchanged by the seat count.
+            assert_eq!((ad.small_blind, ad.big_blind), (50, 100));
+            assert_eq!(ad.blind_schedule.every_n_hands, RATED_BLIND_EVERY_N_HANDS);
+            assert_eq!(ad.ante, 0);
+            // And the two that follow from it.
+            assert_eq!(
+                ad.blind_schedule.small_blind_cap,
+                seats as u64 * RATED_START_STACK / 2,
+                "the cap is the table's chips, halved"
+            );
+            let minimum = crate::protocol::constants::hand_deadline_min_ms(
+                seats, 20_000, 5_000, 30_000, 7_000,
+            );
+            assert!(
+                ad.hand_deadline_ms as u64 >= minimum,
+                "{seats} seats: the deadline is below its own floor"
+            );
+        }
+    }
+
+    /// **Ten seats is the rated preset; anything else is `CUSTOM`.**
+    ///
+    /// That is what a preset name means: §7.2 rule 3 says the name asserts
+    /// §13's exact values and §13 says ten. A six-handed table carrying the
+    /// rated name would be refused by every receiver, this client included, so
+    /// it carries its own numbers instead.
+    #[test]
+    fn only_a_ten_seat_sit_and_go_carries_the_rated_name() {
+        for seats in 2..=MAX_SEATS {
+            let ad = TableAd::sng(seats, "SNG".into(), [1u8; 32], vec![2u8; 38], NOW);
+            if seats == RATED_SEATS {
+                assert_eq!(ad.preset_id, "RATED_SNG_POKERTH_V1");
+            } else {
+                assert_eq!(ad.preset_id, "CUSTOM", "{seats} seats claimed the name");
+                // And claiming it would be refused, which is the point.
+                let mut lying = ad.clone();
+                lying.preset_id = "RATED_SNG_POKERTH_V1".into();
+                assert!(
+                    admit(&lying, NOW).is_err(),
+                    "{seats} seats carried the rated name and was accepted"
+                );
+            }
+        }
+    }
+
+    /// The two constructors produce the same table at ten seats, field for
+    /// field. Two that were supposed to agree would be two places for it to
+    /// change.
+    #[test]
+    fn the_rated_table_is_the_general_one_at_ten_seats() {
+        assert_eq!(
+            TableAd::rated_sng("SNG".into(), [1u8; 32], vec![2u8; 38], NOW),
+            TableAd::sng(RATED_SEATS, "SNG".into(), [1u8; 32], vec![2u8; 38], NOW),
+        );
+    }
+
+    /// Two Sit-and-Gos of **different** sizes are different games, and the
+    /// digest says so. A player choosing six seats is not joinable by a client
+    /// that chose nine, and both are right.
+    #[test]
+    fn two_sizes_are_two_games() {
+        let mut seen = std::collections::BTreeSet::new();
+        for seats in 2..=MAX_SEATS {
+            let ad = TableAd::sng(seats, "SNG".into(), [1u8; 32], vec![2u8; 38], NOW);
+            assert!(
+                seen.insert(crate::net::advert::table_params_hash(&ad)),
+                "two seat counts produced one digest"
+            );
+        }
+        assert_eq!(seen.len(), (MAX_SEATS - 1) as usize);
     }
 
     /// A rated table has no password, which §13 states and PokerTH enforces.

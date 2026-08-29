@@ -232,6 +232,47 @@ pub const RATED_BLIND_EVERY_N_HANDS: u16 = 11;
 /// cap that means something different.
 pub const RATED_SMALL_BLIND_CAP: Chips = RATED_SEATS as Chips * RATED_START_STACK / 2;
 
+/// How many reopening raises a Sit-and-Go's whole-hand deadline buys.
+///
+/// §13 does not state this as a number — it states the rated deadline as
+/// 3 300 000 ms and then *derives* that the surplus over the floor buys four
+/// reopening raises. Four is therefore the property the value was chosen for,
+/// and it is the property to preserve at any other seat count.
+pub const SNG_REOPENINGS: u64 = 4;
+
+/// A Sit-and-Go's whole-hand deadline, for a table of `seats`.
+///
+/// The floor plus [`SNG_REOPENINGS`] reopenings, which is the guarantee §13's
+/// number was picked to give — except at [`RATED_SEATS`], where the number is
+/// **pinned** by the preset and is not ours to derive. That exception is not
+/// tidiness: `RATED_SNG_POKERTH_V1` asserts 3 300 000 exactly, a derived
+/// 3 197 000 would be a different `table_params_hash`, and a client computing it
+/// could not join a rated table. The preset owns its own numbers; everything
+/// else is derived the way the preset's own were.
+pub const fn sng_hand_deadline_ms(seats: u8) -> u64 {
+    if seats == RATED_SEATS {
+        return RATED_HAND_DEADLINE_MS;
+    }
+    let floor = hand_deadline_floor_ms(seats, 20_000, 5_000, 30_000, 7_000);
+    let surplus = SNG_REOPENINGS * reopening_cost_ms(seats, 20_000, 5_000);
+    let want = floor + surplus;
+    if want > HAND_DEADLINE_CAP_MS {
+        HAND_DEADLINE_CAP_MS
+    } else {
+        want
+    }
+}
+
+/// A Sit-and-Go's blind cap, for a table of `seats`.
+///
+/// The whole table's chips, halved: a small blind no hand can be played past,
+/// because every seat is already all in before it is posted. §13 annotates the
+/// rated cap as `n(11)*n(9)/2`, so this is that formula rather than a second
+/// number that happens to agree with it at ten seats.
+pub const fn sng_small_blind_cap(seats: u8) -> Chips {
+    seats as Chips * RATED_START_STACK / 2
+}
+
 /// Seats at a rated table, and also the number needed to start one.
 ///
 /// Ten of ten: a rated table deals its first hand when it is full and not
@@ -278,6 +319,10 @@ const _: () = assert!(RATED_HAND_DEADLINE_MS <= HAND_DEADLINE_CAP_MS);
 const _: () = assert!(RATED_SEATS <= MAX_SEATS);
 /// The cap is a small blind that cannot be posted: every seat is already all in.
 const _: () = assert!(RATED_SMALL_BLIND_CAP == 50_000);
+/// The general formulae agree with the preset's own numbers at ten seats, or
+/// one of them is wrong.
+const _: () = assert!(sng_small_blind_cap(RATED_SEATS) == RATED_SMALL_BLIND_CAP);
+const _: () = assert!(sng_hand_deadline_ms(RATED_SEATS) == RATED_HAND_DEADLINE_MS);
 const _: () = assert!(RATED_SMALL_BLIND_CAP > RATED_START_STACK);
 const _: () = assert!(
     RATED_HAND_DEADLINE_MS >= hand_deadline_min_ms(MAX_SEATS, 20_000, 5_000, 30_000, 7_000)

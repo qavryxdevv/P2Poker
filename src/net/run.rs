@@ -51,12 +51,12 @@ use super::joinrpc;
 use super::joinwire;
 use super::dht::{self, PeerHints, Swarm as DhtSwarm, REANNOUNCE_INTERVAL};
 use super::relay;
-use super::lobby::{LobbyStore, RateLimiter, TableAd};
+use super::lobby::{LobbyStore, RateLimiter, TableAd, TableKind};
 use super::node::{quic_dial_addr, worth_parsing, NodeCommand, NodeEvent, NodeState, REBROADCAST};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
 use super::joinwire::DISPLAY_NAME_MAX;
 use crate::protocol::constants::{
-    PresetId, AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX, MAX_SEATS,
+    AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX, MAX_SEATS,
 };
 
 /// How long to wait for the DHT to bootstrap before giving up on this cycle.
@@ -739,7 +739,7 @@ pub async fn run(
                 let now = super::node::now_unix_ms();
                 match command {
                     NodeCommand::CreateTable {
-                        preset, name, seats, min_players, buyin, password,
+                        kind, name, seats, min_players, buyin, password,
                     } => {
                         // A fresh key per table, and that freshness is the only
                         // thing making two tables with the same players and the
@@ -753,15 +753,16 @@ pub async fn run(
                             }
                         };
                         let table_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-                        let rated = preset == PresetId::RatedSngPokerthV1;
-                        // A preset settles every parameter, so a rated table
-                        // ignores the four the dialog collects for a custom one.
-                        // The password is dropped rather than carried: §13 has
-                        // none, and `rated_values_match` refuses a rated advert
-                        // that demands one.
-                        let (ad, password) = if rated {
+                        let tournament = kind == TableKind::SitAndGo;
+                        // A Sit-and-Go's structure is settled, so it ignores the
+                        // three fields the dialog collects for a cash table. The
+                        // password is dropped rather than carried: a rated table
+                        // may not have one, and a Sit-and-Go that people are
+                        // waiting to fill is the wrong place for a gate anyway.
+                        let (ad, password) = if tournament {
                             (
-                                TableAd::rated_sng(
+                                TableAd::sng(
+                                    seats,
                                     trim_to_bytes(&name, TABLE_NAME_MAX),
                                     app_key.verifying_key().to_bytes(),
                                     my_peer_bytes.clone(),
@@ -788,7 +789,7 @@ pub async fn run(
                         // founder's own seat takes the start stack and not what
                         // the dialog offered — `SeatEntry::admissible` admits
                         // exactly one value there.
-                        let buyin = if rated { ad.start_stack } else { buyin };
+                        let buyin = if tournament { ad.start_stack } else { buyin };
                         match advert::publish(&ad, &table_key) {
                             Ok(bytes) => {
                                 let hash = advert_hash_of(&bytes);

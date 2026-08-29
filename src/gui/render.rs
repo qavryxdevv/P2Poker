@@ -38,8 +38,9 @@
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, TextStyle};
 
 use super::lobby::{empty_explanation, visible, Filter, LobbyView, TableState, PASSWORD_WARNING};
+use crate::net::lobby::TableKind;
 use crate::protocol::constants::{
-    PresetId, RATED_BLIND_EVERY_N_HANDS, RATED_SEATS, RATED_SMALL_BLIND, RATED_START_STACK,
+    RATED_BLIND_EVERY_N_HANDS, RATED_SEATS, RATED_SMALL_BLIND, RATED_START_STACK,
 };
 use crate::storage::settings::Settings;
 use super::theme;
@@ -74,8 +75,8 @@ pub enum LobbyAction {
 /// under `CUSTOM` are asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewTable {
-    /// Which game. A preset settles every field below it.
-    pub preset: PresetId,
+    /// Which game. A Sit-and-Go settles every field below it but `seats`.
+    pub kind: TableKind,
     pub name: String,
     pub seats: u8,
     pub min_players: u8,
@@ -93,9 +94,12 @@ impl Default for NewTable {
     /// at and a table they have to read first.
     fn default() -> Self {
         NewTable {
-            preset: PresetId::RatedSngPokerthV1,
+            kind: TableKind::SitAndGo,
             name: "New table".into(),
-            seats: 6,
+            // Ten, so the table a player founds without touching anything is the
+            // rated one — the only table two strangers can agree on from its
+            // name alone.
+            seats: RATED_SEATS,
             min_players: 2,
             buyin: 1_000,
             password: String::new(),
@@ -335,16 +339,14 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                         ui.add(egui::TextEdit::singleline(&mut f.name).char_limit(32));
                     });
                     field_row(ui, "Game", |ui| {
-                        ui.selectable_value(
-                            &mut f.preset,
-                            PresetId::RatedSngPokerthV1,
-                            "Sit & Go",
-                        );
-                        ui.selectable_value(&mut f.preset, PresetId::Custom, "Cash game");
+                        ui.selectable_value(&mut f.kind, TableKind::SitAndGo, "Sit & Go");
+                        ui.selectable_value(&mut f.kind, TableKind::Cash, "Cash game");
                     });
 
-                    let rated = f.preset == PresetId::RatedSngPokerthV1;
-                    if rated {
+                    if f.kind == TableKind::SitAndGo {
+                        field_row(ui, "Seats", |ui| {
+                            ui.add(egui::Slider::new(&mut f.seats, 2..=RATED_SEATS));
+                        });
                         // The numbers, stated rather than offered. A preset is a
                         // claim about values: every client derives the same
                         // parameters from the name, which is what lets two
@@ -366,19 +368,37 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                         );
                         preset_row(
                             ui,
-                            "Seats",
-                            &format!("{RATED_SEATS}, and it starts when all {RATED_SEATS} are in"),
+                            "Starts",
+                            &format!("when all {} seats are in", f.seats),
                             theme::TEXT,
                         );
                         ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(
-                                "Every one of these is fixed by the preset, so every client \
-                                 computes the same table. No password.",
-                            )
-                            .color(theme::TEXT_DIM)
-                            .size(14.0),
-                        );
+                        // Which of the two it will be, and why that matters.
+                        // Ten seats is the one configuration two strangers can
+                        // agree on from the name; anything else is the same
+                        // game with its numbers spelled out in the advert.
+                        if f.seats == RATED_SEATS {
+                            ui.label(
+                                RichText::new(
+                                    "Rated: every client computes this exact table from its \
+                                     name alone, so two players who have never spoken agree \
+                                     on the game before either sits down.",
+                                )
+                                .color(theme::OK)
+                                .size(14.0),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(format!(
+                                    "The same game with {} seats. Only the ten-seat one is \
+                                     rated, so this table carries its numbers in the \
+                                     advertisement instead of in its name.",
+                                    f.seats
+                                ))
+                                .color(theme::TEXT_DIM)
+                                .size(14.0),
+                            );
+                        }
                     } else {
                         field_row(ui, "Seats", |ui| {
                             ui.add(egui::Slider::new(&mut f.seats, 2..=10));
