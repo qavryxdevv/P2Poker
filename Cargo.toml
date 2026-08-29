@@ -35,6 +35,11 @@ futures-lite = "2.6"
 
 # --- mental poker: docs/research/MENTAL_POKER.md --------------------------
 ziffle = "=0.1.0"
+# The serialisation ziffle delegates to. A direct edge because the wire
+# boundary - not the library - decides compressed-and-validated over the
+# unchecked path (ZIFFLE_VERDICT.md C-1). Already in the tree through ziffle,
+# so this adds nothing to the lockfile.
+ark-serialize = { version = "=0.5.0", default-features = false }
 
 # --- cryptography: docs/research/CRYPTO_LIBS.md ---------------------------
 ed25519-dalek    = { version = "3.0.0", default-features = false, features = ["fast", "zeroize", "rand_core"] }
@@ -89,9 +94,14 @@ ark-std       = { version = "=0.5.0", default-features = false }
 #
 # The bytes reviewed by the ziffle review are in the tree, so the review has a
 # frozen artefact to be a review *of*, and an upstream yank or repository
-# deletion cannot take the deck out from under us. vendor/ziffle/ is the
-# unmodified crates.io 0.1.0 tarball; vendor/ziffle/PROVENANCE.md records the
-# digest, the upstream git sha and the licence choice.
+# deletion cannot take the deck out from under us.
+#
+# vendor/ziffle/ was the unmodified crates.io 0.1.0 tarball and is now FORKED
+# under condition C-12 - the 32/64-bit transcript split, the reveal token that
+# bound one ciphertext coordinate, and a const guard that never fired. Proofs
+# made here do not verify upstream and upstream's do not verify here, which is
+# intended. vendor/ziffle/PROVENANCE.md records the digest, the upstream git
+# sha, the licence choice and every change.
 # ---------------------------------------------------------------------------
 [patch.crates-io]
 ziffle = { path = "vendor/ziffle" }

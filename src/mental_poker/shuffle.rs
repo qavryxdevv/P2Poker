@@ -134,9 +134,11 @@ pub struct ShuffleChain {
     order: Vec<SeatIdx>,
     /// Each shuffler's application Ed25519 key, aligned to `order`.
     keys: Vec<[u8; 32]>,
-    /// `decks[0]` is the initial deck; `decks[k]` is the deck after step
-    /// `k - 1`. Kept in full because a dispute is settled against the chain, not
-    /// against its last link.
+    /// `decks[k]` is the deck after step `k`. The open deck is **not** here:
+    /// nobody shuffled it, nobody verified it, and only the library can state
+    /// what it is - so a chain that stored it would be carrying a constant it
+    /// cannot check. Kept in full because a dispute is settled against the
+    /// chain, not against its last link.
     decks: Vec<Vec<Ciphertext>>,
     admission: ShuffleAdmission,
     state: State,
@@ -153,7 +155,6 @@ impl ShuffleChain {
         params: ChainParams,
         order: Vec<SeatIdx>,
         keys: Vec<[u8; 32]>,
-        initial_deck: Vec<Ciphertext>,
     ) -> Result<Self, ChainError> {
         if order.len() != keys.len() {
             return Err(ChainError::KeysDoNotMatchOrder {
@@ -179,7 +180,7 @@ impl ShuffleChain {
             params,
             order,
             keys,
-            decks: vec![initial_deck],
+            decks: Vec::new(),
             admission: ShuffleAdmission::default(),
             state: State::Open,
         })
@@ -187,7 +188,7 @@ impl ShuffleChain {
 
     /// How many steps have been taken.
     pub fn steps_taken(&self) -> usize {
-        self.decks.len() - 1
+        self.decks.len()
     }
 
     /// How many shufflers the chain has.
@@ -267,10 +268,14 @@ impl ShuffleChain {
             .map_err(|_| StepError::AlreadySubmitted)?;
 
         let ctx = self.ctx_for(k, sequence);
-        let prev = self.decks.last().expect("the initial deck is always present");
-        let verified = crypto
-            .verify_shuffle(prev, &next, proof, &ctx)
-            .map_err(StepError::Rejected)?;
+        // The first link shuffles the open deck, which this chain does not hold
+        // and could not check; every later one shuffles the chain's own last
+        // deck. In neither case is the input something the sender supplied.
+        let verified = match self.decks.last() {
+            None => crypto.verify_initial_shuffle(&next, proof, &ctx),
+            Some(prev) => crypto.verify_shuffle(prev, &next, proof, &ctx),
+        }
+        .map_err(StepError::Rejected)?;
 
         self.decks.push(verified.into_inner());
         if self.steps_taken() == self.order.len() {
@@ -313,8 +318,8 @@ impl ShuffleChain {
         Some(Final::new(Verified::new(last.clone())))
     }
 
-    /// Every deck of the chain, initial first. A dispute is settled against the
-    /// chain, not against its last link.
+    /// Every deck the chain produced, in order. A dispute is settled against
+    /// the chain, not against its last link.
     pub fn decks(&self) -> &[Vec<Ciphertext>] {
         &self.decks
     }
@@ -331,6 +336,14 @@ mod tests {
     struct ArgumentAccepts;
     impl DeckCrypto for ArgumentAccepts {
         const DECK_LEN: usize = 4;
+        fn verify_initial_argument(
+            &self,
+            _next: &[Ciphertext],
+            _proof: &[u8],
+            _ctx: &DeckCtx,
+        ) -> Result<(), VerifyOutcome> {
+            Ok(())
+        }
         fn verify_argument(
             &self,
             _prev: &[Ciphertext],
@@ -346,6 +359,14 @@ mod tests {
     struct ArgumentRejects;
     impl DeckCrypto for ArgumentRejects {
         const DECK_LEN: usize = 4;
+        fn verify_initial_argument(
+            &self,
+            _next: &[Ciphertext],
+            _proof: &[u8],
+            _ctx: &DeckCtx,
+        ) -> Result<(), VerifyOutcome> {
+            Err(VerifyOutcome::Invalid(InvalidReason::ArgumentFailed))
+        }
         fn verify_argument(
             &self,
             _prev: &[Ciphertext],
@@ -361,6 +382,16 @@ mod tests {
     struct CannotVerify;
     impl DeckCrypto for CannotVerify {
         const DECK_LEN: usize = 4;
+        fn verify_initial_argument(
+            &self,
+            _next: &[Ciphertext],
+            _proof: &[u8],
+            _ctx: &DeckCtx,
+        ) -> Result<(), VerifyOutcome> {
+            Err(VerifyOutcome::CouldNotVerify(
+                Unavailable::AggregateKeyUnknown,
+            ))
+        }
         fn verify_argument(
             &self,
             _prev: &[Ciphertext],
@@ -398,7 +429,7 @@ mod tests {
 
     fn chain(order: Vec<SeatIdx>) -> ShuffleChain {
         let keys: Vec<[u8; 32]> = order.iter().map(|&s| [s; 32]).collect();
-        ShuffleChain::open(params(), order, keys, deck_for_round(0)).unwrap()
+        ShuffleChain::open(params(), order, keys).unwrap()
     }
 
     #[test]
@@ -421,7 +452,7 @@ mod tests {
         assert_eq!(c.whose_turn(), None);
         let final_deck = c.finish().expect("every seat shuffled");
         assert_eq!(final_deck.as_ref().as_ref(), &deck_for_round(3));
-        assert_eq!(c.decks().len(), 4, "the initial deck and three steps");
+        assert_eq!(c.decks().len(), 3, "one deck per step; the open deck is not one");
     }
 
     /// Rule 3: an intermediate deck is a deck some players have not touched, and
@@ -528,8 +559,8 @@ mod tests {
         // chain rather than on the verdict.
         c.accept_step(&ArgumentAccepts, 1, deck_for_round(2), b"p", 1)
             .unwrap();
-        assert_eq!(c.decks()[1], deck_for_round(1));
-        assert_eq!(c.decks()[2], deck_for_round(2));
+        assert_eq!(c.decks()[0], deck_for_round(1));
+        assert_eq!(c.decks()[1], deck_for_round(2));
     }
 
     /// The structural check runs inside `verify_shuffle`, so a chain step gets
@@ -538,10 +569,19 @@ mod tests {
     #[test]
     fn a_seat_that_does_not_shuffle_does_not_advance_the_chain() {
         let mut c = chain(vec![0, 1]);
+        // Returning the open deck at step 0 is fifty-two cards face up rather
+        // than an unchanged deck - see `structural_check_initial`.
+        let open: Vec<Ciphertext> = (0..4)
+            .map(|_| {
+                let mut c = [0u8; 66];
+                c[32] = 0x40; // the identity, as tests/deck_constants.rs measures it
+                c
+            })
+            .collect();
         assert_eq!(
-            c.accept_step(&ArgumentAccepts, 0, deck_for_round(0), b"p", 0),
+            c.accept_step(&ArgumentAccepts, 0, open, b"p", 0),
             Err(StepError::Rejected(VerifyOutcome::Invalid(
-                InvalidReason::DeckUnchanged
+                InvalidReason::IdentityCiphertext { position: 0 }
             )))
         );
         assert_eq!(c.steps_taken(), 0);
@@ -601,7 +641,7 @@ mod tests {
     fn a_seat_cannot_appear_twice_in_the_order() {
         let keys = vec![[0u8; 32]; 3];
         assert_eq!(
-            ShuffleChain::open(params(), vec![0, 1, 0], keys, deck_for_round(0)).err(),
+            ShuffleChain::open(params(), vec![0, 1, 0], keys).err(),
             Some(ChainError::DuplicateShuffler { seat: 0 })
         );
     }
@@ -609,11 +649,11 @@ mod tests {
     #[test]
     fn a_chain_needs_two_shufflers() {
         assert_eq!(
-            ShuffleChain::open(params(), vec![0], vec![[0u8; 32]], deck_for_round(0)).err(),
+            ShuffleChain::open(params(), vec![0], vec![[0u8; 32]]).err(),
             Some(ChainError::TooFewShufflers { n: 1 })
         );
         assert_eq!(
-            ShuffleChain::open(params(), vec![], vec![], deck_for_round(0)).err(),
+            ShuffleChain::open(params(), vec![], vec![]).err(),
             Some(ChainError::TooFewShufflers { n: 0 })
         );
     }
@@ -624,8 +664,7 @@ mod tests {
     #[test]
     fn the_order_and_the_keys_must_agree() {
         assert_eq!(
-            ShuffleChain::open(params(), vec![0, 1, 2], vec![[0u8; 32]; 2], deck_for_round(0))
-                .err(),
+            ShuffleChain::open(params(), vec![0, 1, 2], vec![[0u8; 32]; 2]).err(),
             Some(ChainError::KeysDoNotMatchOrder { order: 3, keys: 2 })
         );
     }
@@ -644,7 +683,7 @@ mod tests {
         let mut other = params();
         other.hand_id = 6;
         let keys: Vec<[u8; 32]> = vec![[0u8; 32], [1u8; 32], [2u8; 32]];
-        let d = ShuffleChain::open(other, vec![0, 1, 2], keys, deck_for_round(0)).unwrap();
+        let d = ShuffleChain::open(other, vec![0, 1, 2], keys).unwrap();
         assert_ne!(a, d.ctx_for(0, 7));
     }
 }

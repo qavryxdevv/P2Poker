@@ -32,6 +32,47 @@
 
 pub use getrandom::SysRng;
 
+/// The OS CSPRNG, presented through the trait `rand 0.8` libraries ask for.
+///
+/// The deck library takes `R: Rng`, and every generator that satisfies it in the
+/// tree is one this crate is forbidden to use. Rather than widen the deny-list,
+/// this adapter narrows the choice to one: it is a zero-sized handle on
+/// [`fill`], so a caller cannot seed it, clone a stream from it, or replay it.
+///
+/// `fill_bytes` cannot report failure through the trait, so it **panics** when
+/// the OS source is unavailable. That is the intended behaviour and not an
+/// oversight: the alternative available to a panic-free implementation is to
+/// carry on with whatever is in the buffer, and a deck shuffled with zeros is
+/// worse than a client that stops.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OsRng;
+
+impl rand::RngCore for OsRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        self.fill_bytes(&mut b);
+        u32::from_le_bytes(b)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut b = [0u8; 8];
+        self.fill_bytes(&mut b);
+        u64::from_le_bytes(b)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        fill(dest).expect("the operating system CSPRNG is unavailable");
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl rand::CryptoRng for OsRng {}
+
+
 use rand_core::TryRng;
 
 /// Fill `dest` with bytes from the operating system CSPRNG.

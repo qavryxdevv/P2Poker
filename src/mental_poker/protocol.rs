@@ -245,6 +245,12 @@ pub enum InvalidReason {
     CardNotRemasked { position: usize },
     /// The output deck equals the input deck. A valid proof, and not a shuffle.
     DeckUnchanged,
+    /// The bytes were not a well-formed, canonical, correctly sized encoding.
+    ///
+    /// Always attributable: a decode either ran or it did not, and neither
+    /// answer depends on state this receiver might be missing. So unlike a
+    /// verification, a decode failure is evidence against whoever sent it.
+    Decode(DecodeError),
     /// A deck is not the length the game plays with.
     ///
     /// Checked first and separately, because everything after it is a claim
@@ -363,6 +369,64 @@ pub fn structural_check(
     Ok(())
 }
 
+/// The structural check for the **first** link, whose input is the open deck.
+///
+/// Three of [`structural_check`]'s five conditions look only at `next`, and the
+/// other two are **subsumed** when the input is the open deck — not skipped:
+///
+/// - *No output coordinate appears in the input.* Every input `c1` is the
+///   identity, and the identity check has already refused an output `c1` that is
+///   the identity. So no output coordinate can equal an input one.
+/// - *The deck changed.* Same argument: the input is all identity, and an output
+///   containing no identity cannot equal it.
+///
+/// Both hold **only because the identity check runs**, which is why it runs
+/// first here and not as an afterthought.
+///
+/// The two functions therefore accept and reject exactly the same decks, which
+/// is measured in
+/// [`the_initial_check_accepts_and_rejects_the_same_decks`](tests::the_initial_check_accepts_and_rejects_the_same_decks)
+/// rather than argued. They can name a **different reason** for one input: a
+/// deck returned unchanged is `DeckUnchanged` to the full check and
+/// `IdentityCiphertext` to this one. Both are refusals and both are evidence;
+/// for the first link the second reason is the truer one, because an output
+/// equal to the open deck is not merely unchanged, it is fifty-two cards left
+/// face up.
+///
+/// The alternative was to hand the full check a fabricated all-identity deck,
+/// which would have been bytes invented to satisfy a test — the kind of thing
+/// that is true when written and quietly false a year later.
+pub fn structural_check_initial(
+    next: &[Ciphertext],
+    expected: usize,
+) -> Result<(), InvalidReason> {
+    if next.len() != expected {
+        return Err(InvalidReason::WrongDeckLength {
+            expected,
+            got: next.len(),
+        });
+    }
+
+    for (i, ct) in next.iter().enumerate() {
+        if is_identity_c1(ct) {
+            return Err(InvalidReason::IdentityCiphertext { position: i });
+        }
+    }
+
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(next.len());
+    for (i, ct) in next.iter().enumerate() {
+        if !seen.insert(c1_of(ct)) {
+            let first = next
+                .iter()
+                .position(|o| c1_of(o) == c1_of(ct))
+                .expect("the duplicate has an earlier occurrence");
+            return Err(InvalidReason::DuplicateCiphertext { first, second: i });
+        }
+    }
+
+    Ok(())
+}
+
 /// The key-set check, run when the hand's keys arrive and before any ownership
 /// proof is verified.
 ///
@@ -429,6 +493,12 @@ impl core::fmt::Display for DecodeError {
 }
 
 impl std::error::Error for DecodeError {}
+
+impl From<DecodeError> for InvalidReason {
+    fn from(e: DecodeError) -> Self {
+        InvalidReason::Decode(e)
+    }
+}
 
 /// Every type that crosses the network into the cryptographic layer.
 ///
@@ -541,7 +611,35 @@ pub trait DeckCrypto {
         ctx: &DeckCtx,
     ) -> Result<(), VerifyOutcome>;
 
-    /// Verify one link of a shuffle chain.
+    /// Verify the argument for the **first** link, whose input is the open deck.
+    ///
+    /// Separate because the open deck is not a deck anyone shuffled and is not a
+    /// deck this peer verified: it is the library's own starting point, and only
+    /// the library can state it. A chain that had to name it would be a chain
+    /// carrying a constant it cannot check.
+    fn verify_initial_argument(
+        &self,
+        next: &[Ciphertext],
+        proof: &[u8],
+        ctx: &DeckCtx,
+    ) -> Result<(), VerifyOutcome>;
+
+    /// Verify the first link of a shuffle chain.
+    ///
+    /// [`structural_check_initial`] first, for the same reason and in the same
+    /// order as below.
+    fn verify_initial_shuffle(
+        &self,
+        next: &[Ciphertext],
+        proof: &[u8],
+        ctx: &DeckCtx,
+    ) -> Result<Verified<Vec<Ciphertext>>, VerifyOutcome> {
+        structural_check_initial(next, Self::DECK_LEN).map_err(VerifyOutcome::Invalid)?;
+        self.verify_initial_argument(next, proof, ctx)?;
+        Ok(Verified::new(next.to_vec()))
+    }
+
+    /// Verify one later link of a shuffle chain.
     ///
     /// Structure first, then the argument. The order is not an optimisation:
     /// the structural failures are the ones the argument does not catch.
@@ -696,6 +794,14 @@ mod tests {
     fn the_default_deck_length_is_the_one_the_game_plays_with() {
         struct Any;
         impl DeckCrypto for Any {
+            fn verify_initial_argument(
+                &self,
+                _n: &[Ciphertext],
+                _pr: &[u8],
+                _c: &DeckCtx,
+            ) -> Result<(), VerifyOutcome> {
+                Ok(())
+            }
             fn verify_argument(
                 &self,
                 _p: &[Ciphertext],
@@ -717,6 +823,70 @@ mod tests {
                 expected: 52,
                 got: 4
             }))
+        );
+    }
+
+
+    /// The identity in compressed form, as `tests/deck_constants.rs` measures it
+    /// against arkworks: 32 zero bytes and the infinity flag.
+    fn open_deck_card(seed: u8) -> Ciphertext {
+        let mut c = [0u8; 66];
+        c[32] = 0x40; // c1 = identity
+        c[33] = 0x02; // c2 = the plaintext card point, whatever it is
+        c[34] = seed;
+        c
+    }
+
+    /// The two conditions dropped from the initial check are subsumed, not
+    /// waived. Measured over the shapes an attacker gets to choose, so the
+    /// argument in the doc comment is checked rather than believed.
+    ///
+    /// The assertion is on accept-versus-reject, because the two can name
+    /// different reasons for one input and the doc comment says which.
+    #[test]
+    fn the_initial_check_accepts_and_rejects_the_same_decks() {
+        let open: Vec<Ciphertext> = (0..4u8).map(open_deck_card).collect();
+
+        let cases: Vec<(&str, Vec<Ciphertext>)> = vec![
+            ("an honest shuffle", deck(&[10, 11, 12, 13])),
+            ("a position left in the clear", {
+                let mut d = deck(&[10, 11, 12, 13]);
+                d[2] = open_deck_card(2);
+                d
+            }),
+            ("two positions sharing a coordinate", {
+                let mut d = deck(&[10, 11, 12, 13]);
+                d[3] = d[1];
+                d
+            }),
+            ("the open deck returned unchanged", open.clone()),
+            ("a short deck", deck(&[10, 11])),
+        ];
+
+        for (name, next) in cases {
+            let initial = structural_check_initial(&next, N);
+            let full = structural_check(&open, &next, N);
+            assert_eq!(
+                initial.is_ok(),
+                full.is_ok(),
+                "the two checks disagreed on: {name} ({initial:?} vs {full:?})"
+            );
+        }
+    }
+
+
+    /// And the one input where the reasons differ, pinned so the doc comment
+    /// cannot drift away from the code.
+    #[test]
+    fn an_untouched_open_deck_is_fifty_two_cards_face_up() {
+        let open: Vec<Ciphertext> = (0..4u8).map(open_deck_card).collect();
+        assert_eq!(
+            structural_check_initial(&open, N),
+            Err(InvalidReason::IdentityCiphertext { position: 0 })
+        );
+        assert_eq!(
+            structural_check(&open, &open.clone(), N),
+            Err(InvalidReason::DeckUnchanged)
         );
     }
 
@@ -757,6 +927,14 @@ mod tests {
     fn the_structural_check_cannot_be_skipped_by_an_implementor() {
         struct AlwaysAccepts;
         impl DeckCrypto for AlwaysAccepts {
+            fn verify_initial_argument(
+                &self,
+                _next: &[Ciphertext],
+                _proof: &[u8],
+                _ctx: &DeckCtx,
+            ) -> Result<(), VerifyOutcome> {
+                Ok(())
+            }
             fn verify_argument(
                 &self,
                 _prev: &[Ciphertext],
@@ -789,6 +967,16 @@ mod tests {
     fn invalid_and_could_not_verify_are_different_things() {
         struct Unavailable_;
         impl DeckCrypto for Unavailable_ {
+            fn verify_initial_argument(
+                &self,
+                _next: &[Ciphertext],
+                _proof: &[u8],
+                _ctx: &DeckCtx,
+            ) -> Result<(), VerifyOutcome> {
+                Err(VerifyOutcome::CouldNotVerify(
+                    super::Unavailable::AggregateKeyUnknown,
+                ))
+            }
             fn verify_argument(
                 &self,
                 _prev: &[Ciphertext],
@@ -827,6 +1015,14 @@ mod tests {
     fn a_verified_deck_can_only_come_from_verification() {
         struct Ok_;
         impl DeckCrypto for Ok_ {
+            fn verify_initial_argument(
+                &self,
+                _n: &[Ciphertext],
+                _pr: &[u8],
+                _c: &DeckCtx,
+            ) -> Result<(), VerifyOutcome> {
+                Ok(())
+            }
             fn verify_argument(
                 &self,
                 _p: &[Ciphertext],

@@ -283,3 +283,70 @@ fn open_deck_is_the_deck_ziffle_deals() {
         "the shuffle did not deal all 52 distinct cards"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The encodings the boundary's checks are written against.
+//
+// `structural_check` refuses a deck position left in the clear, which is the
+// highest-value check the review found, and it recognises "in the clear" by a
+// flag bit in the compressed encoding. That bit was a reading of arkworks'
+// convention and had never been compared against what arkworks emits. If it
+// were wrong the check would not fail — it would silently never fire, and a
+// shuffle that left chosen slots face up would pass the boundary.
+//
+// Measured here, so an arkworks bump that moves the convention fails a test
+// rather than disarming the check.
+// ---------------------------------------------------------------------------
+
+/// The identity is 32 zero bytes and a flag byte of `0x40`.
+#[test]
+fn the_identity_encodes_as_the_boundary_expects() {
+    let mut bytes = Vec::new();
+    Affine::identity().serialize_compressed(&mut bytes).unwrap();
+
+    assert_eq!(bytes.len(), 33, "one coordinate is 33 bytes compressed");
+    assert!(
+        bytes[..32].iter().all(|&b| b == 0),
+        "the identity carries no x coordinate"
+    );
+    assert_eq!(
+        bytes[32] & 0x40,
+        0x40,
+        "the infinity flag is bit 6 of the last byte - this is the bit          `is_identity_c1` tests, and the check is inert if it moves"
+    );
+}
+
+/// And no point that is *not* the identity sets it, or the check would refuse
+/// honest decks — the opposite failure, and the one that would at least be
+/// noticed.
+#[test]
+fn no_real_point_sets_the_infinity_flag() {
+    let deck = open_deck();
+    for (i, p) in deck.iter().enumerate() {
+        let mut bytes = Vec::new();
+        p.serialize_compressed(&mut bytes).unwrap();
+        assert_eq!(
+            bytes[32] & 0x40,
+            0,
+            "card {i} of the open deck reads as the identity"
+        );
+    }
+
+    let mut g = Vec::new();
+    Affine::generator().serialize_compressed(&mut g).unwrap();
+    assert_eq!(g[32] & 0x40, 0);
+}
+
+/// The sizes the wire boundary is built on, so a change in the curve or the
+/// serialisation shows up as a failure and not as a decode error at run time.
+#[test]
+fn the_wire_sizes_are_the_ones_the_boundary_declares() {
+    let mut point = Vec::new();
+    Affine::generator().serialize_compressed(&mut point).unwrap();
+    assert_eq!(point.len(), 33, "one compressed point");
+    assert_eq!(
+        point.len() * 2,
+        66,
+        "one ElGamal ciphertext is a pair, and `Ciphertext` is [u8; 66]"
+    );
+}

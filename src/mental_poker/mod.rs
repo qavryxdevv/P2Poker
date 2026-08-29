@@ -6,6 +6,7 @@
 
 pub mod deck;
 pub mod proofs;
+pub mod backend;
 pub mod protocol;
 pub mod reveal;
 pub mod shuffle;

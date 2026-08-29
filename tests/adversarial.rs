@@ -54,6 +54,15 @@ fn deck(from: u8) -> Vec<Ciphertext> {
 struct ArgumentAlwaysAccepts;
 
 impl DeckCrypto for ArgumentAlwaysAccepts {
+    fn verify_initial_argument(
+        &self,
+        _next: &[Ciphertext],
+        _proof: &[u8],
+        _ctx: &DeckCtx,
+    ) -> Result<(), VerifyOutcome> {
+        Ok(())
+    }
+
     fn verify_argument(
         &self,
         _prev: &[Ciphertext],

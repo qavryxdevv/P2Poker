@@ -81,6 +81,26 @@ impl CardIndex {
     pub const fn get(self) -> u8 {
         self.0
     }
+
+    /// A bare deck **position**, for tests only.
+    ///
+    /// Gated on `cfg(test)` rather than merely kept private, because in the
+    /// running client there is no such thing: every index comes from
+    /// [`DeckIndexMap`], and an index the hand gave no role to is one no token
+    /// is ever legal for.
+    ///
+    /// What it is for is the one property that belongs to the deck rather than
+    /// to any hand - that a shuffled deck is a permutation of the open one, all
+    /// fifty-two positions of it - which cannot be stated through a map that
+    /// only ever mints `2m + 5`.
+    #[cfg(test)]
+    pub(crate) const fn position(index: u8, deck_len: usize) -> Option<Self> {
+        if (index as usize) < deck_len {
+            Some(CardIndex(index))
+        } else {
+            None
+        }
+    }
 }
 
 /// Why a map could not be built.
