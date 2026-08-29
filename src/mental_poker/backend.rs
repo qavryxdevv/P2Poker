@@ -256,11 +256,13 @@ impl HandDeck {
     /// Shuffle and re-mask, producing the deck and its argument.
     ///
     /// `prev` is `None` for the first link of the chain, whose input is the open
-    /// deck. Randomness is the operating system's and nothing else
+    /// deck, and otherwise the chain's own last verified deck — which is why it
+    /// is a [`Verified`] and **not** a [`Final`]: a final deck is one nobody
+    /// shuffles again. Randomness is the operating system's and nothing else
     /// (`SPEC_CS.md` §7).
     pub fn shuffle(
         &self,
-        prev: Option<&Final<Verified<Vec<Ciphertext>>>>,
+        prev: Option<&Verified<Vec<Ciphertext>>>,
         ctx: &DeckCtx,
     ) -> Result<(Vec<Ciphertext>, Vec<u8>), VerifyOutcome> {
         let (deck, proof) = match prev {
@@ -269,7 +271,7 @@ impl HandDeck {
                 .shuffle
                 .shuffle_initial_deck(&mut OsRng, self.apk, ctx.as_bytes()),
             Some(p) => {
-                let handle = self.lookup(p.as_ref().as_ref())?;
+                let handle = self.lookup(p.as_ref())?;
                 self.params
                     .shuffle
                     .shuffle_deck(&mut OsRng, self.apk, &handle, ctx.as_bytes())
@@ -545,11 +547,11 @@ mod tests {
         )
         .unwrap();
 
-        let mut last: Option<Final<Verified<Vec<Ciphertext>>>> = None;
         for round in 0..3u8 {
             let t = std::time::Instant::now();
+            let step_ctx = chain.next_ctx(round as u64).expect("the chain is open");
             let (deck, proof) = hand
-                .shuffle(last.as_ref(), &ctx(round))
+                .shuffle(chain.last_verified(), &step_ctx)
                 .expect("this peer can shuffle a deck it verified");
             let proved = t.elapsed();
             let t = std::time::Instant::now();
@@ -568,11 +570,6 @@ mod tests {
                 verified > std::time::Duration::from_millis(1),
                 "verification took {verified:?}; a real Bayer-Groth check cannot be that cheap"
             );
-
-            // Stand in for the next round's input. Only the last one is really
-            // final; the loop uses the same handle type because the library
-            // needs a verified deck either way.
-            last = Some(Final::new(Verified::new(deck)));
         }
 
         let final_deck = chain.finish().expect("every seat shuffled");
@@ -643,10 +640,11 @@ mod tests {
             vec![[0u8; 32], [1u8; 32]],
         )
         .unwrap();
-        let (d0, p0) = hand.shuffle(None, &ctx(0)).unwrap();
-        chain.accept_step(&hand, 0, d0.clone(), &p0, 0).unwrap();
-        let after0 = Final::new(Verified::new(d0));
-        let (d1, p1) = hand.shuffle(Some(&after0), &ctx(1)).unwrap();
+        let c0 = chain.next_ctx(0).unwrap();
+        let (d0, p0) = hand.shuffle(None, &c0).unwrap();
+        chain.accept_step(&hand, 0, d0, &p0, 0).unwrap();
+        let c1x = chain.next_ctx(1).unwrap();
+        let (d1, p1) = hand.shuffle(chain.last_verified(), &c1x).unwrap();
         chain.accept_step(&hand, 1, d1, &p1, 1).unwrap();
         let final_deck = chain.finish().unwrap();
         let _ = deck;
@@ -714,8 +712,26 @@ mod tests {
         assert_eq!(WireDeck::LEN, flatten(&deck).len());
         assert_eq!(WireShuffleProof::LEN, proof.len());
 
-        hand.verify_initial_argument(&deck, &proof, &c).unwrap();
-        let after = Final::new(Verified::new(deck.clone()));
+        // A one-link chain, so the final deck comes from the only thing that
+        // can honestly mint one.
+        let mut c1 = ShuffleChain::open(
+            ChainParams {
+                protocol_version: 1,
+                table_id: [1u8; 32],
+                session_id: [2u8; 32],
+                hand_id: 9,
+            },
+            vec![0, 1],
+            vec![[0u8; 32], [1u8; 32]],
+        )
+        .unwrap();
+        let first = c1.next_ctx(0).unwrap();
+        let (d0, p0) = hand.shuffle(None, &first).unwrap();
+        c1.accept_step(&hand, 0, d0, &p0, 0).unwrap();
+        let second = c1.next_ctx(1).unwrap();
+        let (d1, p1) = hand.shuffle(c1.last_verified(), &second).unwrap();
+        c1.accept_step(&hand, 1, d1, &p1, 1).unwrap();
+        let after = c1.finish().unwrap();
         let (token, tproof) = hand
             .token(&sk, &seated[0], &after, CardIndex::position(0, DECK).unwrap(), &c)
             .unwrap();

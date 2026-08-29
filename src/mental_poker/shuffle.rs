@@ -139,7 +139,11 @@ pub struct ShuffleChain {
     /// what it is - so a chain that stored it would be carrying a constant it
     /// cannot check. Kept in full because a dispute is settled against the
     /// chain, not against its last link.
-    decks: Vec<Vec<Ciphertext>>,
+    ///
+    /// Held as `Verified`, not as bare bytes: the chain is the only thing that
+    /// ran the verification, so it is the only thing that can honestly hand one
+    /// out - and the next shuffler needs one to shuffle from.
+    decks: Vec<Verified<Vec<Ciphertext>>>,
     admission: ShuffleAdmission,
     state: State,
 }
@@ -273,11 +277,11 @@ impl ShuffleChain {
         // deck. In neither case is the input something the sender supplied.
         let verified = match self.decks.last() {
             None => crypto.verify_initial_shuffle(&next, proof, &ctx),
-            Some(prev) => crypto.verify_shuffle(prev, &next, proof, &ctx),
+            Some(prev) => crypto.verify_shuffle(prev.as_ref(), &next, proof, &ctx),
         }
         .map_err(StepError::Rejected)?;
 
-        self.decks.push(verified.into_inner());
+        self.decks.push(verified);
         if self.steps_taken() == self.order.len() {
             self.state = State::Complete;
         }
@@ -315,13 +319,45 @@ impl ShuffleChain {
             return None;
         }
         let last = self.decks.last().expect("a complete chain has a last deck");
-        Some(Final::new(Verified::new(last.clone())))
+        Some(Final::new(Verified::new(last.as_ref().clone())))
     }
 
     /// Every deck the chain produced, in order. A dispute is settled against
     /// the chain, not against its last link.
-    pub fn decks(&self) -> &[Vec<Ciphertext>] {
+    pub fn decks(&self) -> &[Verified<Vec<Ciphertext>>] {
         &self.decks
+    }
+
+    /// The context the next step must be proved under.
+    ///
+    /// `None` once the chain is finished or abandoned. `sequence` is the chain
+    /// stage index of the event that will carry the proof, which is the caller's
+    /// to know and the only part of the context that is.
+    ///
+    /// This exists because the alternative failed a test the first time it was
+    /// written: a shuffler that builds its own context has to reproduce the
+    /// round and the shuffler key exactly as [`accept_step`](Self::accept_step)
+    /// will derive them, and a mismatch makes an honest peer unable to shuffle
+    /// its own turn. It fails closed, which is the good direction, but there is
+    /// no reason to have two derivations of one value at all.
+    pub fn next_ctx(&self, sequence: u64) -> Option<DeckCtx> {
+        let k = self.steps_taken();
+        if self.state != State::Open || k >= self.order.len() {
+            return None;
+        }
+        Some(self.ctx_for(k, sequence))
+    }
+
+    /// The deck the next shuffler must shuffle from, or `None` before the first
+    /// step - where the input is the open deck and only the library knows it.
+    ///
+    /// This is the only way to a mid-chain [`Verified`] deck, and it is here
+    /// rather than on the crypto boundary because the chain is what ran the
+    /// verification. A [`Final`] deck is a different thing and is what
+    /// [`finish`](Self::finish) returns: reveal tokens are issued against that
+    /// and never against an intermediate one (C-6).
+    pub fn last_verified(&self) -> Option<&Verified<Vec<Ciphertext>>> {
+        self.decks.last()
     }
 }
 
@@ -559,8 +595,8 @@ mod tests {
         // chain rather than on the verdict.
         c.accept_step(&ArgumentAccepts, 1, deck_for_round(2), b"p", 1)
             .unwrap();
-        assert_eq!(c.decks()[0], deck_for_round(1));
-        assert_eq!(c.decks()[1], deck_for_round(2));
+        assert_eq!(c.decks()[0].as_ref(), &deck_for_round(1));
+        assert_eq!(c.decks()[1].as_ref(), &deck_for_round(2));
     }
 
     /// The structural check runs inside `verify_shuffle`, so a chain step gets
@@ -633,6 +669,28 @@ mod tests {
         c.abort(AbortReason::StepRejected { seat: 0 });
         assert_eq!(c.aborted(), Some(AbortReason::StepRejected { seat: 0 }));
         assert!(c.finish().is_none());
+    }
+
+
+    /// One owner for the step context: what the chain hands out is what the
+    /// chain checks against.
+    #[test]
+    fn the_context_a_shuffler_is_given_is_the_one_it_is_judged_by() {
+        let mut c = chain(vec![0, 1]);
+        assert_eq!(c.next_ctx(7), Some(c.ctx_for(0, 7)));
+
+        c.accept_step(&ArgumentAccepts, 0, deck_for_round(1), b"p", 0)
+            .unwrap();
+        assert_eq!(c.next_ctx(8), Some(c.ctx_for(1, 8)));
+        assert_ne!(c.next_ctx(8), Some(c.ctx_for(0, 8)), "the round moved");
+
+        c.accept_step(&ArgumentAccepts, 1, deck_for_round(2), b"p", 1)
+            .unwrap();
+        assert_eq!(c.next_ctx(9), None, "a finished chain has no next step");
+
+        let mut c = chain(vec![0, 1]);
+        c.abort(AbortReason::HandAbandoned);
+        assert_eq!(c.next_ctx(0), None, "and neither has an abandoned one");
     }
 
     /// Rule 1: one seat cannot occupy two positions and so shuffle twice while
