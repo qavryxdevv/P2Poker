@@ -86,7 +86,11 @@ impl TableState {
         match self {
             TableState::Open => "open",
             TableState::Full => "full",
-            TableState::ParametersChanged => "parameters changed",
+            // One word, because it shares a row with seven other columns.
+            // What it means is on the hover and in the information pane, and
+            // "parameters changed" in a table cell is a column nothing else
+            // fits beside.
+            TableState::ParametersChanged => "changed",
         }
     }
 

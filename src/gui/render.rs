@@ -231,11 +231,15 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     // Proportions rather than pixel counts: 560 and 280 are answers to one
     // window size only, and on a wide one they left the middle column too narrow
     // to fit the words "Players in the lobby" on a single line.
+    //
+    // The tables column gets over half, because it carries eight columns of its
+    // own and the first proportion that fixed the middle column cut "Timing" and
+    // "State" off the right of it.
     let across = ui.available_width();
     egui::Panel::left("tables")
         .resizable(true)
-        .default_size((across * 0.46).clamp(380.0, 900.0))
-        .min_size(340.0)
+        .default_size((across * 0.55).clamp(430.0, 1_000.0))
+        .min_size(360.0)
         .frame(frame())
         .show(ui, |ui| {
             action = tables_column(ui, view, state);
@@ -243,8 +247,8 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
 
     egui::Panel::right("info")
         .resizable(true)
-        .default_size((across * 0.24).clamp(230.0, 460.0))
-        .min_size(210.0)
+        .default_size((across * 0.22).clamp(215.0, 430.0))
+        .min_size(200.0)
         .frame(frame())
         .show(ui, |ui| info_column(ui, view));
 

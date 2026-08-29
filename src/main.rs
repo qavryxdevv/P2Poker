@@ -237,8 +237,12 @@ fn windowed(
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 700.0])
-            .with_min_inner_size([720.0, 480.0])
+            // Three panes and an eight-column list. The first sizes were 980
+            // by 700 and 720 by 480, and at both of them the table list ran off
+            // its own column: the minimum in particular was a size at which the
+            // client could not show what it is for.
+            .with_inner_size([1_180.0, 760.0])
+            .with_min_inner_size([900.0, 600.0])
             .with_title("p2p-poker"),
         ..Default::default()
     };
