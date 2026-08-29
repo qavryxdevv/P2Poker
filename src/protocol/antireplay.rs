@@ -30,6 +30,19 @@
 //!
 //! Sparse maps rather than dense arrays throughout: a dense `u16` type axis
 //! would be 65 536 cells per `(stage, seat)` to hold at most a pair.
+//!
+//! # Only the ordinary class is allocated in version 1
+//!
+//! D-015 stops the MVP producing `TIMEOUT_VOTE` and `TIMEOUT_CERT`, so their two
+//! structures hold nothing and are not allocated. The measurement is why: of the
+//! 28.3 MiB this store could reach in one hand, **26 MiB were those two
+//! classes** — the client's largest attacker-influenced allocation, held for
+//! machinery D-010 had already made consequence-free.
+//!
+//! An event of either class is therefore **rejected** rather than recorded. That
+//! is not a narrowing of the slot key, which keeps every component including
+//! both subject forms: narrowing the key is how five review passes went wrong,
+//! and a key that is right costs nothing while nothing populates it.
 
 use std::collections::HashMap;
 
@@ -61,6 +74,12 @@ pub enum StoreError {
     /// events one `(stage, seat)` may hold, so it is a last line rather than the
     /// first (`SPEC_CS.md` §17, §27 forbid unbounded allocation regardless).
     Full,
+    /// A class version 1 does not produce (D-015).
+    ///
+    /// Nothing emits one, so receiving one means a non-conforming peer. It is
+    /// refused here rather than stored, which is what keeps the two structures
+    /// unallocated.
+    ClassNotProduced(u8),
 }
 
 impl core::fmt::Display for StoreError {
@@ -68,6 +87,9 @@ impl core::fmt::Display for StoreError {
         match self {
             StoreError::WrongScope => write!(f, "the event is not of this table and hand"),
             StoreError::Full => write!(f, "the anti-replay store is at its bound"),
+            StoreError::ClassNotProduced(c) => {
+                write!(f, "event class {c} is not produced in this version")
+            }
         }
     }
 }
@@ -80,11 +102,10 @@ pub struct AntiReplay {
     table_id: [u8; 32],
     hand_id: u64,
     /// `(stage, seat, event_type) -> event_hash`
+    ///
+    /// The only class version 1 populates. The two timeout classes are refused
+    /// at the door rather than given a structure (D-015).
     ordinary: HashMap<(u64, u8, u16), Hash>,
-    /// `(stage, seat, subject_seat) -> event_hash`
-    votes: HashMap<(u64, u8, u8), Hash>,
-    /// `(stage, seat, subject_digest) -> event_hash`
-    certificates: HashMap<(u64, u8, [u8; 32]), Hash>,
 }
 
 impl AntiReplay {
@@ -98,24 +119,21 @@ impl AntiReplay {
         + (MAX_SEATS as usize)
         + 16 * (MAX_SEATS as usize);
 
-    /// The per-class bound for the two timeout classes: at most every seat
-    /// naming every other seat, at every stage.
-    pub const SUBJECT_CAPACITY: usize =
+    /// What the two timeout classes would have cost if version 1 produced
+    /// them: every seat naming every other seat, at every stage.
+    ///
+    /// Kept as a constant because it is the measurement D-015 rests on, and
+    /// because a later version that reinstates them needs the bound.
+    pub const DEFERRED_SUBJECT_CAPACITY: usize =
         (MAX_STAGES_PER_HAND as usize) * (MAX_SEATS as usize) * ((MAX_SEATS as usize) - 1);
 
     pub fn new(table_id: [u8; 32], hand_id: u64) -> Self {
-        AntiReplay {
-            table_id,
-            hand_id,
-            ordinary: HashMap::new(),
-            votes: HashMap::new(),
-            certificates: HashMap::new(),
-        }
+        AntiReplay { table_id, hand_id, ordinary: HashMap::new() }
     }
 
-    /// How many events are recorded, across all three classes.
+    /// How many events are recorded.
     pub fn len(&self) -> usize {
-        self.ordinary.len() + self.votes.len() + self.certificates.len()
+        self.ordinary.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -143,18 +161,11 @@ impl AntiReplay {
                 event_hash,
                 Self::ORDINARY_CAPACITY,
             ),
-            Subject::Seat(subject) => Self::record(
-                &mut self.votes,
-                (slot.sequence, seat, subject),
-                event_hash,
-                Self::SUBJECT_CAPACITY,
-            ),
-            Subject::Digest(digest) => Self::record(
-                &mut self.certificates,
-                (slot.sequence, seat, digest),
-                event_hash,
-                Self::SUBJECT_CAPACITY,
-            ),
+            // Version 1 emits neither, so receiving one means a non-conforming
+            // peer. Refusing here is what keeps the two structures unallocated.
+            Subject::Seat(_) | Subject::Digest(_) => {
+                Err(StoreError::ClassNotProduced(slot.event_class))
+            }
         }
     }
 
@@ -177,6 +188,13 @@ impl AntiReplay {
         }
     }
 }
+
+// The two deferred classes together dwarfed the one that remains - the ratio is
+// the measurement D-015 rests on, so it fails the build rather than a test run
+// if either bound is ever edited without the other.
+const _: () = assert!(
+    AntiReplay::DEFERRED_SUBJECT_CAPACITY * 2 > AntiReplay::ORDINARY_CAPACITY * 8
+);
 
 #[cfg(test)]
 mod tests {
@@ -283,54 +301,53 @@ mod tests {
         assert_eq!(s.observe(&muck, 1, [2u8; 32]), Ok(Observation::Fresh));
     }
 
-    /// The subject axis. The protocol admits two simultaneous timeout subjects,
-    /// so a voter voting against both must land in two cells — otherwise honest,
-    /// required behaviour manufactures evidence against the voter.
+    /// D-015: version 1 emits neither timeout class, so receiving one means a
+    /// non-conforming peer and the store refuses rather than allocating. This
+    /// is what keeps 26 of the 28.3 MiB out of the client.
     #[test]
-    fn two_timeout_subjects_at_one_stage_are_two_entries() {
-        let mut s = store();
-        let against_2 = slot_of(EventType::TimeoutVote, 15, Subject::Seat(2));
-        let against_5 = slot_of(EventType::TimeoutVote, 15, Subject::Seat(5));
-        assert_eq!(s.observe(&against_2, 0, [1u8; 32]), Ok(Observation::Fresh));
-        assert_eq!(
-            s.observe(&against_5, 0, [2u8; 32]),
-            Ok(Observation::Fresh),
-            "an honest voter must not incriminate itself by voting twice"
-        );
-    }
-
-    #[test]
-    fn one_subject_twice_with_different_bodies_is_still_equivocation() {
+    fn a_timeout_class_is_refused_and_allocates_nothing() {
         let mut s = store();
         let vote = slot_of(EventType::TimeoutVote, 15, Subject::Seat(2));
-        s.observe(&vote, 0, [1u8; 32]).unwrap();
-        assert_eq!(
-            s.observe(&vote, 0, [9u8; 32]),
-            Ok(Observation::Equivocation { previously: [1u8; 32] })
+        let cert = slot_of(EventType::TimeoutCert, 15, Subject::Digest([1u8; 32]));
+
+        assert_eq!(s.observe(&vote, 0, [1u8; 32]), Err(StoreError::ClassNotProduced(1)));
+        assert_eq!(s.observe(&cert, 0, [2u8; 32]), Err(StoreError::ClassNotProduced(2)));
+        assert!(s.is_empty(), "a refused class must leave nothing behind");
+    }
+
+    /// The property the subject axis protected has **not** gone away with the
+    /// store — it lives in the slot key, which keeps every component.
+    ///
+    /// Narrowing that key is how five review passes went wrong, and a key that
+    /// is right costs nothing while nothing populates it. So this is asserted
+    /// here too: if a later version reinstates the timeout classes, the axis
+    /// they need is already correct and this test will have been guarding it.
+    #[test]
+    fn the_slot_key_still_separates_two_timeout_subjects() {
+        let against_2 = slot_of(EventType::TimeoutVote, 15, Subject::Seat(2));
+        let against_5 = slot_of(EventType::TimeoutVote, 15, Subject::Seat(5));
+        assert_ne!(
+            against_2, against_5,
+            "an honest voter must not incriminate itself by voting twice"
         );
+
+        let cert_a = slot_of(EventType::TimeoutCert, 15, Subject::Digest([1u8; 32]));
+        let cert_b = slot_of(EventType::TimeoutCert, 15, Subject::Digest([2u8; 32]));
+        assert_ne!(cert_a, cert_b);
     }
 
+    /// An ordinary event at the same `(stage, seat)` as a refused timeout class
+    /// is unaffected: the refusal is per class, not per slot.
     #[test]
-    fn two_certificate_digests_at_one_stage_are_two_entries() {
-        let mut s = store();
-        let a = slot_of(EventType::TimeoutCert, 15, Subject::Digest([1u8; 32]));
-        let b = slot_of(EventType::TimeoutCert, 15, Subject::Digest([2u8; 32]));
-        assert_eq!(s.observe(&a, 0, [0xA1; 32]), Ok(Observation::Fresh));
-        assert_eq!(s.observe(&b, 0, [0xA2; 32]), Ok(Observation::Fresh));
-    }
-
-    /// The three classes are separate structures, so a vote and an ordinary
-    /// event at one `(stage, seat)` never meet.
-    #[test]
-    fn the_three_classes_are_separate_structures() {
+    fn refusing_a_timeout_class_does_not_disturb_the_ordinary_one() {
         let mut s = store();
         let ordinary = slot_of(EventType::ActionCall, 20, Subject::None);
         let vote = slot_of(EventType::TimeoutVote, 20, Subject::Seat(1));
-        let cert = slot_of(EventType::TimeoutCert, 20, Subject::Digest([7u8; 32]));
+
         assert_eq!(s.observe(&ordinary, 0, [1u8; 32]), Ok(Observation::Fresh));
-        assert_eq!(s.observe(&vote, 0, [2u8; 32]), Ok(Observation::Fresh));
-        assert_eq!(s.observe(&cert, 0, [3u8; 32]), Ok(Observation::Fresh));
-        assert_eq!(s.len(), 3);
+        assert!(s.observe(&vote, 0, [2u8; 32]).is_err());
+        assert_eq!(s.observe(&ordinary, 0, [1u8; 32]), Ok(Observation::Duplicate));
+        assert_eq!(s.len(), 1);
     }
 
     #[test]
@@ -354,15 +371,11 @@ mod tests {
     #[test]
     fn the_store_refuses_to_grow_past_its_bound() {
         let mut s = store();
-        // Fill the vote class, whose bound is the smaller of the two.
         let mut filled = 0usize;
         'outer: for sequence in 0..u64::MAX {
             for seat in 0..MAX_SEATS {
-                for subject in 0..MAX_SEATS {
-                    if subject == seat {
-                        continue;
-                    }
-                    let slot = slot_of(EventType::TimeoutVote, sequence, Subject::Seat(subject));
+                for t in [EventType::ActionCall, EventType::HandAbort] {
+                    let slot = slot_of(t, sequence, Subject::None);
                     match s.observe(&slot, seat, [(filled % 251) as u8; 32]) {
                         Ok(Observation::Fresh) => filled += 1,
                         Ok(other) => panic!("unexpected {other:?} while filling"),
@@ -372,15 +385,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(filled, AntiReplay::SUBJECT_CAPACITY);
+        assert_eq!(filled, AntiReplay::ORDINARY_CAPACITY);
 
-        // One more of a kind not already present must now be refused.
-        let overflow = slot_of(EventType::TimeoutVote, u64::MAX, Subject::Seat(1));
+        let overflow = slot_of(EventType::ActionFold, u64::MAX, Subject::None);
         assert_eq!(s.observe(&overflow, 0, [0xFF; 32]), Err(StoreError::Full));
 
-        // But a duplicate of something already stored still answers, because it
-        // allocates nothing.
-        let known = slot_of(EventType::TimeoutVote, 0, Subject::Seat(1));
+        // A duplicate of something already stored still answers, because
+        // answering allocates nothing.
+        let known = slot_of(EventType::ActionCall, 0, Subject::None);
         assert!(matches!(
             s.observe(&known, 0, [0u8; 32]),
             Ok(Observation::Duplicate) | Ok(Observation::Equivocation { .. })
@@ -392,7 +404,8 @@ mod tests {
         // 2048 stages x 10 seats x 2, plus 10 for the boundary window, plus
         // 16 x 10 for the boundary checkpoint band.
         assert_eq!(AntiReplay::ORDINARY_CAPACITY, 40_960 + 10 + 160);
-        // Every seat naming every other seat, at every stage.
-        assert_eq!(AntiReplay::SUBJECT_CAPACITY, 2_048 * 10 * 9);
+        // What the two deferred classes would each have cost: every seat naming
+        // every other seat, at every stage. This is the number D-015 rests on.
+        assert_eq!(AntiReplay::DEFERRED_SUBJECT_CAPACITY, 2_048 * 10 * 9);
     }
 }

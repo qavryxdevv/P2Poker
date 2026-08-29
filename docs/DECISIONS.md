@@ -1495,6 +1495,110 @@ this feature, and it is the same shape as D-009 rule 1's mirror test.
 
 ---
 
+---
+
+## D-015 — The timeout machinery is not produced in the MVP
+
+**Date:** 2026-08-29
+**Decided by:** project owner
+**Status:** accepted
+**Answers:** OQ-F
+**Completes:** D-006, D-007, D-008, D-010
+
+### The decision
+
+`TIMEOUT_VOTE`, `TIMEOUT_CERT` and `EquivocationProof` are **not produced** in
+version 1. They stay specified, so a later version can add them without a wire
+break, and nothing emits or consumes one.
+
+### What prompted it
+
+The anti-replay store was measured. Worst case per hand:
+
+| class | entries | resident |
+|---|---:|---:|
+| ordinary events | 41 130 | 2.2 MiB |
+| timeout votes | 184 320 | 9.8 MiB |
+| timeout certificates | 184 320 | 16.3 MiB |
+| **total** | | **28.3 MiB** |
+
+At the protocol's limit of eight concurrent table sessions that is ~226 MiB.
+**Twenty-six of those twenty-eight MiB are the two timeout classes**, and D-010
+had already made them consequence-free: consuming a certificate or a proof
+moves no chip and removes no player. So the client was carrying its largest
+attacker-influenced allocation for machinery that does nothing.
+
+### Why this is possible at all, which is the part worth checking
+
+It looks as though removing the certificate must leave an away-from-keyboard
+player able to stall a table, since the certificate was how peers *agreed* a
+deadline had passed. It does not, and the reason is D-006's own observation
+taken one step further.
+
+Publishing a decryption share is something the **client** does automatically; it
+never waits for the human. So is emitting an action. A player who has walked
+away from the keyboard is still running a cooperating client, and that client
+can emit **its own** auto check/fold when its own timer expires. That is a
+single-writer event by the seat itself — it needs no vote, no quorum and no
+agreement, because the seat is present and speaking. Only the human is absent.
+
+That leaves exactly one other case: a client that emits nothing at all, whether
+it crashed, lost its network or is deliberately silent. D-013 already answers
+it — the seat stalls one hand, is then outside `P(k+1)`, and every later hand
+proceeds without it while its stack is blinded off.
+
+So the two cases are covered by two mechanisms that already exist, and the
+certificate sat between them covering neither:
+
+| | client emits | who resolves it |
+|---|---|---|
+| Human away, client running | yes | the seat's own auto check/fold |
+| Client gone or silent | no | D-013 drops it from `P(k+1)` |
+
+A client that is running but deliberately refuses to act while still publishing
+shares behaves as the second row: it stalls one hand and is then skipped. That
+costs a hand and is visible in the transcript, which under D-010 was already all
+that would have happened.
+
+### What it removes
+
+- 26 MiB of the 28 MiB worst-case anti-replay footprint, and with it the
+  client's largest attacker-influenced allocation.
+- Two of the three anti-replay classes, and both subject axes.
+- The machinery that produced a defect in **five consecutive review passes** —
+  A-1, N3, M2, and D-009 rule 1's recurrences — every one of which turned on
+  who was required to sign what, and by when, with no shared clock.
+
+### What it costs, stated plainly
+
+1. **No cryptographic record of who timed out.** The transcript still shows
+   whose event is missing from a stage, which is what a human or a later version
+   would read anyway, but there is no signed assertion about it.
+2. **A later version cannot adjudicate today's transcripts** for timeout
+   questions, because the evidence was never produced. That is accepted: under
+   D-010 the evidence had no consequence, so nothing was going to be adjudicated
+   from it.
+3. **An equivocation is detected and not provable to a third party.** The store
+   still finds it — two bodies in one slot — and the finding still stops the
+   hand under D-014's tier 1, which acts on the accused's own signed messages
+   and needs no proof object. What is lost is handing that proof to somebody who
+   was not there.
+
+Point 3 is the one to weigh before real money, and it is recorded in the open
+list rather than treated as settled.
+
+### What stays
+
+- The slot key keeps every component, including both subject forms. Narrowing
+  it is how five passes went wrong, and a key that is right costs nothing when
+  nothing populates it.
+- `docs/PROTOCOL.md` keeps the message definitions and their codes, so adding
+  them later is not a wire break.
+- D-014's anti-cheat is untouched. It never rested on the timeout machinery: its
+  evidence is a message the accused signed.
+
+---
+
 ## Open decisions
 
 ### How to read the identifiers in this list (`Q5`) — two live `P` series, and which is which
@@ -1514,6 +1618,8 @@ exactly how `N-4` came to quote a predicate that had been superseded.
 **The convention, and it is one rule.** *An item is prefixed with the gate that
 opened it, except the first, which keeps the bare labels it has held longest.*
 
+| D-015-1 | Apply D-015 across the corpus: nothing emits or consumes `TIMEOUT_VOTE`, `TIMEOUT_CERT` or `EquivocationProof` in version 1, while their definitions and codes stay. Touches `PROTOCOL.md`, `STATE_MACHINE.md`, `THREAT_MODEL.md`, `CRYPTOGRAPHY.md`, `NETWORK_STACK.md`. | all — **not started** |
+| D-015-2 | Before real money: an equivocation is now detected but not provable to a third party who was not present. Decide whether that is acceptable, or reinstate the proof object with the machinery reviewed. | a later numbered decision |
 | Series | Opened by | Labels | What they are about |
 |---|---|---|---|
 | **The original `P` series** — **keeps bare `P1 … P8`** | `research/PHASE2_GATE.md` and `PHASE1_VERIFY3.md` | `P1`, `P2`, … `P8` | **Phase and reachability defects in the state machine.** `P1` unreachable phases, `P3` the witness-independent terminal stage, `P5` `Diverged` with no liveness exit, `P8` mid-session seat entry deferred rather than described. Cited throughout `STATE_MACHINE.md` (its numbered gate list, T50, §2.3, §9.4) and in `PROTOCOL.md` §3.2, §4.4, §4.11 |
@@ -1613,6 +1719,7 @@ that already exists.
 | Q4-e | **DONE in this pass.** `CheckpointState` carried `values: u8` and no `state_hash`, so T49's *"equals this peer's own derivation"*, T50's *"two distinct values now exist"* and T51's *"every value agrees"* had no term in the record to read — uncomputable on the `agreed` and `boundary` slots `P1` added for them, and, in T50's case, uncomputable everywhere, since a count of distinct values cannot be maintained without the values. `values` is deleted; `own: Hash` and `dissent: Option<Hash>` replace it. T49 is `e.state_hash == c.own`, T50 is `e.state_hash != c.own` with `c.dissent := c.dissent.or(Some(e.state_hash))`, T51 is `c.dissent.is_none()`. Bound unchanged in shape — three fixed records, 65 bytes each more than before, nothing keyed on a sender-chosen quantity. | `STATE_MACHINE.md` §2.6, §5.2 — **closed** |
 | G5-Q5 | **DONE in this pass, as a convention plus a rename, and the convention is stated above the table because it changes how the table is read.** Two live series were both using bare `P1 … P8`, colliding on **`P3`, `P5` and `P8`** in the same files — `PROTOCOL.md` carries two different `P3`s (l. 83, the witness-independent terminal stage; l. 5833, the hand-deadline floor), `STATE_MACHINE.md` T50 cites an older `P5` and §2.3 an older `P8`. **The fourth Phase 3 gate's series is the one renamed**, to `G4-P1 … G4-P8`, because the original series is load-bearing inside `STATE_MACHINE.md`'s normative text and inside archived gate reports that are records and are not edited; renaming those would falsify the trail. The fifth gate's findings take `G5-Q1 … G5-Q6` from the start, since bare `Q1 … Q6` collide with `STATE_MACHINE.md`'s own open **questions**. Six rows in this list carry the prefixed form with the old label kept in the cell so a search for the remembered string still lands. **A second form of the same collision is named in the same place:** `N1`/`N-1e`, `N4`/`N-4`, `N8`/`N-8`, `N9`/`N-9` and `P4`/`P-4` are five pairs of identifiers for one defect each, and in three of the five a pass updated one row and left its twin asserting the opposite — **a hyphen is not a namespace**, and no row may be re-opened under a punctuation variant of an existing label. | `DECISIONS.md` — **closed**; the residual sweep is `G5-Q5-x` |
 | G5-Q5-x | **Owed to `PROTOCOL.md` by `G5-Q5`, and it is a citation sweep rather than a defect.** The bare `P2` and `P3` citations inside `PROTOCOL.md` that belong to the **fourth gate** — the deadline-floor sites at §8.2 (*"this is `P3`"*), §9.4 rule 2a, §13's `n(17)` row, §12's `Q-10` neighbourhood, §4.0 step 10b's `P2` — now read as the **original** `P3`/`P2` under the convention above, which is the wrong item: the original `P3` is the witness-independent terminal stage, cited eight times in the same file. Each should become `G4-P3` / `G4-P2`. Not edited from here (D-011 rule 1); filed in the pass that made the convention (D-013's process rule). Same sweep, smaller: `STATE_MACHINE.md`'s `P2-e`/`P3-e`/`P7`/`P7-w` citations, which are the fourth gate's. **Until the sweep runs, the disambiguator is the subject, not the label**: a `P3` about a *deadline* is `G4-P3`, a `P3` about a *terminal stage* is the original. | `PROTOCOL.md` §8.2, §9.4, §13, §4.0; `STATE_MACHINE.md` — low, and it is a correctness question only for an editor |
+| ZR-1 | **The `ziffle` review has reported and the decision it forces is: fork the vendored crate now, or ship upstream-identical bytes?** `docs/research/ZIFFLE_VERDICT.md` closes `CRYPTOGRAPHY.md` **OQ-2** (the forked Fiat-Shamir transcript is sound - two reviewers, one by argument, one by executing a cross-statement graft that was rejected) and **OQ-5** (the `Transcript` assert is unreachable by an adversary, argued and measured), and it discharges **OQ-1** substantially but not wholly: the algebra is right line by line, twenty-two attack families against an independent forger produced no forgery, and an exhaustive 2^16 hybrid of the two strongest strategies was rejected - but **nobody proved witness-extended emulation and nobody re-derived the soundness bound at `m = 1`**, which OQ-1 asked for by name. The verdict is **fit for the play-money MVP only with conditions C-1 ... C-15**, and **not fit for real money** on a separate and much higher bar (§6 there). **What the owner has to decide, and why it cannot wait.** Two defects are wire-format changes: the transcript frames its lengths with `usize::to_be_bytes()`, so a 32-bit or wasm client derives *different challenges from the same proof* and the table splits into two mutually unverifiable halves; and `RevealTokenProof` binds a card's `c1` and drops its `c2`, which was demonstrated end to end at N = 52 to let one card's reveal tokens decrypt a different card. Both are two-line fixes in a vendored fork. **The wire format is frozen by the first proof that is persisted or exchanged**, so this is nearly free now and expensive later; the same fork would carry the dead `N > 1` guard, the wrong comment at `lib.rs:1000`, and optionally a joint-state challenge derivation and a protocol tag on `Transcript::init`. **Against forking:** it puts the project on a private wire format no upstream fix will match, ziffle's own 16 unit tests and 15 doctests stop being a check on the code we actually run without re-verification, and it forfeits interoperability with the one other project using the crate. **What does not depend on the answer:** conditions C-0 to C-11, C-13 and C-15 are required either way, and the three-line structural deck check (C-3 - no `c1` is the identity, the `c1` are pairwise distinct, no `c1` is carried over from `prev`, `next != prev`, at 0.019 ms against ~36 ms of proof verification) is required even if the fork happens, because on its own it closes the only three attacks in the review that let a player see a card he should not. | `docs/research/ZIFFLE_VERDICT.md`; `CRYPTOGRAPHY.md` OQ-1/§9, `DEPENDENCIES.md` §3.1 - **blocks writing `src/mental_poker/`** |
 
 **Settled and removed from this list:** the `DISPUTE` self-equivocation question
 (review N4) is answered by D-009 rule 1 — the slot key must include every field
