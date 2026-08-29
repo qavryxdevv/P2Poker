@@ -3,6 +3,7 @@
 
 pub mod advert;
 pub mod dht;
+pub mod chained;
 pub mod formation;
 pub mod joinrpc;
 pub mod joinwire;
