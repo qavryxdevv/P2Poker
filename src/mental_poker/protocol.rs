@@ -287,6 +287,141 @@ pub fn check_key_set(keys: &[[u8; 33]]) -> Result<(), InvalidReason> {
     Ok(())
 }
 
+
+// ---------------------------------------------------------------------------
+// The wire boundary (conditions C-1, C-2, C-6, C-9)
+// ---------------------------------------------------------------------------
+
+/// Why a byte string was refused.
+///
+/// Always attributable: a decode either ran or it did not, and neither answer
+/// depends on state this receiver might be missing. So unlike a verification,
+/// a decode failure is always evidence against whoever sent it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeError {
+    /// Not exactly the length this type has.
+    ///
+    /// Checked before parsing, because the upstream deserialisers **ignore
+    /// trailing bytes** — so without this a proof and that proof with a
+    /// megabyte appended are the same object to the library and two different
+    /// objects to anything that hashes or deduplicates them.
+    WrongLength { expected: usize, got: usize },
+    /// The bytes are not a valid encoding of this type.
+    Malformed,
+    /// The value parsed, but its encoding is not the canonical one.
+    ///
+    /// The measured reason this exists: the upstream encoding accepts at least
+    /// 2^624 distinct byte strings for one 52-card deck, because six bits per
+    /// point are read and discarded. Anyone holding no secret at all can emit
+    /// unbounded distinct byte strings that every peer accepts as the same
+    /// value, which defeats deduplication, message identity, and any signature
+    /// taken over the received bytes rather than over the canonical form.
+    NonCanonical,
+}
+
+impl core::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DecodeError::WrongLength { expected, got } => {
+                write!(f, "expected exactly {expected} bytes, got {got}")
+            }
+            DecodeError::Malformed => write!(f, "not a valid encoding"),
+            DecodeError::NonCanonical => write!(f, "not the canonical encoding"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+/// Every type that crosses the network into the cryptographic layer.
+///
+/// An implementor writes [`decode_raw`](DeckWire::decode_raw) and
+/// [`encode`](DeckWire::encode); [`decode`](DeckWire::decode) is provided and
+/// enforces the two conditions that must not be left to a caller's memory —
+/// exact length before parsing, and re-encode-and-compare after it.
+///
+/// `encode` is the **only** form that is ever hashed, signed, deduplicated or
+/// used as a message identifier. Received bytes are never any of those things.
+pub trait DeckWire: Sized + PartialEq {
+    /// The one length a valid encoding of this type has.
+    const LEN: usize;
+
+    /// Parse, having been given exactly `LEN` bytes.
+    ///
+    /// Must use the compressed, validated form and no unchecked path: the
+    /// uncompressed path with validation off accepted two million of two
+    /// million random byte strings as points not on the curve.
+    fn decode_raw(bytes: &[u8]) -> Result<Self, DecodeError>;
+
+    /// The canonical encoding.
+    fn encode(&self) -> Vec<u8>;
+
+    /// Parse bytes that arrived from outside.
+    ///
+    /// Length first, then the parse, then the round-trip comparison. The order
+    /// is the cheap-before-expensive ordering the protocol requires, and the
+    /// comparison is what makes one value one byte string.
+    fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::LEN {
+            return Err(DecodeError::WrongLength { expected: Self::LEN, got: bytes.len() });
+        }
+        let value = Self::decode_raw(bytes)?;
+        if value.encode() != bytes {
+            return Err(DecodeError::NonCanonical);
+        }
+        Ok(value)
+    }
+}
+
+/// One shuffle proof per peer per position per hand (condition C-9).
+///
+/// A second is a protocol violation rather than something to verify, which
+/// matters because rejecting one bogus proof costs 10 to 36 ms of verification
+/// **at every seat**: a single peer on a slow link can otherwise burn most of a
+/// core at every other player's client.
+///
+/// So the admission check comes before the expensive work, and it is a
+/// structure with a bound rather than a counter, because the position and the
+/// sender both arrive from the network.
+#[derive(Debug, Default, Clone)]
+pub struct ShuffleAdmission {
+    seen: HashSet<(u8, u8)>,
+}
+
+/// Why a shuffle proof was not admitted for verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotAdmitted {
+    /// This seat already submitted a proof for this position in this hand.
+    AlreadySubmitted { seat: u8, position: u8 },
+    /// A seat or position outside the table.
+    OutOfRange { seat: u8, position: u8 },
+}
+
+impl ShuffleAdmission {
+    /// Admit one proof for verification, or say why not.
+    ///
+    /// Called **before** `verify_shuffle`, never after: the point is to spend
+    /// nothing on a proof that is not allowed to exist.
+    pub fn admit(&mut self, seat: u8, position: u8, seats: u8) -> Result<(), NotAdmitted> {
+        if seat >= seats || position >= seats {
+            return Err(NotAdmitted::OutOfRange { seat, position });
+        }
+        if !self.seen.insert((seat, position)) {
+            return Err(NotAdmitted::AlreadySubmitted { seat, position });
+        }
+        Ok(())
+    }
+
+    /// How many proofs have been admitted this hand.
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+}
+
 /// The construction, behind one boundary.
 ///
 /// An implementor writes [`verify_argument`](DeckCrypto::verify_argument) and
@@ -612,6 +747,114 @@ mod tests {
             .verify_shuffle(&prev, &next, b"", &ctx)
             .expect("structurally sound and the argument accepted");
         assert_eq!(verified.as_ref().len(), 52);
+    }
+
+
+    /// A type whose canonical encoding has one spare bit, so a second byte
+    /// string decodes to the same value. That is the shape of the real defect:
+    /// upstream reads and discards six bits per point.
+    #[derive(Debug, PartialEq)]
+    struct Sloppy(u8);
+
+    impl DeckWire for Sloppy {
+        const LEN: usize = 2;
+        fn decode_raw(bytes: &[u8]) -> Result<Self, DecodeError> {
+            // The top bit of the second byte is read and ignored, exactly as
+            // the real deserialiser ignores its flag bits.
+            Ok(Sloppy(bytes[0]))
+        }
+        fn encode(&self) -> Vec<u8> {
+            vec![self.0, 0x00]
+        }
+    }
+
+    #[test]
+    fn the_canonical_encoding_round_trips() {
+        let bytes = Sloppy(7).encode();
+        assert_eq!(Sloppy::decode(&bytes), Ok(Sloppy(7)));
+    }
+
+    /// The length gate runs before the parse, because the upstream
+    /// deserialisers ignore trailing bytes - so a proof and that proof with a
+    /// megabyte appended would be one object to the library and two to
+    /// anything that hashes or deduplicates it.
+    #[test]
+    fn trailing_bytes_are_refused_before_parsing() {
+        let mut bytes = Sloppy(7).encode();
+        bytes.push(0xFF);
+        assert_eq!(
+            Sloppy::decode(&bytes),
+            Err(DecodeError::WrongLength { expected: 2, got: 3 })
+        );
+        assert_eq!(
+            Sloppy::decode(&[7]),
+            Err(DecodeError::WrongLength { expected: 2, got: 1 })
+        );
+        assert_eq!(
+            Sloppy::decode(&[]),
+            Err(DecodeError::WrongLength { expected: 2, got: 0 })
+        );
+    }
+
+    /// The round-trip comparison, which is what makes one value one byte
+    /// string. Without it anyone holding no secret can emit unbounded distinct
+    /// encodings that every peer accepts as the same thing.
+    #[test]
+    fn a_second_encoding_of_one_value_is_refused() {
+        let canonical = Sloppy(7).encode();
+        let variant = vec![7, 0x80]; // decodes to the same value
+
+        assert_eq!(Sloppy::decode(&canonical), Ok(Sloppy(7)));
+        assert_eq!(
+            Sloppy::decode(&variant),
+            Err(DecodeError::NonCanonical),
+            "two byte strings for one value defeats dedup, message ids and \
+             any signature over received bytes"
+        );
+    }
+
+    #[test]
+    fn one_shuffle_proof_per_seat_per_position() {
+        let mut admission = ShuffleAdmission::default();
+        assert_eq!(admission.admit(0, 0, 6), Ok(()));
+        assert_eq!(admission.admit(0, 1, 6), Ok(()), "a different position is fine");
+        assert_eq!(admission.admit(1, 0, 6), Ok(()), "a different seat is fine");
+
+        assert_eq!(
+            admission.admit(0, 0, 6),
+            Err(NotAdmitted::AlreadySubmitted { seat: 0, position: 0 }),
+            "a second proof is a protocol violation, not something to verify"
+        );
+        assert_eq!(admission.len(), 3);
+    }
+
+    /// Both indices arrive from the network, so both are bounded before they
+    /// reach a structure.
+    #[test]
+    fn a_seat_or_position_outside_the_table_is_refused() {
+        let mut admission = ShuffleAdmission::default();
+        assert_eq!(
+            admission.admit(6, 0, 6),
+            Err(NotAdmitted::OutOfRange { seat: 6, position: 0 })
+        );
+        assert_eq!(
+            admission.admit(0, 200, 6),
+            Err(NotAdmitted::OutOfRange { seat: 0, position: 200 })
+        );
+        assert!(admission.is_empty(), "neither was recorded");
+    }
+
+    /// A whole table's worth of proofs fits, and nothing beyond it does.
+    #[test]
+    fn admission_is_bounded_by_the_table() {
+        let mut admission = ShuffleAdmission::default();
+        for seat in 0..10 {
+            for position in 0..10 {
+                assert_eq!(admission.admit(seat, position, 10), Ok(()));
+            }
+        }
+        assert_eq!(admission.len(), 100);
+        assert!(admission.admit(0, 0, 10).is_err());
     }
 
     #[test]
