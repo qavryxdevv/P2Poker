@@ -168,6 +168,22 @@ pub async fn run(
     let mut table: Option<Formation> = None;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
 
+    // Who mDNS has already told us about.
+    //
+    // It keeps telling us. The query goes out on a timer and every neighbour
+    // answers it, so the same peer is "discovered" over and over for as long as
+    // it is switched on. Announcing each answer costs a line in the log and,
+    // through it, a repaint of the whole window — which on a machine with no
+    // graphics driver is half a second of processor time for news that is not
+    // news. Dialling each answer costs a connection attempt to a peer already
+    // connected.
+    //
+    // Emptied by `Expired`, so a neighbour that goes away and comes back is
+    // announced again. Without that half of it this would be a set that only
+    // ever grows and a peer that could never be rediscovered.
+    let mut seen_locally: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
+
     // The DHT socket. Port 0, never 6881 - see `dht`.
     let dht = Dht::builder()
         .port(0)
@@ -538,9 +554,30 @@ pub async fn run(
                         libp2p::mdns::Event::Discovered(found),
                     )) => {
                         for (peer, addr) in found {
+                            // The address is taken every time even for a peer
+                            // already known: mDNS reports one entry per address,
+                            // and a neighbour that gains one — a second adapter,
+                            // a new lease — is offering a route this node does
+                            // not have yet. It is only the *announcement* that
+                            // is once per peer.
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
-                            let _ = swarm.dial(addr);
-                            let _ = events.send(NodeEvent::LocalPeer(peer)).await;
+                            if seen_locally.insert(peer) {
+                                let _ = swarm.dial(addr);
+                                let _ = events.send(NodeEvent::LocalPeer(peer)).await;
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Mdns(
+                        libp2p::mdns::Event::Expired(gone),
+                    )) => {
+                        // Forgotten, so the next answer from this peer counts as
+                        // news again. Nothing else is done: an expired mDNS
+                        // record says the advertisement lapsed, not that the
+                        // connection is down, and dropping a live connection
+                        // because a multicast packet went missing would be the
+                        // worst possible reading of it.
+                        for (peer, _addr) in gone {
+                            seen_locally.remove(&peer);
                         }
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(

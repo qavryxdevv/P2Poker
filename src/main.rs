@@ -208,6 +208,40 @@ fn software_args(args: &[String]) -> Vec<String> {
     out
 }
 
+/// How many node events one frame will apply before it gives up and asks for
+/// another.
+///
+/// A bound rather than "drain it all", because everything fed from the network
+/// is bounded where it is consumed, and a peer that could make this window
+/// spend an unbounded amount of time before painting is a peer that can freeze
+/// the client.
+const EVENTS_PER_FRAME: usize = 64;
+
+/// How long a log line may wait before the window is redrawn for it.
+///
+/// Measured, on this machine, with a full-size lobby and nothing happening:
+///
+/// | renderer | one repaint | idle cost at the old 4 Hz |
+/// |---|---|---|
+/// | OpenGL, on a card | ~4 ms | 1.4% of one core |
+/// | Direct3D 12 on WARP | ~500 ms | 660% — 6.6 cores |
+///
+/// The window is the same, and so is the work egui does to build it: measured
+/// from inside, the client's own `ui` takes 0.6 ms of that. What differs is the
+/// rasteriser, and a processor shading 900 000 pixels is three orders of
+/// magnitude off a graphics card doing the same.
+///
+/// So the machine that can afford to be prompt is prompt, and the one that
+/// cannot batches its chatter. Three seconds is not a compromise on anything a
+/// player watches: `NodeEvent::changes_more_than_the_log` sends everything of
+/// that kind down the immediate path.
+fn quiet_wake(draw: Draw) -> Duration {
+    match draw {
+        Draw::Gl => Duration::from_millis(200),
+        Draw::Software => Duration::from_secs(3),
+    }
+}
+
 /// Which of the two renderers draws the window.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Draw {
@@ -459,6 +493,54 @@ fn windowed(player: Player, run: Run) -> Started {
                 }
             );
             render::install(&cc.egui_ctx);
+
+            // Wake the window when the node speaks, rather than asking it to
+            // look. What was here was `request_repaint_after(250 ms)` at the
+            // end of every frame, unconditionally: the window painted four
+            // times a second whether or not anything had changed, purely to
+            // reach the `try_recv` at the top of `ui`.
+            //
+            // On a graphics card that costs 1.4% of one core and nobody
+            // notices. On the software renderer a frame takes **longer than the
+            // interval**, so the next paint is due before the last one is
+            // finished and it never stops: 660% of a core - 6.6 of them -
+            // sitting at a table with nothing happening. Both measured.
+            //
+            // A relay rather than a shared buffer, so the boundedness survives:
+            // this second channel is the same size as the first, back-pressure
+            // reaches the node exactly as before, and the order events arrive
+            // in is the order they are applied - which `AppState` depends on.
+            let (woken, events) = tokio::sync::mpsc::channel(256);
+            let waker = cc.egui_ctx.clone();
+            let mut arriving = rx;
+            let lazily = quiet_wake(draw);
+            rt.spawn(async move {
+                while let Some(event) = arriving.recv().await {
+                    // Asked before the event is handed over, because after it is
+                    // sent it belongs to the window.
+                    //
+                    // Both wakes name `ViewportId::ROOT`. A bare
+                    // `request_repaint` wakes "the current viewport", which is
+                    // the top of a stack this task is not on; while the table's
+                    // own window is open that is the table, and eframe checks a
+                    // wake against the viewport it names before honouring it.
+                    // With no timer left there is no second chance.
+                    let now = event.changes_more_than_the_log();
+                    if woken.send(event).await.is_err() {
+                        break;
+                    }
+                    if now {
+                        waker.request_repaint_of(eframe::egui::ViewportId::ROOT);
+                    } else {
+                        // Not "later" but "no sooner than": egui keeps the
+                        // earliest outstanding request, so a seat filling in the
+                        // meantime still repaints at once and this one rides
+                        // along with it.
+                        waker.request_repaint_after_for(lazily, eframe::egui::ViewportId::ROOT);
+                    }
+                }
+            });
+
             let mut state = AppState::new();
             state.me = settings.nickname.clone();
             cc.egui_ctx.set_zoom_factor(settings.zoom());
@@ -471,7 +553,7 @@ fn windowed(player: Player, run: Run) -> Started {
                 profile_dir,
                 app_key,
                 commands,
-                events: rx,
+                events,
                 bounded,
                 started,
                 _rt: rt,
@@ -676,6 +758,20 @@ impl Client {
     /// still in the hand, and unseating them because they wanted the screen back
     /// would be the worst possible reading of a click. **Leave table** does
     /// that, in the lobby, deliberately.
+    /// Apply what the node has said, up to a bound.
+    ///
+    /// Returns whether the queue was emptied. `false` means the bound stopped
+    /// it, and the caller owes the window another frame.
+    fn drain(&mut self) -> bool {
+        for _ in 0..EVENTS_PER_FRAME {
+            match self.events.try_recv() {
+                Ok(event) => self.state.apply(event),
+                Err(_) => return true,
+            }
+        }
+        false
+    }
+
     fn table_window(&mut self, ctx: &eframe::egui::Context) {
         use eframe::egui::{ViewportBuilder, ViewportId};
 
@@ -805,11 +901,16 @@ impl eframe::App for Client {
         // Drain what has arrived, bounded per frame so a burst cannot stall the
         // paint loop — which is the same rule as everywhere else: anything fed
         // from the network is bounded where it is consumed.
-        for _ in 0..64 {
-            match self.events.try_recv() {
-                Ok(event) => self.state.apply(event),
-                Err(_) => break,
-            }
+        //
+        // **And say so when the bound bites.** While a timer asked for a frame
+        // four times a second this was harmless: whatever was left over was
+        // picked up 250 ms later. With the timer gone the only thing that wakes
+        // this window is an event arriving, and the events that were left in the
+        // queue have already been counted as arrived — so a burst of more than
+        // 64 would sit there, unread, until something else happened. A hand
+        // beginning inside such a burst would simply not be drawn.
+        if !self.drain() {
+            ctx.request_repaint();
         }
 
         if let Some(secs) = self.bounded {
@@ -892,9 +993,17 @@ impl eframe::App for Client {
             }
         }
 
-        // The node pushes events whether or not the window is being interacted
-        // with, so the window is repainted on a timer rather than only on input.
-        ctx.request_repaint_after(Duration::from_millis(250));
+        // Nothing here. The window is repainted when egui has input for it and
+        // when the node has something to say - the relay in `windowed` calls
+        // `request_repaint` as each event arrives - and at no other time.
+        //
+        // The one exception is a run with a deadline, which has to be woken to
+        // notice it has passed. Coarse on purpose: a second's imprecision on
+        // `--for` costs nothing, and asking every 250 ms would put the busy
+        // loop back for the scripted runs that use it.
+        if self.bounded.is_some() {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
     }
 }
 

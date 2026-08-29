@@ -203,6 +203,23 @@ pub fn install(ctx: &egui::Context) {
     }
 }
 
+/// A scrolling pane whose bar is always there, rather than fading in when it is
+/// needed.
+///
+/// Not a decision about taste. `VisibleWhenNeeded` fades the bar with
+/// `animate_bool_responsive`, the fade changes the width left for the content,
+/// rewrapped content is a different height, and a different height wants a
+/// different answer about whether a bar was needed at all. The animation never
+/// settles — and an animation in flight asks egui for another frame, for ever.
+///
+/// On a machine with a graphics card nobody would ever find this. On the
+/// software renderer a frame costs about half a second of processor time, and
+/// this alone was half of what an idle client burned: 78% of a core against
+/// 39%, measured. Reserving the width once ends the argument.
+fn scroller(area: egui::ScrollArea) -> egui::ScrollArea {
+    area.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+}
+
 /// A column, drawn as a card floating on the window rather than as a region of
 /// it. The outer margin is what makes the three columns read as three things;
 /// without it they share edges and the eye sees one grey field, which is what
@@ -754,7 +771,7 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE)
         .show(ui, |ui| {
-            egui::ScrollArea::both()
+            scroller(egui::ScrollArea::both())
                 .id_salt("tables")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -830,7 +847,7 @@ fn people_column(ui: &mut egui::Ui, view: &LobbyView) {
     let half = ui.available_height() * 0.55;
     ui.allocate_ui(egui::vec2(ui.available_width(), half), |ui| {
         group(ui, "Lobby chat", |ui| {
-            egui::ScrollArea::vertical()
+            scroller(egui::ScrollArea::vertical())
                 .id_salt("chat")
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
@@ -854,7 +871,7 @@ fn people_column(ui: &mut egui::Ui, view: &LobbyView) {
     });
 
     group(ui, "Players in the lobby", |ui| {
-        egui::ScrollArea::vertical()
+        scroller(egui::ScrollArea::vertical())
             .id_salt("players")
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -872,7 +889,7 @@ fn info_column(ui: &mut egui::Ui, view: &LobbyView) {
     let top = ui.available_height() * 0.46;
     ui.allocate_ui(egui::vec2(ui.available_width(), top), |ui| {
         group(ui, "Table information", |ui| {
-            egui::ScrollArea::vertical()
+            scroller(egui::ScrollArea::vertical())
                 .id_salt("info")
                 .auto_shrink([false, false])
                 .show(ui, |ui| match view.selected_row() {
@@ -913,7 +930,7 @@ fn info_column(ui: &mut egui::Ui, view: &LobbyView) {
     });
 
     group(ui, "Client log", |ui| {
-        egui::ScrollArea::vertical()
+        scroller(egui::ScrollArea::vertical())
             .id_salt("log")
             .auto_shrink([false, false])
             .stick_to_bottom(true)

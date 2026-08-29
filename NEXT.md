@@ -3,7 +3,7 @@
 Updated 2026-08-29, evening.
 
     cargo clippy --all-targets --release        0 warnings
-    cargo test --release -- --test-threads=19   590 unit + 49 harness, 0 failed
+    cargo test --release -- --test-threads=19   591 unit + 49 harness, 0 failed
     tools/check-portable.ps1                    8/8, 26.4 MB
 
 ## Two processes now form a table
@@ -98,6 +98,47 @@ are unit-tested; the hop itself is not.
 
 Cost: 21.3 MB → 26.4 MB, and 23 crates, none of which brings a new licence into
 the tree (`DEPENDENCIES.md` §6).
+
+### And then it burned a core, which was our fault, not the renderer's
+
+A client sitting at a table with no hand running took ~100% of a processor in
+the VM. The renderer was the trigger, not the cause. Measured, idle, full-size
+window:
+
+| | before | after |
+|---|---|---|
+| OpenGL, on a card | 1.4% of one core | **0.0%** |
+| Direct3D 12 on WARP | 660% — 6.6 cores | **~41%** |
+
+Three separate faults, each found by measurement and each invisible on a GPU:
+
+1. **A repaint on a timer.** `request_repaint_after(250 ms)` ran at the end of
+   every frame whether or not anything had changed. A frame in software takes
+   longer than 250 ms, so the next was always already due: it never stopped.
+   Now the window is woken by the node, through a relay task that holds the
+   egui context — and the wake names `ViewportId::ROOT`, because a bare
+   `request_repaint` wakes whichever viewport is on top of a stack the task is
+   not on, which while the table window is open is the table.
+2. **Chatter treated as news.** `NodeEvent::changes_more_than_the_log` splits
+   what a player is watching from what is only a line in the log. A seat
+   filling repaints at once; a dial that failed waits up to three seconds on
+   the software renderer, 200 ms on a card. The match is exhaustive with no
+   wildcard, so a new event will not compile until somebody chooses a side.
+   mDNS also stopped announcing the same neighbour every few seconds — it is
+   announced once and forgotten again on `Expired`, which is now handled.
+3. **A scrollbar that could not make up its mind.** `VisibleWhenNeeded` fades
+   the bar; the fade changes the content width; rewrapped content is a
+   different height; a different height wants a different answer. The animation
+   never settled, and an animation in flight asks egui for another frame for
+   ever. That alone was half the idle cost — 78% against 39%.
+
+What is **not** fixed: one full redraw of the window still costs about half a
+second of processor time under WARP against four milliseconds on a card, and a
+controlled experiment says that is the price of the window itself rather than of
+anything in particular that we draw — a bare `CentralPanel` with no fill, no
+stroke and no rounding costs the same as the whole lobby. Moving the mouse over
+the client in a VM will be slow. Cutting that means drawing less, and the first
+candidates are `paint.rs`'s `RINGS = 16` and `BANDS = 14`.
 
 ## Next actions, in order
 

@@ -201,6 +201,61 @@ pub enum NodeEvent {
     StillRelayed(PeerId),
 }
 
+impl NodeEvent {
+    /// Whether this changes anything on screen other than a line in the log.
+    ///
+    /// The window is repainted when the node speaks, and on a machine with no
+    /// graphics driver a repaint is not cheap: measured, one full redraw of the
+    /// lobby costs about half a second of processor time under WARP against
+    /// four milliseconds on a graphics card. The node says something two or
+    /// three times a second — mDNS answers, DHT hints, dials that failed — and
+    /// almost all of it is a log line nobody is reading at that instant.
+    ///
+    /// So the caller waits before repainting for those, and repaints at once
+    /// for the rest. A seat filling, a roster ratifying, a hand starting: those
+    /// are what a player is looking at, and they must never be held back.
+    ///
+    /// **Exhaustive on purpose — no wildcard.** A new variant will not compile
+    /// until somebody decides which side it is on, which is the only way this
+    /// stays true as the protocol grows. A wildcard here would silently make
+    /// every future event slow, and the one that mattered would be the hand.
+    pub fn changes_more_than_the_log(&self) -> bool {
+        match self {
+            // The table, and everything a player watches while sitting at it.
+            Self::Hosting { .. }
+            | Self::TableParams { .. }
+            | Self::Seated { .. }
+            | Self::Roster { .. }
+            | Self::TableReal { .. }
+            | Self::JoinRefused { .. }
+            | Self::LeftTable { .. }
+            // The lobby list and the counters above it.
+            | Self::TableSeen { .. }
+            | Self::PeerConnected(_)
+            | Self::PeerDisconnected(_)
+            // The status line, which is a claim about whether this client can
+            // play at all.
+            | Self::Reachability { .. }
+            | Self::Reserved { .. }
+            | Self::NoRelayFound { .. } => true,
+
+            // Log only. Chatty, repetitive, and worth a second's delay.
+            Self::Listening(_)
+            | Self::Discovered { .. }
+            | Self::TableRefused { .. }
+            | Self::PortMapped { .. }
+            | Self::Warning(_)
+            | Self::Announced { .. }
+            | Self::DialFailed { .. }
+            | Self::LocalPeer(_)
+            | Self::MeshPeer(_)
+            | Self::Published { .. }
+            | Self::HolePunched(_)
+            | Self::StillRelayed(_) => false,
+        }
+    }
+}
+
 /// Turn a discovered `SocketAddrV4` into something the swarm can dial.
 ///
 /// QUIC only for a discovered peer. The Mainline announce carries **one** port
@@ -401,5 +456,38 @@ mod tests {
         let b = now_unix_ms();
         assert!(b >= a);
         assert!(a > 1_600_000_000_000, "and it is a real wall clock");
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    /// The two kinds, named by hand rather than derived, so this test disagrees
+    /// with the code when somebody changes the code's mind.
+    #[test]
+    fn a_seat_filling_is_not_a_log_line() {
+        let peer = libp2p::PeerId::random();
+        let now = [
+            NodeEvent::Seated { key: [0; 32], seat: 3 },
+            NodeEvent::Roster { key: [0; 32], seats: vec![] },
+            NodeEvent::TableReal { key: [0; 32], session: [1; 32] },
+            NodeEvent::PeerConnected(peer),
+            NodeEvent::Reachability { public: true },
+        ];
+        for e in now {
+            assert!(e.changes_more_than_the_log(), "{e:?} must not be held back");
+        }
+
+        let later = [
+            NodeEvent::LocalPeer(peer),
+            NodeEvent::MeshPeer(peer),
+            NodeEvent::DialFailed { reason: "no route".into() },
+            NodeEvent::Discovered { hints: 68, dropped: 0 },
+            NodeEvent::Warning("noise".into()),
+        ];
+        for e in later {
+            assert!(!e.changes_more_than_the_log(), "{e:?} is only a log line");
+        }
     }
 }
