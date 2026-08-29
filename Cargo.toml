@@ -105,3 +105,25 @@ ark-std       = { version = "=0.5.0", default-features = false }
 # ---------------------------------------------------------------------------
 [patch.crates-io]
 ziffle = { path = "vendor/ziffle" }
+
+# ---------------------------------------------------------------------------
+# Build profiles, sized for how this project is actually worked on.
+# ---------------------------------------------------------------------------
+#
+# The dev profile exists here only for `cargo clippy`. Every test in this
+# project runs in release - the cryptography is unusably slow otherwise, and the
+# random-hand harness plays ~120 000 hands - so nothing ever attaches a debugger
+# to a dev build.
+#
+# Full debug information for a dependency tree this size costs about 15 GB, all
+# of it for a debugger nobody runs. `line-tables-only` keeps what a panic
+# backtrace needs, which is the one thing that information is used for here.
+[profile.dev]
+debug = "line-tables-only"
+
+# The release profile carries none, for the same reason plus one more: the
+# shipped binary is the portable single file of SPEC_CS.md section 22, and
+# debug information is weight a player downloads and never uses.
+[profile.release]
+debug = false
+strip = "debuginfo"

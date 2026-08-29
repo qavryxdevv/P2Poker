@@ -256,19 +256,35 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
 fn build_gossipsub(
     key: &identity::Keypair,
 ) -> Result<gossipsub::Behaviour, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(key.clone()),
+        gossipsub_config()?,
+    )?)
+}
+
+/// The configuration, separately, so a test can read it back.
+///
+/// `gossipsub::Behaviour::new` consumes the config and exposes none of it, so a
+/// build that merely succeeds proves nothing about the settings. Splitting it
+/// out is not tidiness: the settings below are the ones that were silently
+/// weakened and committed, under a doc comment that asserted them.
+pub fn gossipsub_config() -> Result<gossipsub::Config, Box<dyn std::error::Error + Send + Sync>> {
     // The message id is over the content, so two peers relaying one advert
-    // produce one id and the duplicate cache actually suppresses it.
+    // produce one id and the duplicate cache actually suppresses it. It must
+    // NOT include the sequence number: that is per-sender, so one advert
+    // relayed by two peers would be two messages and the cache would suppress
+    // neither.
     let message_id_fn = |message: &gossipsub::Message| {
         let mut s = DefaultHasher::new();
         message.data.hash(&mut s);
         message.topic.hash(&mut s);
-        message.sequence_number.hash(&mut s);
         gossipsub::MessageId::from(s.finish().to_be_bytes())
     };
 
     let config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
-        .validation_mode(gossipsub::ValidationMode::Permissive)
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        .validate_messages()
         .message_id_fn(message_id_fn)
         .max_transmit_size(GOSSIP_MAX_TRANSMIT)
         .mesh_n(8)
@@ -279,12 +295,10 @@ fn build_gossipsub(
         // Deliberately off: flood publishing sends every message to every known
         // peer of the topic rather than to the mesh, which turns one advert into
         // a fan-out proportional to the whole lobby.
+        .flood_publish(false)
         .build()?;
 
-    Ok(gossipsub::Behaviour::new(
-        gossipsub::MessageAuthenticity::Signed(key.clone()),
-        config,
-    )?)
+    Ok(config)
 }
 
 /// The relay server's limits.
@@ -390,6 +404,48 @@ mod tests {
         let t = Topics::default();
         assert_ne!(t.lobby.hash(), t.lobby_chat.hash());
         assert_eq!(t.lobby.to_string(), LOBBY_TOPIC);
+    }
+
+    /// The settings this module's documentation asserts, asserted.
+    ///
+    /// **This test exists because these exact values were silently changed and
+    /// committed**, under the doc comment that claims them: `Strict` became
+    /// `Permissive`, `validate_messages` was dropped, `flood_publish(false)` was
+    /// dropped, and the per-sender sequence number was added to the message id.
+    /// `gossipsub::Behaviour::new` consumes the config and exposes nothing, so
+    /// the build test that existed could not have noticed any of it.
+    ///
+    /// Each line below is a security property and not a preference:
+    ///
+    /// * `Strict` requires every message to carry a signature, a source and a
+    ///   sequence number. `Permissive` accepts an unsigned one.
+    /// * `validate_messages` stops the behaviour forwarding a message before
+    ///   this client has judged it — without it, a message this client is about
+    ///   to reject has already gone to its mesh peers in its name.
+    /// * `flood_publish(false)` keeps a publish to the mesh. On, it goes to
+    ///   every known peer of the topic, turning one advert into a fan-out the
+    ///   size of the lobby.
+    #[test]
+    fn the_gossip_settings_are_the_ones_the_documentation_claims() {
+        let config = gossipsub_config().expect("the config builds");
+
+        assert!(
+            matches!(config.validation_mode(), gossipsub::ValidationMode::Strict),
+            "Permissive accepts an unsigned message"
+        );
+        assert!(
+            config.validate_messages(),
+            "without this, a message this client is about to reject has already \
+             been forwarded in its name"
+        );
+        assert!(
+            !config.flood_publish(),
+            "flood publishing turns one advert into a fan-out the size of the lobby"
+        );
+        assert_eq!(config.max_transmit_size(), GOSSIP_MAX_TRANSMIT);
+        assert_eq!(config.mesh_n(), 8);
+        assert_eq!(config.mesh_n_low(), 6);
+        assert_eq!(config.mesh_n_high(), 12);
     }
 
     /// The message id is over the content, so two peers relaying one advert

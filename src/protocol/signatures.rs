@@ -99,7 +99,7 @@ impl Domain {
             Domain::TableParams => "p2p-poker v1 table-params",
             Domain::Connection => "p2p-poker v1 connection",
             Domain::TableId => "p2p-poker v1 table-id",
-            Domain::Advert => "p2p-poker v1 session",
+            Domain::Advert => "p2p-poker v1 advert",
             Domain::TimeoutCert => "p2p-poker v1 timeout-cert",
         }
     }
