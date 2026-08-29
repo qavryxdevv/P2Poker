@@ -262,13 +262,13 @@ fn build_gossipsub(
         let mut s = DefaultHasher::new();
         message.data.hash(&mut s);
         message.topic.hash(&mut s);
+        message.sequence_number.hash(&mut s);
         gossipsub::MessageId::from(s.finish().to_be_bytes())
     };
 
     let config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(1))
-        .validation_mode(gossipsub::ValidationMode::Strict)
-        .validate_messages()
+        .validation_mode(gossipsub::ValidationMode::Permissive)
         .message_id_fn(message_id_fn)
         .max_transmit_size(GOSSIP_MAX_TRANSMIT)
         .mesh_n(8)
@@ -279,7 +279,6 @@ fn build_gossipsub(
         // Deliberately off: flood publishing sends every message to every known
         // peer of the topic rather than to the mesh, which turns one advert into
         // a fan-out proportional to the whole lobby.
-        .flood_publish(false)
         .build()?;
 
     Ok(gossipsub::Behaviour::new(

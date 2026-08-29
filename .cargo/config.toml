@@ -8,3 +8,15 @@ jobs = 19
 # ceiling there.
 [term]
 quiet = false
+
+# The C runtime, linked statically.
+#
+# `SPEC_CS.md` section 22 asks for a single executable that can simply be copied
+# to another machine. With the default dynamic linkage the binary imports
+# `vcruntime140.dll`, which is present on most Windows installs and guaranteed on
+# none - so "copy it and it runs" would have been true on this machine and
+# untrue on a fresh one, which is the worst kind of portability claim.
+#
+# Verified by reading the import table before and after: the name is gone.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

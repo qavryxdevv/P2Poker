@@ -158,6 +158,12 @@ pub struct NetworkStatus {
     pub dht_announced: bool,
     pub relay: Option<RelayStatus>,
     pub public: Option<bool>,
+    /// How many dials have failed.
+    ///
+    /// Counted rather than logged line by line: most dials fail on an open DHT,
+    /// so a log full of them buries what matters — but with no count at all,
+    /// *most dials fail* and *this client is broken* look identical.
+    pub failed_dials: usize,
 }
 
 /// What a relay reservation bought, in the terms a player cares about.
