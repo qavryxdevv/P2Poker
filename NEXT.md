@@ -15,7 +15,7 @@ cargo build --release
 Terminal one:
 
 ```bash
-./target/release/p2p-poker --headless --profile ./A --host Riverside --for 45
+./target/release/p2p-poker --headless --profile ./A --host Riverside --seats 2 --for 45
 ```
 
 Terminal two:
@@ -31,9 +31,13 @@ GossipSub topic, and every §4.3 admission rule running on bytes that travelled.
 
 `--profile` matters: the profile lives beside the executable so the folder can be
 copied, and two copies of one folder are one player — which §4.3's `peer_id` rule
-then correctly refuses a second seat to.
+then correctly refuses a second seat to. `--seats 2` matters too: without it the
+command line founds a **rated Sit-and-Go**, and that needs all ten seats before
+it deals.
 
-The window does the same thing through **Create table** and **Join table**.
+The window does the same thing through **Create table** and **Join table**, and
+the table opens in a window of its own beside the lobby with the other players
+arriving in it as they sit down.
 
 ## What has been demonstrated, and what has not
 
@@ -67,7 +71,7 @@ list under a UAC-filtered token, which reads exactly like "there are no VMs".
 | Discovery | Mainline, mDNS, QUIC + TCP, GossipSub, relay adequacy, a circuit that carries |
 | Lobby | signed adverts across the wire, §7.2 rules 2–7, rate limits, eviction |
 | Formation | **complete and wired** — join RPC, roster, ratification, `session_id`, over a real connection |
-| GUI | lobby and table, both drawn; the table window has no engine behind it yet |
+| GUI | lobby and table in two windows, settings, live roster; no hand engine behind the table yet |
 
 ## Next actions, in order
 

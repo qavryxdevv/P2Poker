@@ -53,7 +53,16 @@ cargo build --release
 ```
 
 The window opens on the lobby. **Create table** advertises one; **Join table**
-sits down at somebody else's.
+sits down at somebody else's. The table itself opens in a window of its own,
+beside the lobby, and the other players appear in it as they sit down.
+
+A new table is a **rated Sit-and-Go** by default: ten seats, 10 000 chips each,
+blinds 50/100 doubling every eleven hands, and it deals when all ten are in.
+Those numbers are not a choice — they are `RATED_SNG_POKERTH_V1`, read out of
+PokerTH's own `RANKING_GAME_*` constants, and every client derives the same
+parameters from the name alone. That is what lets two people who have never
+spoken agree on the game before either sits down. A custom cash table is one
+click away for everything else.
 
 Two clients on one machine are two players only if they keep two profiles — the
 protocol refuses a second seat to the same node at the same table, deliberately:
@@ -72,7 +81,9 @@ Both print `TABLE FORMED session=…` with the same session identity.
 |---|---|
 | `--headless` | the node without a window; a scripted run, or a volunteer relay |
 | `--profile DIR` | keep the profile somewhere other than beside the binary |
-| `--host NAME` | advertise a table called `NAME` |
+| `--host NAME` | advertise a table called `NAME` — a rated Sit-and-Go |
+| `--seats N` | make it a custom table of `N` seats instead (a rated one needs all ten) |
+| `--min N` | how many of them it starts with |
 | `--join NAME` | sit down at the first table called `NAME` |
 | `--table` | open on the table rather than the lobby |
 | `--for N` | stop after `N` seconds |
