@@ -1,10 +1,47 @@
 # Where to pick up
 
-Updated 2026-08-29, evening.
+Updated 2026-08-30.
 
     cargo clippy --all-targets --release        0 warnings
     cargo test --release -- --test-threads=19   591 unit + 49 harness, 0 failed
-    tools/check-portable.ps1                    8/8, 26.4 MB
+    tools/check-portable.ps1                    8/8, 27.8 MB
+
+    RUST_LOG=libp2p_kad=debug,libp2p_relay=debug ./target/release/p2p-poker --headless
+
+There is a `tracing` subscriber now, off unless `RUST_LOG` is set. Until today
+there was none, so libp2p's account of itself went nowhere and every network
+question was answered by adding a temporary `eprintln!` and rebuilding. That
+cost more hours than any bug in this file.
+
+## A client behind a NAT now has a public address
+
+    /ip4/149.102.131.48/tcp/4001/p2p/12D3KooWM8dGCW1r.../p2p-circuit/p2p/12D3KooWK85eVcrB...
+
+Measured. The client reaches the public libp2p network, reads the `/libp2p/relay`
+namespace out of the DHT — **that is the list of relays, and it is not a file** —
+finds around twenty, and takes a reservation. Their limits are 128 KiB and two
+minutes, which is D-001's recorded figure, and the client says so itself: *NOT
+enough to carry a hand*. Enough to carry the introduction and the lobby, which
+is what D-004's layers 2 and 3 are for.
+
+**Correction to D-001's addendum**, measured: the four `bootstrap.libp2p.io`
+nodes advertise the hop protocol and answer `RESERVATION_REFUSED`. They are
+operated infrastructure. Ordinary public nodes, found through the DHT, do grant
+reservations.
+
+**A hand costs 18 KB heads-up** (`MENTAL_POKER.md` §5.1, `n × (5547 + 3432)`),
+54 KB six-handed, against a 128 KiB circuit budget — about seven hands per
+circuit. Carrying a game over a public relay is arithmetically fine; what it
+needs is two or three reservations held at once and a session that survives a
+circuit being reset under it.
+
+### What is NOT proven
+
+That two clients find each other **through the DHT lobby** rather than through
+mDNS. The announcement succeeds and the query is answered; both test clients sit
+on one LAN, where mDNS would find them anyway. Until that is watched end to end,
+the Mainline announcement stays: replacing working discovery with an unproven
+one is not an improvement.
 
 ## Two processes now form a table
 
@@ -142,16 +179,38 @@ candidates are `paint.rs`'s `RINGS = 16` and `BANDS = 14`.
 
 ## Next actions, in order
 
-1. **The hand, wired.** Formation ends at `session_id` and the engine starts at
+1. **Prove the DHT lobby.** Two clients that cannot see each other by mDNS —
+   turn it off, or put one elsewhere — and watch one client's table appear in
+   the other's list. Everything below waits on this.
+2. **Then drop Mainline**, and take the owner's name for the key while doing it:
+   `p2p-poker/main-lobby/v1`. One change, not two.
+3. **The volunteer relay path has never worked.** `run.rs` builds its circuit
+   address without `/p2p/<PeerId>`, so the transport refuses it before a packet
+   is sent — and reports the refusal as an empty string, because
+   `TransportError::Other` is dropped on the way out. The identify path added
+   today is correct and is what actually obtains reservations.
+4. **A fixed port.** `listen_addrs()` asks for port 0 on both transports and
+   there is no flag, so a player cannot forward a port on their router and be
+   the reachable node everyone else needs. That is the cheapest way for this
+   network to have its first relay.
+5. **The hand, wired.** Formation ends at `session_id` and the engine starts at
    `GENESIS(1)`. `table::dealing` already runs a hand between three peers in
    memory; nothing carries `HAND_INIT` and the deck messages between two.
-2. **Two machines on two networks.** The one claim above that rests on nothing.
-3. **The automatic renderer hop, in a VM.** Everything around it is tested; the
+6. **Two machines on two networks.** Still rests on nothing.
+7. **The automatic renderer hop, in a VM.** Everything around it is tested; the
    hop wants a machine with no OpenGL to prove itself on.
-4. **The table window's engine.** It draws a sample hand and says so. §22's rule
+8. **The table window's engine.** It draws a sample hand and says so. §22's rule
    — never display an unverified card as valid — is enforced by the type
    (`Facing::up` takes the verdict), so the wiring cannot break it by omission.
-5. Phase 11's audit.
+9. Phase 11's audit.
+
+### Also found and not yet fixed
+
+`quic_port` matches a circuit address, so once reservations are routine this
+client could announce a relay's port as its own and ask the router to open it.
+UPnP's four distinct outcomes all fall into `_ => {}` and are indistinguishable
+from never having tried; on success the crate calls `add_external_address`,
+which makes it a second, undocumented arbiter of reachability beside AutoNAT.
 
 ## Open items
 
