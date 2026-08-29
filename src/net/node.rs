@@ -71,6 +71,15 @@ pub enum NodeEvent {
     DialFailed { reason: String },
     /// A peer was found on the local network.
     LocalPeer(PeerId),
+    /// A peer subscribed to a topic this node also holds.
+    ///
+    /// Worth its own line: until one does, `publish` returns
+    /// `NoPeersSubscribedToTopic` and a table this node is offering reaches
+    /// nobody. That is the ordinary state at start-up and is indistinguishable,
+    /// in a log without this event, from an advert that is silently broken.
+    MeshPeer(PeerId),
+    /// This node's own advert went out.
+    Published { bytes: usize },
 }
 
 /// Turn a discovered `SocketAddrV4` into something the swarm can dial.

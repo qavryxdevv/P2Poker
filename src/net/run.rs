@@ -39,10 +39,12 @@ use libp2p::{futures::StreamExt as SwarmStreamExt, gossipsub, identity, swarm::S
 use mainline::{Dht, Id};
 use tokio::sync::mpsc;
 
+use super::advert;
 use super::dht::{self, PeerHints, Swarm as DhtSwarm, REANNOUNCE_INTERVAL};
+use super::lobby::TableAd;
 use super::node::{quic_dial_addr, worth_parsing, NodeEvent, NodeState, REBROADCAST};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
-use crate::protocol::constants::LOBBY_MSG_MAX;
+use crate::protocol::constants::{AD_TTL_MS, LOBBY_MSG_MAX};
 
 /// How long to wait for the DHT to bootstrap before giving up on this cycle.
 const BOOTSTRAP_PATIENCE: Duration = Duration::from_secs(20);
@@ -92,9 +94,20 @@ pub fn quic_port(addr: &Multiaddr) -> Option<u16> {
 ///
 /// Events go out on the channel rather than to a logger, so the GUI and a
 /// headless run see the same stream.
+/// A table this node is offering, if it is offering one.
+///
+/// The signing key **is** the table's identity, so it is held here and nowhere
+/// else: a table whose key lived in two places would be a table two peers could
+/// be handed two versions of.
+pub struct Hosted {
+    pub ad: TableAd,
+    pub key: ed25519_dalek::SigningKey,
+}
+
 pub async fn run(
     identity: identity::Keypair,
     events: mpsc::Sender<NodeEvent>,
+    mut hosted: Option<Hosted>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut swarm = swarm::build(NodeConfig {
         identity,
@@ -182,13 +195,40 @@ pub async fn run(
                             .await;
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
-                        gossipsub::Event::Message { .. },
+                        gossipsub::Event::Subscribed { peer_id, .. },
                     )) => {
-                        // The seam. Decoding, `verify_strict` and §7.2's
-                        // admission rules go here, in that order, and each of
-                        // them already exists and is tested — what is missing is
-                        // the envelope parser that turns bytes into the advert
-                        // `lobby::admit` takes.
+                        let _ = events.send(NodeEvent::MeshPeer(peer_id)).await;
+                    }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
+                        gossipsub::Event::Message { message, propagation_source, .. },
+                    )) => {
+                        // The sending peer, which is **not** the table key: a
+                        // peer relaying somebody else's advert is the ordinary
+                        // case, and the two are rate limited separately.
+                        let mut from = [0u8; 32];
+                        let peer_bytes = propagation_source.to_bytes();
+                        let take = peer_bytes.len().min(32);
+                        from[..take].copy_from_slice(&peer_bytes[..take]);
+
+                        let now = super::node::now_unix_ms();
+                        match advert::receive(
+                            &message.data,
+                            from,
+                            now,
+                            &mut state.limits,
+                            &mut state.lobby,
+                        ) {
+                            Ok(key) => {
+                                let _ = events.send(NodeEvent::TableSeen { key }).await;
+                            }
+                            Err(e) => {
+                                let _ = events
+                                    .send(NodeEvent::TableRefused {
+                                        reason: format!("{e:?}"),
+                                    })
+                                    .await;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -247,7 +287,41 @@ pub async fn run(
             }
 
             _ = housekeeping.tick() => {
-                state.tick(super::node::now_unix_ms());
+                let now = super::node::now_unix_ms();
+                state.tick(now);
+
+                // Re-broadcast this node's own table. The timestamps move every
+                // time, which is what rule 6 compares; the parameters do not,
+                // which is what rule 7 compares. A re-broadcast that changed a
+                // parameter would mark this node's own table unjoinable at every
+                // receiver, so the advert is edited only here and only in time.
+                if let Some(h) = hosted.as_mut() {
+                    h.ad.timestamp_unix_ms = now;
+                    h.ad.expires_at_unix_ms = now + AD_TTL_MS;
+                    match advert::publish(&h.ad, &h.key) {
+                        Ok(bytes) => {
+                            let n = bytes.len();
+                            if let Err(e) = swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .publish(topics.lobby.clone(), bytes)
+                            {
+                                // No mesh peer yet is the ordinary case at
+                                // start-up, not a fault.
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!("not published: {e}")))
+                                    .await;
+                            } else {
+                                let _ = events.send(NodeEvent::Published { bytes: n }).await;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("own advert: {e}")))
+                                .await;
+                        }
+                    }
+                }
             }
         }
     }
