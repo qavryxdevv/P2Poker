@@ -27,6 +27,20 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Native programs write progress to stderr, and `2>&1` under Windows PowerShell's
+# `ErrorActionPreference = 'Stop'` turns the first such line into a *terminating*
+# NativeCommandError - so the deployment failed because cargo said "Finished".
+# PowerShell 7 does not do this, which is exactly why it went unnoticed: the same
+# script passed under `pwsh` and died under `powershell`. A tool in `tools\` has to
+# work under both, so every native call that wants its stderr goes through here.
+function Invoke-Native {
+    param([Parameter(Mandatory)][string]$Exe, [string[]]$Arguments = @())
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Exe @Arguments 2>&1 } finally { $ErrorActionPreference = $previous }
+}
+
 $failures = 0
 
 if (-not $Exe) {
@@ -65,14 +79,28 @@ $expected = @(
     'advapi32.dll','bcrypt.dll','bcryptprimitives.dll','dbghelp.dll','dwmapi.dll',
     'gdi32.dll','imm32.dll','iphlpapi.dll','kernel32.dll','ntdll.dll','ole32.dll',
     'oleaut32.dll','opengl32.dll','pdh.dll','powrprof.dll','psapi.dll','shcore.dll',
-    'shell32.dll','user32.dll','uxtheme.dll','ws2_32.dll'
+    'shell32.dll','user32.dll','uxtheme.dll','ws2_32.dll',
+    # The software renderer's road to WARP. All four are Windows' own: `dxgi`
+    # and `setupapi` are genuine imports, `d3d12` and `dcomp` are loaded at
+    # runtime. Read out of the PE import table, which gained exactly two names
+    # when the second renderer went in.
+    'd3d12.dll','dxgi.dll','dcomp.dll','setupapi.dll'
 )
 $unexpected = $names |
     Where-Object { $_ -notmatch '^(api-ms-|ext-ms-)' } |
     Where-Object { $expected -notcontains $_ } |
     # Graphics driver names appear as string literals for runtime loading, not
     # as imports, and are part of the system rather than of this program.
-    Where-Object { $_ -notmatch 'libegl|atioglxx|darkmode' }
+    #
+    # `dxcompiler` is the one worth naming: it is the DirectX shader compiler,
+    # and it is NOT part of Windows. wgpu loads it only when told to prefer DXC
+    # over the FXC that Windows does carry, which we never do - proven by the
+    # software renderer drawing a window on a machine where the file is absent.
+    #
+    # The `create_*` pair are not libraries at all. This harvest reads strings,
+    # and an export name butted up against a library name in the binary reads as
+    # one word: `CreateFactoryMedia` + `dxgi.dll`, `CreateEventA` + `dcomp.dll`.
+    Where-Object { $_ -notmatch 'libegl|atioglxx|darkmode|dxcompiler|^create_factory_media|^createevent' }
 
 if ($unexpected) {
     Write-Host "WARN  names not on the known-system list: $($unexpected -join ', ')" -ForegroundColor Yellow
@@ -90,9 +118,9 @@ try {
         Copy-Item $Exe (Join-Path $d 'p2p-poker.exe')
     }
 
-    $idA = (& (Join-Path $a 'p2p-poker.exe') --headless --for 3 2>&1 |
+    $idA = (Invoke-Native (Join-Path $a 'p2p-poker.exe') @('--headless', '--for', '3') |
         Select-String '^peer id').ToString()
-    $idB = (& (Join-Path $b 'p2p-poker.exe') --headless --for 3 2>&1 |
+    $idB = (Invoke-Native (Join-Path $b 'p2p-poker.exe') @('--headless', '--for', '3') |
         Select-String '^peer id').ToString()
 
     if ($idA -and $idB) { Pass "starts from an empty directory with nothing beside it" }
@@ -126,9 +154,9 @@ try {
         Fail "the two identities are one secret, or are not 32-byte keys"
     }
 
-    $playerA = (& (Join-Path $a 'p2p-poker.exe') --headless --for 3 2>&1 |
+    $playerA = (Invoke-Native (Join-Path $a 'p2p-poker.exe') @('--headless', '--for', '3') |
         Select-String '^player').ToString()
-    $playerB = (& (Join-Path $b 'p2p-poker.exe') --headless --for 3 2>&1 |
+    $playerB = (Invoke-Native (Join-Path $b 'p2p-poker.exe') @('--headless', '--for', '3') |
         Select-String '^player').ToString()
     if ($playerA -and $playerB -and $playerA -ne $playerB) {
         Pass "two directories are two players"
@@ -137,7 +165,7 @@ try {
     }
 
     # The identity must survive a restart, or the client is a stream of strangers.
-    $idA2 = (& (Join-Path $a 'p2p-poker.exe') --headless --for 3 2>&1 |
+    $idA2 = (Invoke-Native (Join-Path $a 'p2p-poker.exe') @('--headless', '--for', '3') |
         Select-String '^peer id').ToString()
     if ($idA -eq $idA2) { Pass "the identity survives a restart" }
     else { Fail "the identity changed on restart" }

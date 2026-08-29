@@ -15,7 +15,16 @@
 //!                                the binary
 //! p2p-poker --host N --seats 6   a six-handed Sit-and-Go
 //! p2p-poker --host N --cash      a cash table, which deals with two
+//! p2p-poker --renderer software  draw without a graphics driver
 //! ```
+//!
+//! `--renderer` is there to be overridden, not to be typed. The client draws
+//! with OpenGL, and a machine with no graphics driver — a virtual machine
+//! without acceleration, most often — has only the OpenGL 1.1 Windows ships,
+//! where the window needs 2.0. Rather than fail, the client starts itself again
+//! on Direct3D 12, which falls through to WARP, the software rasteriser Windows
+//! itself carries. Slow, and it needs nothing installed. `--renderer gl` or
+//! `--renderer software` pins the choice and skips the second attempt.
 //!
 //! `--profile` exists because two clients on one machine must be two players.
 //! The profile lives beside the executable so the whole folder can be copied,
@@ -54,7 +63,11 @@ fn main() {
         Ok(k) => k,
         Err(e) => {
             eprintln!("profile at {}: {e}", dir.display());
-            return;
+            // Not `return`. Without an identity there is no client, and a
+            // scripted run - `check-portable.ps1`, `deploy.ps1`'s proof that
+            // the copy runs - reads the exit code and would have recorded a
+            // pass.
+            std::process::exit(1);
         }
     };
     println!("peer id  {}", libp2p::PeerId::from(identity.public()));
@@ -66,7 +79,7 @@ fn main() {
         Ok(k) => k,
         Err(e) => {
             eprintln!("player key at {}: {e}", dir.display());
-            return;
+            std::process::exit(1);
         }
     };
     println!(
@@ -117,20 +130,131 @@ fn main() {
 
     if has("--headless") {
         headless(identity, app_key, settings, hosted, bounded, value_of("--join"));
-    } else {
-        windowed(
+        return;
+    }
+
+    let asked = value_of("--renderer");
+    let draw = match asked.as_deref() {
+        None | Some("auto") => Draw::Gl,
+        Some("gl") => Draw::Gl,
+        Some("software") => Draw::Software,
+        Some(other) => {
+            eprintln!("--renderer takes auto, gl or software, not {other:?}");
+            std::process::exit(2);
+        }
+    };
+
+    let outcome = windowed(
+        Player {
             identity,
             app_key,
-            dir,
+            profile_dir: dir,
             settings,
+        },
+        Run {
             hosted,
             bounded,
-            if has("--table") {
+            screen: if has("--table") {
                 Screen::Table
             } else {
                 Screen::Lobby
             },
-        );
+            draw,
+        },
+    );
+
+    // Every local `windowed` held is dropped by now — the tokio runtime with the
+    // node on it included. That ordering is the whole reason this decision is
+    // taken out here rather than at the point of failure: a second process would
+    // otherwise start a second node under the same identity, on ports the first
+    // one had not let go of yet. §4.3 gives one seat per `peer_id`, so two live
+    // copies of one profile is not a slow client, it is a refused seat.
+    if outcome == Started::NoOpenGl {
+        if asked.is_none() {
+            println!();
+            println!("No OpenGL 2.0 on this machine. Starting again in software.");
+            std::process::exit(again_in_software(&args));
+        }
+        // Pinned by hand, so no second attempt is made — but the advice is
+        // still owed. Without this the person who typed `--renderer gl` got one
+        // line of glutin's own words and nothing else.
+        advice(Draw::Gl);
+        std::process::exit(1);
+    }
+    if outcome != Started::Ok {
+        std::process::exit(1);
+    }
+}
+
+/// The child's arguments: ours, with the renderer settled.
+///
+/// Separate from the spawn so it can be tested, because the one thing that must
+/// not go wrong here is a child that reads `auto` and starts a third process.
+/// Any `--renderer` the user gave is dropped **with its value** - dropping the
+/// flag alone would leave a bare `auto` sitting where `--profile` expects a
+/// directory.
+fn software_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 1);
+    let mut rest = args.iter().skip(1);
+    while let Some(a) = rest.next() {
+        if a == "--renderer" {
+            rest.next();
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out.push("--renderer".to_owned());
+    out.push("software".to_owned());
+    out
+}
+
+/// Which of the two renderers draws the window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Draw {
+    /// OpenGL through the graphics driver: every machine that has one.
+    Gl,
+    /// Direct3D 12, which on a machine with no graphics driver resolves to
+    /// WARP — `Microsoft Basic Render Driver`, a `Cpu` adapter that is part of
+    /// Windows rather than of any driver, and so is present in a bare virtual
+    /// machine. Measured on a developer box: it is enumerated alongside the two
+    /// real GPUs, version 10.0.19041, which is the Windows build, not a driver.
+    Software,
+}
+
+/// How far the window got.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Started {
+    /// It opened, ran, and closed.
+    Ok,
+    /// The renderer wanted OpenGL 2.0 and this machine has 1.1 — worth a second
+    /// attempt in software, which is the one case the client can fix by itself.
+    NoOpenGl,
+    /// Anything else: no display at all, or software failed too.
+    Failed,
+}
+
+/// Start this same executable again, drawing in software, and wait for it.
+///
+/// A second process because a process gets one event loop and no more:
+/// `winit` swaps a global flag the first time one is built and never clears it,
+/// so a renderer cannot be retried in place — `EventLoopError::RecreationAttempt`
+/// is all a second attempt would produce.
+///
+/// Every flag the user gave is carried over, minus any `--renderer` of their
+/// own, so the child cannot read `auto` and start a third process.
+fn again_in_software(args: &[String]) -> i32 {
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("cannot find this executable to start it again");
+        return 1;
+    };
+    let mut command = std::process::Command::new(exe);
+    command.args(software_args(args));
+    match command.status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("could not start again in software: {e}");
+            1
+        }
     }
 }
 
@@ -245,15 +369,35 @@ fn headless(
 }
 
 /// The client, with its window.
-fn windowed(
+/// Who is playing: everything read out of the profile directory.
+struct Player {
     identity: libp2p::identity::Keypair,
     app_key: ed25519_dalek::SigningKey,
     profile_dir: std::path::PathBuf,
     settings: p2p_poker::storage::settings::Settings,
+}
+
+/// What this particular start is for: everything that came off the command line.
+struct Run {
     hosted: Option<NodeCommand>,
     bounded: Option<u64>,
     screen: Screen,
-) {
+    draw: Draw,
+}
+
+fn windowed(player: Player, run: Run) -> Started {
+    let Player {
+        identity,
+        app_key,
+        profile_dir,
+        settings,
+    } = player;
+    let Run {
+        hosted,
+        bounded,
+        screen,
+        draw,
+    } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     // The other direction. Bounded, and the window never blocks on it: a full
@@ -289,6 +433,11 @@ fn windowed(
             .with_min_inner_size([900.0, 600.0])
             .with_title("p2p-poker")
             .with_icon(window_icon()),
+        renderer: match draw {
+            Draw::Gl => eframe::Renderer::Glow,
+            Draw::Software => eframe::Renderer::Wgpu,
+        },
+        wgpu_options: software_wgpu(),
         ..Default::default()
     };
 
@@ -297,6 +446,18 @@ fn windowed(
         "p2p-poker",
         options,
         Box::new(move |cc| {
+            // The first thing said from inside a window that exists. `eframe`
+            // calls this only after the renderer has a surface, so a script has
+            // something to wait for — and the software path's `drawing …` line
+            // is printed while choosing an adapter, which is earlier and proves
+            // less.
+            println!(
+                "window   open ({})",
+                match draw {
+                    Draw::Gl => "gl",
+                    Draw::Software => "software",
+                }
+            );
             render::install(&cc.egui_ctx);
             let mut state = AppState::new();
             state.me = settings.nickname.clone();
@@ -317,9 +478,119 @@ fn windowed(
             }))
         }),
     );
-    if let Err(e) = result {
-        eprintln!("the window could not open: {e}");
-        eprintln!("run with --headless if this machine has no display");
+    match result {
+        Ok(()) => Started::Ok,
+        Err(e) => {
+            let reason = e.to_string();
+            // Returned rather than acted on. The caller is the one place where
+            // this runtime and its node are certainly gone, which is what a
+            // second process needs to be true before it starts.
+            if draw == Draw::Gl && is_a_driver_problem(&e) {
+                eprintln!("the window could not open: {reason}");
+                Started::NoOpenGl
+            } else {
+                explain_window_failure(&reason, draw);
+                Started::Failed
+            }
+        }
+    }
+}
+
+/// Whether a software renderer could repair this failure.
+///
+/// Three of `eframe::Error`'s variants are the OpenGL path failing and no more
+/// than that: the painter refusing the version (`OpenGL`), glutin failing
+/// (`Glutin`), and glutin finding no usable framebuffer configuration at all
+/// (`NoGlutinConfigs`) — the last of which is what a machine with no driver
+/// whatsoever tends to produce. Direct3D 12 does not care about any of them.
+///
+/// Narrow on purpose, and this is the half that matters: `Winit` and
+/// `WinitEventLoop` mean there is no display to draw on, where a second
+/// renderer would fail in the same way and slower; and `AppCreation` is a fault
+/// in **this** program, which a second attempt would only repeat.
+///
+/// An earlier version read the message text, on the belief that `eframe`
+/// offered no variant to match. It does — `lib.rs:526` — and a string match
+/// would have missed `NoGlutinConfigs` entirely, because its `Display` never
+/// says "OpenGL".
+fn is_a_driver_problem(e: &eframe::Error) -> bool {
+    matches!(
+        e,
+        eframe::Error::OpenGL(_) | eframe::Error::Glutin(_) | eframe::Error::NoGlutinConfigs(..)
+    )
+}
+
+/// How the software renderer picks its adapter.
+///
+/// Left to itself, wgpu asks for the *best* adapter and would take a real GPU
+/// where one exists. Here the request is the opposite: this process only exists
+/// because OpenGL was missing, so the processor is the point. A `Cpu` adapter is
+/// preferred and the rest are kept as a fallback, because a virtual machine with
+/// a paravirtual Direct3D 12 adapter and no OpenGL is a real configuration and
+/// drawing on it beats not starting.
+fn software_wgpu() -> eframe::egui_wgpu::WgpuConfiguration {
+    // `eframe::wgpu`, not `wgpu`. The direct dependency exists only to choose
+    // the backend set and is declared for Windows alone, so naming it here
+    // would stop this file compiling anywhere else. `eframe` re-exports the
+    // same crate at `lib.rs:162`.
+    use eframe::wgpu;
+
+    let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.power_preference = wgpu::PowerPreference::LowPower;
+    setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
+        let usable = |a: &wgpu::Adapter| surface.is_none_or(|s| a.is_surface_supported(s));
+        let picked = adapters
+            .iter()
+            .find(|a| a.get_info().device_type == wgpu::DeviceType::Cpu && usable(a))
+            .or_else(|| adapters.iter().find(|a| usable(a)))
+            .cloned()
+            .ok_or_else(|| "no Direct3D 12 adapter at all, not even the software one".to_owned())?;
+        // Printed, not logged. This line is the answer to "did the fallback
+        // work?", and it is wanted by somebody staring at a terminal in a
+        // virtual machine, who has no logger configured and should not need one.
+        let info = picked.get_info();
+        println!("drawing  {} ({:?})", info.name, info.device_type);
+        Ok(picked)
+    }));
+    eframe::egui_wgpu::WgpuConfiguration {
+        wgpu_setup: setup.into(),
+        ..Default::default()
+    }
+}
+
+/// Say why the window did not open, and what is left to try.
+///
+/// The first version said one thing for every failure: *"run with --headless if
+/// this machine has no display"*. In a virtual machine that is the wrong advice
+/// about the wrong problem - there **is** a display, and what is missing is a
+/// graphics driver. Somebody following it would conclude their VM has no screen.
+///
+/// By the time this is reached the client has already tried the one repair it
+/// can make on its own, so what is printed here is what is genuinely left.
+fn explain_window_failure(reason: &str, draw: Draw) {
+    eprintln!("the window could not open: {reason}");
+    advice(draw);
+}
+
+/// What is left to try, given which renderer has just failed.
+fn advice(draw: Draw) {
+    eprintln!();
+    match draw {
+        Draw::Software => {
+            eprintln!("This was the software renderer, so there is no Direct3D 12 here");
+            eprintln!("either - not even WARP, which every Windows 10 carries. Either this");
+            eprintln!("machine is older than that, or it has no display at all.");
+            eprintln!();
+            eprintln!("  p2p-poker --headless");
+            eprintln!();
+            eprintln!("runs the node with no window. It plays no poker, but it is a full peer");
+            eprintln!("and a relay for others, and --host and --join work, which is what a");
+            eprintln!("two-machine test needs.");
+        }
+        Draw::Gl => {
+            eprintln!("  p2p-poker --renderer software   draw on the processor instead");
+            eprintln!("  p2p-poker --headless            no window at all: node and relay only");
+        }
     }
 }
 
@@ -624,5 +895,71 @@ impl eframe::App for Client {
         // The node pushes events whether or not the window is being interacted
         // with, so the window is repainted on a timer rather than only on input.
         ctx.request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The failure the user actually hit, built as the variant `eframe` returns
+    /// rather than as the sentence it prints.
+    #[test]
+    fn the_painter_refusing_opengl_earns_a_second_attempt() {
+        let e = eframe::Error::OpenGL(eframe::egui_glow::PainterError::from(
+            "egui_glow requires opengl 2.0+. ".to_owned(),
+        ));
+        assert!(is_a_driver_problem(&e));
+        // And the sentence really is the one the user saw, so the two halves of
+        // this fix are talking about the same failure.
+        assert!(e.to_string().contains("egui_glow requires opengl 2.0+"));
+    }
+
+    /// Narrow on purpose: a machine with no display must not be handed to a
+    /// renderer that also needs one, and a fault in this program must not be
+    /// repeated in a second process.
+    #[test]
+    fn our_own_faults_do_not_earn_a_second_attempt() {
+        let mine = eframe::Error::AppCreation(Box::new(std::io::Error::other("my fault")));
+        assert!(!is_a_driver_problem(&mine));
+    }
+
+    #[test]
+    fn the_child_is_told_which_renderer_and_keeps_every_other_flag() {
+        let args: Vec<String> = ["p2p-poker.exe", "--profile", "D", "--host", "T", "--seats", "6"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(
+            software_args(&args),
+            vec!["--profile", "D", "--host", "T", "--seats", "6", "--renderer", "software"]
+        );
+    }
+
+    /// A `--renderer` of the user's own goes, and so does its value. Leaving
+    /// `auto` behind would put the child in the same state as the parent, and
+    /// every child would start another child.
+    #[test]
+    fn the_users_own_renderer_choice_is_removed_with_its_value() {
+        let args: Vec<String> = ["p2p-poker.exe", "--renderer", "auto", "--profile", "D"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let out = software_args(&args);
+        assert_eq!(out, vec!["--profile", "D", "--renderer", "software"]);
+        // The value went with the flag: `auto` is not sitting where `--profile`
+        // would read its directory.
+        assert_eq!(out.iter().filter(|a| *a == "auto").count(), 0);
+    }
+
+    /// A trailing `--renderer` with nothing after it must not eat a flag that
+    /// is not there, nor panic.
+    #[test]
+    fn a_trailing_renderer_flag_is_harmless() {
+        let args: Vec<String> = ["p2p-poker.exe", "--table", "--renderer"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(software_args(&args), vec!["--table", "--renderer", "software"]);
     }
 }

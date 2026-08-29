@@ -67,7 +67,7 @@ chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["
 rs_poker = { version = "=5.0.0", default-features = false }
 
 # --- gui: docs/research/GUI_STACK.md --------------------------------------
-eframe      = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+eframe      = { version = "0.36.1", default-features = false, features = ["glow", "wgpu_no_default_features", "default_fonts"] }
 egui_extras = { version = "0.36.1", features = ["image"] }
 rust-embed  = "8.12.0"
 image       = { version = "0.25.10", default-features = false, features = ["png"] }
@@ -84,6 +84,12 @@ netdev = { version = "0.46", default-features = false, features = ["gateway"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+# The second renderer, and the reason the client starts on a machine with no
+# graphics driver. Only the Direct3D 12 backend is compiled: it is the one that
+# can reach WARP, the software rasteriser every Windows 10 already carries.
+# Named here rather than left to eframe because eframe's `wgpu` feature turns on
+# all of wgpu's backends, which is several megabytes we would never call.
+wgpu = { version = "30.0", default-features = false, features = ["std", "wgsl", "dx12"] }
 
 # --- dev-only: the arkworks types the vendored ziffle is built on --------
 # Present so tests/deck_constants.rs (ZIFFLE_VERDICT.md C-7) can recompute

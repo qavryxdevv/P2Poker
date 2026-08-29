@@ -138,13 +138,23 @@ try {
 
     # The VM watches; this host hosts a table AND is directly reachable from the
     # VM, so it is also the relay candidate.
+    #
+    # Both `--headless`, and it matters on each side for a different reason.
+    # In the VM this runs inside a WinRM job - a non-interactive session with no
+    # desktop - so a window could not open there even on a machine that had a
+    # graphics driver, and the client would now spend the run re-launching
+    # itself into the software renderer instead of talking to anybody. On this
+    # host a window is simply not what is being measured. The exit code is kept:
+    # a client that never started used to look exactly like one that started and
+    # found nothing.
     $vmJob = Invoke-Command -Session $session -AsJob -ScriptBlock {
         param($dir, $secs, $log)
         Set-Location $dir
-        & "$dir\p2p-poker.exe" --for $secs *> $log
+        & "$dir\p2p-poker.exe" --headless --for $secs *> $log
+        if ($LASTEXITCODE -ne 0) { "EXIT=$LASTEXITCODE" | Out-File -Append -Encoding utf8 $log }
     } -ArgumentList $remoteDir, $Seconds, $vmLogRemote
 
-    $hostProc = Start-Process -FilePath $Binary -ArgumentList @('--host', 'HyperV-test', '--for', "$Seconds") `
+    $hostProc = Start-Process -FilePath $Binary -ArgumentList @('--headless', '--host', 'HyperV-test', '--for', "$Seconds") `
         -RedirectStandardOutput $hostLog -NoNewWindow -PassThru
 
     Wait-Process -Id $hostProc.Id -Timeout ($Seconds + 60)
@@ -171,6 +181,10 @@ try {
         Write-Host ("{0} {1}" -f $mark, $label) -ForegroundColor $colour
     }
 
+    # First, because every line below it is meaningless if a client never ran -
+    # and a client that failed to start produces the same empty log as one that
+    # started and found nobody.
+    Check 'the client started at all'          '^peer id ' '^peer id '
     Check 'announced under the lobby infohash' 'announce udp' 'announce udp'
     Check 'discovered peers through the DHT'   'discover \d+ usable' 'discover \d+ usable'
     Check 'completed a libp2p handshake'       '^connect ' '^connect '

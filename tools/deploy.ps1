@@ -19,6 +19,20 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Native programs write progress to stderr, and `2>&1` under Windows PowerShell's
+# `ErrorActionPreference = 'Stop'` turns the first such line into a *terminating*
+# NativeCommandError - so the deployment failed because cargo said "Finished".
+# PowerShell 7 does not do this, which is exactly why it went unnoticed: the same
+# script passed under `pwsh` and died under `powershell`. A tool in `tools\` has to
+# work under both, so every native call that wants its stderr goes through here.
+function Invoke-Native {
+    param([Parameter(Mandatory)][string]$Exe, [string[]]$Arguments = @())
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Exe @Arguments 2>&1 } finally { $ErrorActionPreference = $previous }
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 
 # Cargo is not always on the PATH of the shell this is launched from — a
@@ -50,12 +64,12 @@ Push-Location $root
 try {
     if (-not $SkipChecks) {
         Step 'cargo test --release'
-        $test = & $cargo test --release -- --test-threads=19 2>&1
+        $test = Invoke-Native $cargo @('test', '--release', '--', '--test-threads=19')
         if ($LASTEXITCODE -ne 0) { $test | Select-Object -Last 25; Die 'the tests do not pass' }
         Ok 'tests pass'
 
         Step 'cargo clippy --all-targets --release'
-        $clippy = & $cargo clippy --all-targets --release 2>&1
+        $clippy = Invoke-Native $cargo @('clippy', '--all-targets', '--release')
         if ($LASTEXITCODE -ne 0) { $clippy | Select-Object -Last 25; Die 'clippy is not clean' }
         if ($clippy | Select-String -Pattern '^warning' -Quiet) {
             $clippy | Select-String -Pattern '^warning' | Select-Object -First 5
@@ -104,7 +118,7 @@ if ($kept -gt 0) {
 # A deployed client that cannot start is a deployment that failed, and the
 # cheapest possible proof is to start it.
 Step 'starting it once, headless, to prove the copy runs'
-$out = & (Join-Path $To 'p2p-poker.exe') --headless --for 3 2>&1
+$out = Invoke-Native (Join-Path $To 'p2p-poker.exe') @('--headless', '--for', '3')
 if ($LASTEXITCODE -ne 0) { $out | Select-Object -Last 10; Die 'the deployed binary did not run' }
 $peer = ($out | Select-String '^peer id').ToString()
 if (-not $peer) { $out | Select-Object -Last 10; Die 'it started but printed no identity' }

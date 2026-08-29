@@ -73,15 +73,22 @@ corrected in place and the correction is recorded in §9.7.
 
 | Figure | Value | How |
 |---|---|---|
-| Crates **compiled into the client** | **425** | `cargo tree --edges normal`, unique name+version, minus `p2p-poker` itself |
-| Crates **recorded in `Cargo.lock`** | **611** | `[[package]]` entries, minus `p2p-poker` itself |
-| Locked but never compiled | **186** | the difference |
+| Crates **compiled into the client** | **461** | `cargo tree --edges normal`, unique name+version, minus `p2p-poker` itself |
+| Crates **recorded in `Cargo.lock`** | **646** | `[[package]]` entries, minus `p2p-poker` itself |
+| Locked but never compiled | **185** | the difference |
 
-`cargo audit` prints "**612** crate dependencies" because it counts the root package
-too. 612 − 1 = 611; 426 − 1 = 425. The two figures in this table both exclude the
+`cargo audit` prints "**647** crate dependencies" because it counts the root package
+too. 647 − 1 = 646; 462 − 1 = 461. The two figures in this table both exclude the
 root, so they are directly comparable. **(a)**
 
-**425 is a lot** against §28's "use the minimum number of dependencies", and it is
+**These numbers were 425 / 611 / 186 when this register was first written**, and the
+drift is worth naming rather than quietly overwriting: **+13** came from local
+discovery and port mapping (`libp2p` `mdns` and `upnp`, `crab_nat`, `netdev`), and
+**+23** from the second renderer — `wgpu 30.0.1` and its Direct3D 12 backend, which
+is what lets the client start on a machine with no graphics driver. Neither addition
+brought a new licence into the tree; §6 has the measurement.
+
+**461 is a lot** against §28's "use the minimum number of dependencies", and it is
 recorded here rather than glossed over. It is what libp2p, arkworks and egui cost
 together. The open decision in `DECISIONS.md` to run all discovery through Mainline
 DHT and drop the libp2p `dns` and `kad` features would remove roughly twelve of
@@ -725,9 +732,12 @@ moves into §5.9's category.
 
 ### 5.12 What is deliberately not registered
 
-The remaining **303** compiled crates are not individually registered. They are
+The remaining **339** compiled crates are not individually registered. They are
 dominated by the GUI and its platform stack (`eframe 0.36.1`, `egui_extras 0.36.1`,
-`image 0.25.10`, `rust-embed 8.12.0`, winit, glow, fonts, clipboard), plus logging
+`image 0.25.10`, `rust-embed 8.12.0`, winit, glow, fonts, clipboard), the second
+renderer (`wgpu 30.0.1` with its `dx12` backend only, `wgpu-core`, `wgpu-hal`,
+`naga`, `gpu-allocator`, `egui-wgpu` — 23 crates, all of them shader compilation and
+graphics-API plumbing), plus logging
 (`tracing 0.1.44`), proc-macro machinery, and small utility crates; a handful are
 duplicate minor versions of crates already registered above (`getrandom 0.2.17` and
 `0.3.4`, `minicbor-derive 0.19.5`, `ark-serialize-derive 0.5.0`), named in the prose
@@ -737,7 +747,8 @@ of §5 without a row of their own. They are covered by the whole-tree licence sw
 **The assumption that makes that exclusion defensible, stated so it can be
 attacked:** no attacker-controlled bytes reach them. The table image and the fonts
 are compiled into the binary by `rust-embed`, so the PNG and font decoders only ever
-see our own assets. **This assumption fails the moment anything peer-supplied is
+see our own assets. The same holds for the renderer: `naga` compiles shaders, and the
+only shaders it ever sees are `egui`'s own, compiled in. **This assumption fails the moment anything peer-supplied is
 rendered** — an avatar, a table skin, a chat message with an image, a downloaded
 theme. If any of that is ever added, `image`, the font stack and the clipboard path
 move into §5.7 and are registered individually. That is a §8 re-audit trigger.
@@ -746,40 +757,49 @@ move into §5.7 and are registered individually. That is a §8 re-audit trigger.
 
 ## 6. Licence sweep over the whole compiled tree
 
-Every one of the 425 compiled dependencies has a licence expression in its own
+Every one of the 461 compiled dependencies has a licence expression in its own
 `Cargo.toml`. **There is no dependency whose licence could not be established.**
 **(a)** `cargo deny check licenses` reports exactly one `unlicensed` error, and it is
 `p2p-poker` itself.
 
-Distribution over the 425, counted from `cargo metadata`'s `license` field. The
-groups sum to 425 exactly. **(a)**
+Distribution over the 461, counted from `cargo metadata`'s `license` field. The
+groups sum to 461 exactly. **(a)**
 
 | Licence expression | Count | Notes |
 |---|---|---|
-| MIT and/or Apache-2.0 only, in any spelling or order | 360 | includes 87 MIT-only, 8 Apache-2.0-only (among them **`rs_poker`**, `prost`, `winit`, `glutin*`), and the 15 deprecated slash forms in note 3 below |
+| MIT and/or Apache-2.0 only, in any spelling or order | 391 | includes 93 MIT-only, 9 Apache-2.0-only (among them **`rs_poker`**, `prost`, `winit`, `glutin*`, `codespan-reporting`), and the 20 deprecated slash forms in note 3 below |
 | `Unicode-3.0` | 18 | the ICU crates under `idna` |
 | `BSD-3-Clause` | 7 | `ed25519-dalek` ×2, `curve25519-dalek` ×2, `x25519-dalek`, `subtle`, `sha1_smol` — six of the seven are registered in §5 |
 | `Unlicense OR MIT` / `Unlicense/MIT` | 7 | `memchr`, `aho-corasick`, `byteorder`, `byteorder-lite`, `walkdir`, `same-file`, `winapi-util` |
 | `MIT OR Apache-2.0 OR Zlib` | 5 | `glow`, `cursor-icon`, `raw-window-handle`, `tinyvec_macros`, `lru-slab` |
 | `Zlib OR Apache-2.0 OR MIT` | 3 | `bytemuck`, `bytemuck_derive`, `tinyvec` |
-| `MIT OR Zlib OR Apache-2.0` | 2 | `miniz_oxide` ×2 — the same three licences in a third word order |
 | `ISC` | 3 | **`rustls-webpki`**, `untrusted`, `libloading` |
+| `MIT OR Zlib OR Apache-2.0` | 2 | `miniz_oxide` ×2 — the same three licences in a third word order |
+| `BSD-2-Clause OR Apache-2.0 OR MIT` | 2 | `zerocopy`, `zerocopy-derive` |
+| `BSD-3-Clause OR Apache-2.0` | 2 | `moxcms`, `pxfm` (colour management under `image`) |
+| `BSD-3-Clause OR MIT OR Apache-2.0` | 2 | `num_enum`, `num_enum_derive` |
 | `Zlib` | 2 | `foldhash` ×2 |
 | `BSL-1.0` | 2 | `clipboard-win`, `error-code` |
 | `BlueOak-1.0.0` | 2 | **`minicbor`**, `minicbor-derive` |
-| `BSD-3-Clause OR Apache-2.0` | 2 | `moxcms`, `pxfm` (colour management under `image`) |
+| `(MIT OR Apache-2.0) AND Apache-2.0` | 1 | `moka` — a choice **and** an obligation; the Apache-2.0 half is not optional |
 | `(MIT OR Apache-2.0) AND Unicode-3.0` | 1 | `unicode-ident` |
+| `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0` | 1 | `epaint_default_fonts` — font licences, not code |
 | `CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception` | 1 | **`blake3`** |
 | `CC0-1.0 OR MIT-0 OR Apache-2.0` | 1 | `constant_time_eq` |
 | `Apache-2.0 OR ISC OR MIT` | 1 | **`rustls`** |
 | `Apache-2.0 AND ISC` | 1 | **`ring`** — a conjunction, not a choice |
-| `BSD-2-Clause OR Apache-2.0 OR MIT` | 1 | `zerocopy` |
+| `Apache-2.0 AND MIT` | 1 | `dpi` (winit's) — the second conjunction in the tree |
 | `BSD-2-Clause` | 1 | `arrayref` (used by `blake3`) |
 | `MIT OR BSD-3-Clause` | 1 | `if-addrs` |
 | `0BSD OR MIT OR Apache-2.0` | 1 | `adler2` |
 | `Apache-2.0 OR GPL-2.0-only` | 1 | `self_cell` — the Apache branch is taken; **the only appearance of GPL in the tree is as the unchosen half of a dual licence** |
-| `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0` | 1 | `epaint_default_fonts` — font licences, not code |
 | **`MPL-2.0`** | **1** | **`attohttpc`** |
+
+**What the second renderer did to this table: nothing but arithmetic.** All 23 of the
+`wgpu` crates are MIT-or-Apache-2.0 in one spelling or another, save
+`codespan-reporting 0.13.1`, which is Apache-2.0-only and joins the eight already
+there. No new licence expression, no copyleft, nothing that a policy allowing the
+tree before would reject now. **(a)**
 
 Five things a `deny.toml` has to handle, all verified:
 
@@ -788,16 +808,19 @@ Five things a `deny.toml` has to handle, all verified:
    the `upnp` feature removes it. It must be an explicit, deliberate allow.
 2. **`minicbor` and `minicbor-derive` are BlueOak-1.0.0** and `rustls-webpki` is
    **ISC**; neither is on any default allow-list.
-3. **Fifteen crates use the deprecated SPDX slash form** `MIT/Apache-2.0`, which a
+3. **Twenty crates use the deprecated SPDX slash form** `MIT/Apache-2.0`, which a
    strict licence policy may fail to parse: `ark-std`, `asn1-rs-impl`, `bs58`,
    `curve25519-dalek-derive`, `enum-as-inner`, `futures-rustls`, `futures-timer`,
-   `guillotiere`, `hex_fmt`, `ipconfig`, `minimal-lexical`, `rusticata-macros`,
-   `siphasher`, `tagptr`, `winapi` — plus `flume` (`Apache-2.0/MIT`) and `fnv`
-   (`Apache-2.0 / MIT`, with spaces). `CRYPTOGRAPHY.md` §9 names only `ark-std`;
-   sixteen more need the same clarification. **(a)**
-4. **`ring 0.17.14` is `Apache-2.0 AND ISC`** — a conjunction, not a choice, and it
-   also carries BoringSSL/OpenSSL-derived files. It needs a clarification entry, not
-   a plain allow.
+   `guillotiere`, `hex_fmt`, `ipconfig`, `minimal-lexical`, `pollster`, `rustc-hash`,
+   `rusticata-macros`, `siphasher`, `tagptr`, `type-map`, `winapi` — plus `flume`
+   (`Apache-2.0/MIT`) and `fnv` (`Apache-2.0 / MIT`, with spaces). The last three of
+   those arrived with the second renderer. `CRYPTOGRAPHY.md` §9 names only `ark-std`;
+   nineteen more need the same clarification. **(a)**
+4. **Three expressions are conjunctions, not choices.** `ring 0.17.14` is
+   `Apache-2.0 AND ISC` and also carries BoringSSL/OpenSSL-derived files; `dpi 0.1.2`
+   is `Apache-2.0 AND MIT`; `moka 0.12.16` is `(MIT OR Apache-2.0) AND Apache-2.0`,
+   where the choice is real but the Apache-2.0 obligation stands whichever way it
+   goes. All three need clarification entries rather than plain allows.
 5. **`ziffle 0.1.0` declares `MIT OR Apache-2.0` but only the Apache-2.0 branch is
    usable, and this is the one row in the sweep where the declared expression and the
    effective licence differ.** The crate ships both texts; its `LICENSE-MIT` opens

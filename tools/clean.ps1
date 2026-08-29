@@ -41,6 +41,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
 $root = Split-Path -Parent $PSScriptRoot
 $target = Join-Path $root 'target'
 
@@ -138,7 +139,17 @@ if ($Deep) {
 
     Push-Location $root
     try {
-        $json = & $cargo build --release --all-targets --message-format=json 2>$null
+        # `2>$null` still makes Windows PowerShell wrap cargo's stderr in error
+        # records, and `ErrorActionPreference = 'Stop'` then makes the first of
+        # them terminating - the sweep died because cargo said "Finished".
+        # PowerShell 7 does not, which is why it passed under `pwsh` for so long.
+        # Stderr stays discarded rather than merged: this output is parsed as
+        # JSON, one object per line, and a progress line in the middle of it is
+        # not a build artifact.
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $json = & $cargo build --release --all-targets --message-format=json 2>$null }
+        finally { $ErrorActionPreference = $previous }
         if ($LASTEXITCODE -ne 0) {
             Write-Host 'FAIL  the build did not succeed; nothing swept' -ForegroundColor Red
             exit 1

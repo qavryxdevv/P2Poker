@@ -703,11 +703,36 @@ Justification, clause by clause:
 
 ### Known risks, stated plainly
 
-* **OpenGL requirement.** The `glow` renderer needs `OPENGL32.dll` to resolve a real driver. On a
-  Windows VM with no GPU driver, Microsoft's software GL is 1.1 and eframe will fail to create a
-  context. Mitigation: keep `eframe`'s `wgpu` renderer behind a cargo feature as a fallback (it
-  builds — measured at 7.99 MB) and document it. Slint has the same exposure with `femtovg`, plus
-  a `renderer-software` option we did not measure.
+* **OpenGL requirement — happened, and is now closed.** The `glow` renderer needs `OPENGL32.dll`
+  to resolve a real driver. On a Windows VM with no GPU driver, Microsoft's software GL is 1.1 and
+  eframe fails to create a context. This is not hypothetical: it is what the client did the first
+  time somebody ran it in a VM, and the message it printed then — *"run with --headless if this
+  machine has no display"* — was advice about a different problem.
+
+  **Closed 2026-08-29**, by the mitigation this section proposed: `eframe`'s `wgpu` renderer is
+  compiled in beside `glow`, and the client re-launches itself on it when OpenGL is missing.
+  Three things were measured that this section had not been:
+
+  1. **Only the `dx12` backend is needed, and only it can be afforded.** `egui-wgpu` takes `wgpu`
+     with `default-features = false`, so the backend set is ours to choose. Turning them all on
+     (via `eframe`'s own `wgpu` feature) puts `wgpu-hal`'s dx12 and vulkan code in the build at
+     once and the `windows` crate resolves to two incompatible versions — `gpu-allocator 0.28.0`
+     accepts `>=0.53, <=0.62` and unifies onto the `0.57` that `sysinfo` pulls in under
+     `libp2p-memory-connection-limits`, while `wgpu-hal` itself is written against `0.62`.
+     `error[E0308]: there are multiple different versions of crate windows`. Asking for `dx12`
+     alone resolves cleanly on `windows 0.62.2`. **The memory-limit defence was never a candidate
+     for removal to make a renderer build.**
+  2. **WARP is there.** `Microsoft Basic Render Driver` is enumerated as a `Cpu` adapter next to
+     this machine's two real GPUs, driver version `10.0.19041` — the Windows build number, not a
+     driver's — and `wgpu-hal`'s dx12 backend knows it by name. Nothing to install.
+  3. **The retry must be a second process.** `winit 0.30.13` swaps a process-global `AtomicBool`
+     the first time an event loop is built and never clears it (`event_loop.rs:119`), so a
+     fallback inside the same process gets `EventLoopError::RecreationAttempt` and nothing else.
+
+  Cost: 21.3 MB → 26.4 MB, 23 crates, two new names in the PE import table (`dxgi.dll`,
+  `setupapi.dll`, both Windows' own), and no new licence expression in the tree.
+  Slint has the same exposure with `femtovg`, plus a `renderer-software` option we did not
+  measure — moot now.
 * **egui is immediate-mode.** The whole table is redrawn every frame. For one poker table that is
   irrelevant, but the table window should be repaint-throttled when idle (`ctx.request_repaint_after`)
   so a laptop is not pinned at the display refresh rate.

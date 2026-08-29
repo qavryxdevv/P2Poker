@@ -1,10 +1,10 @@
 # Where to pick up
 
-Updated 2026-08-29, evening. Tree clean, everything committed.
+Updated 2026-08-29, evening.
 
     cargo clippy --all-targets --release        0 warnings
-    cargo test --release -- --test-threads=19   546 unit + 49 harness, 0 failed
-    tools/check-portable.ps1                    6/6
+    cargo test --release -- --test-threads=19   590 unit + 49 harness, 0 failed
+    tools/check-portable.ps1                    8/8, 26.4 MB
 
 ## Two processes now form a table
 
@@ -72,6 +72,32 @@ list under a UAC-filtered token, which reads exactly like "there are no VMs".
 | Lobby | signed adverts across the wire, §7.2 rules 2–7, rate limits, eviction |
 | Formation | **complete and wired** — join RPC, roster, ratification, `session_id`, over a real connection |
 | GUI | lobby and table in two windows, settings, live roster; no hand engine behind the table yet |
+| Renderer | OpenGL, falling back by itself to Direct3D 12 on WARP where there is no graphics driver |
+
+## It starts on a machine with no graphics driver
+
+A virtual machine without acceleration has the OpenGL 1.1 that Windows ships,
+and the window needs 2.0. The client no longer stops there: it starts itself
+again on Direct3D 12, which with no driver present resolves to WARP — `Microsoft
+Basic Render Driver`, part of Windows rather than of any driver — and says which
+adapter it landed on.
+
+A **second process**, because a process gets one event loop and no more: `winit`
+swaps a global flag the first time one is built and never clears it, so the
+renderer cannot be retried in place. The decision is taken in `main`, after
+`windowed` has returned and its tokio runtime is gone, so the second process
+cannot start a second node under the same identity while the first still holds
+the ports.
+
+Measured, not assumed: `Microsoft Basic Render Driver` is enumerated on this
+machine alongside its two real GPUs, driver version `10.0.19041` — the Windows
+build number, not a driver's — and the client draws a window on it when told
+`--renderer software`. What is **not** yet measured is the automatic hop, which
+needs a machine where OpenGL is genuinely absent. The two decisions it turns on
+are unit-tested; the hop itself is not.
+
+Cost: 21.3 MB → 26.4 MB, and 23 crates, none of which brings a new licence into
+the tree (`DEPENDENCIES.md` §6).
 
 ## Next actions, in order
 
@@ -79,10 +105,12 @@ list under a UAC-filtered token, which reads exactly like "there are no VMs".
    `GENESIS(1)`. `table::dealing` already runs a hand between three peers in
    memory; nothing carries `HAND_INIT` and the deck messages between two.
 2. **Two machines on two networks.** The one claim above that rests on nothing.
-3. **The table window's engine.** It draws a sample hand and says so. §22's rule
+3. **The automatic renderer hop, in a VM.** Everything around it is tested; the
+   hop wants a machine with no OpenGL to prove itself on.
+4. **The table window's engine.** It draws a sample hand and says so. §22's rule
    — never display an unverified card as valid — is enforced by the type
    (`Facing::up` takes the verdict), so the wiring cannot break it by omission.
-4. Phase 11's audit.
+5. Phase 11's audit.
 
 ## Open items
 

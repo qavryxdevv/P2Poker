@@ -87,10 +87,41 @@ Both print `TABLE FORMED session=…` with the same session identity.
 | `--join NAME` | sit down at the first table called `NAME` |
 | `--table` | open on the table rather than the lobby |
 | `--for N` | stop after `N` seconds |
+| `--renderer gl` \| `software` | pin the renderer instead of letting it choose |
+
+### On a machine with no graphics driver
+
+The window draws with OpenGL, and a virtual machine without graphics
+acceleration has only the OpenGL 1.1 that Windows ships, where the window needs
+2.0. The client does not stop there. It starts itself again on Direct3D 12,
+which with no driver present resolves to **WARP** — `Microsoft Basic Render
+Driver`, a software rasteriser that is part of Windows rather than of any
+driver — and prints which adapter it ended up on:
+
+```text
+the window could not open: egui_glow: OpenGL: egui_glow requires opengl 2.0+.
+
+No OpenGL 2.0 on this machine. Starting again in software.
+drawing  Microsoft Basic Render Driver (Cpu)
+window   open (software)
+```
+
+Nothing to install, and nothing to type: `--renderer` exists to override the
+choice, not to make it. It is a second process because a process gets one event
+loop and no more, so a renderer cannot be retried in place.
+
+`window   open (…)` is printed from inside a window that exists, so it is the
+line a script waits for. A run that never got that far says why and **exits
+non-zero** — 1 when the window could not open, 2 for an argument it does not
+understand. Every failure used to exit 0, including a profile that could not be
+created, which meant a client that never started was indistinguishable from one
+that ran and found nothing.
 
 ## It is portable, and that is checked
 
-One executable, around 21 MB, statically linked against the C runtime. Copy it
+One executable, around 26 MB, statically linked against the C runtime. Five of
+those megabytes are the second renderer, which is what makes it start on a
+machine with no graphics driver at all. Copy it
 into an empty folder and it runs, creating exactly `profile/identity.key` and
 `profile/player.key` beside itself — two keys, because the protocol keeps the
 network identity and the player identity apart. Two folders are two players.
