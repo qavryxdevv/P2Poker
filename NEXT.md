@@ -3,7 +3,7 @@
 Updated 2026-08-30.
 
     cargo clippy --all-targets --release        0 warnings
-    cargo test --release -- --test-threads=19   626 unit + 54 harness, 0 failed
+    cargo test --release -- --test-threads=19   636 unit + 54 harness, 0 failed
     tools/check-portable.ps1                    8/8, 27.5 MB
 
     RUST_LOG=libp2p_kad=debug,libp2p_relay=debug ./target/release/p2p-poker --headless
@@ -231,15 +231,65 @@ no serialisation, so the one value every seat must agree on before a card is
 opened could not be put on a wire. A getter, no arithmetic, recorded in
 `PROVENANCE.md`.
 
+### Betting runs, and the board opens
+
+Two clients heads-up play the pre-flop round out and the flop appears. The five
+`ACTION_*` messages are single-writer stages, one per turn; `BOARD_REVEAL` is
+collective and **every dealt-in seat owes one, folded seats included** — the
+price of `n`-of-`n`.
+
+`Hand` has a second entry point now, and it is the first thing in the whole
+driver that waits for a human: `act(action, key, now)`. It applies the player's
+action through the **same** `BettingRound::apply` a receiver runs, so a client
+cannot send itself something a peer would refuse. `turn()` hands the window
+seat, street, `to_call`, legal actions and pot in one call.
+
+Two quantities live in `Play` because the engine does not hold them:
+
+* `paid`, the per-hand committed totals. `BettingRound::committed` is per
+  **round** and `build_pots` wants the hand.
+* `aggressor`, cleared when a round *opens* and never when a street is
+  *skipped* — which is what makes it the right seat to show first after an
+  all-in run-out where the last streets had no betting (D-021).
+
 ### What is next in the hand, in order
 
-1. Betting: one stage per action, with the engine that already exists.
-2. `BOARD_REVEAL` for the three post-flop streets — the same reveal machinery
-   as `DEAL_PRIVATE`, with every dealt-in seat contributing to every index.
-3. Showdown: `SHOWDOWN_REVEAL` / `SHOWDOWN_MUCK`, then `HAND_COMPLETE`.
-4. The RNG beacon, replacing `provisional_button`.
-5. The stage-timeout path. Every stage seals a `next_deadline_ms` from the
+1. Showdown: `SHOWDOWN_REVEAL` / `SHOWDOWN_MUCK` as **one collective stage**
+   (D-021 — the order is an emission discipline, not extra stages), then the
+   settlement and `HAND_COMPLETE`.
+2. Hand `k+1`: `TERMINAL(k)`, `GENESIS(k+1)`, the dead-button rotation via
+   `engine::advance_positions`, and D-020's five-second hold before it starts.
+3. The RNG beacon, replacing `provisional_button`.
+4. The stage-timeout path. Every stage seals a `next_deadline_ms` from the
    table's own parameters and nothing yet acts when one passes.
+5. `STATE_HASH` / `STATE_ACK` checkpoints, including checkpoint 8 at the hand
+   boundary — without it `PROTOCOL.md` §12 says T61 fires at `hand_deadline_ms`
+   after every settled hand.
+
+### Four defects found by pointing a critic at the design, not at the code
+
+Worth recording because none of them would have been found by testing what was
+written — they are all about what was *not*.
+
+1. **`mental_poker::reveal` implemented the point-to-point model §4.6
+   withdrew.** Every peer discarded the `m-1` shares it received for another
+   seat's hole card, so `SHOWDOWN_REVEAL` — one message, because the rest is
+   already on the transcript — would have had nothing to combine with. The
+   showdown could not have been built on top of it.
+2. **The hand driver kept only its own two token sets**, for the same reason,
+   and had reimplemented a slice of `table::dealing` rather than using it.
+3. **Shares were recorded before `stage.hear` ran**, so an ordinary mesh
+   redelivery came back as a fault against an honest peer. Moving `hear` first
+   only moved the defect. The rule now, in all four collective stages: exact
+   repeat → done; then verify; then hear.
+4. **`blind_positions` keyed heads-up on `occupied.len() == 2`.** A busted seat
+   is still occupied. `engine::initial_positions` — the tested TDA 32
+   implementation, keyed on chips — was called by nothing.
+
+The test that caught (3) is the first three-handed hand in the tree, with every
+message delivered twice. Heads-up hid all of it: at two seats every collective
+stage completes on the first message, so the duplicate lands at a sequence the
+hand has already left.
 
 ## Next actions, in order
 
