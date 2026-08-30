@@ -3,8 +3,8 @@
 Updated 2026-08-30.
 
     cargo clippy --all-targets --release        0 warnings
-    cargo test --release -- --test-threads=19   591 unit + 49 harness, 0 failed
-    tools/check-portable.ps1                    8/8, 27.8 MB
+    cargo test --release -- --test-threads=19   626 unit + 54 harness, 0 failed
+    tools/check-portable.ps1                    8/8, 27.5 MB
 
     RUST_LOG=libp2p_kad=debug,libp2p_relay=debug ./target/release/p2p-poker --headless
 
@@ -191,35 +191,78 @@ so no single seat's contribution decides the button, and a hash of the
 ratifications is not that guarantee. One function, so the beacon replaces it in
 one change.
 
+### The hand now reaches hole cards
+
+Stages 0 through `2m+3` all run. Two clients, two independent states, no
+network in the test and no server anywhere in the design, go from an empty
+table to each holding two cards the other cannot read
+(`two_clients_reach_their_own_hole_cards`).
+
+| Stage | Message | Shape |
+|---|---|---|
+| 0 | `HAND_INIT` | collective |
+| 1 | `DECK_INIT` | collective — key and ownership proof, per-sender `DeckCtx` |
+| `2+2j`, `3+2j` | `SHUFFLE_STEP`, `SHUFFLE_PROOF` | single-writer, one pair per shuffler |
+| `2m+2` | `DECK_COMMIT` | collective — the barrier |
+| `2m+3` | `DEAL_PRIVATE` | collective — shares for everybody else's cards |
+
+Four things in there are load-bearing:
+
+* **A step is held, not applied, until its proof verifies.** The proof carries
+  the input and output deck hashes, checked before the 42 ms of verification, so
+  an argument lifted from another hand costs a hash.
+* **A refused argument abandons the hand rather than shortening the chain.**
+  `ZIFFLE_VERDICT.md` C-6 rule 4. A chain that can be shortened is a chain an
+  attacker shortens to one honest shuffler.
+* **`DECK_COMMIT` is the last cheap moment.** Three values every seat derived
+  independently. After it a hole card exists, and a disagreement is a dispute.
+* **Privacy is one missing share and nothing else.** `DEAL_PRIVATE` is
+  broadcast; each seat withholds only its own share of its own two cards. The
+  index set must be *exactly* what a sender owes — the dangerous "more" is a
+  board index published early.
+
+Round 0's `input_deck_hash` is a constant standing for the open deck, which the
+library owns and never surfaces. It binds nothing and is not meant to: the
+context does all of round 0's binding. Written into `PROTOCOL.md` §4.5 so the
+next reader does not have to rediscover it.
+
+`vendor/ziffle` gained **FORK(d)**: `AggregatePublicKey` had a private field and
+no serialisation, so the one value every seat must agree on before a card is
+opened could not be put on a wire. A getter, no arithmetic, recorded in
+`PROVENANCE.md`.
+
 ### What is next in the hand, in order
 
-1. `DECK_INIT` (stage 1) — each seat's deck key and ownership proof. The
-   cryptography exists (`mental_poker::backend::keygen`, `verify_key`); what does
-   not is the payload type and the per-sender `DeckCtx`.
-2. The shuffle chain, stages 2 to 2m+1, single-writer.
-3. `DECK_COMMIT`, then checkpoint, then `DEAL_PRIVATE` — and at that point there
-   are hole cards on the screen.
-4. Betting: one stage per action, with the engine that already exists.
-5. The RNG beacon, replacing `provisional_button`.
+1. Betting: one stage per action, with the engine that already exists.
+2. `BOARD_REVEAL` for the three post-flop streets — the same reveal machinery
+   as `DEAL_PRIVATE`, with every dealt-in seat contributing to every index.
+3. Showdown: `SHOWDOWN_REVEAL` / `SHOWDOWN_MUCK`, then `HAND_COMPLETE`.
+4. The RNG beacon, replacing `provisional_button`.
+5. The stage-timeout path. Every stage seals a `next_deadline_ms` from the
+   table's own parameters and nothing yet acts when one passes.
 
 ## Next actions, in order
 
-1. **The hand, wired.** Formation ends at `session_id` and the engine starts at
-   `GENESIS(1)`. `table::dealing` already runs a hand between three peers in
-   memory; nothing carries `HAND_INIT` and the deck messages between two. This
-   is now the thing standing between a lobby that works and a game.
-2. **Why two clients on one machine do not find each other**, when two on
+1. **Betting.** The hand reaches hole cards and stops there. `poker::state`
+   already holds the engine; what is missing is one stage per action and the
+   turn order that decides whose stage it is.
+2. **A hand between two real processes, end to end.** The deal is proved
+   between two states in one test; the same thing over GossipSub is not. A
+   `DEAL_PRIVATE` is ~2 KB heads-up and the deck messages are 9 KB per
+   shuffler, so this is also the first time the transport is asked to carry
+   something that does not fit in one small frame.
+3. **Why two clients on one machine do not find each other**, when two on
    different VLANs do. Not blocking, but a test that only passes on two
-   computers is a test nobody runs. Formation ends at `session_id` and the engine starts at
-   `GENESIS(1)`. `table::dealing` already runs a hand between three peers in
-   memory; nothing carries `HAND_INIT` and the deck messages between two.
-3. **Two machines on two networks.** Still rests on nothing.
-4. **The automatic renderer hop, in a VM.** Everything around it is tested; the
+   computers is a test nobody runs.
+4. **Two machines on two networks.** Still rests on nothing.
+5. **The automatic renderer hop, in a VM.** Everything around it is tested; the
    hop wants a machine with no OpenGL to prove itself on.
-5. **The table window's engine.** It draws a sample hand and says so. §22's rule
+6. **The rest of the table window.** The hero's hole cards are drawn from the
+   hand now, and the other seats' backs with them; the board, the pot and the
+   action are still the sample. §22's rule
    — never display an unverified card as valid — is enforced by the type
    (`Facing::up` takes the verdict), so the wiring cannot break it by omission.
-6. Phase 11's audit.
+7. Phase 11's audit.
 
 ### Done since, and worth not re-deriving
 
