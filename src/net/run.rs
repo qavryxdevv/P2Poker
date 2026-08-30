@@ -874,10 +874,11 @@ pub async fn run(
                                         // this machinery can fail: everybody
                                         // says their clock ran out and nothing
                                         // happens.
-                                        if let Some((subject, held, need)) = h.take_tally() {
+                                        if let Some((subject, held, need, d)) = h.take_tally() {
                                             let _ = events
                                                 .send(NodeEvent::Warning(format!(
-                                                    "seat {subject}'s clock: {held} of {need}                                                      peers agree"
+                                                    "seat {subject} @{}: {held}/{need} agree",
+                                                    short_hash(&d)
                                                 )))
                                                 .await;
                                         }
@@ -1979,9 +1980,15 @@ pub async fn run(
                         // acts for its own owner first.
                         let who: Vec<String> =
                             h.waiting_for().iter().map(|s| s.to_string()).collect();
+                        let mine = h
+                            .take_tally()
+                            .map(|(s, held, need, d)| {
+                                format!("seat {s} @{}: {held}/{need} agree", short_hash(&d))
+                            })
+                            .unwrap_or_default();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "my clock has run out on seat {}",
+                                "my clock has run out on seat {} — {mine}",
                                 who.join(", ")
                             )))
                             .await;

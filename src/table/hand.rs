@@ -685,7 +685,7 @@ pub struct Hand {
     /// A vote that is not counted is the quietest failure in this machinery —
     /// the peers all say their clocks ran out and nothing ever happens — so the
     /// count is reported rather than inferred.
-    tally: Option<(SeatIdx, usize, usize)>,
+    tally: Option<(SeatIdx, usize, usize, Hash)>,
     /// The last seat a certificate acted for, and what it did.
     ///
     /// Read once by the node so it can say so: an action nobody took is the one
@@ -3384,6 +3384,12 @@ impl Hand {
             )?;
             self.voted.insert(digest);
             self.take_vote(digest, self.open.my_seat, bytes.clone(), subject);
+            self.tally = Some((
+                seat,
+                self.votes.get(&digest).map(|m| m.len()).unwrap_or(0),
+                self.voters(seat).len(),
+                digest,
+            ));
             out.push(Send::Broadcast(bytes));
             out.append(&mut self.certify_if_unanimous(key, now_ms)?);
         }
@@ -3434,6 +3440,7 @@ impl Hand {
             mine.subject_seat,
             held,
             self.voters(mine.subject_seat).len(),
+            digest,
         ));
         // The vote that completes the set is what produces the certificate, so
         // the two are one call: there is no state in which unanimity has been
@@ -3740,7 +3747,7 @@ impl Hand {
     }
 
     /// How the vote count stands, taken rather than read.
-    pub fn take_tally(&mut self) -> Option<(SeatIdx, usize, usize)> {
+    pub fn take_tally(&mut self) -> Option<(SeatIdx, usize, usize, Hash)> {
         self.tally.take()
     }
 
