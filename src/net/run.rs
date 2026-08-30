@@ -2498,6 +2498,19 @@ async fn begin_hand(
                     let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), bytes);
                 }
             }
+            // What this hand hangs off, said out loud. Two peers that opened
+            // hand one from different views of the formation produce different
+            // genesis values, and every message each sends is then "a different
+            // parent" to the other — which reads, in every other line of the
+            // log, as silence. This is the one line that tells them apart.
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "hand #{} opens at genesis {} with seats {:?}",
+                    h.hand_id(),
+                    short_hash(&h.genesis()),
+                    h.required()
+                )))
+                .await;
             let _ = events
                 .send(NodeEvent::HandWaiting {
                     hand_id: h.hand_id(),
@@ -2513,6 +2526,11 @@ async fn begin_hand(
                 .await;
         }
     }
+}
+
+/// Eight hex characters of a hash, which is what a person can compare.
+fn short_hash(h: &[u8; 32]) -> String {
+    h[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The first hand's opening, once the roster has ratified.

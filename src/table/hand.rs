@@ -2916,6 +2916,20 @@ impl Hand {
         now_ms.saturating_sub(self.opened_at_ms) >= u64::from(self.open.hand_deadline_ms)
     }
 
+    /// `GENESIS(k)`: what this hand's first stage hangs off.
+    ///
+    /// Public so a client can say it. Two peers that opened one hand from
+    /// different views of the formation differ here and nowhere a log would
+    /// otherwise show.
+    pub fn genesis(&self) -> Hash {
+        self.open.genesis
+    }
+
+    /// The required emitter set this hand was opened with.
+    pub fn required(&self) -> &[SeatIdx] {
+        &self.open.required
+    }
+
     /// Whether this hand has ended, however it ended.
     ///
     /// The two ways are not interchangeable — one moves chips and one does not
