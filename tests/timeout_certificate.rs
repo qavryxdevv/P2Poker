@@ -734,3 +734,138 @@ fn the_subject_applies_a_certificate_about_a_stage_it_has_left() {
         next[0].required
     );
 }
+
+
+/// **`HAND_COMPLETE` wins over an abort, and the peer that gave up follows.**
+///
+/// `PROTOCOL.md` section 4.10: *a hand is decided or aborted, never both; a
+/// receiver that applied an abort and later accepts a complete `HAND_COMPLETE`
+/// stage for the same hand replaces its terminal with that stage's
+/// `stage_hash`*. `HAND_COMPLETE` wins because it is collective — a completing
+/// one proves no seat was silent, which is the premise every abort rests on.
+///
+/// It is not a nicety. `GENESIS(k+1)` depends on `TERMINAL(k)`, so a peer
+/// keeping `abort_terminal(k)` while the others keep the settlement's hash
+/// could never speak to them again. The race is narrow and entirely
+/// legitimate: one peer's own deadline expiring between its own
+/// `HAND_COMPLETE` emission and the arrival of the last other copy — which is
+/// why the stage that peer had open has to be carried across the abort, or the
+/// rule is unreachable in the one case it is written for.
+#[test]
+fn a_settlement_that_arrives_after_an_abort_replaces_its_terminal() {
+    use p2p_poker::poker::actions::Action;
+    use p2p_poker::protocol::messages::EventType;
+    use p2p_poker::table::hand::Abort;
+
+    const LATE: u64 = NOW + 600_000;
+
+    fn is_settlement(bytes: &[u8]) -> bool {
+        matches!(
+            p2p_poker::net::chained::peek(bytes, 16_384),
+            Ok((EventType::HandComplete, _, _))
+        )
+    }
+
+    let (mut t, opening) = Live::open(0);
+
+    // **One rule for the whole hand: seat 2 never hears anybody's settlement.**
+    // Everything else reaches everyone, so seat 2 plays the hand out and
+    // publishes a settlement of its own — and its stage stays one short, which
+    // is the state section 4.10's race leaves a peer in.
+    let mut held: Vec<Vec<u8>> = Vec::new();
+    let mut queue = opening;
+    for _ in 0..600 {
+        if queue.is_empty() {
+            // Nothing left to deliver: somebody has to act.
+            let owed = t.hands[0].waiting_for();
+            let Some(&seat) = owed.first() else { break };
+            let s = usize::from(seat);
+            let Ok(out) = t.hands[s].act(Action::Fold, &t.keys[s], NOW) else {
+                break;
+            };
+            queue = out.into_iter().map(|Send::Broadcast(b)| b).collect();
+            if queue.is_empty() {
+                break;
+            }
+        }
+        for bytes in std::mem::take(&mut queue) {
+            if is_settlement(&bytes) {
+                held.push(bytes.clone());
+            }
+            for to in 0..3usize {
+                if to == 2 && is_settlement(&bytes) {
+                    continue;
+                }
+                match t.hands[to].on_event(&bytes, &t.keys[to], NOW) {
+                    Ok(out) => {
+                        for Send::Broadcast(b) in out {
+                            queue.push(b);
+                        }
+                    }
+                    Err(Failed::NotYet) => t.hands[to].hold(bytes.clone()),
+                    Err(_) => {}
+                }
+            }
+        }
+        if t.hands[0].betting_over() && t.hands[1].betting_over() {
+            break;
+        }
+    }
+
+    assert!(
+        t.hands[0].betting_over() && t.hands[1].betting_over(),
+        "seats 0 and 1 were meant to settle"
+    );
+    assert!(
+        !t.hands[2].betting_over(),
+        "seat 2 was meant to be one settlement short, not settled"
+    );
+    assert!(
+        held.len() >= 2,
+        "the settlements the other seats published were not captured"
+    );
+
+    // Seat 2's own deadline expires in that gap.
+    let own: Vec<Vec<u8>> = t.hands[2]
+        .abort_now(Abort::Deadline, &t.keys[2], LATE)
+        .expect("the abort is sealed")
+        .into_iter()
+        .map(|Send::Broadcast(b)| b)
+        .collect();
+    assert!(t.hands[2].aborted().is_some(), "seat 2 did not give the hand up");
+
+    // Seats 0 and 1 have settled, so they discard it. That is the first half of
+    // the rule and has its own test; asserted here so this one cannot pass by
+    // the whole table aborting together.
+    for to in 0..2usize {
+        for bytes in &own {
+            let _ = t.hands[to].on_event(bytes, &t.keys[to], LATE);
+        }
+        assert!(
+            t.hands[to].aborted().is_none(),
+            "seat {to} reopened a hand it had settled"
+        );
+    }
+
+    // And now the settlements it never heard reach it.
+    for bytes in &held {
+        let _ = t.hands[2].on_event(bytes, &t.keys[2], LATE);
+    }
+
+    // **The point.** All three open the next hand at one genesis and one
+    // roster hash — so seat 2 took the settlement's terminal and the settled
+    // stacks, rather than the abort's.
+    let next: Vec<_> = (0..3usize)
+        .map(|s| t.hands[s].next_hand().expect("a next hand"))
+        .collect();
+    for s in 1..3usize {
+        assert_eq!(
+            next[0].genesis, next[s].genesis,
+            "seat {s} derives a different genesis: it kept the abort's terminal"
+        );
+        assert_eq!(
+            next[0].roster_hash, next[s].roster_hash,
+            "seat {s} derives a different roster hash: it kept the abort's stacks"
+        );
+    }
+}

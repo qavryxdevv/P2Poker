@@ -867,6 +867,15 @@ pub async fn run(
                                     if let Some(n) = h.take_cert_note() {
                                         let _ = events.send(NodeEvent::Warning(n)).await;
                                     }
+                                    // The one condition this client cannot
+                                    // repair and must not hide.
+                                    if let Some(f) = h.take_fork() {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "this hand has forked: {f}"
+                                            )))
+                                            .await;
+                                    }
                                     if h.dealt() {
                                         if !hand_reported {
                                             hand_reported = true;

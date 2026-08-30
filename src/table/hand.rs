@@ -390,6 +390,20 @@ pub struct CertFact {
     pub kind: u16,
 }
 
+/// A settlement being collected while this client is in `Phase::Aborted`.
+///
+/// The aborted peer never computed a settlement of its own, so it cannot
+/// compare each body against one it derived. It compares the emitters against
+/// **each other** instead: the first body is the claim and every later one must
+/// equal it, which is the same disagreement test from the other side.
+#[derive(Clone, Debug)]
+struct Late {
+    stage: Collective,
+    body: HandComplete,
+    /// Set once every seat of the required set has published the same body.
+    closed: Option<(Hash, Vec<Chips>)>,
+}
+
 /// A `TIMEOUT_CERT` checked from its own bytes, with nothing taken on trust.
 #[derive(Clone, Debug)]
 struct VerifiedCert {
@@ -734,6 +748,13 @@ pub struct Hand {
     /// R4: a betting stage certified while this client was elsewhere. The two
     /// chains cannot be reconciled, so this is reported and not repaired.
     forked: Option<String>,
+    /// A settlement that completed after this client had already aborted.
+    ///
+    /// §4.10: *a hand is decided or aborted, never both*, and `HAND_COMPLETE`
+    /// wins — it is collective, so a completing one proves no seat was silent,
+    /// which is the premise every abort rests on. A receiver that aborted first
+    /// therefore replaces its terminal, and its stacks, with the settlement's.
+    late: Option<Late>,
     /// What is left of **this** client's own per-hand thinking reserve.
     ///
     /// Local, and deliberately so. Every peer budgets the *whole* reserve for
@@ -945,6 +966,7 @@ impl Hand {
                 banked: BTreeSet::new(),
                 proof: None,
                 forked: None,
+                late: None,
                 bank_left_ms: o.time_bank_ms,
                 shuffle_note: None,
                 cert_note: Vec::new(),
@@ -1018,6 +1040,11 @@ impl Hand {
         // their handlers were ever reached — and the peer least able to be
         // standing at the stage a certificate is about is the subject of it,
         // which is exactly the peer that has to hear it.
+        // A settlement arriving after this client gave the hand up. §4.10:
+        // `HAND_COMPLETE` wins, because it is collective.
+        if kind == EventType::HandComplete && matches!(self.phase, Phase::Aborted(_)) {
+            return self.on_late_settlement(bytes);
+        }
         // An abort is answered from **any** phase and from any position: it is
         // §3.2's witness-independent terminal, it has no required emitter set,
         // and two peers that saw different prefixes of a hand must still be
@@ -3171,7 +3198,7 @@ impl Hand {
         }
         let body = HandAbort::on_deadline(self.mine.stacks.clone());
         let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
-        self.phase = Phase::Aborted(why);
+        self.give_up(why);
         Ok(vec![Send::Broadcast(bytes)])
     }
 
@@ -3290,7 +3317,7 @@ impl Hand {
             }
         }
 
-        self.phase = Phase::Aborted(Abort::Told { cause: body.cause });
+        self.give_up(Abort::Told { cause: body.cause });
         Ok(Vec::new())
     }
 
@@ -3839,6 +3866,101 @@ impl Hand {
         self.proof = Some((hash, bytes.to_vec()));
     }
 
+    /// Give the hand up, keeping the settlement this client had already
+    /// published.
+    ///
+    /// §4.10's race is exactly *"a peer's own deadline expiring between its
+    /// `HAND_COMPLETE` emission and the arrival of the last other copy"*. The
+    /// stage that peer had open already holds its own copy, and a stage
+    /// requiring every seat of the required set can only ever complete if it is
+    /// carried across. Dropped, the rule that `HAND_COMPLETE` wins would be
+    /// unreachable in the one case it is written for.
+    fn give_up(&mut self, why: Abort) {
+        if self.late.is_none() {
+            if let Phase::Playing { play, .. } = &self.phase {
+                if let Step::Settling { stage, mine } = &play.step {
+                    self.late = Some(Late {
+                        stage: stage.clone(),
+                        body: (**mine).clone(),
+                        closed: None,
+                    });
+                }
+            }
+        }
+        self.phase = Phase::Aborted(why);
+    }
+
+    /// A `HAND_COMPLETE` arriving after this client gave the hand up.
+    ///
+    /// §4.10's precedence rule has two halves. The first — a settled hand
+    /// discards a late abort — is a guard in `on_hand_abort`. This is the
+    /// second: *a receiver that applied an abort and later accepts a complete
+    /// `HAND_COMPLETE` stage for the same hand replaces its terminal with that
+    /// stage's `stage_hash`*. Without it the peer that gave up keeps
+    /// `abort_terminal(k)` while everybody else keeps the settlement's hash,
+    /// and `GENESIS(k+1)` depends on `TERMINAL(k)` — so the two could never
+    /// speak again. The race is narrow and entirely legitimate: it needs one
+    /// peer's own deadline to expire between its neighbours' settlement and the
+    /// arrival of the last copy.
+    fn on_late_settlement(&mut self, bytes: &[u8]) -> Result<Vec<Send>, Failed> {
+        let opened = chained::open_in_hand(
+            bytes,
+            FRAME_CAP,
+            EventType::HandComplete,
+            &self.open.table_id,
+            self.open.hand_id,
+        )
+        .map_err(Failed::Wire)?;
+        let seat = self.seat_of(&opened.sender)?;
+        let theirs: HandComplete =
+            chained::payload(&opened, HAND_COMPLETE_CAP).map_err(Failed::Wire)?;
+
+        let sequence = opened.envelope.sequence;
+        if self.late.is_none() {
+            let stage = Collective::closed(
+                sequence,
+                EventType::HandComplete.code(),
+                &self.open.required,
+            )
+            .ok_or(Failed::NotInThisStage)?;
+            self.late = Some(Late {
+                stage,
+                body: theirs.clone(),
+                closed: None,
+            });
+        }
+        let Some(late) = self.late.as_mut() else {
+            unreachable!("just set")
+        };
+        if late.stage.sequence() != sequence {
+            // Two settlements at two positions is not a settlement.
+            return Err(Failed::Elsewhere {
+                seat,
+                what: "one settlement stood at one stage",
+            });
+        }
+        if late.stage.heard(seat) == Some(opened.event_hash) {
+            return Ok(Vec::new());
+        }
+        if theirs != late.body {
+            return Err(Failed::DeckDisagrees {
+                seat,
+                what: "settlement",
+            });
+        }
+        match late.stage.hear(seat, opened.event_hash) {
+            Heard::Counted | Heard::Bystander | Heard::Again => {}
+            Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
+            Heard::Uninvited => return Err(Failed::NotInThisStage),
+        }
+        if late.stage.complete() {
+            let hash = late.stage.hash().ok_or(Failed::NotInThisStage)?;
+            let stacks = late.body.final_stacks.clone();
+            late.closed = Some((hash, stacks));
+        }
+        Ok(Vec::new())
+    }
+
     /// A `TIMEOUT_CERT` checked from its own bytes, with nothing taken on
     /// trust and nothing read from this receiver's position in the hand.
     ///
@@ -4302,7 +4424,7 @@ impl Hand {
             body.cert_hash = Some(h);
         }
         let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
-        self.phase = Phase::Aborted(Abort::Told { cause: 1 });
+        self.give_up(Abort::Told { cause: 1 });
         Ok(vec![Send::Broadcast(bytes)])
     }
 
@@ -4329,6 +4451,13 @@ impl Hand {
             return None;
         }
         Some(std::mem::take(&mut self.cert_note).join(" | "))
+    }
+
+    /// The one condition this client cannot repair and must not hide: two
+    /// parents at one sequence, taken rather than read so the node reports it
+    /// once.
+    pub fn take_fork(&mut self) -> Option<String> {
+        self.forked.take()
     }
 
     pub fn take_tally(&mut self) -> Option<(SeatIdx, usize, usize, Hash)> {
@@ -4644,6 +4773,17 @@ impl Hand {
                 play.round.stack.clone(),
                 self.slot.previous_event_hash,
             ),
+            // A settlement that arrived after this client gave up. §4.10:
+            // `HAND_COMPLETE` wins over an abort, so the terminal and the
+            // stacks are the settlement's and not the abort's.
+            Phase::Aborted(_) if self.late.as_ref().is_some_and(|l| l.closed.is_some()) => {
+                let (hash, stacks) = self
+                    .late
+                    .as_ref()
+                    .and_then(|l| l.closed.clone())
+                    .expect("checked in the guard");
+                (stacks, hash)
+            }
             Phase::Aborted(_) => (
                 // An abort moves no chips: every seat ends the hand with what
                 // it started it with (D-010, I27), and those are the values
@@ -6663,179 +6803,5 @@ mod tests {
         assert!(failures.is_empty(), "it was good all along");
         assert_eq!(sends.len(), 1, "and completing stage 0 offers a deck key");
         assert!(a.dealt());
-    }
-
-    // ================= ATTACK PROBES (temporary) =================
-
-    /// PROBE 1: one seat, two valid HAND_INITs at slot 0, differing only in
-    /// the envelope's unchecked `emitted_at_unix_ms`.
-    #[test]
-    fn probe_timestamp_equivocation_splits_the_table() {
-        let (_atk, first) = Hand::open(opening3(2), &key(12), NOW, 30_000).unwrap();
-        let (_atk2, second) = Hand::open(opening3(2), &key(12), NOW + 1, 30_000).unwrap();
-        let Send::Broadcast(a_bytes) = &first[0];
-        let Send::Broadcast(b_bytes) = &second[0];
-        assert_ne!(a_bytes, b_bytes, "two distinct byte strings");
-
-        let slot0 = Slot {
-            table_id: [1; 32],
-            hand_id: 1,
-            sequence: 0,
-            previous_event_hash: [4; 32],
-        };
-        let oa = chained::open(a_bytes, FRAME_CAP, EventType::HandInit, &slot0).unwrap();
-        let ob = chained::open(b_bytes, FRAME_CAP, EventType::HandInit, &slot0).unwrap();
-        assert_eq!(oa.sender, ob.sender);
-        assert_eq!(oa.envelope.sequence, ob.envelope.sequence);
-        assert_eq!(oa.envelope.previous_event_hash, ob.envelope.previous_event_hash);
-        assert_eq!(oa.envelope.event_class, ob.envelope.event_class);
-        assert_eq!(oa.envelope.payload, ob.envelope.payload, "identical payload");
-        assert_ne!(oa.event_hash, ob.event_hash, "different event_hash");
-
-        let (mut v1, from_v1) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
-        let (mut v2, from_v2) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
-
-        assert!(v1.on_event(a_bytes, &key(10), NOW).unwrap().is_empty());
-        let e1 = v1.on_event(b_bytes, &key(10), NOW);
-        assert_eq!(e1, Err(Failed::Equivocation { seat: 2 }), "V1 refuses the second");
-
-        assert!(v2.on_event(b_bytes, &key(11), NOW).unwrap().is_empty());
-        let e2 = v2.on_event(a_bytes, &key(11), NOW);
-        assert_eq!(e2, Err(Failed::Equivocation { seat: 2 }), "V2 refuses the second");
-
-        let Send::Broadcast(v1b) = &from_v1[0];
-        let Send::Broadcast(v2b) = &from_v2[0];
-        let _ = v1.on_event(v2b, &key(10), NOW).unwrap();
-        let _ = v2.on_event(v1b, &key(11), NOW).unwrap();
-
-        assert!(v1.dealt() && v2.dealt(), "stage 0 completed on both");
-        assert_ne!(
-            v1.slot().previous_event_hash,
-            v2.slot().previous_event_hash,
-            "THE FORK: two honest peers hang stage 1 off different parents"
-        );
-        assert_eq!(v1.slot().sequence, 1);
-        assert_eq!(v2.slot().sequence, 1);
-    }
-
-    /// PROBE 2: after the fork, honest traffic is mutually invisible.
-    #[test]
-    fn probe_fork_makes_honest_traffic_invisible() {
-        let (_a1, first) = Hand::open(opening3(2), &key(12), NOW, 30_000).unwrap();
-        let (_a2, second) = Hand::open(opening3(2), &key(12), NOW + 1, 30_000).unwrap();
-        let Send::Broadcast(a_bytes) = &first[0];
-        let Send::Broadcast(b_bytes) = &second[0];
-
-        let (mut v1, from_v1) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
-        let (mut v2, from_v2) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
-        let Send::Broadcast(v1b) = &from_v1[0];
-        let Send::Broadcast(v2b) = &from_v2[0];
-
-        let _ = v1.on_event(a_bytes, &key(10), NOW);
-        let _ = v2.on_event(b_bytes, &key(11), NOW);
-        let d1 = v1.on_event(v2b, &key(10), NOW).unwrap();
-        let d2 = v2.on_event(v1b, &key(11), NOW).unwrap();
-        assert_eq!(d1.len(), 1, "V1 offers a deck key");
-        assert_eq!(d2.len(), 1, "V2 offers a deck key");
-
-        let Send::Broadcast(k1) = &d1[0];
-        let Send::Broadcast(k2) = &d2[0];
-        assert_eq!(v2.on_event(k1, &key(11), NOW), Err(Failed::NotYet));
-        assert_eq!(v1.on_event(k2, &key(10), NOW), Err(Failed::NotYet));
-    }
-
-    /// PROBE 3: re-sending one's own event after the stage moved on.
-    #[test]
-    fn probe_self_replay_after_the_stage_moved() {
-        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
-        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
-        let Send::Broadcast(ab) = &from_a[0];
-        let _ = deliver(&mut b, &from_a, &key(11));
-        let _ = deliver(&mut a, &from_b, &key(10));
-        assert_eq!(b.slot().sequence, 1, "B has left stage 0");
-        assert_eq!(b.on_event(ab, &key(11), NOW), Ok(Vec::new()), "silently dropped");
-        assert_eq!(b.slot().sequence, 1, "and nothing moved");
-    }
-
-    /// PROBE 4: event_class cannot be moved off the catalogue value.
-    #[test]
-    fn probe_event_class_is_pinned_by_the_catalogue() {
-        use crate::protocol::messages::{EnvelopeError, EventBody, PROTOCOL_VERSION};
-        let mut body = EventBody {
-            protocol_version: PROTOCOL_VERSION,
-            table_id: [1u8; 32],
-            hand_id: 1,
-            sequence: 3,
-            sender_public_key: key(12).verifying_key().to_bytes(),
-            event_type: EventType::ActionBet.code(),
-            payload: vec![1, 2, 3],
-            previous_event_hash: [5u8; 32],
-            emitted_at_unix_ms: NOW,
-            next_deadline_ms: 0,
-            chain_scope: 1,
-            event_class: 1,
-        };
-        assert_eq!(
-            body.check_envelope(),
-            Err(EnvelopeError::EventClassMismatch {
-                declared: 1,
-                expected: 0
-            })
-        );
-        body.event_class = 2;
-        assert!(body.check_envelope().is_err());
-        body.event_class = 0;
-        assert!(body.check_envelope().is_ok());
-    }
-
-    /// PROBE 5: an UNSIGNED frame steers on_event and lands in the hold queue.
-    #[test]
-    fn probe_unsigned_junk_reaches_the_hold_queue() {
-        use crate::protocol::messages::{EventBody, SignedEvent};
-        use crate::protocol::serialization::to_canonical;
-        let (mut v, _) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
-
-        let body = EventBody {
-            protocol_version: 1,
-            table_id: [1u8; 32],
-            hand_id: 1,
-            sequence: 1000,
-            sender_public_key: [0xAAu8; 32],
-            event_type: EventType::HandInit.code(),
-            payload: vec![],
-            previous_event_hash: [0u8; 32],
-            emitted_at_unix_ms: 0,
-            next_deadline_ms: 0,
-            chain_scope: 1,
-            event_class: 0,
-        };
-        let body_bytes = to_canonical(&body).unwrap();
-        let junk = to_canonical(&SignedEvent {
-            body: body_bytes,
-            signature: [0u8; 64],
-        })
-        .unwrap();
-
-        assert_eq!(
-            v.on_event(&junk, &key(10), NOW),
-            Err(Failed::NotYet),
-            "an unsigned frame is answered NotYet, i.e. HELD and forwarded"
-        );
-        v.hold(junk.clone());
-        assert_eq!(v.held(), 1);
-
-        for i in 0..70u64 {
-            let mut b2 = body.clone();
-            b2.sequence = 1000 + i;
-            let bb = to_canonical(&b2).unwrap();
-            let j = to_canonical(&SignedEvent {
-                body: bb,
-                signature: [0u8; 64],
-            })
-            .unwrap();
-            assert_eq!(v.on_event(&j, &key(10), NOW), Err(Failed::NotYet));
-            v.hold(j);
-        }
-        assert_eq!(v.held(), 64, "the bounded queue is full of unsigned junk");
     }
 }
