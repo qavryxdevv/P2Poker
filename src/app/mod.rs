@@ -361,10 +361,27 @@ impl AppState {
                     h.turn = None;
                     h.waiting_on = seat;
                 }
+                // Logged, because "whose turn is it" is the question a player
+                // asks of a table that appears to be doing nothing — and a
+                // table that is doing nothing because it is waiting for
+                // somebody looks identical to one that is stuck.
+                if let Some(seat) = seat {
+                    self.log
+                        .push_back(format!("hand #{hand_id}: waiting for seat {seat}"));
+                }
             }
             NodeEvent::Board { hand_id, cards } => {
+                let named: Vec<String> = cards
+                    .iter()
+                    .filter_map(|i| crate::poker::state::Card::from_index(*i).ok())
+                    .map(|c| c.to_string())
+                    .collect();
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
                     h.board = cards;
+                }
+                if !named.is_empty() {
+                    self.log
+                        .push_back(format!("hand #{hand_id}: board {}", named.join(" ")));
                 }
             }
             NodeEvent::HandEnded {
