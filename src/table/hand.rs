@@ -670,9 +670,36 @@ impl Hand {
             small_blind: o.small_blind,
             big_blind: o.big_blind,
             ante: 0,
-            // Everybody on the roster is a party to the first hand. A seat that
-            // has busted or sat out is not, and neither exists yet.
-            dealt_in: occupied.clone(),
+            // **Who took part, not who is sitting there.**
+            //
+            // `STATE_MACHINE.md` §5.3 step 4: `dealt_in` is the seats that are
+            // active *and* in `signed_this_hand`, with chips. The required set
+            // this hand was opened with **is** that — for hand one it is the
+            // signers of `TABLE_READY`, and for every hand after it is `P(k-1)`
+            // (D-013) — so this filters it by chips and nothing more.
+            //
+            // Dealing in whoever happens to occupy a seat was the defect that
+            // made one disconnection kill a whole table rather than cost one
+            // hand: an absent seat stayed a **required** contributor of a deck
+            // key and a shuffle, so every subsequent hand stalled to the hand
+            // deadline, for ever. It still pays blinds from its position, which
+            // is what a tournament's dead money is and is handled by
+            // `post_blinds` reading the stack rather than the deal.
+            dealt_in: {
+                let mut d: Vec<SeatIdx> = o
+                    .required
+                    .iter()
+                    .copied()
+                    .filter(|s| {
+                        o.seats
+                            .iter()
+                            .any(|(seat, _, stack)| seat == s && *stack > 0)
+                    })
+                    .collect();
+                d.sort_unstable();
+                d.dedup();
+                d
+            },
             stacks: o.seats.iter().map(|(_, _, stack)| *stack).collect(),
             roster_hash: o.roster_hash,
             // A buy-in enters the ledger here and nowhere earlier, which is
