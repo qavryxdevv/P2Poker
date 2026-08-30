@@ -3142,7 +3142,37 @@ impl Hand {
     /// because the answer changes as stages open and close and a single armed
     /// instant would have to be re-armed at every one of them.
     pub fn may_abandon(&self, now_ms: u64) -> bool {
-        !self.over() && self.past_deadline(now_ms)
+        if self.over() || !self.past_deadline(now_ms) {
+            return false;
+        }
+        // **The better mechanism gets to go first.** The stage deadline and the
+        // vote fall due at the same moment, so without this the local abort
+        // pre-empts the certificate on the very tick that produced the vote —
+        // and the hand would end anonymously where it could have ended naming
+        // the seat that stalled it. Where a certificate is achievable the abort
+        // waits one more stage's worth; where it is not — heads-up, and below
+        // the floor generally — it fires at once, because nothing better is
+        // coming.
+        if self.certificate_possible() && !self.long_past_stage(now_ms) {
+            return false;
+        }
+        true
+    }
+
+    /// Whether a certificate could still end the stage this hand is waiting on.
+    fn certificate_possible(&self) -> bool {
+        self.waiting_for()
+            .iter()
+            .any(|s| *s != self.open.my_seat && self.voters(*s).len() >= 2)
+    }
+
+    /// Twice the stage's own deadline: the window a certificate is given.
+    fn long_past_stage(&self, now_ms: u64) -> bool {
+        let Some(owed) = self.owed_type() else {
+            return true;
+        };
+        let allowed = u64::from(self.next_deadline_for(owed)).saturating_mul(2);
+        now_ms.saturating_sub(self.stage_at_ms) >= allowed
     }
 
     /// Whether the stage now open is one the cryptography has to complete.
