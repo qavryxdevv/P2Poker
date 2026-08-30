@@ -841,6 +841,14 @@ pub async fn run(
                                         &mut swarm,
                                         &mut said,
                                     );
+                                    // Outside `dealt()`: a certificate is
+                                    // decided at cryptographic stages too, and
+                                    // gating the report on cards being out
+                                    // delayed every note until some later
+                                    // event happened to take another path.
+                                    if let Some(n) = h.take_cert_note() {
+                                        let _ = events.send(NodeEvent::Warning(n)).await;
+                                    }
                                     if h.dealt() {
                                         if !hand_reported {
                                             hand_reported = true;
@@ -879,11 +887,6 @@ pub async fn run(
                                                     "seat {subject} @{}: {held}/{need} agree",
                                                     short_hash(&d)
                                                 )))
-                                                .await;
-                                        }
-                                        if let Some(n) = h.take_cert_note() {
-                                            let _ = events
-                                                .send(NodeEvent::Warning(n))
                                                 .await;
                                         }
                                         // A seat the table acted for, once.
@@ -2063,9 +2066,16 @@ pub async fn run(
                                 who.join(", ")
                             )))
                             .await;
+                        if let Some(n) = h.take_cert_note() {
+                            let _ = events.send(NodeEvent::Warning(n)).await;
+                        }
                         publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said);
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if let Some(n) = h.take_cert_note() {
+                            let _ = events.send(NodeEvent::Warning(n)).await;
+                        }
+                    }
                     Err(e) => {
                         let _ = events
                             .send(NodeEvent::Warning(format!("the clock: {e}")))

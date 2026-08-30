@@ -3508,8 +3508,47 @@ impl Hand {
         key: &SigningKey,
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
-        if self.certifying.is_some() {
-            return Ok(Vec::new());
+        // **A certificate already in progress is not a reason to stay silent.**
+        // It is usually the opposite: a peer's copy arrived before this client
+        // had a complete set of its own, which opened the stage here without
+        // this client having contributed to it. The stage then waits for every
+        // voter, this client owes one of them, and returning early left both
+        // peers holding a stage neither could close — measured, twice, as
+        // `cert: not started, one is already in progress` on one survivor while
+        // the other had emitted and was waiting for it.
+        if let Some(c) = &self.certifying {
+            if c.stage.heard(self.open.my_seat).is_some() {
+                return Ok(Vec::new());
+            }
+            let subject = c.subject;
+            let digest = subject.subject_digest();
+            let voters = self.voters(subject.subject_seat);
+            let held = self.votes.get(&digest).map(|m| m.len()).unwrap_or(0);
+            // Its own copy is its own word, so it waits for a complete set
+            // exactly as it would to start one. A peer's certificate is not
+            // evidence this client may sign against.
+            if voters.len() < 2 || held < voters.len() {
+                return Ok(Vec::new());
+            }
+            let bytes = self.seal_certificate(&digest, key, now_ms)?;
+            let hash = self.opened(&bytes, EventType::TimeoutCert)?.event_hash;
+            self.certs.insert(hash);
+            let complete = match self.certifying.as_mut() {
+                Some(c) => {
+                    c.stage.hear(self.open.my_seat, hash);
+                    c.stage.complete()
+                }
+                None => unreachable!("checked just above"),
+            };
+            self.cert_note.push(format!(
+                "the table has certified seat {}'s timeout, unanimously among {:?}",
+                subject.subject_seat, voters
+            ));
+            let mut out = vec![Send::Broadcast(bytes)];
+            if complete {
+                out.append(&mut self.apply_certificate(key, now_ms)?);
+            }
+            return Ok(out);
         }
         // The first subject this client holds a complete set for. Complete
         // means **every** seat in the voter set, which is what unanimity is:
@@ -3530,26 +3569,26 @@ impl Hand {
             }
         }
         let Some((digest, subject, voters)) = found else {
+            // Only worth a word when a set that looks complete produced
+            // nothing. A partial set is the ordinary state and says nothing.
+            if let Some((d, m)) = self.votes.iter().max_by_key(|(_, m)| m.len()) {
+                let subject = self.subject_of(d).map(|s| s.subject_seat);
+                let need = subject.map(|s| self.voters(s).len()).unwrap_or(0);
+                if m.len() >= need && need >= 2 {
+                    self.cert_note.push(format!(
+                        "cert: {} votes held and none certified; subject {:?} dealt_in {:?} certified {:?}",
+                        m.len(),
+                        subject,
+                        self.mine.dealt_in,
+                        self.certified
+                    ));
+                }
+            }
             return Ok(Vec::new());
         };
         // Ascending by voter seat, which the wire requires and which is what
         // makes one set of votes one byte string.
-        let votes: Vec<Vec<u8>> = self
-            .votes
-            .get(&digest)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default();
-        let body = TimeoutCert {
-            subject_digest: digest,
-            votes,
-        };
-        let bytes = self.say_at(
-            EventType::TimeoutCert,
-            &body,
-            TIMEOUT_CERT_CAP,
-            key,
-            now_ms,
-        )?;
+        let bytes = self.seal_certificate(&digest, key, now_ms)?;
         let hash = self.opened(&bytes, EventType::TimeoutCert)?.event_hash;
         let mut stage = Collective::closed(
             self.slot.sequence,
@@ -3567,6 +3606,28 @@ impl Hand {
         ));
         self.certifying = Some(Certifying { subject, stage });
         Ok(vec![Send::Broadcast(bytes)])
+    }
+
+    /// One certificate, from the votes this client holds for `digest`.
+    ///
+    /// Ascending by voter seat, which the wire requires and which is what makes
+    /// one set of votes one byte string.
+    fn seal_certificate(
+        &self,
+        digest: &Hash,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, Failed> {
+        let votes: Vec<Vec<u8>> = self
+            .votes
+            .get(digest)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        let body = TimeoutCert {
+            subject_digest: *digest,
+            votes,
+        };
+        self.say_at(EventType::TimeoutCert, &body, TIMEOUT_CERT_CAP, key, now_ms)
     }
 
     /// The subject a digest is about, from a vote this client holds.
