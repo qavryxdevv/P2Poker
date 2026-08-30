@@ -557,8 +557,24 @@ pub async fn run(
                         state_peers += 1;
                         let _ = events.send(NodeEvent::PeerConnected(peer_id)).await;
                     }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        if poker_peers.remove(&peer_id) {
+                    SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        num_established,
+                        ..
+                    } => {
+                        // **`num_established` is what is left, not what closed.**
+                        // A peer reached over both TCP and QUIC has two
+                        // connections, and a relayed peer that hole-punches to a
+                        // direct one has two for as long as the changeover
+                        // takes. Treating either close as a departure removed a
+                        // peer from `poker_peers` while it was still connected,
+                        // undid its exemption from the connection cap, and
+                        // reported it gone to the player. Measured on three
+                        // clients on one machine: eleven departures and four for
+                        // the other in four minutes, for two peers that never
+                        // actually went anywhere, and seventeen
+                        // direct-connection events for eight arrivals.
+                        if num_established == 0 && poker_peers.remove(&peer_id) {
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: true })
                                 .await;
@@ -2204,6 +2220,30 @@ pub async fn run(
             _ = housekeeping.tick() => {
                 let now = super::node::now_unix_ms();
                 state.tick(now);
+                // **Who this client can actually reach on the lobby topic.**
+                // A publish that returns `Ok` says only that it went somewhere.
+                // Measured on three clients on one machine, all discovered by
+                // mDNS within a second: `0 mesh peer(s) of 2` — both peers
+                // subscribed, neither grafted, so an advert reaches them only
+                // as an explicit peer or by gossip pull, and a table that
+                // should form in seconds took minutes. Nothing in the log
+                // distinguished that from "nobody is there" before this line.
+                {
+                    let g = &swarm.behaviour().gossipsub;
+                    let hash = topics.lobby.hash();
+                    let mesh = g.mesh_peers(&hash).count();
+                    let known = g
+                        .all_peers()
+                        .filter(|(_, subscribed)| subscribed.contains(&&hash))
+                        .count();
+                    if known > 0 || mesh > 0 {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "lobby topic: {mesh} of {known} subscribed peer(s) in the mesh"
+                            )))
+                            .await;
+                    }
+                }
                 // Told to the interface as well, which keeps its own copy and
                 // cannot see this clock.
                 let _ = events.send(NodeEvent::Swept { now_ms: now }).await;
