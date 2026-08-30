@@ -86,9 +86,20 @@ pub enum NodeCommand {
 pub enum NodeEvent {
     /// A transport address this node is reachable on.
     Listening(Multiaddr),
-    /// A peer completed a handshake and speaks this protocol.
+    /// Somebody joined or left the network this client is on.
+    ///
+    /// **Any** peer: since this client speaks to the public libp2p DHT there are
+    /// several hundred of them and almost none is a poker client. They are
+    /// counted and never written to the log — a line each was hundreds a minute,
+    /// and it buried everything a player might actually want to read.
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
+    /// A peer that turned out to be another **poker** client.
+    ///
+    /// Told apart by `identify`: the protocol version this client announces is
+    /// its own, so a peer answering with it is running this software. That is
+    /// what a player means by "peers", and it is what the header counts.
+    PokerPeer { peer: PeerId, gone: bool },
     /// The DHT returned addresses. Most will not be poker clients.
     Discovered { hints: usize, dropped: usize },
     /// An advert was accepted into the lobby.
@@ -271,8 +282,7 @@ impl NodeEvent {
             | Self::LeftTable { .. }
             // The lobby list and the counters above it.
             | Self::TableSeen { .. }
-            | Self::PeerConnected(_)
-            | Self::PeerDisconnected(_)
+            | Self::PokerPeer { .. }
             // The status line, which is a claim about whether this client can
             // play at all.
             | Self::Reachability { .. }
@@ -293,6 +303,9 @@ impl NodeEvent {
             | Self::DialFailed { .. }
             | Self::LocalPeer(_)
             | Self::LobbyPeer(_)
+            // Counted only, and the count is not on the header.
+            | Self::PeerConnected(_)
+            | Self::PeerDisconnected(_)
             // Log only — and lazily on purpose. A sweep that removes nothing
             // must not cost a repaint, and one that removes a row can wait the
             // fraction of a second the lazy wake takes.
@@ -456,7 +469,9 @@ mod wake_tests {
             NodeEvent::Seated { key: [0; 32], seat: 3 },
             NodeEvent::Roster { key: [0; 32], seats: vec![] },
             NodeEvent::TableReal { key: [0; 32], session: [1; 32] },
-            NodeEvent::PeerConnected(peer),
+            // Another poker client is a change to the header. A stranger on
+            // the DHT is not, and there are several hundred of those.
+            NodeEvent::PokerPeer { peer, gone: false },
             NodeEvent::Reachability { public: true },
         ];
         for e in now {
@@ -464,6 +479,8 @@ mod wake_tests {
         }
 
         let later = [
+            NodeEvent::PeerConnected(peer),
+            NodeEvent::PeerDisconnected(peer),
             NodeEvent::LocalPeer(peer),
             NodeEvent::MeshPeer(peer),
             NodeEvent::DialFailed { reason: "no route".into() },

@@ -183,6 +183,13 @@ pub struct PokerBehaviour {
 }
 
 /// The topics this node subscribes to.
+/// What this client answers with when asked who it is.
+///
+/// Named rather than written twice: `identify` announces it, and it is what
+/// tells another poker client apart from the several hundred strangers this node
+/// shares a DHT with.
+pub const PROTOCOL_VERSION: &str = "/p2p-poker/1";
+
 pub struct Topics {
     pub lobby: gossipsub::IdentTopic,
     pub lobby_chat: gossipsub::IdentTopic,
@@ -283,7 +290,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
             ipfs_kad.set_mode(None);
 
             let identify = identify::Behaviour::new(
-                identify::Config::new("/p2p-poker/1".into(), key.public())
+                identify::Config::new(PROTOCOL_VERSION.into(), key.public())
                     .with_agent_version(format!("p2p-poker/{}", env!("CARGO_PKG_VERSION")))
                     .with_push_listen_addr_updates(true),
             );

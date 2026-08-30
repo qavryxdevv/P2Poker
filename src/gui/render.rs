@@ -650,6 +650,9 @@ fn header(ui: &mut egui::Ui, view: &LobbyView) -> bool {
             (view.tables.len(), "tables", theme::TEXT_DIM),
             (open, "open", theme::OK),
             (view.status.peers, "peers", theme::ACCENT),
+            // Beside it, not instead of it: "462 peers" is true about the
+            // network and says nothing about who is here to play.
+            (view.status.lobby_peers, "in lobby", theme::OK),
         ] {
             pill(ui, &format!("{n} {what}"), colour);
         }

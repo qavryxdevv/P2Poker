@@ -278,7 +278,14 @@ pub struct NetworkStatus {
     /// Which protocol opened a port, if one did. `"PCP"`, `"NAT-PMP"`, or
     /// `None` — and `None` is the ordinary case rather than a fault.
     pub port_mapped: Option<&'static str>,
+    /// Everything this node is connected to, poker client or not — several
+    /// hundred, because the lobby rides the public libp2p DHT. It is a true
+    /// statement about the network and it is **not** a count of players, which
+    /// is why the next field exists beside it rather than replacing it.
     pub peers: usize,
+    /// Other poker clients: peers whose `identify` answered with this client's
+    /// own protocol version. What a player means when they ask who is about.
+    pub lobby_peers: usize,
     pub listening: Vec<String>,
     pub dht_announced: bool,
     pub relay: Option<RelayStatus>,

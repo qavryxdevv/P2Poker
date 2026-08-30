@@ -322,6 +322,11 @@ pub async fn run(
     let mut seen_locally: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
 
+    // Which connected peers are other poker clients, so a disconnection can say
+    // whether it was one without asking `identify` about a peer already gone.
+    let mut poker_peers: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
+
     // The QUIC port, kept only so the router can be asked to open it once.
     // It used to be what got announced to Mainline as well; that is gone, and
     // opening a door in a NAT is worth doing whether or not anybody is told
@@ -463,6 +468,11 @@ pub async fn run(
                         let _ = events.send(NodeEvent::PeerConnected(peer_id)).await;
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        if poker_peers.remove(&peer_id) {
+                            let _ = events
+                                .send(NodeEvent::PokerPeer { peer: peer_id, gone: true })
+                                .await;
+                        }
                         let _ = events.send(NodeEvent::PeerDisconnected(peer_id)).await;
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::RelayClient(
@@ -845,6 +855,15 @@ pub async fn run(
                             }
                         }
 
+                        // Another one of us, or a stranger on the same DHT?
+                        if info.protocol_version == super::swarm::PROTOCOL_VERSION
+                            && poker_peers.insert(peer_id)
+                        {
+                            let _ = events
+                                .send(NodeEvent::PokerPeer { peer: peer_id, gone: false })
+                                .await;
+                        }
+
                         let relays = info.protocols.contains(&libp2p::relay::HOP_PROTOCOL_NAME);
                         seen_a_relay |= relays;
                         if relays && !have_reservation && !asked_hops.contains(&peer_id) {
@@ -1174,9 +1193,17 @@ pub async fn run(
                 // gives it a circuit, so announcing before then is a packet
                 // sent to be discarded, and the lobby it thinks it joined
                 // has never heard of it.
-                // Not while seated: the lobby is a screen this player is not
-                // looking at, and each read is a Kademlia walk.
-                if asked_public_dht && !table_closed {
+                // Read even while playing. The first version stopped, on the
+                // grounds that a seated player is not looking at the lobby —
+                // and that is only true of somebody playing one table. A player
+                // who wants a second and a third has to be able to see what is
+                // on offer while the first is running, and a lobby that goes
+                // blank the moment you sit down cannot do that.
+                //
+                // What stays off at a closed table is the part that serves other
+                // people: Kademlia's server mode, and advertising a table
+                // nobody can join.
+                if asked_public_dht {
                     let reachable_here = swarm.external_addresses().next().is_some();
                     if reachable_here && !in_public_lobby {
                         match swarm.behaviour_mut().ipfs_kad.start_providing(lobby_namespace())

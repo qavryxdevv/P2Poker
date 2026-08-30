@@ -136,13 +136,21 @@ impl AppState {
                 self.status.listening.push(addr.to_string());
                 self.note(format!("listening on {addr}"));
             }
-            NodeEvent::PeerConnected(p) => {
-                self.status.peers += 1;
-                self.note(format!("connected to {p}"));
-            }
-            NodeEvent::PeerDisconnected(p) => {
+            // Counted, not written down. This client shares a DHT with several
+            // hundred strangers and a line each was hundreds a minute in the
+            // client log, which buried every line a player might have wanted.
+            NodeEvent::PeerConnected(_) => self.status.peers += 1,
+            NodeEvent::PeerDisconnected(_) => {
                 self.status.peers = self.status.peers.saturating_sub(1);
-                self.note(format!("lost {p}"));
+            }
+            NodeEvent::PokerPeer { peer, gone } => {
+                if gone {
+                    self.status.lobby_peers = self.status.lobby_peers.saturating_sub(1);
+                    self.note(format!("a player left the network: {peer}"));
+                } else {
+                    self.status.lobby_peers += 1;
+                    self.note(format!("another poker client: {peer}"));
+                }
             }
             NodeEvent::Discovered { hints, dropped } => {
                 self.note(format!("{hints} peers found, {dropped} unusable"));
@@ -538,7 +546,13 @@ mod tests {
     fn the_log_is_bounded() {
         let mut s = AppState::new();
         for _ in 0..(MAX_LOG_LINES * 3) {
-            s.apply(NodeEvent::PeerConnected(peer()));
+            // A **poker** peer, because an ordinary DHT connection deliberately
+            // writes no line at all any more: there are several hundred of them
+            // and a line each buried everything else.
+            s.apply(NodeEvent::PokerPeer {
+                peer: peer(),
+                gone: false,
+            });
         }
         assert_eq!(s.log.len(), MAX_LOG_LINES);
     }
