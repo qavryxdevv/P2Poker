@@ -3,8 +3,8 @@
 Updated 2026-08-30.
 
     cargo clippy --all-targets --release        0 warnings
-    cargo test --release -- --test-threads=19   638 unit + 54 harness, 0 failed
-    tools/check-portable.ps1                    8/8, 27.5 MB
+    cargo test --release -- --test-threads=19   641 unit + 54 harness, 0 failed
+    tools/check-portable.ps1                    8/8, 28 MB
 
     RUST_LOG=libp2p_kad=debug,libp2p_relay=debug ./target/release/p2p-poker --headless
 
