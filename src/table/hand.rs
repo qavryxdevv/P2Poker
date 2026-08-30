@@ -49,7 +49,8 @@ use crate::poker::engine::{
     betting_is_closed, first_to_act, initial_positions, next_to_act, only_one_live, post_blinds,
     round_complete, Positions,
 };
-use crate::poker::evaluator::evaluate_holdem;
+use crate::poker::evaluator::{evaluate_holdem, HandRank};
+use crate::poker::pots::{award, build_pots};
 use crate::poker::state::{Card, Chips, Street};
 use crate::protocol::serialization::h;
 use crate::protocol::signatures::Domain;
@@ -59,8 +60,8 @@ use crate::mental_poker::reveal::RevealStage;
 
 use super::dealing::{self, Dealing, Identity, Refused, Share};
 use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, BoardReveal,
-    DealPrivate, DeckCommit, DeckInit, HandInit, NotOurs, RevealEntry, ShowdownMuck,
-    ShowdownReveal, ShuffleProof, ShuffleStep};
+    DealPrivate, DeckCommit, DeckInit, HandComplete, HandInit, NotOurs, PotAward, Refund,
+    RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep};
 use super::stage::{Collective, Heard};
 
 /// What a step wants sent.
@@ -301,6 +302,10 @@ pub const SHOWDOWN_REVEAL_CAP: usize = 512;
 /// The cap on a `SHOWDOWN_MUCK` body: one boolean.
 pub const SHOWDOWN_MUCK_CAP: usize = 64;
 
+/// The cap on a `HAND_COMPLETE` body: at most `MAX_SEATS` pots, each with three
+/// seat lists, plus four vectors of that length.
+pub const HAND_COMPLETE_CAP: usize = 4_096;
+
 /// How far this hand has got.
 ///
 /// One variant per stage, each carrying only what that stage needs, so a stage
@@ -483,7 +488,16 @@ enum Step {
     /// cannot see a card it was not going to see, or claim a pot it did not win.
     Showdown { stage: Collective, order: Vec<SeatIdx> },
 
-    /// The betting is over and the pots are waiting to be settled.
+    /// Stage after the showdown: `HAND_COMPLETE`, collective and **derived**.
+    ///
+    /// There is no writer. Every seat computes the byte-identical body from its
+    /// own engine and signs its own copy, and a receiver recomputes all of it —
+    /// the pot layering, the eligible sets, the winners, the clockwise odd-chip
+    /// distribution — rather than believing any of it.
+    Settling { stage: Collective, mine: Box<HandComplete> },
+
+    /// The hand is over and settled. Kept rather than dropped, because D-020's
+    /// five-second hold is what draws the board and the hands that were shown.
     Ended,
 }
 
@@ -534,6 +548,14 @@ struct StepHeard {
 /// One hand in progress.
 pub struct Hand {
     open: Opening,
+    /// `P(k)` as a vector: the seats this client has accepted at least one
+    /// chained event from this hand.
+    ///
+    /// It is in the end-of-hand state hash, and `PROTOCOL.md` D-013 makes it
+    /// what decides who is dealt in next hand — a seat that signed nothing is
+    /// outside every required set from the following hand, which is how one
+    /// silent seat costs exactly one hand rather than the table.
+    signed: Vec<bool>,
     /// The body this client derived. Everybody else's is compared against it.
     mine: HandInit,
     /// The slot of the stage now open.
@@ -631,8 +653,13 @@ impl Hand {
             .event_hash;
         stage.hear(o.my_seat, own_hash);
 
+        let mut signed = vec![false; usize::from(o.max_players)];
+        if let Some(slot) = signed.get_mut(usize::from(o.my_seat)) {
+            *slot = true;
+        }
         Ok((
             Hand {
+                signed,
                 open: o,
                 mine,
                 slot,
@@ -677,6 +704,7 @@ impl Hand {
                 | EventType::ActionFold
                 | EventType::ShowdownReveal
                 | EventType::ShowdownMuck
+                | EventType::HandComplete
         ) {
             return Err(Failed::Wire(WireError::WrongType));
         }
@@ -712,9 +740,17 @@ impl Hand {
                 Step::Acting { .. } => self.on_action(bytes, kind, key, now_ms),
                 Step::Opening { .. } => self.on_board_reveal(bytes, key, now_ms),
                 Step::Showdown { .. } => self.on_showdown(bytes, kind, key, now_ms),
+                Step::Settling { .. } => self.on_hand_complete(bytes),
                 Step::Ended => Err(Failed::NothingFurther),
             },
             Phase::Between => Err(Failed::NothingFurther),
+        }
+    }
+
+    /// Note that a seat has signed something this hand.
+    fn note_signed(&mut self, seat: SeatIdx) {
+        if let Some(slot) = self.signed.get_mut(usize::from(seat)) {
+            *slot = true;
         }
     }
 
@@ -752,6 +788,7 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::HandInit)?;
         let seat = self.seat_of(&opened.sender)?;
+        self.note_signed(seat);
 
         let theirs: HandInit = chained::payload(&opened, HAND_INIT_CAP).map_err(Failed::Wire)?;
         theirs
@@ -847,6 +884,7 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::DeckInit)?;
         let seat = self.seat_of(&opened.sender)?;
+        self.note_signed(seat);
         let body: DeckInit = chained::payload(&opened, DECK_INIT_CAP).map_err(Failed::Wire)?;
 
         // An exact repeat is weather, and it must be answered before the key
@@ -1062,6 +1100,7 @@ impl Hand {
     fn on_shuffle_step(&mut self, bytes: &[u8]) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::ShuffleStep)?;
         let seat = self.seat_of(&opened.sender)?;
+        self.note_signed(seat);
         let body: ShuffleStep =
             chained::payload(&opened, SHUFFLE_STEP_CAP).map_err(Failed::Wire)?;
 
@@ -1110,6 +1149,7 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::ShuffleProof)?;
         let seat = self.seat_of(&opened.sender)?;
+        self.note_signed(seat);
         let body: ShuffleProof =
             chained::payload(&opened, SHUFFLE_PROOF_CAP).map_err(Failed::Wire)?;
 
@@ -1244,6 +1284,7 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::DeckCommit)?;
         let seat = self.seat_of(&opened.sender)?;
+        self.note_signed(seat);
         let theirs: DeckCommit =
             chained::payload(&opened, DECK_COMMIT_CAP).map_err(Failed::Wire)?;
 
@@ -1345,6 +1386,7 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::DealPrivate)?;
         let seat = self.seat_of(&opened.sender)?;
+        self.note_signed(seat);
         let body: DealPrivate =
             chained::payload(&opened, DEAL_PRIVATE_CAP).map_err(Failed::Wire)?;
         if !body.canonical() {
@@ -1652,6 +1694,7 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, kind)?;
         let seat = self.seat_of(&opened.sender)?;
+        self.note_signed(seat);
 
         let (head, action) = match kind {
             EventType::ActionBet | EventType::ActionRaise => {
@@ -1802,15 +1845,19 @@ impl Hand {
             // street it is, and there is no showdown: nobody has to show a hand
             // that nothing was called against, and nobody could open it anyway.
             if only_one_live(&play.round, &play.dealt) {
-                play.step = Step::Ended;
-                return Ok(Vec::new());
+                After::Settle
+            } else {
+                match play.street.next() {
+                    Some(street) => After::Board(street),
+                    // The river's betting closed.
+                    None => After::Showdown,
+                }
             }
-            play.street.next()
         };
         match next {
-            Some(street) => self.open_board(street, key, now_ms),
-            // The river's betting closed. The showdown is the next stage.
-            None => self.begin_showdown(key, now_ms),
+            After::Board(street) => self.open_board(street, key, now_ms),
+            After::Showdown => self.begin_showdown(key, now_ms),
+            After::Settle => self.begin_settlement(key, now_ms),
         }
     }
 
@@ -1896,6 +1943,7 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::BoardReveal)?;
         let seat = self.seat_of(&opened.sender)?;
+        self.note_signed(seat);
         let body: BoardReveal =
             chained::payload(&opened, BOARD_REVEAL_CAP).map_err(Failed::Wire)?;
         let ctx = self.deck_ctx(&opened.sender);
@@ -2018,12 +2066,9 @@ impl Hand {
                 })
                 .collect();
             if live.len() < 2 {
-                // One seat left. Nothing to compare and nothing to show.
-                let Phase::Playing { play, .. } = &mut self.phase else {
-                    return Err(Failed::NothingFurther);
-                };
-                play.step = Step::Ended;
-                return Ok(Vec::new());
+                // One seat left. Nothing to compare and nothing to show, so the
+                // hand goes straight to its settlement.
+                return self.begin_settlement(key, now_ms);
             }
             // The aggressor, if there was one and it is still in the hand;
             // otherwise the seat that would have opened the river's betting.
@@ -2224,7 +2269,7 @@ impl Hand {
         let hash = self.opened(&bytes, EventType::ShowdownReveal)?.event_hash;
         self.record_showdown(me, hash, true)?;
         let mut out = vec![Send::Broadcast(bytes)];
-        out.append(&mut self.close_showdown_if_done()?);
+        out.append(&mut self.close_showdown_if_done(key, now_ms)?);
         Ok(out)
     }
 
@@ -2247,7 +2292,7 @@ impl Hand {
         let hash = self.opened(&bytes, EventType::ShowdownMuck)?.event_hash;
         self.record_showdown(me, hash, false)?;
         let mut out = vec![Send::Broadcast(bytes)];
-        out.append(&mut self.close_showdown_if_done()?);
+        out.append(&mut self.close_showdown_if_done(key, now_ms)?);
         Ok(out)
     }
 
@@ -2286,6 +2331,7 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, kind)?;
         let seat = self.seat_of(&opened.sender)?;
+        self.note_signed(seat);
         let ctx = self.deck_ctx(&opened.sender);
         let me = self.open.my_seat;
 
@@ -2410,12 +2456,16 @@ impl Hand {
 
         // Somebody speaking may be what makes it this client's turn.
         let mut out = self.speak_at_showdown(key, now_ms)?;
-        out.append(&mut self.close_showdown_if_done()?);
+        out.append(&mut self.close_showdown_if_done(key, now_ms)?);
         Ok(out)
     }
 
     /// If every live seat has spoken, the showdown is over.
-    fn close_showdown_if_done(&mut self) -> Result<Vec<Send>, Failed> {
+    fn close_showdown_if_done(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
         let parent = {
             let Phase::Playing { play, .. } = &self.phase else {
                 return Ok(Vec::new());
@@ -2429,9 +2479,280 @@ impl Hand {
             stage.hash().ok_or(Failed::NotInThisStage)?
         };
         self.slot = self.slot.then(parent);
+        self.begin_settlement(key, now_ms)
+    }
+
+    /// The hand is decided: compute the settlement and publish this peer's copy.
+    ///
+    /// `STATE_MACHINE.md` splits this in two on purpose and so does this: the
+    /// settlement is **computed and published** here, and **applied** only when
+    /// the collective stage completes. A driver that awarded the pots on its own
+    /// derivation would leave the chain with no terminal stage if a seat went
+    /// quiet between the last reveal and this one.
+    fn begin_settlement(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let mine = Box::new(self.settlement()?);
+        let bytes = self.say(
+            EventType::HandComplete,
+            mine.as_ref(),
+            HAND_COMPLETE_CAP,
+            key,
+            now_ms,
+        )?;
+        let hash = self.opened(&bytes, EventType::HandComplete)?.event_hash;
+        // The required set is the set that emitted `HAND_INIT`, and it is
+        // deliberately **not** narrowed within the hand: a seat that signed
+        // stage 0 and then went quiet blocks this stage, and exactly one hand
+        // pays for that — the one it went quiet in.
+        let mut stage = Collective::closed(
+            self.slot.sequence,
+            EventType::HandComplete.code(),
+            &self.open.required,
+        )
+        .ok_or(Failed::NotInThisStage)?;
+        stage.hear(self.open.my_seat, hash);
+
         let Phase::Playing { play, .. } = &mut self.phase else {
             return Err(Failed::NothingFurther);
         };
+        play.step = Step::Settling { stage, mine };
+        let mut out = vec![Send::Broadcast(bytes)];
+        out.append(&mut self.close_settlement_if_done()?);
+        Ok(out)
+    }
+
+    /// Everything `HAND_COMPLETE` says, derived from this peer's own engine.
+    fn settlement(&self) -> Result<HandComplete, Failed> {
+        let button = self.mine.button_position;
+        let seat_count = self.open.max_players;
+        let n = usize::from(seat_count);
+        let Phase::Playing { table, play, .. } = &self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+
+        // The per-hand commitments, which is what a pot is layered from. The
+        // round is closed, so `paid` is the whole of it.
+        let (pots, refunds) = build_pots(&play.paid, &play.round.folded);
+
+        // Only the hands that were **shown** are ranked. A seat that folded or
+        // mucked has no live hand here, and `award` treats `None` as exactly
+        // that — which is how the forfeiture is enforced without a rule for it.
+        let board = five_card_board(&play.dealing.board());
+        let mut rank: Vec<Option<HandRank>> = vec![None; n];
+        for (seat, hole) in play.shown.iter().enumerate() {
+            if let (Some(hole), Some(board)) = (hole, board) {
+                rank[seat] = Some(evaluate_holdem(*hole, &board));
+            }
+        }
+
+        let mut won = vec![0 as Chips; n];
+        let mut awards = Vec::with_capacity(pots.len());
+        for pot in &pots {
+            let payout = award(pot, &rank, button, seat_count);
+            let mut winners: Vec<u8> = payout.iter().map(|(s, _)| *s).collect();
+            winners.sort_unstable();
+            // The seats that took a chip more than the even share, which is the
+            // remainder handed out clockwise from the button. Named on the wire
+            // because two peers that split a remainder differently disagree
+            // about a stack for ever.
+            let share = pot.size / payout.len().max(1) as Chips;
+            let mut odd: Vec<u8> = payout
+                .iter()
+                .filter(|(_, c)| *c > share)
+                .map(|(s, _)| *s)
+                .collect();
+            odd.sort_unstable();
+            for (seat, chips) in payout {
+                won[usize::from(seat)] += chips;
+            }
+            let mut eligible = pot.eligible.clone();
+            eligible.sort_unstable();
+            awards.push(PotAward {
+                size: pot.size,
+                eligible,
+                winners,
+                odd_chips: odd,
+            });
+        }
+
+        let mut back = vec![0 as Chips; n];
+        for r in &refunds {
+            back[usize::from(r.seat)] += r.amount;
+        }
+
+        // What everybody started the hand with is `HAND_INIT`'s own `stacks`,
+        // which every seat compared byte for byte at stage 0. Using the local
+        // roster instead would make the deltas depend on a value nobody agreed.
+        let mut final_stacks = Vec::with_capacity(n);
+        let mut deltas = Vec::with_capacity(n);
+        let mut busted = Vec::new();
+        for seat in 0..n {
+            let start = self.mine.stacks.get(seat).copied().unwrap_or(0);
+            let end = play.round.stack.get(seat).copied().unwrap_or(0) + won[seat] + back[seat];
+            if end == 0 && start > 0 {
+                busted.push(seat as u8);
+            }
+            final_stacks.push(end);
+            deltas.push(i64::try_from(end).unwrap_or(i64::MAX)
+                - i64::try_from(start).unwrap_or(i64::MAX));
+        }
+
+        let state_hash = self.state_hash(table, play, &pots, &final_stacks)?;
+        Ok(HandComplete {
+            pots: awards,
+            refunds: refunds
+                .iter()
+                .map(|r| Refund {
+                    seat: r.seat,
+                    amount: r.amount,
+                })
+                .collect(),
+            deltas,
+            final_stacks,
+            busted,
+            state_hash,
+        })
+    }
+
+    /// The end-of-hand state hash, `PROTOCOL.md` §6.1's checkpoint 8.
+    ///
+    /// Three fields are the table's defaults rather than tracked quantities,
+    /// and each is **correct** for what this client can form today rather than
+    /// a placeholder: `ledger_out` is zero because no seat has left (there is no
+    /// message that removes one yet), `sitting_out` is all false for the same
+    /// reason, and `ante` comes from `HAND_INIT`, which is agreed. When a seat
+    /// can leave, all three become real and this function is where they land.
+    fn state_hash(
+        &self,
+        table: &Table,
+        play: &Play,
+        pots: &[crate::poker::pots::Pot],
+        final_stacks: &[Chips],
+    ) -> Result<Hash, Failed> {
+        use crate::protocol::state_view::{PotView, PublicTableState, RosterEntry};
+
+        let n = usize::from(self.open.max_players);
+        let roster: Vec<RosterEntry> = self
+            .open
+            .seats
+            .iter()
+            .map(|(seat, k, _)| RosterEntry {
+                seat: *seat,
+                app_public_key: *k,
+                stack: final_stacks.get(usize::from(*seat)).copied().unwrap_or(0),
+            })
+            .collect();
+
+        let view = PublicTableState {
+            protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
+            table_id: self.open.table_id,
+            hand_id: self.open.hand_id,
+            checkpoint: 8,
+            roster,
+            button_position: self.mine.button_position,
+            sb_position: self.mine.sb_position,
+            bb_seat: self.mine.bb_seat,
+            level: u32::from(self.mine.level),
+            small_blind: self.mine.small_blind,
+            big_blind: self.mine.big_blind,
+            ante: self.mine.ante,
+            street: street_code(play.street),
+            board: play.dealing.board().iter().map(|c| c.index()).collect(),
+            committed_this_round: play.round.committed.clone(),
+            committed_this_hand: play.paid.clone(),
+            folded: play.round.folded.clone(),
+            all_in: play.round.stack.iter().map(|c| *c == 0).collect(),
+            acted_this_round: play.round.acted.clone(),
+            sitting_out: vec![false; n],
+            current_bet: play.round.current_bet,
+            last_full_raise: play.round.last_full_raise,
+            player_to_act: None,
+            pots: pots
+                .iter()
+                .map(|p| {
+                    let mut eligible = p.eligible.clone();
+                    eligible.sort_unstable();
+                    PotView {
+                        size: p.size,
+                        eligible,
+                    }
+                })
+                .collect(),
+            deck_commitment: deck_hash(table.deck.as_ref().as_ref().as_ref()),
+            ledger_in: self.mine.stacks.iter().sum(),
+            ledger_out: 0,
+            transcript_head: self.slot.previous_event_hash,
+            signed_this_hand: self.signed.clone(),
+        };
+        view.state_hash()
+            .map_err(|_| Failed::Wire(WireError::Unencodable("the end-of-hand state")))
+    }
+
+    /// One seat's copy of the settlement.
+    fn on_hand_complete(&mut self, bytes: &[u8]) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, EventType::HandComplete)?;
+        let seat = self.seat_of(&opened.sender)?;
+        self.note_signed(seat);
+        let theirs: HandComplete =
+            chained::payload(&opened, HAND_COMPLETE_CAP).map_err(Failed::Wire)?;
+
+        let Phase::Playing { play, .. } = &mut self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+        let Step::Settling { stage, mine } = &mut play.step else {
+            return Err(Failed::Elsewhere {
+                seat,
+                what: "the settlement were open",
+            });
+        };
+        if stage.heard(seat) == Some(opened.event_hash) {
+            return Ok(Vec::new());
+        }
+        // Every field recomputed, and compared as a whole. There is no writer
+        // here: a body that differs anywhere means two engines disagree about
+        // the hand, which is a divergence and not a preference.
+        if theirs != **mine {
+            return Err(Failed::DeckDisagrees {
+                seat,
+                what: "settlement",
+            });
+        }
+        match stage.hear(seat, opened.event_hash) {
+            Heard::Counted | Heard::Bystander | Heard::Again => {}
+            Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
+            Heard::Uninvited => return Err(Failed::NotInThisStage),
+        }
+        self.close_settlement_if_done()
+    }
+
+    /// If everybody has published the same settlement, apply it.
+    fn close_settlement_if_done(&mut self) -> Result<Vec<Send>, Failed> {
+        let parent = {
+            let Phase::Playing { play, .. } = &self.phase else {
+                return Ok(Vec::new());
+            };
+            let Step::Settling { stage, .. } = &play.step else {
+                return Ok(Vec::new());
+            };
+            if !stage.complete() {
+                return Ok(Vec::new());
+            }
+            stage.hash().ok_or(Failed::NotInThisStage)?
+        };
+        self.slot = self.slot.then(parent);
+
+        let Phase::Playing { play, .. } = &mut self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+        let Step::Settling { mine, .. } = &play.step else {
+            return Err(Failed::NothingFurther);
+        };
+        // Applied now, and not when it was computed. The stacks in `round` are
+        // what every later question reads.
+        for (seat, end) in mine.final_stacks.iter().enumerate() {
+            if let Some(slot) = play.round.stack.get_mut(seat) {
+                *slot = *end;
+            }
+        }
         play.step = Step::Ended;
         Ok(Vec::new())
     }
@@ -2964,6 +3285,17 @@ fn five_card_board(board: &[Card]) -> Option<[Card; 5]> {
     <[Card; 5]>::try_from(board).ok()
 }
 
+/// What follows a closed betting round.
+///
+/// Three roads and no fourth: the board opens, the showdown opens, or the hand
+/// is over and is settled. Named rather than left as nested `Option`s, because
+/// the three are not degrees of one thing.
+enum After {
+    Board(Street),
+    Showdown,
+    Settle,
+}
+
 /// Which of the two action bodies is being sealed.
 ///
 /// `say` is generic over the body, so the two cannot be one variable without a
@@ -3459,6 +3791,35 @@ mod tests {
                     "seat {seat} mucked a hand that was not beaten"
                 );
             }
+        }
+
+        // And the chips moved, identically on both peers.
+        let stacks = a.stacks();
+        assert_eq!(stacks, b.stacks(), "one settlement, not two");
+        assert_eq!(
+            stacks.iter().sum::<u64>(),
+            2 * 10_000,
+            "a hand may not create or destroy a chip"
+        );
+
+        // The pot went to the best hand shown. A seat that mucked forfeits
+        // whatever it held, which is the point of forfeiting.
+        let best = (0..2u8)
+            .filter_map(|seat| a.shown(seat).map(|h| (seat, evaluate_holdem(h, &board))))
+            .max_by_key(|(_, r)| *r)
+            .expect("something was shown");
+        let split = (0..2u8)
+            .filter_map(|seat| a.shown(seat).map(|h| (seat, evaluate_holdem(h, &board))))
+            .filter(|(_, r)| *r == best.1)
+            .count();
+        if split == 1 {
+            assert_eq!(
+                stacks[usize::from(best.0)],
+                10_000 + 100,
+                "the best hand shown took the other seat's blind"
+            );
+        } else {
+            assert_eq!(stacks, vec![10_000, 10_000], "a tie splits it back");
         }
     }
 
