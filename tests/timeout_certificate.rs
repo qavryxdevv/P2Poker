@@ -519,3 +519,76 @@ fn an_abort_naming_a_player_is_refused_without_a_certificate_this_client_verifie
         );
     }
 }
+
+
+/// **A hand is decided or aborted, never both** (`PROTOCOL.md` section 4.10).
+///
+/// A receiver holding a complete `HAND_COMPLETE` stage must discard every
+/// `HAND_ABORT` for that hand. Without the guard the abort was *applied*:
+/// `HandAbort::consistent` compares `final_stacks` against the hand's
+/// **start**-of-hand stacks, which do not move at settlement, so a late abort
+/// passed every check and reverted a hand that had already paid out — on that
+/// one receiver, forking it from the table for every hand after.
+#[test]
+fn a_settled_hand_discards_a_late_abort() {
+    use p2p_poker::net::chained;
+    use p2p_poker::poker::actions::Action;
+    use p2p_poker::protocol::messages::EventType;
+    use p2p_poker::table::hand::HAND_ABORT_CAP;
+    use p2p_poker::table::handwire::HandAbort;
+
+    let (mut t, opening) = Live::open(0);
+    t.settle(opening);
+
+    // Everybody folds to one player, which settles the hand.
+    for _ in 0..12 {
+        let owed = t.hands[0].waiting_for();
+        let Some(&seat) = owed.first() else { break };
+        let s = usize::from(seat);
+        let Ok(out) = t.hands[s].act(Action::Fold, &t.keys[s], NOW) else {
+            break;
+        };
+        t.settle(out.into_iter().map(|Send::Broadcast(b)| b).collect());
+        if t.hands[0].betting_over() {
+            break;
+        }
+    }
+    assert!(
+        t.hands[0].betting_over(),
+        "the hand did not settle, so this test proves nothing"
+    );
+    let settled: Vec<Vec<u64>> = (0..3).map(|s| t.hands[s].stacks()).collect();
+
+    // A late abort, correct in every field, from a seat that is at the table.
+    // `on_deadline` is cause 1 with nobody named — the hand-deadline abort,
+    // the one shape a receiver accepts on its own expired clock.
+    //
+    // **The hand's START stacks, not the settled ones.** `HandAbort::consistent`
+    // compares `final_stacks` against `self.mine.stacks`, which is where the
+    // hand began and does not move at settlement, so those are the numbers an
+    // abort has to carry to be accepted at all — and carrying them is exactly
+    // what reverts the payout. Built with the settled stacks the first time,
+    // this test passed with the guard removed and proved nothing.
+    let body = HandAbort::on_deadline(vec![10_000; 3]);
+    let bytes = chained::seal(
+        EventType::HandAbort,
+        &t.hands[1].slot(),
+        &body,
+        &t.keys[1],
+        NOW + 600_000,
+        7_000 + 30_000,
+        HAND_ABORT_CAP,
+    )
+    .expect("the abort seals");
+
+    let _ = t.hands[0].on_event(&bytes, &t.keys[0], NOW + 600_000);
+    assert!(
+        t.hands[0].aborted().is_none(),
+        "a settled hand was reopened by an abort that arrived after it"
+    );
+    assert_eq!(
+        t.hands[0].stacks(),
+        settled[0],
+        "the settlement was reverted to the hand's starting stacks"
+    );
+}

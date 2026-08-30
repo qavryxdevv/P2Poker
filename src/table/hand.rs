@@ -3131,6 +3131,30 @@ impl Hand {
     fn on_hand_abort(&mut self, bytes: &[u8], now_ms: u64) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::HandAbort)?;
         let seat = self.seat_of(&opened.sender)?;
+
+        // **A hand is decided or aborted, never both** (§4.10). A receiver
+        // holding a complete `HAND_COMPLETE` stage discards every abort for
+        // that hand, and `Step::Ended` is exactly that: the settlement stage
+        // completed, which means every seat of `P(k-1)` published the same
+        // one. `HAND_COMPLETE` wins because it is collective — a completing
+        // one proves no seat was silent, which is the premise every abort
+        // rests on.
+        //
+        // Discarded rather than refused: the race is legitimate and narrow, it
+        // needs a peer's own deadline to expire between its `HAND_COMPLETE`
+        // and the arrival of the last other copy, and the sender did nothing
+        // wrong. Without this the abort was **applied**: `consistent` compares
+        // `final_stacks` against `self.mine.stacks`, which is the hand's
+        // START-of-hand stacks and does not move at settlement, so a late
+        // abort passed every check and reverted a hand that had already paid
+        // out — on that receiver alone, forking it from the table.
+        if matches!(
+            &self.phase,
+            Phase::Playing { play, .. } if matches!(play.step, Step::Ended)
+        ) {
+            return Ok(Vec::new());
+        }
+
         let body: HandAbort =
             chained::payload(&opened, HAND_ABORT_CAP).map_err(Failed::Wire)?;
         body.consistent(&self.mine.stacks)
