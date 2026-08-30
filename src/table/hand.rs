@@ -192,6 +192,13 @@ pub struct Opening {
     /// How long a peer has to answer a cryptographic step, from the table's own
     /// parameters. Carried on the envelope of every stage this hand emits.
     pub crypto_step_timeout_ms: u32,
+    /// How long a seat has to act before its own client acts for it.
+    ///
+    /// From the table's advertisement, so every seat has the same number. It is
+    /// **not** enforced by anybody else: version 1 has no `TIMEOUT_VOTE` and no
+    /// `TIMEOUT_CERT` (D-015), so a seat that goes quiet in a betting stage is
+    /// answered by its own client folding for it, and by nothing else.
+    pub action_timeout_ms: u32,
     /// Where the button sits, when a previous hand decided it.
     ///
     /// `None` only for the **first** hand of a table, where nothing has decided
@@ -231,6 +238,7 @@ impl Opening {
             level: 1,
             my_seat: f.my_seat()?,
             crypto_step_timeout_ms: ad.crypto_step_timeout_ms,
+            action_timeout_ms: ad.action_timeout_ms,
             // The first hand of a table: nothing has decided the button yet.
             button: None,
         })
@@ -3128,8 +3136,21 @@ impl Hand {
             level: self.open.level,
             my_seat: self.open.my_seat,
             crypto_step_timeout_ms: self.open.crypto_step_timeout_ms,
+            action_timeout_ms: self.open.action_timeout_ms,
             button: Some(positions.button),
         })
+    }
+
+    /// How long this client may take on its own turn.
+    ///
+    /// The table's own number, so every seat waits the same. Clamped below at
+    /// five seconds, because a table advertising a one-second clock would fold
+    /// every seat that blinked, and above at five minutes, because the point of
+    /// a clock is that a table cannot be held for ever.
+    pub fn action_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            u64::from(self.open.action_timeout_ms).clamp(5_000, 300_000),
+        )
     }
 
     /// Whether the betting is over and the hand is waiting to be settled.
@@ -3479,6 +3500,7 @@ mod tests {
             level: 1,
             my_seat,
             crypto_step_timeout_ms: 30_000,
+            action_timeout_ms: 20_000,
             button: None,
         }
     }
@@ -3510,6 +3532,7 @@ mod tests {
             level: 1,
             my_seat,
             crypto_step_timeout_ms: 30_000,
+            action_timeout_ms: 20_000,
             button: None,
         }
     }

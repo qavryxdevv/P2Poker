@@ -331,6 +331,14 @@ pub async fn run(
     // When the next hand may start. D-020's hold, and the only timer in this
     // loop that is about a person rather than about the network.
     let mut next_hand_at: Option<tokio::time::Instant> = None;
+    // When this client stops waiting for its own player and acts for them.
+    //
+    // Version 1's whole answer to a stalled betting stage (D-015): there is no
+    // `TIMEOUT_VOTE` and no `TIMEOUT_CERT`, so a seat that goes quiet is
+    // answered by **its own client** folding for it and by nothing else. A
+    // seat that goes quiet in a *cryptographic* stage has no answer here at
+    // all, and that is `hand_deadline_ms`, which is not built.
+    let mut act_by: Option<tokio::time::Instant> = None;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
 
     // Who mDNS has already told us about.
@@ -671,6 +679,7 @@ pub async fn run(
                         cards_reported = false;
                         turn_reported = None;
                         next_hand_at = None;
+                        act_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -698,6 +707,7 @@ pub async fn run(
                         cards_reported = false;
                         turn_reported = None;
                         next_hand_at = None;
+                        act_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -813,6 +823,10 @@ pub async fn run(
                                         tokio::time::Instant::now() + end.pause(),
                                     );
                                 }
+                                        act_by = h
+                                            .turn()
+                                            .filter(|t| t.mine)
+                                            .map(|_| tokio::time::Instant::now() + h.action_timeout());
                                         if let Some(cards) = h.cards().filter(|_| !cards_reported) {
                                             cards_reported = true;
                                             let _ = events
@@ -1751,6 +1765,7 @@ pub async fn run(
                         cards_reported = false;
                         turn_reported = None;
                         next_hand_at = None;
+                        act_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -1798,6 +1813,14 @@ pub async fn run(
                                         tokio::time::Instant::now() + end.pause(),
                                     );
                                 }
+                                // Armed when it is this client's turn again -
+                                // which heads-up is immediately, on the next
+                                // street - and disarmed otherwise, so a clock
+                                // never runs against a seat that is not up.
+                                act_by = h
+                                    .turn()
+                                    .filter(|t| t.mine)
+                                    .map(|_| tokio::time::Instant::now() + h.action_timeout());
                             }
                             // The player's own engine refused it, which means
                             // the window offered something it should not have.
@@ -1824,10 +1847,58 @@ pub async fn run(
                         cards_reported = false;
                         turn_reported = None;
                         next_hand_at = None;
+                        act_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
                         }).await;
+                    }
+                }
+            }
+
+            // This client's own clock ran out on its own turn.
+            () = async {
+                match act_by {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            }, if act_by.is_some() => {
+                act_by = None;
+                let Some(h) = hand.as_mut() else { continue };
+                let Some(turn) = h.turn().filter(|t| t.mine) else { continue };
+                // Check when it is free, fold when it is not. Never call and
+                // never raise: a client that put its owner's chips in while
+                // they were away would be playing for them, and this is only
+                // keeping the table moving.
+                let action = if turn.legal.can_check {
+                    crate::poker::actions::Action::Check
+                } else {
+                    crate::poker::actions::Action::Fold
+                };
+                let now = super::node::now_unix_ms();
+                match h.act(action, &app_key, now) {
+                    Ok(sends) => {
+                        if let Some(t) = &table_topic {
+                            for crate::table::hand::Send::Broadcast(out) in sends {
+                                let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), out);
+                            }
+                        }
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "your clock ran out — {action:?} for you"
+                            )))
+                            .await;
+                        if let Some(end) = report_hand(h, &events, &mut turn_reported).await {
+                            next_hand_at = Some(tokio::time::Instant::now() + end.pause());
+                        }
+                        if h.turn().is_some_and(|t| t.mine) {
+                            act_by = Some(tokio::time::Instant::now() + h.action_timeout());
+                        }
+                    }
+                    Err(e) => {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!("the clock's own action: {e}")))
+                            .await;
                     }
                 }
             }
