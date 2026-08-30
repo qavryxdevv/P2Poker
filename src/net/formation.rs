@@ -417,6 +417,63 @@ impl Formation {
         self.session
     }
 
+    /// `TERMINAL(0)`: the hash of the `TABLE_READY` stage.
+    ///
+    /// Formation is itself a collective stage — a fixed set of seats each
+    /// emitting once — so it has a stage hash like any other, and that hash is
+    /// what the first hand's genesis hangs off. `PROTOCOL.md` says it in one
+    /// line: *"`TERMINAL(0)` is a `stage_hash` and carries no fields at all."*
+    ///
+    /// `None` until every seat has ratified, for the same reason `session` is:
+    /// a stage that has not completed has no hash, and a partial one computed
+    /// from whoever happened to answer first would differ between peers.
+    pub fn terminal_zero(&self) -> Option<Hash> {
+        self.session?;
+        // Ascending, which `stage_hash_collective` requires and a `BTreeMap`
+        // gives for free — the same order `session_id` above depends on, and
+        // for the same reason.
+        let emitters: Vec<crate::protocol::transcript::StageEmitter> = self
+            .ratified
+            .iter()
+            .map(
+                |(&seat, &event_hash)| crate::protocol::transcript::StageEmitter {
+                    seat,
+                    event_hash,
+                },
+            )
+            .collect();
+        Some(crate::protocol::transcript::stage_hash_collective(
+            0,
+            crate::protocol::messages::EventType::TableReady.code(),
+            &emitters,
+        ))
+    }
+
+    /// `GENESIS(1)`: the parent of the first hand's first stage.
+    ///
+    /// `roster_hash(1) == roster_hash(0)` because a buy-in enters the ledger at
+    /// the first `HAND_INIT` and nowhere earlier, which is what makes an
+    /// abandoned formation move no chips (`PROTOCOL.md` §4.3).
+    pub fn genesis_one(&self) -> Option<Hash> {
+        Some(crate::protocol::transcript::genesis_hand(
+            &self.under.table_id,
+            1,
+            &self.session?,
+            &self.roster.hash_at_zero(),
+            &self.terminal_zero()?,
+        ))
+    }
+
+    /// The seats that ratified, ascending: the required emitter set `R` for the
+    /// first hand.
+    ///
+    /// §3.2, the disposition of J2: *"`R` is derived from demonstrated
+    /// participation in the agreed chain, never from a seat's status … for the
+    /// first hand, the required set is the signers of `TABLE_READY`."*
+    pub fn ratifiers(&self) -> Vec<u8> {
+        self.ratified.keys().copied().collect()
+    }
+
     /// The founder's answer to a join request.
     ///
     /// `connection_peer_id` is what the **transport** authenticated, not what

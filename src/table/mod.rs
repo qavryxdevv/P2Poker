@@ -5,6 +5,9 @@
 //! defect between two well-tested halves has nowhere else to live.
 
 pub mod dealing;
+pub mod hand;
+pub mod handwire;
+pub mod stage;
 pub mod transport;
 pub mod formation;
 pub mod join;
