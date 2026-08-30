@@ -349,6 +349,36 @@ This is where three milestones of duplicate handling paid off. A re-send *is* a
 duplicate, and duplicates have been weather rather than faults since the
 exact-repeat check went in.
 
+### Measured: a client is killed mid-hand and the table plays on
+
+Three headless processes, seat 2's client killed with `Stop-Process` while a
+hand was running. Both survivors' logs:
+
+```
+my clock has run out on seat 2
+the table acted for seat 2: Fold
+hand #1 is over
+...
+hand #7 opens at genesis c7217231 with seats [0, 1]
+hand #7 has begun
+```
+
+So the whole path ran over GossipSub: both survivors' own timers expired, both
+voted, the votes assembled into a certificate, and **the table folded a seat
+whose client no longer exists**. Six hands completed in total, and from the next
+hand `GENESIS` is derived with `seats [0, 1]` — the dead seat is outside `P(k)`,
+takes no cards, and its stack sits there for the blinds. That is D-013 and D-022
+doing exactly what a tournament does with a dead seat.
+
+**And the run showed a defect in the same breath.** The second stall ended with
+*"the hand ran out of time; every stack is restored"* rather than a certificate:
+the stage deadline and the vote fall due at the same moment and the stall tick
+does both, so the local abort pre-empted the certificate on the very tick that
+produced the vote. The hand ended anonymously where it could have ended naming
+the seat. Fixed by giving the certificate one more stage's worth wherever one is
+achievable — and firing at once where it is not, which is heads-up and below the
+floor generally, because there nothing better is coming.
+
 ### Three seats found a bug two seats could not
 
 Worth stating because it is the argument for running three in the first place.
