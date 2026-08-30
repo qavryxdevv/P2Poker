@@ -216,6 +216,7 @@ pub async fn run(
     mut commands: mpsc::Receiver<NodeCommand>,
     local_discovery: bool,
     port: u16,
+    profile_dir: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut swarm = swarm::build(NodeConfig {
         identity,
@@ -247,6 +248,30 @@ pub async fn run(
     // be asked of a relay this node has never met. Sitting on a home connection
     // with no other player running, the client could reach neither conclusion —
     // which is exactly what `relay: none` was reporting.
+    // What this client knew last time.
+    //
+    // **Beside the compiled entry point, never instead of it.** A saved book
+    // goes stale — a peer that answered yesterday may be off today, and a first
+    // run has no book at all — so the DNS name is still dialled every start.
+    // What the book buys is not being *dependent* on it: a client that has run
+    // before can reach the network through peers it met itself, and the day
+    // those four machines are unreachable is the day that matters.
+    let remembered = super::peerbook::load(&profile_dir);
+    if !remembered.is_empty() {
+        let kad = &mut swarm.behaviour_mut().ipfs_kad;
+        for (peer, addrs) in &remembered {
+            for a in addrs {
+                kad.add_address(peer, a.clone());
+            }
+        }
+        let _ = events
+            .send(NodeEvent::Warning(format!(
+                "{} peer(s) remembered from last time",
+                remembered.len()
+            )))
+            .await;
+    }
+
     for entry in PUBLIC_ENTRY {
         match entry.parse::<libp2p::Multiaddr>() {
             Ok(addr) => {
@@ -325,6 +350,10 @@ pub async fn run(
     // Whether any relay has ever been seen, so "no relay found" is a finding
     // about the network rather than about the first minute of a run.
     let mut seen_a_relay = false;
+
+    // When this client last re-published its table for a newcomer, so a rush of
+    // arrivals is one publish rather than one each.
+    let mut last_lobby_shout: Option<tokio::time::Instant> = None;
     let mut have_reservation = false;
     // Counted so that "no relay" is reported as a finding rather than as
     // impatience: three cycles is three minutes of looking.
@@ -352,6 +381,15 @@ pub async fn run(
     // closes, and hands the port back on the way out.
 
     let mut discover_timer = tokio::time::interval(Duration::from_secs(60));
+    // Ten minutes. The table changes slowly and a file written every minute is
+    // a file written six hundred times a day for no gain.
+    let mut peerbook_timer = tokio::time::interval(Duration::from_secs(600));
+    // Presence, on the same rhythm the table advertisements use and for the
+    // same reason: three of these fit inside the time it takes to be forgotten,
+    // so two lost messages do not empty a pane that should not be empty.
+    let mut presence_timer = tokio::time::interval(Duration::from_millis(
+        super::lobbytalk::PRESENCE_EVERY_MS,
+    ));
     let mut housekeeping = tokio::time::interval(REBROADCAST);
 
     loop {
@@ -910,8 +948,19 @@ pub async fn run(
                             // not have yet. It is only the *announcement* that
                             // is once per peer.
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                            // **Every** address is dialled, and only the
+                            // announcement is once per peer.
+                            //
+                            // The first version dialled only the first address
+                            // a peer was ever seen at, which on a machine with
+                            // more than one adapter is a coin toss: mDNS
+                            // reports one entry per address, and if the one
+                            // that arrived first was a Hyper-V or WSL adapter's
+                            // the dial failed and the peer's real address was
+                            // never tried. Two clients on one machine stopped
+                            // connecting at all.
+                            let _ = swarm.dial(addr);
                             if seen_locally.insert(peer) {
-                                let _ = swarm.dial(addr);
                                 let _ = events.send(NodeEvent::LocalPeer(peer)).await;
                             }
                         }
@@ -962,7 +1011,26 @@ pub async fn run(
                         if t == topics.lobby.hash() {
                             if let Some(f) = table.as_mut().filter(|f| f.is_founder()) {
                                 let now = super::node::now_unix_ms();
-                                if !state.lobby.tables().any(|l| *l.key == f.table_id()) {
+                                // For **every** arrival, not only the first.
+                                //
+                                // The condition here used to be "unless my own
+                                // table is already in my own lobby", which is
+                                // true from the first successful publish
+                                // onwards — so the second player to subscribe,
+                                // and every one after, was told nothing and
+                                // waited up to half a minute for the next
+                                // housekeeping tick. That is what "new tables do
+                                // not appear reliably" was.
+                                //
+                                // Bounded to once every few seconds, because a
+                                // burst of arrivals must not become a burst of
+                                // publishes.
+                                let quiet = last_lobby_shout
+                                    .is_none_or(|at: tokio::time::Instant| {
+                                        at.elapsed() >= Duration::from_secs(3)
+                                    });
+                                if quiet {
+                                    last_lobby_shout = Some(tokio::time::Instant::now());
                                     if let Ok(bytes) = f.readvertise(now, AD_TTL_MS) {
                                         if swarm
                                             .behaviour_mut()
@@ -1038,6 +1106,31 @@ pub async fn run(
                             );
                     }
                     _ => {}
+                }
+            }
+
+            _ = presence_timer.tick() => {
+                let now = super::node::now_unix_ms();
+                if let Ok(bytes) = super::lobbytalk::presence(&app_key, &nickname, now) {
+                    // A failure here is `NoPeersSubscribedToTopic`, which is the
+                    // ordinary state of a client nobody has met yet — and, as
+                    // of this writing, the state two clients stay in even when
+                    // they are connected to each other. See NEXT.md.
+                    let _ = swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(topics.lobby_chat.clone(), bytes);
+                }
+            }
+
+            _ = peerbook_timer.tick() => {
+                let peers = harvest(&mut swarm);
+                if !peers.is_empty() {
+                    if let Err(e) = super::peerbook::save(&profile_dir, &peers) {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!("could not save peers: {e}")))
+                            .await;
+                    }
                 }
             }
 
@@ -1134,6 +1227,32 @@ pub async fn run(
             Some(command) = commands.recv() => {
                 let now = super::node::now_unix_ms();
                 match command {
+                    NodeCommand::SayInLobby(text) => {
+                        let now = super::node::now_unix_ms();
+                        match super::lobbytalk::say(&app_key, &nickname, &text, now) {
+                            Ok(bytes) => {
+                                // Shown locally whatever the mesh does. A line
+                                // that vanished because nobody was subscribed
+                                // would look like a client that swallowed it.
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .publish(topics.lobby_chat.clone(), bytes);
+                                let _ = events
+                                    .send(NodeEvent::LobbySaid {
+                                        who: app_key.verifying_key().to_bytes(),
+                                        nickname: nickname.clone(),
+                                        text,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!("not said: {e}")))
+                                    .await;
+                            }
+                        }
+                    }
                     NodeCommand::CreateTable {
                         kind, name, seats, min_players, buyin, password,
                     } => {
@@ -1341,6 +1460,9 @@ pub async fn run(
             _ = housekeeping.tick() => {
                 let now = super::node::now_unix_ms();
                 state.tick(now);
+                // Told to the interface as well, which keeps its own copy and
+                // cannot see this clock.
+                let _ = events.send(NodeEvent::Swept { now_ms: now }).await;
 
                 // Re-broadcast this node's own table.
                 //
@@ -1632,9 +1754,33 @@ async fn handle_gossip(
 
     if message.topic != topics.lobby.hash() {
         return if message.topic == topics.lobby_chat.hash() {
-            // Chat is not parsed yet, and forwarding a message this client has
-            // not judged would be asserting something about it.
-            gossipsub::MessageAcceptance::Ignore
+            let now = super::node::now_unix_ms();
+            match super::lobbytalk::receive(&message.data, peer_bytes(&from), now, &mut state.limits)
+            {
+                Ok(super::lobbytalk::Heard::Here { who, nickname }) => {
+                    let _ = events.send(NodeEvent::LobbyHere { who, nickname }).await;
+                    gossipsub::MessageAcceptance::Accept
+                }
+                Ok(super::lobbytalk::Heard::Said {
+                    who,
+                    nickname,
+                    text,
+                }) => {
+                    let _ = events
+                        .send(NodeEvent::LobbySaid {
+                            who,
+                            nickname,
+                            text,
+                        })
+                        .await;
+                    gossipsub::MessageAcceptance::Accept
+                }
+                // Rate limiting is about this client's own budget and says
+                // nothing about the message, so it is not forwarded and not
+                // condemned. Everything else is a judgement.
+                Err(super::lobbytalk::NotHeard::TooMuch) => gossipsub::MessageAcceptance::Ignore,
+                Err(_) => gossipsub::MessageAcceptance::Reject,
+            }
         } else {
             // A topic this node never subscribed to has no business arriving.
             gossipsub::MessageAcceptance::Reject
@@ -1685,6 +1831,52 @@ async fn handle_gossip(
         }
     }
 }
+/// The routing table, as something that can be written down.
+///
+/// Only addresses that will still mean something tomorrow, and only the first
+/// few per peer: a public node advertises nine or more and this client can dial
+/// two of those forms.
+fn harvest(
+    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+) -> Vec<(libp2p::PeerId, Vec<Multiaddr>)> {
+    use super::peerbook::{worth_keeping, MAX_ADDRS_PER_PEER, MAX_PEERS};
+
+    let mut out = Vec::new();
+    for bucket in swarm.behaviour_mut().ipfs_kad.kbuckets() {
+        for entry in bucket.iter() {
+            let addrs: Vec<Multiaddr> = entry
+                .node
+                .value
+                .iter()
+                .filter(|a| worth_keeping(a))
+                .take(MAX_ADDRS_PER_PEER)
+                .cloned()
+                .collect();
+            if !addrs.is_empty() {
+                out.push((*entry.node.key.preimage(), addrs));
+            }
+            if out.len() >= MAX_PEERS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// A GossipSub source as the thirty-two bytes a rate limiter is keyed on.
+///
+/// The same reduction the advert path does inline. A peer id is a multihash and
+/// is usually longer than a key; what matters here is only that one peer maps
+/// to one budget, so a prefix is enough and a collision costs an honest peer a
+/// share of a stranger's allowance rather than anything worse.
+fn peer_bytes(from: &libp2p::PeerId) -> [u8; 32] {
+    let mut peer = [0u8; 32];
+    let bytes = from.to_bytes();
+    let take = bytes.len().min(32);
+    peer[..take].copy_from_slice(&bytes[..take]);
+    peer
+}
+
 /// Whether an address is one the rest of the internet could dial.
 ///
 /// A relay is only useful if the address it was reached on is reachable from

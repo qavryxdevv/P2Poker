@@ -52,6 +52,8 @@ use super::theme;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LobbyAction {
     None,
+    /// Say this in the lobby.
+    Say(String),
     Select([u8; 32]),
     /// Keep these settings.
     Save(Settings),
@@ -136,6 +138,8 @@ pub enum Dialog {
 #[derive(Debug, Clone)]
 pub struct LobbyUi {
     pub search: String,
+    /// What the player is typing into the lobby chat, not yet sent.
+    pub draft: String,
     pub filter: Filter,
     /// The dialog the player has open, if any.
     pub dialog: Option<Dialog>,
@@ -152,6 +156,7 @@ impl LobbyUi {
     pub fn new(settings: Settings) -> Self {
         LobbyUi {
             search: String::new(),
+            draft: String::new(),
             filter: Filter::default(),
             dialog: None,
             settings,
@@ -259,6 +264,10 @@ fn group<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R
 /// Draw the lobby, and say what was pressed.
 pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyAction {
     let mut action = LobbyAction::None;
+    // The chat box is in the middle column and the columns are drawn inside
+    // closures, so what it produced is carried out here rather than assigned
+    // through a borrow the closure does not have.
+    let mut said: Option<String> = None;
 
     egui::Panel::top("header")
         .frame(
@@ -315,7 +324,21 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
 
     egui::CentralPanel::default()
         .frame(frame())
-        .show(ui, |ui| people_column(ui, view));
+        .show(ui, |ui| {
+            // The middle column can produce an action now, so its result is
+            // taken rather than dropped. `CentralPanel::show` hands back what
+            // the closure returns.
+            if let LobbyAction::Say(text) = people_column(ui, view, state) {
+                said = Some(text);
+            }
+        });
+
+    // A line typed into the chat box beats nothing else that happened this
+    // frame: the other actions come from buttons, and a button and the Enter
+    // key cannot both have been pressed in one pass.
+    if let Some(text) = said {
+        action = LobbyAction::Say(text);
+    }
 
     if let Some(what) = dialog(ui, state) {
         action = what;
@@ -843,10 +866,17 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
     action
 }
 
-fn people_column(ui: &mut egui::Ui, view: &LobbyView) {
+fn people_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyAction {
+    let mut action = LobbyAction::None;
     let half = ui.available_height() * 0.55;
     ui.allocate_ui(egui::vec2(ui.available_width(), half), |ui| {
         group(ui, "Lobby chat", |ui| {
+            // The box first, so the reserved height is taken off the top and
+            // the scrolling history fills whatever is left. The other order
+            // gives the history all of it and pushes the box off the pane.
+            let line_height = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+            let history = (ui.available_height() - line_height).max(0.0);
+            ui.allocate_ui(egui::vec2(ui.available_width(), history), |ui| {
             scroller(egui::ScrollArea::vertical())
                 .id_salt("chat")
                 .auto_shrink([false, false])
@@ -867,6 +897,22 @@ fn people_column(ui: &mut egui::Ui, view: &LobbyView) {
                         ui.label(RichText::new("quiet").color(theme::TEXT_DIM).italics());
                     }
                 });
+            });
+
+            // Enter sends and keeps the cursor where it was, because a chat box
+            // that loses focus after every line is a chat box that is used once.
+            let box_id = ui.id().with("chat-draft");
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut state.draft)
+                    .id(box_id)
+                    .hint_text("say something…")
+                    .desired_width(f32::INFINITY),
+            );
+            let sent = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if sent && !state.draft.trim().is_empty() {
+                action = LobbyAction::Say(std::mem::take(&mut state.draft));
+                ui.memory_mut(|m| m.request_focus(box_id));
+            }
         });
     });
 
@@ -883,6 +929,8 @@ fn people_column(ui: &mut egui::Ui, view: &LobbyView) {
                 }
             });
     });
+
+    action
 }
 
 fn info_column(ui: &mut egui::Ui, view: &LobbyView) {

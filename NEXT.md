@@ -59,6 +59,52 @@ road a peer arrived by — *found … on this network* for multicast, *found …
 the public lobby* for the DHT — so an ordinary run answers the question that
 used to need a special one.
 
+## The lobby: three fixed, one not
+
+**Stale tables.** The interface keeps its own copy of the lobby and swept it
+only when a *new* advertisement arrived. When the last founder went away nothing
+arrived, so a row for a table that no longer existed stayed until the client was
+restarted — which is the state a player is in the moment somebody closes their
+client. The node now says `Swept` on its own clock and the interface ages its
+copy on that. There is a test, and it fails if the sweep is taken out again.
+
+**New tables appearing late.** The founder re-published for a newcomer only
+"unless my own table is already in my own lobby", which is true from the first
+successful publish onwards — so the *second* player to arrive, and everyone
+after, was told nothing and waited up to half a minute. Now every arrival is
+answered, bounded to one publish every three seconds.
+
+**mDNS was broken by my own dedupe, and this one is worth remembering.** The fix
+for the log flood — announce a local peer once rather than every few seconds —
+also dialled only the *first* address that peer was ever seen at. On a machine
+with a Hyper-V or WSL adapter that is a coin toss, and when it came up wrong the
+peer was never reached and never retried. Two clients on one machine stopped
+connecting at all, silently, and it looked like a DHT problem for hours. Every
+address is dialled again; only the announcement is once.
+
+**The routing table is kept between runs.** `profile/peers.txt`, written every
+ten minutes and read at start. Measured: 172 peers, 76 KB. The compiled entry
+point is still dialled every start — the book is *beside* it, never instead of
+it, because a saved book goes stale and a first run has none.
+
+### Chat and presence: written, tested, and not delivering
+
+`net::lobbytalk` fills `LobbyPlayerPresence` and `LobbyChat`, the two event
+types the protocol reserved and nothing ever used. Signed by the player key,
+capped, rate limited, eight unit tests including a tampered message and a name
+of forty emoji. The interface has a chat box; the panes were already there.
+
+**It does not work on the wire yet.** Two clients on one machine, connected to
+each other and both subscribed to the chat topic, and every publish comes back
+`NoPeersSubscribedToTopic`. Neither sees a `Subscribed` from the other for that
+topic, while the *lobby* topic works — tables flow between them. Same
+subscription code, same start-up, one topic works and the other does not. That
+is where to start: log every `gossipsub::Event::Subscribed` with its topic hash
+and find out whether the announcement is not sent, not received, or not matched.
+
+Nothing is harmed by shipping it in this state: a failed publish is discarded
+and the panes read *quiet* and *nobody yet*, exactly as before.
+
 ## Next actions, in order
 
 1. **The hand, wired.** Formation ends at `session_id` and the engine starts at

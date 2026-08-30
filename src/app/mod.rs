@@ -53,6 +53,14 @@ fn short(key: &[u8; 32]) -> String {
 /// memory bug with an external trigger like any other.
 pub const MAX_LOG_LINES: usize = 500;
 
+/// How many lines of lobby chat to keep.
+///
+/// A pane, not a history. Nothing is stored between runs and nothing is
+/// replayed to somebody who arrives later — GossipSub delivers to whoever is on
+/// the topic when a line is published, and keeping more than fits on a screen
+/// would be keeping a record this client has no business keeping.
+pub const MAX_CHAT_LINES: usize = 200;
+
 /// Everything the client knows, in the form the panes read it.
 #[derive(Debug, Default)]
 pub struct AppState {
@@ -68,6 +76,15 @@ pub struct AppState {
     /// identifier — §4.3 says that of a name received from the network, and it
     /// is no less true of one's own.
     pub me: String,
+    /// Who is in the lobby: player key to name and when they last said so.
+    ///
+    /// Keyed on the **key**, never the name: two players may choose one name,
+    /// and a list keyed on names would let either of them evict the other.
+    pub players: std::collections::BTreeMap<[u8; 32], (String, u64)>,
+    /// What has been said in the lobby, newest last.
+    pub chat: VecDeque<crate::gui::lobby::ChatLine>,
+    /// The last clock this client was told about, so presence can be aged.
+    pub last_sweep_ms: u64,
     /// The latest advertisement timestamp this client has seen.
     ///
     /// Used as the clock for this store's own expiry. Not this machine's clock:
@@ -172,6 +189,57 @@ impl AppState {
             NodeEvent::StillRelayed(p) => self.note(format!("{p} stays relayed")),
             NodeEvent::LocalPeer(p) => self.note(format!("found {p} on this network")),
             NodeEvent::LobbyPeer(p) => self.note(format!("found {p} in the public lobby")),
+            NodeEvent::LobbyHere { who, nickname } => {
+                // Noted when somebody arrives, not every time they say they are
+                // still here: presence repeats every thirty seconds and a line
+                // each time would bury everything else.
+                let arrived = !self.players.contains_key(&who);
+                if arrived {
+                    self.note(format!(
+                        "{nickname} ({}) is in the lobby",
+                        crate::storage::profile::short_name(&who)
+                    ));
+                }
+                self.players.insert(who, (nickname, self.last_sweep_ms));
+            }
+            NodeEvent::LobbySaid {
+                who,
+                nickname,
+                text,
+            } => {
+                // Somebody who speaks is somebody who is here, so a client that
+                // joined between two presence messages still sees them in the
+                // list rather than only in the chat.
+                self.players.insert(who, (nickname.clone(), self.last_sweep_ms));
+                if self.chat.len() >= MAX_CHAT_LINES {
+                    self.chat.pop_front();
+                }
+                self.chat.push_back(crate::gui::lobby::ChatLine {
+                    // The name **and** the key, because a name is decoration
+                    // and two players may choose one.
+                    who: format!("{nickname} ({})", crate::storage::profile::short_name(&who)),
+                    said: text,
+                });
+            }
+            NodeEvent::Swept { now_ms } => {
+                self.last_sweep_ms = now_ms;
+                // A player who has stopped saying they are here stops being
+                // here. There is no goodbye message, because a client that is
+                // switched off does not send one.
+                self.players.retain(|_, (_, at)| {
+                    now_ms.saturating_sub(*at) < crate::net::lobbytalk::PRESENCE_TTL_MS
+                });
+                let gone = self.lobby.expire(now_ms);
+                if gone > 0 {
+                    // Said only when something went. A line every half minute
+                    // saying nothing happened is a line that hides the ones
+                    // that matter.
+                    self.note(format!(
+                        "{gone} table{} expired",
+                        if gone == 1 { "" } else { "s" }
+                    ));
+                }
+            }
             NodeEvent::MeshPeer(p) => self.note(format!("{p} joined the lobby mesh")),
             NodeEvent::Published { bytes } => self.note(format!("advertised, {bytes} bytes")),
             NodeEvent::TableSeen {
@@ -310,6 +378,21 @@ impl AppState {
         v.selected = self.selected;
         v.log = self.log.iter().cloned().collect();
         v.me = self.me.clone();
+        v.chat = self.chat.iter().cloned().collect();
+        // Name and key together, because a name is decoration. Sorted by name
+        // so the pane does not reshuffle every time somebody says they are
+        // still here.
+        v.seated = {
+            let mut who: Vec<String> = self
+                .players
+                .iter()
+                .map(|(k, (name, _))| {
+                    format!("{name} ({})", crate::storage::profile::short_name(k))
+                })
+                .collect();
+            who.sort();
+            who
+        };
         v
     }
 }
@@ -494,6 +577,41 @@ mod tests {
         let line = s.view().status.summary();
         assert!(!line.contains("cannot carry a hand"), "{line}");
         assert_eq!(line, "Looking for peers");
+    }
+
+    /// A table nobody re-advertises must leave the interface's own lobby, and
+    /// nothing else was ever going to tell it to.
+    ///
+    /// The sweep used to happen only inside the handler for an **incoming**
+    /// advert, so the last table on a quiet network stayed on screen until the
+    /// client was restarted — which is exactly the state a player is in when
+    /// the founder closes their client.
+    #[test]
+    fn a_table_that_nobody_re_advertises_leaves_the_screen() {
+        use crate::protocol::constants::AD_TTL_MS;
+
+        let mut s = AppState::new();
+        let now = 1_700_000_000_000u64;
+        let ad = crate::net::lobby::TableAd::rated_sng(
+            "Riverside".into(),
+            [9u8; 32],
+            vec![1, 2, 3],
+            now,
+        );
+        let key = [7u8; 32];
+        s.apply(NodeEvent::TableSeen {
+            key,
+            ad: Box::new(ad),
+            params_hash: [1u8; 32],
+            advert_hash: [2u8; 32],
+        });
+        assert_eq!(s.view().tables.len(), 1, "the table arrived");
+
+        // Time passes and nobody says it again.
+        s.apply(NodeEvent::Swept {
+            now_ms: now + AD_TTL_MS + 1,
+        });
+        assert_eq!(s.view().tables.len(), 0, "and it is gone from the screen");
     }
 
     #[test]

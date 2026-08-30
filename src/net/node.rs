@@ -45,6 +45,11 @@ use crate::protocol::constants::AD_REBROADCAST_MS;
 /// [`NodeEvent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCommand {
+    /// Say something in the lobby.
+    ///
+    /// The text is whatever was typed. It is trimmed and capped where it is
+    /// sealed, not here: one place decides what fits on the wire.
+    SayInLobby(String),
     /// Found a table and advertise it.
     CreateTable {
         /// Which game. A Sit-and-Go reads `seats` and `name` and nothing else
@@ -171,6 +176,26 @@ pub enum NodeEvent {
     DialFailed { reason: String },
     /// A peer was found on the local network.
     LocalPeer(PeerId),
+    /// The clock moved on, so adverts that have run out can go.
+    ///
+    /// The interface keeps its **own** copy of the lobby, and until this event
+    /// existed that copy was swept only when a new advertisement arrived. When
+    /// the last table's founder went away, nothing arrived — so the row for a
+    /// table that no longer existed stayed on the screen until the client was
+    /// restarted. Expiry is a function of time passing, and time passing has to
+    /// be an event or it is not noticed.
+    Swept { now_ms: u64 },
+    /// Somebody is in the lobby, under this name.
+    ///
+    /// `who` is the player key and is the identity; `nickname` is decoration
+    /// and two players may choose one. The interface shows both.
+    LobbyHere { who: [u8; 32], nickname: String },
+    /// Somebody said something in the lobby.
+    LobbySaid {
+        who: [u8; 32],
+        nickname: String,
+        text: String,
+    },
     /// A peer was found in the public lobby, through the DHT.
     ///
     /// Separate from [`LocalPeer`](NodeEvent::LocalPeer) on purpose. The two
@@ -252,7 +277,11 @@ impl NodeEvent {
             // play at all.
             | Self::Reachability { .. }
             | Self::Reserved { .. }
-            | Self::NoRelayFound { .. } => true,
+            | Self::NoRelayFound { .. }
+            // Both change a pane a player is looking at, and a line of chat
+            // that arrived three seconds ago is a line nobody answers.
+            | Self::LobbyHere { .. }
+            | Self::LobbySaid { .. } => true,
 
             // Log only. Chatty, repetitive, and worth a second's delay.
             Self::Listening(_)
@@ -264,6 +293,10 @@ impl NodeEvent {
             | Self::DialFailed { .. }
             | Self::LocalPeer(_)
             | Self::LobbyPeer(_)
+            // Log only — and lazily on purpose. A sweep that removes nothing
+            // must not cost a repaint, and one that removes a row can wait the
+            // fraction of a second the lazy wake takes.
+            | Self::Swept { .. }
             | Self::MeshPeer(_)
             | Self::Published { .. }
             | Self::HolePunched(_)

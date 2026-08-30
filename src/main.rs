@@ -337,7 +337,7 @@ fn headless(player: Player, run: Run, join: Option<String>) {
         identity,
         app_key,
         settings,
-        ..
+        profile_dir,
     } = player;
     let Run {
         hosted,
@@ -354,7 +354,7 @@ fn headless(player: Player, run: Run, join: Option<String>) {
         // immediately and for ever, and its `select!` arm would spin.
         let (commands, command_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
-            if let Err(e) = p2p_poker::net::run::run(identity, app_key, tx, command_rx, local_discovery, port).await {
+            if let Err(e) = p2p_poker::net::run::run(identity, app_key, tx, command_rx, local_discovery, port, profile_dir).await {
                 eprintln!("node stopped: {e}");
             }
         });
@@ -496,12 +496,15 @@ fn windowed(player: Player, run: Run) -> Started {
     // The window keeps a copy: it saves the settings, and the defaults a
     // settings file falls back to are derived from this key.
     let node_key = app_key.clone();
+    // The node writes its peer book here; the window writes the settings. Two
+    // owners of one path, which is a clone rather than an argument thread.
+    let node_dir = profile_dir.clone();
     rt.spawn(async move {
         let _ = opening.send(NodeCommand::SetNickname(opening_name)).await;
         if let Some(command) = hosted {
             let _ = opening.send(command).await;
         }
-        if let Err(e) = p2p_poker::net::run::run(identity, node_key, tx, command_rx, local_discovery, port).await {
+        if let Err(e) = p2p_poker::net::run::run(identity, node_key, tx, command_rx, local_discovery, port, node_dir).await {
             eprintln!("node stopped: {e}");
         }
     });
@@ -1017,6 +1020,7 @@ impl eframe::App for Client {
                         password,
                     }),
                     render::LobbyAction::LeaveTable => self.tell(NodeCommand::LeaveTable),
+                    render::LobbyAction::Say(text) => self.tell(NodeCommand::SayInLobby(text)),
                     render::LobbyAction::Save(mut settings) => {
                         settings.repair(&self.app_key);
                         ctx.set_zoom_factor(settings.zoom());
