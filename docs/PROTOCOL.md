@@ -924,12 +924,25 @@ GENESIS(0) = h("p2p-poker v1 genesis",
 
 GENESIS(k) = h("p2p-poker v1 genesis",                              for k >= 1
                [ u16_be(protocol_version), table_id, u64_be(k),
-                 session_id, roster_hash(k), TERMINAL(k-1) ])
+                 session_id, roster_hash(k), TERMINAL(k-1),
+                 R(k) as u8 seat indices, ascending, without repeats ])
 
 roster_hash(k) = h("p2p-poker v1 roster",
                    [ for each seat s in ascending seat index:
                        u8(s) || app_public_key[s] || u64_be(stack_at_hand_start[s]) ])
 ```
+
+**`R(k)` is in the genesis, and this closes a divergence that was measured
+rather than argued.** `roster_hash(k)` is the seating and the stacks; `R(k)` is
+who the hand requires. Two peers can derive the same seating from different
+participation — one had certified a seat absent and dropped it, the other had
+not — and before this term they then opened hand after hand at **identical**
+genesis hashes with different players in them. Nothing refused anything, because
+every check downstream compares against the genesis and the genesis could not
+tell the two hands apart. Three clients, one killed, five hands of `[0, 1, 2]`
+against `[1, 2]`. With `R(k)` inside, two peers that disagree about who is
+playing cannot open the same hand at all, which turns a silent split into a
+refusal at the first `HAND_INIT`. `R(1)` is the signers of `TABLE_READY` (§3.2).
 
 **`stack_at_hand_start[s]` at `k = 0` is the ratified roster's `SeatEntry.buyin`,
 and this sentence closes `U1`.** The field was defined only as `TERMINAL(k-1)`'s

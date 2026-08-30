@@ -4287,13 +4287,6 @@ impl Hand {
         }
         let roster_hash = crate::protocol::transcript::roster_hash(&roster);
         let hand_id = self.open.hand_id + 1;
-        let genesis = crate::protocol::transcript::genesis_hand(
-            &self.open.table_id,
-            hand_id,
-            &self.open.session_id,
-            &roster_hash,
-            &terminal,
-        );
 
         // The bank, folded forward one hand. Every input is agreed: `P(k)` is
         // `signed`, which is inside the end-of-hand state hash, and the two
@@ -4391,6 +4384,19 @@ impl Hand {
         if required.len() < 2 {
             return None;
         }
+
+        // **After `required`, because the genesis commits to it.** Two peers
+        // that derive different participation must derive different hands, or
+        // they play different tables under one hash and nothing refuses
+        // anything.
+        let genesis = crate::protocol::transcript::genesis_hand(
+            &self.open.table_id,
+            hand_id,
+            &self.open.session_id,
+            &roster_hash,
+            &terminal,
+            &required,
+        );
 
         Some(Opening {
             table_id: self.open.table_id,

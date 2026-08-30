@@ -461,6 +461,10 @@ impl Formation {
             &self.session?,
             &self.roster.hash_at_zero(),
             &self.terminal_zero()?,
+            // `R(1)` **is** the signers of `TABLE_READY` (§3.2), so the first
+            // hand commits to who ratified it exactly as every later one
+            // commits to who is still playing.
+            &self.ratifiers(),
         ))
     }
 

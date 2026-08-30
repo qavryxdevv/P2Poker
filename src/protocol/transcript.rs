@@ -146,8 +146,21 @@ pub fn genesis_hand(
     session_id: &Hash,
     roster: &Hash,
     previous_terminal: &Hash,
+    participants: &[SeatIdx],
 ) -> Hash {
     debug_assert!(hand_id >= 1, "hand 0 is the setup chain; use genesis_setup");
+    // **Who is playing is part of which hand this is.** The roster is the
+    // seating and the stacks; the participants are `R(k)`, the seats this hand
+    // requires, and two peers can derive the same seating from different
+    // participation. When they did, they opened hand after hand at identical
+    // genesis hashes with different players in them, refused nothing, and ran
+    // two tables — measured, `[0, 1, 2]` against `[1, 2]` for five hands. A
+    // genesis that does not commit to this cannot tell those two hands apart,
+    // and every check downstream is comparing the wrong thing.
+    assert!(
+        participants.windows(2).all(|w| w[0] < w[1]),
+        "the participants must be in ascending seat order, without repeats"
+    );
     hash(
         Domain::Genesis,
         &[
@@ -157,6 +170,7 @@ pub fn genesis_hand(
             session_id,
             roster,
             previous_terminal,
+            participants,
         ],
     )
 }
@@ -351,16 +365,24 @@ mod tests {
         let session = [0x33; 32];
         let roster = [0x44; 32];
         let terminal = [0x55; 32];
-        let hand = genesis_hand(&TABLE, 1, &session, &roster, &terminal);
+        let who: &[SeatIdx] = &[0, 1, 2];
+        let hand = genesis_hand(&TABLE, 1, &session, &roster, &terminal, who);
         assert_ne!(setup, hand);
 
         assert_ne!(setup, genesis_setup(&TABLE, &[0x99; 32]), "the parameters");
         assert_ne!(setup, genesis_setup(&[0x99; 32], &PARAMS), "the table");
 
-        assert_ne!(hand, genesis_hand(&TABLE, 2, &session, &roster, &terminal));
-        assert_ne!(hand, genesis_hand(&TABLE, 1, &[0x99; 32], &roster, &terminal));
-        assert_ne!(hand, genesis_hand(&TABLE, 1, &session, &[0x99; 32], &terminal));
-        assert_ne!(hand, genesis_hand(&TABLE, 1, &session, &roster, &[0x99; 32]));
+        assert_ne!(hand, genesis_hand(&TABLE, 2, &session, &roster, &terminal, who));
+        assert_ne!(hand, genesis_hand(&TABLE, 1, &[0x99; 32], &roster, &terminal, who));
+        assert_ne!(hand, genesis_hand(&TABLE, 1, &session, &[0x99; 32], &terminal, who));
+        assert_ne!(hand, genesis_hand(&TABLE, 1, &session, &roster, &[0x99; 32], who));
+        // The one this was added for: same table, same seating, same terminal,
+        // different players in the hand.
+        assert_ne!(
+            hand,
+            genesis_hand(&TABLE, 1, &session, &roster, &terminal, &[1, 2]),
+            "a hand two of the three are playing is not the same hand"
+        );
     }
 
     /// The property the whole abort design rests on: two peers that saw
@@ -369,7 +391,7 @@ mod tests {
     /// `GENESIS(k+1)` depends on `TERMINAL(k)`.
     #[test]
     fn an_aborted_hands_terminal_is_witness_independent() {
-        let genesis = genesis_hand(&TABLE, 4, &[0x33; 32], &[0x44; 32], &[0x55; 32]);
+        let genesis = genesis_hand(&TABLE, 4, &[0x33; 32], &[0x44; 32], &[0x55; 32], &[0, 1]);
 
         // Two peers, having accepted entirely different events of hand 4,
         // compute the terminal from the genesis alone.
