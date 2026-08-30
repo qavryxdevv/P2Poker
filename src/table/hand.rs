@@ -3675,13 +3675,19 @@ impl Hand {
 
     /// The subject a digest is about, from a vote this client holds.
     fn subject_of(&self, digest: &Hash) -> Option<TimeoutVote> {
-        for seat in &self.mine.dealt_in {
-            let s = self.subject_now(*seat)?;
-            if s.subject_digest() == *digest {
-                return Some(s);
-            }
-        }
-        None
+        // **Skipped, not abandoned.** This was `self.subject_now(*seat)?`, so a
+        // single seat yielding `None` returned `None` for the whole lookup and
+        // silently turned off every certificate for the stage — including ones
+        // about seats the function had not reached yet. It happens not to fire
+        // today, because `subject_now` returns `None` on phase state and not on
+        // anything about the seat, so it is all seats or none; that is a
+        // property of the current `stage_type`, not a rule anybody stated, and
+        // it is not worth resting a security check on.
+        self.mine
+            .dealt_in
+            .iter()
+            .filter_map(|seat| self.subject_now(*seat))
+            .find(|s| s.subject_digest() == *digest)
     }
 
     /// Seal into the stage now open, without advancing it.
@@ -3715,6 +3721,30 @@ impl Hand {
             return false;
         };
         now_ms.saturating_sub(self.stage_at_ms) >= u64::from(self.next_deadline_for(owed))
+    }
+
+    /// What accepting a certificate does to the roster, once it has had its
+    /// effect and not before.
+    ///
+    /// The voter set shrinks here and **only** here — on acceptance of a
+    /// certificate that itself cleared the floor. That is what makes the
+    /// shrinkage inductive: an attacker cannot reach `|V| = 1` by asserting,
+    /// because every step towards it had to clear the floor too.
+    ///
+    /// Idempotent, and the strike is inside the same guard as the voter set.
+    /// They were separate, so a certificate applied twice about one seat
+    /// counted once towards `R(k+1)` and twice towards
+    /// [`MAX_CONSECUTIVE_AUTO_ACTIONS`] — which decides when a seat sits out.
+    fn commit_certificate(&mut self, subject: SeatIdx) {
+        self.certifying = None;
+        self.note_signed(subject);
+        if self.certified.contains(&subject) {
+            return;
+        }
+        self.certified.push(subject);
+        if let Some(n) = self.strikes.get_mut(usize::from(subject)) {
+            *n = n.saturating_add(1);
+        }
     }
 
     /// A certificate from a peer, or this client's own coming back.
@@ -3848,21 +3878,21 @@ impl Hand {
         key: &SigningKey,
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
-        let taken = self.certifying.take().ok_or(Failed::NothingFurther)?;
-        let subject = taken.subject;
-        let parent = taken.stage.hash().ok_or(Failed::NotInThisStage)?;
-
-        // The voter set shrinks here and **only** here — on acceptance of a
-        // certificate that itself cleared the floor. That is what makes the
-        // shrinkage inductive: an attacker cannot reach `|V| = 1` by asserting,
-        // because every step towards it had to clear the floor too.
-        if !self.certified.contains(&subject.subject_seat) {
-            self.certified.push(subject.subject_seat);
-        }
-        if let Some(n) = self.strikes.get_mut(usize::from(subject.subject_seat)) {
-            *n = n.saturating_add(1);
-        }
-        self.note_signed(subject.subject_seat);
+        // **Read, do not take, and change nothing yet.** Everything below can
+        // fail — the phase may not be a betting one, and the engine may refuse
+        // the action — and the first version had already shrunk the voter set,
+        // added a strike and consumed the certificate before it found out. The
+        // state that left behind was the worst of both: a seat removed from
+        // `R(k+1)` with nothing done about the stage it was late for, and no
+        // certificate left to try again with.
+        let (subject, parent, my_copy) = {
+            let c = self.certifying.as_ref().ok_or(Failed::NothingFurther)?;
+            (
+                c.subject,
+                c.stage.hash().ok_or(Failed::NotInThisStage)?,
+                c.stage.heard(self.open.my_seat),
+            )
+        };
 
         match subject.kind {
             // An action deadline. The engine acts for the seat: **check** when
@@ -3891,6 +3921,9 @@ impl Hand {
                         .map_err(|what| Failed::Illegal { seat, what })?;
                     play.actions = play.actions.saturating_add(1);
                 }
+                // Nothing has failed, so the certificate has had its effect and
+                // the roster effects go with it.
+                self.commit_certificate(subject.subject_seat);
                 // The stage is closed by the **certificate** stage's own hash,
                 // because the betting stage it was about has none: nobody
                 // wrote it. The two are at one sequence in two classes, which
@@ -3904,6 +3937,7 @@ impl Hand {
             // **as evidence only**. No chips move: an abort restores every
             // stack, and D-010 forbids reading `attributed` to move one.
             _ => {
+                self.commit_certificate(subject.subject_seat);
                 self.slot = self.slot.then(parent);
                 self.mark_stage(now_ms);
                 let named = self
@@ -3915,8 +3949,7 @@ impl Hand {
                 // The **certificate**, not the stage: §4.10 says `cert_hash`
                 // is the `event_hash` of a `TIMEOUT_CERT`. This client's own
                 // copy is the one it can prove it holds.
-                let cert = taken.stage.heard(self.open.my_seat);
-                self.abort_named(named, cert, key, now_ms)
+                self.abort_named(named, my_copy, key, now_ms)
             }
         }
     }
