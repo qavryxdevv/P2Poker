@@ -792,12 +792,22 @@ Measured, three clients on one machine, table of three:
 | adverts published in 200 s | 1 | one per 30 s tick until the table fills |
 | advisory events dropped | n/a | 0 |
 
-**Two runs in three is not a cure.** The third still did not form, so something
-else is wrong as well — the founder's `lobby topic: 0 of 1 subscribed peer(s)`
-against both joiners' `0 of 2` is the standing clue, and it means the founder is
-missing one peer's subscription entirely. Delivery works anyway because an
-mDNS-discovered peer is an explicit peer and `publish` reaches those without the
-mesh, which is exactly why this took so long to see.
+**Two runs in three is not a cure**, and one later run seated all three by log
+line 28 with the hand dealt immediately — the best of the day. So the spread is
+wide and the remaining failures are not yet characterised.
+
+**And the clue that was written here was wrong.** `lobby topic: 0 of 1` on the
+founder against `0 of 2` on the joiners looked like a missing subscription; with
+the peers named rather than counted, a later run showed all three symmetric —
+each seeing exactly the other two — so the `0 of 1` was one tick taken before
+the second joiner had connected, and nothing more.
+
+The `0` mesh count is **not** a fault either, and chasing it would waste a day:
+`libp2p-gossipsub` excludes explicit peers from the mesh on purpose, because
+they already receive everything, and an mDNS-discovered peer is made explicit
+here. A local table is delivered entirely by the explicit-peer path. That is
+also why the throttling took so long to find — the mesh being empty looked like
+the problem and never was.
 
 Also unexplained: the founder often reports `lobby topic: 0 of 1 subscribed
 peer(s) in the mesh` while both joiners report `0 of 2`. Delivery works anyway,

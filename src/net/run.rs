@@ -2238,10 +2238,19 @@ pub async fn run(
                         .all_peers()
                         .filter(|(_, subscribed)| subscribed.contains(&&hash))
                         .count();
+                    // Named, not counted. The founder reporting one subscriber
+                    // while both joiners report two is the standing clue, and a
+                    // count cannot say WHICH peer is missing.
+                    let who: Vec<String> = g
+                        .all_peers()
+                        .filter(|(_, subscribed)| subscribed.contains(&&hash))
+                        .map(|(p, _)| p.to_string().chars().rev().take(6).collect::<String>())
+                        .collect();
                     if known > 0 || mesh > 0 {
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "lobby topic: {mesh} of {known} subscribed peer(s) in the mesh"
+                                "lobby topic: {mesh} of {known} subscribed peer(s) in the mesh                                  {who:?}; {} poker peer(s) connected",
+                                poker_peers.len()
                             )))
                             .await;
                     }
