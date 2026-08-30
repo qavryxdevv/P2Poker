@@ -3079,3 +3079,27 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod ad_is_admissible {
+    #[test]
+    fn every_table_this_client_hosts_passes_this_client_s_own_gate() {
+        for seats in 2..=crate::protocol::constants::MAX_SEATS {
+            let ad = super::new_table(
+                "T".into(),
+                seats,
+                seats,
+                10_000,
+                false,
+                [7; 32],
+                vec![1, 2, 3],
+                1_700_000_000_000,
+            );
+            assert_eq!(
+                crate::net::lobby::admit(&ad, 1_700_000_000_000),
+                Ok(()),
+                "the advert this client publishes at {seats} seats is one it would refuse"
+            );
+        }
+    }
+}

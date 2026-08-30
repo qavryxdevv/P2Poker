@@ -638,3 +638,78 @@ clients. Three defects, none of which any unit test could have found:
 committed two of its verify agents' mutations. **Never `git add -A` while
 anything else can write to the tree, and read `git status` for foreign
 modifications before every commit.**
+
+
+## The decision clock, made to work over a real mesh
+
+D-023 restored `TIMEOUT_VOTE` and `TIMEOUT_CERT`. Every unit test passed and the
+machinery did not work between processes. Four defects, in the order they were
+found, and each one hid the next.
+
+**The tally read `1 of 2` for ever.** Both peers voted; each held only its own
+vote. Not a digest mismatch, which was the obvious guess and was wrong — the
+digests were identical, and a one-line diagnostic that printed the digest
+settled that in one run instead of an afternoon of reasoning. The peers were a
+stage apart.
+
+**They were a stage apart because a client forwards nothing.**
+`validate_messages()` means GossipSub passes a message on only after the
+application reports a verdict, and every arm of the hand-event branch returned
+to the top of the loop without reporting one. Between three directly-meshed
+peers this is invisible: delivery to a direct peer needs no forwarding. It stops
+being invisible the moment a peer dies mid-broadcast. Its last event reaches one
+survivor, that survivor relays nothing, and the two live peers sit one sequence
+apart for the rest of the hand, each naming a different seat as late.
+
+**`certifying` was never cleared when a stage advanced**, and
+`certify_if_unanimous` refuses to start while one is in progress — so a stage
+that opened a certificate and moved on blocked every certificate for the rest of
+the hand.
+
+**And the one that had nothing to do with the machinery.** With all of the
+above fixed, both survivors voted, agreed, reached unanimity and each emitted a
+certificate — and then each refused the other's `HAND_ABORT`, because
+`apply_certificate` built it with a named subject and no `cert_hash` and §4.10
+forbids that shape. Everything was right up to the last message.
+
+### What that cost, and the four habits that would have shortened it
+
+* **Grep for the failure, not for the success.** `hand: {e}` was printed on
+  every refusal for the whole investigation and was never grepped for, because
+  the greps were written to look for the thing that was supposed to happen. The
+  answer had been in the log for three runs.
+* **Instrument the decision, not the state.** Reading `certify_if_unanimous` and
+  reasoning about it produced two wrong hypotheses. Printing what it *decided*
+  produced the answer on the first run.
+* **A silent path is where bugs live.** Of the twelve places a vote can be
+  dropped between the wire and `take_vote`, five say nothing at all. Two of
+  those five were firing.
+* **A test must be shown to fail.** Both regression tests here were verified by
+  backing the fix out and requiring the failure — and the one written for the
+  reserve cap failed immediately on a value picked by hand, which is why that
+  constant is now derived.
+
+### And two ways to destroy a file, both self-inflicted here
+
+* `io.open(p, 'w').write(io.open(p).read())` truncates before it reads. It
+  emptied `hand.rs` completely. Read into a variable first, write through a
+  temporary file, `os.replace`.
+* `git checkout -- <file>` to undo a *deliberate* temporary edit also discards
+  every uncommitted change in that file. It threw away the same file's work a
+  second time, ten minutes later. Revert the one line, or commit first.
+
+## Still open
+
+* `STATE_HASH` / `STATE_ACK` — the hash is computed inside `HAND_COMPLETE` and
+  the stage that carries it does not exist. §12's T61 fires after every settled
+  hand and has nothing to fire on.
+* The RNG beacon, which `provisional_button` stands in for.
+* `HAND_ABORT` causes 2 and 3: this build refuses them rather than check
+  evidence it cannot verify, and the embedded evidence needs a larger
+  `FRAME_CAP`.
+* Two machines on two networks. Everything measured so far is three processes on
+  one.
+* The forwarding fix has no test. This harness delivers every message to every
+  survivor, which is a mesh that forwards — by construction it cannot see a
+  client that fails to. It needs three libp2p nodes with two of them not
+  directly meshed.
