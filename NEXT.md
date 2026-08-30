@@ -757,6 +757,43 @@ at all.
 The lesson is the same one this file keeps recording: *a count could not say
 which peer was missing, and the question was entirely about which.*
 
+## Measured and not explained: the roster moves without a certificate
+
+Three clients, one killed, everything of D-024 in place. Both survivors agreed
+at every step — same genesis, same seats — so this is not a fork. It is the
+derivation being unstable:
+
+```
+hand #1 opens at genesis 460d01bc with seats [0, 1, 2]
+my clock has run out on seat 1 — seat 1 @8b47b283: 1/2 agree
+a peer ended the hand on its own deadline; every stack is restored
+hand #2 opens at genesis 510f1640 with seats [1, 2]      <- seat 0 dropped
+hand #3 opens at genesis b407894e with seats [0, 1]      <- seat 0 back, 2 gone
+hand #4 ... [0, 1]
+hand #5 ... [0, 1]
+```
+
+**No certificate was ever accepted** (`certs=0` on both), so `certified` is empty
+and `took_part` is true for every seat on the `by_certificate` branch. `dealt_in`
+is a subset of `required`, and hand 1's `required` is the ratifiers, so it had
+three members and the branch should have been taken. On that branch hand 2 could
+only be `[0, 1, 2]`. It was not.
+
+And hand 3 **re-adds** seat 0, which the `by_certificate` branch cannot do — it
+only ever filters `self.open.required`. So hand 3 used the observation branch,
+which means hand 2's `required` had fewer than three members and
+`by_certificate` had already flipped off. Once the required set reaches two the
+derivation reverts to *"whoever I heard from"*, which is exactly when agreement
+matters most, and it can put a seat back.
+
+Two things to establish, with instrumentation and not by reading:
+
+* what dropped seat 0 at hand 2, given an empty `certified` and restored stacks;
+* whether `by_certificate = self.open.required.len() >= 3` is the right gate at
+  all. It was chosen because D-023's floor makes certification impossible below
+  three seats, but a three-seat table that loses one is exactly the case, and
+  the fallback it lands in is the unstable one.
+
 ## Still open
 
 * **A seat certified absent never re-enters**, because `next_hand`'s
