@@ -344,6 +344,31 @@ pub const SHOWDOWN_MUCK_CAP: usize = 64;
 /// seat lists, plus four vectors of that length.
 pub const HAND_COMPLETE_CAP: usize = 4_096;
 
+/// How many of a stage's own allowances a **cryptographic** stage may take
+/// before any peer may end the hand.
+///
+/// Two, which is the owner's "200% of the decision time" applied to the thing
+/// it fits. Applied to a *hand* that number would be far too short: heads-up a
+/// legal hand is eight actions plus the cryptography, so a whole-hand deadline
+/// at twice one decision would abort almost every honest hand. Applied to **one
+/// stage** it is generous — a peer that has not produced a deck key or a
+/// shuffle in twice the time the table allots for one is not thinking.
+///
+/// This is safe where a forced *fold* would not be, and the asymmetry is the
+/// whole argument: **an abort moves no chips** (D-010), so every stack is
+/// restored and a false abort costs a replayed hand. A false fold costs the
+/// hand itself, which is why that needs the unanimity of §8.4 and this does
+/// not — and why this works heads-up, where unanimity is one interested party
+/// and cannot.
+///
+/// It does not open a new way to cheat. That a losing player can stall and get
+/// its chips back is D-010's own accepted cost, already recorded; this makes it
+/// quicker to do and much quicker to recover from. What prices it is D-013 and
+/// D-022: a seat that goes quiet is outside `P(k)`, so it is not dealt the next
+/// hand, and a second offence spends its reconnection allowance while the
+/// blinds keep taking its stack.
+pub const STAGE_DEADLINE_FACTOR: u64 = 2;
+
 /// How many hands a seat may miss and still be dealt back in.
 ///
 /// **Denominated in hands, and that is the whole design.** A reconnection
@@ -635,6 +660,16 @@ struct StepHeard {
 /// One hand in progress.
 pub struct Hand {
     open: Opening,
+    /// When the stage now open was reached, on this peer's own clock.
+    ///
+    /// A **cryptographic** stage that stalls is what
+    /// [`STAGE_DEADLINE_FACTOR`] bounds, and it is bounded per stage rather
+    /// than per hand because the hand's own budget has to accommodate a whole
+    /// legal hand of human thinking and is therefore tens of minutes.
+    stage_at_ms: u64,
+    /// The sequence `stage_at_ms` belongs to, so the clock restarts when — and
+    /// only when — the hand actually moves.
+    stage_seq: u64,
     /// When this hand's stage 0 was sealed, on this peer's own clock.
     ///
     /// The hand deadline is measured from here. Advisory, local, and shared
@@ -792,6 +827,8 @@ impl Hand {
             Hand {
                 signed,
                 opened_at_ms,
+                stage_at_ms: opened_at_ms,
+                stage_seq: 0,
                 open: o,
                 mine,
                 slot,
@@ -860,6 +897,19 @@ impl Hand {
             return self.on_hand_abort(bytes, now_ms);
         }
 
+        let out = self.dispatch(bytes, kind, key, now_ms);
+        self.mark_stage(now_ms);
+        out
+    }
+
+    /// The phase's own handler for an event that passed the guards.
+    fn dispatch(
+        &mut self,
+        bytes: &[u8],
+        kind: EventType,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
         match self.phase {
             Phase::Init(_) => self.on_hand_init(bytes, key, now_ms),
             Phase::Deck { .. } => self.on_deck_init(bytes, key, now_ms),
@@ -1821,6 +1871,7 @@ impl Hand {
         let hash = self.opened(&bytes, kind)?.event_hash;
         let mut out = vec![Send::Broadcast(bytes)];
         out.append(&mut self.apply_action(me, action, kind, hash, key, now_ms)?);
+        self.mark_stage(now_ms);
         Ok(out)
     }
 
@@ -2983,7 +3034,62 @@ impl Hand {
     /// anybody's wall time, which is why nothing in the chain depends on two
     /// peers agreeing about when it passed.
     fn past_deadline(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.opened_at_ms) >= u64::from(self.open.hand_deadline_ms)
+        // The hand's own budget, which every stage shares and which has to be
+        // long enough for a whole legal hand.
+        if now_ms.saturating_sub(self.opened_at_ms) >= u64::from(self.open.hand_deadline_ms) {
+            return true;
+        }
+        // And the stage's, which only a **cryptographic** stage has. A betting
+        // stage is not bounded here: it is bounded by the seat's own client
+        // acting for it, which is version 1's whole answer to a betting stall
+        // (D-015), and ending the hand under a player who is merely thinking
+        // would be a worse answer than the one that already exists.
+        if !self.crypto_stage() {
+            return false;
+        }
+        let allowed = u64::from(self.open.crypto_step_timeout_ms)
+            .saturating_mul(STAGE_DEADLINE_FACTOR);
+        now_ms.saturating_sub(self.stage_at_ms) >= allowed
+    }
+
+    /// Whether this hand may be given up on now.
+    ///
+    /// Public because the deadline is the **node's** to act on: it is measured
+    /// on this peer's own monotonic clock and shared with nobody, so nothing
+    /// inside the hand can ask what time it is. Polled rather than scheduled,
+    /// because the answer changes as stages open and close and a single armed
+    /// instant would have to be re-armed at every one of them.
+    pub fn may_abandon(&self, now_ms: u64) -> bool {
+        !self.over() && self.past_deadline(now_ms)
+    }
+
+    /// Whether the stage now open is one the cryptography has to complete.
+    fn crypto_stage(&self) -> bool {
+        match &self.phase {
+            Phase::Init(_)
+            | Phase::Deck { .. }
+            | Phase::Shuffling { .. }
+            | Phase::Committing { .. }
+            | Phase::Dealing { .. } => true,
+            // A hand being played is bounded by the action clock, and one that
+            // has ended or is between phases is bounded by nothing because
+            // there is nothing to wait for.
+            Phase::Playing { play, .. } => !matches!(play.step, Step::Acting { .. }),
+            Phase::Aborted(_) | Phase::Between => false,
+        }
+    }
+
+    /// Note the clock against the stage now open.
+    ///
+    /// Called wherever an event has been handled, and restarts the stage clock
+    /// only when the sequence actually moved — so a peer that is being sent
+    /// duplicates cannot hold the stage open by re-sending, which is precisely
+    /// what the re-send loop does every five seconds.
+    fn mark_stage(&mut self, now_ms: u64) {
+        if self.slot.sequence != self.stage_seq {
+            self.stage_seq = self.slot.sequence;
+            self.stage_at_ms = now_ms;
+        }
     }
 
     /// `GENESIS(k)`: what this hand's first stage hangs off.

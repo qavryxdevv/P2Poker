@@ -343,7 +343,8 @@ pub async fn run(
     // CRYPTOGRAPHIC stage has in version 1: nobody votes and nobody certifies,
     // so each peer runs its own timer and the abort is buffered at a receiver
     // until that receiver's own timer agrees.
-    let mut hand_by: Option<tokio::time::Instant> = None;
+    let mut stall = tokio::time::interval(std::time::Duration::from_secs(2));
+    stall.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // This client's own contribution to the stage now open, and the sequence
     // it belongs to.
     //
@@ -678,8 +679,7 @@ pub async fn run(
                                                         o,
                                                         &app_key,
                                                         &mut hand,
-                                                        &mut hand_by,
-                                                        &mut said,
+                                                                                            &mut said,
                                                         &mut swarm,
                                                         table_topic.as_ref(),
                                                         &events,
@@ -732,7 +732,6 @@ pub async fn run(
                         said.clear();
                         next_hand_at = None;
                         act_by = None;
-                        hand_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -762,7 +761,6 @@ pub async fn run(
                         said.clear();
                         next_hand_at = None;
                         act_by = None;
-                        hand_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -871,9 +869,8 @@ pub async fn run(
                                         // are read from a complete set of
                                         // verified shares or not at all, so
                                         // there is no partial state to report.
-                                                if h.aborted().is_some() && hand_by.is_some() {
-                                            hand_by = None;
-                                            act_by = None;
+                                                if h.aborted().is_some() {
+                                                                act_by = None;
                                             let _ = events
                                                 .send(NodeEvent::Warning(
                                                     "a peer ended the hand on its own deadline;                                                      every stack is restored"
@@ -976,8 +973,7 @@ pub async fn run(
                                                 o,
                                                 &app_key,
                                                 &mut hand,
-                                                &mut hand_by,
-                                                &mut said,
+                                                                            &mut said,
                                                 &mut swarm,
                                                 table_topic.as_ref(),
                                                 &events,
@@ -1838,7 +1834,6 @@ pub async fn run(
                         said.clear();
                         next_hand_at = None;
                         act_by = None;
-                        hand_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -1914,7 +1909,6 @@ pub async fn run(
                         said.clear();
                         next_hand_at = None;
                         act_by = None;
-                        hand_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
@@ -1941,17 +1935,16 @@ pub async fn run(
                 }
             }
 
-            // The hand's own deadline. Nobody produced what a stage needed.
-            () = async {
-                match hand_by {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
-                }
-            }, if hand_by.is_some() => {
-                hand_by = None;
-                act_by = None;
-                let Some(h) = hand.as_mut() else { continue };
+            // A stage that nobody is completing. Polled rather than armed:
+            // the answer changes every time a stage opens or closes, and the
+            // cryptographic ones are bounded per stage rather than per hand.
+            _ = stall.tick() => {
                 let now = super::node::now_unix_ms();
+                let Some(h) = hand.as_mut() else { continue };
+                if !h.may_abandon(now) {
+                    continue;
+                }
+                act_by = None;
                 match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
                     Ok(sends) => {
                         publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said);
@@ -2039,8 +2032,7 @@ pub async fn run(
                             opening,
                             &app_key,
                             &mut hand,
-                            &mut hand_by,
-                            &mut said,
+                                    &mut said,
                             &mut swarm,
                             table_topic.as_ref(),
                             &events,
@@ -2511,9 +2503,6 @@ async fn begin_hand(
     opening: crate::table::hand::Opening,
     app_key: &ed25519_dalek::SigningKey,
     hand: &mut Option<crate::table::hand::Hand>,
-    // Armed here rather than by the caller, so that no road into a hand can
-    // start one without a terminus.
-    deadline_at: &mut Option<tokio::time::Instant>,
     said: &mut Vec<Vec<u8>>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
     topic: Option<&gossipsub::IdentTopic>,
@@ -2553,7 +2542,6 @@ async fn begin_hand(
                     seats: h.waiting_for(),
                 })
                 .await;
-            *deadline_at = Some(tokio::time::Instant::now() + h.hand_deadline());
             *hand = Some(h);
         }
         Err(e) => {
