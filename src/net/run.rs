@@ -327,7 +327,7 @@ pub async fn run(
     let mut cards_reported = false;
     // The last turn told to the interface, so a stage per action does not
     // become a redraw per action.
-    let mut turn_reported: Option<(Option<u8>, u64, u64)> = None;
+    let mut turn_reported: Option<(Option<u8>, u64, u64, bool)> = None;
     // When the next hand may start. D-020's hold, and the only timer in this
     // loop that is about a person rather than about the network.
     let mut next_hand_at: Option<tokio::time::Instant> = None;
@@ -339,6 +339,15 @@ pub async fn run(
     // seat that goes quiet in a *cryptographic* stage has no answer here at
     // all, and that is `hand_deadline_ms`, which is not built.
     let mut act_by: Option<tokio::time::Instant> = None;
+    // Whether this table has ever dealt a hand.
+    //
+    // The two roads into the first hand fire again on **every later table
+    // message**, and they are idempotent only because `hand.is_some()` guards
+    // them. Between hands, and after the last one, `hand` is `None` and that
+    // guard is open — so without this the next table message would deal hand
+    // one again, on a table that has already played it, with stacks from the
+    // roster rather than from the chain.
+    let mut ever_dealt = false;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
 
     // Who mDNS has already told us about.
@@ -624,6 +633,8 @@ pub async fn run(
                                             // must stay as findable as it was.
                                             table_closed = table_is_closed(f, &mut tournament_started);
                                             dht_effort(&mut swarm, table_closed);
+                                            if !ever_dealt {
+                                            ever_dealt = true;
                                             begin_hand(
                                                 match opening_for_hand_one(f) {
                                                     Some(o) => o,
@@ -636,6 +647,7 @@ pub async fn run(
                                                 &events,
                                             )
                                             .await;
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -818,15 +830,14 @@ pub async fn run(
                                         // are read from a complete set of
                                         // verified shares or not at all, so
                                         // there is no partial state to report.
-                                        if let Some(end) = report_hand(h, &events, &mut turn_reported).await {
-                                    next_hand_at = Some(
-                                        tokio::time::Instant::now() + end.pause(),
-                                    );
-                                }
-                                        act_by = h
-                                            .turn()
-                                            .filter(|t| t.mine)
-                                            .map(|_| tokio::time::Instant::now() + h.action_timeout());
+                                                let report =
+                                            report_hand(h, &events, &mut turn_reported).await;
+                                        if let Some(end) = report.ended {
+                                            next_hand_at = Some(
+                                                tokio::time::Instant::now() + end.pause(),
+                                            );
+                                        }
+                                        act_by = report.clock.apply(act_by, h.action_timeout());
                                         if let Some(cards) = h.cards().filter(|_| !cards_reported) {
                                             cards_reported = true;
                                             let _ = events
@@ -902,6 +913,8 @@ pub async fn run(
                                     // sites start the hand, and `begin_hand` is
                                     // idempotent, because this one fires again
                                     // on every later table message.
+                                    if !ever_dealt {
+                                    ever_dealt = true;
                                     begin_hand(
                                         match opening_for_hand_one(f) {
                                             Some(o) => o,
@@ -914,6 +927,7 @@ pub async fn run(
                                         &events,
                                     )
                                     .await;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -1808,19 +1822,13 @@ pub async fn run(
                                             .publish(t.clone(), out);
                                     }
                                 }
-                                if let Some(end) = report_hand(h, &events, &mut turn_reported).await {
-                                    next_hand_at = Some(
-                                        tokio::time::Instant::now() + end.pause(),
-                                    );
+                                let report =
+                                    report_hand(h, &events, &mut turn_reported).await;
+                                if let Some(end) = report.ended {
+                                    next_hand_at =
+                                        Some(tokio::time::Instant::now() + end.pause());
                                 }
-                                // Armed when it is this client's turn again -
-                                // which heads-up is immediately, on the next
-                                // street - and disarmed otherwise, so a clock
-                                // never runs against a seat that is not up.
-                                act_by = h
-                                    .turn()
-                                    .filter(|t| t.mine)
-                                    .map(|_| tokio::time::Instant::now() + h.action_timeout());
+                                act_by = report.clock.apply(act_by, h.action_timeout());
                             }
                             // The player's own engine refused it, which means
                             // the window offered something it should not have.
@@ -1888,12 +1896,11 @@ pub async fn run(
                                 "your clock ran out — {action:?} for you"
                             )))
                             .await;
-                        if let Some(end) = report_hand(h, &events, &mut turn_reported).await {
+                        let report = report_hand(h, &events, &mut turn_reported).await;
+                        if let Some(end) = report.ended {
                             next_hand_at = Some(tokio::time::Instant::now() + end.pause());
                         }
-                        if h.turn().is_some_and(|t| t.mine) {
-                            act_by = Some(tokio::time::Instant::now() + h.action_timeout());
-                        }
+                        act_by = report.clock.apply(act_by, h.action_timeout());
                     }
                     Err(e) => {
                         let _ = events
@@ -2450,19 +2457,28 @@ fn opening_for_hand_one(f: &Formation) -> Option<crate::table::hand::Opening> {
 async fn report_hand(
     h: &crate::table::hand::Hand,
     events: &mpsc::Sender<NodeEvent>,
-    last: &mut Option<(Option<u8>, u64, u64)>,
-) -> Option<Ended> {
+    last: &mut Option<(Option<u8>, u64, u64, bool)>,
+) -> Report {
     let hand_id = h.hand_id();
     let turn = h.turn();
+    // The hand being **over** is part of the key. Without it, a fold-out reads
+    // as `(nobody to act, this pot, this board)` both when the fold is applied
+    // and again when the settlement completes — the same tuple, so the second
+    // was suppressed and `HandEnded` was never sent. The hand ended on one peer
+    // and hung on the other, which is exactly what was measured.
     let now = (
         turn.as_ref().map(|t| t.seat),
         h.pot(),
         h.board().len() as u64,
+        h.betting_over(),
     );
     if *last == Some(now) {
-        return None;
+        // Nothing new. In particular the clock is **not** re-armed: a mesh
+        // redelivers, and a duplicate that reset the deadline every time would
+        // be a clock that never runs out.
+        return Report::default();
     }
-    let board_changed = last.map(|(_, _, b)| b) != Some(now.2);
+    let board_changed = last.map(|(_, _, b, _)| b) != Some(now.2);
     *last = Some(now);
 
     if board_changed {
@@ -2490,6 +2506,10 @@ async fn report_hand(
                     max_raise_to: t.legal.max_raise_to,
                 })
                 .await;
+            return Report {
+                ended: None,
+                clock: Clock::Start,
+            };
         }
         Some(t) => {
             let _ = events
@@ -2498,6 +2518,10 @@ async fn report_hand(
                     seat: Some(t.seat),
                 })
                 .await;
+            return Report {
+                ended: None,
+                clock: Clock::Stop,
+            };
         }
         None => {
             let _ = events
@@ -2516,11 +2540,57 @@ async fn report_hand(
                         shown,
                     })
                     .await;
-                return Some(Ended { anybody_showed });
+                return Report {
+                    ended: Some(Ended { anybody_showed }),
+                    clock: Clock::Stop,
+                };
             }
         }
     }
-    None
+    Report {
+        ended: None,
+        clock: Clock::Stop,
+    }
+}
+
+/// What one report says.
+#[derive(Default)]
+struct Report {
+    /// The hand ended, and whether anything was shown.
+    ended: Option<Ended>,
+    /// What to do with this client's own clock.
+    clock: Clock,
+}
+
+/// What a report says about the clock.
+///
+/// Three answers and not two, because "nothing changed" must not be confused
+/// with "stop": a redelivered message reports nothing, and a clock that was
+/// restarted on every redelivery would never run out.
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum Clock {
+    /// It is newly this client's turn: start counting.
+    Start,
+    /// It is not this client's turn: stop.
+    Stop,
+    /// Nothing changed. Leave the clock exactly as it is.
+    #[default]
+    Leave,
+}
+
+impl Clock {
+    /// The new deadline, given the old one.
+    fn apply(
+        self,
+        was: Option<tokio::time::Instant>,
+        timeout: std::time::Duration,
+    ) -> Option<tokio::time::Instant> {
+        match self {
+            Clock::Start => Some(tokio::time::Instant::now() + timeout),
+            Clock::Stop => None,
+            Clock::Leave => was,
+        }
+    }
 }
 
 impl Ended {
