@@ -354,6 +354,10 @@ pub async fn run(
     // When this client last re-published its table for a newcomer, so a rush of
     // arrivals is one publish rather than one each.
     let mut last_lobby_shout: Option<tokio::time::Instant> = None;
+
+    // Whether this client is at a table. Drives `dht_effort`, and stops the
+    // lobby being polled by somebody who is not reading it.
+    let mut at_a_table = false;
     let mut have_reservation = false;
     // Counted so that "no relay" is reported as a finding rather than as
     // impatience: three cycles is three minutes of looking.
@@ -549,6 +553,8 @@ pub async fn run(
                                                 key: f.table_id(),
                                                 session,
                                             }).await;
+                                            at_a_table = true;
+                                            dht_effort(&mut swarm, true);
                                         }
                                     }
                                     Err(e) => {
@@ -584,7 +590,9 @@ pub async fn run(
                                     }
                                     Err(e) => {
                                         table = None;
-                                        let _ = events.send(NodeEvent::LeftTable {
+                                        at_a_table = false;
+                        dht_effort(&mut swarm, false);
+                        let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
                                         }).await;
                                     }
@@ -602,6 +610,8 @@ pub async fn run(
                         if let Some(t) = table_topic.take() {
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
+                        at_a_table = false;
+                        dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
                         }).await;
@@ -1145,7 +1155,9 @@ pub async fn run(
                 // gives it a circuit, so announcing before then is a packet
                 // sent to be discarded, and the lobby it thinks it joined
                 // has never heard of it.
-                if asked_public_dht {
+                // Not while seated: the lobby is a screen this player is not
+                // looking at, and each read is a Kademlia walk.
+                if asked_public_dht && !at_a_table {
                     let reachable_here = swarm.external_addresses().next().is_some();
                     if reachable_here && !in_public_lobby {
                         match swarm.behaviour_mut().ipfs_kad.start_providing(lobby_namespace())
@@ -1424,7 +1436,9 @@ pub async fn run(
                                 swarm.behaviour_mut().join.send_request(&founder, request);
                             }
                             Err(e) => {
-                                let _ = events.send(NodeEvent::LeftTable {
+                                at_a_table = false;
+                        dht_effort(&mut swarm, false);
+                        let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
                                 }).await;
                             }
@@ -1450,6 +1464,8 @@ pub async fn run(
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
                         table = None;
+                        at_a_table = false;
+                        dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
                         }).await;
@@ -1861,6 +1877,32 @@ fn harvest(
         }
     }
     out
+}
+
+/// Turn the public DHT down while a player is at a table, and up again after.
+///
+/// **Down, not off.** Leaving the network entirely would cost the table its
+/// advertisement — a founder that stops re-broadcasting disappears from every
+/// lobby and nobody else can join — and it would cost the relay reservation,
+/// which took two to three minutes to obtain. Coming back would mean the whole
+/// bootstrap again.
+///
+/// What is turned down is the part that is pure service to strangers: in server
+/// mode this node answers Kademlia queries for the whole public network, and at
+/// a table that is bandwidth taken from the game. Client mode keeps every query
+/// this client makes and stops every query it answers. It is one field, and it
+/// goes back up the moment the player stands.
+fn dht_effort(swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>, at_a_table: bool) {
+    let kad = &mut swarm.behaviour_mut().ipfs_kad;
+    if at_a_table {
+        kad.set_mode(Some(libp2p::kad::Mode::Client));
+    } else {
+        // `None` is not "client": it restores libp2p's own rule, which is
+        // server once there is a confirmed external address. Pinning it to
+        // server here would make a NATed client claim to serve queries it
+        // cannot be reached for.
+        kad.set_mode(None);
+    }
 }
 
 /// A GossipSub source as the thirty-two bytes a rate limiter is keyed on.
