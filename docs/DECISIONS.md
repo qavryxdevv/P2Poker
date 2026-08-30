@@ -2170,3 +2170,78 @@ the pause. The reasons:
 * The hold covers the **revealed** hole cards and the board together, because a
   hand is read from both. Nothing about it changes which cards exist.
 
+---
+
+## D-021 — the showdown runs in TDA order, and a beaten hand may muck
+
+Decided 2026-08-30, on the owner's instruction. This **resolves** the open
+question carried as `STATE_MACHINE.md` Q1 and `PROTOCOL.md` Q-01, whose named
+default until now was `MandatoryReveal` — chosen as implementation order, not
+as a decision. The decision is:
+
+    config.showdown_policy = TdaMuckWithForfeiture
+
+### The order
+
+The last **aggressor** of the final betting round shows first. If nobody bet on
+that round, the first seat still in the hand, clockwise from the button, shows
+first. Everybody else follows clockwise from there. This is TDA's rule and it
+is what a tournament player expects; a client that opened every hand at once
+would be showing cards in an order the table did not agree to.
+
+A seat that is not first to show, and cannot beat what is already exposed, may
+**muck**: it forfeits every pot, irrevocably, and its cards are never opened.
+That is `STATE_MACHINE.md`'s T43, which exists only under this policy. A seat
+that *can* beat what is exposed and wants the pot must show.
+
+### Why this is cheap here, contrary to what §7.7 assumed
+
+`STATE_MACHINE.md` §7.7 kept `MandatoryReveal` as the MVP because it is *"the
+only option that needs no additional cryptography"*. Under the shipped design
+that is not the distinguishing property, because **a muck is the absence of a
+message and not the presence of one**.
+
+Every hole card is one reveal share short for everybody except its owner
+(`PROTOCOL.md` §3.4). Showing means publishing your own share; mucking means
+not publishing it. There is nothing to forge, nothing to verify and no new
+primitive: a mucked hand cannot be opened by an honest peer, a modified peer, or
+every other peer at the table acting together. The forfeiture is enforced the
+same way — a seat with no share on the transcript is a seat no settlement can
+award a pot to.
+
+### What it does cost, stated plainly
+
+* **The showdown becomes sequential.** Under `MandatoryReveal` it is one
+  collective stage; under this policy it is one single-writer stage per seat, in
+  an order derived from the betting. That is up to `m` round trips where there
+  was one, and each needs its own deadline.
+* **The hand driver has to track the aggressor.** `poker::actions` deliberately
+  does not (`src/poker/actions.rs:113`) — its legality predicate has no use for
+  it. The driver keeps it, because the showdown order is the one place the
+  identity of the last aggressor changes what happens.
+* **A stalled showdown is a stalled hand.** A seat that neither shows nor mucks
+  is the ordinary crypto-stall case and ends at the hand deadline (T57), with
+  every stack restored. No new terminus.
+* **`HAND_COMPLETE` ranks only the hands that were shown.** Under
+  `MandatoryReveal` the settlement is derivable from a transcript that contains
+  every hand; here it is derivable from a transcript that contains the shown
+  ones and a muck for each of the rest, which is equally complete and equally
+  checkable — but it is a different derivation and the two must not be confused.
+
+### The client may muck for its owner
+
+The owner's words were *"if they find out they have lost, they muck"*. So a
+client that is not first to show and whose hand cannot beat what is exposed
+mucks **by default**, without asking. TDA permits showing anyway and the option
+stays on the screen, because a player who wants to show a bluff is entitled to,
+and a client that silently mucked it would have taken a decision that was not
+its own.
+
+### Interaction with D-020
+
+The five-second hold starts when the **showdown is over** — every seat has
+shown or mucked — and not at the first reveal. Holding from the first show
+would freeze the table in the middle of a sequence the player is watching
+unfold. What is held is what the transcript ended with: the hands that were
+shown, and the board.
+
