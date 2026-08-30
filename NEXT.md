@@ -417,6 +417,15 @@ D-010 is enforced at the **receiver**: an abort whose deltas are not all zero,
 or whose `final_stacks` are not this receiver's own start-of-hand stacks, is
 refused whoever signed it.
 
+**The abort path is unit-tested and has never run over the network, and it
+cannot be seen in a short run by design.** `sng_hand_deadline_ms` gives a
+three-seat table tens of minutes — the rated ten-handed value is 3 300 000 ms —
+because `STATE_MACHINE.md` budgets a whole legal hand of human action time plus
+one reopening. That is the accepted cost of D-015 deleting the certificate
+path: *"a stalled hand takes tens of minutes to end rather than seconds"*.
+Exercising it against two real processes needs a run of that length, or a table
+advertising a shorter deadline than any preset offers.
+
 ### What is next, in order
 
 1. **Three seats and more over the real network.** Everything measured so far
