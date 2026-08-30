@@ -325,6 +325,9 @@ pub async fn run(
     let mut deck_reported: Option<(Option<u8>, bool)> = None;
     // Whether this hand's own cards have been handed to the interface.
     let mut cards_reported = false;
+    // The last turn told to the interface, so a stage per action does not
+    // become a redraw per action.
+    let mut turn_reported: Option<(Option<u8>, u64, u64)> = None;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
 
     // Who mDNS has already told us about.
@@ -660,6 +663,7 @@ pub async fn run(
                         hand_reported = false;
                         deck_reported = None;
                         cards_reported = false;
+                        turn_reported = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -685,6 +689,7 @@ pub async fn run(
                         hand_reported = false;
                         deck_reported = None;
                         cards_reported = false;
+                        turn_reported = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -795,6 +800,7 @@ pub async fn run(
                                         // are read from a complete set of
                                         // verified shares or not at all, so
                                         // there is no partial state to report.
+                                        report_hand(h, &events, &mut turn_reported).await;
                                         if let Some(cards) = h.cards().filter(|_| !cards_reported) {
                                             cards_reported = true;
                                             let _ = events
@@ -1728,6 +1734,7 @@ pub async fn run(
                         hand_reported = false;
                         deck_reported = None;
                         cards_reported = false;
+                        turn_reported = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -1750,6 +1757,40 @@ pub async fn run(
                         }
                     }
 
+                    NodeCommand::Act(action) => {
+                        let Some(h) = hand.as_mut() else {
+                            let _ = events
+                                .send(NodeEvent::Warning(
+                                    "there is no hand to act in".into(),
+                                ))
+                                .await;
+                            continue;
+                        };
+                        let now = super::node::now_unix_ms();
+                        match h.act(action, &app_key, now) {
+                            Ok(sends) => {
+                                if let Some(t) = &table_topic {
+                                    for crate::table::hand::Send::Broadcast(out) in sends {
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .gossipsub
+                                            .publish(t.clone(), out);
+                                    }
+                                }
+                                report_hand(h, &events, &mut turn_reported).await;
+                            }
+                            // The player's own engine refused it, which means
+                            // the window offered something it should not have.
+                            // Reported rather than swallowed: a button that
+                            // does nothing is worse than one that explains.
+                            Err(e) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!("that action: {e}")))
+                                    .await;
+                            }
+                        }
+                    }
+
                     NodeCommand::LeaveTable => {
                         if let Some(t) = table_topic.take() {
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
@@ -1761,6 +1802,7 @@ pub async fn run(
                         hand_reported = false;
                         deck_reported = None;
                         cards_reported = false;
+                        turn_reported = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
@@ -2254,6 +2296,85 @@ async fn begin_hand(
             let _ = events
                 .send(NodeEvent::Warning(format!("the hand could not start: {e}")))
                 .await;
+        }
+    }
+}
+
+/// Tell the interface where the hand is, when it has moved.
+///
+/// One function rather than a block at each call site, because the two call
+/// sites - an event arriving and this client acting - must say the same thing.
+/// The comparison against the last report is what keeps a stage per action from
+/// becoming a redraw per action.
+async fn report_hand(
+    h: &crate::table::hand::Hand,
+    events: &mpsc::Sender<NodeEvent>,
+    last: &mut Option<(Option<u8>, u64, u64)>,
+) {
+    let hand_id = h.hand_id();
+    let turn = h.turn();
+    let now = (
+        turn.as_ref().map(|t| t.seat),
+        h.pot(),
+        h.board().len() as u64,
+    );
+    if *last == Some(now) {
+        return;
+    }
+    let board_changed = last.map(|(_, _, b)| b) != Some(now.2);
+    *last = Some(now);
+
+    if board_changed {
+        let _ = events
+            .send(NodeEvent::Board {
+                hand_id,
+                cards: h.board().iter().map(|c| c.index()).collect(),
+            })
+            .await;
+    }
+
+    match turn {
+        Some(t) if t.mine => {
+            let _ = events
+                .send(NodeEvent::YourTurn {
+                    hand_id,
+                    street: t.street as u16,
+                    to_call: t.to_call,
+                    pot: t.pot,
+                    can_check: t.legal.can_check,
+                    can_call: t.legal.can_call,
+                    can_bet: t.legal.can_bet,
+                    can_raise: t.legal.can_raise,
+                    min_raise_to: t.legal.min_raise_to,
+                    max_raise_to: t.legal.max_raise_to,
+                })
+                .await;
+        }
+        Some(t) => {
+            let _ = events
+                .send(NodeEvent::NotYourTurn {
+                    hand_id,
+                    seat: Some(t.seat),
+                })
+                .await;
+        }
+        None => {
+            let _ = events
+                .send(NodeEvent::NotYourTurn { hand_id, seat: None })
+                .await;
+            if h.betting_over() {
+                let seats = u8::try_from(h.stacks().len()).unwrap_or(0);
+                let shown = (0..seats)
+                    .map(|s| h.shown(s).map(|c| [c[0].index(), c[1].index()]))
+                    .collect();
+                let _ = events
+                    .send(NodeEvent::HandEnded {
+                        hand_id,
+                        stacks: h.stacks(),
+                        shown,
+                    })
+                    .await;
+            }
         }
     }
 }

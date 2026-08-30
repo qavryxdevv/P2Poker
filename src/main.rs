@@ -865,13 +865,30 @@ impl Client {
             self.screen = Screen::Lobby;
             self.table_closed = true;
         }
-        match action {
-            p2p_poker::gui::table::TableAction::None
-            | p2p_poker::gui::table::TableAction::BackToLobby => {}
-            other => self
-                .state
-                .log
-                .push_back(format!("{other:?} is not wired to the engine yet")),
+        // The button, straight to the engine. The action is checked by this
+        // client's own `BettingRound` before anything is sealed and by every
+        // receiver against its own afterwards, and the two are the same code —
+        // so a button that offered something illegal fails here rather than on
+        // the wire.
+        use p2p_poker::gui::table::TableAction as Ta;
+        use p2p_poker::poker::actions::Action;
+        let played = match action {
+            Ta::Fold => Some(Action::Fold),
+            Ta::Check => Some(Action::Check),
+            Ta::Call => Some(Action::Call),
+            // The bar hands back a **total for the round**, which is what the
+            // wire carries and what the engine takes. Whether that total opens
+            // the betting or raises it is the engine's to know, not the
+            // window's, and asking the window would be a second opinion that
+            // can disagree.
+            Ta::Raise(total) => Some(match self.state.hand.as_ref().and_then(|h| h.turn) {
+                Some(t) if t.can_bet => Action::Bet(total),
+                _ => Action::Raise(total),
+            }),
+            Ta::None | Ta::BackToLobby => None,
+        };
+        if let Some(a) = played {
+            self.tell(p2p_poker::net::node::NodeCommand::Act(a));
         }
     }
 
@@ -922,6 +939,25 @@ impl Client {
         TableView {
             name,
             blinds,
+            can_act: hand.and_then(|h| h.turn).is_some(),
+            to_call: hand.and_then(|h| h.turn).map(|t| t.to_call).unwrap_or(0),
+            min_raise: hand
+                .and_then(|h| h.turn)
+                .filter(|t| t.can_bet || t.can_raise)
+                .map(|t| t.min_raise_to)
+                .unwrap_or(0),
+            max_raise: hand
+                .and_then(|h| h.turn)
+                .filter(|t| t.can_bet || t.can_raise)
+                .map(|t| t.max_raise_to)
+                .unwrap_or(0),
+            pot: hand.and_then(|h| h.turn).map(|t| t.pot).unwrap_or(0),
+            to_act: hand.and_then(|h| {
+                h.turn
+                    .map(|_| seat.seat.unwrap_or(0))
+                    .or(h.waiting_on)
+            }),
+            board: board_cards(hand),
             street: match (hand, seat.session.is_some()) {
                 (Some(h), _) if h.cards.is_some() => "pre-flop".into(),
                 (Some(h), _) if h.deck_ready => "deck sealed".into(),
@@ -980,6 +1016,28 @@ impl Client {
                 .push_back("the node is busy; try that again".into());
         }
     }
+}
+
+/// The five board slots.
+///
+/// A card is face-up only where one has actually been opened — three after the
+/// flop, four after the turn, five after the river — and `Facing::Empty` for
+/// the rest. There is no back on the board: an unopened board card is not a
+/// card somebody is holding, it is a card that does not exist yet.
+fn board_cards(
+    hand: Option<&p2p_poker::app::HandInProgress>,
+) -> [p2p_poker::gui::table::Facing; 5] {
+    use p2p_poker::gui::table::Facing;
+    let mut out = [Facing::Empty; 5];
+    let Some(h) = hand else {
+        return out;
+    };
+    for (slot, index) in out.iter_mut().zip(h.board.iter()) {
+        if let Ok(card) = p2p_poker::poker::state::Card::from_index(*index) {
+            *slot = Facing::up(card, true);
+        }
+    }
+    out
 }
 
 /// What to draw in one seat's two card slots.

@@ -45,6 +45,14 @@ use crate::protocol::constants::AD_REBROADCAST_MS;
 /// [`NodeEvent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCommand {
+    /// Act on this client's own turn.
+    ///
+    /// The action is the player's, and it is checked twice: once here by the
+    /// hand's own engine before anything is sealed, and again by every receiver
+    /// against its own. The two are the same code, so a button that offered
+    /// something illegal would fail at the first of them rather than reaching
+    /// the wire.
+    Act(crate::poker::actions::Action),
     /// Say something in the lobby.
     ///
     /// The text is whatever was typed. It is trimmed and capped where it is
@@ -182,6 +190,35 @@ pub enum NodeEvent {
         hand_id: u64,
         shuffling: Option<u8>,
         ready: bool,
+    },
+    /// It is this client's turn, and this is what it may do.
+    ///
+    /// Sent when the answer changes and not on every event: the betting is a
+    /// stage per action, and a window redrawing on each one would flicker
+    /// through states nobody acted in.
+    YourTurn {
+        hand_id: u64,
+        street: u16,
+        to_call: u64,
+        pot: u64,
+        can_check: bool,
+        can_call: bool,
+        can_bet: bool,
+        can_raise: bool,
+        min_raise_to: u64,
+        max_raise_to: u64,
+    },
+    /// Somebody else is to act, or nobody is.
+    NotYourTurn { hand_id: u64, seat: Option<u8> },
+    /// A street opened and these are the cards on it.
+    Board { hand_id: u64, cards: Vec<u8> },
+    /// The hand is over.
+    HandEnded {
+        hand_id: u64,
+        /// Final stacks by seat.
+        stacks: Vec<u64>,
+        /// What each seat showed, by seat; `None` for folded and mucked.
+        shown: Vec<Option<[u8; 2]>>,
     },
     /// This client's own two cards, opened from a complete set of verified
     /// shares.
@@ -322,6 +359,10 @@ impl NodeEvent {
             | Self::DeckProgress { .. }
             | Self::HoleCards { .. }
             | Self::CardsDealt { .. }
+            | Self::YourTurn { .. }
+            | Self::NotYourTurn { .. }
+            | Self::Board { .. }
+            | Self::HandEnded { .. }
             | Self::JoinRefused { .. }
             | Self::LeftTable { .. }
             // The lobby list and the counters above it.

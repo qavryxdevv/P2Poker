@@ -78,6 +78,36 @@ pub struct HandInProgress {
     pub cards: Option<[u8; 2]>,
     /// The seats holding cards, so the table can draw backs at the others.
     pub holding: Vec<u8>,
+    /// The board, as deck indices, as far as it has opened.
+    pub board: Vec<u8>,
+    /// What this client may do, if it is its turn.
+    pub turn: Option<MyTurn>,
+    /// Whose turn it is, when it is not this client's.
+    pub waiting_on: Option<u8>,
+    /// Final stacks, once the hand has been settled.
+    pub stacks: Vec<u64>,
+    /// What each seat showed at the showdown, by seat.
+    pub shown: Vec<Option<[u8; 2]>>,
+    /// Whether the hand is over.
+    pub over: bool,
+}
+
+/// What this client may do on its own turn.
+///
+/// A copy of what the engine said, taken at one instant. The window draws from
+/// this and never recomputes any of it: the only place a legal action is
+/// decided is `poker::actions`, and a second opinion here would be a second
+/// opinion that can be wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MyTurn {
+    pub to_call: u64,
+    pub pot: u64,
+    pub can_check: bool,
+    pub can_call: bool,
+    pub can_bet: bool,
+    pub can_raise: bool,
+    pub min_raise_to: u64,
+    pub max_raise_to: u64,
 }
 
 /// Everything the client knows, in the form the panes read it.
@@ -269,6 +299,12 @@ impl AppState {
                     deck_ready: false,
                     cards: None,
                     holding: Vec::new(),
+                    board: Vec::new(),
+                    turn: None,
+                    waiting_on: None,
+                    stacks: Vec::new(),
+                    shown: Vec::new(),
+                    over: false,
                 });
                 self.waiting_for.clear();
                 self.note(format!("hand #{hand_id} has begun"));
@@ -287,6 +323,63 @@ impl AppState {
                     (Some(s), _) => format!("hand #{hand_id}: seat {s} is shuffling"),
                     (None, false) => format!("hand #{hand_id}: the deck is being prepared"),
                 });
+            }
+            NodeEvent::YourTurn {
+                hand_id,
+                street,
+                to_call,
+                pot,
+                can_check,
+                can_call,
+                can_bet,
+                can_raise,
+                min_raise_to,
+                max_raise_to,
+            } => {
+                let _ = street;
+                if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
+                    h.turn = Some(MyTurn {
+                        to_call,
+                        pot,
+                        can_check,
+                        can_call,
+                        can_bet,
+                        can_raise,
+                        min_raise_to,
+                        max_raise_to,
+                    });
+                    h.waiting_on = None;
+                }
+                self.log.push_back(if to_call > 0 {
+                    format!("hand #{hand_id}: your turn — {to_call} to call")
+                } else {
+                    format!("hand #{hand_id}: your turn")
+                });
+            }
+            NodeEvent::NotYourTurn { hand_id, seat } => {
+                if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
+                    h.turn = None;
+                    h.waiting_on = seat;
+                }
+            }
+            NodeEvent::Board { hand_id, cards } => {
+                if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
+                    h.board = cards;
+                }
+            }
+            NodeEvent::HandEnded {
+                hand_id,
+                stacks,
+                shown,
+            } => {
+                if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
+                    h.stacks = stacks;
+                    h.shown = shown;
+                    h.over = true;
+                    h.turn = None;
+                    h.waiting_on = None;
+                }
+                self.log.push_back(format!("hand #{hand_id} is over"));
             }
             NodeEvent::CardsDealt { hand_id, seats } => {
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
