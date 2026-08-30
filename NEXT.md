@@ -3,7 +3,7 @@
 Updated 2026-08-30.
 
     cargo clippy --all-targets --release        0 warnings
-    cargo test --release -- --test-threads=19   636 unit + 54 harness, 0 failed
+    cargo test --release -- --test-threads=19   638 unit + 54 harness, 0 failed
     tools/check-portable.ps1                    8/8, 27.5 MB
 
     RUST_LOG=libp2p_kad=debug,libp2p_relay=debug ./target/release/p2p-poker --headless
@@ -252,19 +252,50 @@ Two quantities live in `Play` because the engine does not hold them:
   *skipped* — which is what makes it the right seat to show first after an
   all-in run-out where the last streets had no betting (D-021).
 
-### What is next in the hand, in order
+### A whole hand plays out
 
-1. Showdown: `SHOWDOWN_REVEAL` / `SHOWDOWN_MUCK` as **one collective stage**
-   (D-021 — the order is an emission discipline, not extra stages), then the
-   settlement and `HAND_COMPLETE`.
+Two clients go from an empty table to a settled hand: four streets, five board
+cards, a showdown in TDA order, and the chips moving. Twelve runs over random
+decks assert chips conserved, the pot to the best hand shown, and a tie split
+back.
+
+The showdown is **one collective stage**, which is `PROTOCOL.md` §4.6's shape:
+`SHOWDOWN_REVEAL` and `SHOWDOWN_MUCK` are the only `event_class = 0` pair that
+shares a `sequence`. TDA order is an **emission discipline** — a client waits
+until every seat ahead of it has spoken, then speaks — so no extra stages, no
+extra deadlines, and a seat that speaks early has committed a live-poker
+irregularity and nothing more.
+
+A beaten hand mucks without asking. Three things force a show and all three are
+rules: being first, anybody being all in (TDA 16), and not being beaten — a tie
+shows, because a split pot is won by showing. A muck is the **absence** of a
+share, so no peer can open that hand and the forfeiture needs no enforcement.
+
+### The gap: no buttons
+
+`Hand::act` exists and `Hand::turn` says what is legal, and **nothing in the
+client calls either**. `src/net/run.rs` drives the hand from arriving events;
+there is no path from a click to an action. That is the next thing a player
+would notice, and it is small: the table window has the seats and the pot
+already.
+
+### What is next, in order
+
+1. **The action buttons.** `turn()` → three or four buttons and a raise slider;
+   the click calls `act()` and `run.rs` publishes what it returns.
 2. Hand `k+1`: `TERMINAL(k)`, `GENESIS(k+1)`, the dead-button rotation via
-   `engine::advance_positions`, and D-020's five-second hold before it starts.
-3. The RNG beacon, replacing `provisional_button`.
-4. The stage-timeout path. Every stage seals a `next_deadline_ms` from the
-   table's own parameters and nothing yet acts when one passes.
-5. `STATE_HASH` / `STATE_ACK` checkpoints, including checkpoint 8 at the hand
-   boundary — without it `PROTOCOL.md` §12 says T61 fires at `hand_deadline_ms`
-   after every settled hand.
+   `engine::advance_positions` — which exists, is tested, and is still called by
+   nothing — and D-020's five-second hold before the next deal starts.
+3. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
+   carried inside `HAND_COMPLETE`; the checkpoint **stage** is not there, and
+   `PROTOCOL.md` §12 says T61 then fires at `hand_deadline_ms` after every
+   settled hand.
+4. The RNG beacon, replacing `provisional_button`.
+5. The stage-timeout path. Every stage seals a `next_deadline_ms` and nothing
+   yet acts when one passes.
+6. A hand between two real processes over GossipSub. Everything above is proved
+   between two states in one test; the transport has never carried a
+   `SHUFFLE_PROOF`.
 
 ### Four defects found by pointing a critic at the design, not at the code
 
