@@ -343,24 +343,43 @@ chain alone — settled stacks, `TERMINAL(k)`, `P(k)` — and two peers agree on
 through `engine::advance_positions`. D-020's hold sits between the hands: five
 seconds when somebody showed, a beat when everybody folded.
 
-And there is a clock. A seat that goes quiet in a **betting** stage is answered
-by its own client checking or folding for it — version 1 has no `TIMEOUT_VOTE`
-and no `TIMEOUT_CERT` (D-015), so that is the whole of the answer, and a seat
-that goes quiet in a **cryptographic** stage still has none.
+And there are two clocks. A seat that goes quiet in a **betting** stage is
+answered by its own client checking or folding for it — version 1 has no
+`TIMEOUT_VOTE` and no `TIMEOUT_CERT` (D-015), so that is the whole of the
+answer. A seat that goes quiet in a **cryptographic** stage is answered by
+`HAND_ABORT` on the hand's own deadline.
+
+`HAND_ABORT`'s shape is the interesting part and it is not a convenience. It is
+a **witness-independent terminal**: no required emitter set, any seat may emit,
+and the stage closes at a receiver on the first copy that verifies. An abort is
+by definition the outcome in which the peers could not agree about the middle of
+the hand, so a terminal needing their agreement could not be reached.
+`TERMINAL(k) = ABORT_TERMINAL(k)` is a function of `GENESIS(k)` and nothing
+else, which is why two peers that gave up a second apart still derive one
+`GENESIS(k+1)`.
+
+*"Buffer, do not reject"* is the acceptance gate, and it maps onto
+`Failed::NotYet` — which the caller already holds and replays. Without it one
+peer could end everybody's hand by claiming a deadline that had not passed.
+
+D-010 is enforced at the **receiver**: an abort whose deltas are not all zero,
+or whose `final_stacks` are not this receiver's own start-of-hand stacks, is
+refused whoever signed it.
 
 ### What is next, in order
 
-1. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
+1. **Three seats and more over the real network.** Everything measured so far
+   is heads-up, and heads-up hides a whole class of defect — it hid the
+   duplicate handling for two milestones. This is now the cheapest way to find
+   the next real bug, because the machinery to run it already exists.
+2. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
    carried inside `HAND_COMPLETE`; the checkpoint **stage** is not there, and
    `PROTOCOL.md` §12 says T61 then fires at `hand_deadline_ms` after every
    settled hand.
-2. **`hand_deadline_ms`**, which is the only answer version 1 has to a seat
-   going quiet in a *cryptographic* stage. The action clock covers the betting
-   ones; a stalled shuffle still stops the hand for ever.
 3. The RNG beacon, replacing `provisional_button`.
-4. Three seats and more over the real network. Everything measured so far is
-   heads-up, and heads-up hides a whole class of defect — it hid the duplicate
-   handling for two milestones.
+4. `HAND_ABORT` causes 2 and 3 — a failed shuffle or reveal proof. They embed
+   up to two 32 768 B `SignedEvent`s, so they need a larger `FRAME_CAP` than
+   this client opens. It emits neither and refuses one it is sent.
 5. Two machines on two networks. Still rests on nothing.
 
 ### Four defects found by pointing a critic at the design, not at the code
