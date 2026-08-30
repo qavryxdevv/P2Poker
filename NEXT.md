@@ -709,6 +709,16 @@ forbids that shape. Everything was right up to the last message.
   `FRAME_CAP`.
 * Two machines on two networks. Everything measured so far is three processes on
   one.
+* **Seen once and not explained**: `hand: seat 2's shuffle: a second attempt at
+  a position that already has one`, on one survivor of a kill run, while the
+  other saw nothing and the table played on. Every ordinary duplicate is already
+  silent — a re-sent event carries a sequence the receiver has left, and
+  `on_event` returns `Ok` for those without a word — so this was a second
+  arrival at a sequence the receiver had **not** left, which the obvious paths
+  do not produce. It matters more than it looks: with validation verdicts now
+  reported, a refusal is a `Reject`, and repeatedly rejecting an honest peer is
+  how it loses mesh score. Reproduce before fixing; do not guess a duplicate
+  check into the shuffle chain.
 * The forwarding fix has no test. This harness delivers every message to every
   survivor, which is a mesh that forwards — by construction it cannot see a
   client that fails to. It needs three libp2p nodes with two of them not
