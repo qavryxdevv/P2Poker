@@ -680,6 +680,12 @@ struct StepHeard {
 /// One hand in progress.
 pub struct Hand {
     open: Opening,
+    /// The last vote tally worth saying out loud: subject, held, needed.
+    ///
+    /// A vote that is not counted is the quietest failure in this machinery —
+    /// the peers all say their clocks ran out and nothing ever happens — so the
+    /// count is reported rather than inferred.
+    tally: Option<(SeatIdx, usize, usize)>,
     /// The last seat a certificate acted for, and what it did.
     ///
     /// Read once by the node so it can say so: an action nobody took is the one
@@ -874,6 +880,7 @@ impl Hand {
         Ok((
             Hand {
                 signed,
+                tally: None,
                 acted_for: None,
                 votes: BTreeMap::new(),
                 voted: BTreeSet::new(),
@@ -3198,10 +3205,23 @@ impl Hand {
     /// duplicates cannot hold the stage open by re-sending, which is precisely
     /// what the re-send loop does every five seconds.
     fn mark_stage(&mut self, now_ms: u64) {
-        if self.slot.sequence != self.stage_seq {
-            self.stage_seq = self.slot.sequence;
-            self.stage_at_ms = now_ms;
+        if self.slot.sequence == self.stage_seq {
+            return;
         }
+        self.stage_seq = self.slot.sequence;
+        self.stage_at_ms = now_ms;
+
+        // Everything about the stage just left goes with it. A vote and a
+        // certificate are bound to one stage — a vote for a stage nobody is
+        // waiting on any more can never be counted, because the subject it
+        // names cannot be rebuilt — and keeping them had two costs, one of
+        // them fatal: `certify_if_unanimous` refuses to start while a
+        // certificate is in progress, so a stage that opened one and moved on
+        // without completing it **blocked every certificate for the rest of
+        // the hand**. The other is only that the map grows.
+        self.certifying = None;
+        self.votes.clear();
+        self.voted.clear();
     }
 
     /// `GENESIS(k)`: what this hand's first stage hangs off.
@@ -3407,7 +3427,14 @@ impl Hand {
         if !self.voters(body.subject_seat).contains(&seat) {
             return Err(Failed::NotInThisStage);
         }
-        self.take_vote(mine.subject_digest(), seat, bytes.to_vec(), body);
+        let digest = mine.subject_digest();
+        self.take_vote(digest, seat, bytes.to_vec(), body);
+        let held = self.votes.get(&digest).map(|m| m.len()).unwrap_or(0);
+        self.tally = Some((
+            mine.subject_seat,
+            held,
+            self.voters(mine.subject_seat).len(),
+        ));
         // The vote that completes the set is what produces the certificate, so
         // the two are one call: there is no state in which unanimity has been
         // reached and nobody has said so.
@@ -3710,6 +3737,11 @@ impl Hand {
         let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
         self.phase = Phase::Aborted(Abort::Told { cause: 1 });
         Ok(vec![Send::Broadcast(bytes)])
+    }
+
+    /// How the vote count stands, taken rather than read.
+    pub fn take_tally(&mut self) -> Option<(SeatIdx, usize, usize)> {
+        self.tally.take()
     }
 
     /// What a certificate last did, taken rather than read: the node reports

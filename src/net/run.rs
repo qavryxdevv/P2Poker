@@ -869,7 +869,19 @@ pub async fn run(
                                         // are read from a complete set of
                                         // verified shares or not at all, so
                                         // there is no partial state to report.
-                                                // A seat the table acted for, once.
+                                                // How the count stands. A vote that is
+                                        // never counted is the quietest way
+                                        // this machinery can fail: everybody
+                                        // says their clock ran out and nothing
+                                        // happens.
+                                        if let Some((subject, held, need)) = h.take_tally() {
+                                            let _ = events
+                                                .send(NodeEvent::Warning(format!(
+                                                    "seat {subject}'s clock: {held} of {need}                                                      peers agree"
+                                                )))
+                                                .await;
+                                        }
+                                        // A seat the table acted for, once.
                                         if let Some((seat, what)) = h.take_certified_action() {
                                             let _ = events
                                                 .send(NodeEvent::Warning(format!(
