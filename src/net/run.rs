@@ -339,6 +339,11 @@ pub async fn run(
     // seat that goes quiet in a *cryptographic* stage has no answer here at
     // all, and that is `hand_deadline_ms`, which is not built.
     let mut act_by: Option<tokio::time::Instant> = None;
+    // When this hand may be given up on. The only terminus a stalled
+    // CRYPTOGRAPHIC stage has in version 1: nobody votes and nobody certifies,
+    // so each peer runs its own timer and the abort is buffered at a receiver
+    // until that receiver's own timer agrees.
+    let mut hand_by: Option<tokio::time::Instant> = None;
     // Whether this table has ever dealt a hand.
     //
     // The two roads into the first hand fire again on **every later table
@@ -642,6 +647,7 @@ pub async fn run(
                                                 },
                                                 &app_key,
                                                 &mut hand,
+                                                &mut hand_by,
                                                 &mut swarm,
                                                 table_topic.as_ref(),
                                                 &events,
@@ -692,6 +698,7 @@ pub async fn run(
                         turn_reported = None;
                         next_hand_at = None;
                         act_by = None;
+                        hand_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -720,6 +727,7 @@ pub async fn run(
                         turn_reported = None;
                         next_hand_at = None;
                         act_by = None;
+                        hand_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -830,7 +838,21 @@ pub async fn run(
                                         // are read from a complete set of
                                         // verified shares or not at all, so
                                         // there is no partial state to report.
-                                                let report =
+                                                if h.aborted().is_some() && hand_by.is_some() {
+                                            hand_by = None;
+                                            act_by = None;
+                                            let _ = events
+                                                .send(NodeEvent::Warning(
+                                                    "a peer ended the hand on its own deadline;                                                      every stack is restored"
+                                                        .into(),
+                                                ))
+                                                .await;
+                                            next_hand_at = Some(
+                                                tokio::time::Instant::now()
+                                                    + std::time::Duration::from_millis(800),
+                                            );
+                                        }
+                                        let report =
                                             report_hand(h, &events, &mut turn_reported).await;
                                         if let Some(end) = report.ended {
                                             next_hand_at = Some(
@@ -922,6 +944,7 @@ pub async fn run(
                                         },
                                         &app_key,
                                         &mut hand,
+                                        &mut hand_by,
                                         &mut swarm,
                                         table_topic.as_ref(),
                                         &events,
@@ -1780,6 +1803,7 @@ pub async fn run(
                         turn_reported = None;
                         next_hand_at = None;
                         act_by = None;
+                        hand_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -1856,10 +1880,48 @@ pub async fn run(
                         turn_reported = None;
                         next_hand_at = None;
                         act_by = None;
+                        hand_by = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
                         }).await;
+                    }
+                }
+            }
+
+            // The hand's own deadline. Nobody produced what a stage needed.
+            () = async {
+                match hand_by {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            }, if hand_by.is_some() => {
+                hand_by = None;
+                act_by = None;
+                let Some(h) = hand.as_mut() else { continue };
+                let now = super::node::now_unix_ms();
+                match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
+                    Ok(sends) => {
+                        if let Some(t) = &table_topic {
+                            for crate::table::hand::Send::Broadcast(out) in sends {
+                                let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), out);
+                            }
+                        }
+                        let _ = events
+                            .send(NodeEvent::Warning(
+                                "the hand ran out of time; every stack is restored".into(),
+                            ))
+                            .await;
+                        // Straight on: an abort has nothing to look at, so
+                        // D-020's hold has nothing to hold.
+                        next_hand_at = Some(
+                            tokio::time::Instant::now() + std::time::Duration::from_millis(800),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!("the hand could not be ended: {e}")))
+                            .await;
                     }
                 }
             }
@@ -1933,6 +1995,7 @@ pub async fn run(
                             opening,
                             &app_key,
                             &mut hand,
+                            &mut hand_by,
                             &mut swarm,
                             table_topic.as_ref(),
                             &events,
@@ -2402,6 +2465,9 @@ async fn begin_hand(
     opening: crate::table::hand::Opening,
     app_key: &ed25519_dalek::SigningKey,
     hand: &mut Option<crate::table::hand::Hand>,
+    // Armed here rather than by the caller, so that no road into a hand can
+    // start one without a terminus.
+    deadline_at: &mut Option<tokio::time::Instant>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
     topic: Option<&gossipsub::IdentTopic>,
     events: &mpsc::Sender<NodeEvent>,
@@ -2429,6 +2495,7 @@ async fn begin_hand(
                     seats: h.waiting_for(),
                 })
                 .await;
+            *deadline_at = Some(tokio::time::Instant::now() + h.hand_deadline());
             *hand = Some(h);
         }
         Err(e) => {

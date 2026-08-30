@@ -60,8 +60,8 @@ use crate::mental_poker::reveal::RevealStage;
 
 use super::dealing::{self, Dealing, Identity, Refused, Share};
 use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, BoardReveal,
-    DealPrivate, DeckCommit, DeckInit, HandComplete, HandInit, NotOurs, PotAward, Refund,
-    RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep};
+    DealPrivate, DeckCommit, DeckInit, HandAbort, HandComplete, HandInit, NotOurs, PotAward,
+    Refund, RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep};
 use super::stage::{Collective, Heard};
 
 /// What a step wants sent.
@@ -192,6 +192,12 @@ pub struct Opening {
     /// How long a peer has to answer a cryptographic step, from the table's own
     /// parameters. Carried on the envelope of every stage this hand emits.
     pub crypto_step_timeout_ms: u32,
+    /// How long the whole hand may take before any peer may end it.
+    ///
+    /// `PROTOCOL.md` §8: the only terminus a stalled **cryptographic** stage
+    /// has in version 1. Every seat has the same number, from the table's
+    /// advertisement, and each measures it on its own clock.
+    pub hand_deadline_ms: u32,
     /// How long a seat has to act before its own client acts for it.
     ///
     /// From the table's advertisement, so every seat has the same number. It is
@@ -239,6 +245,7 @@ impl Opening {
             my_seat: f.my_seat()?,
             crypto_step_timeout_ms: ad.crypto_step_timeout_ms,
             action_timeout_ms: ad.action_timeout_ms,
+            hand_deadline_ms: ad.hand_deadline_ms,
             // The first hand of a table: nothing has decided the button yet.
             button: None,
         })
@@ -323,6 +330,14 @@ pub const SHOWDOWN_MUCK_CAP: usize = 64;
 /// seat lists, plus four vectors of that length.
 pub const HAND_COMPLETE_CAP: usize = 4_096;
 
+/// The cap on a `HAND_ABORT` body.
+///
+/// Enough for the hand-deadline path, which carries no evidence. Causes 2 and 3
+/// embed up to two `SignedEvent`s of 32 768 B each and will need both a larger
+/// cap and a larger [`FRAME_CAP`]; this client emits neither and refuses one it
+/// is sent, which is stated here rather than discovered later.
+pub const HAND_ABORT_CAP: usize = 4_096;
+
 /// How far this hand has got.
 ///
 /// One variant per stage, each carrying only what that stage needs, so a stage
@@ -346,6 +361,13 @@ enum Phase {
         /// This client's own secret for the hand. Never leaves the process.
         secret: HandSecret,
     },
+    /// The hand ended without being played out.
+    ///
+    /// Terminal, and it holds nothing: an abort restores every stack to what it
+    /// was at the genesis of the hand, and those are `HandInit::stacks`, which
+    /// every seat compared byte for byte at stage 0. There is nothing else to
+    /// remember and nothing to settle.
+    Aborted(Abort),
     /// The hole left while one phase is being rebuilt into the next.
     ///
     /// A phase carries values that must not be copied - a `HandSecret` above
@@ -518,6 +540,17 @@ enum Step {
     Ended,
 }
 
+/// Why a hand ended without being played out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Abort {
+    /// Nobody produced a required cryptographic contribution before the hand's
+    /// own deadline. Nobody is named: `PROTOCOL.md` §4.9's `attributed` is
+    /// empty on this path, and D-010 forbids reading it to move a chip anyway.
+    Deadline,
+    /// A cause this client accepted from a peer.
+    Told { cause: u16 },
+}
+
 /// The deck every stage from `DECK_COMMIT` onwards is about.
 ///
 /// The final deck and the index map travel together from here to showdown
@@ -565,6 +598,14 @@ struct StepHeard {
 /// One hand in progress.
 pub struct Hand {
     open: Opening,
+    /// When this hand's stage 0 was sealed, on this peer's own clock.
+    ///
+    /// The hand deadline is measured from here. Advisory, local, and shared
+    /// with nobody: §8.2 puts every deadline on the peer's own monotonic clock,
+    /// so two peers reaching it a second apart is ordinary rather than a
+    /// divergence — and it is why an abort is buffered until the receiver's own
+    /// timer agrees.
+    opened_at_ms: u64,
     /// `P(k)` as a vector: the seats this client has accepted at least one
     /// chained event from this hand.
     ///
@@ -672,6 +713,7 @@ impl Hand {
             .event_hash;
         stage.hear(o.my_seat, own_hash);
 
+        let opened_at_ms = now_ms;
         let mut signed = vec![false; usize::from(o.max_players)];
         if let Some(slot) = signed.get_mut(usize::from(o.my_seat)) {
             *slot = true;
@@ -679,6 +721,7 @@ impl Hand {
         Ok((
             Hand {
                 signed,
+                opened_at_ms,
                 open: o,
                 mine,
                 slot,
@@ -724,6 +767,7 @@ impl Hand {
                 | EventType::ShowdownReveal
                 | EventType::ShowdownMuck
                 | EventType::HandComplete
+                | EventType::HandAbort
         ) {
             return Err(Failed::Wire(WireError::WrongType));
         }
@@ -737,6 +781,13 @@ impl Hand {
         }
         if sequence > self.slot.sequence {
             return Err(Failed::NotYet);
+        }
+
+        // An abort is answered from **any** phase, because it is answered by
+        // the receiver's own state rather than by where this client's hand got
+        // to. It is the one message that can arrive at a stage nobody completed.
+        if kind == EventType::HandAbort {
+            return self.on_hand_abort(bytes, now_ms);
         }
 
         match self.phase {
@@ -762,7 +813,7 @@ impl Hand {
                 Step::Settling { .. } => self.on_hand_complete(bytes),
                 Step::Ended => Err(Failed::NothingFurther),
             },
-            Phase::Between => Err(Failed::NothingFurther),
+            Phase::Aborted(_) | Phase::Between => Err(Failed::NothingFurther),
         }
     }
 
@@ -2776,6 +2827,120 @@ impl Hand {
         Ok(Vec::new())
     }
 
+    /// Give up on this hand: nobody produced what the stage needed in time.
+    ///
+    /// The **only** answer version 1 has to a seat going quiet in a
+    /// cryptographic stage. There is no `TIMEOUT_VOTE` and no `TIMEOUT_CERT`
+    /// (D-015), so nobody is named — `attributed` is empty — and no chip moves.
+    /// The silent seat pays for it in the next hand instead, by being outside
+    /// `signed_this_hand` and therefore outside `P(k)` (D-013).
+    ///
+    /// The abort chains from the **stalled** stage's own index, because a
+    /// stalled stage has no `stage_hash` to chain from and there is no third
+    /// option. `PROTOCOL.md` §5.2.1's slot key contains `event_type`, which is
+    /// what stops this being an equivocation against a peer that already spoke
+    /// at that sequence.
+    pub fn abort_now(
+        &mut self,
+        why: Abort,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        if matches!(self.phase, Phase::Aborted(_)) {
+            return Ok(Vec::new());
+        }
+        let body = HandAbort::on_deadline(self.mine.stacks.clone());
+        let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
+        self.phase = Phase::Aborted(why);
+        Ok(vec![Send::Broadcast(bytes)])
+    }
+
+    /// A peer's abort.
+    ///
+    /// **Buffered, not refused**, until this receiver's own trigger is present.
+    /// `PROTOCOL.md` §4.9's acceptance gate says so in those words for the
+    /// hand-deadline path, and it is what stops a witness-independent terminal
+    /// from becoming a one-message hand void: a peer cannot end everybody's
+    /// hand by claiming a deadline that has not passed here. `Failed::NotYet`
+    /// is exactly the buffer — the caller holds it and replays it.
+    fn on_hand_abort(&mut self, bytes: &[u8], now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, EventType::HandAbort)?;
+        let seat = self.seat_of(&opened.sender)?;
+        let body: HandAbort =
+            chained::payload(&opened, HAND_ABORT_CAP).map_err(Failed::Wire)?;
+        body.consistent(&self.mine.stacks)
+            .map_err(|what| Failed::Elsewhere { seat, what })?;
+
+        match body.cause {
+            // The uncertified path. The gate: this receiver's **own** deadline
+            // must have passed. Until it has, hold the message.
+            1 if body.attributed.is_empty() => {
+                if !self.past_deadline(now_ms) {
+                    return Err(Failed::NotYet);
+                }
+            }
+            // Causes 2 and 3 carry their own disproof and are accepted at once
+            // — but this client neither emits nor verifies that evidence yet,
+            // and accepting an abort whose evidence it cannot check would be
+            // taking a peer's word for the end of a hand.
+            2 | 3 => {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "this build could check the evidence it carries",
+                })
+            }
+            other => {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: match other {
+                        1 => "a certificate existed, which this version never produces",
+                        _ => "this build implemented that cause",
+                    },
+                })
+            }
+        }
+
+        self.phase = Phase::Aborted(Abort::Told { cause: body.cause });
+        Ok(Vec::new())
+    }
+
+    /// Whether this hand's own deadline has passed.
+    ///
+    /// From the envelope this client sealed its own stage-0 event with, which
+    /// is the table's `hand_deadline_ms` and is therefore the same number at
+    /// every seat. It is a **local** timer against an advisory clock: §8.2 says
+    /// a deadline is measured on the peer's own monotonic clock and never on
+    /// anybody's wall time, which is why nothing in the chain depends on two
+    /// peers agreeing about when it passed.
+    fn past_deadline(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.opened_at_ms) >= u64::from(self.open.hand_deadline_ms)
+    }
+
+    /// Whether this hand has ended, however it ended.
+    ///
+    /// The two ways are not interchangeable — one moves chips and one does not
+    /// — but for "is there anything left to wait for" they are the same answer,
+    /// and a caller that asked only about the settled one would wait for ever
+    /// on an aborted hand.
+    pub fn over(&self) -> bool {
+        self.betting_over() || self.aborted().is_some()
+    }
+
+    /// How long this hand has left before any peer may end it.
+    pub fn hand_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            u64::from(self.open.hand_deadline_ms).clamp(30_000, 3_600_000),
+        )
+    }
+
+    /// Whether this hand ended without being played out.
+    pub fn aborted(&self) -> Option<Abort> {
+        match &self.phase {
+            Phase::Aborted(why) => Some(*why),
+            _ => None,
+        }
+    }
+
     /// Seal one body into the stage now open.
     fn say<T: minicbor::Encode<()>>(
         &self,
@@ -3058,14 +3223,34 @@ impl Hand {
     /// parent is `TERMINAL(k)`, and the required emitter set is `P(k)` — the
     /// seats this client accepted an event from this hand.
     pub fn next_hand(&self) -> Option<Opening> {
-        let Phase::Playing { play, .. } = &self.phase else {
-            return None;
+        // Two roads to a terminal, and they differ in both quantities that go
+        // into hand `k+1`: what everybody holds, and what `TERMINAL(k)` is.
+        let (stacks, terminal): (Vec<Chips>, Hash) = match &self.phase {
+            Phase::Playing { play, .. } if matches!(play.step, Step::Ended) => (
+                // The settlement has been applied, so this is what everybody
+                // holds; and `TERMINAL(k)` is the `HAND_COMPLETE` stage hash,
+                // which is the slot's parent now that the stage closed.
+                play.round.stack.clone(),
+                self.slot.previous_event_hash,
+            ),
+            Phase::Aborted(_) => (
+                // An abort moves no chips: every seat ends the hand with what
+                // it started it with (D-010, I27), and those are the values
+                // already bound into `roster_hash(k)`.
+                self.mine.stacks.clone(),
+                // A function of `GENESIS(k)` and nothing else, which is exactly
+                // why an abort's terminal cannot fork: the peers could not
+                // agree about the middle of the hand, so the terminal must not
+                // depend on the middle of the hand.
+                crate::protocol::transcript::abort_terminal(
+                    &self.open.table_id,
+                    self.open.hand_id,
+                    &self.open.genesis,
+                ),
+            ),
+            _ => return None,
         };
-        if !matches!(play.step, Step::Ended) {
-            return None;
-        }
-        // The settlement has been applied, so this is `TERMINAL(k)`'s stacks.
-        let stacks = &play.round.stack;
+        let stacks = &stacks;
         let alive: Vec<bool> = (0..usize::from(self.open.max_players))
             .map(|i| stacks.get(i).copied().unwrap_or(0) > 0)
             .collect();
@@ -3080,10 +3265,6 @@ impl Hand {
             &alive,
             self.open.max_players,
         )?;
-
-        // `TERMINAL(k)` is the stage hash of `HAND_COMPLETE`, which is what the
-        // slot's parent is once the settlement closed.
-        let terminal = self.slot.previous_event_hash;
 
         // The roster at the start of hand `k+1`, which is this hand's final
         // stacks — `PROTOCOL.md` §3.1's `stack_at_hand_start`.
@@ -3137,6 +3318,7 @@ impl Hand {
             my_seat: self.open.my_seat,
             crypto_step_timeout_ms: self.open.crypto_step_timeout_ms,
             action_timeout_ms: self.open.action_timeout_ms,
+            hand_deadline_ms: self.open.hand_deadline_ms,
             button: Some(positions.button),
         })
     }
@@ -3193,7 +3375,7 @@ impl Hand {
             // seats on screen that owe the table nothing.
             Phase::Shuffling { chain, .. } => chain.whose_turn().into_iter().collect(),
             Phase::Committing { stage, .. } | Phase::Dealing { stage, .. } => stage.waiting_for(),
-            Phase::Playing { .. } | Phase::Between => Vec::new(),
+            Phase::Playing { .. } | Phase::Aborted(_) | Phase::Between => Vec::new(),
         }
     }
 
@@ -3216,7 +3398,7 @@ impl Hand {
             | Phase::Committing { deal, .. }
             | Phase::Dealing { deal, .. }
             | Phase::Playing { deal, .. } => Some(&deal.secret),
-            Phase::Init(_) | Phase::Between => None,
+            Phase::Init(_) | Phase::Aborted(_) | Phase::Between => None,
         }
     }
 
@@ -3239,7 +3421,7 @@ impl Hand {
             | Phase::Committing { deal, .. }
             | Phase::Dealing { deal, .. }
             | Phase::Playing { deal, .. } => &deal.keys,
-            Phase::Init(_) | Phase::Between => &[],
+            Phase::Init(_) | Phase::Aborted(_) | Phase::Between => &[],
         }
     }
 
@@ -3501,6 +3683,7 @@ mod tests {
             my_seat,
             crypto_step_timeout_ms: 30_000,
             action_timeout_ms: 20_000,
+            hand_deadline_ms: 600_000,
             button: None,
         }
     }
@@ -3533,6 +3716,7 @@ mod tests {
             my_seat,
             crypto_step_timeout_ms: 30_000,
             action_timeout_ms: 20_000,
+            hand_deadline_ms: 600_000,
             button: None,
         }
     }
@@ -4038,6 +4222,88 @@ mod tests {
         deliver(&mut a2, &from_b2, &key(10));
         assert!(a2.dealt() && b2.dealt(), "stage 0 of hand two completed");
         assert_eq!(a2.slot(), b2.slot(), "off one parent");
+    }
+
+    /// A hand that stalls is given up on, and the next one still starts.
+    ///
+    /// The property that matters is not that the hand ends — it is that two
+    /// peers which gave up at slightly different moments derive the **same**
+    /// `GENESIS(k+1)`. `ABORT_TERMINAL(k)` is a function of `GENESIS(k)` and
+    /// nothing else precisely so that the middle of the hand, which is what
+    /// they could not agree about, cannot enter it.
+    #[test]
+    fn an_abandoned_hand_still_leads_to_the_next_one() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        // They get as far as stage 1 and then one of them goes quiet.
+        deliver(&mut b, &from_a, &key(11));
+        deliver(&mut a, &from_b, &key(10));
+        assert!(a.next_hand().is_none(), "a hand in progress has no successor");
+
+        // A's deadline passes first, and it says so.
+        let late = NOW + 10 * 60 * 1000;
+        let sends = a.abort_now(Abort::Deadline, &key(10), late).unwrap();
+        assert_eq!(sends.len(), 1);
+        assert!(a.aborted().is_some() && a.over());
+
+        // B is not there yet: the message is **held**, not refused. Otherwise
+        // one peer could end everybody's hand by claiming a deadline.
+        let Send::Broadcast(bytes) = &sends[0];
+        assert_eq!(
+            b.on_event(bytes, &key(11), NOW),
+            Err(Failed::NotYet),
+            "an abort before this receiver's own deadline is buffered"
+        );
+        assert!(b.aborted().is_none(), "and it did not end B's hand");
+
+        // Once B's own timer agrees, the same message lands.
+        assert!(b.on_event(bytes, &key(11), late).unwrap().is_empty());
+        assert!(b.aborted().is_some());
+
+        // And both derive one successor.
+        let next_a = a.next_hand().expect("hand two exists after an abort");
+        let next_b = b.next_hand().expect("on both peers");
+        assert_eq!(next_a.genesis, next_b.genesis, "one GENESIS(2), or a fork");
+        assert_eq!(next_a.roster_hash, next_b.roster_hash);
+        assert_eq!(next_a.hand_id, 2);
+
+        // No chip moved. Every seat starts hand two with what it started hand
+        // one with, which is D-010's accepted cost and I27's invariant.
+        assert_eq!(
+            next_a.seats.iter().map(|(_, _, c)| *c).collect::<Vec<_>>(),
+            a.init().stacks,
+            "an abort restores every stack"
+        );
+    }
+
+    /// An abort that moves a chip is refused, whoever signed it.
+    ///
+    /// This is what makes D-010 a receiver's rule rather than a request to
+    /// emitters: not that nobody writes a forfeiture, but that nobody can make
+    /// one stick.
+    #[test]
+    fn an_abort_that_moves_a_chip_is_refused() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        deliver(&mut b, &from_a, &key(11));
+        deliver(&mut a, &from_b, &key(10));
+        let late = NOW + 10 * 60 * 1000;
+        let sends = a.abort_now(Abort::Deadline, &key(10), late).unwrap();
+        let Send::Broadcast(good) = &sends[0];
+
+        let greedy = tamper::<HandAbort>(
+            good,
+            EventType::HandAbort,
+            &b.slot(),
+            HAND_ABORT_CAP,
+            |x| {
+                x.final_stacks[0] += 100;
+                x.final_stacks[1] -= 100;
+            },
+        );
+        let e = b.on_event(&greedy, &key(11), late).unwrap_err();
+        assert!(matches!(e, Failed::Elsewhere { seat: 0, .. }), "{e}");
+        assert!(b.aborted().is_none(), "and the hand did not end");
     }
 
     /// A mucked hand is never opened, by anybody, ever.

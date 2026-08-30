@@ -493,6 +493,100 @@ impl HandComplete {
     }
 }
 
+/// `HAND_ABORT 0x0802`: the other way a hand can end.
+///
+/// A **witness-independent terminal** (`PROTOCOL.md` §3.2): there is no required
+/// emitter set, any seat of this hand may emit its copy, and the stage closes at
+/// a receiver on the first copy that verifies. That shape is the whole point —
+/// an abort is by definition the outcome in which the peers could not agree
+/// about the middle of the hand, so a terminal that needed their agreement
+/// could not be reached. `TERMINAL(k)` is taken from §3.1's
+/// `ABORT_TERMINAL(k)`, a function of `GENESIS(k)` and nothing else, so two
+/// peers cannot derive different values and `GENESIS(k+1)` always exists.
+///
+/// The last two fields are what make D-010 enforceable at the **receiver**
+/// rather than trusted at the emitter: an abort moves no chips, and a copy that
+/// says otherwise is rejected like any other mismatch, whoever signed it.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct HandAbort {
+    /// `1` a required cryptographic contribution never came; `2` invalid
+    /// shuffle proof; `3` invalid reveal proof; `4` unresolvable divergence;
+    /// `6` anti-cheat void. `5` is deleted and its code point is not reused.
+    #[n(0)]
+    pub cause: u16,
+    /// Ascending by encoded bytes; **empty** on the hand-deadline path.
+    ///
+    /// Evidence only. Nothing in the protocol reads it to move a chip or to
+    /// remove a player (D-010), and this client reads it for the log alone.
+    #[n(1)]
+    pub attributed: Vec<[u8; 32]>,
+    /// `None` on every `attributed = []` path — unanimity was by construction
+    /// never reached there, so no certificate can exist.
+    #[cbor(n(2), with = "minicbor::bytes")]
+    pub cert_hash: Option<[u8; 32]>,
+    /// Required for causes 2 and 3, which are the two a single chained event
+    /// proves on its own. Empty otherwise.
+    #[n(3)]
+    pub evidence: Vec<Vec<u8>>,
+    /// **All zeroes, always.** An abort moves no chips, so there is no delta to
+    /// carry. The field is kept rather than removed so that `HAND_ABORT` and
+    /// `HAND_COMPLETE` stay directly comparable to a verifier, and so that "the
+    /// deltas sum to zero" is one check across both terminals rather than two.
+    #[n(4)]
+    pub deltas: Vec<i64>,
+    /// **The start-of-hand stacks, always.** Exactly the values already bound
+    /// into `roster_hash(k)` and hence into `GENESIS(k)`, so every peer holds
+    /// them from the genesis and two honest peers cannot derive them
+    /// differently.
+    #[n(5)]
+    pub final_stacks: Vec<u64>,
+}
+
+impl HandAbort {
+    /// The hand-deadline abort: nobody is named and no chip moves.
+    pub fn on_deadline(stacks: Vec<u64>) -> Self {
+        HandAbort {
+            cause: 1,
+            attributed: Vec::new(),
+            cert_hash: None,
+            evidence: Vec::new(),
+            deltas: vec![0; stacks.len()],
+            final_stacks: stacks,
+        }
+    }
+
+    /// Whether this body is one the receiver's own rules allow, given the
+    /// stacks that receiver holds from the genesis of the hand.
+    ///
+    /// The two stack checks are not a formality: they are what turns D-010 from
+    /// a request to emitters into something a receiver enforces.
+    pub fn consistent(&self, my_stacks: &[u64]) -> Result<(), &'static str> {
+        if !matches!(self.cause, 1 | 2 | 3 | 4 | 6) {
+            return Err("a cause this protocol does not define");
+        }
+        if self.cause == 1 && !self.attributed.is_empty() && self.cert_hash.is_none() {
+            return Err("a named subject with no certificate");
+        }
+        if self.cert_hash.is_some() && self.attributed.is_empty() {
+            return Err("a certificate naming nobody");
+        }
+        if matches!(self.cause, 2 | 3) == self.evidence.is_empty() {
+            return Err("evidence is required for causes 2 and 3 and forbidden elsewhere");
+        }
+        if self.deltas.iter().any(|d| *d != 0) {
+            return Err("an abort that moves a chip");
+        }
+        if self.final_stacks != my_stacks {
+            return Err("stacks that are not this hand's own starting stacks");
+        }
+        if self.deltas.len() != self.final_stacks.len() {
+            return Err("a delta for every seat, or none");
+        }
+        Ok(())
+    }
+}
+
 /// The street code `PROTOCOL.md` §4.7 defines: **the number of board cards**.
 ///
 /// Pre-flop `0`, flop `3`, turn `4`, river `5`. Not the engine's `Street`
