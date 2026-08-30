@@ -169,6 +169,15 @@ fn a_silent_seat_is_certified_and_the_hand_ends_on_both_survivors() {
         "the appeal was refused somewhere: {:?}",
         t.refusals
     );
+    // Exactly the two certificates about this one subject — this client's own
+    // and its neighbour's — and nothing else has reached the set.
+    for s in 0..2usize {
+        assert_eq!(
+            t.hands[s].verified_certificates(),
+            2,
+            "seat {s} did not record both certificates it verified"
+        );
+    }
     for s in 0..2usize {
         assert!(
             t.hands[s].aborted().is_some(),
@@ -438,4 +447,75 @@ fn both_survivors_derive_the_same_next_hand() {
         "the certified seat is still required: {:?}",
         zero.required
     );
+}
+
+
+/// **An abort may name a player only against a certificate this client
+/// verified itself.**
+///
+/// `certs` is the whole of that check, and it is what stops a one-message hand
+/// void: one peer ending a hand and naming somebody, on its own word, with a
+/// thirty-two byte string it invented. The set must therefore contain nothing
+/// but `TIMEOUT_CERT` hashes this client opened, checked vote by vote against
+/// the voter set, and found unanimous.
+///
+/// This exists because a bad edit put the `certs.insert` into `on_hand_init`
+/// instead of `on_timeout_cert`, which filled the set with **every `HAND_INIT`
+/// hash of the hand** — a value every peer at the table holds and can quote —
+/// and left the certificate path inserting nothing at all. The gate was open to
+/// anyone and shut to the mechanism it was written for, and the end-to-end
+/// tests did not notice: both survivors abort on their own completed
+/// certificate, so neither ever needs to accept the other's abort.
+#[test]
+fn an_abort_naming_a_player_is_refused_without_a_certificate_this_client_verified() {
+    use p2p_poker::net::chained;
+    use p2p_poker::protocol::messages::EventType;
+    use p2p_poker::table::hand::HAND_ABORT_CAP;
+    use p2p_poker::table::handwire::HandAbort;
+
+    let (mut t, opening) = Table::open_with_seat_two_silent();
+    t.settle(opening, NOW);
+    assert!(t.hands[0].aborted().is_none());
+
+    // **The invariant, held directly.** Nothing has been certified, so the set
+    // an abort is checked against must be empty. The bad edit made this two:
+    // one `HAND_INIT` hash per surviving seat.
+    for s in 0..2usize {
+        assert_eq!(
+            t.hands[s].verified_certificates(),
+            0,
+            "seat {s} would accept a named abort quoting something it never verified"
+        );
+    }
+
+    // Seat 1 names seat 2 and quotes a hash seat 0 has never verified as a
+    // certificate. Every field but `cert_hash` is what an honest abort carries.
+    let mut body = HandAbort::on_deadline(t.hands[1].stacks());
+    body.attributed = vec![key(12).verifying_key().to_bytes()];
+
+    for (what, forged) in [
+        ("a hash out of thin air", [0x5a; 32]),
+        // The shape the bad edit actually admitted: a hash every peer at the
+        // table holds and can quote, rather than one only a verifier has.
+        ("a hash from the hand's own chain", t.hands[1].slot().previous_event_hash),
+    ] {
+        body.cert_hash = Some(forged);
+        let bytes = chained::seal(
+            EventType::HandAbort,
+            &t.hands[1].slot(),
+            &body,
+            &t.keys[1],
+            LATE,
+            // `hand_delay_ms + crypto_step_timeout_ms`, PROTOCOL.md section 8.2.
+            7_000 + 30_000,
+            HAND_ABORT_CAP,
+        )
+        .expect("the abort seals");
+
+        let outcome = t.hands[0].on_event(&bytes, &t.keys[0], LATE);
+        assert!(
+            t.hands[0].aborted().is_none(),
+            "seat 0 ended the hand on {what}: {outcome:?}"
+        );
+    }
 }

@@ -1093,10 +1093,6 @@ impl Hand {
         if stage.heard(seat) == Some(opened.event_hash) {
             return Ok(Vec::new());
         }
-        // Verified above, in full: every carried vote opened, every voter in
-        // the set, unanimity complete. Remembered from here so an abort that
-        // names it can be checked.
-        self.certs.insert(opened.event_hash);
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
@@ -3799,6 +3795,17 @@ impl Hand {
         if stage.heard(seat) == Some(opened.event_hash) {
             return Ok(Vec::new());
         }
+        // **Only here, and only after all of the above.** Every carried vote
+        // has been opened as an event in its own right, every voter checked
+        // against the set, and unanimity found — so this hash names something
+        // this client verified rather than something it was told. `certs` is
+        // what `on_hand_abort` checks a named subject against, so anything else
+        // reaching this set is a one-message hand void: an abort that names a
+        // player on one peer's word. This insert was written into
+        // `on_hand_init` by a bad edit, which put **every `HAND_INIT` hash of
+        // the hand** — a value every peer holds — into the set, and left this
+        // path putting nothing in it at all.
+        self.certs.insert(opened.event_hash);
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
@@ -3915,6 +3922,19 @@ impl Hand {
     }
 
     /// How the vote count stands, taken rather than read.
+    /// How many `TIMEOUT_CERT`s this client has verified for itself.
+    ///
+    /// The invariant behind `on_hand_abort`'s gate, exposed so a test can hold
+    /// it: this counts certificates **opened, checked vote by vote against the
+    /// voter set and found unanimous** by this client, and nothing else. A
+    /// misplaced insert once filled the same set with every `HAND_INIT` hash of
+    /// the hand — a value every peer holds — which opened the gate to anybody
+    /// and shut it to the mechanism it exists for. A count is what tells those
+    /// two apart from outside.
+    pub fn verified_certificates(&self) -> usize {
+        self.certs.len()
+    }
+
     pub fn take_shuffle_note(&mut self) -> Option<String> {
         self.shuffle_note.take()
     }
