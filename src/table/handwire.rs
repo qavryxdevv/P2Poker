@@ -200,6 +200,32 @@ fn ascending_unique(v: &[SeatIdx]) -> bool {
     v.windows(2).all(|w| w[0] < w[1])
 }
 
+
+// ---------------------------------------------------------------------------
+// DECK_INIT
+// ---------------------------------------------------------------------------
+
+/// One seat's per-hand deck key and its proof of ownership.
+///
+/// Unlike `HAND_INIT`, this body is **not** derived and cannot be compared
+/// against anything: a key is a fresh secret its owner chose, and the only
+/// question a receiver can ask is whether the proof holds. `PROTOCOL.md` §4.4:
+/// thirty-three bytes of key, sixty-five of proof.
+///
+/// The two fields are `Vec<u8>` and not fixed arrays on purpose. The length is
+/// checked where the bytes become a curve point — `DeckWire::decode`, which
+/// checks the length, parses with validation on, and then compares the
+/// re-encoding — and a length check in two places is a length check that can
+/// disagree with itself.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct DeckInit {
+    #[cbor(n(0), with = "minicbor::bytes")]
+    pub key: Vec<u8>,
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub proof: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -183,6 +183,55 @@ pub struct PokerBehaviour {
 }
 
 /// The topics this node subscribes to.
+/// How many connections this client will hold at once.
+///
+/// Measured before it was capped: **over four hundred**, nearly all of them
+/// strangers on the public DHT that this client will never exchange a poker
+/// message with. They cost sockets, file handles, keep-alives and — on a home
+/// connection — a NAT table that other software has to share.
+///
+/// What the client actually needs at once: the handful of entry points, two or
+/// three relays it holds reservations on, the seats at its tables, and enough
+/// DHT peers for a lookup to converge. Eighty is comfortably above that sum and
+/// far below four hundred.
+///
+/// **What it costs.** At the cap a new connection is refused, including one this
+/// client wanted, so a lookup mid-flight can lose a hop and take longer.
+/// Kademlia stores addresses rather than connections and dials on demand, so
+/// the routing table is not what shrinks — the churn during a lookup is. Half
+/// the budget is reserved against **incoming** connections, so a crowd of
+/// strangers arriving cannot fill the table and leave no room for a relay this
+/// client is trying to reach.
+pub const MAX_CONNECTIONS: u32 = 80;
+
+/// The floor and the ceiling the cap moves between.
+///
+/// The cap is not a fixed number, because a fixed one is either wasteful or
+/// starving and there is no way to know which in advance. It starts at
+/// [`MAX_CONNECTIONS`] and moves: **up** when a connection this client wanted
+/// was refused by the limit, **down** while it has been comfortably under for a
+/// while. The floor is what a client needs to function at all — entry points,
+/// two or three relays, a table's seats and enough of a routing table to look
+/// something up. The ceiling is where the cost stops being worth it.
+pub const MIN_CONNECTIONS: u32 = 40;
+
+/// The limits at one budget.
+///
+/// One function, called at start-up and again whenever the budget moves, so the
+/// three limits that are derived from it cannot drift apart from each other —
+/// `ConnectionLimits`'s setters consume `self` and it has no getters, so the
+/// alternative was rebuilding it by hand in three places.
+pub fn connection_limits(budget: u32) -> connection_limits::ConnectionLimits {
+    connection_limits::ConnectionLimits::default()
+        .with_max_pending_incoming(Some(32))
+        .with_max_established(Some(budget))
+        // Half against strangers arriving, so a crowd cannot fill the table and
+        // leave no room for a relay this client is trying to reach.
+        .with_max_established_incoming(Some(budget / 2))
+        .with_max_established_per_peer(Some(2))
+}
+pub const CONNECTION_CEILING: u32 = 320;
+
 /// What this client answers with when asked who it is.
 ///
 /// Named rather than written twice: `identify` announces it, and it is what
@@ -320,10 +369,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                 relay_client,
                 relay_server: relay::Behaviour::new(local_peer_id, relay_config(relay_role)),
                 conn_limits: connection_limits::Behaviour::new(
-                    connection_limits::ConnectionLimits::default()
-                        .with_max_pending_incoming(Some(32))
-                        .with_max_established_incoming(Some(256))
-                        .with_max_established_per_peer(Some(2)),
+                    connection_limits(MAX_CONNECTIONS),
                 ),
                 join: request_response::Behaviour::with_codec(
                     JoinCodec,

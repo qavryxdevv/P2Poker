@@ -68,6 +68,7 @@ use super::portmap;
 use super::relay;
 use super::lobby::{LobbyStore, RateLimiter, TableAd, TableKind};
 use super::node::{worth_parsing, NodeCommand, NodeEvent, NodeState, REBROADCAST};
+use super::swarm::{CONNECTION_CEILING, MAX_CONNECTIONS, MIN_CONNECTIONS};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
 use super::joinwire::DISPLAY_NAME_MAX;
 use crate::protocol::constants::{
@@ -99,6 +100,13 @@ use crate::protocol::constants::{
 /// * **Volunteers come first.** This is consulted only after the DHT's own
 ///   relay swarm has been asked and answered with nobody.
 const PUBLIC_ENTRY: &[&str] = &["/dnsaddr/bootstrap.libp2p.io"];
+
+/// How many players from the lobby to reach for in one discovery cycle.
+///
+/// The connection budget is finite and a lobby key outlives the clients in it,
+/// so dialling every provider at once fills the budget with the dead and leaves
+/// none for the living. Whoever is not reached this cycle is reached the next.
+const DIALS_PER_CYCLE: usize = 8;
 
 /// The namespace relay hosts advertise themselves under, as a DHT key.
 ///
@@ -335,6 +343,22 @@ pub async fn run(
     let mut poker_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
 
+    // Lobby providers already tried, so a record for a client that is long gone
+    // is dialled once rather than every minute for ever.
+    let mut dialled_lobby: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
+
+    // How many discovery cycles in a row this client has been comfortably under
+    // its connection budget. Three, and the budget comes down a step.
+    let mut comfortable: u8 = 0;
+    // The budget as it stands. Kept here because `ConnectionLimits` has a
+    // setter and no getter, so the only way to know the current value is to be
+    // the one who set it.
+    let mut budget: u32 = MAX_CONNECTIONS;
+    // Connections held, counted here rather than asked of the swarm: there is
+    // no accessor for it, and the two events that change it are already handled.
+    let mut state_peers: u32 = 0;
+
     // The QUIC port, kept only so the router can be asked to open it once.
     // It used to be what got announced to Mainline as well; that is gone, and
     // opening a door in a NAT is worth doing whether or not anybody is told
@@ -473,6 +497,7 @@ pub async fn run(
                         let _ = events.send(NodeEvent::Listening(address)).await;
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        state_peers += 1;
                         let _ = events.send(NodeEvent::PeerConnected(peer_id)).await;
                     }
                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -481,6 +506,7 @@ pub async fn run(
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: true })
                                 .await;
                         }
+                        state_peers = state_peers.saturating_sub(1);
                         let _ = events.send(NodeEvent::PeerDisconnected(peer_id)).await;
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::RelayClient(
@@ -704,8 +730,17 @@ pub async fn run(
                         // formation and be refused as malformed.
                         if let Some(h) = hand.as_mut() {
                             use crate::table::hand::Failed;
-                            match h.on_event(&message.data) {
-                                Ok(()) => {
+                            let now = super::node::now_unix_ms();
+                            match h.on_event(&message.data, &app_key, now) {
+                                Ok(sends) => {
+                                    if let Some(t) = &table_topic {
+                                        for crate::table::hand::Send::Broadcast(out) in sends {
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .gossipsub
+                                                .publish(t.clone(), out);
+                                        }
+                                    }
                                     if h.dealt() {
                                         if !hand_reported {
                                             hand_reported = true;
@@ -888,6 +923,28 @@ pub async fn run(
                             .send(NodeEvent::Warning(format!("relay said no: {e}")))
                             .await;
                     }
+                    // A dial refused by this client's own limit, rather than
+                    // by the far end. That is the cap being too tight for what
+                    // this client is actually doing, so it gets room - up to a
+                    // ceiling, because "raise it whenever anything is refused"
+                    // is not a cap at all.
+                    SwarmEvent::OutgoingConnectionError {
+                        error: libp2p::swarm::DialError::Denied { .. },
+                        ..
+                    } if budget < CONNECTION_CEILING => {
+                        {
+                            let raised = (budget + budget / 4).min(CONNECTION_CEILING);
+                            budget = raised;
+                            *swarm.behaviour_mut().conn_limits.limits_mut() =
+                                super::swarm::connection_limits(raised);
+                            comfortable = 0;
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "connection budget raised to {raised}"
+                                )))
+                                .await;
+                        }
+                    }
                     SwarmEvent::OutgoingConnectionError { error, .. } => {
                         let _ = events
                             .send(NodeEvent::DialFailed { reason: error.to_string() })
@@ -941,6 +998,11 @@ pub async fn run(
                         if info.protocol_version == super::swarm::PROTOCOL_VERSION
                             && poker_peers.insert(peer_id)
                         {
+                            // Never subject to the cap. The whole point of a
+                            // cap is to keep strangers from crowding out the
+                            // people this client is here for, and a cap that
+                            // could refuse a player would be doing the opposite.
+                            swarm.behaviour_mut().conn_limits.bypass_peer_id(&peer_id);
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: false })
                                 .await;
@@ -1039,9 +1101,29 @@ pub async fn run(
                                     format!("{} relay(s) advertised in the DHT", providers.len())
                                 }))
                                 .await;
+                            // **A few, not all.** Every provider was dialled
+                            // every cycle, and a lobby key accumulates records
+                            // from clients that are long gone - a dozen dead
+                            // test profiles among them. With connections capped
+                            // the flood filled the budget with strangers and
+                            // left no room for the peer at this client's own
+                            // table, which is how a table stopped forming at
+                            // all. Whoever is not reached this cycle is reached
+                            // the next one.
+                            let mut fresh = 0usize;
                             for peer in providers {
                                 if lobby {
                                     let _ = events.send(NodeEvent::LobbyPeer(peer)).await;
+                                    if !dialled_lobby.insert(peer) {
+                                        continue;
+                                    }
+                                    if dialled_lobby.len() > 512 {
+                                        dialled_lobby.clear();
+                                    }
+                                    fresh += 1;
+                                    if fresh > DIALS_PER_CYCLE {
+                                        continue;
+                                    }
                                 }
                                 // By peer id: the addresses came with the query
                                 // and live in the routing table, and asking for
@@ -1254,6 +1336,25 @@ pub async fn run(
             }
 
             _ = discover_timer.tick() => {
+                // The cap, downwards. Raising it is an event; lowering it is a
+                // habit, and it needs patience: a client that trimmed its budget
+                // the moment it was under would spend every cycle refusing and
+                // raising again. Three quiet cycles, then a step down.
+                {
+                    let held = state_peers;
+                    if held + held / 4 < budget && budget > MIN_CONNECTIONS {
+                        comfortable += 1;
+                        if comfortable >= 3 {
+                            comfortable = 0;
+                            budget = (budget - budget / 8).max(MIN_CONNECTIONS);
+                            *swarm.behaviour_mut().conn_limits.limits_mut() =
+                                super::swarm::connection_limits(budget);
+                        }
+                    } else {
+                        comfortable = 0;
+                    }
+                }
+
                 // The roster moves between ticks - somebody sits, somebody
                 // stands - so the answer is recomputed rather than remembered
                 // from the moment it first became true.

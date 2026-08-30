@@ -175,6 +175,27 @@ pub fn open(
     })
 }
 
+/// What an event says it is, before anything about it is believed.
+///
+/// `open` demands the expected type up front, which is right where the caller
+/// knows what it is waiting for and wrong where one channel carries several —
+/// a table's mesh carries the formation's messages and the hand's, and telling
+/// a duplicate of a stage already left from a message of another kind entirely
+/// needs the type and the sequence *first*.
+///
+/// **Nothing here is trusted.** No signature is checked, so the answer is a
+/// claim: use it to route, never to decide.
+pub fn peek(bytes: &[u8], cap: usize) -> Result<(EventType, u64, u64), WireError> {
+    let signed: SignedEvent =
+        from_canonical(bytes, cap).map_err(|_| WireError::Malformed("not a signed event"))?;
+    let envelope: EventBody =
+        from_canonical(&signed.body, cap).map_err(|_| WireError::Malformed("not an envelope"))?;
+    let kind = envelope
+        .check_envelope()
+        .map_err(|_| WireError::Envelope("the envelope is not what the catalogue says"))?;
+    Ok((kind, envelope.hand_id, envelope.sequence))
+}
+
 /// The payload of an opened event, decoded under its own cap.
 pub fn payload<'a, T: Decode<'a, ()> + Encode<()>>(
     o: &'a Opened,

@@ -2077,6 +2077,22 @@ admin who may remove a player but may not rewrite a hand's history is D-014.
 
 The transport changes. The protocol does not.
 
+### Requirements the owner has set for the Tox side
+
+Recorded here rather than left in a chat log, because they are constraints on
+the implementation and not preferences:
+
+* **The Tox instance opens its own port**, through NAT-PMP and UPnP, the way the
+  libp2p side already tries to. `c-toxcore` has both, and neither is on by
+  default in every build — the option and the build flag are part of the work,
+  not an afterthought.
+* **Only game data.** Human chat stays on ordinary group messages; the protocol
+  rides custom lossless packets.
+* The group is a **closed** one: the founder invites, removes anybody no longer
+  seated, and the `chat_id` reaches players through the lobby advertisement
+  rather than through Tox's own group discovery — which is what makes this
+  buildable at all (see the risks above).
+
 ### What is built first, and why in that order
 
 1. **A transport seam.** `TableSession`, `GameProtocol` and `StateMachine` must

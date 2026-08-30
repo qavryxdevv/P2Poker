@@ -38,7 +38,11 @@ use crate::net::joinwire::WireError;
 use crate::poker::state::{Hash, SeatIdx};
 use crate::protocol::messages::EventType;
 
-use super::handwire::{HandInit, NotOurs};
+use crate::mental_poker::backend::{DeckParams, HandDeck, HandSecret, VerifiedKey, WireKey,
+    WireKeyProof};
+use crate::mental_poker::protocol::{CtxFields, DeckCtx, DeckWire, ProofPosition};
+
+use super::handwire::{DeckInit, HandInit, NotOurs};
 use super::stage::{Collective, Heard};
 
 /// What a step wants sent.
@@ -63,6 +67,11 @@ pub enum Failed {
     Equivocation { seat: SeatIdx },
     /// For a stage this client has not reached. Held, not refused.
     NotYet,
+    /// A key or its proof did not survive the boundary, or the proof does not
+    /// hold. Attributable: the seat that sent it is named.
+    BadKey { seat: SeatIdx, why: &'static str },
+    /// The hand has gone as far as this client can take it.
+    NothingFurther,
 }
 
 impl std::fmt::Display for Failed {
@@ -76,6 +85,8 @@ impl std::fmt::Display for Failed {
                 write!(f, "seat {seat} sent two different copies of one stage")
             }
             Self::NotYet => f.write_str("that belongs to a stage this client has not reached"),
+            Self::BadKey { seat, why } => write!(f, "seat {seat}'s deck key: {why}"),
+            Self::NothingFurther => f.write_str("this hand has gone as far as it can"),
         }
     }
 }
@@ -101,6 +112,9 @@ pub struct Opening {
     pub big_blind: u64,
     pub level: u16,
     pub my_seat: SeatIdx,
+    /// How long a peer has to answer a cryptographic step, from the table's own
+    /// parameters. Carried on the envelope of every stage this hand emits.
+    pub crypto_step_timeout_ms: u32,
 }
 
 impl Opening {
@@ -132,6 +146,7 @@ impl Opening {
             // hand has completed.
             level: 1,
             my_seat: f.my_seat()?,
+            crypto_step_timeout_ms: ad.crypto_step_timeout_ms,
         })
     }
 }
@@ -170,14 +185,43 @@ pub fn provisional_button(session_id: &Hash, occupied: &[SeatIdx]) -> SeatIdx {
     occupied[(pick % occupied.len() as u64) as usize]
 }
 
+/// The cap on a `DECK_INIT` body: a key and a proof, and nothing else.
+pub const DECK_INIT_CAP: usize = 256;
+
+/// How far this hand has got.
+///
+/// One variant per stage, each carrying only what that stage needs, so a stage
+/// cannot read state that belongs to a later one. The `Slot` lives outside,
+/// because advancing it is the same operation whatever the stage was.
+enum Phase {
+    /// Stage 0: `HAND_INIT`, collective.
+    Init(Collective),
+    /// Stage 1: `DECK_INIT`, collective.
+    Deck {
+        stage: Collective,
+        /// The verified keys, **in arrival order**.
+        ///
+        /// Not sorted, and this matters: `verify_key` refuses a key equal to
+        /// one already held and refuses the identity, and it compares against
+        /// exactly this list. Sorting it or building it twice in different
+        /// orders would change which duplicate is caught first.
+        keys: Vec<VerifiedKey>,
+        /// This client's own secret for the hand. Never leaves the process.
+        secret: HandSecret,
+    },
+    /// Stage 1 completed: every seat's key is verified and the deck exists.
+    Dealt(HandDeck),
+}
+
 /// One hand in progress.
 pub struct Hand {
     open: Opening,
     /// The body this client derived. Everybody else's is compared against it.
     mine: HandInit,
-    /// Stage 0's slot, kept so a receiver can check the parent and sequence.
+    /// The slot of the stage now open.
     slot: Slot,
-    stage: Collective,
+    phase: Phase,
+    params: std::sync::Arc<DeckParams>,
     /// Events for a stage this client has not reached. Held rather than
     /// refused, because GossipSub does not order two messages and a peer that
     /// is one step ahead is not a peer that is wrong. The same reason
@@ -257,7 +301,8 @@ impl Hand {
                 open: o,
                 mine,
                 slot,
-                stage,
+                phase: Phase::Init(stage),
+                params: DeckParams::new(),
                 early: VecDeque::new(),
             },
             vec![Send::Broadcast(bytes)],
@@ -265,32 +310,80 @@ impl Hand {
     }
 
     /// Take one event off the wire.
-    pub fn on_event(&mut self, bytes: &[u8]) -> Result<(), Failed> {
-        let opened = chained::open(bytes, FRAME_CAP, EventType::HandInit, &self.slot).map_err(
-            |e| match e {
-                // A different stage or a different parent is not a fault: it is
-                // a peer one step ahead, and GossipSub does not order two
-                // messages. `chained::open` reports the four slot fields with a
-                // distinct message each, deliberately, so the two that mean
-                // "later" can be told from the two that mean "elsewhere".
-                WireError::Envelope("an event at another stage")
-                | WireError::Envelope("a different parent: the sender is on another chain") => {
-                    Failed::NotYet
-                }
-                other => Failed::Wire(other),
-            },
-        )?;
+    ///
+    /// Returns what this client must now say. A stage completing is what
+    /// produces the next stage's message, so the two are one call: there is
+    /// no state in which the hand has advanced and nobody has been told.
+    pub fn on_event(
+        &mut self,
+        bytes: &[u8],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        // What it claims to be, before anything about it is believed. One
+        // channel carries the formation's messages and the hand's, and a
+        // duplicate of a stage already left has to be told from a message of
+        // another kind entirely — the first is ordinary GossipSub weather and
+        // the second belongs to somebody else's handler.
+        let (kind, hand_id, sequence) = chained::peek(bytes, FRAME_CAP).map_err(Failed::Wire)?;
+        if !matches!(kind, EventType::HandInit | EventType::DeckInit) {
+            return Err(Failed::Wire(WireError::WrongType));
+        }
+        if hand_id != self.open.hand_id {
+            return Err(Failed::NotYet);
+        }
+        if sequence < self.slot.sequence {
+            // A stage this hand has left. Not a fault and not worth a word: the
+            // mesh delivers a message more than once as a matter of course.
+            return Ok(Vec::new());
+        }
+        if sequence > self.slot.sequence {
+            return Err(Failed::NotYet);
+        }
 
-        let seat = self
-            .open
+        match self.phase {
+            Phase::Init(_) => self.on_hand_init(bytes, key, now_ms),
+            Phase::Deck { .. } => self.on_deck_init(bytes),
+            Phase::Dealt(_) => Err(Failed::NothingFurther),
+        }
+    }
+
+    /// Which seat a sender is, or nobody.
+    fn seat_of(&self, sender: &[u8; 32]) -> Result<SeatIdx, Failed> {
+        self.open
             .seats
             .iter()
-            .find(|(_, key, _)| *key == opened.sender)
+            .find(|(_, k, _)| k == sender)
             .map(|(seat, _, _)| *seat)
-            .ok_or(Failed::NotAtThisTable)?;
+            .ok_or(Failed::NotAtThisTable)
+    }
 
-        let theirs: HandInit =
-            chained::payload(&opened, HAND_INIT_CAP).map_err(Failed::Wire)?;
+    /// Open an event against the slot now expected.
+    fn opened(&self, bytes: &[u8], kind: EventType) -> Result<chained::Opened, Failed> {
+        chained::open(bytes, FRAME_CAP, kind, &self.slot).map_err(|e| match e {
+            // A different stage or a different parent is not a fault: it is
+            // a peer one step ahead, and GossipSub does not order two
+            // messages. `chained::open` reports the four slot fields with a
+            // distinct message each, deliberately, so the two that mean
+            // "later" can be told from the two that mean "elsewhere".
+            WireError::Envelope("an event at another stage")
+            | WireError::Envelope("a different parent: the sender is on another chain") => {
+                Failed::NotYet
+            }
+            other => Failed::Wire(other),
+        })
+    }
+
+    fn on_hand_init(
+        &mut self,
+        bytes: &[u8],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, EventType::HandInit)?;
+        let seat = self.seat_of(&opened.sender)?;
+
+        let theirs: HandInit = chained::payload(&opened, HAND_INIT_CAP).map_err(Failed::Wire)?;
         theirs
             .self_consistent(self.open.max_players)
             .map_err(|what| Failed::Disagrees { seat, what })?;
@@ -298,11 +391,147 @@ impl Hand {
             .disagreement(&theirs)
             .map_err(|what| Failed::Disagrees { seat, what })?;
 
-        match self.stage.hear(seat, opened.event_hash) {
-            Heard::Counted | Heard::Bystander | Heard::Again => Ok(()),
-            Heard::Equivocation { .. } => Err(Failed::Equivocation { seat }),
-            Heard::Uninvited => Err(Failed::NotInThisStage),
+        let Phase::Init(stage) = &mut self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+        match stage.hear(seat, opened.event_hash) {
+            Heard::Counted | Heard::Bystander | Heard::Again => {}
+            Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
+            Heard::Uninvited => return Err(Failed::NotInThisStage),
         }
+        if !stage.complete() {
+            return Ok(Vec::new());
+        }
+        let parent = stage.hash().expect("a complete stage has one");
+        self.begin_deck(parent, key, now_ms)
+    }
+
+    /// Stage 0 completed: move to stage 1 and offer this client's deck key.
+    fn begin_deck(
+        &mut self,
+        parent: Hash,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        self.slot = self.slot.then(parent);
+
+        let me = self.open.seats[self.seat_index()].1;
+        let ctx = self.deck_ctx(&me);
+        let (secret, wire_key, proof) = self.params.keygen(&ctx);
+        let body = DeckInit {
+            key: wire_key.encode(),
+            proof: proof.encode(),
+        };
+        let bytes = chained::seal(
+            EventType::DeckInit,
+            &self.slot,
+            &body,
+            key,
+            now_ms,
+            self.open.crypto_step_timeout_ms,
+            DECK_INIT_CAP,
+        )
+        .map_err(Failed::Wire)?;
+
+        // The dealt-in seats are the parties to the deck: a seat that posts
+        // dead money holds no key, so the required set here is `dealt_in`
+        // and not `P(k-1)`.
+        let mut stage = Collective::closed(
+            self.slot.sequence,
+            EventType::DeckInit.code(),
+            &self.mine.dealt_in,
+        )
+        .ok_or(Failed::NotInThisStage)?;
+
+        // This client's own key goes through the same verification
+        // everybody else's does, against an empty set, which is what makes
+        // it the first entry the others are compared against.
+        let own = HandDeck::verify_key(wire_key, &proof, &[], &ctx).map_err(|_| Failed::BadKey {
+            seat: self.open.my_seat,
+            why: "this client's own proof did not verify",
+        })?;
+        let own_hash = self.opened(&bytes, EventType::DeckInit)?.event_hash;
+        stage.hear(self.open.my_seat, own_hash);
+
+        self.phase = Phase::Deck {
+            stage,
+            keys: vec![own],
+            secret,
+        };
+        Ok(vec![Send::Broadcast(bytes)])
+    }
+
+    fn on_deck_init(&mut self, bytes: &[u8]) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, EventType::DeckInit)?;
+        let seat = self.seat_of(&opened.sender)?;
+        let body: DeckInit = chained::payload(&opened, DECK_INIT_CAP).map_err(Failed::Wire)?;
+
+        let wire_key = WireKey::decode(&body.key).map_err(|_| Failed::BadKey {
+            seat,
+            why: "not a point on the curve",
+        })?;
+        let proof = WireKeyProof::decode(&body.proof).map_err(|_| Failed::BadKey {
+            seat,
+            why: "not a well-formed ownership proof",
+        })?;
+        let ctx = self.deck_ctx(&opened.sender);
+
+        let Phase::Deck { stage, keys, .. } = &mut self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+        // Against the keys already held, in arrival order: that is what
+        // refuses the identity element and a key equal to one already
+        // seated, which is condition C-4 of the deck review.
+        let verified =
+            HandDeck::verify_key(wire_key, &proof, keys, &ctx).map_err(|_| Failed::BadKey {
+                seat,
+                why: "the proof does not hold, or the key is already in use",
+            })?;
+
+        match stage.hear(seat, opened.event_hash) {
+            Heard::Counted | Heard::Bystander => keys.push(verified),
+            // A repeat must not add the key twice, or the duplicate check
+            // would refuse the honest sender's own key on its next copy.
+            Heard::Again => {}
+            Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
+            Heard::Uninvited => return Err(Failed::NotInThisStage),
+        }
+        if !stage.complete() {
+            return Ok(Vec::new());
+        }
+        let parent = stage.hash().expect("a complete stage has one");
+        self.slot = self.slot.then(parent);
+        let Phase::Deck { keys, .. } = &self.phase else {
+            unreachable!("just matched")
+        };
+        self.phase = Phase::Dealt(HandDeck::new(self.params.clone(), keys));
+        Ok(Vec::new())
+    }
+
+    /// The proof context for one emitter at the stage now open.
+    ///
+    /// Per **sender**, which the wire requires: `sender_public_key` is inside
+    /// the context, so one context shared by three senders would let a proof
+    /// made for one of them verify for another. A test that shares one passes
+    /// and the wire does not.
+    fn deck_ctx(&self, sender: &[u8; 32]) -> DeckCtx {
+        DeckCtx::build(&CtxFields {
+            protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
+            table_id: self.open.table_id,
+            session_id: self.open.session_id,
+            hand_id: self.open.hand_id,
+            sequence: self.slot.sequence,
+            position: ProofPosition::NotAShuffleStep,
+            sender_public_key: *sender,
+        })
+    }
+
+    fn seat_index(&self) -> usize {
+        self.open
+            .seats
+            .iter()
+            .position(|(s, _, _)| *s == self.open.my_seat)
+            .unwrap_or(0)
     }
 
     /// Hold an event that belongs to a stage this client has not reached.
@@ -316,27 +545,74 @@ impl Hand {
     }
 
     /// Judge everything that was held, now that the stage may have moved.
-    pub fn replay_early(&mut self) -> Vec<Failed> {
+    ///
+    /// Whatever the replay produces is returned with the failures, because a
+    /// held event can be the one that completes a stage — and a stage that
+    /// completed without its message going out is a table that stops.
+    pub fn replay_early(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> (Vec<Send>, Vec<Failed>) {
         let waiting: Vec<Vec<u8>> = self.early.drain(..).collect();
-        waiting
-            .into_iter()
-            .filter_map(|bytes| self.on_event(&bytes).err())
-            .collect()
+        let mut sends = Vec::new();
+        let mut failures = Vec::new();
+        for bytes in waiting {
+            match self.on_event(&bytes, key, now_ms) {
+                Ok(mut out) => sends.append(&mut out),
+                Err(e) => failures.push(e),
+            }
+        }
+        (sends, failures)
     }
 
     /// Whether stage 0 is complete: every required seat heard and agreed.
+    ///
+    /// The name is the player's word for it. What it means underneath is that
+    /// the hand has left `HAND_INIT` behind.
     pub fn dealt(&self) -> bool {
-        self.stage.complete()
+        !matches!(self.phase, Phase::Init(_))
     }
 
-    /// Which seats the table is still waiting for.
+    /// Whether every seat's deck key is verified and the deck exists.
+    pub fn deck_ready(&self) -> bool {
+        matches!(self.phase, Phase::Dealt(_))
+    }
+
+    /// Which seats the stage now open is still waiting for.
     pub fn waiting_for(&self) -> Vec<SeatIdx> {
-        self.stage.waiting_for()
+        match &self.phase {
+            Phase::Init(stage) => stage.waiting_for(),
+            Phase::Deck { stage, .. } => stage.waiting_for(),
+            Phase::Dealt(_) => Vec::new(),
+        }
     }
 
-    /// The slot stage 1 hangs off, once stage 0 has completed.
-    pub fn next_slot(&self) -> Option<Slot> {
-        Some(self.slot.then(self.stage.hash()?))
+    /// The slot of the stage now open. After stage 0 completes this is stage
+    /// 1's, which is what makes it the thing to compare between two peers.
+    pub fn slot(&self) -> Slot {
+        self.slot
+    }
+
+    /// This client's own secret for the hand, once it has one.
+    ///
+    /// Held across the stage transition and never sent: it is what will decrypt
+    /// this seat's own cards, and a hand that lost it would be a player who
+    /// cannot read the hand they are in. Borrowed rather than copied, and
+    /// `HandSecret`'s `Debug` never prints it.
+    pub fn secret(&self) -> Option<&HandSecret> {
+        match &self.phase {
+            Phase::Deck { secret, .. } => Some(secret),
+            _ => None,
+        }
+    }
+
+    /// The deck, once every seat's key is verified.
+    pub fn deck(&self) -> Option<&HandDeck> {
+        match &self.phase {
+            Phase::Dealt(deck) => Some(deck),
+            _ => None,
+        }
     }
 
     /// What this client derived, for the interface to draw.
@@ -392,7 +668,22 @@ mod tests {
             big_blind: 100,
             level: 1,
             my_seat,
+            crypto_step_timeout_ms: 30_000,
         }
+    }
+
+    /// Deliver one client's output to the other, and hand back whatever that
+    /// produced. A stage completing is what emits the next stage's message, so
+    /// a test that dropped the return value would stall one step in.
+    fn deliver(to: &mut Hand, sends: &[Send], key: &SigningKey) -> Vec<Send> {
+        let mut out = Vec::new();
+        for Send::Broadcast(bytes) in sends {
+            match to.on_event(bytes, key, NOW) {
+                Ok(mut more) => out.append(&mut more),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        out
     }
 
     /// The whole milestone, with no network: two independent states, each
@@ -405,18 +696,80 @@ mod tests {
         assert!(!a.dealt() && !b.dealt(), "neither has heard the other yet");
         assert_eq!(a.waiting_for(), vec![1]);
 
-        let Send::Broadcast(a_bytes) = &from_a[0];
-        let Send::Broadcast(b_bytes) = &from_b[0];
-        b.on_event(a_bytes).unwrap();
-        a.on_event(b_bytes).unwrap();
+        // Stage 0 completes, and completing it is what produces each side's
+        // `DECK_INIT` — so the deal and the deck are one exchange, not two.
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
 
-        assert!(a.dealt() && b.dealt());
+        assert!(a.dealt() && b.dealt(), "stage 0 is behind them");
         assert_eq!(
-            a.next_slot().unwrap(),
-            b.next_slot().unwrap(),
+            a.slot(),
+            b.slot(),
             "two peers must hang stage 1 off one parent"
         );
-        assert_eq!(a.next_slot().unwrap().sequence, 1);
+        assert_eq!(a.slot().sequence, 1);
+        assert_eq!(b_deck.len(), 1, "completing stage 0 offers a deck key");
+        assert_eq!(a_deck.len(), 1);
+
+        // And stage 1: each verifies the other's key and the deck exists.
+        assert!(deliver(&mut b, &a_deck, &key(11)).is_empty());
+        assert!(deliver(&mut a, &b_deck, &key(10)).is_empty());
+        assert!(a.deck_ready() && b.deck_ready(), "every key verified");
+        assert_eq!(a.slot(), b.slot(), "and one parent for stage 2");
+        assert_eq!(a.slot().sequence, 2);
+    }
+
+    /// The secret is kept across the stage transition. Losing it would be a
+    /// player who cannot read the hand they are sitting in, and it would not
+    /// show until the cards were dealt.
+    #[test]
+    fn the_secret_survives_the_stage_it_was_made_in() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        assert!(a.secret().is_none(), "no secret before there is a deck");
+
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        assert!(a.secret().is_some(), "stage 1 opened, so there is one");
+        assert!(a.deck().is_none(), "and no deck until every key is in");
+
+        deliver(&mut a, &b_deck, &key(10));
+        deliver(&mut b, &a_deck, &key(11));
+        assert!(a.deck().is_some() && b.deck().is_some());
+    }
+
+    /// A key that is not a point on the curve is refused, and the seat that
+    /// sent it is named — the deck review's whole point is that the library
+    /// proves what it claims and the claim is not what a poker game needs.
+    #[test]
+    fn a_deck_key_that_is_not_a_point_is_refused() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        assert_eq!(a_deck.len(), 1);
+
+        // Take A's own `DECK_INIT`, wreck the key inside it, and re-sign it as
+        // A: the envelope is honest and the point is not.
+        let Send::Broadcast(good) = &a_deck[0];
+        let opened = chained::open(good, FRAME_CAP, EventType::DeckInit, &a.slot()).unwrap();
+        let mut body: DeckInit =
+            chained::payload(&opened, DECK_INIT_CAP).unwrap();
+        body.key = vec![0xff; body.key.len()];
+        let forged = chained::seal(
+            EventType::DeckInit,
+            &a.slot(),
+            &body,
+            &key(10),
+            NOW,
+            30_000,
+            DECK_INIT_CAP,
+        )
+        .unwrap();
+
+        let e = b.on_event(&forged, &key(11), NOW).unwrap_err();
+        assert!(matches!(e, Failed::BadKey { seat: 0, .. }), "{e}");
+        assert!(!b.deck_ready(), "and the deck does not exist");
     }
 
     /// A peer's own copy is recorded locally and never travels back to itself.
@@ -433,8 +786,10 @@ mod tests {
         let (mut a, _) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
         let (_, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
         let Send::Broadcast(b_bytes) = &from_b[0];
-        a.on_event(b_bytes).unwrap();
-        a.on_event(b_bytes).unwrap();
+        a.on_event(b_bytes, &key(10), NOW).unwrap();
+        // The second copy arrives at a stage this client has already left. It
+        // is not a fault and not worth a word.
+        assert_eq!(a.on_event(b_bytes, &key(10), NOW), Ok(Vec::new()));
         assert!(a.dealt());
     }
 
@@ -452,7 +807,7 @@ mod tests {
         let (_, from_b) = Hand::open(wrong, &key(11), NOW, 30_000).unwrap();
         let Send::Broadcast(b_bytes) = &from_b[0];
 
-        let e = a.on_event(b_bytes).unwrap_err();
+        let e = a.on_event(b_bytes, &key(10), NOW).unwrap_err();
         assert!(
             matches!(
                 e,
@@ -475,7 +830,10 @@ mod tests {
         theirs.seats[1].1 = key(99).verifying_key().to_bytes();
         let (_, from_c) = Hand::open(theirs, &key(99), NOW, 30_000).unwrap();
         let Send::Broadcast(c_bytes) = &from_c[0];
-        assert_eq!(a.on_event(c_bytes), Err(Failed::NotAtThisTable));
+        assert_eq!(
+            a.on_event(c_bytes, &key(10), NOW),
+            Err(Failed::NotAtThisTable)
+        );
     }
 
     /// Heads-up, the button is the small blind. Getting this wrong is the
@@ -519,7 +877,9 @@ mod tests {
 
         a.hold(b_bytes.clone());
         assert!(!a.dealt(), "held, not applied");
-        assert!(a.replay_early().is_empty(), "and it was good all along");
+        let (sends, failures) = a.replay_early(&key(10), NOW);
+        assert!(failures.is_empty(), "it was good all along");
+        assert_eq!(sends.len(), 1, "and completing stage 0 offers a deck key");
         assert!(a.dealt());
     }
 }
