@@ -171,6 +171,7 @@ impl AppState {
             NodeEvent::HolePunched(p) => self.note(format!("{p} is now a direct connection")),
             NodeEvent::StillRelayed(p) => self.note(format!("{p} stays relayed")),
             NodeEvent::LocalPeer(p) => self.note(format!("found {p} on this network")),
+            NodeEvent::LobbyPeer(p) => self.note(format!("found {p} in the public lobby")),
             NodeEvent::MeshPeer(p) => self.note(format!("{p} joined the lobby mesh")),
             NodeEvent::Published { bytes } => self.note(format!("advertised, {bytes} bytes")),
             NodeEvent::TableSeen {

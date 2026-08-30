@@ -171,6 +171,15 @@ pub enum NodeEvent {
     DialFailed { reason: String },
     /// A peer was found on the local network.
     LocalPeer(PeerId),
+    /// A peer was found in the public lobby, through the DHT.
+    ///
+    /// Separate from [`LocalPeer`](NodeEvent::LocalPeer) on purpose. The two
+    /// paths are meant to be independent and one of them is much easier: on a
+    /// single network multicast answers in a second, so a lobby that only ever
+    /// worked over multicast would look exactly like one that worked. Saying
+    /// which road a player arrived by is what makes the difference visible in
+    /// an ordinary run instead of only in a test with multicast turned off.
+    LobbyPeer(PeerId),
     /// A peer subscribed to a topic this node also holds.
     ///
     /// Worth its own line: until one does, `publish` returns
@@ -254,6 +263,7 @@ impl NodeEvent {
             | Self::Announced { .. }
             | Self::DialFailed { .. }
             | Self::LocalPeer(_)
+            | Self::LobbyPeer(_)
             | Self::MeshPeer(_)
             | Self::Published { .. }
             | Self::HolePunched(_)

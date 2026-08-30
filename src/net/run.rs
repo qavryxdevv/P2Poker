@@ -883,6 +883,9 @@ pub async fn run(
                                 }))
                                 .await;
                             for peer in providers {
+                                if lobby {
+                                    let _ = events.send(NodeEvent::LobbyPeer(peer)).await;
+                                }
                                 // By peer id: the addresses came with the query
                                 // and live in the routing table, and asking for
                                 // them by hand would be asking a second time

@@ -35,184 +35,39 @@ circuit. Carrying a game over a public relay is arithmetically fine; what it
 needs is two or three reservations held at once and a session that survives a
 circuit being reset under it.
 
-### Mainline is gone
+### Mainline is gone, and the lobby works across networks
 
-Discovery is the public libp2p Kademlia DHT and nothing else. `--no-mdns` turns
-multicast off, which is how the DHT path gets tested at all — with it on, two
-clients on one wire find each other in a second whatever the DHT does.
+Discovery is the public libp2p Kademlia DHT and nothing else.
 
-**It worked twice, end to end**, before the removal was finished: two clients,
-multicast off, each holding a reservation on a *different* public relay, agreed
-a table — `TABLE FORMED session=f503d44809bfb094 seats=2` on both.
+**Proven by the owner's own two machines, which is the configuration that
+matters:** two PCs on **different VLANs**, with a firewall blocking inbound
+connections between them, and each client's lobby lists the other's tables.
+Multicast does not cross a VLAN, so mDNS cannot be what found them — it was the
+DHT, and the connection is carried by a relay. That is D-003's acceptance
+criterion met by the awkward case rather than the easy one.
 
-**And it has not worked since, and that is where tomorrow starts.** Four runs of
-eight to ten minutes each, after the removal was tidied up:
+**Two clients on one machine is a bad proxy for this, and it misled me.** Four
+runs of eight to ten minutes, both with `--no-mdns`, both announcing themselves
+successfully, both reading the lobby a hundred and thirty times and getting real
+answers of five or six other players — and never each other. On the evidence
+above that is an artefact of running both behind one NAT with one external
+address, not a broken lobby. It is still worth understanding, because a test
+that cannot be run on one machine is a test that will not be run.
 
-* both clients announce themselves — `start_providing` succeeds and the log says
-  *listed in the public lobby*;
-* both read the lobby a hundred and thirty times and get real answers: five or
-  six other players, which are this machine's own earlier test profiles still
-  advertised in the DHT;
-* and **never each other**. One run connected to 325 peers and not once to its
-  counterpart.
-
-So the mechanism is not dead — records land and queries return them. Two
-particular records are not reaching the queries that want them. What has not
-been established, in order of suspicion:
-
-1. Whether go-libp2p stores an `ADD_PROVIDER` whose only addresses are circuit
-   addresses. It certainly drops one with **no** addresses — `handlers.go`, `if
-   len(pi.Addrs) < 1 { continue }` — and whether a relay address survives its
-   filtering was not checked.
-2. Whether two `get_providers` walks for one key converge on the same nodes from
-   a routing table this thin. Kademlia's client mode was the first suspect and
-   has been changed to automatic (`set_mode(None)`), which did not fix it.
-3. Whether the record needs longer than a ten-minute run to settle.
-
-The cheapest experiment for (1) is a third party: announce from this client and
-look for the record with a tool that is not this client — `ipfs dht findprovs`
-against the same key would settle it in one command.
-
-## Two processes now form a table
-
-```bash
-cargo build --release
-```
-
-Terminal one:
-
-```bash
-./target/release/p2p-poker --headless --profile ./A --host Riverside --seats 2 --for 45
-```
-
-Terminal two:
-
-```bash
-./target/release/p2p-poker --headless --profile ./B --join Riverside --for 40
-```
-
-Both print `TABLE FORMED session=…` with **the same session identity**. Run three
-times on this machine, three tables, three matching identities. That is the join
-RPC on `/p2p-poker/join/1`, `PLAYER_LIST` and `TABLE_READY` on the table's own
-GossipSub topic, and every §4.3 admission rule running on bytes that travelled.
-
-`--profile` matters: the profile lives beside the executable so the folder can be
-copied, and two copies of one folder are one player — which §4.3's `peer_id` rule
-then correctly refuses a second seat to. `--seats 2` matters too: without it the
-command line founds a **rated Sit-and-Go**, and that needs all ten seats before
-it deals.
-
-The window does the same thing through **Create table** and **Join table**, and
-the table opens in a window of its own beside the lobby with the other players
-arriving in it as they sit down.
-
-## What has been demonstrated, and what has not
-
-**Demonstrated.** Two processes, no server: mDNS, a QUIC handshake, a GossipSub
-mesh, a signed advert crossing it, §7.2's admission rules on real bytes, both
-nodes announcing under `LOBBY_INFOHASH` and finding each other through the public
-DHT — and now a whole table formed, ratified and settled on a `session_id`.
-
-A **relay circuit carries traffic**: `tests/relay_circuit.rs` runs three nodes,
-takes a reservation, dials the circuit address and connects over it. Its first
-run found that nothing in this client ever recorded a confirmed external address,
-so a node volunteering as a relay granted reservations carrying no address at
-all.
-
-**Not demonstrated, and this is the first item below.** Two machines on two
-networks. Loopback has no NAT and nothing on one machine simulates one, so DCUtR
-and hole punching are exercised by a run across two networks and by nothing else.
-
-`tools/two-network-test.ps1` runs one node here and one in a Hyper-V VM on a
-different subnet. It must be run elevated — the Hyper-V cmdlets return an empty
-list under a UAC-filtered token, which reads exactly like "there are no VMs".
-
-## What is built
-
-| Layer | State |
-|---|---|
-| Poker engine | complete — blinds, order, dead button, pots, TDA reopening, ~120 000 random hands |
-| Protocol | envelopes, canonical CBOR, signatures, transcript, anti-replay, checkpoints, staleness |
-| Mental poker | complete — the forked `ziffle`, the chain, reveal gating, `n`-of-`n` |
-| The seam | `table::dealing` — three peers, one hand from deck to pot |
-| Discovery | Mainline, mDNS, QUIC + TCP, GossipSub, relay adequacy, a circuit that carries |
-| Lobby | signed adverts across the wire, §7.2 rules 2–7, rate limits, eviction |
-| Formation | **complete and wired** — join RPC, roster, ratification, `session_id`, over a real connection |
-| GUI | lobby and table in two windows, settings, live roster; no hand engine behind the table yet |
-| Renderer | OpenGL, falling back by itself to Direct3D 12 on WARP where there is no graphics driver |
-
-## It starts on a machine with no graphics driver
-
-A virtual machine without acceleration has the OpenGL 1.1 that Windows ships,
-and the window needs 2.0. The client no longer stops there: it starts itself
-again on Direct3D 12, which with no driver present resolves to WARP — `Microsoft
-Basic Render Driver`, part of Windows rather than of any driver — and says which
-adapter it landed on.
-
-A **second process**, because a process gets one event loop and no more: `winit`
-swaps a global flag the first time one is built and never clears it, so the
-renderer cannot be retried in place. The decision is taken in `main`, after
-`windowed` has returned and its tokio runtime is gone, so the second process
-cannot start a second node under the same identity while the first still holds
-the ports.
-
-Measured, not assumed: `Microsoft Basic Render Driver` is enumerated on this
-machine alongside its two real GPUs, driver version `10.0.19041` — the Windows
-build number, not a driver's — and the client draws a window on it when told
-`--renderer software`. What is **not** yet measured is the automatic hop, which
-needs a machine where OpenGL is genuinely absent. The two decisions it turns on
-are unit-tested; the hop itself is not.
-
-Cost: 21.3 MB → 26.4 MB, and 23 crates, none of which brings a new licence into
-the tree (`DEPENDENCIES.md` §6).
-
-### And then it burned a core, which was our fault, not the renderer's
-
-A client sitting at a table with no hand running took ~100% of a processor in
-the VM. The renderer was the trigger, not the cause. Measured, idle, full-size
-window:
-
-| | before | after |
-|---|---|---|
-| OpenGL, on a card | 1.4% of one core | **0.0%** |
-| Direct3D 12 on WARP | 660% — 6.6 cores | **~41%** |
-
-Three separate faults, each found by measurement and each invisible on a GPU:
-
-1. **A repaint on a timer.** `request_repaint_after(250 ms)` ran at the end of
-   every frame whether or not anything had changed. A frame in software takes
-   longer than 250 ms, so the next was always already due: it never stopped.
-   Now the window is woken by the node, through a relay task that holds the
-   egui context — and the wake names `ViewportId::ROOT`, because a bare
-   `request_repaint` wakes whichever viewport is on top of a stack the task is
-   not on, which while the table window is open is the table.
-2. **Chatter treated as news.** `NodeEvent::changes_more_than_the_log` splits
-   what a player is watching from what is only a line in the log. A seat
-   filling repaints at once; a dial that failed waits up to three seconds on
-   the software renderer, 200 ms on a card. The match is exhaustive with no
-   wildcard, so a new event will not compile until somebody chooses a side.
-   mDNS also stopped announcing the same neighbour every few seconds — it is
-   announced once and forgotten again on `Expired`, which is now handled.
-3. **A scrollbar that could not make up its mind.** `VisibleWhenNeeded` fades
-   the bar; the fade changes the content width; rewrapped content is a
-   different height; a different height wants a different answer. The animation
-   never settled, and an animation in flight asks egui for another frame for
-   ever. That alone was half the idle cost — 78% against 39%.
-
-What is **not** fixed: one full redraw of the window still costs about half a
-second of processor time under WARP against four milliseconds on a card, and a
-controlled experiment says that is the price of the window itself rather than of
-anything in particular that we draw — a bare `CentralPanel` with no fill, no
-stroke and no rounding costs the same as the whole lobby. Moving the mouse over
-the client in a VM will be slow. Cutting that means drawing less, and the first
-candidates are `paint.rs`'s `RINGS = 16` and `BANDS = 14`.
+`--no-mdns` exists for exactly that isolation, and the client now says which
+road a peer arrived by — *found … on this network* for multicast, *found … in
+the public lobby* for the DHT — so an ordinary run answers the question that
+used to need a special one.
 
 ## Next actions, in order
 
-1. **Make two clients find each other in the lobby, repeatably.** See above for
-   what is known and the three things that are not. Everything below waits on
-   this: a lobby that lists strangers and not your friend is not a lobby.
-2. **The hand, wired.** Formation ends at `session_id` and the engine starts at
+1. **The hand, wired.** Formation ends at `session_id` and the engine starts at
+   `GENESIS(1)`. `table::dealing` already runs a hand between three peers in
+   memory; nothing carries `HAND_INIT` and the deck messages between two. This
+   is now the thing standing between a lobby that works and a game.
+2. **Why two clients on one machine do not find each other**, when two on
+   different VLANs do. Not blocking, but a test that only passes on two
+   computers is a test nobody runs. Formation ends at `session_id` and the engine starts at
    `GENESIS(1)`. `table::dealing` already runs a hand between three peers in
    memory; nothing carries `HAND_INIT` and the deck messages between two.
 3. **Two machines on two networks.** Still rests on nothing.

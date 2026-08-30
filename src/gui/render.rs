@@ -976,15 +976,18 @@ fn network_strip(ui: &mut egui::Ui, view: &LobbyView) {
         );
 
         ui.label(
+            // A relay is a relay. Whether its budget carries a hand is a
+            // question about a table, and it is asked in `net::relay` when
+            // somebody sits down — not on a strip that reads "too small for a
+            // hand" at a player who is not in one, permanently, because every
+            // public relay reports the library's defaults.
             RichText::new(match &s.relay {
                 None => "relay: none".to_string(),
-                Some(r) if r.adequate => format!("relay: {}", &r.peer[..8.min(r.peer.len())]),
-                Some(_) => "relay: too small for a hand".to_string(),
+                Some(r) => format!("relay: {}", &r.peer[..8.min(r.peer.len())]),
             })
             .color(match &s.relay {
                 None => theme::TEXT_DIM,
-                Some(r) if r.adequate => theme::OK,
-                Some(_) => theme::WARN,
+                Some(_) => theme::OK,
             })
             .size(14.0),
         );
