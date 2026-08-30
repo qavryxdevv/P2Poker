@@ -395,9 +395,16 @@ fn headless(player: Player, run: Run, join: Option<String>) {
                     // holds, a peer count — and printing `log.back()` after
                     // every one of them reprinted the previous line instead,
                     // which read as the same thing happening five times.
-                    let before = state.log.len();
+                    // Counted, not measured by length. The log is capped, so
+                    // once it is full a pop and a push leave `len` where it was
+                    // and this printed nothing at all — which is how a table
+                    // that was playing hand after hand looked, for three runs
+                    // of the two-process test, like one that had stalled after
+                    // the deal.
+                    let before = state.emitted;
                     state.apply(event);
-                    for line in state.log.iter().skip(before) {
+                    let fresh = usize::try_from(state.emitted - before).unwrap_or(0);
+                    for line in state.log.iter().skip(state.log.len().saturating_sub(fresh)) {
                         println!("{line}");
                     }
 

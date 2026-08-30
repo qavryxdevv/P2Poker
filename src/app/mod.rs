@@ -115,8 +115,13 @@ pub struct MyTurn {
 pub struct AppState {
     pub lobby: LobbyStore,
     pub status: NetworkStatus,
-    /// What has happened, newest last.
+    /// What has happened, newest last. Capped at [`MAX_LOG_LINES`].
     pub log: VecDeque<String>,
+    /// How many lines have **ever** been written to the log.
+    ///
+    /// Monotonic, and the only sound way to ask "what is new since I last
+    /// looked" once the log has reached its cap. See [`AppState::note`].
+    pub emitted: u64,
     /// The table the user has selected in the list.
     pub selected: Option<[u8; 32]>,
     /// The table this client is at or forming, if any.
@@ -318,7 +323,7 @@ impl AppState {
                     h.shuffling = shuffling;
                     h.deck_ready = ready;
                 }
-                self.log.push_back(match (shuffling, ready) {
+                self.note(match (shuffling, ready) {
                     (_, true) => format!("hand #{hand_id}: the deck is shuffled and sealed"),
                     (Some(s), _) => format!("hand #{hand_id}: seat {s} is shuffling"),
                     (None, false) => format!("hand #{hand_id}: the deck is being prepared"),
@@ -350,7 +355,7 @@ impl AppState {
                     });
                     h.waiting_on = None;
                 }
-                self.log.push_back(if to_call > 0 {
+                self.note(if to_call > 0 {
                     format!("hand #{hand_id}: your turn — {to_call} to call")
                 } else {
                     format!("hand #{hand_id}: your turn")
@@ -396,7 +401,7 @@ impl AppState {
                     h.turn = None;
                     h.waiting_on = None;
                 }
-                self.log.push_back(format!("hand #{hand_id} is over"));
+                self.note(format!("hand #{hand_id} is over"));
             }
             NodeEvent::CardsDealt { hand_id, seats } => {
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
@@ -573,6 +578,15 @@ impl AppState {
             self.log.pop_front();
         }
         self.log.push_back(line);
+        // Counted, and this is not bookkeeping for its own sake. A reader that
+        // works out what is new from `log.len()` gets nothing at all once the
+        // log is at capacity, because a pop and a push leave the length where
+        // it was. The headless client did exactly that, and the effect was that
+        // every line routed through here stopped being printed the moment five
+        // hundred lines had gone by - a few minutes of an ordinary lobby. It is
+        // how a table that was playing perfectly well looked like a stalled one
+        // for three runs of the two-process test.
+        self.emitted = self.emitted.saturating_add(1);
     }
 
     /// The snapshot the panes read.
