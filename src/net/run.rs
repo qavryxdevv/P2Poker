@@ -996,6 +996,11 @@ pub async fn run(
                                 // formation, which is what it will be.
                                 Err(Failed::Wire(joinwire::WireError::WrongType)) => {}
                                 Err(e) => {
+                                    if let Some(n) = h.take_shuffle_note() {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(n))
+                                            .await;
+                                    }
                                     if let Some(n) = h.take_cert_note() {
                                         let _ = events
                                             .send(NodeEvent::Warning(n))

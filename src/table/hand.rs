@@ -705,6 +705,8 @@ pub struct Hand {
     /// ever cost its owner a fold, and nothing derived from it crosses the
     /// wire — so no peer has to agree about it and none can be misled by it.
     bank_left_ms: u32,
+    /// Diagnostic: what a refused shuffle step looked like from here.
+    shuffle_note: Option<String>,
     /// Diagnostic: what the certificate path last decided.
     cert_note: Vec<String>,
     /// The last seat a certificate acted for, and what it did.
@@ -904,6 +906,7 @@ impl Hand {
                 tally: None,
                 certs: BTreeSet::new(),
                 bank_left_ms: o.time_bank_ms,
+                shuffle_note: None,
                 cert_note: Vec::new(),
                 acted_for: None,
                 votes: BTreeMap::new(),
@@ -1478,9 +1481,29 @@ impl Hand {
         }
 
         let deck = held.deck.clone();
+        let taken = chain.steps_taken();
         chain
             .accept_step(&deal.deck, seat, deck, &body.proof, self.slot.sequence)
-            .map_err(|e| step_failure(seat, e))?;
+            .map_err(|e| {
+                // Seen twice and unexplained, so the refusal carries what would
+                // settle it: whether the chain had already taken this position
+                // while the slot had not moved past it. Guessing at this cost
+                // two wrong hypotheses already.
+                if matches!(e, StepError::AlreadySubmitted) {
+                    return Failed::Elsewhere {
+                        seat,
+                        what: "no step had been taken at this position — chain                                position and slot sequence are in the log",
+                    };
+                }
+                step_failure(seat, e)
+            })
+            .map_err(|e| {
+                self.shuffle_note = Some(format!(
+                    "shuffle refusal from seat {seat}: chain at step {taken},                      slot sequence {}, round {}",
+                    self.slot.sequence, body.shuffle_round
+                ));
+                e
+            })?;
         *heard = None;
 
         let hash = stage_hash_single(
@@ -3878,6 +3901,10 @@ impl Hand {
     }
 
     /// How the vote count stands, taken rather than read.
+    pub fn take_shuffle_note(&mut self) -> Option<String> {
+        self.shuffle_note.take()
+    }
+
     pub fn take_cert_note(&mut self) -> Option<String> {
         if self.cert_note.is_empty() {
             return None;
