@@ -2801,9 +2801,17 @@ shuffler's `SHUFFLE_PROOF` has verified.
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) shuffle_round` | `u8` | must equal the preceding `SHUFFLE_STEP`'s |
-| `n(1) input_deck_hash` | `bytes[32]` | `h("p2p-poker v1 deck-commit", [input deck bytes])` |
+| `n(1) input_deck_hash` | `bytes[32]` | `h("p2p-poker v1 deck-commit", [input deck bytes])`; for round 0 see below |
 | `n(2) output_deck_hash` | `bytes[32]` | over the preceding `SHUFFLE_STEP`'s deck |
 | `n(3) proof` | `bytes` | ≤ 8192 B; 5547 B for a 52-card Bayer–Groth proof |
+
+Round 0 is the exception: its input is the **open deck**, which is a library
+constant and never travels, so `input_deck_hash` is the fixed value
+`h("p2p-poker v1 deck-commit", ["the open deck"])`. It binds nothing, and it is
+not supposed to: the open deck is identical in every hand at every table, so a
+round-0 proof is bound to its hand entirely by the context, which carries the
+table, the session, the hand, the sequence and the shuffler's own key. The field
+is present at round 0 only so that one decoder reads every link.
 
 *Receiver must validate:* `input_deck_hash` matches the deck this receiver
 already holds as the shuffler's input, and `output_deck_hash` matches the deck

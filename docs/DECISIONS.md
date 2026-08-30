@@ -2082,10 +2082,14 @@ The transport changes. The protocol does not.
 Recorded here rather than left in a chat log, because they are constraints on
 the implementation and not preferences:
 
-* **The Tox instance opens its own port**, through NAT-PMP and UPnP, the way the
-  libp2p side already tries to. `c-toxcore` has both, and neither is on by
-  default in every build — the option and the build flag are part of the work,
-  not an afterthought.
+* **The Tox instance opens its own port, through NAT-PMP and UPnP, and both are
+  on without anybody choosing them.** Not an option, not a setting, not a build
+  flag somebody has to remember: `tox_options_set_local_discovery_enabled` and
+  the UPnP/NAT-PMP options are set by this client, and the vendored
+  `libtoxcore` is built with the support compiled in. A player behind a router
+  that would have opened a port for them, and did not because a checkbox was
+  off, is a player who cannot host — and the whole reason for D-019 is not
+  depending on somebody having configured their router by hand.
 * **Only game data.** Human chat stays on ordinary group messages; the protocol
   rides custom lossless packets.
 * The group is a **closed** one: the founder invites, removes anybody no longer

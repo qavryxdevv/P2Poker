@@ -320,6 +320,9 @@ pub async fn run(
     // seat and read as equivocation to everybody else.
     let mut hand: Option<crate::table::hand::Hand> = None;
     let mut hand_reported = false;
+    // The last deck state told to the interface, so that `2m` chain stages do
+    // not become `2m` identical lines in a player's log.
+    let mut deck_reported: Option<(Option<u8>, bool)> = None;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
 
     // Who mDNS has already told us about.
@@ -653,6 +656,7 @@ pub async fn run(
                         tournament_started = false;
                         hand = None;
                         hand_reported = false;
+                        deck_reported = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -676,6 +680,7 @@ pub async fn run(
                         tournament_started = false;
                         hand = None;
                         hand_reported = false;
+                        deck_reported = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -750,6 +755,17 @@ pub async fn run(
                                                     hand_id: init.hand_id,
                                                     button: init.button_position,
                                                     dealt_in: init.dealt_in.clone(),
+                                                })
+                                                .await;
+                                        }
+                                        let deck = (h.shuffler(), h.shuffled());
+                                        if deck_reported != Some(deck) {
+                                            deck_reported = Some(deck);
+                                            let _ = events
+                                                .send(NodeEvent::DeckProgress {
+                                                    hand_id: h.hand_id(),
+                                                    shuffling: deck.0,
+                                                    ready: deck.1,
                                                 })
                                                 .await;
                                         }
@@ -1669,6 +1685,7 @@ pub async fn run(
                         tournament_started = false;
                         hand = None;
                         hand_reported = false;
+                        deck_reported = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -1700,6 +1717,7 @@ pub async fn run(
                         tournament_started = false;
                         hand = None;
                         hand_reported = false;
+                        deck_reported = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),

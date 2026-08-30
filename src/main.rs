@@ -926,7 +926,8 @@ impl Client {
             name,
             blinds,
             street: match (hand, seat.session.is_some()) {
-                (Some(_), _) => "hand dealt".into(),
+                (Some(h), _) if h.deck_ready => "deck sealed".into(),
+                (Some(_), _) => "shuffling".into(),
                 (None, true) => "ready".into(),
                 (None, false) => "waiting".into(),
             },
@@ -936,10 +937,24 @@ impl Client {
             hero: seat.seat.unwrap_or(0),
             max_seats,
             note: Some(match (hand, seat.session) {
-                (Some(h), _) => format!(
-                    "hand #{} — the button is at seat {}",
-                    h.hand_id, h.button
-                ),
+                // While the chain runs, whose turn it is says more than the
+                // button does: it is the one thing on this screen that can be
+                // late, and a player who knows which seat everybody is waiting
+                // for knows whether the wait is theirs to fix.
+                (Some(h), _) => match (h.shuffling, h.deck_ready) {
+                    (_, true) => format!(
+                        "hand #{} — the deck is shuffled and sealed; the button is at seat {}",
+                        h.hand_id, h.button
+                    ),
+                    (Some(s), _) => format!(
+                        "hand #{} — seat {s} is shuffling the deck",
+                        h.hand_id
+                    ),
+                    (None, false) => format!(
+                        "hand #{} — preparing the deck",
+                        h.hand_id
+                    ),
+                },
                 (None, Some(_)) if !self.state.waiting_for.is_empty() => {
                     let who: Vec<String> = self
                         .state

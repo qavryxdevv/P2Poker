@@ -39,10 +39,15 @@ use crate::poker::state::{Hash, SeatIdx};
 use crate::protocol::messages::EventType;
 
 use crate::mental_poker::backend::{DeckParams, HandDeck, HandSecret, VerifiedKey, WireKey,
-    WireKeyProof};
-use crate::mental_poker::protocol::{CtxFields, DeckCtx, DeckWire, ProofPosition};
+    WireKeyProof, CIPHERTEXT, DECK};
+use crate::mental_poker::protocol::{Ciphertext, CtxFields, DeckCtx, DeckWire, Final,
+    ProofPosition, Verified};
+use crate::mental_poker::shuffle::{ChainParams, ShuffleChain, StepError};
+use crate::protocol::serialization::h;
+use crate::protocol::signatures::Domain;
+use crate::protocol::transcript::stage_hash_single;
 
-use super::handwire::{DeckInit, HandInit, NotOurs};
+use super::handwire::{DeckInit, HandInit, NotOurs, ShuffleProof, ShuffleStep};
 use super::stage::{Collective, Heard};
 
 /// What a step wants sent.
@@ -72,6 +77,19 @@ pub enum Failed {
     BadKey { seat: SeatIdx, why: &'static str },
     /// The hand has gone as far as this client can take it.
     NothingFurther,
+    /// A seat shuffled when it was not its turn, or shuffled twice.
+    OutOfTurn { seat: SeatIdx, expected: Option<SeatIdx> },
+    /// A deck or a proof did not survive the boundary, or names a deck this
+    /// client does not hold. Attributable: the seat that sent it is named.
+    BadDeck { seat: SeatIdx, why: &'static str },
+    /// A shuffle argument did not verify.
+    ///
+    /// Separate from [`BadDeck`](Failed::BadDeck) because the consequence is
+    /// different: the chain can never complete, so the hand is abandoned rather
+    /// than shortened (`ZIFFLE_VERDICT.md` C-6 rule 4). The chain is never
+    /// re-formed without the refused shuffler; a chain that could be shortened
+    /// is a chain an attacker can shorten to one honest shuffler.
+    BadShuffle { seat: SeatIdx, why: &'static str },
 }
 
 impl std::fmt::Display for Failed {
@@ -87,6 +105,12 @@ impl std::fmt::Display for Failed {
             Self::NotYet => f.write_str("that belongs to a stage this client has not reached"),
             Self::BadKey { seat, why } => write!(f, "seat {seat}'s deck key: {why}"),
             Self::NothingFurther => f.write_str("this hand has gone as far as it can"),
+            Self::OutOfTurn { seat, expected } => match expected {
+                Some(e) => write!(f, "seat {seat} shuffled out of turn; seat {e} is up"),
+                None => write!(f, "seat {seat} shuffled after the chain closed"),
+            },
+            Self::BadDeck { seat, why } => write!(f, "seat {seat}'s deck: {why}"),
+            Self::BadShuffle { seat, why } => write!(f, "seat {seat}'s shuffle: {why}"),
         }
     }
 }
@@ -157,7 +181,13 @@ impl Opening {
 /// envelope which holds the body, and each has its own bound, because a decoder
 /// with no bound is a decoder whose working set an attacker chooses.
 pub const HAND_INIT_CAP: usize = 512;
-const FRAME_CAP: usize = 4_096;
+/// The largest chained frame this hand will open.
+///
+/// Sized by `SHUFFLE_PROOF`, which is the biggest thing a hand sends: 5547 B of
+/// Bayer-Groth argument, two hashes and an envelope. Sixteen kilobytes leaves
+/// room for the 8192 B the protocol allows a proof and is still small enough
+/// that a peer cannot make this client hold much by sending nonsense.
+const FRAME_CAP: usize = 16_384;
 
 /// Where the button sits, until the RNG beacon exists to decide it.
 ///
@@ -188,6 +218,13 @@ pub fn provisional_button(session_id: &Hash, occupied: &[SeatIdx]) -> SeatIdx {
 /// The cap on a `DECK_INIT` body: a key and a proof, and nothing else.
 pub const DECK_INIT_CAP: usize = 256;
 
+/// The cap on a `SHUFFLE_STEP` body: a round byte and 3432 B of deck.
+pub const SHUFFLE_STEP_CAP: usize = 3_500;
+
+/// The cap on a `SHUFFLE_PROOF` body: a round byte, two hashes and the
+/// argument, which `PROTOCOL.md` §4.5 caps at 8192 B.
+pub const SHUFFLE_PROOF_CAP: usize = 8_320;
+
 /// How far this hand has got.
 ///
 /// One variant per stage, each carrying only what that stage needs, so a stage
@@ -209,8 +246,56 @@ enum Phase {
         /// This client's own secret for the hand. Never leaves the process.
         secret: HandSecret,
     },
-    /// Stage 1 completed: every seat's key is verified and the deck exists.
-    Dealt(HandDeck),
+    /// The hole left while one phase is being rebuilt into the next.
+    ///
+    /// A phase carries values that must not be copied - a `HandSecret` above
+    /// all - so moving between phases means moving the contents out, and Rust
+    /// wants something in the field while that happens. This is that something.
+    /// It is never observable: every function that puts it there replaces it
+    /// before returning, and the arms that match it exist only so that the
+    /// compiler does not have to be told to trust that.
+    Between,
+    /// Stages `2 .. 2m+1`: the shuffle chain, single-writer, a pair of stages
+    /// for each of the `m` dealt-in seats.
+    Shuffling {
+        deal: Deal,
+        /// Boxed: a `ShuffleChain` carries every intermediate deck, and a phase
+        /// that big would make every other variant that big too.
+        chain: Box<ShuffleChain>,
+        /// The `SHUFFLE_STEP` heard at `2+2j`, waiting for its proof at `3+2j`.
+        heard: Option<StepHeard>,
+    },
+    /// The chain finished. The deck is final and reveal tokens can be issued
+    /// against it - and against nothing else, which is what the type says.
+    Shuffled {
+        deal: Deal,
+        deck: Box<Final<Verified<Vec<Ciphertext>>>>,
+    },
+}
+
+/// What the deck stages leave behind and every later stage needs.
+///
+/// One struct rather than three fields repeated in each variant, because the
+/// deck, the secret and the keys are used together from here to showdown: the
+/// secret and the deck issue this client's reveal tokens, the keys verify
+/// everybody else's.
+struct Deal {
+    deck: HandDeck,
+    /// This client's own secret for the hand. Never leaves the process.
+    secret: HandSecret,
+    keys: Vec<VerifiedKey>,
+}
+
+/// A `SHUFFLE_STEP` admitted and waiting for the argument that justifies it.
+///
+/// Held rather than applied, because a deck without a verified proof is a deck
+/// somebody asserted. It occupies a stage of the chain the moment it arrives -
+/// that is what a single-writer stage is - but it does not enter the shuffle
+/// chain until `SHUFFLE_PROOF` verifies.
+struct StepHeard {
+    round: u8,
+    seat: SeatIdx,
+    deck: Vec<Ciphertext>,
 }
 
 /// One hand in progress.
@@ -326,7 +411,13 @@ impl Hand {
         // another kind entirely — the first is ordinary GossipSub weather and
         // the second belongs to somebody else's handler.
         let (kind, hand_id, sequence) = chained::peek(bytes, FRAME_CAP).map_err(Failed::Wire)?;
-        if !matches!(kind, EventType::HandInit | EventType::DeckInit) {
+        if !matches!(
+            kind,
+            EventType::HandInit
+                | EventType::DeckInit
+                | EventType::ShuffleStep
+                | EventType::ShuffleProof
+        ) {
             return Err(Failed::Wire(WireError::WrongType));
         }
         if hand_id != self.open.hand_id {
@@ -343,8 +434,19 @@ impl Hand {
 
         match self.phase {
             Phase::Init(_) => self.on_hand_init(bytes, key, now_ms),
-            Phase::Deck { .. } => self.on_deck_init(bytes),
-            Phase::Dealt(_) => Err(Failed::NothingFurther),
+            Phase::Deck { .. } => self.on_deck_init(bytes, key, now_ms),
+            // Which of the two the chain is expecting is not guessed from the
+            // event's own type field: a step is expected exactly when no step
+            // is held, and reading the state rather than the sender's claim is
+            // what stops a proof being taken for a step.
+            Phase::Shuffling { ref heard, .. } => {
+                if heard.is_some() {
+                    self.on_shuffle_proof(bytes, key, now_ms)
+                } else {
+                    self.on_shuffle_step(bytes)
+                }
+            }
+            Phase::Shuffled { .. } | Phase::Between => Err(Failed::NothingFurther),
         }
     }
 
@@ -461,7 +563,12 @@ impl Hand {
         Ok(vec![Send::Broadcast(bytes)])
     }
 
-    fn on_deck_init(&mut self, bytes: &[u8]) -> Result<Vec<Send>, Failed> {
+    fn on_deck_init(
+        &mut self,
+        bytes: &[u8],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::DeckInit)?;
         let seat = self.seat_of(&opened.sender)?;
         let body: DeckInit = chained::payload(&opened, DECK_INIT_CAP).map_err(Failed::Wire)?;
@@ -501,10 +608,276 @@ impl Hand {
         }
         let parent = stage.hash().expect("a complete stage has one");
         self.slot = self.slot.then(parent);
-        let Phase::Deck { keys, .. } = &self.phase else {
+        self.begin_shuffle(key, now_ms)
+    }
+
+    /// Stage 1 completed: build the deck and open the shuffle chain.
+    fn begin_shuffle(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        // Move the keys and the secret out of the phase rather than cloning
+        // them: `HandSecret` is the one value in this program that must exist
+        // in exactly one place, and a `clone` on it would be a second copy of
+        // a hole-card key with no owner responsible for it.
+        let taken = std::mem::replace(&mut self.phase, Phase::Between);
+        let Phase::Deck { keys, secret, .. } = taken else {
+            return Err(Failed::NothingFurther);
+        };
+        let deal = Deal {
+            deck: HandDeck::new(self.params.clone(), &keys),
+            secret,
+            keys,
+        };
+
+        // The shufflers are the dealt-in seats in ascending order, and their
+        // keys go in the same order: `ShuffleChain` pairs the two by index to
+        // build each step's context, so a mismatch here would make every
+        // honest peer unable to verify an honest shuffle.
+        let mut order = self.mine.dealt_in.clone();
+        order.sort_unstable();
+        let mut chain_keys = Vec::with_capacity(order.len());
+        for seat in &order {
+            let k = self
+                .open
+                .seats
+                .iter()
+                .find(|(s, _, _)| s == seat)
+                .ok_or(Failed::NotAtThisTable)?;
+            chain_keys.push(k.1);
+        }
+        let chain = ShuffleChain::open(
+            ChainParams {
+                protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
+                table_id: self.open.table_id,
+                session_id: self.open.session_id,
+                hand_id: self.open.hand_id,
+            },
+            order,
+            chain_keys,
+        )
+        .map_err(|_| Failed::NotInThisStage)?;
+
+        self.phase = Phase::Shuffling {
+            deal,
+            chain: Box::new(chain),
+            heard: None,
+        };
+        self.shuffle_if_mine(key, now_ms)
+    }
+
+    /// Take this client's turn in the chain, if it is this client's turn.
+    ///
+    /// Emits both stages at once. The shuffler can, because both stage hashes
+    /// are single-writer and it holds every input to them: it does not have to
+    /// wait to hear its own step back before it can seal the proof.
+    fn shuffle_if_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let Phase::Shuffling { deal, chain, .. } = &mut self.phase else {
+            return Ok(Vec::new());
+        };
+        if chain.whose_turn() != Some(self.open.my_seat) {
+            return Ok(Vec::new());
+        }
+        let round = u8::try_from(chain.steps_taken()).map_err(|_| Failed::NotInThisStage)?;
+
+        // The proof is proved under the *proof* stage's sequence, one past the
+        // step's. `next_ctx` owns that derivation so that a shuffler and its
+        // verifiers cannot disagree about it.
+        let proof_seq = self.slot.sequence + 1;
+        let ctx = chain.next_ctx(proof_seq).ok_or(Failed::NothingFurther)?;
+        let input_hash = input_deck_hash(chain.last_verified());
+        let (next, proof) = deal
+            .deck
+            .shuffle(chain.last_verified(), &ctx)
+            .map_err(|_| Failed::BadShuffle {
+                seat: self.open.my_seat,
+                why: "this client could not shuffle the deck it holds",
+            })?;
+        let output_hash = deck_hash(&next);
+
+        let step = chained::seal(
+            EventType::ShuffleStep,
+            &self.slot,
+            &ShuffleStep {
+                shuffle_round: round,
+                deck: flatten(&next),
+            },
+            key,
+            now_ms,
+            self.open.crypto_step_timeout_ms,
+            SHUFFLE_STEP_CAP,
+        )
+        .map_err(Failed::Wire)?;
+        let step_hash = self.opened(&step, EventType::ShuffleStep)?.event_hash;
+        self.slot = self.slot.then(stage_hash_single(
+            self.slot.sequence,
+            EventType::ShuffleStep.code(),
+            self.open.my_seat,
+            step_hash,
+        ));
+
+        let body = ShuffleProof {
+            shuffle_round: round,
+            input_deck_hash: input_hash,
+            output_deck_hash: output_hash,
+            proof,
+        };
+        let proof_event = chained::seal(
+            EventType::ShuffleProof,
+            &self.slot,
+            &body,
+            key,
+            now_ms,
+            self.open.crypto_step_timeout_ms,
+            SHUFFLE_PROOF_CAP,
+        )
+        .map_err(Failed::Wire)?;
+        let proof_hash = self.opened(&proof_event, EventType::ShuffleProof)?.event_hash;
+
+        // This client's own step goes through `accept_step` like anybody
+        // else's, which costs it the 42 ms of verifying its own argument. That
+        // is the price of having one path into the chain: a second, trusting
+        // path would be a path an attacker only has to find once.
+        let me = self.open.my_seat;
+        let Phase::Shuffling { deal, chain, .. } = &mut self.phase else {
             unreachable!("just matched")
         };
-        self.phase = Phase::Dealt(HandDeck::new(self.params.clone(), keys));
+        chain
+            .accept_step(&deal.deck, me, next, &body.proof, self.slot.sequence)
+            .map_err(|e| step_failure(me, e))?;
+        self.slot = self.slot.then(stage_hash_single(
+            self.slot.sequence,
+            EventType::ShuffleProof.code(),
+            me,
+            proof_hash,
+        ));
+
+        let mut out = vec![Send::Broadcast(step), Send::Broadcast(proof_event)];
+        out.append(&mut self.finish_chain_if_done()?);
+        Ok(out)
+    }
+
+    /// Admit a `SHUFFLE_STEP`: the deck is held, the stage is chained.
+    fn on_shuffle_step(&mut self, bytes: &[u8]) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, EventType::ShuffleStep)?;
+        let seat = self.seat_of(&opened.sender)?;
+        let body: ShuffleStep =
+            chained::payload(&opened, SHUFFLE_STEP_CAP).map_err(Failed::Wire)?;
+
+        let Phase::Shuffling { chain, .. } = &self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+        let expected = chain.whose_turn();
+        if expected != Some(seat) {
+            return Err(Failed::OutOfTurn { seat, expected });
+        }
+        if usize::from(body.shuffle_round) != chain.steps_taken() {
+            return Err(Failed::BadDeck {
+                seat,
+                why: "the round does not match the chain's position",
+            });
+        }
+        let deck = unflatten(&body.deck).ok_or(Failed::BadDeck {
+            seat,
+            why: "not fifty-two cards of sixty-six bytes",
+        })?;
+
+        let hash = stage_hash_single(
+            self.slot.sequence,
+            EventType::ShuffleStep.code(),
+            seat,
+            opened.event_hash,
+        );
+        self.slot = self.slot.then(hash);
+        let Phase::Shuffling { heard, .. } = &mut self.phase else {
+            unreachable!("just matched")
+        };
+        *heard = Some(StepHeard {
+            round: body.shuffle_round,
+            seat,
+            deck,
+        });
+        Ok(Vec::new())
+    }
+
+    /// Verify a `SHUFFLE_PROOF` and let the held step into the chain.
+    fn on_shuffle_proof(
+        &mut self,
+        bytes: &[u8],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, EventType::ShuffleProof)?;
+        let seat = self.seat_of(&opened.sender)?;
+        let body: ShuffleProof =
+            chained::payload(&opened, SHUFFLE_PROOF_CAP).map_err(Failed::Wire)?;
+
+        let Phase::Shuffling { deal, chain, heard } = &mut self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+        let held = heard.as_ref().ok_or(Failed::NotYet)?;
+        // The proof must come from the seat whose step is held. A different
+        // seat here is not a late message from elsewhere - the chain is at
+        // this exact stage - so it is attributable.
+        if held.seat != seat {
+            return Err(Failed::OutOfTurn {
+                seat,
+                expected: Some(held.seat),
+            });
+        }
+        if held.round != body.shuffle_round {
+            return Err(Failed::BadDeck {
+                seat,
+                why: "the proof's round does not match the step's",
+            });
+        }
+        // The two cheap checks before the expensive one, in that order: this
+        // is what makes a lifted proof cost a hash rather than 42 ms.
+        if body.input_deck_hash != input_deck_hash(chain.last_verified()) {
+            return Err(Failed::BadDeck {
+                seat,
+                why: "the proof names an input deck this client does not hold",
+            });
+        }
+        if body.output_deck_hash != deck_hash(&held.deck) {
+            return Err(Failed::BadDeck {
+                seat,
+                why: "the proof names an output deck that is not the step's",
+            });
+        }
+
+        let deck = held.deck.clone();
+        chain
+            .accept_step(&deal.deck, seat, deck, &body.proof, self.slot.sequence)
+            .map_err(|e| step_failure(seat, e))?;
+        *heard = None;
+
+        let hash = stage_hash_single(
+            self.slot.sequence,
+            EventType::ShuffleProof.code(),
+            seat,
+            opened.event_hash,
+        );
+        self.slot = self.slot.then(hash);
+
+        let mut out = self.finish_chain_if_done()?;
+        out.append(&mut self.shuffle_if_mine(key, now_ms)?);
+        Ok(out)
+    }
+
+    /// If the last shuffler has been through, close the chain.
+    fn finish_chain_if_done(&mut self) -> Result<Vec<Send>, Failed> {
+        let Phase::Shuffling { chain, .. } = &mut self.phase else {
+            return Ok(Vec::new());
+        };
+        let Some(final_deck) = chain.finish() else {
+            return Ok(Vec::new());
+        };
+        let taken = std::mem::replace(&mut self.phase, Phase::Between);
+        let Phase::Shuffling { deal, .. } = taken else {
+            unreachable!("just matched")
+        };
+        self.phase = Phase::Shuffled {
+            deal,
+            deck: Box::new(final_deck),
+        };
         Ok(Vec::new())
     }
 
@@ -576,7 +949,20 @@ impl Hand {
 
     /// Whether every seat's deck key is verified and the deck exists.
     pub fn deck_ready(&self) -> bool {
-        matches!(self.phase, Phase::Dealt(_))
+        matches!(self.phase, Phase::Shuffling { .. } | Phase::Shuffled { .. })
+    }
+
+    /// Whether the chain has closed and the deck is final.
+    pub fn shuffled(&self) -> bool {
+        matches!(self.phase, Phase::Shuffled { .. })
+    }
+
+    /// Whose turn it is to shuffle, or `None` once the chain has closed.
+    pub fn shuffler(&self) -> Option<SeatIdx> {
+        match &self.phase {
+            Phase::Shuffling { chain, .. } => chain.whose_turn(),
+            _ => None,
+        }
     }
 
     /// Which seats the stage now open is still waiting for.
@@ -584,7 +970,11 @@ impl Hand {
         match &self.phase {
             Phase::Init(stage) => stage.waiting_for(),
             Phase::Deck { stage, .. } => stage.waiting_for(),
-            Phase::Dealt(_) => Vec::new(),
+            // One seat at a time: a single-writer stage is waiting for exactly
+            // the shuffler whose turn it is, and naming the others would put
+            // seats on screen that owe the table nothing.
+            Phase::Shuffling { chain, .. } => chain.whose_turn().into_iter().collect(),
+            Phase::Shuffled { .. } | Phase::Between => Vec::new(),
         }
     }
 
@@ -603,19 +993,36 @@ impl Hand {
     pub fn secret(&self) -> Option<&HandSecret> {
         match &self.phase {
             Phase::Deck { secret, .. } => Some(secret),
-            _ => None,
+            Phase::Shuffling { deal, .. } | Phase::Shuffled { deal, .. } => Some(&deal.secret),
+            Phase::Init(_) | Phase::Between => None,
         }
     }
 
-    /// The deck, once every seat's key is verified.
+    /// The deck, once every seat's key has been verified.
     pub fn deck(&self) -> Option<&HandDeck> {
         match &self.phase {
-            Phase::Dealt(deck) => Some(deck),
+            Phase::Shuffling { deal, .. } | Phase::Shuffled { deal, .. } => Some(&deal.deck),
             _ => None,
         }
     }
 
-    /// What this client derived, for the interface to draw.
+    /// The verified keys of the seats holding the deck, in arrival order.
+    pub fn keys(&self) -> &[VerifiedKey] {
+        match &self.phase {
+            Phase::Deck { keys, .. } => keys,
+            Phase::Shuffling { deal, .. } | Phase::Shuffled { deal, .. } => &deal.keys,
+            Phase::Init(_) | Phase::Between => &[],
+        }
+    }
+
+    /// The final deck, once the chain has closed.
+    pub fn final_deck(&self) -> Option<&Final<Verified<Vec<Ciphertext>>>> {
+        match &self.phase {
+            Phase::Shuffled { deck, .. } => Some(deck),
+            _ => None,
+        }
+    }
+
     pub fn init(&self) -> &HandInit {
         &self.mine
     }
@@ -638,6 +1045,80 @@ fn blind_positions(button: SeatIdx, occupied: &[SeatIdx]) -> (SeatIdx, SeatIdx) 
         (button, next(at, 1))
     } else {
         (next(at, 1), next(at, 2))
+    }
+}
+
+/// The canonical bytes of a deck: fifty-two ciphertexts, end to end.
+fn flatten(deck: &[Ciphertext]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(deck.len() * CIPHERTEXT);
+    for card in deck {
+        out.extend_from_slice(card);
+    }
+    out
+}
+
+/// The reverse, refusing anything that is not exactly a deck.
+///
+/// A short deck, a long one and a deck whose length is not a multiple of a
+/// ciphertext are one answer - `None` - because none of them is a deck and
+/// telling a sender which way it was wrong tells it nothing worth knowing.
+fn unflatten(bytes: &[u8]) -> Option<Vec<Ciphertext>> {
+    if bytes.len() != DECK * CIPHERTEXT {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(CIPHERTEXT)
+            .map(|c| {
+                let mut card = [0u8; CIPHERTEXT];
+                card.copy_from_slice(c);
+                card
+            })
+            .collect(),
+    )
+}
+
+/// `h("p2p-poker v1 deck-commit", [deck bytes])`, as `PROTOCOL.md` §4.5 defines
+/// the two hashes a `SHUFFLE_PROOF` carries.
+fn deck_hash(deck: &[Ciphertext]) -> Hash {
+    h(Domain::DeckCommit.context(), &[&flatten(deck)])
+}
+
+/// The input hash for a step, including the first one.
+///
+/// The first link's input is the **open deck**, which the crypto library owns
+/// and never surfaces as ciphertexts - `verify_initial_shuffle` is a separate
+/// entry point precisely because the open deck is not a deck anyone shuffled.
+/// So round 0 names a constant instead. It loses nothing: the open deck is the
+/// same in every hand at every table, so its hash binds a proof to nothing, and
+/// all of round 0's binding comes from the context, which carries the table,
+/// the session, the hand, the sequence and the shuffler's own key.
+fn input_deck_hash(prev: Option<&Verified<Vec<Ciphertext>>>) -> Hash {
+    match prev {
+        Some(v) => deck_hash(v.as_ref()),
+        None => h(Domain::DeckCommit.context(), &[b"the open deck"]),
+    }
+}
+
+/// Turn a chain refusal into this hand's failure, keeping who is answerable.
+fn step_failure(seat: SeatIdx, e: StepError) -> Failed {
+    match e {
+        StepError::NotYourTurn { expected, .. } => Failed::OutOfTurn {
+            seat,
+            expected: Some(expected),
+        },
+        StepError::Closed => Failed::OutOfTurn {
+            seat,
+            expected: None,
+        },
+        StepError::AlreadySubmitted => Failed::BadShuffle {
+            seat,
+            why: "a second attempt at a position that already has one",
+        },
+        StepError::Rejected(_) => Failed::BadShuffle {
+            seat,
+            why: "the argument does not hold for this pair of decks",
+        },
     }
 }
 
@@ -677,10 +1158,11 @@ mod tests {
     /// a test that dropped the return value would stall one step in.
     fn deliver(to: &mut Hand, sends: &[Send], key: &SigningKey) -> Vec<Send> {
         let mut out = Vec::new();
-        for Send::Broadcast(bytes) in sends {
+        for (i, Send::Broadcast(bytes)) in sends.iter().enumerate() {
+            let at = to.slot().sequence;
             match to.on_event(bytes, key, NOW) {
                 Ok(mut more) => out.append(&mut more),
-                Err(e) => panic!("{e}"),
+                Err(e) => panic!("event {i} of {} at stage {at}: {e}", sends.len()),
             }
         }
         out
@@ -711,12 +1193,195 @@ mod tests {
         assert_eq!(b_deck.len(), 1, "completing stage 0 offers a deck key");
         assert_eq!(a_deck.len(), 1);
 
-        // And stage 1: each verifies the other's key and the deck exists.
-        assert!(deliver(&mut b, &a_deck, &key(11)).is_empty());
-        assert!(deliver(&mut a, &b_deck, &key(10)).is_empty());
+        // And stage 1: each verifies the other's key, the deck exists, and
+        // the first shuffler takes its turn without being asked to.
+        let b_more = deliver(&mut b, &a_deck, &key(11));
+        let a_more = deliver(&mut a, &b_deck, &key(10));
         assert!(a.deck_ready() && b.deck_ready(), "every key verified");
-        assert_eq!(a.slot(), b.slot(), "and one parent for stage 2");
-        assert_eq!(a.slot().sequence, 2);
+        assert_eq!(b.slot().sequence, 2, "stage 2 is the first shuffle");
+        assert_eq!(b.shuffler(), Some(0), "and seat 0 is up");
+        assert!(b_more.is_empty(), "seat 1 is not the first shuffler");
+        assert_eq!(a_more.len(), 2, "seat 0 sends a step and its proof");
+    }
+
+    /// The whole chain, between two processes' worth of state: two seats, two
+    /// links, and a deck that is final at the end of it.
+    ///
+    /// Slow on purpose. It generates two Bayer-Groth arguments and verifies
+    /// four - each client checks its own as well as the other's, because there
+    /// is one path into the chain and no trusted shortcut along it.
+    #[test]
+    fn two_clients_shuffle_the_deck() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        deliver(&mut b, &a_deck, &key(11));
+        // Seat 0 completes stage 1 and shuffles in the same call.
+        let a_shuffle = deliver(&mut a, &b_deck, &key(10));
+        assert_eq!(a_shuffle.len(), 2);
+        assert_eq!(a.shuffler(), Some(1), "seat 0 is through; seat 1 is up");
+        assert_eq!(a.waiting_for(), vec![1], "one seat at a time");
+
+        // Seat 1 hears the pair, accepts it, and takes its own turn - again in
+        // one call, because accepting the last step is what makes it your turn.
+        let b_shuffle = deliver(&mut b, &a_shuffle, &key(11));
+        assert_eq!(b_shuffle.len(), 2, "seat 1's step and its proof");
+        assert!(b.shuffled(), "seat 1 saw its own step close the chain");
+
+        assert!(deliver(&mut a, &b_shuffle, &key(10)).is_empty());
+        assert!(a.shuffled(), "and so did seat 0");
+        assert_eq!(
+            a.slot(),
+            b.slot(),
+            "both left the chain at one stage, off one parent"
+        );
+        assert_eq!(
+            a.slot().sequence,
+            6,
+            "two seats: stages 2,3 and 4,5, so the next stage is 6"
+        );
+        assert_eq!(
+            a.final_deck().unwrap().as_ref().as_ref(),
+            b.final_deck().unwrap().as_ref().as_ref(),
+            "and on one deck"
+        );
+        assert!(a.waiting_for().is_empty(), "nobody owes the chain anything");
+    }
+
+    /// Re-seal one of A's own events with a changed body, as A, so the
+    /// envelope is honest and only the contents are not.
+    fn tamper<T: minicbor::Encode<()> + for<'b> minicbor::Decode<'b, ()>>(
+        bytes: &[u8],
+        kind: EventType,
+        at: &Slot,
+        cap: usize,
+        change: impl FnOnce(&mut T),
+    ) -> Vec<u8> {
+        let opened = chained::open(bytes, FRAME_CAP, kind, at).unwrap();
+        let mut body: T = chained::payload(&opened, cap).unwrap();
+        change(&mut body);
+        chained::seal(kind, at, &body, &key(10), NOW, 30_000, cap).unwrap()
+    }
+
+    /// Two clients up to the point where seat 0 has sent a step and a proof,
+    /// and seat 1 has heard neither.
+    fn ready_to_shuffle() -> (Hand, Hand, Vec<Send>) {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        deliver(&mut b, &a_deck, &key(11));
+        let shuffle = deliver(&mut a, &b_deck, &key(10));
+        (a, b, shuffle)
+    }
+
+    /// A deck that is not fifty-two cards never reaches the crypto at all.
+    #[test]
+    fn a_deck_of_the_wrong_size_is_refused() {
+        let (_a, mut b, shuffle) = ready_to_shuffle();
+        let Send::Broadcast(step) = &shuffle[0];
+        let short = tamper::<ShuffleStep>(
+            step,
+            EventType::ShuffleStep,
+            &b.slot(),
+            SHUFFLE_STEP_CAP,
+            |s| s.deck.truncate(66 * 51),
+        );
+        let e = b.on_event(&short, &key(11), NOW).unwrap_err();
+        assert!(
+            matches!(e, Failed::BadDeck { seat: 0, .. }),
+            "{e}"
+        );
+    }
+
+    /// A round byte that does not match the chain's position is refused before
+    /// the deck is even parsed.
+    #[test]
+    fn a_step_at_the_wrong_round_is_refused() {
+        let (_a, mut b, shuffle) = ready_to_shuffle();
+        let Send::Broadcast(step) = &shuffle[0];
+        let wrong = tamper::<ShuffleStep>(
+            step,
+            EventType::ShuffleStep,
+            &b.slot(),
+            SHUFFLE_STEP_CAP,
+            |s| s.shuffle_round = 1,
+        );
+        let e = b.on_event(&wrong, &key(11), NOW).unwrap_err();
+        assert!(matches!(e, Failed::BadDeck { seat: 0, .. }), "{e}");
+    }
+
+    /// A proof that names a deck other than the step it follows is refused,
+    /// and refused by the hash rather than by forty-two milliseconds of
+    /// verification.
+    #[test]
+    fn a_proof_that_names_another_deck_is_refused() {
+        let (_a, mut b, shuffle) = ready_to_shuffle();
+        let Send::Broadcast(step) = &shuffle[0];
+        let Send::Broadcast(proof) = &shuffle[1];
+        b.on_event(step, &key(11), NOW).unwrap();
+
+        let lifted = tamper::<ShuffleProof>(
+            proof,
+            EventType::ShuffleProof,
+            &b.slot(),
+            SHUFFLE_PROOF_CAP,
+            |p| p.output_deck_hash[0] ^= 1,
+        );
+        let e = b.on_event(&lifted, &key(11), NOW).unwrap_err();
+        assert!(matches!(e, Failed::BadDeck { seat: 0, .. }), "{e}");
+        assert!(!b.shuffled());
+    }
+
+    /// An argument that does not hold is a different failure from a mismatched
+    /// hash: it names the shuffle, because the consequence is that the chain
+    /// can never complete and the hand is abandoned rather than shortened.
+    #[test]
+    fn an_argument_that_does_not_hold_is_refused_as_a_shuffle() {
+        let (_a, mut b, shuffle) = ready_to_shuffle();
+        let Send::Broadcast(step) = &shuffle[0];
+        let Send::Broadcast(proof) = &shuffle[1];
+        b.on_event(step, &key(11), NOW).unwrap();
+
+        let broken = tamper::<ShuffleProof>(
+            proof,
+            EventType::ShuffleProof,
+            &b.slot(),
+            SHUFFLE_PROOF_CAP,
+            |p| {
+                let n = p.proof.len();
+                p.proof[n / 2] ^= 0xff;
+            },
+        );
+        let e = b.on_event(&broken, &key(11), NOW).unwrap_err();
+        assert!(matches!(e, Failed::BadShuffle { seat: 0, .. }), "{e}");
+        assert!(!b.shuffled(), "and the chain did not advance");
+    }
+
+    /// The round-0 input hash is a constant, and it is the same constant for
+    /// every client - which is the whole of what it has to be.
+    #[test]
+    fn the_open_deck_has_one_hash() {
+        assert_eq!(input_deck_hash(None), input_deck_hash(None));
+        assert_ne!(
+            input_deck_hash(None),
+            deck_hash(&[[0u8; CIPHERTEXT]; DECK]),
+            "and it is not the hash of a deck of zeroes"
+        );
+    }
+
+    /// Fifty-two cards out and fifty-two back, and nothing else accepted.
+    #[test]
+    fn a_deck_survives_the_wire_and_nothing_else_does() {
+        let deck: Vec<Ciphertext> = (0..DECK as u8).map(|i| [i; CIPHERTEXT]).collect();
+        let flat = flatten(&deck);
+        assert_eq!(flat.len(), DECK * CIPHERTEXT);
+        assert_eq!(unflatten(&flat).unwrap(), deck);
+        assert!(unflatten(&flat[..flat.len() - 1]).is_none(), "short");
+        assert!(unflatten(&[flat.clone(), vec![0]].concat()).is_none(), "long");
+        assert!(unflatten(&[]).is_none(), "empty");
     }
 
     /// The secret is kept across the stage transition. Losing it would be a

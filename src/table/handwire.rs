@@ -226,6 +226,49 @@ pub struct DeckInit {
     pub proof: Vec<u8>,
 }
 
+/// `SHUFFLE_STEP 0x0305`: the deck one shuffler produced (`PROTOCOL.md` §4.5).
+///
+/// The deck and the proof that justifies it travel as **two** stages, not one.
+/// That is the protocol's choice and it is not arbitrary: the proof is 5547 B
+/// against the deck's 3432 B, and a receiver that has the deck can start
+/// nothing with it until the proof verifies anyway — so splitting them lets the
+/// step be admitted, hashed and chained at its own sequence while the expensive
+/// half is still arriving.
+///
+/// `deck` is `Vec<u8>` rather than `[[u8; 66]; 52]` for the same reason
+/// [`DeckInit`]'s fields are: the length is checked where the bytes become
+/// ciphertexts, once, and a second length check in the decoder is a check that
+/// can disagree with the first.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct ShuffleStep {
+    #[n(0)]
+    pub shuffle_round: u8,
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub deck: Vec<u8>,
+}
+
+/// `SHUFFLE_PROOF 0x0306`: the argument for the step at the preceding stage.
+///
+/// The two hashes are what bind the proof to one transition. Without them a
+/// proof is a statement about *some* pair of decks, and a peer that had seen a
+/// valid shuffle in any hand could replay its argument here. With them the
+/// receiver checks that the input named is the deck it already holds as this
+/// shuffler's input and the output named is the deck that just arrived, before
+/// it spends 42 ms verifying anything.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct ShuffleProof {
+    #[n(0)]
+    pub shuffle_round: u8,
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub input_deck_hash: [u8; 32],
+    #[cbor(n(2), with = "minicbor::bytes")]
+    pub output_deck_hash: [u8; 32],
+    #[cbor(n(3), with = "minicbor::bytes")]
+    pub proof: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

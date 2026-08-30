@@ -70,6 +70,10 @@ pub struct HandInProgress {
     pub hand_id: u64,
     pub button: u8,
     pub dealt_in: Vec<u8>,
+    /// The seat whose turn it is to shuffle, while the chain is running.
+    pub shuffling: Option<u8>,
+    /// Whether the chain has closed and the deck is final.
+    pub deck_ready: bool,
 }
 
 /// Everything the client knows, in the form the panes read it.
@@ -254,9 +258,29 @@ impl AppState {
                     hand_id,
                     button,
                     dealt_in,
+                    // `HAND_INIT` completing is what starts the chain, so at
+                    // this instant nobody has shuffled yet. The first
+                    // `DeckProgress` names the seat that is up.
+                    shuffling: None,
+                    deck_ready: false,
                 });
                 self.waiting_for.clear();
                 self.note(format!("hand #{hand_id} has begun"));
+            }
+            NodeEvent::DeckProgress {
+                hand_id,
+                shuffling,
+                ready,
+            } => {
+                if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
+                    h.shuffling = shuffling;
+                    h.deck_ready = ready;
+                }
+                self.log.push_back(match (shuffling, ready) {
+                    (_, true) => format!("hand #{hand_id}: the deck is shuffled and sealed"),
+                    (Some(s), _) => format!("hand #{hand_id}: seat {s} is shuffling"),
+                    (None, false) => format!("hand #{hand_id}: the deck is being prepared"),
+                });
             }
             NodeEvent::HandWaiting { hand_id, seats } => {
                 // Said once per set, not once per arriving copy: a table

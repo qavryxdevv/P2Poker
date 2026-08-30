@@ -172,6 +172,17 @@ pub enum NodeEvent {
     /// Named rather than left as a spinner: "waiting for seat 3" is something a
     /// player can act on and a turning circle is not.
     HandWaiting { hand_id: u64, seats: Vec<u8> },
+    /// How far the deck has got.
+    ///
+    /// Sent whenever the answer changes and not on every event, because the
+    /// shuffle chain is `2m` stages and a player watching a table does not need
+    /// to be told the same thing twice. `shuffling` is the seat whose turn it
+    /// is; `ready` is whether the chain has closed and the deck is final.
+    DeckProgress {
+        hand_id: u64,
+        shuffling: Option<u8>,
+        ready: bool,
+    },
     /// The founder refused. **Advisory** — a founder may lie, so the reason is
     /// carried as the claim it is.
     JoinRefused { reason: u16 },
@@ -294,6 +305,7 @@ impl NodeEvent {
             | Self::TableReal { .. }
             | Self::HandBegan { .. }
             | Self::HandWaiting { .. }
+            | Self::DeckProgress { .. }
             | Self::JoinRefused { .. }
             | Self::LeftTable { .. }
             // The lobby list and the counters above it.
