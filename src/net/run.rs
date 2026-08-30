@@ -889,7 +889,7 @@ pub async fn run(
                                                 tokio::time::Instant::now() + end.pause(),
                                             );
                                         }
-                                        act_by = report.clock.apply(act_by, h.action_timeout());
+                                        act_by = report.clock.apply(act_by, h.action_deadline());
                                         if let Some(cards) = h.cards().filter(|_| !cards_reported) {
                                             cards_reported = true;
                                             let _ = events
@@ -1880,7 +1880,7 @@ pub async fn run(
                                     next_hand_at =
                                         Some(tokio::time::Instant::now() + end.pause());
                                 }
-                                act_by = report.clock.apply(act_by, h.action_timeout());
+                                act_by = report.clock.apply(act_by, h.action_deadline());
                             }
                             // The player's own engine refused it, which means
                             // the window offered something it should not have.
@@ -1999,7 +1999,7 @@ pub async fn run(
                         if let Some(end) = report.ended {
                             next_hand_at = Some(tokio::time::Instant::now() + end.pause());
                         }
-                        act_by = report.clock.apply(act_by, h.action_timeout());
+                        act_by = report.clock.apply(act_by, h.action_deadline());
                     }
                     Err(e) => {
                         let _ = events

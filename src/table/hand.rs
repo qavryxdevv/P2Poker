@@ -208,6 +208,21 @@ pub struct Opening {
     /// has in version 1. Every seat has the same number, from the table's
     /// advertisement, and each measures it on its own clock.
     pub hand_deadline_ms: u32,
+    /// The allowance beyond `action_timeout_ms` before a deadline has passed.
+    ///
+    /// `PROTOCOL.md` §8.2: it *"must absorb the P2P round trip, relay hops for
+    /// CGNAT peers, and signature verification"*, and **every peer must use the
+    /// identical constant, because peers disagreeing about whether a timeout
+    /// fired is a consensus fault, not a UX detail.** So it is a table
+    /// parameter and never a client's choice.
+    ///
+    /// The player sees `action_timeout_ms`; the deadline is the sum.
+    pub action_grace_ms: u32,
+    /// The pause between a hand ending and the next one being dealt, from the
+    /// table's advertisement. `PROTOCOL.md` §8.2 puts it in the deadline a
+    /// terminal event arms; D-020's five seconds is this client's own hold on
+    /// top and is not the same number.
+    pub hand_delay_ms: u32,
     /// How long a seat has to act before its own client acts for it.
     ///
     /// From the table's advertisement, so every seat has the same number. It is
@@ -255,6 +270,8 @@ impl Opening {
             my_seat: f.my_seat()?,
             crypto_step_timeout_ms: ad.crypto_step_timeout_ms,
             action_timeout_ms: ad.action_timeout_ms,
+            action_grace_ms: ad.action_grace_ms,
+            hand_delay_ms: ad.hand_delay_ms,
             hand_deadline_ms: ad.hand_deadline_ms,
             // Everybody starts whole. A table that has played no hands has
             // nobody who has missed one.
@@ -343,31 +360,6 @@ pub const SHOWDOWN_MUCK_CAP: usize = 64;
 /// The cap on a `HAND_COMPLETE` body: at most `MAX_SEATS` pots, each with three
 /// seat lists, plus four vectors of that length.
 pub const HAND_COMPLETE_CAP: usize = 4_096;
-
-/// How many of a stage's own allowances a **cryptographic** stage may take
-/// before any peer may end the hand.
-///
-/// Two, which is the owner's "200% of the decision time" applied to the thing
-/// it fits. Applied to a *hand* that number would be far too short: heads-up a
-/// legal hand is eight actions plus the cryptography, so a whole-hand deadline
-/// at twice one decision would abort almost every honest hand. Applied to **one
-/// stage** it is generous — a peer that has not produced a deck key or a
-/// shuffle in twice the time the table allots for one is not thinking.
-///
-/// This is safe where a forced *fold* would not be, and the asymmetry is the
-/// whole argument: **an abort moves no chips** (D-010), so every stack is
-/// restored and a false abort costs a replayed hand. A false fold costs the
-/// hand itself, which is why that needs the unanimity of §8.4 and this does
-/// not — and why this works heads-up, where unanimity is one interested party
-/// and cannot.
-///
-/// It does not open a new way to cheat. That a losing player can stall and get
-/// its chips back is D-010's own accepted cost, already recorded; this makes it
-/// quicker to do and much quicker to recover from. What prices it is D-013 and
-/// D-022: a seat that goes quiet is outside `P(k)`, so it is not dealt the next
-/// hand, and a second offence spends its reconnection allowance while the
-/// blinds keep taking its stack.
-pub const STAGE_DEADLINE_FACTOR: u64 = 2;
 
 /// How many hands a seat may miss and still be dealt back in.
 ///
@@ -3035,21 +3027,25 @@ impl Hand {
     /// peers agreeing about when it passed.
     fn past_deadline(&self, now_ms: u64) -> bool {
         // The hand's own budget, which every stage shares and which has to be
-        // long enough for a whole legal hand.
+        // long enough for a whole legal hand of everybody thinking.
         if now_ms.saturating_sub(self.opened_at_ms) >= u64::from(self.open.hand_deadline_ms) {
             return true;
         }
-        // And the stage's, which only a **cryptographic** stage has. A betting
-        // stage is not bounded here: it is bounded by the seat's own client
-        // acting for it, which is version 1's whole answer to a betting stall
-        // (D-015), and ending the hand under a player who is merely thinking
-        // would be a worse answer than the one that already exists.
+        // And the stage's own, which is `crypto_step_timeout_ms` and is
+        // `PROTOCOL.md` §8.2's number rather than one this client picked. It is
+        // measured from **accepting the event that completed the previous
+        // stage**, which is what `stage_at_ms` records, and §8.2 says that is
+        // what removes clock synchronisation from the problem: two peers'
+        // timers then differ by the propagation delay between them and not by
+        // their clock offset.
+        //
+        // A **betting** stage is not bounded here. A player thinking is
+        // legitimate, and it is bounded instead by that seat's own client
+        // acting for it at `action_timeout_ms + action_grace_ms`.
         if !self.crypto_stage() {
             return false;
         }
-        let allowed = u64::from(self.open.crypto_step_timeout_ms)
-            .saturating_mul(STAGE_DEADLINE_FACTOR);
-        now_ms.saturating_sub(self.stage_at_ms) >= allowed
+        now_ms.saturating_sub(self.stage_at_ms) >= u64::from(self.open.crypto_step_timeout_ms)
     }
 
     /// Whether this hand may be given up on now.
@@ -3146,7 +3142,7 @@ impl Hand {
             body,
             key,
             now_ms,
-            self.open.crypto_step_timeout_ms,
+            self.next_deadline_for(kind),
             cap,
         )
         .map_err(Failed::Wire)
@@ -3538,6 +3534,8 @@ impl Hand {
             my_seat: self.open.my_seat,
             crypto_step_timeout_ms: self.open.crypto_step_timeout_ms,
             action_timeout_ms: self.open.action_timeout_ms,
+            action_grace_ms: self.open.action_grace_ms,
+            hand_delay_ms: self.open.hand_delay_ms,
             hand_deadline_ms: self.open.hand_deadline_ms,
             grace,
             present_run,
@@ -3545,16 +3543,54 @@ impl Hand {
         })
     }
 
-    /// How long this client may take on its own turn.
+    /// How long this client may take on its own turn before it acts for its
+    /// owner.
     ///
-    /// The table's own number, so every seat waits the same. Clamped below at
-    /// five seconds, because a table advertising a one-second clock would fold
-    /// every seat that blinked, and above at five minutes, because the point of
-    /// a clock is that a table cannot be held for ever.
+    /// **`action_timeout_ms + action_grace_ms`**, which is `PROTOCOL.md` §8.2's
+    /// deadline for a betting action and not a number of this client's
+    /// choosing. The player's own clock is the shorter one — the timeout — and
+    /// the grace is what absorbs the round trip, so a client that folded at the
+    /// timeout would be folding hands that had in fact been played in time.
+    pub fn action_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(u64::from(self.open.action_timeout_ms).saturating_add(
+            u64::from(self.open.action_grace_ms),
+        ))
+    }
+
+    /// What the player sees: their own clock, without the transport's share.
     pub fn action_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(
-            u64::from(self.open.action_timeout_ms).clamp(5_000, 300_000),
-        )
+        std::time::Duration::from_millis(u64::from(self.open.action_timeout_ms))
+    }
+
+    /// `next_deadline_ms` for the stage this event opens.
+    ///
+    /// **Normative, not the emitter's choice** (`PROTOCOL.md` §8.2): a
+    /// deterministic function of the table parameters and the kind of the next
+    /// stage, and *"a peer that writes a different value emits an invalid
+    /// event"*. It is a function of the event being sealed because the event
+    /// that completes stage `s` is what arms stage `s+1`.
+    fn next_deadline_for(&self, kind: EventType) -> u32 {
+        match kind {
+            // A betting action opens another betting stage — or a reveal, and
+            // the reveal's own arming is the same number either way only by
+            // coincidence, so it is written per row rather than shared.
+            EventType::ActionCheck
+            | EventType::ActionCall
+            | EventType::ActionBet
+            | EventType::ActionRaise
+            | EventType::ActionFold => self
+                .open
+                .action_timeout_ms
+                .saturating_add(self.open.action_grace_ms),
+            // A hand boundary: the pause before the next deal, and then the
+            // first cryptographic stage of it.
+            EventType::HandComplete | EventType::HandAbort => self
+                .open
+                .hand_delay_ms
+                .saturating_add(self.open.crypto_step_timeout_ms),
+            // Everything else this driver emits opens a cryptographic stage.
+            _ => self.open.crypto_step_timeout_ms,
+        }
     }
 
     /// Whether the betting is over and the hand is waiting to be settled.
@@ -3905,6 +3941,8 @@ mod tests {
             my_seat,
             crypto_step_timeout_ms: 30_000,
             action_timeout_ms: 20_000,
+            action_grace_ms: 5_000,
+            hand_delay_ms: 7_000,
             hand_deadline_ms: 600_000,
             grace: vec![GRACE_HANDS; 3],
             present_run: vec![0; 3],
@@ -3940,6 +3978,8 @@ mod tests {
             my_seat,
             crypto_step_timeout_ms: 30_000,
             action_timeout_ms: 20_000,
+            action_grace_ms: 5_000,
+            hand_delay_ms: 7_000,
             hand_deadline_ms: 600_000,
             grace: vec![GRACE_HANDS; 3],
             present_run: vec![0; 3],
