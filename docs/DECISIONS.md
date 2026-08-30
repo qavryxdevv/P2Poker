@@ -2284,3 +2284,76 @@ would freeze the table in the middle of a sequence the player is watching
 unfold. What is held is what the transcript ended with: the hands that were
 shown, and the board.
 
+---
+
+## D-022 — a disconnected player is held for two hands, not for one minute
+
+Decided 2026-08-30, on the owner's instruction: a player who drops — by
+accident or on purpose — gets a reconnection allowance; it is **spent** across
+outages so nobody can drop repeatedly for free, and it is **earned back** by
+playing. The owner's words were one minute, exhausted by repeated use, restored
+after about fifteen hands.
+
+The allowance is exactly that, with one substitution that decides the whole
+design.
+
+### It is counted in hands, and it must be
+
+**An allowance measured in seconds forks the chain.** `PROTOCOL.md` §8.2 puts
+every deadline on the peer's own monotonic clock; there is no shared time and
+there deliberately never was one. An allowance denominated in seconds is one
+two peers disagree about the moment their clocks differ by a second — and this
+allowance decides `dealt_in`, so a disagreement about it is a different
+`HAND_INIT` at each seat, which is a fork with nobody lying and nothing to
+attribute it to.
+
+Hands are agreed by construction. `signed_this_hand` is `P(k)` (§3.2), it is
+already inside the end-of-hand state hash, and the bank is a pure fold over the
+sequence of those sets from hand one. Two peers that agree on every
+`signed_this_hand` agree on every seat's balance, and the checkpoint that
+compares the one compares the other — so the bank needs no field of its own in
+`PublicTableState` and adds no wire format.
+
+A hand at this table runs twenty to thirty seconds. **Two hands is the minute
+that was asked for**, in the one unit that cannot drift.
+
+### The rules
+
+* Every seat starts with `GRACE_HANDS = 2`.
+* After each hand, for every seat that still has chips: present in `P(k)` →
+  its run of present hands grows, and at `REPLENISH_AFTER = 15` it earns one
+  unit back (capped) and the run resets. Absent → it spends one unit and the
+  run resets.
+* A seat is dealt into hand `k+1` when it is in `P(k)`, has chips, **and** has
+  at least one unit left.
+
+### What a spent allowance costs, and what it does not
+
+A seat with nothing left is **not dealt in**, however present it becomes. It
+keeps its chips and its position, and the blinds keep taking them — which is a
+tournament's own answer to a seat nobody can play against, and is what the
+owner described: dead money that the blinds eat.
+
+It is **not removed**. Removal would change `roster_hash`, hence `GENESIS(k)`,
+hence every hash after it, and the roster is frozen at seating (`P8`).
+`PLAYER_LEAVE` exists for a seat that leaves **of its own accord** and is a
+single-writer stage — so no third party can write one on an absent player's
+behalf, and none should be able to.
+
+It can play its way back: an undealt seat may still sign the hand's terminal as
+a bystander, which puts it in `P(k)`, which grows its run. Fifteen present
+hands and it is dealt in again. That is the "restored after fifteen hands" of
+the instruction, and it is why the accrual counts **presence** rather than
+hands played — a seat that is not dealt in could otherwise never earn anything
+back, and the allowance would be a life sentence rather than a penalty.
+
+### The cost this does not remove
+
+The **first** hand a player disappears in still stalls to `hand_deadline_ms` —
+tens of minutes — because that hand had already dealt them in and a
+cryptographic stage cannot be completed without them. D-015 deleted the
+certificate path that would have ended it sooner, and `STATE_MACHINE.md` states
+the consequence in those words. The bank is about every hand *after* that one,
+and before this decision there were none: an absent seat stayed a required
+contributor for ever and every subsequent hand stalled the same way.
+

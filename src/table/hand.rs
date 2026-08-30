@@ -192,6 +192,16 @@ pub struct Opening {
     /// How long a peer has to answer a cryptographic step, from the table's own
     /// parameters. Carried on the envelope of every stage this hand emits.
     pub crypto_step_timeout_ms: u32,
+    /// Each seat's reconnection allowance, in **hands**, indexed by seat.
+    ///
+    /// See [`GRACE_HANDS`]. Carried from hand to hand rather than recomputed,
+    /// because it is a fold over every hand played so far and a peer that
+    /// joined late has no way to replay it — which is also why a seat that
+    /// arrives after the table is seated cannot exist (`P8`).
+    pub grace: Vec<u8>,
+    /// How many consecutive hands each seat has been present for, towards
+    /// [`REPLENISH_AFTER`].
+    pub present_run: Vec<u8>,
     /// How long the whole hand may take before any peer may end it.
     ///
     /// `PROTOCOL.md` §8: the only terminus a stalled **cryptographic** stage
@@ -246,6 +256,10 @@ impl Opening {
             crypto_step_timeout_ms: ad.crypto_step_timeout_ms,
             action_timeout_ms: ad.action_timeout_ms,
             hand_deadline_ms: ad.hand_deadline_ms,
+            // Everybody starts whole. A table that has played no hands has
+            // nobody who has missed one.
+            grace: vec![GRACE_HANDS; usize::from(ad.max_players)],
+            present_run: vec![0; usize::from(ad.max_players)],
             // The first hand of a table: nothing has decided the button yet.
             button: None,
         })
@@ -329,6 +343,29 @@ pub const SHOWDOWN_MUCK_CAP: usize = 64;
 /// The cap on a `HAND_COMPLETE` body: at most `MAX_SEATS` pots, each with three
 /// seat lists, plus four vectors of that length.
 pub const HAND_COMPLETE_CAP: usize = 4_096;
+
+/// How many hands a seat may miss and still be dealt back in.
+///
+/// **Denominated in hands, and that is the whole design.** A reconnection
+/// allowance measured in seconds needs a clock two peers share, and there is
+/// none — `PROTOCOL.md` §8.2 puts every deadline on the peer's own monotonic
+/// clock. An allowance that decides `dealt_in` and is measured on a clock
+/// nobody shares is an allowance two peers disagree about, and a disagreement
+/// about `dealt_in` is a different `HAND_INIT` at every seat: the chain forks
+/// with nobody lying.
+///
+/// Hands are agreed by construction. `signed_this_hand` is `P(k)` (§3.2), it is
+/// already inside the end-of-hand state hash, and the bank below is a pure
+/// function of the sequence of those sets from hand one — so two peers that
+/// agree on every `signed_this_hand` agree on every seat's bank, and the
+/// checkpoint that compares one compares the other.
+///
+/// Two hands is about a minute at this table's pace, which is the interval the
+/// owner asked for, expressed in the one unit that cannot drift.
+pub const GRACE_HANDS: u8 = 2;
+
+/// How many hands a seat must be present for to earn one unit back.
+pub const REPLENISH_AFTER: u8 = 15;
 
 /// The cap on a `HAND_ABORT` body.
 ///
@@ -685,6 +722,11 @@ impl Hand {
             // deadline, for ever. It still pays blinds from its position, which
             // is what a tournament's dead money is and is handled by
             // `post_blinds` reading the stack rather than the deal.
+            // A seat that has burned its reconnection allowance is not
+            // dealt back in, however present it becomes. Its stack stays and
+            // the blinds keep taking it, which is the tournament's answer to a
+            // seat nobody can play against — and it can earn its way back in
+            // by being present for [`REPLENISH_AFTER`] hands.
             dealt_in: {
                 let mut d: Vec<SeatIdx> = o
                     .required
@@ -694,6 +736,7 @@ impl Hand {
                         o.seats
                             .iter()
                             .any(|(seat, _, stack)| seat == s && *stack > 0)
+                            && o.grace.get(usize::from(*s)).copied().unwrap_or(0) > 0
                     })
                     .collect();
                 d.sort_unstable();
@@ -3330,6 +3373,36 @@ impl Hand {
             &terminal,
         );
 
+        // The bank, folded forward one hand. Every input is agreed: `P(k)` is
+        // `signed`, which is inside the end-of-hand state hash, and the two
+        // constants are this version's. A seat present this hand adds to its
+        // run and earns a unit back at [`REPLENISH_AFTER`]; a seat absent this
+        // hand spends one and its run resets.
+        //
+        // A seat that has burned its allowance can still accrue: it is not
+        // dealt in, but it may sign the hand's terminal as a bystander, which
+        // puts it in `P(k)` and is how it plays its way back to the table.
+        let n = usize::from(self.open.max_players);
+        let mut grace = self.open.grace.clone();
+        let mut present_run = self.open.present_run.clone();
+        grace.resize(n, GRACE_HANDS);
+        present_run.resize(n, 0);
+        for seat in 0..n {
+            if !alive.get(seat).copied().unwrap_or(false) {
+                continue;
+            }
+            if self.signed.get(seat).copied().unwrap_or(false) {
+                present_run[seat] = present_run[seat].saturating_add(1);
+                if present_run[seat] >= REPLENISH_AFTER && grace[seat] < GRACE_HANDS {
+                    grace[seat] += 1;
+                    present_run[seat] = 0;
+                }
+            } else {
+                grace[seat] = grace[seat].saturating_sub(1);
+                present_run[seat] = 0;
+            }
+        }
+
         // `R(k+1) = P(k)`: the seats that demonstrably took part in hand `k`.
         // A seat that signed nothing is outside the required set from here on,
         // which is D-013 and is how one silent seat costs exactly one hand
@@ -3360,6 +3433,8 @@ impl Hand {
             crypto_step_timeout_ms: self.open.crypto_step_timeout_ms,
             action_timeout_ms: self.open.action_timeout_ms,
             hand_deadline_ms: self.open.hand_deadline_ms,
+            grace,
+            present_run,
             button: Some(positions.button),
         })
     }
@@ -3725,6 +3800,8 @@ mod tests {
             crypto_step_timeout_ms: 30_000,
             action_timeout_ms: 20_000,
             hand_deadline_ms: 600_000,
+            grace: vec![GRACE_HANDS; 3],
+            present_run: vec![0; 3],
             button: None,
         }
     }
@@ -3758,6 +3835,8 @@ mod tests {
             crypto_step_timeout_ms: 30_000,
             action_timeout_ms: 20_000,
             hand_deadline_ms: 600_000,
+            grace: vec![GRACE_HANDS; 3],
+            present_run: vec![0; 3],
             button: None,
         }
     }
@@ -4345,6 +4424,55 @@ mod tests {
         let e = b.on_event(&greedy, &key(11), late).unwrap_err();
         assert!(matches!(e, Failed::Elsewhere { seat: 0, .. }), "{e}");
         assert!(b.aborted().is_none(), "and the hand did not end");
+    }
+
+    /// The reconnection bank: a seat that drops is held, and a seat that keeps
+    /// dropping is not.
+    ///
+    /// Every quantity here is a fold over `P(k)`, which is agreed and already
+    /// in the state hash, so two peers cannot disagree about how much anybody
+    /// has left. That is the whole reason it is counted in hands: an allowance
+    /// in seconds is an allowance measured on a clock nobody shares, and one
+    /// that decides `dealt_in` would fork the chain.
+    #[test]
+    fn the_bank_is_spent_by_absence_and_earned_by_presence() {
+        let mut o = opening3(0);
+        assert_eq!(o.grace, vec![GRACE_HANDS; 3]);
+
+        // Seat 2 goes quiet. It is still on the roster and still has chips, so
+        // it still posts blinds from its position — but it is not dealt in.
+        o.required = vec![0, 1];
+        let (h, _) = Hand::open(o.clone(), &key(10), NOW, 30_000).unwrap();
+        assert_eq!(
+            h.init().dealt_in,
+            vec![0, 1],
+            "an absent seat is not a required contributor of a deck key"
+        );
+        assert_eq!(
+            h.init().stacks.len(),
+            3,
+            "and it is still on the roster, with its chips"
+        );
+
+        // A seat with no allowance left is not dealt in even when it is in the
+        // required set — which is what stops a player dropping every hand.
+        let mut spent = opening3(0);
+        spent.grace = vec![GRACE_HANDS, GRACE_HANDS, 0];
+        let (h, _) = Hand::open(spent, &key(10), NOW, 30_000).unwrap();
+        assert_eq!(
+            h.init().dealt_in,
+            vec![0, 1],
+            "a seat that burned its allowance stays out until it earns one back"
+        );
+    }
+
+    /// A busted seat is not dealt in, whatever its allowance says.
+    #[test]
+    fn no_chips_means_no_hand() {
+        let mut o = opening3(0);
+        o.seats[2].2 = 0;
+        let (h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
+        assert_eq!(h.init().dealt_in, vec![0, 1]);
     }
 
     /// A mucked hand is never opened, by anybody, ever.
