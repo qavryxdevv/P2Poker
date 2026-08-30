@@ -310,6 +310,30 @@ The button alternates every hand, which is the heads-up dead-button rule, and a
 hundred-and-thirty-second run gets through several hands end to end: crypto,
 betting, settlement, rotation, next deal.
 
+### How to read a two-process run, and how not to
+
+Two mistakes were made repeatedly today and both produced **confident wrong
+conclusions**, so they are written down rather than left to be repeated.
+
+**Do not count anything from a log while the process is still running.** A
+three-seat run was reported as "no hands completed" from a mid-run read; by the
+end every peer had played two and was into a third. A two-process run was
+reported as three hands; it finished five. Wait for the process to exit, then
+count.
+
+**Do not conclude from a filtered tail.** The same three-seat run was reported
+as "the table never formed", from a `grep | tail` whose window happened to hold
+only the host's early lines. The table had formed, agreed one session, and run
+a three-link shuffle chain. Read the whole non-lobby log before saying what
+happened:
+
+```
+grep -vE "in the public lobby|^found |^listening on|^connection budget|^relay |player\(s\)" run.log
+```
+
+Both mistakes have the same shape — a cheap partial read treated as evidence —
+and the cost each time was a claim that had to be withdrawn.
+
 ### The three runs that lied, and why
 
 Runs two, three and four all looked like the same failure — a hand dealt,
