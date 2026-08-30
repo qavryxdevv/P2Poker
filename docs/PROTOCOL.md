@@ -3046,7 +3046,7 @@ question rather than a cryptographic one.
 
 | Field | Type | Limit / rule |
 |---|---|---|
-| `n(0) street` | `u16` | `3` flop, `4` turn, `5` river |
+| `n(0) street` | `u16` | `3` flop, `4` turn, `5` river — §4.7's street code, which owns the encoding |
 | `n(1) entries` | `Vec<RevealEntry>` | exactly the indices of that street: 3 for the flop, 1 for the turn, 1 for the river |
 
 *Receiver must validate:* the street matches the engine's current street exactly;
@@ -3129,9 +3129,39 @@ path:
 
 | Field | Type | Limit / rule |
 |---|---|---|
-| `n(0) street` | `u16` | must equal the engine's current street |
+| `n(0) street` | `u16` | the street code below; must equal the engine's current street |
 | `n(1) seat` | `u8` | must equal `player_to_act` and the sender's seat |
 | `n(2) action_index` | `u32` | count of actions so far in this hand; must equal the engine's |
+
+**`street`, normatively.** The code is **the number of board cards the street
+has**, and this section owns it:
+
+| Street | `street` |
+|---|---|
+| pre-flop | `0` |
+| flop | `3` |
+| turn | `4` |
+| river | `5` |
+
+Every message in this document with a `street` field uses this table and no
+other: `ACTION_*` above, `BOARD_REVEAL` (§4.6), and `street` inside
+`PublicTableState` (§6.1).
+
+This block exists because the encoding was **not stated anywhere** for seven
+passes, and that is the same defect this document records against `role_code` in
+§4.5, with the same consequence: two conforming clients each pick a reasonable
+enumeration — `0,1,2,3` from the engine's own `Street` discriminants is the
+obvious other one — and every action of every hand mismatches at `n(0)`. It was
+inferrable, from `BOARD_REVEAL`'s `3` flop / `4` turn / `5` river and from
+`PublicTableState`'s `board` being *"length 0/3/4/5"*, and inferrable is not
+stated. **`0,1,2,3` is the withdrawn reading and appears nowhere in this corpus
+except in this paragraph, which records its withdrawal.**
+
+The count was chosen over the discriminants because it is the one encoding a
+reader can check against the message it travels with: a `BOARD_REVEAL` carrying
+`street = 3` carries three entries, and a client that got the mapping wrong
+fails a length check in the same message rather than silently agreeing to
+different streets.
 
 and then per type:
 

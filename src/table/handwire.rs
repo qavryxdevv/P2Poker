@@ -23,7 +23,7 @@
 //! is not something anybody can act on, while "seat 3 says the button is at 2
 //! and I say 1" is.
 
-use crate::poker::state::{Hash, SeatIdx};
+use crate::poker::state::{Hash, SeatIdx, Street};
 
 /// The body of a `HAND_INIT`, in `PROTOCOL.md` §4.3's field order.
 ///
@@ -356,9 +356,142 @@ impl DealPrivate {
     }
 }
 
+/// The street code `PROTOCOL.md` §4.7 defines: **the number of board cards**.
+///
+/// Pre-flop `0`, flop `3`, turn `4`, river `5`. Not the engine's `Street`
+/// discriminants, which are `0,1,2,3` — that is the reading §4.7 withdraws, and
+/// it is withdrawn because it was never stated either way for seven passes of
+/// the document. Two conforming clients each picking a reasonable enumeration
+/// mismatch on `n(0)` of every action of every hand.
+///
+/// It is written here as a match on `board_cards()` rather than as a table of
+/// literals, so the wire code and the board length cannot drift apart: the
+/// reason the count was chosen over the discriminants is that a receiver can
+/// check it against the message it travels with.
+pub fn street_code(street: Street) -> u16 {
+    street.board_cards() as u16
+}
+
+/// The reverse, refusing anything that is not a street.
+///
+/// `1` and `2` are refused rather than mapped to something near them. They are
+/// exactly what a client that used the engine's discriminants would send for
+/// the flop and the turn, and answering that with a street is how the withdrawn
+/// reading would survive in the field.
+pub fn street_from_code(code: u16) -> Option<Street> {
+    match code {
+        0 => Some(Street::PreFlop),
+        3 => Some(Street::Flop),
+        4 => Some(Street::Turn),
+        5 => Some(Street::River),
+        _ => None,
+    }
+}
+
+/// The three fields every betting action carries (`PROTOCOL.md` §4.7).
+///
+/// `ACTION_CHECK`, `ACTION_CALL` and `ACTION_FOLD` are exactly this and nothing
+/// more. The other two add a total, and are [`ActionAmount`].
+///
+/// All three fields are redundant with what a receiver already knows, and that
+/// is their purpose: a receiver re-runs the engine from its own state and
+/// compares. `action_index` in particular is what makes a replayed action
+/// visible as one — the same action at the same street from the same seat, one
+/// action later, is a different `action_index` and does not verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct ActionHead {
+    #[n(0)]
+    pub street: u16,
+    #[n(1)]
+    pub seat: u8,
+    #[n(2)]
+    pub action_index: u32,
+}
+
+/// `ACTION_BET`'s `amount` and `ACTION_RAISE`'s `raise_to`.
+///
+/// One type for both, because the field is the same field: **the seat's total
+/// commitment for the round**, never an increment. TDA 43-B, and on a street
+/// where `current_bet == 0` a bet's total and its increment are the same
+/// number, which is exactly why carrying the total removes the ambiguity
+/// instead of relocating it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct ActionAmount {
+    #[n(0)]
+    pub street: u16,
+    #[n(1)]
+    pub seat: u8,
+    #[n(2)]
+    pub action_index: u32,
+    /// The total for the round. `amount` in `ACTION_BET`, `raise_to` in
+    /// `ACTION_RAISE`; one name here because it is one quantity.
+    #[n(3)]
+    pub total: u64,
+}
+
+impl ActionAmount {
+    /// The head, for the checks that do not care about the total.
+    pub fn head(&self) -> ActionHead {
+        ActionHead {
+            street: self.street,
+            seat: self.seat,
+            action_index: self.action_index,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The street code is the board length, pinned against the engine rather
+    /// than against a table of literals — because the reason §4.7 chose the
+    /// count over the discriminants is that it is checkable against the message
+    /// it travels with.
+    #[test]
+    fn the_street_code_is_the_board_length() {
+        for street in [Street::PreFlop, Street::Flop, Street::Turn, Street::River] {
+            assert_eq!(street_code(street) as usize, street.board_cards());
+            assert_eq!(street_from_code(street_code(street)), Some(street));
+        }
+        assert_eq!(street_code(Street::PreFlop), 0);
+        assert_eq!(street_code(Street::River), 5);
+    }
+
+    /// `1` and `2` are exactly what a client using the engine's discriminants
+    /// would send for the flop and the turn. Answering them with a street is
+    /// how the withdrawn reading would survive in the field.
+    #[test]
+    fn the_engine_discriminants_are_not_street_codes() {
+        assert_eq!(street_from_code(1), None, "the flop is 3, not 1");
+        assert_eq!(street_from_code(2), None, "the turn is 4, not 2");
+        assert_eq!(street_from_code(6), None);
+        assert_eq!(street_from_code(u16::MAX), None);
+    }
+
+    #[test]
+    fn an_action_survives_the_wire() {
+        let head = ActionHead {
+            street: street_code(Street::Flop),
+            seat: 3,
+            action_index: 7,
+        };
+        let bytes = minicbor::to_vec(head).unwrap();
+        assert_eq!(minicbor::decode::<ActionHead>(&bytes).unwrap(), head);
+
+        let raise = ActionAmount {
+            street: street_code(Street::Turn),
+            seat: 3,
+            action_index: 8,
+            total: 1_200,
+        };
+        let bytes = minicbor::to_vec(raise).unwrap();
+        assert_eq!(minicbor::decode::<ActionAmount>(&bytes).unwrap(), raise);
+        assert_eq!(raise.head().seat, 3);
+        assert_eq!(raise.head().action_index, 8);
+    }
 
     fn body() -> HandInit {
         HandInit {
