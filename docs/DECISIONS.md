@@ -2447,3 +2447,86 @@ the consequence in those words. The bank is about every hand *after* that one,
 and before this decision there were none: an absent seat stayed a required
 contributor for ever and every subsequent hand stalled the same way.
 
+---
+
+## D-023 — the decision clock is restored where there is somebody to appeal to
+
+Decided 2026-08-30, on the owner's instruction, and it **reverses part of
+D-015**: `TIMEOUT_VOTE` and `TIMEOUT_CERT` are produced again, at tables where
+`|V(subject)| >= 2`. The hand deadline stays as the heads-up fallback, which is
+what the owner asked for and what D-007 requires anyway.
+
+The question that prompted it was exact: *can the other peers safely force a
+fold on a player who is well past their time, without a rogue peer being able
+to force folds on opponents?* The answer is yes, with one condition, and the
+condition is the whole security property.
+
+### One peer cannot take the action from a player who was about to act
+
+A vote says only *"my own timer expired and I have accepted nothing from that
+seat at this stage"*. It is not an accusation, it is not evidence, and alone it
+does nothing. Only a **complete** set — one from every seat in `V(subject)` —
+becomes a certificate, and only a certificate moves anything.
+
+So a rogue needs every other seat's signature, and an honest peer will not sign
+while it has accepted the victim's action or before its own timer expired.
+**One honest third party is enough to protect a victim**, and that is asserted
+by a test: a lone vote leaves the same player to act on all three peers.
+
+### The floor is on `|V|`, never on the seat count
+
+This is D-008 and it is the part that is easy to get wrong. The attack does not
+need a two-seat table; it needs a **one-member voter set**. Vote four seats out
+at a six-seat table, declare the fifth, and `V` is `{attacker}` — a complete
+certificate on one signature. Every protection scoped on the seat count passes,
+because the seat count is still six.
+
+Closed in three pieces, and all three are needed: the floor follows `|V|`; `V`
+shrinks **only** by an accepted certificate; and each such certificate had to
+clear the floor itself. The shrinkage is inductive and cannot be bought with
+assertions.
+
+Heads-up `V` is the one opponent, so "unanimity" would be the signature of the
+single party with an interest in the outcome. Below the floor a certificate is
+inert — not accepted, not chained, not evidence — and this client does not even
+send a vote towards one.
+
+### What it does, and what it still does not buy
+
+The effect is the rules': **check** when nothing is owed and **fold** when
+facing a bet, never folding a hand that could check for free. The round then
+continues normally. A cryptographic subject aborts the hand instead and names
+the seat *as evidence only* — no chips move, because an abort restores every
+stack (D-010).
+
+It does **not** stop everybody-but-one conspiring. That is unavoidable wherever
+a group decides, and it is already outside what this construction fixes. What
+it costs the victim is a hand, not chips, and the conspiracy is signed and
+permanent in the transcript.
+
+A voter that simply refuses to vote protects a genuine staller. That is
+liveness rather than safety, and the hand deadline covers it.
+
+### Two things the corpus settled that were not in my head
+
+* **The certificate stage is collective in its own right**, and its
+  `stage_hash` is taken over the *whole* set of certificates rather than over
+  one chosen copy. That is what stops two honest emitters, who embedded
+  different valid signatures for one vote, from forking the stage.
+* **A betting stage's `subject_event_type` had no defined value.** Five action
+  types are legal at one `sequence` and the field is inside `subject_digest`,
+  so two conforming clients each picking a reasonable member would produce
+  different digests, land their votes in different slots, and **never assemble
+  a certificate at all** — a gate that cannot be reached is not a gate. Pinned
+  to the group base `0x0500` in `PROTOCOL.md` §4.8, which is the same class of
+  defect as `role_code` (§4.5) and the street code (§4.7) and the third one
+  found in this corpus by trying to implement against it.
+
+### What of D-015 stands
+
+Everything else. `certified_subjects` is back because `V` needs it, and the
+action-deadline effect is back, but the hand deadline remains the terminus for
+a stalled cryptographic stage below the floor, and no version of this restores
+a certificate that moves a chip — D-010 removed that outcome and it stays
+removed.
+
