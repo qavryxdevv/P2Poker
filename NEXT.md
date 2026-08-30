@@ -745,6 +745,49 @@ The other is a protocol decision and should not be patched in a hurry:
 Until both are done, a peer that misses one broadcast at the wrong moment can be
 voted off a table it is still playing.
 
+## Why a table between three clients on one machine took minutes to form
+
+Chased with instruments rather than reasoning, because every hypothesis along the
+way was wrong. In order:
+
+* **`ConnectionClosed` ignored `num_established`**, so a peer reached over both
+  TCP and QUIC was reported gone whenever either connection closed, and was
+  dropped from `poker_peers` — losing its exemption from the connection cap —
+  while still connected. Eleven false departures for one peer in four minutes.
+  Fixed; the same run afterwards showed two arrivals and zero departures.
+* **A dial failure was never logged.** `NodeEvent::DialFailed` incremented a
+  counter and nothing else, so a client that could not reach the machine it was
+  sitting next to looked exactly like one that had nothing to reach. The first
+  twelve are now printed, and they immediately showed the dial budget going on
+  dead peers from earlier test runs — every fresh profile announces itself a
+  provider of the lobby key on the public DHT and the record outlives the
+  process by hours.
+* **The node was throttled by its own log.** Every event goes out with
+  `send().await` on a channel of sixty-four; a busy DHT fills it, and a full
+  channel stops the node's whole `select!` — timers included. Measured: the
+  thirty-second housekeeping tick did not fire for three minutes, the table
+  advertisement went out ONCE in a two-hundred-second run, and a third player
+  who missed that one publish waited the rest of the run. Widening the channel
+  moved the third player's arrival from log line 1851 to line 159 of the same
+  run shape.
+
+### Still not right, and the buffer is a bandage on it
+
+**A node's liveness must not depend on how fast something drains its log.** With
+65 536 slots it takes a lot to stall, but the ticks still arrive in catch-up
+bursts, so the loop is still being starved by something — most likely raw event
+volume rather than backpressure now. The proper fix is that advisory events
+(`Warning`, `DialFailed`, `LobbyPeer`, `PeerConnected`, `PeerDisconnected`) must
+be sent with `try_send` and dropped when full, with only the few state-critical
+ones allowed to block. That is about a hundred call sites and should be done as
+one deliberate change, not folded into something else.
+
+Also unexplained: the founder often reports `lobby topic: 0 of 1 subscribed
+peer(s) in the mesh` while both joiners report `0 of 2`. Delivery works anyway,
+because an mDNS-discovered peer is an explicit peer and `publish` reaches those
+without the mesh — but the asymmetry means the founder is missing one peer's
+subscription, and nothing yet explains it.
+
 ## Still open
 
 * `STATE_HASH` / `STATE_ACK` — the hash is computed inside `HAND_COMPLETE` and

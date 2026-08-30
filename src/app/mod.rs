@@ -481,7 +481,18 @@ impl AppState {
             // a log full of them buries the lines that mean something — but the
             // count is carried, because "most dials fail" and "this client is
             // broken" look identical without one.
-            NodeEvent::DialFailed { .. } => self.status.failed_dials += 1,
+            NodeEvent::DialFailed { reason } => {
+                self.status.failed_dials += 1;
+                // **The first few, in full.** Kept out of the log entirely
+                // before this, which meant a client that could not reach the
+                // machine it was sitting next to looked exactly like one that
+                // had nothing to reach. The window that matters is the first
+                // half-minute — a table forming — and after that the count
+                // alone is the right amount of noise.
+                if self.status.failed_dials <= 12 {
+                    self.note(format!("dial failed: {reason}"));
+                }
+            }
             NodeEvent::Warning(w) => self.note(w),
 
             NodeEvent::PortMapped { how, external } => {
