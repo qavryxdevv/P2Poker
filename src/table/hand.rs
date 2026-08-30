@@ -4051,6 +4051,18 @@ impl Hand {
             if !alive.get(seat).copied().unwrap_or(false) {
                 continue;
             }
+            // Three certificates against one seat and it sits out at this
+            // boundary: it keeps its stack, posts dead money, takes no cards
+            // and drains. `PROTOCOL.md` §8.3, and it is the tournament's dead
+            // seat. Expressed by emptying the allowance rather than by a
+            // second flag, so there is one gate on `dealt_in` and not two that
+            // can disagree — and so the seat can still earn its way back the
+            // way any other absent one does.
+            if self.strikes.get(seat).copied().unwrap_or(0) >= MAX_CONSECUTIVE_AUTO_ACTIONS {
+                grace[seat] = 0;
+                present_run[seat] = 0;
+                continue;
+            }
             if self.signed.get(seat).copied().unwrap_or(false) {
                 present_run[seat] = present_run[seat].saturating_add(1);
                 if present_run[seat] >= REPLENISH_AFTER && grace[seat] < GRACE_HANDS {
@@ -5373,6 +5385,27 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "one second in, nobody's timer has expired"
+        );
+    }
+
+    /// Three certificates and the seat sits out: it keeps its stack, posts
+    /// dead money, takes no cards and drains. The tournament's dead seat.
+    #[test]
+    fn three_strikes_and_the_seat_takes_no_more_cards() {
+        let mut o = opening3(0);
+        // The state a seat reaches after three certificates against it, which
+        // `apply_certificate` produces one at a time.
+        o.grace = vec![GRACE_HANDS, GRACE_HANDS, 0];
+        let (h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
+        assert_eq!(
+            h.init().dealt_in,
+            vec![0, 1],
+            "a seat sitting out takes no cards"
+        );
+        assert_eq!(
+            h.init().stacks.len(),
+            3,
+            "and keeps its stack, which the blinds go on taking"
         );
     }
 
