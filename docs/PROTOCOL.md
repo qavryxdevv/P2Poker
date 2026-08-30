@@ -6230,6 +6230,38 @@ relay hops for CGNAT peers, and signature verification. Every peer must use the
 identical constant, because peers disagreeing about whether a timeout fired is a
 consensus fault, not a UX detail. [RULES B4]
 
+**The subject of a certificate is read from the votes it carries, never rebuilt
+from the receiver's own stage.** The first carried vote's payload is the
+preimage and `subject_digest` must recompute from it; every carried vote's
+envelope `sequence` and `previous_event_hash` must equal the `subject_sequence`
+and `parent_event_hash` that its own payload names, and the certificate's
+envelope must too. **That is what replaces the receiver's cursor as the replay
+barrier**, and it is strictly stronger: a vote sealed at one stage cannot be
+counted towards a subject at another, for any receiver, because the voter signed
+the position it voted at. `deadline_ms` must equal the value the receiver
+derives from the hand's own parameters, or a position-free receiver would be
+taking the deadline on the emitters' word.
+
+The carried voter set must contain the receiver's own `V(subject)` and be
+contained in `dealt_in \ {subject}`, with `|carried| >= 2` and `|dealt_in| >= 3`.
+**A shortfall against the receiver's own `V` is buffered, not refused**: a
+receiver missing an earlier certificate derives a larger `V`, and the peer that
+most reliably misses one is the subject itself.
+
+**The peer least able to stand at the subject stage is the subject of the
+certificate**: it moved past that stage precisely because it emitted the event
+the voters never received. A receiver that could only check a certificate
+against its live cursor could therefore never apply one about itself, would
+never shrink its own `R(k+1)`, and would play a table the others had already
+left — under identical genesis hashes, with no refusal logged anywhere. That is
+measured, five hands. See D-024.
+
+**And the legality condition governs emission only.** *"The receiver has not
+itself accepted an event for that stage from `subject_seat`"* is a rule about
+whether a peer may **emit** a vote. It is never applied to the votes carried
+inside a certificate: at the subject it is unsatisfiable by construction, and an
+implementer hardening the vote path would silently re-close this exact door.
+
 `next_deadline_ms` is **normative, not the emitter's choice.** Its value is a
 deterministic function of the table parameters and the kind of the next stage:
 

@@ -2613,3 +2613,101 @@ floor — absence means *certified* absence:
 Heads-up there can be no certificate, and this falls back to observation. That
 is safe for the only reason it is ever safe: with one other peer there is nobody
 to disagree with, and if the two do disagree the table is over regardless.
+
+---
+
+## D-024 — a certificate's roster effect is position-free; its stage effect is not
+
+Decided 2026-08-30, forced by a measurement rather than by an argument.
+
+Three clients, the third killed. One survivor certified seat 0's timeout —
+seat 0 being a **live** peer that had gone quiet for one stage — and dropped it
+from the next hand. Seat 0 never applied that certificate. The two then opened
+hands two to six at **identical genesis hashes** with different players in them,
+`[0, 1, 2]` against `[1, 2]`, and neither logged a refusal.
+
+### The mechanism, and why it is the ordinary case
+
+* Seat 0 emitted the event the others were waiting on. They never received it.
+* They voted, reached unanimity, certified and ended the hand.
+* Seat 0 had already advanced past that stage — it moved on **because** it did
+  the thing they never saw.
+* Their certificate reached seat 0 at a stage seat 0 had left, so `subject_of`
+  could not rebuild the subject from seat 0's own cursor, and `on_event` had
+  already dropped it at `sequence < slot.sequence` before `on_timeout_cert` was
+  reached at all. Even the diagnostic written for exactly this was unreachable.
+
+**The peer least able to stand at the stage a certificate is about is the
+subject of it.** That is not a corner: it is the shape of the event.
+
+### The ruling
+
+1. **The roster effect is position-free.** On a fully verified certificate the
+   receiver banks `certified` and `strikes` wherever it stands, keyed on the
+   subject digest so that two genuine certifications of one seat count twice and
+   a redelivery of either counts once.
+2. **The stage effect is not.** The engine action and the slot advance run only
+   when the receiver's own slot equals the stage the certificate names.
+3. **A `kind = 2` certificate ends the hand from anywhere**, which converges
+   because `ABORT_TERMINAL(k)` is a function of `GENESIS(k)` alone.
+4. **A `kind = 1` certificate at a stage the receiver has left is a fork, and is
+   reported rather than repaired.** A betting stage is single-writer: the
+   subject advanced with its own action's `stage_hash_single` and the voters
+   with the certificate stage's hash, so there are two parents at one sequence.
+   `BettingRound` validates legality but never turn order, so replaying would
+   take a decision for a seat on a street it is not acting in and succeed in
+   silence; and §3.2 forbids the alternative, because the hash has already been
+   chained from.
+5. **The voter set is checked in the direction that can only tighten.** The
+   carried set must contain this receiver's own `V(subject)` and be contained in
+   `dealt_in \ {subject}`. A *shortfall* against the receiver's own `V` is
+   **held**, never refused: a receiver missing an earlier certificate derives a
+   larger `V`, and the peer that most reliably misses one is the subject.
+6. **The roster freezes with the terminal**, or `next_hand` races a wall clock
+   against the mesh.
+
+### What replaces the receiver's cursor
+
+The artefact proves its own position. Every carried vote's **signed** envelope
+must name the stage its own payload names, and the certificate's must too. A
+vote sealed at one stage cannot be counted towards a subject at another, for any
+receiver, with or without a history of its own — and the voter put its key
+behind that binding, which no cursor of the receiver's could match.
+
+`deadline_ms` is re-derived from the hand's own `Opening`, whose parameters are
+inside `table_params_hash` and thence every genesis. On the in-position road
+this comes free from rebuilding the subject. A position-free receiver has to
+restore it explicitly, or two colluding peers could certify a seat at a deadline
+shorter than the table's — which is the one guarantee D-023 exists to give.
+
+### What this does not change
+
+The `|V| >= 2` floor, and the requirement of a signature from **every** seat in
+`V`. Nothing here reduces unanimity to a quorum, and nothing here lets one peer
+name another on its own word.
+
+### Three defects the ruling forced out of the tree
+
+Each was live, and none was visible in any test or any run:
+
+* `certs` was fed from `on_hand_init`, so it held every `HAND_INIT` hash of the
+  hand — a value every peer holds — and the gate on a named abort was open to
+  anybody and shut to the mechanism it exists for.
+* §4.10's *Precedence against `HAND_COMPLETE`* was normative and unimplemented,
+  and a late abort carrying the hand's start stacks passed every check and
+  reverted a settlement.
+* `apply_certificate` shrank the voter set and consumed the certificate before
+  the engine call that can fail, leaving a seat removed from `R(k+1)` with
+  nothing done about the stage it was late for.
+
+### An amendment to D-010
+
+D-010's point 2 says attribution *"has no automatic consequence"*. That is
+literally true — nothing reads `attributed` — but `certified_subjects` and
+`attributed` are written by the same event, and under D-023 the damage a
+certificate can do is a wasted hand **plus a persistent edit to who is dealt
+in**. D-010's claim to have removed the prize is one term short. What carries
+the argument instead is the floor and the inductive shrinkage: an attacker
+cannot reach `|V| = 1` by asserting, because every step towards it had to clear
+the floor too.
+

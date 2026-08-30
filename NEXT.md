@@ -698,124 +698,52 @@ forbids that shape. Everything was right up to the last message.
   every uncommitted change in that file. It threw away the same file's work a
   second time, ten minutes later. Revert the one line, or commit first.
 
-## The one that matters most, found last and not fixed
+## The one that mattered most — closed
 
 **Two survivors ran different rosters for five hands under identical genesis
-hashes, and neither said a word.**
+hashes, and neither said a word.** One certified a live seat that had gone quiet
+for one stage and dropped it; that seat never applied the certificate about
+itself, because it had already moved past the stage the certificate named —
+`subject_of` rebuilds from the current slot, and `on_event` dropped the
+certificate at `sequence < slot.sequence` before its handler was ever reached.
+Even the diagnostic written for exactly this was unreachable.
 
-Measured, three clients, the third killed. One survivor certified seat 0's
-timeout — seat 0 being a **live** peer that had gone quiet for one stage — and
-dropped it: `hand #2 opens at genesis b63100a9 with seats [1, 2]`. Seat 0 itself
-never applied that certificate: `certs=0`, and `hand #2 opens at genesis
-b63100a9 with seats [0, 1, 2]`. The genesis hashes agree hand for hand. The
-participation set does not. No refusal was logged on either side.
+Both halves are now done and both are recorded as **D-024**:
 
-The mechanism is not exotic and it is not the certificate's fault:
+* The genesis commits to `R(k)`, so two peers that disagree about who is playing
+  cannot open the same hand. That turned a silent split into a refusal.
+* A certificate proves its own position instead of being checked against the
+  receiver's cursor — every carried vote's *signed* envelope must name the stage
+  its payload names — so the subject can verify and apply one about itself. Its
+  roster effect is banked wherever the receiver stands; its stage effect runs
+  only in position.
 
-* Seat 0 emitted the event the others were waiting on. They never received it.
-* They voted, reached unanimity, certified and aborted the hand.
-* Seat 0 had already advanced past that stage — it moved on *because* it did the
-  thing they never saw.
-* Their certificate reached seat 0 at a stage seat 0 had left, so
-  `subject_of` could not rebuild the subject, so `on_timeout_cert` returned
-  `NotYet` and it was **held for ever**, silently.
-
-So the peer most likely to be unable to apply a certificate is the subject of
-it. That is not a corner: it is the ordinary shape of the event.
-
-Two things are wrong and only one is cheap.
-
-The cheap one is done: a certificate that cannot be placed now says so, naming
-the sequence this client has reached, so the split is audible.
-
-The other is a protocol decision and should not be patched in a hurry:
-
-* A receiver can only check a certificate against a stage it can rebuild, and it
-  rebuilds the subject from its **current** slot. To accept one about a stage it
-  has left, it would have to keep its own past slots — `(sequence, parent hash)`
-  — and check the subject digest against that history. That is what makes
-  accepting a passed stage safe rather than trusting the digest, and it is the
-  difference between this and a replay of votes from another position.
-* And `dealt_in` must be inside what the genesis commits to, or two peers can
-  keep deriving the same genesis from different participation sets. There is a
-  `dealt_in differs from what I derived` check on `HAND_INIT` and it did not
-  fire here, because the two peers had stopped exchanging the events that would
-  have carried it.
-
-Until both are done, a peer that misses one broadcast at the wrong moment can be
-voted off a table it is still playing.
-
-## Why a table between three clients on one machine took minutes to form
-
-Chased with instruments rather than reasoning, because every hypothesis along the
-way was wrong. In order:
-
-* **`ConnectionClosed` ignored `num_established`**, so a peer reached over both
-  TCP and QUIC was reported gone whenever either connection closed, and was
-  dropped from `poker_peers` — losing its exemption from the connection cap —
-  while still connected. Eleven false departures for one peer in four minutes.
-  Fixed; the same run afterwards showed two arrivals and zero departures.
-* **A dial failure was never logged.** `NodeEvent::DialFailed` incremented a
-  counter and nothing else, so a client that could not reach the machine it was
-  sitting next to looked exactly like one that had nothing to reach. The first
-  twelve are now printed, and they immediately showed the dial budget going on
-  dead peers from earlier test runs — every fresh profile announces itself a
-  provider of the lobby key on the public DHT and the record outlives the
-  process by hours.
-* **The node was throttled by its own log.** Every event goes out with
-  `send().await` on a channel of sixty-four; a busy DHT fills it, and a full
-  channel stops the node's whole `select!` — timers included. Measured: the
-  thirty-second housekeeping tick did not fire for three minutes, the table
-  advertisement went out ONCE in a two-hundred-second run, and a third player
-  who missed that one publish waited the rest of the run. Widening the channel
-  moved the third player's arrival from log line 1851 to line 159 of the same
-  run shape.
-
-### The proper fix, done
-
-`net::node::Events` now divides events by consequence rather than importance. An
-advisory one — a peer count, a dial failure, a warning, anything that is a
-rendering of state the node already holds — is **offered** and dropped if there
-is no room. Only an event the receiver's own fold depends on (a seat, a roster,
-a card, a turn) is waited for. Nothing is dropped silently: the count is carried
-and reported on the housekeeping tick, because *"no warnings"* and *"the
-warnings were thrown away"* must never look the same in a log.
-
-It is one wrapper and six signatures rather than a hundred call sites, because
-`Events::send` keeps the shape the call sites already had.
-
-Measured, three clients on one machine, table of three:
-
-| | before | after |
-|---|---|---|
-| table formed | not within 124 s | 33 s, 34 s, and once not within 110 s |
-| adverts published in 200 s | 1 | one per 30 s tick until the table fills |
-| advisory events dropped | n/a | 0 |
-
-**Two runs in three is not a cure**, and one later run seated all three by log
-line 28 with the hand dealt immediately — the best of the day. So the spread is
-wide and the remaining failures are not yet characterised.
-
-**And the clue that was written here was wrong.** `lobby topic: 0 of 1` on the
-founder against `0 of 2` on the joiners looked like a missing subscription; with
-the peers named rather than counted, a later run showed all three symmetric —
-each seeing exactly the other two — so the `0 of 1` was one tick taken before
-the second joiner had connected, and nothing more.
-
-The `0` mesh count is **not** a fault either, and chasing it would waste a day:
-`libp2p-gossipsub` excludes explicit peers from the mesh on purpose, because
-they already receive everything, and an mDNS-discovered peer is made explicit
-here. A local table is delivered entirely by the explicit-peer path. That is
-also why the throttling took so long to find — the mesh being empty looked like
-the problem and never was.
-
-Also unexplained: the founder often reports `lobby topic: 0 of 1 subscribed
-peer(s) in the mesh` while both joiners report `0 of 2`. Delivery works anyway,
-because an mDNS-discovered peer is an explicit peer and `publish` reaches those
-without the mesh — but the asymmetry means the founder is missing one peer's
-subscription, and nothing yet explains it.
+Found by an adversarial review workflow: three independent designs, each
+attacked from two lenses, all three refuted, and the fourth built from what
+survived. The same review found three live defects in the tree that no design
+was responsible for — `certs` fed from `on_hand_init`, no `HAND_COMPLETE`
+precedence, and the roster mutated ahead of a fallible engine call — each of
+which is now fixed with a test shown to fail without it.
 
 ## Still open
+
+* **A seat certified absent never re-enters**, because `next_hand`'s
+  `by_certificate` branch only ever filters `self.open.required`. D-024 makes
+  that permanence immediate and audible for the first time; it does not change
+  it, and whether it is right is a rules question nobody has answered.
+* **The kind-1 fork is unrepairable at the receiver** and is now reported by
+  name. A betting stage is single-writer, so a subject certified out of position
+  and the voters are on two branches at one sequence, and §3.2 forbids
+  redefining a `stage_hash` already chained from.
+* **`src/protocol/slot.rs` and `src/protocol/antireplay.rs` have no callers.**
+  Both are fully written and documented as *"one site, for the whole project"*,
+  and the only reference to either outside their own files is `pub mod` in
+  `src/protocol/mod.rs`. §5.2.1's eight-tuple anti-replay key does not exist at
+  runtime. Wire it in or delete it, but it must not stay a third opinion about
+  replay that nothing runs.
+* **The second half of §4.10's precedence rule** — a receiver that applied an
+  abort and later accepts a complete `HAND_COMPLETE` replaces its terminal — is
+  still not implemented.
 
 * `STATE_HASH` / `STATE_ACK` — the hash is computed inside `HAND_COMPLETE` and
   the stage that carries it does not exist. §12's T61 fires after every settled
