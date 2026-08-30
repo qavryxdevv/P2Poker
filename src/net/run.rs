@@ -869,7 +869,15 @@ pub async fn run(
                                         // are read from a complete set of
                                         // verified shares or not at all, so
                                         // there is no partial state to report.
-                                                if h.aborted().is_some() {
+                                                // A seat the table acted for, once.
+                                        if let Some((seat, what)) = h.take_certified_action() {
+                                            let _ = events
+                                                .send(NodeEvent::Warning(format!(
+                                                    "the table acted for seat {seat}: {what:?}"
+                                                )))
+                                                .await;
+                                        }
+                                        if h.aborted().is_some() {
                                                                 act_by = None;
                                             let _ = events
                                                 .send(NodeEvent::Warning(
@@ -1951,6 +1959,20 @@ pub async fn run(
                 // be the one opponent.
                 match h.vote_on_timeouts(&app_key, now) {
                     Ok(sends) if !sends.is_empty() => {
+                        // Said out loud, because a table that is waiting on
+                        // somebody looks exactly like one that is stuck, and
+                        // this is the line that tells them apart. It is also
+                        // the only visible sign the mechanism exists at all: a
+                        // healthy table never reaches it, because every client
+                        // acts for its own owner first.
+                        let who: Vec<String> =
+                            h.waiting_for().iter().map(|s| s.to_string()).collect();
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "my clock has run out on seat {}",
+                                who.join(", ")
+                            )))
+                            .await;
                         publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said);
                     }
                     Ok(_) => {}

@@ -680,6 +680,12 @@ struct StepHeard {
 /// One hand in progress.
 pub struct Hand {
     open: Opening,
+    /// The last seat a certificate acted for, and what it did.
+    ///
+    /// Read once by the node so it can say so: an action nobody took is the one
+    /// event at a table that has no author to attribute it to, and a player who
+    /// saw a seat fold without folding deserves to know why.
+    acted_for: Option<(SeatIdx, Action)>,
     /// Votes heard about each subject, by the digest that identifies it.
     ///
     /// A vote alone is not evidence and does nothing; only a complete set —
@@ -868,6 +874,7 @@ impl Hand {
         Ok((
             Hand {
                 signed,
+                acted_for: None,
                 votes: BTreeMap::new(),
                 voted: BTreeSet::new(),
                 certifying: None,
@@ -3636,6 +3643,7 @@ impl Hand {
                 // is what `event_class` is for.
                 self.slot = self.slot.then(parent);
                 self.mark_stage(now_ms);
+                self.acted_for = Some((seat, action));
                 self.after_action(seat, key, now_ms)
             }
             // A cryptographic deadline. The hand ends and the seat is named —
@@ -3672,6 +3680,12 @@ impl Hand {
         let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
         self.phase = Phase::Aborted(Abort::Told { cause: 1 });
         Ok(vec![Send::Broadcast(bytes)])
+    }
+
+    /// What a certificate last did, taken rather than read: the node reports
+    /// it once and it is not a standing fact about the hand.
+    pub fn take_certified_action(&mut self) -> Option<(SeatIdx, Action)> {
+        self.acted_for.take()
     }
 
     /// How many certificates have been accepted against a seat this hand.
