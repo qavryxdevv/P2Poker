@@ -138,6 +138,26 @@ impl Collective {
     }
 
     /// Whether every required seat has been heard.
+    /// What this seat has already been heard saying, if anything.
+    ///
+    /// Non-mutating, and it exists so a caller can tell an **exact repeat**
+    /// from a first hearing *before* it spends anything on the message. That
+    /// distinction is not cosmetic: a mesh redelivers as a matter of course, and
+    /// a handler that verifies first and hears second either
+    ///
+    /// * charges the duplicate through a check that is not idempotent — a deck
+    ///   key already in the set, a token set that takes one share per seat — and
+    ///   reports an honest peer as at fault, or
+    /// * hears first and then finds the message does not verify, having already
+    ///   counted a seat towards a stage it never validly contributed to.
+    ///
+    /// With this the order is: exact repeat → done; otherwise verify, then
+    /// hear, which still catches a **different** body from the same seat as the
+    /// equivocation it is.
+    pub fn heard(&self, seat: SeatIdx) -> Option<Hash> {
+        self.heard.get(&seat).copied()
+    }
+
     pub fn complete(&self) -> bool {
         self.required.iter().all(|s| self.heard.contains_key(s))
     }

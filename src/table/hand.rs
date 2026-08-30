@@ -38,18 +38,19 @@ use crate::net::joinwire::WireError;
 use crate::poker::state::{Hash, SeatIdx};
 use crate::protocol::messages::EventType;
 
-use crate::mental_poker::backend::{DeckParams, HandDeck, HandSecret, VerifiedKey, VerifiedToken,
+use crate::mental_poker::backend::{DeckParams, HandDeck, HandSecret, VerifiedKey,
     WireKey, WireKeyProof, WireToken, WireTokenProof, CIPHERTEXT, DECK};
 use crate::mental_poker::deck::{CardIndex, DeckIndexMap};
 use crate::mental_poker::protocol::{Ciphertext, CtxFields, DeckCtx, DeckWire, Final,
     ProofPosition, Verified};
-use crate::mental_poker::reveal::TokenSet;
 use crate::mental_poker::shuffle::{ChainParams, ShuffleChain, StepError};
+use crate::poker::engine::{initial_positions, Positions};
 use crate::poker::state::Card;
 use crate::protocol::serialization::h;
 use crate::protocol::signatures::Domain;
 use crate::protocol::transcript::stage_hash_single;
 
+use super::dealing::{self, Dealing, Identity, Refused, Share};
 use super::handwire::{DealPrivate, DeckCommit, DeckInit, HandInit, NotOurs, RevealEntry,
     ShuffleProof, ShuffleStep};
 use super::stage::{Collective, Heard};
@@ -273,8 +274,8 @@ enum Phase {
     /// Stage 1: `DECK_INIT`, collective.
     Deck {
         stage: Collective,
-        /// The seat each key in `keys` came from, by the same index.
-        key_seats: Vec<SeatIdx>,
+        /// The keys so far, indexed by seat. See [`Deal::by_seat`].
+        by_seat: Vec<Option<VerifiedKey>>,
         /// The verified keys, **in arrival order**.
         ///
         /// Not sorted, and this matters: `verify_key` refuses a key equal to
@@ -319,16 +320,20 @@ enum Phase {
         deal: Deal,
         table: Table,
         stage: Collective,
-        /// The shares arriving for this client's own two cards, one set per
-        /// index. Each expects every dealt-in seat, this client included: its
-        /// own share is added here and never published, and that omission is
-        /// the whole of what makes a hole card private.
-        mine: Vec<TokenSet<VerifiedToken>>,
+        /// Every share of every card of the hand, not just this client's.
+        ///
+        /// Boxed: it carries `2m + 5` token sets. Every seat's shares for every
+        /// seat's hole cards are kept, which is what makes a showdown one
+        /// message — the other `m-1` shares are already here. The card stays
+        /// private because its **owner** never publishes its own share, and
+        /// `m-1` of `m` opens nothing (`PROTOCOL.md` §3.4).
+        dealing: Box<Dealing>,
     },
     /// This client holds its two cards.
     Holding {
         deal: Deal,
         table: Table,
+        dealing: Box<Dealing>,
         cards: [Card; 2],
     },
 }
@@ -354,21 +359,15 @@ struct Deal {
     deck: HandDeck,
     /// This client's own secret for the hand. Never leaves the process.
     secret: HandSecret,
+    /// The verified keys in **arrival order**, which is the order
+    /// `HandDeck::verify_key` compared them in and the order `HandDeck::new`
+    /// aggregated them in. Not sorted, and it must not be.
     keys: Vec<VerifiedKey>,
-    /// The seat each key came from, by the same index.
-    ///
-    /// Two parallel vectors rather than pairs, because `HandDeck::new` and
-    /// `verify_key` both take `&[VerifiedKey]` and a vector of pairs would have
-    /// to be rebuilt for every call. They are only ever pushed together.
-    key_seats: Vec<SeatIdx>,
-}
-
-impl Deal {
-    /// The verified key a seat committed to in `DECK_INIT`.
-    fn key_of(&self, seat: SeatIdx) -> Option<&VerifiedKey> {
-        let i = self.key_seats.iter().position(|s| *s == seat)?;
-        self.keys.get(i)
-    }
+    /// The same keys indexed by seat, which is what every later stage wants:
+    /// a share arrives from a seat and has to be verified under that seat's
+    /// key. `VerifiedKey` is `Copy`, so this is not a second copy of anything
+    /// that could drift — the two are filled from one value.
+    by_seat: Vec<Option<VerifiedKey>>,
 }
 
 /// A `SHUFFLE_STEP` admitted and waiting for the argument that justifies it.
@@ -412,7 +411,24 @@ impl Hand {
     ) -> Result<(Hand, Vec<Send>), Failed> {
         let occupied: Vec<SeatIdx> = o.seats.iter().map(|(s, _, _)| *s).collect();
         let button = provisional_button(&o.session_id, &occupied);
-        let (sb_position, bb_seat) = blind_positions(button, &occupied);
+        // Keyed on **chips**, not on occupancy. A busted seat is still an
+        // occupied seat, so "two seats at the table" and "two players with
+        // chips" part company the moment somebody busts — and heads-up is a
+        // rule about the second of those. `initial_positions` is the engine's
+        // own TDA 32 implementation and gets it right; deriving it a second
+        // time here is how the two would come to disagree.
+        let mut alive = vec![false; usize::from(o.max_players)];
+        for (seat, _, stack) in &o.seats {
+            let Some(slot) = alive.get_mut(usize::from(*seat)) else {
+                return Err(Failed::NotAtThisTable);
+            };
+            *slot = *stack > 0;
+        }
+        let Positions {
+            button,
+            small_blind: sb_position,
+            big_blind: bb_seat,
+        } = initial_positions(button, &alive, o.max_players).ok_or(Failed::NotInThisStage)?;
 
         let mine = HandInit {
             hand_id: o.hand_id,
@@ -585,6 +601,9 @@ impl Hand {
         let Phase::Init(stage) = &mut self.phase else {
             return Err(Failed::NothingFurther);
         };
+        if stage.heard(seat) == Some(opened.event_hash) {
+            return Ok(Vec::new());
+        }
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
@@ -644,9 +663,13 @@ impl Hand {
         let own_hash = self.opened(&bytes, EventType::DeckInit)?.event_hash;
         stage.hear(self.open.my_seat, own_hash);
 
+        let mut by_seat = vec![None; usize::from(self.open.max_players)];
+        if let Some(slot) = by_seat.get_mut(usize::from(self.open.my_seat)) {
+            *slot = Some(own);
+        }
         self.phase = Phase::Deck {
             stage,
-            key_seats: vec![self.open.my_seat],
+            by_seat,
             keys: vec![own],
             secret,
         };
@@ -663,6 +686,16 @@ impl Hand {
         let seat = self.seat_of(&opened.sender)?;
         let body: DeckInit = chained::payload(&opened, DECK_INIT_CAP).map_err(Failed::Wire)?;
 
+        // An exact repeat is weather, and it must be answered before the key
+        // is looked at: `verify_key` refuses a key already in the set, so the
+        // ordinary redelivery would otherwise come back as "already in use"
+        // against a peer that sent its own key twice, which is what a mesh does.
+        if let Phase::Deck { stage, .. } = &self.phase {
+            if stage.heard(seat) == Some(opened.event_hash) {
+                return Ok(Vec::new());
+            }
+        }
+
         let wire_key = WireKey::decode(&body.key).map_err(|_| Failed::BadKey {
             seat,
             why: "not a point on the curve",
@@ -676,7 +709,7 @@ impl Hand {
         let Phase::Deck {
             stage,
             keys,
-            key_seats,
+            by_seat,
             ..
         } = &mut self.phase
         else {
@@ -694,7 +727,9 @@ impl Hand {
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander => {
                 keys.push(verified);
-                key_seats.push(seat);
+                if let Some(slot) = by_seat.get_mut(usize::from(seat)) {
+                    *slot = Some(verified);
+                }
             }
             // A repeat must not add the key twice, or the duplicate check
             // would refuse the honest sender's own key on its next copy.
@@ -719,7 +754,7 @@ impl Hand {
         let taken = std::mem::replace(&mut self.phase, Phase::Between);
         let Phase::Deck {
             keys,
-            key_seats,
+            by_seat,
             secret,
             ..
         } = taken
@@ -730,7 +765,7 @@ impl Hand {
             deck: HandDeck::new(self.params.clone(), &keys),
             secret,
             keys,
-            key_seats,
+            by_seat,
         };
 
         // The shufflers are the dealt-in seats in ascending order, and their
@@ -1052,6 +1087,9 @@ impl Hand {
         let Phase::Committing { stage, mine, .. } = &mut self.phase else {
             return Err(Failed::NothingFurther);
         };
+        if stage.heard(seat) == Some(opened.event_hash) {
+            return Ok(Vec::new());
+        }
         mine.disagreement(&theirs)
             .map_err(|what| Failed::DeckDisagrees { seat, what })?;
         match stage.hear(seat, opened.event_hash) {
@@ -1072,7 +1110,7 @@ impl Hand {
     /// One share for every hole index that is **not** this client's own, and
     /// its own two computed but never published. That single omission is what
     /// makes a hole card private, and it is worth being explicit that nothing
-    /// else does: the message is broadcast, every peer sees every share in it,
+    /// else does: the message is broadcast, every peer keeps every share in it,
     /// and each card is one share short for everybody but its owner.
     fn begin_dealing(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
         let taken = std::mem::replace(&mut self.phase, Phase::Between);
@@ -1081,44 +1119,31 @@ impl Hand {
         };
 
         let me = self.open.my_seat;
-        let mine_indices = table
-            .map
-            .hole_cards(me)
-            .ok_or(Failed::NotInThisStage)?;
+        let mine_indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
         let my_key = deal.key_of(me).ok_or(Failed::NotInThisStage)?;
         let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
+
+        // The map is cloned rather than moved because `DECK_COMMIT` committed
+        // to its hash and `index_map()` still answers from `Table`. It is a
+        // `Vec<u8>` and a byte; both copies are built from one value and
+        // neither is ever mutated, so there is nothing that can drift.
+        let mut dealing = Dealing::new(table.map.clone(), self.mine.dealt_in.clone());
+        let identity = Identity {
+            seat: me,
+            key: my_key,
+            secret: &deal.secret,
+        };
 
         // Ascending by index, which is the canonical order, and built by
         // walking the map rather than by sorting afterwards - a sort would hide
         // a duplicate instead of making it impossible.
         let mut entries = Vec::new();
-        let mut for_me: Vec<TokenSet<VerifiedToken>> = Vec::new();
         for index in every_hole_index(&table.map) {
-            let (token, proof) = deal
-                .deck
-                .token(&deal.secret, my_key, &table.deck, index, &ctx)
-                .map_err(|_| Failed::BadToken {
-                    seat: me,
-                    why: "this client could not compute its own share",
-                })?;
-            if mine_indices.iter().any(|i| i.get() == index.get()) {
-                // This client's own card: verify the share the same way a
-                // receiver would, then keep it. Same path, same guarantee.
-                let verified = deal
-                    .deck
-                    .verify_token(my_key, &table.deck, index, token, &proof, &ctx)
-                    .map_err(|_| Failed::BadToken {
-                        seat: me,
-                        why: "this client's own share did not verify",
-                    })?;
-                let mut set = TokenSet::awaiting(index, self.mine.dealt_in.clone());
-                set.add(me, index, verified)
-                    .map_err(|_| Failed::BadToken {
-                        seat: me,
-                        why: "this client's own share was refused by its own set",
-                    })?;
-                for_me.push(set);
-            } else {
+            let (token, proof) = dealing
+                .own_share(&deal.as_ref(&table), &identity, index, &ctx)
+                .map_err(|e| refused(me, e))?;
+            // This client's own two are computed, recorded, and never sent.
+            if !mine_indices.iter().any(|i| i.get() == index.get()) {
                 entries.push(RevealEntry {
                     deck_index: index.get(),
                     token: token.encode(),
@@ -1144,7 +1169,7 @@ impl Hand {
             deal,
             table,
             stage,
-            mine: for_me,
+            dealing: Box::new(dealing),
         };
         Ok(vec![Send::Broadcast(bytes)])
     }
@@ -1162,16 +1187,25 @@ impl Hand {
         }
 
         let ctx = self.deck_ctx(&opened.sender);
-        let me = self.open.my_seat;
         let Phase::Dealing {
             deal,
             table,
             stage,
-            mine,
+            dealing,
         } = &mut self.phase
         else {
             return Err(Failed::NothingFurther);
         };
+
+        // An exact repeat is weather: a mesh redelivers as a matter of course,
+        // and a token set takes one share per seat and never an update, so
+        // replaying the shares would report an honest peer as at fault. Answered
+        // before anything is spent on the message, and **before** the stage is
+        // told — a seat is counted towards a stage only by a message that
+        // verified, which is the other half of the same rule.
+        if stage.heard(seat) == Some(opened.event_hash) {
+            return Ok(Vec::new());
+        }
 
         // Exactly the required set: fewer is a refusal to cooperate, more means
         // a share for a card this sender was never asked to help open - its own
@@ -1190,11 +1224,6 @@ impl Hand {
             });
         }
 
-        let their_key = deal.key_of(seat).ok_or(Failed::BadToken {
-            seat,
-            why: "no verified deck key for this seat",
-        })?;
-        let my_indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
         for entry in &body.entries {
             let index = table
                 .map
@@ -1211,27 +1240,26 @@ impl Hand {
                 seat,
                 why: "the proof is not well formed",
             })?;
-            let verified = deal
-                .deck
-                .verify_token(their_key, &table.deck, index, token, &proof, &ctx)
-                .map_err(|_| Failed::BadToken {
-                    seat,
-                    why: "the proof does not hold against the committed deck",
-                })?;
-            // Everybody's shares are verified; only this client's own two are
-            // kept. The rest are somebody else's card and this client has no
-            // use for them until a showdown, when their owner reveals.
-            if my_indices.iter().any(|i| i.get() == index.get()) {
-                if let Some(set) = mine.iter_mut().find(|s| s.index().get() == index.get()) {
-                    set.add(seat, index, verified)
-                        .map_err(|_| Failed::BadToken {
-                            seat,
-                            why: "a second share for one card from one seat",
-                        })?;
-                }
-            }
+            // **Every** share is kept, not only the ones for this client's own
+            // cards. That is what makes a showdown one message: seat X's hand
+            // opens from the `m-1` shares already here plus the one X publishes.
+            dealing
+                .accept(
+                    &deal.as_ref(table),
+                    self.open.my_seat,
+                    &Share {
+                        from: seat,
+                        index,
+                        token,
+                        proof: &proof,
+                    },
+                    &ctx,
+                )
+                .map_err(|e| refused(seat, e))?;
         }
 
+        // Everything verified, so now the seat counts. A different body from
+        // this seat at this stage is still the equivocation it always was.
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
@@ -1249,31 +1277,34 @@ impl Hand {
     fn read_my_cards(&mut self) -> Result<Vec<Send>, Failed> {
         let taken = std::mem::replace(&mut self.phase, Phase::Between);
         let Phase::Dealing {
-            deal, table, mine, ..
+            deal,
+            table,
+            mut dealing,
+            ..
         } = taken
         else {
             return Err(Failed::NothingFurther);
         };
 
+        let me = self.open.my_seat;
+        let indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
         let mut cards = Vec::with_capacity(2);
-        for set in &mine {
-            let index = set.index();
-            let tokens = set.complete().ok_or(Failed::BadToken {
-                seat: self.open.my_seat,
-                why: "the stage completed without every share for a card",
-            })?;
-            let owned: Vec<VerifiedToken> = tokens.into_iter().copied().collect();
-            let card = deal
-                .deck
-                .open(&table.deck, index, &owned)
-                .map_err(|e| Failed::Unsound {
-                    index: e.index,
-                    what: e.what,
+        for index in indices {
+            let card = dealing
+                .open(&deal.as_ref(&table), index)
+                .map_err(|_| Failed::BadToken {
+                    seat: me,
+                    why: "the stage completed without every share for a card",
                 })?;
             cards.push(card);
         }
         let cards: [Card; 2] = cards.try_into().map_err(|_| Failed::NotInThisStage)?;
-        self.phase = Phase::Holding { deal, table, cards };
+        self.phase = Phase::Holding {
+            deal,
+            table,
+            dealing,
+            cards,
+        };
         Ok(Vec::new())
     }
 
@@ -1428,6 +1459,34 @@ impl Hand {
         matches!(self.phase, Phase::Holding { .. })
     }
 
+    /// The board, as far as it has been opened.
+    ///
+    /// Empty before the flop, and it stays empty until a `BOARD_REVEAL` stage
+    /// completes: a board card comes out of a complete set of verified shares
+    /// or it does not exist. Nobody is ever shown one this client did not open
+    /// itself.
+    pub fn board(&self) -> Vec<Card> {
+        match &self.phase {
+            Phase::Holding { dealing, .. } => dealing.board(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Which seats are still owed for the stage now open, by seat.
+    ///
+    /// For a reveal stage this is the seats whose shares have not arrived, and
+    /// it is what a table window puts next to "waiting for".
+    pub fn outstanding_shares(&self, index: crate::mental_poker::deck::CardIndex)
+        -> Option<Vec<SeatIdx>>
+    {
+        match &self.phase {
+            Phase::Dealing { dealing, .. } | Phase::Holding { dealing, .. } => {
+                dealing.outstanding(index)
+            }
+            _ => None,
+        }
+    }
+
     /// Whose turn it is to shuffle, or `None` once the chain has closed.
     pub fn shuffler(&self) -> Option<SeatIdx> {
         match &self.phase {
@@ -1525,22 +1584,6 @@ impl Hand {
     }
 }
 
-/// Where the blinds sit relative to the button.
-///
-/// Heads-up is the exception every poker implementation gets wrong once: with
-/// two players the **button is the small blind**, and the other seat is the big
-/// blind. With three or more the small blind is the next occupied seat after the
-/// button and the big blind the one after that.
-fn blind_positions(button: SeatIdx, occupied: &[SeatIdx]) -> (SeatIdx, SeatIdx) {
-    let at = occupied.iter().position(|s| *s == button).unwrap_or(0);
-    let next = |from: usize, by: usize| occupied[(from + by) % occupied.len()];
-    if occupied.len() == 2 {
-        (button, next(at, 1))
-    } else {
-        (next(at, 1), next(at, 2))
-    }
-}
-
 /// The canonical bytes of a deck: fifty-two ciphertexts, end to end.
 fn flatten(deck: &[Ciphertext]) -> Vec<u8> {
     let mut out = Vec::with_capacity(deck.len() * CIPHERTEXT);
@@ -1590,6 +1633,57 @@ fn input_deck_hash(prev: Option<&Verified<Vec<Ciphertext>>>) -> Hash {
     match prev {
         Some(v) => deck_hash(v.as_ref()),
         None => h(Domain::DeckCommit.context(), &[b"the open deck"]),
+    }
+}
+
+impl Deal {
+    /// The verified key a seat committed to in `DECK_INIT`.
+    fn key_of(&self, seat: SeatIdx) -> Option<&VerifiedKey> {
+        self.by_seat.get(usize::from(seat))?.as_ref()
+    }
+
+    /// The borrowed view `table::dealing` takes.
+    ///
+    /// A function rather than a stored struct because it borrows three things
+    /// that live in two different places, and a stored one would pin them all
+    /// for the life of the phase.
+    fn as_ref<'a>(&'a self, table: &'a Table) -> dealing::Deal<'a> {
+        dealing::Deal {
+            hand: &self.deck,
+            keys: &self.by_seat,
+            deck: &table.deck,
+        }
+    }
+}
+
+/// Turn a refused share into this hand's failure, keeping who is answerable.
+///
+/// `Refused::NotDue` is the interesting one: it means the sender published a
+/// share the rules do not allow at this point — its own hole card before
+/// showdown, or a board index whose street has not been reached. Both are
+/// attributable and both are named as such.
+fn refused(seat: SeatIdx, e: Refused) -> Failed {
+    match e {
+        Refused::NotDue(_) => Failed::BadToken {
+            seat,
+            why: "a share the rules do not allow at this point in the hand",
+        },
+        Refused::DidNotVerify(_) => Failed::BadToken {
+            seat,
+            why: "the proof does not hold against the committed deck",
+        },
+        Refused::NotWanted(_) => Failed::BadToken {
+            seat,
+            why: "a second share for one card from one seat",
+        },
+        Refused::UnknownSeat { .. } => Failed::BadToken {
+            seat,
+            why: "no verified deck key for this seat",
+        },
+        Refused::NoSuchCard { .. } => Failed::BadToken {
+            seat,
+            why: "an index this hand gave no role to",
+        },
     }
 }
 
@@ -1658,6 +1752,36 @@ mod tests {
                 (1, key(11).verifying_key().to_bytes(), 10_000),
             ],
             max_players: 2,
+            small_blind: 50,
+            big_blind: 100,
+            level: 1,
+            my_seat,
+            crypto_step_timeout_ms: 30_000,
+        }
+    }
+
+    /// Three seats, which is the smallest table at which a collective stage
+    /// can still be open after one peer has been heard.
+    ///
+    /// Heads-up hides a whole class of defect: with two seats every collective
+    /// stage completes on the first message that arrives, so a second copy of
+    /// it lands at a sequence the hand has already left and is dropped before
+    /// any handler sees it. At three it lands *in* the open stage, which is
+    /// where duplicate handling is actually exercised.
+    fn opening3(my_seat: SeatIdx) -> Opening {
+        Opening {
+            table_id: [1; 32],
+            hand_id: 1,
+            session_id: [2; 32],
+            roster_hash: [3; 32],
+            genesis: [4; 32],
+            required: vec![0, 1, 2],
+            seats: vec![
+                (0, key(10).verifying_key().to_bytes(), 10_000),
+                (1, key(11).verifying_key().to_bytes(), 10_000),
+                (2, key(12).verifying_key().to_bytes(), 10_000),
+            ],
+            max_players: 3,
             small_blind: 50,
             big_blind: 100,
             level: 1,
@@ -1808,6 +1932,78 @@ mod tests {
             3,
             "seat 1's step, its proof, and the commit its own step unlocks"
         );
+    }
+
+    /// Three peers play the whole deal out with **every message delivered
+    /// twice**, which is what a mesh does.
+    ///
+    /// This is the defect the order of two lines used to cause in
+    /// `on_deal_private`: the shares were recorded before `stage.hear` ran, and
+    /// a token set takes one share per seat and never an update — so an
+    /// ordinary redelivery came back as `BadToken` against a peer that had done
+    /// nothing but send its message twice.
+    ///
+    /// It also happens to be the first three-handed hand in the tree, which
+    /// exercises a shuffle chain of three links and a `DEAL_PRIVATE` of four
+    /// entries rather than two.
+    #[test]
+    fn every_message_delivered_twice_still_deals() {
+        let (mut a, from_a) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
+        let (mut c, from_c) = Hand::open(opening3(2), &key(12), NOW, 30_000).unwrap();
+
+        let keys = [key(10), key(11), key(12)];
+        let mut pending: Vec<(SeatIdx, Vec<Send>)> = vec![(0, from_a), (1, from_b), (2, from_c)];
+
+        // Bounded, so a hand that fails to converge fails the test rather than
+        // running for ever.
+        for _ in 0..64 {
+            if pending.is_empty() {
+                break;
+            }
+            let mut next: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+            for (from, sends) in std::mem::take(&mut pending) {
+                for seat in 0..3u8 {
+                    if seat == from {
+                        continue;
+                    }
+                    let hand: &mut Hand = match seat {
+                        0 => &mut a,
+                        1 => &mut b,
+                        _ => &mut c,
+                    };
+                    let out = deliver(hand, &sends, &keys[usize::from(seat)]);
+                    // And again. A second copy must be weather: no fault, and
+                    // nothing new to say.
+                    let again = deliver(hand, &sends, &keys[usize::from(seat)]);
+                    assert!(
+                        again.is_empty(),
+                        "a duplicate produced {} message(s) of its own",
+                        again.len()
+                    );
+                    if !out.is_empty() {
+                        next.push((seat, out));
+                    }
+                }
+            }
+            pending = next;
+        }
+
+        for (seat, hand) in [(0u8, &a), (1, &b), (2, &c)] {
+            assert!(hand.dealt_cards(), "seat {seat} did not reach its own cards");
+            assert_eq!(hand.slot(), a.slot(), "all three left the deal together");
+        }
+        let all: Vec<[Card; 2]> = [&a, &b, &c].iter().map(|h| h.cards().unwrap()).collect();
+        for i in 0..3 {
+            for j in (i + 1)..3 {
+                for card in all[i] {
+                    assert!(
+                        !all[j].contains(&card),
+                        "one deck: seats {i} and {j} share a card"
+                    );
+                }
+            }
+        }
     }
 
     /// The milestone: two clients, no network, each holding two cards it can
@@ -2174,16 +2370,39 @@ mod tests {
     /// `sb_position` and the hand never starting.
     #[test]
     fn heads_up_the_button_posts_the_small_blind() {
-        assert_eq!(blind_positions(0, &[0, 1]), (0, 1));
-        assert_eq!(blind_positions(1, &[0, 1]), (1, 0));
+        let two = |n: usize, alive: Vec<bool>, button: u8| {
+            let p = initial_positions(button, &alive, n as u8).unwrap();
+            (p.button, p.small_blind, p.big_blind)
+        };
+        assert_eq!(two(2, vec![true, true], 0), (0, 0, 1));
+        assert_eq!(two(2, vec![true, true], 1), (1, 1, 0));
+
+        // The case the old derivation got wrong: three seats at the table, one
+        // of them busted. Heads-up is a rule about players with chips, and
+        // keying it on how many seats are occupied gives seat 2 a small blind
+        // it should not post and leaves the button posting nothing.
+        assert_eq!(
+            two(3, vec![true, false, true], 0),
+            (0, 0, 2),
+            "two players with chips is heads-up whatever the third seat is"
+        );
     }
 
     /// Three-handed and more, the blinds are the next two occupied seats.
     #[test]
     fn at_three_the_blinds_follow_the_button() {
-        assert_eq!(blind_positions(0, &[0, 1, 2]), (1, 2));
-        assert_eq!(blind_positions(2, &[0, 1, 2]), (0, 1));
-        assert_eq!(blind_positions(3, &[0, 3, 7]), (7, 0));
+        let at = |n: usize, alive: Vec<bool>, button: u8| {
+            let p = initial_positions(button, &alive, n as u8).unwrap();
+            (p.small_blind, p.big_blind)
+        };
+        assert_eq!(at(3, vec![true, true, true], 0), (1, 2));
+        assert_eq!(at(3, vec![true, true, true], 2), (0, 1));
+
+        let mut wide = vec![false; 8];
+        for s in [0usize, 3, 7] {
+            wide[s] = true;
+        }
+        assert_eq!(at(8, wide, 3), (7, 0), "the ring wraps past the empty seats");
     }
 
     /// Every peer derives one button from one session, or stage 0 cannot
