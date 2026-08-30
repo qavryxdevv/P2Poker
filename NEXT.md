@@ -3,7 +3,7 @@
 Updated 2026-08-30.
 
     cargo clippy --all-targets --release        0 warnings
-    cargo test --release -- --test-threads=19   641 unit + 54 harness, 0 failed
+    cargo test --release -- --test-threads=19   647 unit + 54 harness, 0 failed
     tools/check-portable.ps1                    8/8, 28 MB
 
     RUST_LOG=libp2p_kad=debug,libp2p_relay=debug ./target/release/p2p-poker --headless
@@ -439,6 +439,21 @@ answered by its own client checking or folding for it — version 1 has no
 answer. A seat that goes quiet in a **cryptographic** stage is answered by
 `HAND_ABORT` on the hand's own deadline.
 
+**D-023 changed the first half of that.** `TIMEOUT_VOTE` and `TIMEOUT_CERT` are
+produced again where `|V(subject)| >= 2`: a vote says only *"my own timer
+expired and I have accepted nothing from that seat"*, only a **complete** set
+becomes a certificate, and only a certificate moves anything — so one honest
+third party is enough to protect a victim, and a test asserts that a lone vote
+leaves the same player to act on all three peers. The floor is on `|V|` and
+never on the seat count, because the attack needs a one-member voter set rather
+than a two-seat table.
+
+Heads-up the mechanism is **inert by design** and the hand deadline is the only
+terminus. The honest statement is now: the reconnection bank cannot be cheated;
+the action clock cannot be cheated at three seats or more; heads-up it still
+can, and heads-up there is nobody to appeal to, so it always will be. What
+bounds it there is the hand deadline and the fact that an abort moves no chips.
+
 `HAND_ABORT`'s shape is the interesting part and it is not a convenience. It is
 a **witness-independent terminal**: no required emitter set, any seat may emit,
 and the stage closes at a receiver on the first copy that verifies. An abort is
@@ -467,14 +482,7 @@ advertising a shorter deadline than any preset offers.
 
 ### What is next, in order
 
-1. **`TIMEOUT_VOTE` / `TIMEOUT_CERT`, D-015's deleted machinery.** It is the
-   only thing that makes "the time you have left" checkable by anybody but
-   yourself, and D-022 names it: the reconnection bank cannot be cheated,
-   because it is a fold over signatures, and the **action clock can**, because
-   the only thing acting on it is the stalling player's own client. Restoring
-   it is a message type, a voter set, unanimity, and §5.2.1's slot-key
-   subtlety — all specified, none built.
-2. **Three seats and more over the real network.** Everything measured so far
+1. **Three seats and more over the real network.** Everything measured so far
    is heads-up, and heads-up hides a whole class of defect — it hid the
    duplicate handling for two milestones. This is now the cheapest way to find
    the next real bug, because the machinery to run it already exists.
