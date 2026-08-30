@@ -2347,6 +2347,53 @@ the instruction, and it is why the accrual counts **presence** rather than
 hands played — a seat that is not dealt in could otherwise never earn anything
 back, and the allowance would be a life sentence rather than a penalty.
 
+### "Trustworthy shared time" — what is obtainable and what is not
+
+The owner's follow-up is the right question: if a player's remaining time
+matters, somebody must be able to check it, or the player simply lies.
+
+**Wall-clock time is not obtainable here, and no amount of engineering makes it
+so.** There is no server to ask, by construction. NTP is a server. A median of
+peer-reported clocks is a median of numbers the peers chose. Any scheme that
+asks *"what time is it"* in a system with no trusted party can be answered
+falsely by whoever benefits, and cannot be checked.
+
+**What is obtainable is agreement that a deadline passed**, which is a
+different question with a real answer. Two mechanisms give it:
+
+* **The transcript, for anything countable.** A signed, ordered sequence of
+  events *is* a clock — a logical one — and it is trustworthy because everybody
+  holds the same one and every entry is signed by the seat it came from. The
+  bank above is exactly this, which is why it needs no clock and cannot be
+  cheated: a seat's balance is a fold over `P(k)`, and a seat cannot forge its
+  own presence in a set derived from signatures.
+* **Unanimity, for anything that is genuinely about elapsed time.** This is
+  `PROTOCOL.md` §8.3's `TIMEOUT_VOTE` and §8.4's `TIMEOUT_CERT`, and it is a
+  shared clock built from **agreement rather than from time**: no single peer's
+  clock decides anything; every *other* seat in the voter set signs that its
+  own timer expired, and only unanimity makes a certificate. A liar cannot
+  forge one because it needs everybody else. A staller cannot dodge one because
+  it is not in the voter set for its own subject.
+
+### The gap this leaves, named
+
+**Version 1 has neither for thinking time.** D-015 deleted `TIMEOUT_VOTE` and
+`TIMEOUT_CERT` from this version, so the only thing acting on an action
+deadline is the player's **own** client folding for them. A player who wants to
+stall runs a slow clock, or none, and takes as long as they like: nobody else
+can act on it and nobody can prove anything. `STATE_MACHINE.md` records the
+consequence in its own words — a player who walks away is never auto-sat-out.
+
+That is the one place where "nobody cheats about the time they have left" is
+**not** currently true, and the fix is not a new invention: it is restoring the
+mechanism this corpus already specifies. Its cost is a message type, a voter
+set, the unanimity rule, and §5.2.1's slot-key subtlety that keeps a vote from
+being an equivocation against its own emitter — all of it written down and none
+of it built.
+
+Until then the honest statement is: **the reconnection bank cannot be cheated,
+and the action clock can.**
+
 ### The cost this does not remove
 
 The **first** hand a player disappears in still stalls to `hand_deadline_ms` —

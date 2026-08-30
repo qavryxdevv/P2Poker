@@ -467,19 +467,26 @@ advertising a shorter deadline than any preset offers.
 
 ### What is next, in order
 
-1. **Three seats and more over the real network.** Everything measured so far
+1. **`TIMEOUT_VOTE` / `TIMEOUT_CERT`, D-015's deleted machinery.** It is the
+   only thing that makes "the time you have left" checkable by anybody but
+   yourself, and D-022 names it: the reconnection bank cannot be cheated,
+   because it is a fold over signatures, and the **action clock can**, because
+   the only thing acting on it is the stalling player's own client. Restoring
+   it is a message type, a voter set, unanimity, and §5.2.1's slot-key
+   subtlety — all specified, none built.
+2. **Three seats and more over the real network.** Everything measured so far
    is heads-up, and heads-up hides a whole class of defect — it hid the
    duplicate handling for two milestones. This is now the cheapest way to find
    the next real bug, because the machinery to run it already exists.
-2. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
+3. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
    carried inside `HAND_COMPLETE`; the checkpoint **stage** is not there, and
    `PROTOCOL.md` §12 says T61 then fires at `hand_deadline_ms` after every
    settled hand.
-3. The RNG beacon, replacing `provisional_button`.
-4. `HAND_ABORT` causes 2 and 3 — a failed shuffle or reveal proof. They embed
+4. The RNG beacon, replacing `provisional_button`.
+5. `HAND_ABORT` causes 2 and 3 — a failed shuffle or reveal proof. They embed
    up to two 32 768 B `SignedEvent`s, so they need a larger `FRAME_CAP` than
    this client opens. It emits neither and refuses one it is sent.
-5. Two machines on two networks. Still rests on nothing.
+6. Two machines on two networks. Still rests on nothing.
 
 ### Four defects found by pointing a critic at the design, not at the code
 
