@@ -1339,21 +1339,51 @@ impl Hand {
     /// Whatever the replay produces is returned with the failures, because a
     /// held event can be the one that completes a stage — and a stage that
     /// completed without its message going out is a table that stops.
+    ///
+    /// Two things here are not obvious and both were wrong the first time.
+    ///
+    /// **An event that is still early goes back in the queue.** The first
+    /// version dropped it, which turned "this peer is one stage ahead" into
+    /// "this peer's message is gone", and the only thing that would have
+    /// recovered it was a re-send nothing performs.
+    ///
+    /// **The replay loops.** Applying the held stage `n+1` can complete it and
+    /// move the hand to `n+2`, which may also be in the queue — from one pass
+    /// it would go back into the queue and stay there until some *other* event
+    /// arrived to trigger another replay. Over a mesh that delivers a burst and
+    /// then goes quiet, "some other event" is not guaranteed to exist, so the
+    /// pass repeats while it is making progress and stops when it is not.
     pub fn replay_early(
         &mut self,
         key: &SigningKey,
         now_ms: u64,
     ) -> (Vec<Send>, Vec<Failed>) {
-        let waiting: Vec<Vec<u8>> = self.early.drain(..).collect();
         let mut sends = Vec::new();
         let mut failures = Vec::new();
-        for bytes in waiting {
-            match self.on_event(&bytes, key, now_ms) {
-                Ok(mut out) => sends.append(&mut out),
-                Err(e) => failures.push(e),
+        loop {
+            let waiting: Vec<Vec<u8>> = self.early.drain(..).collect();
+            let mut applied = false;
+            for bytes in waiting {
+                match self.on_event(&bytes, key, now_ms) {
+                    Ok(mut out) => {
+                        applied = true;
+                        sends.append(&mut out);
+                    }
+                    // Still ahead of this client. Held again, and the hold is
+                    // still bounded - `hold` drops the oldest at 64.
+                    Err(Failed::NotYet) => self.hold(bytes),
+                    Err(e) => failures.push(e),
+                }
+            }
+            if !applied {
+                return (sends, failures);
             }
         }
-        (sends, failures)
+    }
+
+    /// How many events are being held for a stage this client has not reached.
+    pub fn held(&self) -> usize {
+        self.early.len()
     }
 
     /// Whether stage 0 is complete: every required seat heard and agreed.
@@ -1735,6 +1765,49 @@ mod tests {
         // A's chain closed on B's proof, so A commits; then B's commit
         // completes the barrier and A deals.
         assert_eq!(a_more.len(), 2, "A's commit and its shares");
+    }
+
+    /// Two events held in the wrong order still both land.
+    ///
+    /// The mesh does not order anything, so a peer one stage ahead arrives as a
+    /// burst in whatever order the network chose. The first version of the
+    /// replay dropped anything still early and ran one pass, which turned that
+    /// ordinary case into a table that stops with no error anywhere.
+    #[test]
+    fn events_held_out_of_order_are_replayed_until_they_fit() {
+        // This client is seat 1, so seat 0 shuffles first and can run ahead.
+        let (mut a, from_a) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+
+        let a_deck = deliver(&mut a, &from_b, &key(11));
+        let b_deck = deliver(&mut b, &from_a, &key(10));
+        let b_shuffle = deliver(&mut b, &a_deck, &key(10));
+        assert_eq!(b_shuffle.len(), 2, "seat 0's step and its proof");
+
+        // Seat 1 has not heard seat 0's deck key yet, and the shuffle arrives
+        // first — proof before step, which is the harder order.
+        let Send::Broadcast(step) = &b_shuffle[0];
+        let Send::Broadcast(proof) = &b_shuffle[1];
+        assert_eq!(a.on_event(proof, &key(11), NOW), Err(Failed::NotYet));
+        a.hold(proof.clone());
+        assert_eq!(a.on_event(step, &key(11), NOW), Err(Failed::NotYet));
+        a.hold(step.clone());
+        assert_eq!(a.held(), 2);
+
+        // The key that unblocks them.
+        let Send::Broadcast(bd) = &b_deck[0];
+        assert!(a.on_event(bd, &key(11), NOW).unwrap().is_empty());
+        assert_eq!(a.held(), 2, "still both, and both still early");
+
+        let (more, failures) = a.replay_early(&key(11), NOW);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(a.held(), 0, "nothing left parked");
+        assert!(a.shuffled(), "seat 1 took its turn and closed the chain");
+        assert_eq!(
+            more.len(),
+            3,
+            "seat 1's step, its proof, and the commit its own step unlocks"
+        );
     }
 
     /// The milestone: two clients, no network, each holding two cards it can

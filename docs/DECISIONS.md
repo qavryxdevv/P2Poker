@@ -2109,3 +2109,64 @@ Stated because the alternative — write the Tox layer first and wire the hand
 into it — leaves the project with no working game and a second network stack at
 the same time.
 
+---
+
+## D-020 — the showdown is held on screen before the next hand
+
+Decided 2026-08-30, on the owner's instruction: **at a showdown the cards of
+the opponents who had to show stay visible for about five seconds before the
+next hand begins.**
+
+A player who cannot see what beat them cannot learn anything from the hand, and
+a client that snaps straight to the next deal is one that has thrown that away
+to save five seconds nobody wanted saved.
+
+### Only the seats that showed, and that is arithmetic rather than etiquette
+
+The owner's clarification, and it is worth stating why it is not a rule this
+client has to be trusted to keep. A seat that folded, and a seat that reached
+the showdown and mucked, **never emits its own reveal share**. Its two cards are
+therefore one share short for every other seat at the table, permanently and by
+the counting argument of `PROTOCOL.md` §3.4 — there is no complete token set for
+them anywhere, and no client, honest or modified, can open them.
+
+So the screen holds exactly what `SHOWDOWN_REVEAL` put on the transcript: the
+seats that were required to show, or chose to. A folded seat's holes stay backs,
+not because the interface declines to draw them, but because there is nothing to
+draw and no path by which there could be.
+
+### It is a local hold, not a protocol stage
+
+The delay is **not** a message and **not** a stage. Every client holds its own
+screen for the same interval and then emits `HAND_INIT` for hand `k+1`. Nothing
+in the chain has to agree about it.
+
+That is a deliberate choice over the alternative, which was a stage that ends
+the pause. The reasons:
+
+* `HAND_INIT` is a **collective** stage, so it completes when every required
+  seat has spoken and not before. A client whose hold ran long, or short, or
+  who was looking at another table, is simply late — and late is already what
+  the stage is built to tolerate. Nothing forks.
+* A stage that ended the pause would be a stage a seat could refuse to write,
+  which is one more place to stall a table on purpose. The pause has no
+  consequence for anybody's chips, so it must not have a consequence for
+  whether the game continues.
+* The interval is therefore a **display setting**, and a player who wants
+  fifteen seconds or none can have it without being out of protocol.
+
+### What it constrains
+
+* The hand driver must keep the revealed cards reachable after `HAND_COMPLETE`
+  rather than dropping them with the hand's state — the showdown's contents are
+  what the screen is holding.
+* The client must not begin hand `k+1` while its own hold is running, or the
+  cards vanish from under the player at the moment the new deal repaints.
+* A hand that ends with **everybody folding to one seat** has no showdown and
+  no cards to hold, so it has no pause. Holding a blank table for five seconds
+  is worse than not holding it. The same is true of a showdown in which every
+  losing seat mucked: there is one hand to look at, which is the winner's, and
+  whether that is worth five seconds is the same question as any other showdown.
+* The hold covers the **revealed** hole cards and the board together, because a
+  hand is read from both. Nothing about it changes which cards exist.
+

@@ -742,6 +742,24 @@ pub async fn run(
                             let now = super::node::now_unix_ms();
                             match h.on_event(&message.data, &app_key, now) {
                                 Ok(sends) => {
+                                    // Anything held for a stage this client had
+                                    // not reached is judged again now, because
+                                    // this event may have been the one that
+                                    // reached it. Without this a peer that ran
+                                    // ahead is parked for ever: the mesh does
+                                    // not re-send, and a hand of 2m+4 stages
+                                    // hears out-of-order messages as a matter
+                                    // of course rather than as an exception.
+                                    let (mut more, held_failures) = h.replay_early(&app_key, now);
+                                    let mut sends = sends;
+                                    sends.append(&mut more);
+                                    for e in held_failures {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "a held event was refused: {e}"
+                                            )))
+                                            .await;
+                                    }
                                     if let Some(t) = &table_topic {
                                         for crate::table::hand::Send::Broadcast(out) in sends {
                                             let _ = swarm
