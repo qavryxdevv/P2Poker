@@ -310,6 +310,45 @@ The button alternates every hand, which is the heads-up dead-button rule, and a
 hundred-and-thirty-second run gets through several hands end to end: crypto,
 betting, settlement, rotation, next deal.
 
+### Three seats play, and the bug they found was the transport
+
+Measured, three headless processes, one host and two joiners:
+
+```
+x1: hands=3 clocks=3    hand #4: your turn - 100 to call
+x2: hands=3 clocks=2    hand #4 opens at genesis e1d3d0e9 with seats [0, 1, 2]
+x3: hands=3 clocks=2    hand #4: your turn - 50 to call
+```
+
+Three hands settled and a fourth in progress, a three-link shuffle chain each
+time, one genesis, and the correct three-handed pre-flop ladder — 100 to call
+under the gun, 50 for the small blind. Before the fix below it was **zero
+hands**, every time.
+
+**GossipSub has no history.** A peer grafted into the topic mesh after a
+publish never sees it, and nothing re-sent. At two seats it rarely bites — both
+are meshed before either speaks. At three it is the ordinary case: seats 0 and
+1 ratify and publish `HAND_INIT` while the last joiner is still meshing, and
+that seat then waits for two messages that will never come again.
+
+It is **silent by construction**, which is why it survived so long. A missing
+parent reads as "a peer one stage ahead", which the driver holds rather than
+refuses — correctly — and `replay_early` runs only after a *successful* event,
+so a peer that received nothing replays nothing. No error, no refusal, three
+logs indistinguishable from a healthy one. The asymmetry was the only tell:
+everybody had seat 2's message, seat 2 had nobody's.
+
+Every message a client emits in a hand is now kept and re-sent every five
+seconds until the hand ends. **All of them**, not the newest: a peer stuck at
+stage 0 is not helped by stage 1 — it is already holding stage 1, and only the
+stage-0 bytes release it. **The stored bytes, never a re-signature**: re-signing
+changes `emitted_at_unix_ms` and makes a second distinct body at one slot, which
+is an equivocation proof against an honest peer.
+
+This is where three milestones of duplicate handling paid off. A re-send *is* a
+duplicate, and duplicates have been weather rather than faults since the
+exact-repeat check went in.
+
 ### Three seats found a bug two seats could not
 
 Worth stating because it is the argument for running three in the first place.
