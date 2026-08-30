@@ -74,6 +74,10 @@ pub struct HandInProgress {
     pub shuffling: Option<u8>,
     /// Whether the chain has closed and the deck is final.
     pub deck_ready: bool,
+    /// This client's own two cards, as deck indices, once they are readable.
+    pub cards: Option<[u8; 2]>,
+    /// The seats holding cards, so the table can draw backs at the others.
+    pub holding: Vec<u8>,
 }
 
 /// Everything the client knows, in the form the panes read it.
@@ -263,6 +267,8 @@ impl AppState {
                     // `DeckProgress` names the seat that is up.
                     shuffling: None,
                     deck_ready: false,
+                    cards: None,
+                    holding: Vec::new(),
                 });
                 self.waiting_for.clear();
                 self.note(format!("hand #{hand_id} has begun"));
@@ -281,6 +287,18 @@ impl AppState {
                     (Some(s), _) => format!("hand #{hand_id}: seat {s} is shuffling"),
                     (None, false) => format!("hand #{hand_id}: the deck is being prepared"),
                 });
+            }
+            NodeEvent::CardsDealt { hand_id, seats } => {
+                if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
+                    h.holding = seats;
+                }
+            }
+            NodeEvent::HoleCards { hand_id, cards } => {
+                if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
+                    h.cards = Some(cards);
+                }
+                self.log
+                    .push_back(format!("hand #{hand_id}: your cards are dealt"));
             }
             NodeEvent::HandWaiting { hand_id, seats } => {
                 // Said once per set, not once per arriving copy: a table

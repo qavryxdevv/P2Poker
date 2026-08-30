@@ -282,6 +282,27 @@ directly.
 the test fail with its own message and restoring it makes it pass — checked, not
 assumed.
 
+### FORK(d) — the aggregate public key could not leave the process
+
+`AggregatePublicKey` wraps a curve point in a private field and derives no
+serialisation, while the individual `PublicKey` it aggregates derives both. So
+the one value every seat must agree on before a card is opened was the one
+value no caller could put on a wire.
+
+`DECK_COMMIT` (`docs/PROTOCOL.md` §4.4) has each dealt-in seat commit to the
+final deck hash, the index-map hash **and the aggregate key it derived**. That
+stage is the cheap barrier that catches two peers holding different decks
+before any hole card exists, which is the only moment at which catching it is
+still cheap.
+
+Added `AggregatePublicKey::as_public_key`, returning the point it already holds
+as the `PublicKey` type the individual keys use. No arithmetic, no new
+encoding: it goes through the same `serialize_compressed` every other point in
+this protocol goes through. It is not a wire-format break — nothing that
+verified before verifies differently now — and it is recorded here because
+`vendor/ziffle/` is a reviewed artefact and an unrecorded edit to one is
+indistinguishable from tampering.
+
 ### FORK(c) — a guard that never fired, and a comment that misleads
 
 `Shuffle::<N>`'s `const _N_GREATER_THAN_1: () = assert!(N > 1)` was never

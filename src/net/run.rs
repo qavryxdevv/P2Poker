@@ -323,6 +323,8 @@ pub async fn run(
     // The last deck state told to the interface, so that `2m` chain stages do
     // not become `2m` identical lines in a player's log.
     let mut deck_reported: Option<(Option<u8>, bool)> = None;
+    // Whether this hand's own cards have been handed to the interface.
+    let mut cards_reported = false;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
 
     // Who mDNS has already told us about.
@@ -657,6 +659,7 @@ pub async fn run(
                         hand = None;
                         hand_reported = false;
                         deck_reported = None;
+                        cards_reported = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -681,6 +684,7 @@ pub async fn run(
                         hand = None;
                         hand_reported = false;
                         deck_reported = None;
+                        cards_reported = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -766,6 +770,25 @@ pub async fn run(
                                                     hand_id: h.hand_id(),
                                                     shuffling: deck.0,
                                                     ready: deck.1,
+                                                })
+                                                .await;
+                                        }
+                                        // The cards, once and once only. They
+                                        // are read from a complete set of
+                                        // verified shares or not at all, so
+                                        // there is no partial state to report.
+                                        if let Some(cards) = h.cards().filter(|_| !cards_reported) {
+                                            cards_reported = true;
+                                            let _ = events
+                                                .send(NodeEvent::CardsDealt {
+                                                    hand_id: h.hand_id(),
+                                                    seats: h.init().dealt_in.clone(),
+                                                })
+                                                .await;
+                                            let _ = events
+                                                .send(NodeEvent::HoleCards {
+                                                    hand_id: h.hand_id(),
+                                                    cards: [cards[0].index(), cards[1].index()],
                                                 })
                                                 .await;
                                         }
@@ -1686,6 +1709,7 @@ pub async fn run(
                         hand = None;
                         hand_reported = false;
                         deck_reported = None;
+                        cards_reported = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -1718,6 +1742,7 @@ pub async fn run(
                         hand = None;
                         hand_reported = false;
                         deck_reported = None;
+                        cards_reported = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),

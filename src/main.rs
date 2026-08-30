@@ -882,7 +882,7 @@ impl Client {
     /// player asked for a look. §22's rule is kept by construction either way —
     /// a seated view has no cards in it, because no hand has been dealt.
     fn table_view(&self) -> p2p_poker::gui::table::TableView {
-        use p2p_poker::gui::table::{Facing, SeatView, TableView};
+        use p2p_poker::gui::table::{SeatView, TableView};
 
         let Some(seat) = self.state.seated.as_ref() else {
             return TableView::sample();
@@ -908,10 +908,7 @@ impl Client {
                 seat: *n,
                 name: who.clone(),
                 stack: *stack,
-                // No hand has been dealt, so there is nothing to draw and
-                // nothing to claim. §22 is kept by there being no card rather
-                // than by a check.
-                cards: [Facing::Empty, Facing::Empty],
+                cards: hole_cards(self.state.hand.as_ref(), *n, seat.seat),
                 ..Default::default()
             })
             .collect::<Vec<_>>();
@@ -926,6 +923,7 @@ impl Client {
             name,
             blinds,
             street: match (hand, seat.session.is_some()) {
+                (Some(h), _) if h.cards.is_some() => "pre-flop".into(),
                 (Some(h), _) if h.deck_ready => "deck sealed".into(),
                 (Some(_), _) => "shuffling".into(),
                 (None, true) => "ready".into(),
@@ -941,6 +939,10 @@ impl Client {
                 // button does: it is the one thing on this screen that can be
                 // late, and a player who knows which seat everybody is waiting
                 // for knows whether the wait is theirs to fix.
+                (Some(h), _) if h.cards.is_some() => format!(
+                    "hand #{} — your cards are dealt; the button is at seat {}",
+                    h.hand_id, h.button
+                ),
                 (Some(h), _) => match (h.shuffling, h.deck_ready) {
                     (_, true) => format!(
                         "hand #{} — the deck is shuffled and sealed; the button is at seat {}",
@@ -977,6 +979,43 @@ impl Client {
                 .log
                 .push_back("the node is busy; try that again".into());
         }
+    }
+}
+
+/// What to draw in one seat's two card slots.
+///
+/// Face-up only for this client's own seat, and only from cards it opened
+/// itself: `Facing::up` takes a verdict and the verdict here is that the cards
+/// came out of a complete set of verified shares. Every other seat gets backs
+/// once the deal is done — those cards exist, this client holds `m-1` shares
+/// for each of them, and it is one share short of every one of them by design.
+/// Before the deal there is no card anywhere, and §22 is kept by there being
+/// nothing to draw rather than by a check.
+fn hole_cards(
+    hand: Option<&p2p_poker::app::HandInProgress>,
+    seat: u8,
+    hero: Option<u8>,
+) -> [p2p_poker::gui::table::Facing; 2] {
+    use p2p_poker::gui::table::Facing;
+
+    let Some(h) = hand else {
+        return [Facing::Empty, Facing::Empty];
+    };
+    if !h.holding.contains(&seat) {
+        return [Facing::Empty, Facing::Empty];
+    }
+    match (h.cards, hero) {
+        (Some(cards), Some(me)) if me == seat => cards.map(|index| {
+            match p2p_poker::poker::state::Card::from_index(index) {
+                Ok(card) => Facing::up(card, true),
+                // A byte outside the deck cannot come from a card this client
+                // opened, so this is unreachable — and it draws a back rather
+                // than panicking, because a covered card is a correct thing to
+                // draw and a crashed table is not.
+                Err(_) => Facing::Down,
+            }
+        }),
+        _ => [Facing::Down, Facing::Down],
     }
 }
 

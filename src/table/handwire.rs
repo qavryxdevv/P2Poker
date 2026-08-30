@@ -269,6 +269,93 @@ pub struct ShuffleProof {
     pub proof: Vec<u8>,
 }
 
+/// `DECK_COMMIT 0x0307`: the barrier before any card exists.
+///
+/// Three values every dealt-in seat derived independently and must have
+/// derived identically. It is deliberately cheap - two hashes and a point -
+/// because its whole purpose is to catch two peers holding different decks at
+/// the last moment when catching it costs nothing. After this stage a hole
+/// card exists, and a disagreement discovered then is a dispute rather than a
+/// restart.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct DeckCommit {
+    #[cbor(n(0), with = "minicbor::bytes")]
+    pub final_deck_hash: [u8; 32],
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub index_map_hash: [u8; 32],
+    #[cbor(n(2), with = "minicbor::bytes")]
+    pub apk: Vec<u8>,
+}
+
+impl DeckCommit {
+    /// Which of the three fields differs, if any.
+    ///
+    /// Named rather than a bare inequality for the same reason `HandInit`'s is:
+    /// the three mean different things gone wrong, and a client that reports
+    /// "the deck does not match" when the index map is what differs has sent
+    /// its owner to look in the wrong place.
+    pub fn disagreement(&self, theirs: &DeckCommit) -> Result<(), &'static str> {
+        if self.final_deck_hash != theirs.final_deck_hash {
+            return Err("the final deck");
+        }
+        if self.index_map_hash != theirs.index_map_hash {
+            return Err("the deck-index map");
+        }
+        if self.apk != theirs.apk {
+            return Err("the aggregate key");
+        }
+        Ok(())
+    }
+}
+
+/// One peer's decryption share for one card, with the proof it was computed
+/// with the key that peer committed to (`PROTOCOL.md` §4.6).
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct RevealEntry {
+    #[n(0)]
+    pub deck_index: u8,
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub token: Vec<u8>,
+    #[cbor(n(2), with = "minicbor::bytes")]
+    pub proof: Vec<u8>,
+}
+
+/// `DEAL_PRIVATE 0x0401`: every seat's shares for everybody else's hole cards.
+///
+/// The message is broadcast and the result is private, which reads like a
+/// contradiction and is not: each seat withholds only its own share of its own
+/// cards, so every hole card is one share short for everybody except its owner.
+/// `PROTOCOL.md` §4.6 owns that argument and corrected two other documents that
+/// had rested privacy on point-to-point delivery instead.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct DealPrivate {
+    #[n(0)]
+    pub entries: Vec<RevealEntry>,
+}
+
+impl DealPrivate {
+    /// Ascending by index and no index twice.
+    ///
+    /// A canonicality rule, not a policy one: two orderings of one set would be
+    /// two byte strings for one message, and a collective stage compares byte
+    /// strings. Checked before anything is verified, because it costs a pass
+    /// over a short list and the alternative costs a DLEQ verification per
+    /// duplicate a sender chose to send.
+    pub fn canonical(&self) -> bool {
+        self.entries
+            .windows(2)
+            .all(|w| w[0].deck_index < w[1].deck_index)
+    }
+
+    /// The indices, in order.
+    pub fn indices(&self) -> Vec<u8> {
+        self.entries.iter().map(|e| e.deck_index).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

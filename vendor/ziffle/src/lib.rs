@@ -389,6 +389,27 @@ impl OwnershipProof {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AggregatePublicKey(CurveAffine);
 
+// FORK(d) - the aggregate key could not be serialised.
+//
+// `PublicKey` carries `CanonicalSerialize`; the aggregate of several of them
+// did not, and its field is private, so a caller had no way to put the value
+// on a wire. A protocol that has every seat commit to the aggregate it derived
+// - which is the cheapest possible barrier against two peers holding different
+// decks - cannot be built without this.
+//
+// A getter, no arithmetic: the aggregation is unchanged and this returns what
+// `new` already computed, in the type the individual keys use, so it is
+// encoded by the same serialiser and no second encoding of a point exists.
+impl AggregatePublicKey {
+    /// The aggregate as a [`PublicKey`], for serialisation.
+    ///
+    /// It is a public key: the sum of public keys on the curve. Nothing about
+    /// it is secret, and there is no secret key anybody holds for it.
+    pub fn as_public_key(&self) -> PublicKey {
+        PublicKey(self.0)
+    }
+}
+
 impl AggregatePublicKey {
     /// Creates an aggregate public key from verified individual public keys.
     ///

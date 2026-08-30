@@ -183,6 +183,20 @@ pub enum NodeEvent {
         shuffling: Option<u8>,
         ready: bool,
     },
+    /// This client's own two cards, opened from a complete set of verified
+    /// shares.
+    ///
+    /// It reaches the interface and goes no further: the channel is inside one
+    /// process, and the whole point of the deal is that these two bytes exist
+    /// here and nowhere else on the network. `card` values are deck indices in
+    /// `0..=51` — the interface turns them into a rank and a suit.
+    HoleCards { hand_id: u64, cards: [u8; 2] },
+    /// Somebody's hole cards are dealt but not this client's to see.
+    ///
+    /// Sent so a table can draw backs at the other seats. It carries no card,
+    /// because there is none to carry: those cards are one share short here and
+    /// will stay that way unless their owner shows.
+    CardsDealt { hand_id: u64, seats: Vec<u8> },
     /// The founder refused. **Advisory** — a founder may lie, so the reason is
     /// carried as the claim it is.
     JoinRefused { reason: u16 },
@@ -306,6 +320,8 @@ impl NodeEvent {
             | Self::HandBegan { .. }
             | Self::HandWaiting { .. }
             | Self::DeckProgress { .. }
+            | Self::HoleCards { .. }
+            | Self::CardsDealt { .. }
             | Self::JoinRefused { .. }
             | Self::LeftTable { .. }
             // The lobby list and the counters above it.

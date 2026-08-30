@@ -316,6 +316,18 @@ impl HandDeck {
         Ok((to_ciphertexts(&WireDeck(deck)), WireShuffleProof(proof).encode()))
     }
 
+    /// The aggregate key this peer derived, for the `DECK_COMMIT` barrier.
+    ///
+    /// Every dealt-in seat publishes this and they must all match. They will
+    /// match whenever the seats verified the same set of keys, whatever order
+    /// each of them arrived in - aggregation is a sum on the curve, and a sum
+    /// does not care about order. So a mismatch here means the key **sets**
+    /// differ, which means the decks differ, which means the hand cannot be
+    /// played and must stop before a card exists.
+    pub fn apk(&self) -> WireKey {
+        WireKey(self.apk.as_public_key())
+    }
+
     /// This peer's decryption share for one card of the final deck.
     ///
     /// Takes an index and never a card, so a share cannot be produced for a
