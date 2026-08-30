@@ -1947,7 +1947,7 @@ before the signature so two encodings of one event cannot both be accepted.
 | 8 | Sender is a permitted emitter in this context (roster member for a table event; any peer for a lobby event) | drop |
 | 9 | `verify_strict(sender_public_key, TO_BE_SIGNED, signature)` | **protocol violation**, attributable |
 | 10 | `chain_scope` matches the `event_type`'s entry in §4.11, and if `chain_scope == 0` the envelope carries the sentinels of §2.3 exactly | drop |
-| 10a | Anti-replay: for a chained event, look up **`slot(E)` exactly as §5.2.1 defines it** — this step reproduces no part of that tuple and reads it whole; for an unchained event, the per-type rule in §5.2.1's box. **For a chained event whose `hand_id` names a hand this receiver has completed, this step is *skipped* and step 10b is the whole of its anti-replay rule — normative, and this is the disposition of `N2`.** §5.3's `event_class == 0` store is one map per table per hand and is dropped when the hand ends, so there is no slot to look such an event up in and **none is created**: no `hand_id` a sender chooses causes an allocation of any kind, here or anywhere in the pipeline. **One exception, and it is the only structure that outlives its hand:** the checkpoint-8 `STATE_ACK` band of §4.9, whose slots §5.3 retains until `TERMINAL(k+1)`; an event landing there is looked up here exactly as a live one is. Skipping the step gives up nothing a stale event could use, because step 10b applies none of them, enters none in a `stage_hash` and counts none into a `P` of an initialised hand — so there is no effect for a duplicate to repeat. §5.3 states the bound and the one capability the skip does give up | violation or duplicate-drop |
+| 10a | **NOT IMPLEMENTED IN VERSION 1 — see §5.2.5 for the checks that run in its place, and §5.2.1's header for why this one does not.** As specified: for a chained event, look up **`slot(E)` exactly as §5.2.1 defines it** — this step reproduces no part of that tuple and reads it whole; for an unchained event, the per-type rule in §5.2.1's box. **For a chained event whose `hand_id` names a hand this receiver has completed, this step is *skipped* and step 10b is the whole of its anti-replay rule — normative, and this is the disposition of `N2`.** §5.3's `event_class == 0` store is one map per table per hand and is dropped when the hand ends, so there is no slot to look such an event up in and **none is created**: no `hand_id` a sender chooses causes an allocation of any kind, here or anywhere in the pipeline. **One exception, and it is the only structure that outlives its hand:** the checkpoint-8 `STATE_ACK` band of §4.9, whose slots §5.3 retains until `TERMINAL(k+1)`; an event landing there is looked up here exactly as a live one is. Skipping the step gives up nothing a stale event could use, because step 10b applies none of them, enters none in a `stage_hash` and counts none into a `P` of an initialised hand — so there is no effect for a duplicate to repeat. §5.3 states the bound and the one capability the skip does give up | violation or duplicate-drop |
 | 10b | **Stale hand — normative, and this is the disposition of `L4`.** If the envelope's `hand_id` names a hand this receiver has **completed**, a chained event is *not* dropped for arriving late. Step 10a has been skipped for it (above) and this step is its whole anti-replay rule. It is evaluated against that hand's **retained record** (§5.3): if the record says this receiver **was** in the solitary regime for that hand (§3.2, past tense) and `sender_seat` is outside the recorded **`P(hand_id - 1)`** — the required emitter set *of the hand the event names*, never `P(hand_id)`; §3.2's rule and step 12 both say `P(k-1)` and this step now says the same thing, which is `N7` — and the type is neither of the two exempt cases, it routes to step 12a; if it is a checkpoint-8 `STATE_HASH` (§4.9) it is compared against the retained `checkpoint8_state_hash`, and a **mismatch** enters §6.3 at step 1 and, where the record says the hand was solitary, routes to step 12a with it (`N1`), while a **match** from a seat outside the recorded set adds its sender to §4.9's readmission set, as a `0x0804 PLAYER_SIT_IN` of that hand's boundary window does (`N5`); otherwise it is dropped as out of stage, exactly as before. It is **never applied**, never enters a `stage_hash`, **counts into no `P` of a hand this receiver has already initialised**, and **enlarges no required emitter set of any hand — `P2`**: §4.9's readmission set is read once, at the next hand init, where it widens that stage's *accepted* emitter set and not its required one, which is the entire exception and is the reason a replay of this event is inert. It never reaches step 13 | freeze, compare, readmit, or drop |
 | 11 | Decode the payload struct, canonicality gate, per-field range checks | violation |
 | 12 | Stage legality: is this `event_type` from this seat expected at this `sequence`? **And the stage-contribution rule: a seat that has already contributed to a stage may not contribute to it again under a different `event_type`** — the one exception is the terminal `HAND_ABORT` of §4.10, which by construction lands at a stage its emitter has usually already contributed to, and which is also one of the two events exempt from step 10a's chain-position rule (§4.10; the other is a boundary event, whose parent is `TERMINAL(k)`). **And the solitary-stage rule (§3.2): if this receiver was in the solitary regime for the hand this event names and the sender is outside `P(k-1)`, the event is a state divergence and not a rejection — see step 12a.** And **an out-of-set checkpoint-8 `STATE_HASH` is not an out-of-stage event**: §4.9's box widens the accepted set at that one stage and this step must not reject it | violation |
@@ -4616,7 +4616,7 @@ when some key component changes with it.
 | # | Type(s) | Required / permitted honest emissions | Varies within one `(hand_id, sender)` | Verdict |
 |---:|---|---|---|---|
 | 1–13 | `HELLO`, `CAPABILITIES`, `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST`, the six `LOBBY_*`, `DISPUTE` | any number, any time | — | **Outside the predicate.** `chain_scope = 0` occupies no slot; per-type anti-replay in §5.2.1's box |
-| 14 | `TABLE_READY` | one per seat, setup chain | — | **Clean** |
+| 14 | `TABLE_READY` | **one per seat per `list_serial`**, all of them at `hand_id = 0, sequence = 0` on the setup chain — an honest client re-ratifies whenever `adopt` sees a new serial | `list_serial`, `roster_hash`, `emitted_at_unix_ms` — **all three in the payload or outside the key, so none of them separates the slots** | **FAILS, and this is the sixth recurrence.** The row read *"one per seat, setup chain / — / Clean"* for five revisions; the emission count was simply wrong. Two ratifications by one honest seat at two serials are one slot and two `event_hash`es, which is §5.2.2's predicate exactly. Measured: 14 honest ratifications on a five-seat formation produce 5 slots and **9** convictions. This row is why §5.2.1 is not implemented (see its header) and it is the first thing a future wire-in must fix — by giving each ratification its own `sequence`, not by narrowing the key |
 | 15 | `RNG_COMMIT` | one per seat, own stage | — | **Clean** |
 | 16 | `RNG_REVEAL` | one per seat, the next stage | `sequence` | **Clean** |
 | 17 | `HAND_INIT` | one derived copy per seat of `P(k-1)` | — | **Clean.** A `HAND_INIT` that stalls is disposed of by a `HAND_ABORT` at `HAND_INIT`'s own `sequence`, which differs in `event_type` — row 36 |
@@ -4665,7 +4665,7 @@ Codes `0xF000`–`0xFFFF` are reserved for private and experimental use and are
 | Attack (§14 / §17) | Stopped by | Mechanism |
 |---|---|---|
 | replay of an old signed message | `previous_event_hash` + `sequence` | a replayed event's `previous_event_hash` does not equal the current `stage_hash(s-1)`, because the chain has moved on |
-| duplicate message | an `event_hash` set per **slot**, and the slot key is §5.2.1's — read whole, reproduced nowhere | a byte-identical repeat is idempotent; a differing repeat in one slot is equivocation. §4.11 carries the per-type check that says why each key component is there |
+| duplicate message | **in version 1: the per-stage `heard` map of §5.2.5, not a slot store.** The design target was an `event_hash` set per **slot** under §5.2.1's key | a byte-identical repeat is idempotent; a differing repeat in one slot is equivocation. §4.11 carries the per-type check that says why each key component is there |
 | out-of-order message | `sequence` = stage index | an event for stage `s+2` is buffered, never applied, until stage `s+1` completes |
 | message from another hand | `hand_id` **and** `previous_event_hash` | the chain of hand `k` cannot link to hand `k'` |
 | message from another table | `table_id` for chained events; the payload's table field for unchained ones | `table_id` is the table's public key, so it cannot be forged; an unchained message names its table in the payload and is bound to it by the signature over the whole body (§2.3) |
@@ -4681,13 +4681,38 @@ Codes `0xF000`–`0xFFFF` are reserved for private and experimental use and are
 
 ### 5.2 Equivocation, exactly
 
-#### 5.2.1 The anti-replay slot key — the one place it is written (D-011 rule 2)
+#### 5.2.1 The anti-replay slot key — DESIGN RECORD, not implemented in version 1 (D-011 rule 2, D-025)
 
-**NORMATIVE. This box is the definition of the anti-replay slot for the whole
-corpus. `STATE_MACHINE.md`, `CRYPTOGRAPHY.md`, `NETWORK_STACK.md` and
-`THREAT_MODEL.md` reference this section by number and reproduce none of it —
-not the tuple, not a subset of it, not a paraphrase of it. §4.0 step 10a, §5.3's
-stored state and §4.11's per-type check all read this tuple and nothing else.**
+**NOT IMPLEMENTED IN VERSION 1, AND NOT IMPLEMENTABLE AS WRITTEN AGAINST THIS
+MESSAGE SET. This section is retained as a design record and as the reference a
+future version must start from; it is not an acceptance condition, and no client
+computes it.** The modules that implemented it — `src/protocol/slot.rs` and
+`src/protocol/antireplay.rs` — were deleted rather than wired in. Read the
+box below as *"the key a corrected message set would need"*, never as *"what the
+receiver checks"*.
+
+**Why it was not wired in, in one sentence:** applied to the message set this
+document actually specifies, the key convicts honest peers. `TABLE_READY` is a
+chained event pinned to `hand_id = 0, sequence = 0` for every seat (§4.2), an
+honest client re-ratifies on every `list_serial` change, and the two fields that
+distinguish those emissions — `list_serial` and `roster_hash` — are **payload**
+fields, which this key excludes on purpose. So several distinct honest bodies by
+one signer land in one slot, and the predicate of §5.2.2 labels each repeat after
+the first an equivocation. Measured on an ordinary attack-free five-seat
+formation: **14 honest ratifications, 5 slot keys, 9 honest bodies convicted.**
+That is `§4.11` row 14's verdict — *"one per seat, setup chain / — / Clean"* —
+being wrong, and it is the **sixth** recurrence of the defect this section says
+five review passes were spent on. The executable form of the measurement is
+`tests/anti_replay_authority.rs`.
+
+**By this section's own closing rule that is a defect in the message and not in
+the key**, so the key is left as it stands. Correcting `TABLE_READY`'s placement
+is a wire change and belongs to a version that makes it, together with the rest
+of the wire-in prerequisites in §5.2.5.
+
+**What carries the property in the running client instead is §5.2.5, and every
+document that used to reference this section for an enforcement claim now
+references that one.** §4.0 step 10a, §5.3 and §4.11 are annotated accordingly.
 
 > ```
 > slot(E)  is defined only for  E.chain_scope == 1 , and is the 8-tuple
@@ -5107,9 +5132,89 @@ most often appears, for want of a place to put it. The evidence is the whole poi
 of producing the proof at all now that no transition consumes it, which is exactly
 the question §12 records and does not answer.
 
+#### 5.2.5 What bounds replay and names a double signer in version 1 (NORMATIVE)
+
+**This section is the enforcement authority. §5.2.1 is not.** Every claim in this
+corpus of the form *"a replay is stopped"* or *"an equivocation is named"* points
+here, and each row below names the check that carries it. There is no slot store
+and no eight-tuple lookup anywhere in the client; a document that says otherwise
+is stale.
+
+| What | The check that carries it | Where | Disposition |
+|---|---|---|---|
+| A chained event at the wrong chain, hand, stage or parent | `table_id`, `hand_id`, `sequence`, `previous_event_hash` compared field by field, then `verify_strict` over the **bytes as received** | `net/chained.rs` `open_inner` | rejected and named |
+| **Replay of any ordinary chained event of a stage the hand has left** — the principal bound | the monotone stage cursor: `sequence < slot.sequence` | `table/hand.rs` `on_event` | dropped silently; the mesh redelivers as a matter of course |
+| An event of a stage not yet reached | `sequence > slot.sequence` | same | **held** in a FIFO bounded at 64, re-judged on every later event |
+| **A duplicate contribution at a collective stage** | the per-stage `heard` map: an identical `event_hash` from a seat already heard | `table/stage.rs` `Collective::hear` → `Heard::Again` | idempotent, and pre-checked by `heard(seat)` before anything is spent |
+| **A second, different body from one seat at one collective stage** — the equivocation the corpus cares about | the same map: a **differing** hash from a seat already heard | `table/stage.rs` `Collective::hear` → `Heard::Equivocation`; nine call sites in `table/hand.rs` | the **first** stands, the second is `Failed::Equivocation{seat}`; the stage hash is taken over the first |
+| Double application at a single-writer stage | the cursor again — `slot` advances synchronously with the effect — plus `action_index` on a betting action | `table/hand.rs` | second copy falls under the cursor rule |
+| A redelivered `TIMEOUT_CERT` | a per-hand set keyed on `subject_digest` | `table/hand.rs` `bank_certificate`, and `certified` behind `commit_certificate` | applied exactly once per hand per subject |
+| A redelivered `TIMEOUT_VOTE` | a map keyed by voter seat, plus the subject rebuilt from the receiver's own position | `table/hand.rs` `take_vote`, `on_timeout_vote` | overwritten, so it cannot double-count |
+| A re-applied `HAND_ABORT` | `Phase::Aborted` short-circuits | `table/hand.rs` | idempotent |
+| A stale `PLAYER_LIST` | `list_serial` strictly greater than the held one | `table/join.rs` `admit_list` | refused — **except while the client's own serial is still 0** |
+| A re-broadcast lobby advert for a table already held | `timestamp_unix_ms` strictly greater than the held one | `net/lobby.rs` `LobbyStore::offer` rule 6 | refused — **only when an entry is already held** |
+| A third party's replay of a `JOIN_REQUEST` | `req.peer_id` must equal the transport-authenticated connection peer id | `table/join.rs` `admit_join` | refused |
+| A `JOIN_ACCEPT` replay | bound to the joiner's own outstanding `request_hash`, and `pending` is cleared on the first | `table/join.rs`, `net/formation.rs` | refused |
+| Byte-identical frames within 120 s | the GossipSub duplicate cache, `duplicate_cache_time(120s)`, over a 64-bit non-cryptographic id | `net/swarm.rs` | dropped before the application; **also suppresses this node's own re-publish** |
+
+**Three properties of this set are load-bearing and are stated rather than left
+to be inferred.**
+
+1. **The cursor is a cursor, not a record.** It bounds replay by refusing to look
+   backwards, and it keeps no per-slot history. Nothing in the client can answer
+   *"have I seen this exact event before?"* once the stage that held it is gone.
+   That is sufficient for the safety property — a passed stage applies nothing —
+   and it is **not** sufficient for evidence: a double signer at a *single-writer*
+   stage is not named, because the second body arrives under the cursor and is
+   dropped without comparison. §5.2.1's key would have named it. Naming it buys
+   nothing today, because of point 3.
+2. **The equivocation detector is per-receiver and arrival-ordered.** `hear`
+   keeps whichever body reached this client first. Two honest peers that received
+   different copies each name the other's, and their stage hashes differ. The
+   detector reports the split; it does not prevent it, and no slot key would.
+3. **Detection has no consumer.** There is no `EquivocationProof` object in the
+   client, `Failed::Equivocation` becomes a warning and a GossipSub `Reject` aimed
+   at the *relayer* rather than the signer, and **GossipSub peer scoring is not
+   configured at all** — no `with_peer_score` call exists. So `Reject` means only
+   *"this node will not forward that copy"*. Under D-010 that is the intended
+   state: a proof ends no hand, moves no chip and evicts nobody. It is recorded
+   here because a reader who assumes otherwise will over-value both this section
+   and §5.2.1.
+
+**Prerequisites a future wire-in of §5.2.1 must satisfy, all of them findings
+against the tree rather than opinions:**
+
+* **`TABLE_READY` must get a distinct `sequence` per `list_serial`** (§4.11 row
+  14), or honest formation traffic collides in the key. This is the blocker.
+* **`event_class` 1 and 2 are produced now.** D-023 restored `TIMEOUT_VOTE` and
+  `TIMEOUT_CERT` and D-024 gave a certificate a persistent roster effect, so a
+  store that refuses those classes — as the deleted one did — rejects exactly the
+  messages the certificate path is built from. §5.3's *"not allocated in version
+  1"* and §4.8/§8.3's *"defined, not produced"* are stale in the same way.
+* **D-024 already installs a narrower dedup key** over those events — *"keyed on
+  the subject digest so that … a redelivery of either counts once"* — and does not
+  say whether that key is digest-alone or digest-plus-emitter. Two authorities
+  over one message class is the condition this section exists to prevent, so that
+  ambiguity is closed before, not after.
+* **§4.0 step 10a's skip rule interacts with D-024 point 3.** A `kind = 2`
+  certificate ends the hand from any position; ending the hand drops the class-0
+  store and switches step 10a off for every later event of that `hand_id`. A key
+  that stops applying at the moment the roster is edited is not an authority.
+
+---
+
 ### 5.3 Bounded anti-replay state
 
 Anti-replay must not become a memory-exhaustion vector (`SPEC_CS.md` §17, §27).
+
+**NOT IMPLEMENTED. No structure described below exists in the client** — the
+module that held it, `src/protocol/antireplay.rs`, was deleted with §5.2.1's key
+and for the same reason. What bounds replay instead is §5.2.5, whose state is the
+per-stage `heard` map, the stage cursor, and the two per-hand sets on
+certificates; all of them are dropped with the stage or the hand that owns them,
+so the memory-exhaustion question this section opens is answered by construction
+rather than by a capacity constant. Retained as the design record a future
+version starts from, and as the measurement D-015 rests on.
 
 **The stored state is one structure per `event_class`, and each is indexed by
 exactly the components of §5.2.1's key that vary within one `(table_id, hand_id,

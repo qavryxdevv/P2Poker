@@ -2711,3 +2711,108 @@ the argument instead is the floor and the inductive shrinkage: an attacker
 cannot reach `|V| = 1` by asserting, because every step towards it had to clear
 the floor too.
 
+---
+
+## D-025 — the anti-replay slot key is deleted, not wired in
+
+`src/protocol/slot.rs` implemented `PROTOCOL.md` §5.2.1's eight-tuple and
+`src/protocol/antireplay.rs` the store §5.3 specifies. Both were complete,
+documented and tested — 23 passing tests between them — and **called by nothing**.
+Behind them sat three more files in the same condition: `staleness.rs` (§4.0 step
+10b, a *third* opinion about anti-replay, zero references), `checkpoint.rs`
+(referenced only by `staleness.rs`) and `seats.rs` (referenced only by those two).
+2 354 lines, 69 tests, no callers — one closed island whose entry point was the
+key.
+
+**Three of the five are deleted rather than wired in, and the reason is not that
+they were unused.** `slot.rs`, `antireplay.rs` and `staleness.rs` each carry a
+rule about which events to **reject**; each passes its own tests; and applied to
+this tree the key they share convicts honest peers. That is the shape that has
+to go.
+
+`checkpoint.rs` and `seats.rs` stay, marked in `src/protocol/mod.rs` as drafts.
+They are §6.2's checkpoint records and the seat set beneath them, they refuse
+nothing, and wiring them in would add a stage this client does not have rather
+than overrule a check it runs. `tests/anti_replay_authority.rs` holds both
+halves: the three must stay gone, and the two must stay uncalled from live code
+— because switching §6.2 on is a decision with its own tests and not something
+that should arrive by an import.
+
+### The finding that settled it
+
+Applied to the message set this corpus specifies, §5.2.1's key **convicts honest
+peers**. `TABLE_READY` is a chained event sealed at `hand_id = 0, sequence = 0`
+for every seat at every `list_serial` (`net/joinwire.rs` `seal_ready`), and an
+honest client re-ratifies whenever `adopt` sees a new serial
+(`net/formation.rs`, which resets `sent_ready`). What distinguishes two such
+emissions — `list_serial`, `roster_hash` — is in the **payload**, which the key
+excludes on purpose so that the predicate is not vacuous. So one honest seat puts
+several distinct bodies in one slot.
+
+Measured on an ordinary, attack-free five-seat formation, with no adversary
+present: **14 honest ratifications, 5 slot keys, 9 honest bodies the predicate of
+§5.2.2 labels equivocation.** `PROTOCOL.md` §4.11 row 14 had rated that message
+*"one per seat, setup chain / — / Clean"* through five revisions. The emission
+count was simply wrong, and the row is now corrected to FAILS.
+
+This is the **sixth** recurrence of D-009 rule 1's failure, and the first found by
+measurement rather than by review. `THREAT_MODEL.md` §9.1.2 limitation 12 said the
+property would stay *"asserted rather than demonstrated"* until a mirror test
+existed and was seen to fail on a **deliberately coarsened** key. The test now
+exists and no coarsening was needed: the key as specified was enough.
+
+### Why not wire in a corrected form
+
+Three further findings, each independently sufficient to stop a wire-in:
+
+1. **`antireplay.rs`'s premise is false against the tree.** It refuses
+   `event_class` 1 and 2 as `ClassNotProduced`, on the grounds that D-015 stops
+   version 1 producing them. D-023 restored both and D-024 gave a certificate a
+   persistent roster effect. `net/run.rs` calls `vote_on_timeouts`; `table/hand.rs`
+   seals both types. Wiring the store in as written rejects exactly the messages
+   the certificate path is built from.
+2. **It would have stopped none of the replays that actually work.** Each was
+   verified by executed test, not accepted from a report: unsigned junk saturating
+   the 64-slot hold queue (pre-signature, and the store is post-acceptance); a
+   withheld `HAND_ABORT` released at a later stage (the store answers `Fresh`);
+   the expired-advert and stale-`PLAYER_LIST` admissions (unchained, so `slot()`
+   returns `Unchained` by construction); the stale-ratification queue flush (the
+   store's own ordinary capacity does not model the setup chain). The timestamp
+   fork is *already* detected by `Collective::hear`; the store would report the
+   same thing at the same moment and change nothing.
+3. **Two authorities already exist in prose.** D-024 installs a dedup *"keyed on
+   the subject digest so that … a redelivery of either counts once"* over exactly
+   the events §5.2.1 claims sole ownership of, and does not say whether that key
+   is digest-alone or digest-plus-emitter. `PROTOCOL.md` §8.2 separately names a
+   different *"replay barrier"* for `TIMEOUT_CERT`. Adding a third opinion that
+   nothing runs is how this project shipped two clients under one identity twice.
+
+### What replaces it
+
+`PROTOCOL.md` §5.2.5, new and normative, enumerates the checks that actually
+bound replay and name a double signer, each against the file that carries it. The
+short form: the monotone stage cursor is the principal replay bound; the per-stage
+`heard` map of `table/stage.rs` `Collective::hear` is the duplicate suppressor and
+the equivocation detector; certificates dedup on a per-hand `subject_digest` set.
+§5.2.1 and §5.3 are retained as design records, marked NOT IMPLEMENTED, with the
+prerequisites a future wire-in must satisfy listed in §5.2.5.
+
+### What is knowingly given up
+
+Detection of a double signer at a **single-writer** stage — two different
+`ACTION_RAISE` amounts at one `sequence`. The second arrives under the cursor and
+is dropped without comparison, so nobody is named. This is accepted for now
+because the detection has no consumer: there is no `EquivocationProof` object in
+the client, `Failed::Equivocation` becomes a warning and a GossipSub `Reject`
+aimed at the *relayer*, and no `with_peer_score` call exists anywhere in `src/`.
+Under D-010 that is the intended state. **A version that gives equivocation a
+consequence must revisit this**, and it should do so by extending `hear`'s
+first-wins rule to single-writer stages — three fields, in the file that already
+owns the property — and not by reviving an eight-tuple.
+
+### Guard
+
+`tests/anti_replay_authority.rs` fails if any of the five files returns, if any
+source file imports one, if `Collective::hear` loses its equivocation arm, or if
+the stage cursor stops swallowing a passed stage. Its doc comments say how to make
+each test fail, which is this project's standing requirement.

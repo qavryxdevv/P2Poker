@@ -891,9 +891,46 @@ re-parented to a different position.
 *Basis:* A5, A6, A11.
 
 **G7 — Equivocation produces evidence.**
-If a player signs two conflicting **chained** events into one anti-replay slot,
-the pair constitutes a self-authenticating, transferable proof of that player's
-misbehaviour.
+**NOT MET IN VERSION 1, and the shortfall is now specific rather than
+conditional.** The goal as stated — if a player signs two conflicting **chained**
+events into one anti-replay slot, the pair constitutes a self-authenticating,
+transferable proof of that player's misbehaviour — required `PROTOCOL.md` §5.2.1's
+slot key to be computed at acceptance. It is not, and it will not be: the modules
+that implemented it were deleted because, applied to this message set, the key
+convicts honest peers (§5.2.1's header; `tests/anti_replay_authority.rs` measures
+9 convictions across 14 honest ratifications on an ordinary formation).
+
+**What is delivered instead, and by what.** A **collective** stage names a double
+signer: `table/stage.rs` `Collective::hear` keeps the first `event_hash` it
+received from a seat and answers a differing second with `Heard::Equivocation`,
+which nine sites in `table/hand.rs` turn into `Failed::Equivocation{seat}`. That
+covers `HAND_INIT`, `DECK_INIT`, `DECK_COMMIT`, `DEAL_PRIVATE`, `BOARD_REVEAL`,
+`SHOWDOWN_REVEAL`/`MUCK`, `HAND_COMPLETE` and the certificate stage. `PROTOCOL.md`
+§5.2.5 is the enumeration and this document does not reproduce it.
+
+**Three limits, all of which the goal's wording concealed.**
+
+1. **A single-writer stage names nobody.** Two different `ACTION_RAISE` amounts,
+   or two `SHUFFLE_STEP` bodies, at one `sequence`: the first advances the cursor
+   and the second is dropped under `sequence < slot.sequence` without ever being
+   compared. `TABLE_READY` and `TIMEOUT_VOTE` are worse — both **overwrite**
+   (`net/formation.rs` `take_ratification`, `table/hand.rs` `take_vote`).
+2. **What `hear` produces is a local error, not a transferable proof.** No
+   `EquivocationProof` object exists in the client. The finding does not leave the
+   receiver, so "self-authenticating and transferable" is unmet outright.
+3. **Nothing consumes it.** `Failed::Equivocation` becomes a warning and a
+   GossipSub `Reject` aimed at the **relayer**, and no `with_peer_score` call
+   exists anywhere in `src/`, so `Reject` means only "this node will not forward
+   that copy". Under D-010 that is intended.
+
+**What the goal now depends on.** Not on §5.2.1 being right — nothing reads it.
+On `Collective::hear` keeping its `Heard::Equivocation` arm, which is one `match`
+arm in one file and is exactly the kind of thing a simplifying editor turns into
+an overwrite. `tests/anti_replay_authority.rs`
+`a_double_signer_at_a_collective_stage_is_still_named` is the guard, and it is
+written against the running code rather than against a copy of the predicate —
+the corpus records that a test written against a copy is how three of five earlier
+recurrences survived review.
 
 **[R4] The predicate and its slot key are `PROTOCOL.md` §5.2's, and this goal
 does not reproduce either.** An earlier revision quoted the predicate in full,
@@ -1139,7 +1176,7 @@ to judgement.
 | 13 | Replay of old actions | **CP** | The signed body binds `protocol_version`, `table_id`, `hand_id`, `sequence` and `previous_event_hash`, so an event is valid at exactly one position of one chain. Shuffle and reveal proofs additionally bind `ctx` (A11); probes confirmed proofs do not transfer across different `ctx` values. *This row is contingent on our own `ctx` construction being right, which is why an adversarial test that replays a valid shuffle proof from hand `h` into hand `h+1` and asserts rejection is mandatory, not optional.* *Inherits A5, A11.* |
 | 14 | Rewriting a hand's history | **CP** | The transcript is a hash chain from `GENESIS`; changing any past event changes every subsequent `previous_event_hash`, which requires a BLAKE3 collision, and every event is independently signed. *Inherits A5, A6.* |
 | 15 | Impersonating another participant | **CP** | Authorisation comes from the application Ed25519 signature alone. The `PeerId` is never authentication (`SPEC_CS.md` §20), the DHT record is never an identity claim, and a GossipSub `Signed`/`Strict` message proves only which socket spoke. Announcing someone else's `IP:port` under `LOBBY_INFOHASH` is possible and meaningless — it produces a dead dial, not an identity. *Inherits A5.* |
-| 16 | Different histories to different players (equivocation) | **D&A** | Not preventable: a modified client can sign two conflicting events. What the design delivers instead is that the pair is **self-authenticating evidence** — two chained events by one key in one anti-replay slot with different `event_hash` values. **[R7]** The slot key is not reproduced here; it is one literal tuple in `PROTOCOL.md` §5.2 and this row points at it (D-011 rules 1 and 2). The earlier revision of this cell printed a five-field version of it, which was already stale when it was written. That is evidence of misbehaviour **only** while no honest peer can be made to fill one slot twice by following the rules, which is a property of the message set rather than of the signature scheme, is not implied by A1–A7, and has failed **five** times already (X31, X32, G7's table, §9.1.2 limitation 12). Under **D-010** what a proof buys is smaller than it was, and under **D-011 rule 3** smaller again: the pair is evidence in the transcript, consuming it moves no chips, unseats nobody, and — the half that only became true with D-011 — causes no layer to block-list the accused key. So the worst case at the end of this row, for the equivocator and for a peer falsely accused alike, is **a wasted hand**; where the accused's transport was dropped for other reasons it is a wasted hand and a connection they re-establish. Detection is fast in practice because all `n` peers at a table are mutually connected and exchange `STATE_HASH` after critical transitions, and because an equivocator cannot carry two divergent hands to showdown: opening any card needs every player's share, so both branches stall. The honest limit: the evidence only exists once both halves reach one honest party, and a partition can delay that. |
+| 16 | Different histories to different players (equivocation) | **D&A** | Not preventable: a modified client can sign two conflicting events. What the design delivers is **narrower than this row claimed for six revisions**, and the correction is the substance of the cell rather than a footnote to it. The intended delivery was that the pair is self-authenticating evidence — two chained events by one key in one anti-replay slot with different `event_hash` values — resting on `PROTOCOL.md` §5.2.1's slot key. **That key is not computed by any client and has been deleted from the tree**, because against this message set it convicts honest peers (§5.2.1's header). What actually runs is `table/stage.rs` `Collective::hear`, which names a double signer at a **collective** stage only, produces a local `Failed::Equivocation` rather than a transferable object, and is consumed by nothing — see G7 and `PROTOCOL.md` §5.2.5, which this row does not reproduce. At a **single-writer** stage — every betting action, both shuffle events — a second differing body is dropped under the stage cursor and is never compared, so no evidence of any kind is produced. **[R7]** The earlier revision of this cell printed a five-field version of it, which was already stale when it was written. That is evidence of misbehaviour **only** while no honest peer can be made to fill one slot twice by following the rules, which is a property of the message set rather than of the signature scheme, is not implied by A1–A7, and has failed **five** times already (X31, X32, G7's table, §9.1.2 limitation 12). Under **D-010** what a proof buys is smaller than it was, and under **D-011 rule 3** smaller again: the pair is evidence in the transcript, consuming it moves no chips, unseats nobody, and — the half that only became true with D-011 — causes no layer to block-list the accused key. So the worst case at the end of this row, for the equivocator and for a peer falsely accused alike, is **a wasted hand**; where the accused's transport was dropped for other reasons it is a wasted hand and a connection they re-establish. Detection is fast in practice because all `n` peers at a table are mutually connected and exchange `STATE_HASH` after critical transitions, and because an equivocator cannot carry two divergent hands to showdown: opening any card needs every player's share, so both branches stall. The honest limit: the evidence only exists once both halves reach one honest party, and a partition can delay that. |
 | 17 | Malformed packets | **D&A**, with a residual risk | The event decoder is bounded by construction: `minicbor` validates a claimed length against the remaining input *before* allocating — measured at **0 bytes allocated** for a byte string claiming 4 GiB, for one claiming `u64::MAX`, and for an array claiming 4 GiB of elements, and 20 000 levels of nesting produced an error rather than a stack overflow (`research/CRYPTO_LIBS.md` §4.8). No `eval`, no `pickle`, explicit schema validation. **Residual risk, stated rather than hidden:** the *cryptographic* deserialisers (arkworks / `ziffle`) have **not** been fuzzed, and `ziffle`'s `Transcript::update_with_serialized` contains an `assert!` panic path if a serialised element exceeds a 256-byte buffer. Unreachable for 33-byte points, but it is a panic on network-derived data. Until `SPEC_CS.md` §27 fuzzing lands over `ShuffleProof`, `MaskedDeck`, `RevealToken` and `OwnershipProof`, a malformed crypto object is a plausible remote panic, i.e. a DoS. |
 | 18 | Oversized packets | **D&A** | Hard caps at every boundary, and an over-cap frame is dropped rather than parsed. **[R20]** Which caps exist, their values, and the fact that the gossip cap is a two-sided constant a peer cannot tune per build are `NETWORK_STACK.md` §11.3 and §6.5's, and the enumeration this cell carried is deleted under D-011 rule 1. What is classified here: the caps are **structural**, applied before decoding, so an oversized frame costs a receiver nothing beyond the bytes it already read; and the response to one is volume-keyed, never keyed on fault or attribution, so it is not an eviction and is untouched by D-011 rule 3. |
 | 19 | Resource exhaustion "in reasonable measure" | **OOS** | Mitigated, not solved, and `SPEC_CS.md` §18 lists DoS as beyond the protocol's reach. Mitigations in place: `connection_limits` (max pending/established, per-peer cap), `memory_connection_limits` at a percentage of RAM, GossipSub peer scoring and `validate_messages()`, `flood_publish(false)` to remove an amplification lever, a bounded dial budget for unverified DHT hints, subscription filters, and the relay's own reservation/circuit rate limiters. An adversary with meaningful bandwidth defeats all of it. |
@@ -2237,8 +2274,29 @@ the only one of the five that records something the design *had* and gave up.
    fix; the version scoped on the seat count let one modified client manufacture
    a one-signer certificate at a six-seat table (X30).
 
-3. **Honest behaviour never incriminates the honest peer, and the anti-replay
-   slot key is the enforcement (D-009 rule 1, D-011 rule 2).** No sequence of
+3. **VIOLATED FOR A SIXTH TIME, AND THIS TIME BY MEASUREMENT RATHER THAN BY
+   REVIEW. The property below is not held by version 1, and the slot key named as
+   its enforcement has been deleted rather than shipped.** The mirror test this
+   item said was missing now exists — `tests/anti_replay_authority.rs`
+   `an_honest_formation_puts_several_bodies_in_one_slot_key` — and the first
+   thing it did was fail the property: `TABLE_READY` is chained at
+   `hand_id = 0, sequence = 0` for every seat, an honest client re-ratifies on
+   every `list_serial` change, and `list_serial` is a payload field the key
+   excludes. On an ordinary attack-free five-seat formation that is **14 honest
+   ratifications, 5 slot keys and 9 honest bodies the predicate convicts.**
+   `PROTOCOL.md` §4.11 row 14 had rated that message *"one per seat, setup chain
+   / — / Clean"* for five revisions; the emission count was simply wrong.
+   **The disposition is that the key is not implemented** (`PROTOCOL.md` §5.2.1
+   header) and that what runs instead is `PROTOCOL.md` §5.2.5, under which no
+   honest peer is convicted of anything because no client computes the key. The
+   property is therefore *vacuously* held at runtime and *unmet* in the
+   specification — a distinction worth keeping, because a future version that
+   wires the key in without first fixing `TABLE_READY`'s placement reintroduces
+   the conviction on day one. That fix is a wire change and is the first
+   prerequisite listed in §5.2.5.
+
+   **The original text of this item follows, and is retained because the reasoning
+   is what a future version must satisfy.** No sequence of
    emissions the protocol requires or permits of an honest peer may put two
    bodies in one slot, and therefore none may produce a valid
    `EquivocationProof` against that peer. The enforcement is not a review habit:
@@ -2537,10 +2595,25 @@ carrying its own list.
     blocks a key at any layer, a sixth recurrence would cost the framed honest
     peer a hand rather than a stack and a network. But the specification would
     still frame it, the frame is permanent in the transcript, and D-010 point 2
-    says a human may later adjudicate on exactly such records. Until the mirror
-    test exists in `tests/adversarial/` — carrying all three named interleavings
-    of §5.5 — and is seen to fail on a deliberately coarsened slot key, the
-    property is asserted rather than demonstrated.
+    says a human may later adjudicate on exactly such records.
+
+    **RESOLVED, in the direction this limitation feared. The mirror test now
+    exists — `tests/anti_replay_authority.rs` — and the sixth recurrence it was
+    written to catch was already present.** It is `TABLE_READY`: several honest
+    ratifications by one seat, at one pinned `(hand_id = 0, sequence = 0)`, which
+    the slot key cannot separate because what distinguishes them is in the
+    payload. Measured at 9 convictions across 14 honest emissions on an
+    attack-free formation. No coarsening of the key was needed to demonstrate the
+    failure — the key as specified was enough, which is a stronger result than
+    this limitation asked for and a worse one.
+
+    The consequence is that **the slot key was deleted rather than wired in**
+    (`PROTOCOL.md` §5.2.1 header, §5.2.5). This limitation's own sentence — that
+    the harm from a wrong key is *"the honest peer's own conduct stops its own
+    hand"*, and that it arrives *"because §5.2.1's key and §4.0 step 10a are what
+    reject it"* — is what settled the decision: a key that is never computed
+    produces neither the harm nor the protection, and on this tree the harm was
+    the larger of the two.
 13. **`SmallRng` and `StdRng` are compiled into the binary and cannot be removed**
     without dropping libp2p features the connectivity design depends on (A7).
     `SPEC_CS.md` §7's prohibition is therefore enforced as a discipline over our

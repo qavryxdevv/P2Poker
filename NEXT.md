@@ -689,6 +689,22 @@ forbids that shape. Everything was right up to the last message.
   reserve cap failed immediately on a value picked by hand, which is why that
   constant is now derived.
 
+### And a third, which is not about files
+
+**`git add -A` while a review workflow is running commits the workflow's
+working files.** It happened twice in one session: a 106-line probe reached
+`origin/master` as `tests/zz_replay_poc.rs`, and 178 lines of an agent's
+`// ATTACK PROBES (temporary)` block went into `src/table/hand.rs`'s test module
+under a commit message about GossipSub subscriptions.
+
+This file already said *"never `git add -A` while anything else can write to
+the tree, and read `git status` for foreign modifications before every
+commit"*. Saying it again is not the fix. **Name the paths**: `git add
+src/net/run.rs src/table/hand.rs` and nothing else, every time, for as long as
+anything else can write. `git status --porcelain` before each commit, and read
+it — the second time, the evidence was on screen and went past unread because
+the test count had gone *up*.
+
 ### And two ways to destroy a file, both self-inflicted here
 
 * `io.open(p, 'w').write(io.open(p).read())` truncates before it reads. It
