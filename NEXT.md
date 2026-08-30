@@ -295,7 +295,42 @@ question in this file.
 and acts first pre-flop.
 
 It stopped there because a headless client has nobody to press a button — which
-is what the action clock now answers.
+is what the action clock answers. With the clock in, the same two processes
+play **hand after hand**:
+
+```
+hand #1: your turn — 50 to call
+your clock ran out — Fold for you
+hand #1 is over
+hand #2 is waiting for seat 1
+hand #2 has begun
+```
+
+The button alternates every hand, which is the heads-up dead-button rule, and a
+hundred-and-thirty-second run gets through several hands end to end: crypto,
+betting, settlement, rotation, next deal.
+
+### The three runs that lied, and why
+
+Runs two, three and four all looked like the same failure — a hand dealt,
+somebody to act, then `hand #N is over` with no action and no clock in between.
+The table was playing perfectly well. **The log was broken.**
+
+`AppState::note` pops the front when the log is at its five-hundred-line cap
+and pushes the new line, so `log.len()` does not change — and the headless
+client worked out what was new by comparing `log.len()` before and after
+applying an event. Once five hundred lines had gone by, which is a few minutes
+of an ordinary lobby, every line routed through `note` stopped being printed.
+That is every `Warning`, including *"your clock ran out"*.
+
+Two runs of seven hands each were already in those logs and unreadable.
+
+The lesson is worth keeping: **a diagnostic that is derived from a bounded
+buffer's length is not a diagnostic.** `AppState::emitted` counts lines ever
+written and the printer uses that. Three of the hand handlers were also pushing
+to the log directly rather than through `note`, so those lines bypassed the cap
+and the log grew without bound; both halves of the defect were in the same
+place.
 
 ### The buttons, the next hand and the clock
 
