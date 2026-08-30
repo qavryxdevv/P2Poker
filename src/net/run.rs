@@ -355,9 +355,12 @@ pub async fn run(
     // arrivals is one publish rather than one each.
     let mut last_lobby_shout: Option<tokio::time::Instant> = None;
 
-    // Whether this client is at a table. Drives `dht_effort`, and stops the
-    // lobby being polled by somebody who is not reading it.
-    let mut at_a_table = false;
+    // Whether the table this client is at has closed to newcomers. Drives
+    // `dht_effort`, stops the lobby being polled by somebody who is not reading
+    // it, and stops the advertisement of a table nobody can join.
+    let mut table_closed = false;
+    // A tournament that has once been full has started, and does not reopen.
+    let mut tournament_started = false;
     let mut have_reservation = false;
     // Counted so that "no relay" is reported as a finding rather than as
     // impatience: three cycles is three minutes of looking.
@@ -553,8 +556,11 @@ pub async fn run(
                                                 key: f.table_id(),
                                                 session,
                                             }).await;
-                                            at_a_table = true;
-                                            dht_effort(&mut swarm, true);
+                                            // Only once every seat is taken.
+                                            // A table that is still filling
+                                            // must stay as findable as it was.
+                                            table_closed = table_is_closed(f, &mut tournament_started);
+                                            dht_effort(&mut swarm, table_closed);
                                         }
                                     }
                                     Err(e) => {
@@ -590,7 +596,8 @@ pub async fn run(
                                     }
                                     Err(e) => {
                                         table = None;
-                                        at_a_table = false;
+                                        table_closed = false;
+                        tournament_started = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -610,7 +617,8 @@ pub async fn run(
                         if let Some(t) = table_topic.take() {
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
-                        at_a_table = false;
+                        table_closed = false;
+                        tournament_started = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -1145,6 +1153,17 @@ pub async fn run(
             }
 
             _ = discover_timer.tick() => {
+                // The roster moves between ticks - somebody sits, somebody
+                // stands - so the answer is recomputed rather than remembered
+                // from the moment it first became true.
+                let closed = table
+                    .as_ref()
+                    .is_some_and(|f| table_is_closed(f, &mut tournament_started));
+                if closed != table_closed {
+                    table_closed = closed;
+                    dht_effort(&mut swarm, closed);
+                }
+
                 // The public lobby: announce, then read.
                 //
                 // **Announce only with an address to announce.** A provider
@@ -1157,7 +1176,7 @@ pub async fn run(
                 // has never heard of it.
                 // Not while seated: the lobby is a screen this player is not
                 // looking at, and each read is a Kademlia walk.
-                if asked_public_dht && !at_a_table {
+                if asked_public_dht && !table_closed {
                     let reachable_here = swarm.external_addresses().next().is_some();
                     if reachable_here && !in_public_lobby {
                         match swarm.behaviour_mut().ipfs_kad.start_providing(lobby_namespace())
@@ -1436,7 +1455,8 @@ pub async fn run(
                                 swarm.behaviour_mut().join.send_request(&founder, request);
                             }
                             Err(e) => {
-                                at_a_table = false;
+                                table_closed = false;
+                        tournament_started = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -1464,7 +1484,8 @@ pub async fn run(
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
                         table = None;
-                        at_a_table = false;
+                        table_closed = false;
+                        tournament_started = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
@@ -1489,7 +1510,14 @@ pub async fn run(
                 // was refused with "the advertisement has expired", which is the
                 // defect the first two-instance run found and which no unit test
                 // could have, because it needs thirty seconds to appear.
-                if let Some(f) = table.as_mut().filter(|f| f.is_founder()) {
+                // Not a table that has closed. A full tournament under way has
+                // nobody to attract - it is a closed group now - and a lobby
+                // listing it is a lobby listing a door that does not open.
+                if let Some(f) = table
+                    .as_mut()
+                    .filter(|f| f.is_founder())
+                    .filter(|_| !table_closed)
+                {
                     match f.readvertise(now, AD_TTL_MS) {
                         Ok(bytes) => {
                             let n = bytes.len();
@@ -1902,6 +1930,30 @@ fn dht_effort(swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>, at_a_tabl
         // server here would make a NATed client claim to serve queries it
         // cannot be reached for.
         kad.set_mode(None);
+    }
+}
+
+/// Whether the table has stopped being open to anybody.
+///
+/// **Not "the roster ratified".** That was the first version and it was wrong:
+/// a Sit-and-Go ratifies the roster it has, which for a table still filling is
+/// two players out of ten, and a table that goes quiet while it is waiting is a
+/// table nobody can find to join. The signal is that every seat is taken.
+///
+/// **And for a tournament it latches.** A Sit-and-Go that has been full has
+/// started, and a seat that frees afterwards is somebody who busted, not a seat
+/// on offer — so it must not go back on the market. A cash table is the
+/// opposite: people arrive and leave between hands, and a free seat is exactly
+/// what it wants to advertise. `latched` carries the tournament's answer; the
+/// cash answer is computed fresh every time.
+fn table_is_closed(f: &Formation, latched: &mut bool) -> bool {
+    let full = f.session().is_some() && f.roster().len() as u8 >= f.advert().max_players;
+    let tournament = f.advert().mode == super::lobby::Mode::TournamentSngPlayMoney.code();
+    if tournament {
+        *latched |= full;
+        *latched
+    } else {
+        full
     }
 }
 
