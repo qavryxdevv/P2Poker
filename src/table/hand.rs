@@ -44,15 +44,21 @@ use crate::mental_poker::deck::{CardIndex, DeckIndexMap};
 use crate::mental_poker::protocol::{Ciphertext, CtxFields, DeckCtx, DeckWire, Final,
     ProofPosition, Verified};
 use crate::mental_poker::shuffle::{ChainParams, ShuffleChain, StepError};
-use crate::poker::engine::{initial_positions, Positions};
-use crate::poker::state::Card;
+use crate::poker::actions::{Action, BettingRound, Illegal, LegalActions};
+use crate::poker::engine::{
+    betting_is_closed, first_to_act, initial_positions, next_to_act, only_one_live, post_blinds,
+    round_complete, Positions,
+};
+use crate::poker::state::{Card, Chips, Street};
 use crate::protocol::serialization::h;
 use crate::protocol::signatures::Domain;
 use crate::protocol::transcript::stage_hash_single;
 
+use crate::mental_poker::reveal::RevealStage;
+
 use super::dealing::{self, Dealing, Identity, Refused, Share};
-use super::handwire::{DealPrivate, DeckCommit, DeckInit, HandInit, NotOurs, RevealEntry,
-    ShuffleProof, ShuffleStep};
+use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, BoardReveal,
+    DealPrivate, DeckCommit, DeckInit, HandInit, NotOurs, RevealEntry, ShuffleProof, ShuffleStep};
 use super::stage::{Collective, Heard};
 
 /// What a step wants sent.
@@ -101,6 +107,20 @@ pub enum Failed {
     /// A reveal contribution was not what the stage required, or its proof did
     /// not verify against the committed deck.
     BadToken { seat: SeatIdx, why: &'static str },
+    /// A seat offered an action the rules do not allow.
+    ///
+    /// Attributable and never corrected: `PROTOCOL.md` §4.7 is explicit that an
+    /// illegal action *"is not a state transition, and it never becomes one"*.
+    /// The receiver does not clamp a raise to the minimum or turn a check into
+    /// a call; it refuses the message and names who signed it.
+    Illegal { seat: SeatIdx, what: Illegal },
+    /// The action names a street or a position in the hand that is not the one
+    /// this client's engine is at.
+    ///
+    /// Separate from an illegal action because it is a different accusation: the
+    /// action might be perfectly legal somewhere else in the hand, and what is
+    /// wrong is *where the sender thinks it is*.
+    Elsewhere { seat: SeatIdx, what: &'static str },
     /// Every share verified and the product is still not a card.
     ///
     /// Not attributable to anybody: it means the argument's soundness failed,
@@ -134,6 +154,10 @@ impl std::fmt::Display for Failed {
                 write!(f, "seat {seat} holds a different {what}")
             }
             Self::BadToken { seat, why } => write!(f, "seat {seat}'s reveal: {why}"),
+            Self::Illegal { seat, what } => write!(f, "seat {seat} cannot do that: {what:?}"),
+            Self::Elsewhere { seat, what } => {
+                write!(f, "seat {seat} is acting as though {what}")
+            }
             Self::Unsound { index, what } => {
                 write!(f, "card {index} could not be opened: {what}")
             }
@@ -263,6 +287,12 @@ pub const DECK_COMMIT_CAP: usize = 160;
 /// derived from the seat count of whatever table happens to be running.
 pub const DEAL_PRIVATE_CAP: usize = 4_096;
 
+/// The cap on any betting action: three small numbers, and at most one more.
+pub const ACTION_CAP: usize = 64;
+
+/// The cap on a `BOARD_REVEAL` body: a street code and at most three entries.
+pub const BOARD_REVEAL_CAP: usize = 1_024;
+
 /// How far this hand has got.
 ///
 /// One variant per stage, each carrying only what that stage needs, so a stage
@@ -329,13 +359,98 @@ enum Phase {
         /// `m-1` of `m` opens nothing (`PROTOCOL.md` §3.4).
         dealing: Box<Dealing>,
     },
-    /// This client holds its two cards.
-    Holding {
+    /// The cards are out and the hand is being played: betting, the board,
+    /// the showdown, the settlement.
+    ///
+    /// **One variant, not four.** Every stage from here to the end of the hand
+    /// needs the same things — the round to judge the next action, what each
+    /// seat has already paid to build the pots, every seat's shares to open a
+    /// hand at showdown — so four variants would either repeat all of it or box
+    /// it into exactly the struct below. The [`Step`] inside says which stage is
+    /// open, and nothing outside `Play` reads it.
+    Playing {
         deal: Deal,
         table: Table,
-        dealing: Box<Dealing>,
-        cards: [Card; 2],
+        /// Boxed for the reason `ShuffleChain` is: `Play` carries `2m + 5` token
+        /// sets and a `BettingRound`, and an unboxed variant would make
+        /// `Phase::Init` that big too.
+        play: Box<Play>,
     },
+}
+
+/// Everything the hand needs once the cards are out.
+///
+/// Nothing in here is a local quantity. Every field is a pure function of
+/// `HandInit` — which every seat compared byte for byte at stage 0 — and of the
+/// chained events accepted since. That is what makes two peers derive the same
+/// betting state from the same transcript, and it is why [`Hand::act`] applies
+/// this client's own action through the same `BettingRound::apply` that a
+/// peer's goes through: one predicate, so the two cannot disagree.
+pub struct Play {
+    /// Every share of every card of the hand. Also owns the deck-index map's
+    /// second copy and the board as it opens.
+    dealing: Box<Dealing>,
+
+    /// `max_players` long, `true` for a seat in `HandInit::dealt_in`. The engine
+    /// takes `&DealtIn` on every call and this is it, built once.
+    dealt: Vec<bool>,
+
+    /// The betting round now open. Its `committed` is **this street only**; the
+    /// hand total of seat `s` is `paid[s] + round.committed[s]`.
+    round: BettingRound,
+
+    /// What each seat committed on the streets already closed.
+    ///
+    /// The engine does not hold this — `BettingRound::committed` is per round —
+    /// and `build_pots` needs the per-hand total, so somebody has to carry it.
+    /// Written in exactly one place, where a round closes.
+    paid: Vec<Chips>,
+
+    street: Street,
+
+    /// The last seat to bet or raise in the last betting round that actually
+    /// ran. `poker::actions` deliberately does not track it
+    /// (`src/poker/actions.rs:113`) — its legality predicate has no use for one.
+    ///
+    /// The showdown order is the one place its identity changes what happens
+    /// (D-021): the last aggressor shows first. It is cleared when a round
+    /// **opens**, never when a street is skipped, which is what makes it the
+    /// right seat after an all-in run-out where the last streets had no betting.
+    aggressor: Option<SeatIdx>,
+
+    /// `PROTOCOL.md` §4.7's `action_index`: how many actions this hand has
+    /// accepted, this client's own included.
+    actions: u32,
+
+    /// This client's own two, opened when `DEAL_PRIVATE` completed.
+    cards: [Card; 2],
+
+    step: Step,
+}
+
+/// Which stage of the played-out hand is open.
+enum Step {
+    /// A single-writer betting stage (`PROTOCOL.md` §4.7). `to_act` owes one of
+    /// the five action events at the sequence now open.
+    ///
+    /// **The event type is read from the event here, not from this state**, and
+    /// that is deliberately the opposite of the shuffle chain's rule. There two
+    /// types alternate deterministically and reading the sender's claim would
+    /// let a proof be taken for a step; here five types are all legal at one
+    /// sequence and *which one arrives is the entire content of the message*.
+    Acting { to_act: SeatIdx },
+
+    /// A collective `BOARD_REVEAL` for `street` (`PROTOCOL.md` §4.6).
+    ///
+    /// Every dealt-in seat contributes, folded and all-in seats included. That
+    /// is the price of `n`-of-`n` and it is §4.6's own sentence: a folded player
+    /// holds a key share until the hand ends, and a folded player who goes
+    /// silent stalls the hand exactly as an active one would.
+    Opening { street: Street, stage: Collective },
+
+    /// The betting is over and the hand is waiting for the showdown or the
+    /// settlement. Not yet built.
+    Ended,
 }
 
 /// The deck every stage from `DECK_COMMIT` onwards is about.
@@ -520,6 +635,12 @@ impl Hand {
                 | EventType::ShuffleProof
                 | EventType::DeckCommit
                 | EventType::DealPrivate
+                | EventType::BoardReveal
+                | EventType::ActionCheck
+                | EventType::ActionCall
+                | EventType::ActionBet
+                | EventType::ActionRaise
+                | EventType::ActionFold
         ) {
             return Err(Failed::Wire(WireError::WrongType));
         }
@@ -550,8 +671,13 @@ impl Hand {
                 }
             }
             Phase::Committing { .. } => self.on_deck_commit(bytes, key, now_ms),
-            Phase::Dealing { .. } => self.on_deal_private(bytes),
-            Phase::Holding { .. } | Phase::Between => Err(Failed::NothingFurther),
+            Phase::Dealing { .. } => self.on_deal_private(bytes, key, now_ms),
+            Phase::Playing { ref play, .. } => match play.step {
+                Step::Acting { .. } => self.on_action(bytes, kind, key, now_ms),
+                Step::Opening { .. } => self.on_board_reveal(bytes, key, now_ms),
+                Step::Ended => Err(Failed::NothingFurther),
+            },
+            Phase::Between => Err(Failed::NothingFurther),
         }
     }
 
@@ -1174,7 +1300,12 @@ impl Hand {
         Ok(vec![Send::Broadcast(bytes)])
     }
 
-    fn on_deal_private(&mut self, bytes: &[u8]) -> Result<Vec<Send>, Failed> {
+    fn on_deal_private(
+        &mut self,
+        bytes: &[u8],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::DealPrivate)?;
         let seat = self.seat_of(&opened.sender)?;
         let body: DealPrivate =
@@ -1270,11 +1401,15 @@ impl Hand {
         }
         let parent = stage.hash().expect("a complete stage has one");
         self.slot = self.slot.then(parent);
-        self.read_my_cards()
+        self.read_my_cards(key, now_ms)
     }
 
     /// Every share is in: open this client's two cards.
-    fn read_my_cards(&mut self) -> Result<Vec<Send>, Failed> {
+    fn read_my_cards(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
         let taken = std::mem::replace(&mut self.phase, Phase::Between);
         let Phase::Dealing {
             deal,
@@ -1299,13 +1434,531 @@ impl Hand {
             cards.push(card);
         }
         let cards: [Card; 2] = cards.try_into().map_err(|_| Failed::NotInThisStage)?;
-        self.phase = Phase::Holding {
+
+        let n = usize::from(self.open.max_players);
+        let mut dealt = vec![false; n];
+        let mut stack = vec![0 as Chips; n];
+        for (seat, _, chips) in &self.open.seats {
+            let Some(slot) = stack.get_mut(usize::from(*seat)) else {
+                return Err(Failed::NotAtThisTable);
+            };
+            *slot = *chips;
+        }
+        for seat in &self.mine.dealt_in {
+            let Some(slot) = dealt.get_mut(usize::from(*seat)) else {
+                return Err(Failed::NotAtThisTable);
+            };
+            *slot = true;
+        }
+
+        let mut play = Play {
+            dealing,
+            round: BettingRound {
+                big_blind: self.mine.big_blind,
+                current_bet: 0,
+                last_full_raise: self.mine.big_blind,
+                committed: vec![0; n],
+                stack,
+                acted: vec![false; n],
+                // A seat that is not dealt in is `folded` from the start. The
+                // engine has one predicate for "cannot act", and this is how a
+                // seat that was never in the hand enters it.
+                folded: dealt.iter().map(|d| !d).collect(),
+            },
+            dealt,
+            paid: vec![0; n],
+            street: Street::PreFlop,
+            aggressor: None,
+            actions: 0,
+            cards,
+            step: Step::Ended,
+        };
+
+        // Pre-flop, and only pre-flop, the blinds go in before anybody acts.
+        // They are not actions: `post_blinds` leaves `acted` false for both,
+        // which is what gives the big blind its option without a rule for it.
+        post_blinds(
+            &mut play.round,
+            self.mine.sb_position,
+            self.mine.bb_seat,
+            self.mine.small_blind,
+            self.mine.big_blind,
+        );
+        self.phase = Phase::Playing {
             deal,
             table,
-            dealing,
-            cards,
+            play: Box::new(play),
         };
-        Ok(Vec::new())
+        self.open_betting(Street::PreFlop, key, now_ms)
+    }
+
+    /// Open the betting for a street, or skip past it if nobody can act.
+    ///
+    /// The skip is not an optimisation. When every remaining seat is all in
+    /// there is no decision left to make and no message anybody could send, so
+    /// a street that waited for one would wait for ever. The board still opens;
+    /// only the betting is skipped.
+    fn open_betting(
+        &mut self,
+        street: Street,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let button = self.mine.button_position;
+        let bb_seat = self.mine.bb_seat;
+        let seat_count = self.open.max_players;
+        let up = {
+            let Phase::Playing { play, .. } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            play.street = street;
+            // Cleared when a round **opens**. A street skipped in a run-out
+            // leaves the previous street's aggressor standing, which is the
+            // seat that must show first at the showdown (D-021).
+            play.aggressor = None;
+            if betting_is_closed(&play.round, &play.dealt) {
+                None
+            } else {
+                first_to_act(street, &play.round, &play.dealt, button, bb_seat, seat_count)
+            }
+        };
+        match up {
+            Some(to_act) => {
+                let Phase::Playing { play, .. } = &mut self.phase else {
+                    return Err(Failed::NothingFurther);
+                };
+                play.step = Step::Acting { to_act };
+                Ok(Vec::new())
+            }
+            // Nobody can act. Either every remaining seat is all in — the
+            // run-out, where the board still opens and only the betting is
+            // skipped — or all but one has folded, which `close_round_and_open`
+            // recognises and ends the hand on. Ending it here instead would
+            // freeze an all-in hand with the board unfinished.
+            None => self.close_round_and_open(key, now_ms),
+        }
+    }
+
+    /// This client's own action, from the player.
+    ///
+    /// The second entry point, and the only one: every other stage of the hand
+    /// is driven by an arriving event, and this is the one that waits for a
+    /// human. It applies the action through `BettingRound::apply` — the **same**
+    /// predicate a receiver runs — so this client cannot send itself something
+    /// a receiver would refuse.
+    pub fn act(
+        &mut self,
+        action: Action,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let me = self.open.my_seat;
+        let (kind, body) = {
+            let Phase::Playing { play, .. } = &self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            let Step::Acting { to_act } = play.step else {
+                return Err(Failed::Elsewhere {
+                    seat: me,
+                    what: "a betting stage were open",
+                });
+            };
+            if to_act != me {
+                return Err(Failed::OutOfTurn {
+                    seat: me,
+                    expected: Some(to_act),
+                });
+            }
+            let head = ActionHead {
+                street: street_code(play.street),
+                seat: me,
+                action_index: play.actions,
+            };
+            let kind = match action {
+                Action::Fold => EventType::ActionFold,
+                Action::Check => EventType::ActionCheck,
+                Action::Call => EventType::ActionCall,
+                Action::Bet(_) => EventType::ActionBet,
+                Action::Raise(_) => EventType::ActionRaise,
+            };
+            let body = match action {
+                Action::Bet(total) | Action::Raise(total) => Body::Amount(ActionAmount {
+                    street: head.street,
+                    seat: head.seat,
+                    action_index: head.action_index,
+                    total,
+                }),
+                _ => Body::Head(head),
+            };
+            (kind, body)
+        };
+
+        let bytes = match &body {
+            Body::Head(h) => self.say(kind, h, ACTION_CAP, key, now_ms)?,
+            Body::Amount(a) => self.say(kind, a, ACTION_CAP, key, now_ms)?,
+        };
+        let hash = self.opened(&bytes, kind)?.event_hash;
+        let mut out = vec![Send::Broadcast(bytes)];
+        out.append(&mut self.apply_action(me, action, kind, hash, key, now_ms)?);
+        Ok(out)
+    }
+
+    /// One betting action off the wire.
+    fn on_action(
+        &mut self,
+        bytes: &[u8],
+        kind: EventType,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, kind)?;
+        let seat = self.seat_of(&opened.sender)?;
+
+        let (head, action) = match kind {
+            EventType::ActionBet | EventType::ActionRaise => {
+                let a: ActionAmount =
+                    chained::payload(&opened, ACTION_CAP).map_err(Failed::Wire)?;
+                let act = if kind == EventType::ActionBet {
+                    Action::Bet(a.total)
+                } else {
+                    Action::Raise(a.total)
+                };
+                (a.head(), act)
+            }
+            _ => {
+                let h: ActionHead =
+                    chained::payload(&opened, ACTION_CAP).map_err(Failed::Wire)?;
+                let act = match kind {
+                    EventType::ActionFold => Action::Fold,
+                    EventType::ActionCheck => Action::Check,
+                    _ => Action::Call,
+                };
+                (h, act)
+            }
+        };
+
+        {
+            let Phase::Playing { play, .. } = &self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            let Step::Acting { to_act } = play.step else {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "a betting stage were open",
+                });
+            };
+            if to_act != seat {
+                return Err(Failed::OutOfTurn {
+                    seat,
+                    expected: Some(to_act),
+                });
+            }
+            // The envelope already proved who signed it. These three fields say
+            // where the *sender* believes the hand is, and a disagreement means
+            // two engines have diverged rather than that anybody lied — which
+            // is why they are on the wire at all.
+            if head.seat != seat {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "it were another seat",
+                });
+            }
+            if street_from_code(head.street) != Some(play.street) {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "the hand were on another street",
+                });
+            }
+            if head.action_index != play.actions {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "a different number of actions had been taken",
+                });
+            }
+        }
+        self.apply_action(seat, action, kind, opened.event_hash, key, now_ms)
+    }
+
+    /// Apply an action that has been checked into place, and move the hand on.
+    fn apply_action(
+        &mut self,
+        seat: SeatIdx,
+        action: Action,
+        kind: EventType,
+        event_hash: Hash,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let seat_count = self.open.max_players;
+        {
+            let Phase::Playing { play, .. } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            // The engine, and nothing else, decides whether this was legal. An
+            // illegal action is refused and never corrected: `PROTOCOL.md` §4.7
+            // says it "is not a state transition, and it never becomes one".
+            play.round
+                .apply(seat, action)
+                .map_err(|what| Failed::Illegal { seat, what })?;
+            if matches!(action, Action::Bet(_) | Action::Raise(_)) {
+                play.aggressor = Some(seat);
+            }
+            play.actions = play.actions.saturating_add(1);
+        }
+
+        // A betting stage is single-writer, so its hash is fixed the moment its
+        // one writer has been heard.
+        self.slot = self.slot.then(stage_hash_single(
+            self.slot.sequence,
+            kind.code(),
+            seat,
+            event_hash,
+        ));
+
+        let next = {
+            let Phase::Playing { play, .. } = &self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            if only_one_live(&play.round, &play.dealt) || round_complete(&play.round, &play.dealt) {
+                None
+            } else {
+                next_to_act(&play.round, &play.dealt, seat, seat_count)
+            }
+        };
+        match next {
+            Some(to_act) => {
+                let Phase::Playing { play, .. } = &mut self.phase else {
+                    return Err(Failed::NothingFurther);
+                };
+                play.step = Step::Acting { to_act };
+                Ok(Vec::new())
+            }
+            None => self.close_round_and_open(key, now_ms),
+        }
+    }
+
+    /// The betting round is over: bank what was committed, then open the board.
+    fn close_round_and_open(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let next = {
+            let Phase::Playing { play, .. } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            // Everything committed this street joins the hand total, and the
+            // round resets for the next one. This is the only place `paid` is
+            // written, and `paid[s] + round.committed[s]` is what `build_pots`
+            // will want — the engine holds only the per-round half.
+            for seat in 0..play.paid.len() {
+                play.paid[seat] += play.round.committed[seat];
+                play.round.committed[seat] = 0;
+                play.round.acted[seat] = false;
+            }
+            play.round.current_bet = 0;
+            play.round.last_full_raise = play.round.big_blind;
+
+            // Everybody but one has folded. No card needs opening, whatever
+            // street it is: there is nothing left to compare.
+            if only_one_live(&play.round, &play.dealt) {
+                play.step = Step::Ended;
+                return Ok(Vec::new());
+            }
+            play.street.next()
+        };
+        match next {
+            Some(street) => self.open_board(street, key, now_ms),
+            // The river's betting closed. The showdown is the next stage.
+            None => {
+                let Phase::Playing { play, .. } = &mut self.phase else {
+                    return Err(Failed::NothingFurther);
+                };
+                play.step = Step::Ended;
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// The indices one street opens.
+    fn street_indices(map: &DeckIndexMap, street: Street) -> Vec<CardIndex> {
+        match street {
+            Street::PreFlop => Vec::new(),
+            Street::Flop => map.flop().to_vec(),
+            Street::Turn => vec![map.turn()],
+            Street::River => vec![map.river()],
+        }
+    }
+
+    /// Open a `BOARD_REVEAL` stage for a street and publish this client's part.
+    fn open_board(
+        &mut self,
+        street: Street,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let me = self.open.my_seat;
+        let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
+        let my_key = *self
+            .keys_by_seat(me)
+            .ok_or(Failed::NotInThisStage)?;
+
+        let entries = {
+            let Phase::Playing { deal, table, play } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            // The reveal stage moves first, or the shares for this street are
+            // not yet due and `own_share` refuses them. `advance` never moves
+            // backwards, which is what keeps a late message from reopening an
+            // earlier street.
+            play.dealing.advance(RevealStage::Betting(street));
+            let identity = Identity {
+                seat: me,
+                key: &my_key,
+                secret: &deal.secret,
+            };
+            let mut entries = Vec::new();
+            for index in Self::street_indices(&table.map, street) {
+                let (token, proof) = play
+                    .dealing
+                    .own_share(&deal.as_ref(table), &identity, index, &ctx)
+                    .map_err(|e| refused(me, e))?;
+                entries.push(RevealEntry {
+                    deck_index: index.get(),
+                    token: token.encode(),
+                    proof: proof.encode(),
+                });
+            }
+            entries
+        };
+
+        let body = BoardReveal {
+            street: street_code(street),
+            entries,
+        };
+        let bytes = self.say(EventType::BoardReveal, &body, BOARD_REVEAL_CAP, key, now_ms)?;
+        let hash = self.opened(&bytes, EventType::BoardReveal)?.event_hash;
+        let mut stage = Collective::closed(
+            self.slot.sequence,
+            EventType::BoardReveal.code(),
+            &self.mine.dealt_in,
+        )
+        .ok_or(Failed::NotInThisStage)?;
+        stage.hear(me, hash);
+
+        let Phase::Playing { play, .. } = &mut self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+        play.step = Step::Opening { street, stage };
+        Ok(vec![Send::Broadcast(bytes)])
+    }
+
+    /// One seat's contribution to a street's board cards.
+    fn on_board_reveal(
+        &mut self,
+        bytes: &[u8],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, EventType::BoardReveal)?;
+        let seat = self.seat_of(&opened.sender)?;
+        let body: BoardReveal =
+            chained::payload(&opened, BOARD_REVEAL_CAP).map_err(Failed::Wire)?;
+        let ctx = self.deck_ctx(&opened.sender);
+        let me = self.open.my_seat;
+
+        let street = {
+            let Phase::Playing { deal, table, play } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            let Step::Opening { street, stage } = &mut play.step else {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "a board stage were open",
+                });
+            };
+            let street = *street;
+            if stage.heard(seat) == Some(opened.event_hash) {
+                return Ok(Vec::new());
+            }
+            if street_from_code(body.street) != Some(street) {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "another street were opening",
+                });
+            }
+            let wanted: Vec<u8> = Self::street_indices(&table.map, street)
+                .into_iter()
+                .map(|i| i.get())
+                .collect();
+            if body.entries.iter().map(|e| e.deck_index).collect::<Vec<_>>() != wanted {
+                return Err(Failed::BadToken {
+                    seat,
+                    why: "not exactly this street's indices",
+                });
+            }
+            for entry in &body.entries {
+                let index = table
+                    .map
+                    .index_from_wire(entry.deck_index)
+                    .ok_or(Failed::BadToken {
+                        seat,
+                        why: "an index this hand gave no role to",
+                    })?;
+                let token = WireToken::decode(&entry.token).map_err(|_| Failed::BadToken {
+                    seat,
+                    why: "the share is not a point on the curve",
+                })?;
+                let proof =
+                    WireTokenProof::decode(&entry.proof).map_err(|_| Failed::BadToken {
+                        seat,
+                        why: "the proof is not well formed",
+                    })?;
+                play.dealing
+                    .accept(
+                        &deal.as_ref(table),
+                        me,
+                        &Share {
+                            from: seat,
+                            index,
+                            token,
+                            proof: &proof,
+                        },
+                        &ctx,
+                    )
+                    .map_err(|e| refused(seat, e))?;
+            }
+            match stage.hear(seat, opened.event_hash) {
+                Heard::Counted | Heard::Bystander | Heard::Again => {}
+                Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
+                Heard::Uninvited => return Err(Failed::NotInThisStage),
+            }
+            if !stage.complete() {
+                return Ok(Vec::new());
+            }
+            street
+        };
+
+        // Every share is in: the cards come out, and only now.
+        let parent = {
+            let Phase::Playing { deal, table, play } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            for index in Self::street_indices(&table.map, street) {
+                play.dealing
+                    .open(&deal.as_ref(table), index)
+                    .map_err(|_| Failed::BadToken {
+                        seat: me,
+                        why: "the board stage completed without every share",
+                    })?;
+            }
+            let Step::Opening { stage, .. } = &play.step else {
+                return Err(Failed::NothingFurther);
+            };
+            stage.hash().ok_or(Failed::NotInThisStage)?
+        };
+        self.slot = self.slot.then(parent);
+        self.open_betting(street, key, now_ms)
     }
 
     /// Seal one body into the stage now open.
@@ -1345,6 +1998,17 @@ impl Hand {
             position: ProofPosition::NotAShuffleStep,
             sender_public_key: *sender,
         })
+    }
+
+    /// This client's verified key for the seat, wherever the phase keeps it.
+    fn keys_by_seat(&self, seat: SeatIdx) -> Option<&VerifiedKey> {
+        match &self.phase {
+            Phase::Shuffling { deal, .. }
+            | Phase::Committing { deal, .. }
+            | Phase::Dealing { deal, .. }
+            | Phase::Playing { deal, .. } => deal.key_of(seat),
+            _ => None,
+        }
     }
 
     fn seat_index(&self) -> usize {
@@ -1437,7 +2101,7 @@ impl Hand {
     pub fn shuffled(&self) -> bool {
         matches!(
             self.phase,
-            Phase::Committing { .. } | Phase::Dealing { .. } | Phase::Holding { .. }
+            Phase::Committing { .. } | Phase::Dealing { .. } | Phase::Playing { .. }
         )
     }
 
@@ -1449,14 +2113,69 @@ impl Hand {
     /// show. §22 is kept by there being no card rather than by a check.
     pub fn cards(&self) -> Option<[Card; 2]> {
         match &self.phase {
-            Phase::Holding { cards, .. } => Some(*cards),
+            Phase::Playing { play, .. } => Some(play.cards),
             _ => None,
         }
     }
 
     /// Whether this client is holding its hole cards.
     pub fn dealt_cards(&self) -> bool {
-        matches!(self.phase, Phase::Holding { .. })
+        matches!(self.phase, Phase::Playing { .. })
+    }
+
+    /// Whose turn it is, and everything a table window needs to draw it.
+    ///
+    /// Handed out whole rather than as six accessors, because a window that
+    /// read `legal` on one frame and `to_call` on the next could draw a button
+    /// for an action that is no longer offered. One call, one consistent
+    /// answer.
+    pub fn turn(&self) -> Option<Turn> {
+        let Phase::Playing { play, .. } = &self.phase else {
+            return None;
+        };
+        let Step::Acting { to_act } = play.step else {
+            return None;
+        };
+        Some(Turn {
+            seat: to_act,
+            mine: to_act == self.open.my_seat,
+            street: play.street,
+            to_call: play.round.to_call(to_act),
+            legal: play.round.legal(to_act)?,
+            pot: play.pot(),
+        })
+    }
+
+    /// The street the hand is on, once it is being played.
+    pub fn street(&self) -> Option<Street> {
+        match &self.phase {
+            Phase::Playing { play, .. } => Some(play.street),
+            _ => None,
+        }
+    }
+
+    /// Everything committed to the pot so far this hand, every street.
+    pub fn pot(&self) -> Chips {
+        match &self.phase {
+            Phase::Playing { play, .. } => play.pot(),
+            _ => 0,
+        }
+    }
+
+    /// What each seat has behind, by seat.
+    pub fn stacks(&self) -> Vec<Chips> {
+        match &self.phase {
+            Phase::Playing { play, .. } => play.round.stack.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Which seats have folded, by seat.
+    pub fn folded(&self) -> Vec<bool> {
+        match &self.phase {
+            Phase::Playing { play, .. } => play.round.folded.clone(),
+            _ => Vec::new(),
+        }
     }
 
     /// The board, as far as it has been opened.
@@ -1467,9 +2186,17 @@ impl Hand {
     /// itself.
     pub fn board(&self) -> Vec<Card> {
         match &self.phase {
-            Phase::Holding { dealing, .. } => dealing.board(),
+            Phase::Playing { play, .. } => play.dealing.board(),
             _ => Vec::new(),
         }
+    }
+
+    /// Whether the betting is over and the hand is waiting to be settled.
+    pub fn betting_over(&self) -> bool {
+        matches!(
+            &self.phase,
+            Phase::Playing { play, .. } if matches!(play.step, Step::Ended)
+        )
     }
 
     /// Which seats are still owed for the stage now open, by seat.
@@ -1480,9 +2207,8 @@ impl Hand {
         -> Option<Vec<SeatIdx>>
     {
         match &self.phase {
-            Phase::Dealing { dealing, .. } | Phase::Holding { dealing, .. } => {
-                dealing.outstanding(index)
-            }
+            Phase::Dealing { dealing, .. } => dealing.outstanding(index),
+            Phase::Playing { play, .. } => play.dealing.outstanding(index),
             _ => None,
         }
     }
@@ -1505,7 +2231,7 @@ impl Hand {
             // seats on screen that owe the table nothing.
             Phase::Shuffling { chain, .. } => chain.whose_turn().into_iter().collect(),
             Phase::Committing { stage, .. } | Phase::Dealing { stage, .. } => stage.waiting_for(),
-            Phase::Holding { .. } | Phase::Between => Vec::new(),
+            Phase::Playing { .. } | Phase::Between => Vec::new(),
         }
     }
 
@@ -1527,7 +2253,7 @@ impl Hand {
             Phase::Shuffling { deal, .. }
             | Phase::Committing { deal, .. }
             | Phase::Dealing { deal, .. }
-            | Phase::Holding { deal, .. } => Some(&deal.secret),
+            | Phase::Playing { deal, .. } => Some(&deal.secret),
             Phase::Init(_) | Phase::Between => None,
         }
     }
@@ -1538,7 +2264,7 @@ impl Hand {
             Phase::Shuffling { deal, .. }
             | Phase::Committing { deal, .. }
             | Phase::Dealing { deal, .. }
-            | Phase::Holding { deal, .. } => Some(&deal.deck),
+            | Phase::Playing { deal, .. } => Some(&deal.deck),
             _ => None,
         }
     }
@@ -1550,7 +2276,7 @@ impl Hand {
             Phase::Shuffling { deal, .. }
             | Phase::Committing { deal, .. }
             | Phase::Dealing { deal, .. }
-            | Phase::Holding { deal, .. } => &deal.keys,
+            | Phase::Playing { deal, .. } => &deal.keys,
             Phase::Init(_) | Phase::Between => &[],
         }
     }
@@ -1560,7 +2286,7 @@ impl Hand {
         match &self.phase {
             Phase::Committing { table, .. }
             | Phase::Dealing { table, .. }
-            | Phase::Holding { table, .. } => Some(&table.deck),
+            | Phase::Playing { table, .. } => Some(&table.deck),
             _ => None,
         }
     }
@@ -1570,7 +2296,7 @@ impl Hand {
         match &self.phase {
             Phase::Committing { table, .. }
             | Phase::Dealing { table, .. }
-            | Phase::Holding { table, .. } => Some(&table.map),
+            | Phase::Playing { table, .. } => Some(&table.map),
             _ => None,
         }
     }
@@ -1685,6 +2411,41 @@ fn refused(seat: SeatIdx, e: Refused) -> Failed {
             why: "an index this hand gave no role to",
         },
     }
+}
+
+impl Play {
+    /// Everything committed this hand, across every street.
+    ///
+    /// `paid` holds the closed streets and `round.committed` the open one; the
+    /// engine keeps only the second, which is why the first exists here.
+    fn pot(&self) -> Chips {
+        self.paid.iter().chain(self.round.committed.iter()).sum()
+    }
+}
+
+/// Whose turn it is and what they may do.
+///
+/// Every field is derived from the same `BettingRound` the receiver of the
+/// action will run, so a window cannot offer something a peer would refuse.
+pub struct Turn {
+    pub seat: SeatIdx,
+    /// Whether that seat is this client's.
+    pub mine: bool,
+    pub street: Street,
+    /// What this seat owes to match the current bet.
+    pub to_call: Chips,
+    pub legal: LegalActions,
+    /// Everything committed this hand so far.
+    pub pot: Chips,
+}
+
+/// Which of the two action bodies is being sealed.
+///
+/// `say` is generic over the body, so the two cannot be one variable without a
+/// trait object. This is the alternative, named.
+enum Body {
+    Head(ActionHead),
+    Amount(ActionAmount),
 }
 
 /// Every hole-card index of the hand, ascending.
@@ -2004,6 +2765,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Two clients, heads-up, play the pre-flop round and the flop appears.
+    ///
+    /// The whole point of the loop is that it never says whose turn it is: it
+    /// asks. `provisional_button` picks the button from `session_id`, so which
+    /// seat is the small blind is not this test's business, and a test that
+    /// hard-coded it would pass for the wrong reason.
+    #[test]
+    fn two_clients_bet_and_the_flop_opens() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+        queue.push((1, deliver(&mut b, &a_deck, &key(11))));
+        queue.push((0, deliver(&mut a, &b_deck, &key(10))));
+
+        let keys = [key(10), key(11)];
+        for _ in 0..64 {
+            // Anything in flight is delivered first.
+            if let Some((from, sends)) = queue.pop() {
+                if sends.is_empty() {
+                    continue;
+                }
+                let to = 1 - from;
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let out = deliver(hand, &sends, &keys[usize::from(to)]);
+                queue.push((to, out));
+                continue;
+            }
+            // Nothing in flight. Somebody owes an action, or the flop is out.
+            if a.board().len() == 3 {
+                break;
+            }
+            let seat = match a.turn() {
+                Some(t) => t.seat,
+                None => panic!("nothing in flight and nobody to act"),
+            };
+            let hand: &mut Hand = if seat == 0 { &mut a } else { &mut b };
+            let turn = hand.turn().expect("that hand agrees it is to act");
+            assert!(turn.mine, "each client acts only for itself");
+            // Call if anything is owed, check otherwise — the cheapest way to
+            // the flop, and it exercises both.
+            let action = if turn.legal.can_check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            let out = hand.act(action, &keys[usize::from(seat)], NOW).unwrap();
+            queue.push((seat, out));
+        }
+
+        assert_eq!(a.board().len(), 3, "the flop is on the board");
+        assert_eq!(a.board(), b.board(), "and it is the same flop");
+        assert_eq!(a.street(), Some(Street::Flop));
+        assert_eq!(b.street(), Some(Street::Flop));
+        assert_eq!(
+            a.pot(),
+            2 * 100,
+            "heads-up, the small blind called and the big blind checked"
+        );
+        assert_eq!(a.slot(), b.slot(), "one chain, one stage");
+        for card in a.board() {
+            assert!(
+                !a.cards().unwrap().contains(&card) && !b.cards().unwrap().contains(&card),
+                "one deck: a board card is nobody's hole card"
+            );
+        }
+    }
+
+    /// An action out of turn is refused and names who was up.
+    #[test]
+    fn acting_out_of_turn_is_refused() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+        queue.push((1, deliver(&mut b, &a_deck, &key(11))));
+        queue.push((0, deliver(&mut a, &b_deck, &key(10))));
+        let keys = [key(10), key(11)];
+        for _ in 0..64 {
+            let Some((from, sends)) = queue.pop() else { break };
+            if sends.is_empty() {
+                continue;
+            }
+            let to = 1 - from;
+            let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+            let out = deliver(hand, &sends, &keys[usize::from(to)]);
+            queue.push((to, out));
+        }
+
+        let up = a.turn().expect("somebody is to act").seat;
+        let waiting = 1 - up;
+        let hand: &mut Hand = if waiting == 0 { &mut a } else { &mut b };
+        let e = hand
+            .act(Action::Check, &keys[usize::from(waiting)], NOW)
+            .unwrap_err();
+        assert!(
+            matches!(e, Failed::OutOfTurn { seat, expected: Some(x) } if seat == waiting && x == up),
+            "{e}"
+        );
     }
 
     /// The milestone: two clients, no network, each holding two cards it can
