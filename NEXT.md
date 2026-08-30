@@ -725,6 +725,38 @@ was responsible for — `certs` fed from `on_hand_init`, no `HAND_COMPLETE`
 precedence, and the roster mutated ahead of a fallible engine call — each of
 which is now fixed with a test shown to fail without it.
 
+## Why a table sometimes did not form at all
+
+GossipSub exchanges subscriptions **once**, when a connection is established,
+and measured on three clients on one machine that exchange is unreliable. Every
+failed formation had the same signature, and it stayed invisible until both
+sides of the comparison were named in the log rather than counted:
+
+```
+founder : lobby topic: 0 of 0 subscribed []; connected ["yTmZ9s", "MwT6dL"]
+joiner 2: lobby topic: 0 of 1 subscribed ["7GxK5Q"]; connected ["7GxK5Q", "yTmZ9s"]
+joiner 3: lobby topic: 0 of 1 subscribed ["MwT6dL"]; connected ["7GxK5Q", "MwT6dL"]
+```
+
+Both joiners connected and identified, and the founder knew of **no** peer
+subscribed to the lobby — so `publish` answered `NoPeersSubscribedToTopic` and
+the advert went nowhere. Each joiner meanwhile saw exactly one of its two
+neighbours. A table formed whenever the founder saw both and never when it did
+not.
+
+There is no per-peer *"send my subscriptions"* call in the library, so the fix
+is the primitive that exists: when a peer is first identified as a poker client,
+drop and retake the lobby topics, which re-announces them to everyone connected.
+Once per peer, because `poker_peers` is a set.
+
+**Measured, three clients, table of three: 10 of 12 runs formed, against roughly
+2 of 6 before, the fastest in 9 s.** The subscribed set now matches the
+connected set in every run but one, and that one had a peer that never connected
+at all.
+
+The lesson is the same one this file keeps recording: *a count could not say
+which peer was missing, and the question was entirely about which.*
+
 ## Still open
 
 * **A seat certified absent never re-enters**, because `next_hand`'s
