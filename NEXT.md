@@ -310,6 +310,33 @@ The button alternates every hand, which is the heads-up dead-button rule, and a
 hundred-and-thirty-second run gets through several hands end to end: crypto,
 betting, settlement, rotation, next deal.
 
+### Three seats found a bug two seats could not
+
+Worth stating because it is the argument for running three in the first place.
+A three-seat run formed a table, seated all three, agreed one session — and
+hand one stalled at stage zero. Nothing was refused and nothing errored. One
+seat simply never emitted its `HAND_INIT`.
+
+The `ever_dealt` guard — added the same day to stop the formation path dealing
+hand one again after the table had already played — set its flag **before**
+asking whether the opening existed:
+
+```rust
+if !ever_dealt {
+    ever_dealt = true;
+    begin_hand(match opening_for_hand_one(f) { Some(o) => o, None => continue }, …)
+```
+
+A peer whose roster had not ratified at that instant took the `continue` with
+the flag already set, and the guard — whose whole job is *only once* — was then
+closed against it for the life of the table. Intermittent by construction: it
+turns on which table message arrives first, which is why one three-seat run
+played two hands and a longer one played none.
+
+Heads-up hid it because both peers ratify at almost the same moment. That is
+the second time heads-up has hidden a class of defect: it hid the duplicate
+handling for two milestones before this.
+
 ### How to read a two-process run, and how not to
 
 Two mistakes were made repeatedly today and both produced **confident wrong
