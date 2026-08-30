@@ -101,7 +101,14 @@ pub fn seal<T: Encode<()>>(
         emitted_at_unix_ms: now_ms,
         next_deadline_ms,
         chain_scope: 1,
-        event_class: 0,
+        // From the catalogue, not written here. `check_envelope` compares
+        // against `expected_class` and a literal would have been a second
+        // opinion that can differ — which is exactly what the unchained
+        // builder's own doc comment records happening the first time it was
+        // written by hand. A `TIMEOUT_VOTE` is class 1 and a `TIMEOUT_CERT`
+        // class 2; sealing either as 0 produced an event every receiver
+        // refuses, and there was no way to emit one correctly at all.
+        event_class: EventBody::expected_class(kind),
     };
 
     let envelope_bytes =

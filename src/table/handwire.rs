@@ -587,6 +587,109 @@ impl HandAbort {
     }
 }
 
+/// `TIMEOUT_VOTE 0x0601`: one seat's word that a deadline passed.
+///
+/// Not an accusation and not evidence on its own. It says only *"my own timer
+/// for this stage expired and I have accepted nothing from that seat at it"* —
+/// and a vote alone does nothing at all. Only a complete set, one from every
+/// seat in the voter set, becomes a [`TimeoutCert`].
+///
+/// Its envelope is `event_class = 1`, which puts it in its own anti-replay
+/// slot: a voter that has already contributed to the collective stage `s` can
+/// vote *about* stage `s` without equivocating against itself. A vote
+/// references the stage it is about; it does not occupy it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct TimeoutVote {
+    /// The stage that failed to complete.
+    #[n(0)]
+    pub subject_sequence: u64,
+    /// The seat that failed to emit.
+    #[n(1)]
+    pub subject_seat: SeatIdx,
+    /// What that seat owed.
+    #[n(2)]
+    pub subject_event_type: u16,
+    /// `stage_hash(subject_sequence - 1)`.
+    #[cbor(n(3), with = "minicbor::bytes")]
+    pub parent_event_hash: Hash,
+    /// The `next_deadline_ms` the parent stage's events carried, which is what
+    /// makes the deadline a value both sides can check rather than one the
+    /// voter chose.
+    #[n(4)]
+    pub deadline_ms: u32,
+    /// `1` an action deadline, `2` a cryptographic-step deadline.
+    #[n(5)]
+    pub kind: u16,
+}
+
+impl TimeoutVote {
+    /// The digest a certificate identifies this subject by.
+    ///
+    /// It commits to every field but the sequence's own position, so two
+    /// certificates by one emitter at one stage share a slot **exactly when**
+    /// they concern the same subject under the same deadline. That is what
+    /// keeps a seat which is entitled to certify two different subjects at one
+    /// stage — two mutually partitioned peers each voting against the other is
+    /// enough — from manufacturing an equivocation proof against itself.
+    pub fn subject_digest(&self) -> Hash {
+        crate::protocol::serialization::h(
+            crate::protocol::signatures::Domain::TimeoutCert.context(),
+            &[
+                &self.subject_sequence.to_be_bytes(),
+                &[self.subject_seat],
+                &self.subject_event_type.to_be_bytes(),
+                &self.parent_event_hash,
+                &self.deadline_ms.to_be_bytes(),
+                &self.kind.to_be_bytes(),
+            ],
+        )
+    }
+
+    /// Whether two votes are about the same thing.
+    ///
+    /// Compared field by field rather than by digest, so that a mismatch can
+    /// say which field differs — a voter that disagrees about `deadline_ms` has
+    /// a different view of the parent stage, which is a different fault from
+    /// one that names a different seat.
+    pub fn same_subject(&self, other: &TimeoutVote) -> bool {
+        self.subject_sequence == other.subject_sequence
+            && self.subject_seat == other.subject_seat
+            && self.subject_event_type == other.subject_event_type
+            && self.parent_event_hash == other.parent_event_hash
+            && self.deadline_ms == other.deadline_ms
+            && self.kind == other.kind
+    }
+}
+
+/// `TIMEOUT_CERT 0x0602`: the voter set, unanimously, saying a deadline passed.
+///
+/// A **collective** stage whose required emitter set is `V(subject)` — the same
+/// set that had to vote — so each voter emits its own copy. Legal only when
+/// `|V(subject)| >= 2` and a vote has been collected from **every** seat in it.
+/// A certificate with `|V| < 2` is inert: not chained, not evidence, no
+/// terminating effect, silently ignored.
+///
+/// That floor is the whole security property. At `|V| = 1` "unanimity" is the
+/// signature of the single party with an interest in the outcome, which is why
+/// heads-up this message can never do anything and the hand deadline is the
+/// only terminus there.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct TimeoutCert {
+    /// [`TimeoutVote::subject_digest`] of the subject every carried vote names.
+    #[cbor(n(0), with = "minicbor::bytes")]
+    pub subject_digest: Hash,
+    /// A complete `SignedEvent` per voter, ascending by voter seat.
+    ///
+    /// The whole signed events and not just their signatures: a receiver
+    /// verifies each one the way it verifies any other event, against the
+    /// sender key inside it, so a certificate carries its own proof and needs
+    /// nothing from the receiver's store to be checkable.
+    #[n(1)]
+    pub votes: Vec<Vec<u8>>,
+}
+
 /// The street code `PROTOCOL.md` §4.7 defines: **the number of board cards**.
 ///
 /// Pre-flop `0`, flop `3`, turn `4`, river `5`. Not the engine's `Street`
