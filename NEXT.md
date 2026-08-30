@@ -150,6 +150,58 @@ and `tox-rs/tox` is a pure-Rust reimplementation that is GPLv3+ as well and whos
 own README says the client part is still being worked on. So the FFI is ours to
 write.
 
+## A hand begins
+
+The screen said *no hand in progress* and it was telling the truth: `TableReal`
+fired and nothing followed. Formation ended at `session_id`, the engine started
+at `GENESIS(1)`, and nothing carried a byte between them.
+
+Now it does. Measured between two processes over the real network:
+
+```
+A: hand #1 is waiting for seat 1  ->  hand #1 has begun
+B: hand #1 is waiting for seat 0  ->  hand #1 has begun
+```
+
+Stage 0 of hand 1 — `HAND_INIT`, collective — completes, and both peers derive
+the **same** parent for stage 1. Three modules, all synchronous, bytes in and
+bytes out, the shape `net::formation` already uses: `table::stage`,
+`table::handwire`, `table::hand`. Plus `TERMINAL(0)` and `GENESIS(1)` on the
+formation, which nothing had ever computed.
+
+Two things in there are load-bearing rather than decoration:
+
+* **A bystander is kept out of the stage hash.** A seat that may speak but is
+  not in `R` is heard and does not enter the hash — if it did, two peers who
+  heard different bystanders would fork the chain with nobody lying.
+* **One seat with two stories is a finding, not an overwrite.** Last-one-wins
+  leaves the two peers who saw them in different orders disagreeing for ever,
+  and neither of them knowing why.
+
+And `handwire::disagreement` returns **which field** differs. The symptom of
+getting this wrong is a table that does not move; "seat 3 says the button is at
+2 and I say 1" is something a person can act on.
+
+### The one thing that is provisional, and it is named
+
+`provisional_button` decides where the button sits from `session_id`.
+Deterministic, agreed by everybody, and **not the rule**: `STATE_MACHINE.md` T10
+gives it to the RNG beacon of §7.9, which no code here performs. A beacon exists
+so no single seat's contribution decides the button, and a hash of the
+ratifications is not that guarantee. One function, so the beacon replaces it in
+one change.
+
+### What is next in the hand, in order
+
+1. `DECK_INIT` (stage 1) — each seat's deck key and ownership proof. The
+   cryptography exists (`mental_poker::backend::keygen`, `verify_key`); what does
+   not is the payload type and the per-sender `DeckCtx`.
+2. The shuffle chain, stages 2 to 2m+1, single-writer.
+3. `DECK_COMMIT`, then checkpoint, then `DEAL_PRIVATE` — and at that point there
+   are hole cards on the screen.
+4. Betting: one stage per action, with the engine that already exists.
+5. The RNG beacon, replacing `provisional_button`.
+
 ## Next actions, in order
 
 1. **The hand, wired.** Formation ends at `session_id` and the engine starts at

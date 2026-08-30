@@ -61,6 +61,17 @@ pub const MAX_LOG_LINES: usize = 500;
 /// would be keeping a record this client has no business keeping.
 pub const MAX_CHAT_LINES: usize = 200;
 
+/// What this client knows about the hand in progress.
+///
+/// A local view, like everything else in this module. Nothing here enters a
+/// hash: D-012 forbids canonical state derived from a per-receiver quantity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandInProgress {
+    pub hand_id: u64,
+    pub button: u8,
+    pub dealt_in: Vec<u8>,
+}
+
 /// Everything the client knows, in the form the panes read it.
 #[derive(Debug, Default)]
 pub struct AppState {
@@ -83,6 +94,11 @@ pub struct AppState {
     pub players: std::collections::BTreeMap<[u8; 32], (String, u64)>,
     /// What has been said in the lobby, newest last.
     pub chat: VecDeque<crate::gui::lobby::ChatLine>,
+    /// The hand this client believes is in progress.
+    pub hand: Option<HandInProgress>,
+    /// Which seats the current hand is still waiting for, so the same sentence
+    /// is not written to the log every time somebody else speaks.
+    pub waiting_for: Vec<u8>,
     /// The last clock this client was told about, so presence can be aged.
     pub last_sweep_ms: u64,
     /// The latest advertisement timestamp this client has seen.
@@ -228,6 +244,33 @@ impl AppState {
                     who: format!("{nickname} ({})", crate::storage::profile::short_name(&who)),
                     said: text,
                 });
+            }
+            NodeEvent::HandBegan {
+                hand_id,
+                button,
+                dealt_in,
+            } => {
+                self.hand = Some(HandInProgress {
+                    hand_id,
+                    button,
+                    dealt_in,
+                });
+                self.waiting_for.clear();
+                self.note(format!("hand #{hand_id} has begun"));
+            }
+            NodeEvent::HandWaiting { hand_id, seats } => {
+                // Said once per set, not once per arriving copy: a table
+                // waiting for one seat would otherwise write a line every time
+                // anybody else spoke.
+                if self.waiting_for != seats {
+                    let who: Vec<String> = seats.iter().map(|s| s.to_string()).collect();
+                    self.note(format!(
+                        "hand #{hand_id} is waiting for seat{} {}",
+                        if seats.len() == 1 { "" } else { "s" },
+                        who.join(", ")
+                    ));
+                    self.waiting_for = seats;
+                }
             }
             NodeEvent::Swept { now_ms } => {
                 self.last_sweep_ms = now_ms;

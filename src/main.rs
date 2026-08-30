@@ -917,20 +917,40 @@ impl Client {
             .collect::<Vec<_>>();
 
         let seated = seats.len();
+        // The hand, if one has begun. Until `HAND_INIT` completes there is no
+        // hand number, no button and nothing to say beyond who is still being
+        // waited for — and saying *that* is the point: "no hand in progress"
+        // told a player nothing they could act on.
+        let hand = self.state.hand.as_ref();
         TableView {
             name,
             blinds,
-            street: if seat.session.is_some() {
-                "ready".into()
-            } else {
-                "waiting".into()
+            street: match (hand, seat.session.is_some()) {
+                (Some(_), _) => "hand dealt".into(),
+                (None, true) => "ready".into(),
+                (None, false) => "waiting".into(),
             },
+            hand: hand.map(|h| h.hand_id).unwrap_or(0),
+            button: hand.map(|h| h.button).unwrap_or(0),
             seats,
             hero: seat.seat.unwrap_or(0),
             max_seats,
-            note: Some(match seat.session {
-                Some(_) => "everybody has ratified the roster; the table is set".into(),
-                None => format!("waiting for players — {seated} of {needed}"),
+            note: Some(match (hand, seat.session) {
+                (Some(h), _) => format!(
+                    "hand #{} — the button is at seat {}",
+                    h.hand_id, h.button
+                ),
+                (None, Some(_)) if !self.state.waiting_for.is_empty() => {
+                    let who: Vec<String> = self
+                        .state
+                        .waiting_for
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    format!("waiting for seat {} to open the hand", who.join(", "))
+                }
+                (None, Some(_)) => "everybody has ratified the roster; the table is set".into(),
+                (None, None) => format!("waiting for players — {seated} of {needed}"),
             }),
             ..Default::default()
         }

@@ -304,6 +304,14 @@ pub async fn run(
     // client, which is what §4.3's per-roster `peer_id` rule already allows and
     // what the lobby's own rules are written for.
     let mut table: Option<Formation> = None;
+    // The hand in progress, if any.
+    //
+    // Started once, at the moment the roster settles. `TableReal` is emitted
+    // from more than one place and fires again on later table traffic, so the
+    // start has to be idempotent, or two `HAND_INIT`s would go out under one
+    // seat and read as equivocation to everybody else.
+    let mut hand: Option<crate::table::hand::Hand> = None;
+    let mut hand_reported = false;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
 
     // Who mDNS has already told us about.
@@ -571,6 +579,15 @@ pub async fn run(
                                             // must stay as findable as it was.
                                             table_closed = table_is_closed(f, &mut tournament_started);
                                             dht_effort(&mut swarm, table_closed);
+                                            begin_hand(
+                                                f,
+                                                &app_key,
+                                                &mut hand,
+                                                &mut swarm,
+                                                table_topic.as_ref(),
+                                                &events,
+                                            )
+                                            .await;
                                         }
                                     }
                                     Err(e) => {
@@ -608,6 +625,8 @@ pub async fn run(
                                         table = None;
                                         table_closed = false;
                         tournament_started = false;
+                        hand = None;
+                        hand_reported = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -629,6 +648,8 @@ pub async fn run(
                         }
                         table_closed = false;
                         tournament_started = false;
+                        hand = None;
+                        hand_reported = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -677,6 +698,54 @@ pub async fn run(
                             Some(_) => gossipsub::MessageAcceptance::Accept,
                         };
                         let _ = verdict;
+                        // The hand first, if there is one. A `HAND_INIT`
+                        // decodes as neither a player list nor a ratification,
+                        // so without this it would fall through to the
+                        // formation and be refused as malformed.
+                        if let Some(h) = hand.as_mut() {
+                            use crate::table::hand::Failed;
+                            match h.on_event(&message.data) {
+                                Ok(()) => {
+                                    if h.dealt() {
+                                        if !hand_reported {
+                                            hand_reported = true;
+                                            let init = h.init();
+                                            let _ = events
+                                                .send(NodeEvent::HandBegan {
+                                                    hand_id: init.hand_id,
+                                                    button: init.button_position,
+                                                    dealt_in: init.dealt_in.clone(),
+                                                })
+                                                .await;
+                                        }
+                                    } else {
+                                        let _ = events
+                                            .send(NodeEvent::HandWaiting {
+                                                hand_id: h.hand_id(),
+                                                seats: h.waiting_for(),
+                                            })
+                                            .await;
+                                    }
+                                    continue;
+                                }
+                                // A peer one stage ahead. Held, not refused:
+                                // GossipSub does not order two messages.
+                                Err(Failed::NotYet) => {
+                                    h.hold(message.data.clone());
+                                    continue;
+                                }
+                                // Not a hand event at all - fall through to the
+                                // formation, which is what it will be.
+                                Err(Failed::Wire(joinwire::WireError::WrongType)) => {}
+                                Err(e) => {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!("hand: {e}")))
+                                        .await;
+                                    continue;
+                                }
+                            }
+                        }
+
                         let Some(f) = table.as_mut() else { continue };
                         let now = super::node::now_unix_ms();
                         let result = if joinwire::receive_player_list(&message.data).is_ok() {
@@ -705,6 +774,19 @@ pub async fn run(
                                             session,
                                         })
                                         .await;
+                                    // The joiner's road to the same place. Both
+                                    // sites start the hand, and `begin_hand` is
+                                    // idempotent, because this one fires again
+                                    // on every later table message.
+                                    begin_hand(
+                                        f,
+                                        &app_key,
+                                        &mut hand,
+                                        &mut swarm,
+                                        table_topic.as_ref(),
+                                        &events,
+                                    )
+                                    .await;
                                 }
                             }
                             Err(e) => {
@@ -1484,6 +1566,8 @@ pub async fn run(
                             Err(e) => {
                                 table_closed = false;
                         tournament_started = false;
+                        hand = None;
+                        hand_reported = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -1513,6 +1597,8 @@ pub async fn run(
                         table = None;
                         table_closed = false;
                         tournament_started = false;
+                        hand = None;
+                        hand_reported = false;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
@@ -1957,6 +2043,56 @@ fn dht_effort(swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>, at_a_tabl
         // server here would make a NATed client claim to serve queries it
         // cannot be reached for.
         kad.set_mode(None);
+    }
+}
+
+/// Start hand `k` and put this client's `HAND_INIT` on the table's mesh.
+///
+/// **Idempotent.** `TableReal` is emitted from more than one place and fires
+/// again on later table traffic, and two `HAND_INIT`s under one seat would read
+/// as equivocation to everybody else — one seat, two different events, one
+/// stage — which is exactly the thing `table::stage` reports as a finding.
+async fn begin_hand(
+    f: &Formation,
+    app_key: &ed25519_dalek::SigningKey,
+    hand: &mut Option<crate::table::hand::Hand>,
+    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    topic: Option<&gossipsub::IdentTopic>,
+    events: &mpsc::Sender<NodeEvent>,
+) {
+    use crate::table::hand::{Hand, Opening, Send as HandSend};
+
+    if hand.is_some() {
+        return;
+    }
+    let Some(opening) = Opening::from_formation(f, 1) else {
+        return;
+    };
+    let now = super::node::now_unix_ms();
+    let deadline = f.advert().crypto_step_timeout_ms;
+    match Hand::open(opening, app_key, now, deadline) {
+        Ok((h, sends)) => {
+            if let Some(t) = topic {
+                for HandSend::Broadcast(bytes) in sends {
+                    // A failure here is "nobody else on the topic yet", which
+                    // is ordinary: the stage completes when they arrive and say
+                    // the same thing, and the copy is re-sent then.
+                    let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), bytes);
+                }
+            }
+            let _ = events
+                .send(NodeEvent::HandWaiting {
+                    hand_id: h.hand_id(),
+                    seats: h.waiting_for(),
+                })
+                .await;
+            *hand = Some(h);
+        }
+        Err(e) => {
+            let _ = events
+                .send(NodeEvent::Warning(format!("the hand could not start: {e}")))
+                .await;
+        }
     }
 }
 

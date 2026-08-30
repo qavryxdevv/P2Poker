@@ -103,6 +103,39 @@ pub struct Opening {
     pub my_seat: SeatIdx,
 }
 
+impl Opening {
+    /// Everything hand `k` needs, read off a settled formation.
+    ///
+    /// `None` until the roster has ratified, because three of these fields do
+    /// not exist before then — the session, the genesis that hangs off the
+    /// `TABLE_READY` stage hash, and the required emitter set, which §3.2 says
+    /// **is** the signers of `TABLE_READY` for the first hand.
+    pub fn from_formation(f: &crate::net::formation::Formation, hand_id: u64) -> Option<Self> {
+        let ad = f.advert();
+        Some(Opening {
+            table_id: f.table_id(),
+            hand_id,
+            session_id: f.session()?,
+            roster_hash: f.roster().hash_at_zero(),
+            genesis: f.genesis_one()?,
+            required: f.ratifiers(),
+            seats: f
+                .roster()
+                .seats()
+                .iter()
+                .map(|e| (e.seat, e.app_public_key, e.buyin))
+                .collect(),
+            max_players: ad.max_players,
+            small_blind: ad.small_blind,
+            big_blind: ad.big_blind,
+            // Level 1: the blind schedule advances from `HAND_COMPLETE`, and no
+            // hand has completed.
+            level: 1,
+            my_seat: f.my_seat()?,
+        })
+    }
+}
+
 /// How much of an event body this client will decode.
 ///
 /// `PROTOCOL.md` §9.3's cap for `HAND_INIT`. Nested: the frame holds an

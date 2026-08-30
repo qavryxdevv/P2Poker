@@ -158,6 +158,20 @@ pub enum NodeEvent {
     },
     /// Every seat has ratified: the table is real and has a session identity.
     TableReal { key: [u8; 32], session: [u8; 32] },
+    /// A hand has begun: every seat agreed on the same `HAND_INIT`.
+    ///
+    /// The first thing that crosses the wire after `session_id`, and the first
+    /// time the table window has anything but "no hand in progress" to say.
+    HandBegan {
+        hand_id: u64,
+        button: u8,
+        dealt_in: Vec<u8>,
+    },
+    /// A hand is waiting for these seats to say the same thing this client did.
+    ///
+    /// Named rather than left as a spinner: "waiting for seat 3" is something a
+    /// player can act on and a turning circle is not.
+    HandWaiting { hand_id: u64, seats: Vec<u8> },
     /// The founder refused. **Advisory** — a founder may lie, so the reason is
     /// carried as the claim it is.
     JoinRefused { reason: u16 },
@@ -278,6 +292,8 @@ impl NodeEvent {
             | Self::Seated { .. }
             | Self::Roster { .. }
             | Self::TableReal { .. }
+            | Self::HandBegan { .. }
+            | Self::HandWaiting { .. }
             | Self::JoinRefused { .. }
             | Self::LeftTable { .. }
             // The lobby list and the counters above it.
