@@ -2394,6 +2394,49 @@ of it built.
 Until then the honest statement is: **the reconnection bank cannot be cheated,
 and the action clock can.**
 
+### What the hand deadline already budgets, and what it does not
+
+The owner's concern — *the deadline must follow the other players' decision
+time, with a reserve for latency, so a hand is not cancelled before everybody
+has finished playing it* — is already the shape of the formula.
+`hand_deadline_floor_ms` is not a constant; it is
+
+```
+hand_delay + (2n + 23) · crypto_step_timeout + 4n · (action_timeout + action_grace)
+```
+
+plus four reopenings. At three seats with this table's own numbers that is
+1 377 000 ms, and it decomposes exactly as asked:
+
+| Budgeted for | Three seats |
+|---|---|
+| Everybody's thinking: `4n` decisions of `action_timeout` | 240 s |
+| **Latency reserve**: `action_grace_ms` on every one of those | 60 s |
+| Reopenings — a raise gives every seat its decision back | 200 s |
+| The cryptography: `2n + 23` stages | 870 s |
+
+So a hand cannot be cancelled under a table that is playing: the budget holds
+four decisions per seat, each with its own latency grace, and a raise buys
+everybody another round.
+
+**What it does not budget is a per-player *thinking* bank in seconds**, and
+that is a real gap the moment one exists. Two things follow, and neither is
+optional:
+
+* The floor must grow by `n × bank`, or a player who spends their bank gets the
+  hand abandoned under them — the precise failure the owner is warning about.
+* The bank must be a **table parameter**, advertised and inside
+  `table_params_hash`, not a client-side choice. If each client picked its own,
+  no peer could budget for anybody else's, and a generous client would have its
+  hands aborted by a stingy one.
+
+Note that such a bank is *safe* without any of §8.4's machinery, because it is
+**local**: it extends only this client's own clock for its own seat, and no
+peer's derivation reads it. It is the reconnection bank above that had to be
+counted in hands, because that one decides `dealt_in`. A thinking bank decides
+only when a client folds itself, and a client folding itself early harms nobody
+but its owner.
+
 ### The cost this does not remove
 
 The **first** hand a player disappears in still stalls to `hand_deadline_ms` —
