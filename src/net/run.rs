@@ -344,6 +344,29 @@ pub async fn run(
     // so each peer runs its own timer and the abort is buffered at a receiver
     // until that receiver's own timer agrees.
     let mut hand_by: Option<tokio::time::Instant> = None;
+    // This client's own contribution to the stage now open, and the sequence
+    // it belongs to.
+    //
+    // GossipSub has no history: a peer that joins the topic mesh after a
+    // publish never sees it, and nothing re-sends. At two seats that rarely
+    // bites, because both are meshed before either speaks. At three it is the
+    // ordinary case - the last joiner missed the first two seats' `HAND_INIT`
+    // and sat at "waiting for seats 0, 1" for ever, with no error anywhere and
+    // every other line of its log identical to a healthy one.
+    //
+    // So this client re-sends what it already said, until the stage it said it
+    // in has moved. **The stored bytes, never a re-signature**: re-signing
+    // would change `emitted_at_unix_ms` and produce a second distinct body at
+    // one slot, which is an equivocation proof against an honest peer
+    // (`PROTOCOL.md` §5.2).
+    // **Every** message this client has emitted for the hand in progress, not
+    // just the newest. A peer that missed stage 0 is not helped by stage 1: it
+    // is stuck at 0 and holding everything after it, and only the stage-0 bytes
+    // release it. Capped, because it is a buffer and every buffer here is.
+    let mut said: Vec<Vec<u8>> = Vec::new();
+    let mut resend = tokio::time::interval(std::time::Duration::from_secs(5));
+    resend.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // Whether this table has ever dealt a hand.
     //
     // The two roads into the first hand fire again on **every later table
@@ -656,6 +679,7 @@ pub async fn run(
                                                         &app_key,
                                                         &mut hand,
                                                         &mut hand_by,
+                                                        &mut said,
                                                         &mut swarm,
                                                         table_topic.as_ref(),
                                                         &events,
@@ -705,6 +729,7 @@ pub async fn run(
                         deck_reported = None;
                         cards_reported = false;
                         turn_reported = None;
+                        said.clear();
                         next_hand_at = None;
                         act_by = None;
                         hand_by = None;
@@ -734,6 +759,7 @@ pub async fn run(
                         deck_reported = None;
                         cards_reported = false;
                         turn_reported = None;
+                        said.clear();
                         next_hand_at = None;
                         act_by = None;
                         hand_by = None;
@@ -812,14 +838,12 @@ pub async fn run(
                                             )))
                                             .await;
                                     }
-                                    if let Some(t) = &table_topic {
-                                        for crate::table::hand::Send::Broadcast(out) in sends {
-                                            let _ = swarm
-                                                .behaviour_mut()
-                                                .gossipsub
-                                                .publish(t.clone(), out);
-                                        }
-                                    }
+                                    publish_hand(
+                                        sends,
+                                        table_topic.as_ref(),
+                                        &mut swarm,
+                                        &mut said,
+                                    );
                                     if h.dealt() {
                                         if !hand_reported {
                                             hand_reported = true;
@@ -953,6 +977,7 @@ pub async fn run(
                                                 &app_key,
                                                 &mut hand,
                                                 &mut hand_by,
+                                                &mut said,
                                                 &mut swarm,
                                                 table_topic.as_ref(),
                                                 &events,
@@ -1810,6 +1835,7 @@ pub async fn run(
                         deck_reported = None;
                         cards_reported = false;
                         turn_reported = None;
+                        said.clear();
                         next_hand_at = None;
                         act_by = None;
                         hand_by = None;
@@ -1847,14 +1873,12 @@ pub async fn run(
                         let now = super::node::now_unix_ms();
                         match h.act(action, &app_key, now) {
                             Ok(sends) => {
-                                if let Some(t) = &table_topic {
-                                    for crate::table::hand::Send::Broadcast(out) in sends {
-                                        let _ = swarm
-                                            .behaviour_mut()
-                                            .gossipsub
-                                            .publish(t.clone(), out);
-                                    }
-                                }
+                                publish_hand(
+                                    sends,
+                                    table_topic.as_ref(),
+                                    &mut swarm,
+                                    &mut said,
+                                );
                                 let report =
                                     report_hand(h, &events, &mut turn_reported).await;
                                 if let Some(end) = report.ended {
@@ -1887,6 +1911,7 @@ pub async fn run(
                         deck_reported = None;
                         cards_reported = false;
                         turn_reported = None;
+                        said.clear();
                         next_hand_at = None;
                         act_by = None;
                         hand_by = None;
@@ -1895,6 +1920,24 @@ pub async fn run(
                             why: "left the table".into(),
                         }).await;
                     }
+                }
+            }
+
+            // Say again what this client already said, while the stage it
+            // said it in is still open.
+            _ = resend.tick() => {
+                let (Some(h), Some(t)) = (hand.as_ref(), table_topic.as_ref()) else {
+                    continue;
+                };
+                // A hand that is over is a hand nobody is waiting on.
+                if h.over() || said.is_empty() {
+                    continue;
+                }
+                for out in &said {
+                    let _ = swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(t.clone(), out.clone());
                 }
             }
 
@@ -1911,11 +1954,7 @@ pub async fn run(
                 let now = super::node::now_unix_ms();
                 match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
                     Ok(sends) => {
-                        if let Some(t) = &table_topic {
-                            for crate::table::hand::Send::Broadcast(out) in sends {
-                                let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), out);
-                            }
-                        }
+                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said);
                         let _ = events
                             .send(NodeEvent::Warning(
                                 "the hand ran out of time; every stack is restored".into(),
@@ -1957,11 +1996,7 @@ pub async fn run(
                 let now = super::node::now_unix_ms();
                 match h.act(action, &app_key, now) {
                     Ok(sends) => {
-                        if let Some(t) = &table_topic {
-                            for crate::table::hand::Send::Broadcast(out) in sends {
-                                let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), out);
-                            }
-                        }
+                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said);
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "your clock ran out — {action:?} for you"
@@ -2005,6 +2040,7 @@ pub async fn run(
                             &app_key,
                             &mut hand,
                             &mut hand_by,
+                            &mut said,
                             &mut swarm,
                             table_topic.as_ref(),
                             &events,
@@ -2470,6 +2506,7 @@ fn dht_effort(swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>, at_a_tabl
 /// again on later table traffic, and two `HAND_INIT`s under one seat would read
 /// as equivocation to everybody else — one seat, two different events, one
 /// stage — which is exactly the thing `table::stage` reports as a finding.
+#[allow(clippy::too_many_arguments)]
 async fn begin_hand(
     opening: crate::table::hand::Opening,
     app_key: &ed25519_dalek::SigningKey,
@@ -2477,11 +2514,12 @@ async fn begin_hand(
     // Armed here rather than by the caller, so that no road into a hand can
     // start one without a terminus.
     deadline_at: &mut Option<tokio::time::Instant>,
+    said: &mut Vec<Vec<u8>>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
     topic: Option<&gossipsub::IdentTopic>,
     events: &mpsc::Sender<NodeEvent>,
 ) {
-    use crate::table::hand::{Hand, Send as HandSend};
+    use crate::table::hand::Hand;
 
     if hand.is_some() {
         return;
@@ -2490,14 +2528,12 @@ async fn begin_hand(
     let deadline = opening.crypto_step_timeout_ms;
     match Hand::open(opening, app_key, now, deadline) {
         Ok((h, sends)) => {
-            if let Some(t) = topic {
-                for HandSend::Broadcast(bytes) in sends {
-                    // A failure here is "nobody else on the topic yet", which
-                    // is ordinary: the stage completes when they arrive and say
-                    // the same thing, and the copy is re-sent then.
-                    let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), bytes);
-                }
-            }
+            // Through the same door as every other hand message, so that
+            // `HAND_INIT` is remembered and re-sent like the rest. It is in
+            // fact the one that goes missing: it is published the moment the
+            // roster ratifies, which is before the last joiner has been
+            // grafted into anybody's mesh for this topic.
+            publish_hand(sends, topic, swarm, said);
             // What this hand hangs off, said out loud. Two peers that opened
             // hand one from different views of the formation produce different
             // genesis values, and every message each sends is then "a different
@@ -2525,6 +2561,36 @@ async fn begin_hand(
                 .send(NodeEvent::Warning(format!("the hand could not start: {e}")))
                 .await;
         }
+    }
+}
+
+/// Publish what a hand produced, and remember it.
+///
+/// Remembering is the point: GossipSub has no history, so a peer that joins the
+/// topic mesh after a publish never sees it. Everything this client says in a
+/// hand is kept until the hand ends, and re-sent — **the stored bytes, never a
+/// re-signature**, because re-signing would change `emitted_at_unix_ms` and
+/// make a second distinct body at one slot, which is an equivocation proof
+/// against an honest peer (`PROTOCOL.md` §5.2).
+///
+/// Capped, because it is a buffer and every buffer fed from a hand is bounded
+/// where it is filled. Sixty-four is more messages than a hand of ten seats
+/// produces before the deal, and dropping the oldest is the right direction:
+/// the oldest is the one a peer is least likely to still be waiting for.
+fn publish_hand(
+    sends: Vec<crate::table::hand::Send>,
+    topic: Option<&gossipsub::IdentTopic>,
+    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    said: &mut Vec<Vec<u8>>,
+) {
+    for crate::table::hand::Send::Broadcast(out) in sends {
+        if let Some(t) = topic {
+            let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), out.clone());
+        }
+        if said.len() >= 64 {
+            said.remove(0);
+        }
+        said.push(out);
     }
 }
 
