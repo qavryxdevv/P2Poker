@@ -698,6 +698,53 @@ forbids that shape. Everything was right up to the last message.
   every uncommitted change in that file. It threw away the same file's work a
   second time, ten minutes later. Revert the one line, or commit first.
 
+## The one that matters most, found last and not fixed
+
+**Two survivors ran different rosters for five hands under identical genesis
+hashes, and neither said a word.**
+
+Measured, three clients, the third killed. One survivor certified seat 0's
+timeout — seat 0 being a **live** peer that had gone quiet for one stage — and
+dropped it: `hand #2 opens at genesis b63100a9 with seats [1, 2]`. Seat 0 itself
+never applied that certificate: `certs=0`, and `hand #2 opens at genesis
+b63100a9 with seats [0, 1, 2]`. The genesis hashes agree hand for hand. The
+participation set does not. No refusal was logged on either side.
+
+The mechanism is not exotic and it is not the certificate's fault:
+
+* Seat 0 emitted the event the others were waiting on. They never received it.
+* They voted, reached unanimity, certified and aborted the hand.
+* Seat 0 had already advanced past that stage — it moved on *because* it did the
+  thing they never saw.
+* Their certificate reached seat 0 at a stage seat 0 had left, so
+  `subject_of` could not rebuild the subject, so `on_timeout_cert` returned
+  `NotYet` and it was **held for ever**, silently.
+
+So the peer most likely to be unable to apply a certificate is the subject of
+it. That is not a corner: it is the ordinary shape of the event.
+
+Two things are wrong and only one is cheap.
+
+The cheap one is done: a certificate that cannot be placed now says so, naming
+the sequence this client has reached, so the split is audible.
+
+The other is a protocol decision and should not be patched in a hurry:
+
+* A receiver can only check a certificate against a stage it can rebuild, and it
+  rebuilds the subject from its **current** slot. To accept one about a stage it
+  has left, it would have to keep its own past slots — `(sequence, parent hash)`
+  — and check the subject digest against that history. That is what makes
+  accepting a passed stage safe rather than trusting the digest, and it is the
+  difference between this and a replay of votes from another position.
+* And `dealt_in` must be inside what the genesis commits to, or two peers can
+  keep deriving the same genesis from different participation sets. There is a
+  `dealt_in differs from what I derived` check on `HAND_INIT` and it did not
+  fire here, because the two peers had stopped exchanging the events that would
+  have carried it.
+
+Until both are done, a peer that misses one broadcast at the wrong moment can be
+voted off a table it is still playing.
+
 ## Still open
 
 * `STATE_HASH` / `STATE_ACK` — the hash is computed inside `HAND_COMPLETE` and

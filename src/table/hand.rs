@@ -3712,6 +3712,20 @@ impl Hand {
         let Some(subject) = self.subject_of(&body.subject_digest) else {
             // A certificate about a stage this client is not at. Held, not
             // refused: the mesh does not order two messages.
+            //
+            // **Said out loud, because this is where a table silently splits.**
+            // The one peer most likely to have moved past the stage is the
+            // subject itself — it moved on precisely because it did the thing
+            // the others never saw. It then holds this for ever, never shrinks
+            // its own roster, and plays a table the others have already left,
+            // with no error anywhere. Measured: one survivor certified a live
+            // seat and dropped it, that seat never applied the certificate
+            // about itself, and the two ran different rosters under identical
+            // genesis hashes for five hands.
+            self.cert_note.push(format!(
+                "cert: from seat {seat} about a stage this client has left                  (now at sequence {}) — HELD, and if it is about this seat the                  table has left this client behind",
+                self.slot.sequence
+            ));
             return Err(Failed::NotYet);
         };
         let voters = self.voters(subject.subject_seat);
