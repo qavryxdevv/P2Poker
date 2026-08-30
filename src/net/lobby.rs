@@ -121,6 +121,10 @@ pub struct TableAd {
     pub hand_deadline_ms: u32,
     pub join_deadline_ms: u32,
     pub hand_delay_ms: u32,
+    /// The per-hand thinking reserve, on top of `action_timeout_ms`. A table
+    /// parameter and inside `table_params_hash`: every peer adds it to a
+    /// betting stage's deadline before it will vote that a seat is late.
+    pub time_bank_ms: u32,
     pub button_rule: u16,
     pub odd_chip_rule: u16,
     pub showdown_policy: u16,
@@ -283,6 +287,7 @@ pub fn admit(ad: &TableAd, now_unix_ms: u64) -> Result<(), AdRejected> {
         ad.action_grace_ms as u64,
         ad.crypto_step_timeout_ms as u64,
         ad.hand_delay_ms as u64,
+        ad.time_bank_ms as u64,
     );
     if (ad.hand_deadline_ms as u64) < minimum {
         return Err(AdRejected::DeadlineTooShort {
@@ -480,6 +485,7 @@ impl TableAd {
             hand_deadline_ms: sng_hand_deadline_ms(seats) as u32,
             join_deadline_ms: 120_000,
             hand_delay_ms: 7_000,
+            time_bank_ms: crate::protocol::constants::default_time_bank_ms(seats),
             button_rule: 1,
             odd_chip_rule: 1,
             showdown_policy: 1,
@@ -854,6 +860,7 @@ mod tests {
             hand_deadline_ms: 0, // filled in below
             join_deadline_ms: 120_000,
             hand_delay_ms: 7_000,
+            time_bank_ms: 0,
             button_rule: 1,
             odd_chip_rule: 1,
             showdown_policy: 1,
@@ -875,6 +882,7 @@ mod tests {
             ad.action_grace_ms as u64,
             ad.crypto_step_timeout_ms as u64,
             ad.hand_delay_ms as u64,
+            ad.time_bank_ms as u64,
         ) as u32;
         ad
     }
@@ -1106,7 +1114,7 @@ mod tests {
                 "the cap is the table's chips, halved"
             );
             let minimum = crate::protocol::constants::hand_deadline_min_ms(
-                seats, 20_000, 5_000, 30_000, 7_000,
+                seats, 20_000, 5_000, 30_000, 7_000, 0,
             );
             assert!(
                 ad.hand_deadline_ms as u64 >= minimum,
@@ -1329,6 +1337,7 @@ mod tests {
             ad.action_grace_ms as u64,
             ad.crypto_step_timeout_ms as u64,
             ad.hand_delay_ms as u64,
+            ad.time_bank_ms as u64,
         );
         assert!(minimum > 0);
 
@@ -1353,8 +1362,8 @@ mod tests {
         let mut small = legal_custom();
         small.max_players = 2;
         small.min_players_to_start = 2;
-        let at_two = hand_deadline_min_ms(2, 20_000, 5_000, 30_000, 7_000);
-        let at_ten = hand_deadline_min_ms(10, 20_000, 5_000, 30_000, 7_000);
+        let at_two = hand_deadline_min_ms(2, 20_000, 5_000, 30_000, 7_000, 0);
+        let at_ten = hand_deadline_min_ms(10, 20_000, 5_000, 30_000, 7_000, 0);
         assert!(at_ten > at_two, "more seats, more time");
 
         small.hand_deadline_ms = at_two as u32;

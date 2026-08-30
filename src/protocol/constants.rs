@@ -137,17 +137,25 @@ pub const fn reopening_cost_ms(seats: u8, action_timeout_ms: u64, action_grace_m
 ///
 /// A hand is `6n + 20` round trips; `4n` of them are betting actions and the
 /// other `2n + 23` are cryptographic steps.
+///
+/// `time_bank_ms` is the per-hand thinking reserve every seat may spend on top
+/// of `action_timeout_ms`, and it enters as `n * time_bank_ms` — once per seat
+/// per hand, which is exactly what the reserve is. Without that term a table
+/// that offers a bank abandons the hand under the first table where everybody
+/// uses it, which is the one failure a bank must not cause.
 pub const fn hand_deadline_floor_ms(
     seats: u8,
     action_timeout_ms: u64,
     action_grace_ms: u64,
     crypto_step_timeout_ms: u64,
     hand_delay_ms: u64,
+    time_bank_ms: u64,
 ) -> u64 {
     let n = seats as u64;
     hand_delay_ms
         + (2 * n + 23) * crypto_step_timeout_ms
         + 4 * n * (action_timeout_ms + action_grace_ms)
+        + n * time_bank_ms
 }
 
 /// The **admitted** minimum: the floor plus one reopening.
@@ -163,6 +171,7 @@ pub const fn hand_deadline_min_ms(
     action_grace_ms: u64,
     crypto_step_timeout_ms: u64,
     hand_delay_ms: u64,
+    time_bank_ms: u64,
 ) -> u64 {
     hand_deadline_floor_ms(
         seats,
@@ -170,7 +179,41 @@ pub const fn hand_deadline_min_ms(
         action_grace_ms,
         crypto_step_timeout_ms,
         hand_delay_ms,
+        time_bank_ms,
     ) + reopening_cost_ms(seats, action_timeout_ms, action_grace_ms)
+}
+
+/// The largest per-hand thinking reserve a table may advertise.
+///
+/// **Derived, not chosen.** The reserve enters the whole-hand floor `n` times,
+/// so at ten seats every second of reserve costs ten seconds of deadline, and
+/// [`HAND_DEADLINE_CAP_MS`] is what a hand may not exceed. This is exactly the
+/// headroom the largest table has, shared out one share per seat — a number
+/// picked by hand drifts from the cap the moment any other term moves, which
+/// the test below caught it doing on the first attempt.
+///
+/// It is stated against the default timings. A table with a longer
+/// `action_timeout_ms` has less headroom, and what enforces payability there is
+/// not this ceiling but the joiner's own floor check, which runs on the
+/// advert's own numbers.
+pub const TIME_BANK_CAP_MS: u32 = {
+    let headroom = HAND_DEADLINE_CAP_MS
+        - hand_deadline_min_ms(MAX_SEATS, 20_000, 5_000, 30_000, 7_000, 0);
+    (headroom / MAX_SEATS as u64) as u32
+};
+
+/// What a table offers unless its founder says otherwise.
+///
+/// Zero for `RATED_SNG_POKERTH_V1`, whose whole-hand deadline §13 fixes to the
+/// millisecond and which therefore has no room for one. Every other table gets
+/// half a minute, which is a decision a human can actually use and which the
+/// floor absorbs at any seat count this protocol admits.
+pub const fn default_time_bank_ms(seats: u8) -> u32 {
+    if seats == MAX_SEATS {
+        0
+    } else {
+        30_000
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +296,16 @@ pub const fn sng_hand_deadline_ms(seats: u8) -> u64 {
     if seats == RATED_SEATS {
         return RATED_HAND_DEADLINE_MS;
     }
-    let floor = hand_deadline_floor_ms(seats, 20_000, 5_000, 30_000, 7_000);
+    // With the reserve this table will actually advertise, or the joiner's own
+    // floor check refuses the founder's advert on the founder's own numbers.
+    let floor = hand_deadline_floor_ms(
+        seats,
+        20_000,
+        5_000,
+        30_000,
+        7_000,
+        default_time_bank_ms(seats) as u64,
+    );
     let surplus = SNG_REOPENINGS * reopening_cost_ms(seats, 20_000, 5_000);
     let want = floor + surplus;
     if want > HAND_DEADLINE_CAP_MS {
@@ -325,7 +377,7 @@ const _: () = assert!(sng_small_blind_cap(RATED_SEATS) == RATED_SMALL_BLIND_CAP)
 const _: () = assert!(sng_hand_deadline_ms(RATED_SEATS) == RATED_HAND_DEADLINE_MS);
 const _: () = assert!(RATED_SMALL_BLIND_CAP > RATED_START_STACK);
 const _: () = assert!(
-    RATED_HAND_DEADLINE_MS >= hand_deadline_min_ms(MAX_SEATS, 20_000, 5_000, 30_000, 7_000)
+    RATED_HAND_DEADLINE_MS >= hand_deadline_min_ms(MAX_SEATS, 20_000, 5_000, 30_000, 7_000, 0)
 );
 
 #[cfg(test)]
@@ -337,7 +389,7 @@ mod tests {
     fn the_floor_matches_the_published_derivation() {
         // The rated preset's timing: 20 s action, 5 s grace, 30 s crypto step,
         // 7 s hand delay.
-        let f = |n: u8| hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000);
+        let f = |n: u8| hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000, 0);
         assert_eq!(f(2), 1_017_000);
         assert_eq!(f(4), 1_337_000);
         assert_eq!(f(6), 1_657_000);
@@ -348,13 +400,61 @@ mod tests {
     #[test]
     fn the_admitted_minimum_is_the_floor_plus_one_reopening() {
         for n in [2u8, 4, 6, 8, 10] {
-            let floor = hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000);
+            let floor = hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000, 0);
             let cost = reopening_cost_ms(n, 20_000, 5_000);
-            let min = hand_deadline_min_ms(n, 20_000, 5_000, 30_000, 7_000);
+            let min = hand_deadline_min_ms(n, 20_000, 5_000, 30_000, 7_000, 0);
             assert_eq!(min, floor + cost, "at {n} seats");
             assert!(min > floor, "the minimum must leave room for one reopening");
         }
-        assert_eq!(hand_deadline_min_ms(10, 20_000, 5_000, 30_000, 7_000), 2_522_000);
+        assert_eq!(hand_deadline_min_ms(10, 20_000, 5_000, 30_000, 7_000, 0), 2_522_000);
+    }
+
+    /// The reserve buys thinking time for **every** seat, once per hand, or a
+    /// table that offers one abandons the first hand where everybody uses it.
+    #[test]
+    fn the_thinking_reserve_enters_the_floor_once_per_seat() {
+        for n in 2..=MAX_SEATS {
+            let without = hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000, 0);
+            let with = hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000, 30_000);
+            assert_eq!(
+                with - without,
+                n as u64 * 30_000,
+                "at {n} seats the reserve must be budgeted for every seat"
+            );
+        }
+    }
+
+    /// A table may not offer a reserve it cannot afford: the term enters the
+    /// floor `n` times, and the floor may not pass the cap.
+    #[test]
+    fn the_largest_admitted_reserve_still_fits_under_the_cap() {
+        let floor = hand_deadline_min_ms(
+            MAX_SEATS,
+            20_000,
+            5_000,
+            30_000,
+            7_000,
+            TIME_BANK_CAP_MS as u64,
+        );
+        assert!(
+            floor <= HAND_DEADLINE_CAP_MS,
+            "the cap admits a reserve the deadline cannot pay for: {floor} > {HAND_DEADLINE_CAP_MS}"
+        );
+    }
+
+    /// The shipped defaults have to be payable by the deadline the same
+    /// defaults advertise, or a founder's own advert fails the joiner's floor.
+    #[test]
+    fn every_default_table_can_pay_for_the_reserve_it_offers() {
+        for n in 2..=MAX_SEATS {
+            let bank = default_time_bank_ms(n) as u64;
+            let minimum = hand_deadline_min_ms(n, 20_000, 5_000, 30_000, 7_000, bank);
+            let advertised = sng_hand_deadline_ms(n);
+            assert!(
+                advertised >= minimum,
+                "at {n} seats the advert offers {bank} ms of reserve and only {advertised} ms                  of deadline, against a floor of {minimum}"
+            );
+        }
     }
 
     /// The regression that no timing test could see. 600 000 ms is below the
@@ -364,7 +464,7 @@ mod tests {
     fn six_hundred_thousand_is_below_the_floor_everywhere() {
         for n in [2u8, 4, 6, 8, 10] {
             assert!(
-                hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000) > 600_000,
+                hand_deadline_floor_ms(n, 20_000, 5_000, 30_000, 7_000, 0) > 600_000,
                 "600 000 ms would be legal at {n} seats"
             );
         }
@@ -375,7 +475,7 @@ mod tests {
     /// passed at a value that falsified this very sentence.
     #[test]
     fn the_rated_deadline_buys_exactly_four_reopenings() {
-        let floor = hand_deadline_floor_ms(MAX_SEATS, 20_000, 5_000, 30_000, 7_000);
+        let floor = hand_deadline_floor_ms(MAX_SEATS, 20_000, 5_000, 30_000, 7_000, 0);
         let cost = reopening_cost_ms(MAX_SEATS, 20_000, 5_000);
         assert_eq!((RATED_HAND_DEADLINE_MS - floor) / cost, 4);
     }

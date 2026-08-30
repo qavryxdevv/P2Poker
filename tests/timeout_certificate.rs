@@ -26,6 +26,10 @@ fn key(seed: u8) -> SigningKey {
 }
 
 fn opening3(my_seat: u8) -> Opening {
+    opening3_with_bank(my_seat, 0)
+}
+
+fn opening3_with_bank(my_seat: u8, time_bank_ms: u32) -> Opening {
     Opening {
         table_id: [1; 32],
         hand_id: 1,
@@ -47,6 +51,7 @@ fn opening3(my_seat: u8) -> Opening {
         action_timeout_ms: 20_000,
         action_grace_ms: 5_000,
         hand_delay_ms: 7_000,
+        time_bank_ms,
         hand_deadline_ms: 600_000,
         grace: vec![GRACE_HANDS; 3],
         present_run: vec![0; 3],
@@ -197,4 +202,120 @@ fn a_named_subject_without_its_certificate_is_refused() {
     let mut orphan = HandAbort::on_deadline(stacks.clone());
     orphan.cert_hash = Some([7; 32]);
     assert!(orphan.consistent(&stacks).is_err());
+}
+
+
+/// A table of three that all play, so the hand reaches a betting stage, and
+/// only then loses a seat.
+struct Live {
+    hands: Vec<Hand>,
+    keys: Vec<SigningKey>,
+}
+
+impl Live {
+    fn open(time_bank_ms: u32) -> (Self, Vec<Vec<u8>>) {
+        let keys: Vec<SigningKey> = (0..3u8).map(|s| key(10 + s)).collect();
+        let mut hands = Vec::new();
+        let mut queue = Vec::new();
+        for s in 0..3u8 {
+            let (h, out) = Hand::open(
+                opening3_with_bank(s, time_bank_ms),
+                &keys[usize::from(s)],
+                NOW,
+                30_000,
+            )
+            .expect("the hand opens");
+            hands.push(h);
+            for Send::Broadcast(b) in out {
+                queue.push(b);
+            }
+        }
+        (Live { hands, keys }, queue)
+    }
+
+    fn settle(&mut self, mut queue: Vec<Vec<u8>>) {
+        for _ in 0..600 {
+            if queue.is_empty() {
+                return;
+            }
+            for bytes in std::mem::take(&mut queue) {
+                for to in 0..3usize {
+                    match self.hands[to].on_event(&bytes, &self.keys[to], NOW) {
+                        Ok(out) => {
+                            for Send::Broadcast(b) in out {
+                                queue.push(b);
+                            }
+                        }
+                        Err(Failed::NotYet) => self.hands[to].hold(bytes.clone()),
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        panic!("the delivery loop never went quiet");
+    }
+}
+
+/// **The reserve is what a peer must wait out before it accuses anybody.**
+///
+/// Every peer budgets the whole reserve for every other seat, because what a
+/// seat has left of its own is known only to that seat. Budget less and the
+/// table certifies a player who is still legitimately thinking and folds a hand
+/// out from under them — which is the one outcome D-023's machinery exists to
+/// make impossible.
+#[test]
+fn nobody_votes_a_seat_late_until_its_reserve_has_run_out() {
+    const BANK: u64 = 30_000;
+    let (mut t, opening) = Live::open(BANK as u32);
+    t.settle(opening);
+
+    // The hand has dealt and somebody is on the clock.
+    let owed = t.hands[0].waiting_for();
+    assert_eq!(
+        owed.len(),
+        1,
+        "one seat should be on the clock at a betting stage, not {owed:?}"
+    );
+    let subject = owed[0];
+    let survivors: Vec<usize> = (0..3usize).filter(|s| *s as u8 != subject).collect();
+    assert_eq!(survivors.len(), 2, "two seats must be left to vote");
+
+    // Past the plain action deadline, and not one voter says a word: the
+    // subject is inside the reserve its table advertised.
+    let plain = NOW + 20_000 + 5_000 + 1;
+    for &s in &survivors {
+        let out = t.hands[s]
+            .vote_on_timeouts(&t.keys[s], plain)
+            .expect("voting is not an error");
+        assert!(
+            out.is_empty(),
+            "seat {s} accused seat {subject} while its reserve was still running"
+        );
+    }
+
+    // Past the reserve as well, and now the appeal opens.
+    let spent = NOW + 20_000 + 5_000 + BANK + 1;
+    for &s in &survivors {
+        let out = t.hands[s]
+            .vote_on_timeouts(&t.keys[s], spent)
+            .expect("voting is not an error");
+        assert_eq!(
+            out.len(),
+            1,
+            "seat {s} should vote about seat {subject} once the reserve is gone"
+        );
+    }
+}
+
+/// A table with no reserve must not wait for one that does not exist.
+#[test]
+fn a_table_without_a_reserve_votes_at_the_plain_deadline() {
+    let (mut t, opening) = Live::open(0);
+    t.settle(opening);
+    let subject = t.hands[0].waiting_for()[0];
+    let voter = (0..3usize).find(|s| *s as u8 != subject).expect("a voter");
+    let out = t.hands[voter]
+        .vote_on_timeouts(&t.keys[voter], NOW + 20_000 + 5_000 + 1)
+        .expect("voting is not an error");
+    assert_eq!(out.len(), 1, "with no reserve the plain deadline is the whole deadline");
 }

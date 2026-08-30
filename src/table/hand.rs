@@ -224,6 +224,10 @@ pub struct Opening {
     /// terminal event arms; D-020's five seconds is this client's own hold on
     /// top and is not the same number.
     pub hand_delay_ms: u32,
+    /// The per-hand thinking reserve every seat may spend on top of
+    /// `action_timeout_ms`. A table parameter inside `table_params_hash`, so
+    /// every peer derives the same betting deadline from it.
+    pub time_bank_ms: u32,
     /// How long a seat has to act before its own client acts for it.
     ///
     /// From the table's advertisement, so every seat has the same number. It is
@@ -273,6 +277,7 @@ impl Opening {
             action_timeout_ms: ad.action_timeout_ms,
             action_grace_ms: ad.action_grace_ms,
             hand_delay_ms: ad.hand_delay_ms,
+            time_bank_ms: ad.time_bank_ms,
             hand_deadline_ms: ad.hand_deadline_ms,
             // Everybody starts whole. A table that has played no hands has
             // nobody who has missed one.
@@ -692,6 +697,14 @@ pub struct Hand {
     /// receiver check that claim against something it verified itself rather
     /// than take the emitter's word for it.
     certs: BTreeSet<Hash>,
+    /// What is left of **this** client's own per-hand thinking reserve.
+    ///
+    /// Local, and deliberately so. Every peer budgets the *whole* reserve for
+    /// every other seat, because what a seat has left is known only to that
+    /// seat. This is what the owner of the seat spends, spending it can only
+    /// ever cost its owner a fold, and nothing derived from it crosses the
+    /// wire — so no peer has to agree about it and none can be misled by it.
+    bank_left_ms: u32,
     /// Diagnostic: what the certificate path last decided.
     cert_note: Vec<String>,
     /// The last seat a certificate acted for, and what it did.
@@ -890,6 +903,7 @@ impl Hand {
                 signed,
                 tally: None,
                 certs: BTreeSet::new(),
+                bank_left_ms: o.time_bank_ms,
                 cert_note: Vec::new(),
                 acted_for: None,
                 votes: BTreeMap::new(),
@@ -1957,6 +1971,18 @@ impl Hand {
         let hash = self.opened(&bytes, kind)?.event_hash;
         let mut out = vec![Send::Broadcast(bytes)];
         out.append(&mut self.apply_action(me, action, kind, hash, key, now_ms)?);
+        // What this turn cost the reserve, charged once and only on the action
+        // that ends the turn. `stage_at_ms` is when this client accepted the
+        // event that gave it the turn, which is §8.2's own starting point, so
+        // the reserve drains against the same clock the deadline is measured
+        // on. An action refused as illegal charges nothing: the player has not
+        // acted yet and will be asked again.
+        let over = now_ms
+            .saturating_sub(self.stage_at_ms)
+            .saturating_sub(u64::from(self.open.action_timeout_ms));
+        self.bank_left_ms = self
+            .bank_left_ms
+            .saturating_sub(u32::try_from(over).unwrap_or(u32::MAX));
         self.mark_stage(now_ms);
         Ok(out)
     }
@@ -4240,6 +4266,7 @@ impl Hand {
             action_timeout_ms: self.open.action_timeout_ms,
             action_grace_ms: self.open.action_grace_ms,
             hand_delay_ms: self.open.hand_delay_ms,
+            time_bank_ms: self.open.time_bank_ms,
             hand_deadline_ms: self.open.hand_deadline_ms,
             grace,
             present_run,
@@ -4256,9 +4283,17 @@ impl Hand {
     /// the grace is what absorbs the round trip, so a client that folded at the
     /// timeout would be folding hands that had in fact been played in time.
     pub fn action_deadline(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(u64::from(self.open.action_timeout_ms).saturating_add(
-            u64::from(self.open.action_grace_ms),
-        ))
+        std::time::Duration::from_millis(
+            u64::from(self.open.action_timeout_ms)
+                .saturating_add(u64::from(self.open.action_grace_ms))
+                .saturating_add(u64::from(self.bank_left_ms)),
+        )
+    }
+
+    /// What is left of this client's own thinking reserve, for the table to
+    /// show its owner. Nobody else's is knowable, and none is shown.
+    pub fn bank_left(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(u64::from(self.bank_left_ms))
     }
 
     /// What the player sees: their own clock, without the transport's share.
@@ -4285,7 +4320,15 @@ impl Hand {
             | EventType::ActionFold => self
                 .open
                 .action_timeout_ms
-                .saturating_add(self.open.action_grace_ms),
+                .saturating_add(self.open.action_grace_ms)
+                // **The whole reserve, not what the seat has left of it.**
+                // What a seat has left is known only to that seat, and §8.2
+                // requires every peer to derive the same number. Budgeting the
+                // maximum costs a certificate against a genuinely absent seat
+                // one reserve's delay; budgeting anything less would let the
+                // table certify a player who was still legitimately thinking,
+                // which is the one thing D-023's machinery must never do.
+                .saturating_add(self.open.time_bank_ms),
             // A hand boundary: the pause before the next deal, and then the
             // first cryptographic stage of it.
             EventType::HandComplete | EventType::HandAbort => self
@@ -4670,6 +4713,7 @@ mod tests {
             action_timeout_ms: 20_000,
             action_grace_ms: 5_000,
             hand_delay_ms: 7_000,
+            time_bank_ms: 0,
             hand_deadline_ms: 600_000,
             grace: vec![GRACE_HANDS; 3],
             present_run: vec![0; 3],
@@ -4707,6 +4751,7 @@ mod tests {
             action_timeout_ms: 20_000,
             action_grace_ms: 5_000,
             hand_delay_ms: 7_000,
+            time_bank_ms: 0,
             hand_deadline_ms: 600_000,
             grace: vec![GRACE_HANDS; 3],
             present_run: vec![0; 3],

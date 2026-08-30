@@ -318,6 +318,7 @@ mod tests {
             hand_deadline_ms: 0,
             join_deadline_ms: 120_000,
             hand_delay_ms: 7_000,
+            time_bank_ms: 0,
             button_rule: 1,
             odd_chip_rule: 1,
             showdown_policy: 1,
@@ -334,6 +335,7 @@ mod tests {
             a.action_grace_ms as u64,
             a.crypto_step_timeout_ms as u64,
             a.hand_delay_ms as u64,
+        0,
         ) as u32;
         a
     }

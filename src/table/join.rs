@@ -484,6 +484,7 @@ mod tests {
             hand_deadline_ms: 0,
             join_deadline_ms: 120_000,
             hand_delay_ms: 7_000,
+            time_bank_ms: 0,
             button_rule: 1,
             odd_chip_rule: 1,
             showdown_policy: 1,
@@ -494,7 +495,7 @@ mod tests {
             timestamp_unix_ms: 1_700_000_000_000,
             expires_at_unix_ms: 1_700_000_090_000,
         };
-        a.hand_deadline_ms = hand_deadline_min_ms(6, 20_000, 5_000, 30_000, 7_000) as u32;
+        a.hand_deadline_ms = hand_deadline_min_ms(6, 20_000, 5_000, 30_000, 7_000, 0) as u32;
         a
     }
 

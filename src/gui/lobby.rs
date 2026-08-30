@@ -403,6 +403,7 @@ pub fn suggested_hand_deadline(
     action_grace_ms: u32,
     crypto_step_timeout_ms: u32,
     hand_delay_ms: u32,
+    time_bank_ms: u32,
 ) -> u32 {
     crate::protocol::constants::hand_deadline_min_ms(
         seats,
@@ -410,6 +411,7 @@ pub fn suggested_hand_deadline(
         action_grace_ms as u64,
         crypto_step_timeout_ms as u64,
         hand_delay_ms as u64,
+        time_bank_ms as u64,
     ) as u32
 }
 
@@ -467,6 +469,7 @@ mod tests {
             hand_deadline_ms: 0,
             join_deadline_ms: 120_000,
             hand_delay_ms: 7_000,
+            time_bank_ms: 0,
             button_rule: 1,
             odd_chip_rule: 1,
             showdown_policy: 1,
@@ -477,7 +480,7 @@ mod tests {
             timestamp_unix_ms: NOW,
             expires_at_unix_ms: NOW + 90_000,
         };
-        a.hand_deadline_ms = hand_deadline_min_ms(6, 20_000, 5_000, 30_000, 7_000) as u32;
+        a.hand_deadline_ms = hand_deadline_min_ms(6, 20_000, 5_000, 30_000, 7_000, 0) as u32;
         a
     }
 
@@ -711,15 +714,15 @@ mod tests {
     #[test]
     fn the_suggested_deadline_is_derived_and_admissible() {
         for seats in [2u8, 6, 10] {
-            let d = suggested_hand_deadline(seats, 20_000, 5_000, 30_000, 7_000);
+            let d = suggested_hand_deadline(seats, 20_000, 5_000, 30_000, 7_000, 0);
             assert_eq!(
                 d as u64,
-                hand_deadline_min_ms(seats, 20_000, 5_000, 30_000, 7_000)
+                hand_deadline_min_ms(seats, 20_000, 5_000, 30_000, 7_000, 0)
             );
         }
         assert!(
-            suggested_hand_deadline(10, 20_000, 5_000, 30_000, 7_000)
-                > suggested_hand_deadline(2, 20_000, 5_000, 30_000, 7_000),
+            suggested_hand_deadline(10, 20_000, 5_000, 30_000, 7_000, 0)
+                > suggested_hand_deadline(2, 20_000, 5_000, 30_000, 7_000, 0),
             "more seats need more time, which is why it is derived"
         );
     }

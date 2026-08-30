@@ -2430,9 +2430,21 @@ optional:
   no peer could budget for anybody else's, and a generous client would have its
   hands aborted by a stingy one.
 
-Note that such a bank is *safe* without any of §8.4's machinery, because it is
+~~Note that such a bank is *safe* without any of §8.4's machinery, because it is
 **local**: it extends only this client's own clock for its own seat, and no
-peer's derivation reads it. It is the reconnection bank above that had to be
+peer's derivation reads it.~~ **That was true only while D-015 held.** D-023 put
+the certificate back, and a certificate *is* a peer's derivation of a deadline
+for somebody else's seat. A reserve no peer knew about would be a reserve the
+table folds a player out of the moment they use it.
+
+So the reserve is a **table parameter**, `n(29) time_bank_ms`, inside
+`table_params_hash`, and every peer adds the **whole** of it to a betting
+stage's `next_deadline_ms` before it will vote that a seat is late — never the
+part that seat has left, which is knowable only to that seat. The cost is that a
+certificate against a genuinely absent player waits out one reserve it knows was
+never going to be spent. That is the right way round: the alternative folds a
+hand out from under somebody who was still thinking, which is the one outcome
+this machinery exists to make impossible. It is the reconnection bank above that had to be
 counted in hands, because that one decides `dealt_in`. A thinking bank decides
 only when a client folds itself, and a client folding itself early harms nobody
 but its owner.

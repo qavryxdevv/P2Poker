@@ -115,6 +115,13 @@ pub struct AdBody {
     pub join_deadline_ms: u32,
     #[n(19)]
     pub hand_delay_ms: u32,
+    /// The per-hand thinking reserve every seat may spend on top of
+    /// `action_timeout_ms`. **Inside `table_params_hash`**, because every peer
+    /// adds it to a betting stage's deadline before voting a seat late, and two
+    /// peers using different values would certify a player who was still
+    /// legitimately thinking.
+    #[n(29)]
+    pub time_bank_ms: u32,
     #[n(20)]
     pub button_rule: u16,
     #[n(21)]
@@ -163,6 +170,7 @@ impl From<&TableAd> for AdBody {
             hand_deadline_ms: a.hand_deadline_ms,
             join_deadline_ms: a.join_deadline_ms,
             hand_delay_ms: a.hand_delay_ms,
+            time_bank_ms: a.time_bank_ms,
             button_rule: a.button_rule,
             odd_chip_rule: a.odd_chip_rule,
             showdown_policy: a.showdown_policy,
@@ -215,6 +223,7 @@ impl TryFrom<AdBody> for TableAd {
             hand_deadline_ms: b.hand_deadline_ms,
             join_deadline_ms: b.join_deadline_ms,
             hand_delay_ms: b.hand_delay_ms,
+            time_bank_ms: b.time_bank_ms,
             button_rule: b.button_rule,
             odd_chip_rule: b.odd_chip_rule,
             showdown_policy: b.showdown_policy,
@@ -278,6 +287,7 @@ pub fn table_params_hash(ad: &TableAd) -> Hash {
     let hand_deadline = ad.hand_deadline_ms.to_be_bytes();
     let join_deadline = ad.join_deadline_ms.to_be_bytes();
     let hand_delay = ad.hand_delay_ms.to_be_bytes();
+    let time_bank = ad.time_bank_ms.to_be_bytes();
     let button_rule = ad.button_rule.to_be_bytes();
     let odd_chip_rule = ad.odd_chip_rule.to_be_bytes();
     let showdown = ad.showdown_policy.to_be_bytes();
@@ -310,6 +320,7 @@ pub fn table_params_hash(ad: &TableAd) -> Hash {
             &odd_chip_rule,             // n(21)
             &showdown,                  // n(22)
             ad.deck_suite.as_bytes(),   // n(24), payload bytes verbatim
+            &time_bank,                 // n(29)
         ],
     )
 }
@@ -534,6 +545,7 @@ mod tests {
             hand_deadline_ms: 0,
             join_deadline_ms: 120_000,
             hand_delay_ms: 7_000,
+            time_bank_ms: 0,
             button_rule: 1,
             odd_chip_rule: 1,
             showdown_policy: 1,
@@ -550,6 +562,7 @@ mod tests {
             a.action_grace_ms as u64,
             a.crypto_step_timeout_ms as u64,
             a.hand_delay_ms as u64,
+        0,
         ) as u32;
         a
     }
@@ -881,8 +894,9 @@ mod tests {
             ("odd_chip_rule", Box::new(|a: &mut TableAd| a.odd_chip_rule = 2)),
             ("showdown_policy", Box::new(|a: &mut TableAd| a.showdown_policy = 2)),
             ("deck_suite", Box::new(|a: &mut TableAd| a.deck_suite = "bs-bg12-secp256k1/2".into())),
+            ("time_bank_ms", Box::new(|a: &mut TableAd| a.time_bank_ms = 30_000)),
         ];
-        assert_eq!(included.len(), 25, "the box has twenty-five parts");
+        assert_eq!(included.len(), 26, "the box has twenty-six parts");
 
         let base_hash = table_params_hash(&base);
         for (what, mutate) in included {
@@ -905,11 +919,15 @@ mod tests {
         let body = AdBody::from(&ad());
         let bytes = to_canonical(&body).unwrap();
 
-        // A CBOR array of 29 elements: major type 4, count in one extra byte.
+        // A CBOR array of 30 elements: major type 4, count in one extra byte.
+        // Thirty because `time_bank_ms` is `n(29)`; the derive encodes indices
+        // `0..=29` positionally, so the count **is** the highest index plus
+        // one and a field added anywhere but the end would move every later
+        // one. That is what this assertion is here to catch.
         assert_eq!(
             &bytes[..2],
-            &[0x98, 0x1D],
-            "twenty-nine fields, not thirty-two"
+            &[0x98, 0x1E],
+            "thirty fields, and each at the index the protocol gives it"
         );
         // And n(13) is itself an array of four.
         assert!(bytes.contains(&0x84), "the schedule is nested, not flattened");

@@ -5947,6 +5947,7 @@ unambiguous before the first card exists.
 | `n(17) hand_deadline_ms` | `u32` | `HAND_DEADLINE_MIN(n(11)) ≤ … ≤ 3_600_000` — the lower bound is derived, not a literal (`P3`, and raised by one `REOPENING_COST` in this pass by `G5-Q6`); it is a function of `n(11)`, `n(14)`, `n(15)`, `n(16)` and `n(19)`, it is derived in §8.2, and an advert below it is rejected by rule 2a below. A single figure here made legal play at six seats and up abort itself, and the floor alone let the first re-raise do the same |
 | `n(18) join_deadline_ms` | `u32` | `≤ 3_600_000` |
 | `n(19) hand_delay_ms` | `u32` | `≤ 60_000` |
+| `n(29) time_bank_ms` | `u32` | `≤ TIME_BANK_CAP(n(11))`, the per-hand thinking reserve every seat may spend on top of `n(14)`. **Inside `table_params_hash`.** It is a table parameter rather than a client's own setting because every peer adds it to a betting stage's `next_deadline_ms` (§8.2) before it will vote that a seat is late: if each client chose its own, a generous client would have its hands aborted by a stingy one, and — the outcome that matters — the table would certify a player who was still legitimately thinking. Every peer budgets the **whole** reserve for every other seat, never what that seat has left of it, because what a seat has left is known only to that seat. `0` disables it, which is what §13's preset carries |
 | `n(20) button_rule` | `u16` | `1` = `DEAD_BUTTON` (only value in version 1) |
 | `n(21) odd_chip_rule` | `u16` | `1` = `FIRST_SEAT_LEFT_OF_BUTTON` (only value) |
 | `n(22) showdown_policy` | `u16` | `1` = `MANDATORY_REVEAL` (default), `2` = `TDA_MUCK` — see Q-01 |
@@ -6221,7 +6222,7 @@ deterministic function of the table parameters and the kind of the next stage:
 
 | Next stage kind | `next_deadline_ms` |
 |---|---|
-| a betting action | `action_timeout_ms + action_grace_ms` |
+| a betting action | `action_timeout_ms + action_grace_ms + time_bank_ms` |
 | any cryptographic contribution (`DECK_INIT`, `SHUFFLE_*`, `DECK_COMMIT`, `DEAL_PRIVATE`, `BOARD_REVEAL`, `SHOWDOWN_*`) | `crypto_step_timeout_ms` |
 | `STATE_HASH` / `STATE_ACK` | `crypto_step_timeout_ms` |
 | a hand boundary (`HAND_INIT` after `hand_delay_ms`) | `hand_delay_ms + crypto_step_timeout_ms` |
@@ -6324,7 +6325,14 @@ normatively:
 HAND_DEADLINE_FLOOR(n) =  hand_delay_ms
                         + (2n + 23) * crypto_step_timeout_ms
                         + 4n        * (action_timeout_ms + action_grace_ms)
+                        + n         * time_bank_ms
 ```
+
+The reserve enters **once per seat**, which is what a per-hand reserve is: every
+seat may spend the whole of its own, and a hand in which all of them do must
+still be payable. Omit the term and a table that offers a reserve abandons the
+first hand its players actually use it in — the failure the reserve was added to
+prevent, arriving by the same door.
 
 `4n` rather than `4n − 3` because the three spare allowances are cheaper than an
 off-by-one an implementer has to re-derive. At the §13 preset —

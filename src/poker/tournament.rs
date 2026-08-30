@@ -39,6 +39,18 @@ pub struct Preset {
     pub crypto_step_timeout_sec: u32,
     /// Presentation only. The protocol never waits for it.
     pub hand_delay_sec: u32,
+    /// The per-hand thinking reserve, on top of `action_timeout_sec`.
+    ///
+    /// A **table** parameter and never a client's own choice: it enters the
+    /// whole-hand floor as `n * bank`, and it is what every peer adds to a
+    /// betting stage's deadline before it will vote that a seat is late. If
+    /// each client picked its own, no peer could budget for anybody else's, a
+    /// generous client would have its hands aborted by a stingy one, and a
+    /// player still legitimately thinking would be folded by the table.
+    ///
+    /// Zero at both shipped presets, which is what keeps §13's `hand_deadline`
+    /// exactly the number that section fixes.
+    pub time_bank_sec: u32,
     pub hand_deadline_sec: u32,
     pub join_deadline_sec: u32,
 }
@@ -149,6 +161,7 @@ pub const RATED_SNG_POKERTH_V1: Preset = Preset {
     action_grace_sec: 5,
     crypto_step_timeout_sec: 30,
     hand_delay_sec: 7,
+    time_bank_sec: 0,
     // Normative in `PROTOCOL.md` §13. The floor at ten seats is 2 297 000 ms,
     // so this clears it by 1 003 000 ms, which buys exactly four reopening
     // raises per hand and stays under the 3 600 000 ms cap.
@@ -188,6 +201,7 @@ pub const HEADS_UP_CUSTOM_2P: Preset = Preset {
     action_grace_sec: 5,
     crypto_step_timeout_sec: 30,
     hand_delay_sec: 7,
+    time_bank_sec: 0,
     // 1 017 s is the floor at two seats.
     hand_deadline_sec: 1_200,
     join_deadline_sec: 120,
@@ -271,7 +285,9 @@ impl Preset {
         let crypto = (2 * n + 23) * (self.crypto_step_timeout_sec as u64 * 1_000);
         let action = 4 * n
             * ((self.action_timeout_sec as u64 + self.action_grace_sec as u64) * 1_000);
-        delay + crypto + action
+        // Once per seat per hand, which is what the reserve is.
+        let bank = n * (self.time_bank_sec as u64 * 1_000);
+        delay + crypto + action + bank
     }
 
     /// How many reopening raises one hand can afford above the floor.
@@ -352,6 +368,7 @@ impl Preset {
             self.action_grace_sec as u64 * 1_000,
             self.crypto_step_timeout_sec as u64 * 1_000,
             self.hand_delay_sec as u64 * 1_000,
+            self.time_bank_sec as u64 * 1_000,
         )
     }
 
