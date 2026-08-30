@@ -4453,6 +4453,34 @@ impl Hand {
         Some(std::mem::take(&mut self.cert_note).join(" | "))
     }
 
+    /// Every input the next hand's roster is derived from, in one line.
+    ///
+    /// Written because two readings of the derivation gave answers a live log
+    /// contradicted: a seat dropped with no certificate accepted, and a seat
+    /// that had been dropped came back. The inputs are all private and the
+    /// output is a set, so from outside there was no way to tell which moved.
+    pub fn roster_derivation(&self) -> String {
+        let stacked: Vec<SeatIdx> = (0..self.open.max_players)
+            .filter(|s| {
+                self.open
+                    .seats
+                    .iter()
+                    .any(|(seat, _, stack)| seat == s && *stack > 0)
+            })
+            .collect();
+        let signed: Vec<SeatIdx> = (0..self.open.max_players)
+            .filter(|s| self.signed.get(usize::from(*s)).copied().unwrap_or(false))
+            .collect();
+        format!(
+            "roster from: required {:?} certified {:?} strikes {:?} grace {:?}              signed {signed:?} stacked {stacked:?} by_certificate={}",
+            self.open.required,
+            self.certified,
+            self.strikes,
+            self.open.grace,
+            self.open.required.len() >= 3,
+        )
+    }
+
     /// The one condition this client cannot repair and must not hide: two
     /// parents at one sequence, taken rather than read so the node reports it
     /// once.
@@ -4919,7 +4947,29 @@ impl Hand {
                 })
                 .collect()
         } else {
-            (0..self.open.max_players)
+            // **`R(k)`, never every seat.** This branch used `0..max_players`,
+            // so it could ADD a seat — and it is reached exactly when the
+            // certified branch has just shrunk the roster to two, because that
+            // branch is gated on `required.len() >= 3`. Measured, four hands:
+            //
+            //   hand 1 [0, 1, 2] -> seat 2 certified -> required [0, 1]
+            //   hand 2 [0, 1]    -> observation, `signed` holds 2 -> [0, 1, 2]
+            //   hand 3 [0, 1, 2] -> seat 2 certified again -> [0, 1]
+            //   hand 4 [0, 1]    -> ...
+            //
+            // A seat certified absent came back every other hand and was
+            // certified out again, for ever. `R(k+1) ⊆ R(k)` closes it: the
+            // roster is monotone, whichever branch derives it.
+            //
+            // The cost is stated rather than hidden: D-013 says one silent seat
+            // costs one hand and not the table, and under this a seat dropped
+            // heads-up does not return. That is a rules question and it is in
+            // NEXT.md; what is not a question is that the two branches must not
+            // have opposite policies.
+            self.open
+                .required
+                .iter()
+                .copied()
                 .filter(|s| {
                     took_part(self, usize::from(*s))
                         && alive.get(usize::from(*s)).copied().unwrap_or(false)

@@ -2219,7 +2219,24 @@ pub async fn run(
                 }
             }, if next_hand_at.is_some() => {
                 next_hand_at = None;
+                // **At the derivation, not at the end of the hand.** The
+                // first version reported these when `over()` first became true,
+                // which is before a late certificate is banked, so it described
+                // a state the derivation never saw.
+                if let Some(h) = hand.as_ref() {
+                    let _ = events
+                        .send(NodeEvent::Warning(h.roster_derivation()))
+                        .await;
+                }
                 let next = hand.as_ref().and_then(|h| h.next_hand());
+                if let Some(o) = next.as_ref() {
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "roster to: required {:?}",
+                            o.required
+                        )))
+                        .await;
+                }
                 hand = None;
                 hand_reported = false;
                 deck_reported = None;
