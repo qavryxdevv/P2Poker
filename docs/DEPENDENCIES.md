@@ -839,9 +839,15 @@ Five things a `deny.toml` has to handle, all verified:
    byte-identical to what was published, including when it is wrong. The counts in
    the table above are of *declared* expressions and are unchanged.
 
-**Our own licence is undecided.** `Cargo.toml` has no `license` field, and the choice
-(MIT / Apache-2.0 / dual / GPL-3.0 / AGPL-3.0) is on `DECISIONS.md`'s open list,
-blocking publication. Nothing in the dependency set forecloses any of those five: the
+**Our own licence is decided, and not by a licensing decision.** D-019 puts the
+table's traffic on a Tox group, `c-toxcore` is **GPL-3.0 and not LGPL** — verified
+against the repository's own `LICENSE` on 2026-08-30 — and linking it makes this
+whole client GPL-3.0. MIT, Apache-2.0 and the dual form are foreclosed. Nothing in
+the tree below blocks that: `rs_poker`'s Apache-2.0-only is compatible in that
+direction. **The paragraph that follows was written while the choice was still
+open and is kept as the record of what the tree looked like before**; what it
+says about the dependency set remains true, and what it implies about the choice
+being free no longer is. Nothing in the dependency set forecloses any of those five: the
 tree is permissive throughout, and the single MPL-2.0 crate is file-scoped weak
 copyleft that does not propagate to our sources. `rs_poker`'s Apache-2.0-only licence
 is the one entry that would matter against a GPL-2.0-only choice, which is not on the

@@ -105,6 +105,51 @@ and find out whether the announcement is not sent, not received, or not matched.
 Nothing is harmed by shipping it in this state: a failed publish is discarded
 and the panes read *quiet* and *nobody yet*, exactly as before.
 
+## The table's traffic is moving to Tox (D-019)
+
+The owner's decision, after the case against it was put and answered: a public
+libp2p relay grants 128 KiB and two minutes per circuit, a hand costs 18 KB
+heads-up, and a client whose playability depends on somebody having forwarded a
+port is a client most people cannot use. So once a table forms, its game traffic
+rides a **Tox NGC group** whose `chat_id` is published in the table's lobby
+advertisement. Discovery, the lobby, the join RPC and the ratification stay on
+libp2p.
+
+**The price is written down in D-019 and it is not reversible:** `c-toxcore` is
+GPL-3.0 and not LGPL — verified against its own `LICENSE` — so linking it makes
+this whole client GPL-3.0. That closes the open "project licence" item by a
+decision that was not about licensing, and `DEPENDENCIES.md` §6 has been
+corrected: the tree is no longer permissive throughout.
+
+**Why the narrowed proposal is buildable where the earlier one was not:** the
+defect measured in the Python predecessor was group *discovery* decaying — a
+host up six minutes was never found in 300 s, because a group's onion key is
+`random_bytes()` per start. This design never searches for the group: the chat
+id arrives in the lobby advertisement and members arrive by invitation.
+
+### The order, and the seam is done
+
+1. **`table::transport` — done.** `TableTransport`, six tests. `TableSession`,
+   the protocol and the state machine speak through it and never name libp2p,
+   Tox, GossipSub or a peer id. `FromTable::claimed` is an `Option` and is
+   *named* `claimed` because a Tox group can be joined by anybody holding a chat
+   id that travels in a public advertisement, so "it arrived over the group" is
+   worth nothing as a claim about authorship. The signature decides.
+2. **The hand over the existing transport**, so there is something to carry.
+3. **Then Tox**: build `libtoxcore`, the FFI, the group.
+
+Written in that order deliberately: the alternative leaves the project with no
+working game and a second network stack at the same time.
+
+### What step 3 needs from this machine, and does not have
+
+Visual Studio 2022 is installed. `cmake`, `libsodium` and a `vcpkg` are not, and
+`cl` is not on the path outside a developer prompt. There is no maintained Rust
+binding to lean on: `rstox` predates NGC, `quininer/tox-rs` is marked deprecated,
+and `tox-rs/tox` is a pure-Rust reimplementation that is GPLv3+ as well and whose
+own README says the client part is still being worked on. So the FFI is ours to
+write.
+
 ## Next actions, in order
 
 1. **The hand, wired.** Formation ends at `session_id` and the engine starts at

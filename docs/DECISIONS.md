@@ -1974,3 +1974,118 @@ that already exists.
 **Settled and removed from this list:** the `DISPUTE` self-equivocation question
 (review N4) is answered by D-009 rule 1 — the slot key must include every field
 that legitimately varies — and is no longer open.
+
+---
+
+## D-019 — A Tox group carries the table; libp2p keeps the lobby
+
+**Date:** 2026-08-30
+**Decided by:** project owner
+**Status:** accepted
+**Depends on:** D-001, D-002, D-004
+**Consequence:** the client becomes **GPL-3.0**. See "The price" below.
+
+### The decision
+
+Once a table is formed, its game traffic leaves libp2p and rides a **Tox NGC
+group** created by the founder, whose `chat_id` is published as part of the
+table's advertisement in the lobby. Everything up to that point — discovery, the
+lobby, the join RPC, the roster, the ratification that produces `session_id` —
+stays on libp2p exactly as it is.
+
+* The founder creates the group and is its admin.
+* A player joining the table is invited into the group.
+* Leaving the table leaves the group.
+* The founder removes anybody no longer seated or connected.
+* Ordinary Tox group messages carry **human chat only**.
+* The game protocol rides **custom lossless packets**.
+
+### Why, and what was argued against it
+
+The problem is relay capacity. A public libp2p relay grants 128 KiB and two
+minutes per circuit (D-001's addendum, measured again on 2026-08-30 against the
+relays this client now finds in the DHT), and a hand costs 18 KB heads-up and
+54 KB six-handed (`MENTAL_POKER.md` §5.1). That is about seven heads-up hands per
+circuit and two at six seats.
+
+The case **against** was put and is recorded here rather than lost: the limit
+only bites while a connection stays relayed, DCUtR upgrades roughly 70% of them
+to direct (`NAT_AND_DISCOVERY.md` §4), and a single reachable player running this
+client offers a relay with our own raised limits — twelve hands at a full table
+(`swarm.rs`'s `RELAY_MAX_CIRCUIT_BYTES`, derived from `per_hand_bytes` rather
+than picked). So the exposure is the intersection of "the punch failed" and "no
+volunteer within reach".
+
+**The owner's answer, which is the decision:** that intersection is not
+acceptable to depend on, because it requires somebody to have forwarded a port,
+and a client whose playability rests on that is a client most people cannot use.
+A transport that does not have a per-circuit byte cap is worth its price.
+
+### The price, stated plainly because it is a one-way door
+
+**`c-toxcore` is GPL-3.0, not LGPL.** Verified 2026-08-30 by reading the
+repository's own `LICENSE`: *"GNU GENERAL PUBLIC LICENSE, Version 3, 29 June
+2007"*, and the closing note recommends the Lesser GPL for anyone who wants to
+permit linking with proprietary applications. Linking it makes **this whole
+client GPL-3.0**.
+
+Consequences, none of which are reversible once the code ships:
+
+1. `DECISIONS.md`'s open item **"the project licence has never been chosen"** is
+   closed by this decision rather than by a decision about licensing. MIT,
+   Apache-2.0 and the dual form are foreclosed.
+2. `DEPENDENCIES.md` §6's finding — *"the tree is permissive throughout … the
+   only appearance of GPL in the tree is as the unchosen half of a dual
+   licence"* — stops being true. It must be rewritten, not quietly left.
+3. `rs_poker` is Apache-2.0-only, which **is** compatible with GPL-3.0 in that
+   direction, so nothing in the existing tree blocks the choice.
+
+The pure-Rust `tox-rs/tox` was considered as a way round the C toolchain and is
+**not** a way round the licence: it is GPLv3+ as well, and its own README says
+the client part is still being worked on, so NGC is not there to use.
+
+### The risks this carries, from the owner's own measurements
+
+Recorded because they are the reason to expect trouble in a particular place,
+and because they were measured in the Python predecessor of this client and that
+code no longer exists in the tree.
+
+* **A Tox NGC group is findable only while it is new.** Measured 2026-08-27:
+  a host up 20 s was found in 31 s; a host up 6 minutes was never found in 300 s.
+  The cause is in `Messenger.c` — a group's onion key is `random_bytes()` per
+  start, so two members search two different neighbourhoods.
+  **This design does not depend on that path**: the `chat_id` travels in the
+  lobby advertisement and members arrive by invitation, so group discovery
+  through Tox's DHT is not on the critical path. That is the single most
+  important reason the narrowed proposal is buildable where the earlier one was
+  not.
+* A patched `libtoxcore` fixing the above existed and its benefit was never
+  established — one-to-one over two runs, and cross-network never measured.
+* Routing between two clients behind one NAT is **not** the wall; that
+  correction was made 2026-08-28 after a fresh group handshaked in 83 s.
+
+### What does not change
+
+Everything in the owner's list that is not the transport is already this
+project's design and is not re-decided here: the envelope's `table_id`,
+`hand_id`, `sequence`, sender, type and payload are `EventBody`'s own six
+fields; replay and ordering are `protocol::antireplay` and the chained events;
+the deterministic state machine is `STATE_MACHINE.md`; snapshot-then-catch-up is
+`protocol::checkpoint`; signing every critical action and **never trusting that a
+message arrived over the channel** is the rule the protocol was built on; and an
+admin who may remove a player but may not rewrite a hand's history is D-014.
+
+The transport changes. The protocol does not.
+
+### What is built first, and why in that order
+
+1. **A transport seam.** `TableSession`, `GameProtocol` and `StateMachine` must
+   not name libp2p or Tox. This is cheap now and expensive after the hand is
+   wired, and it is what makes the Tox work additive instead of invasive.
+2. The hand over the existing transport, so there is something to carry.
+3. `libtoxcore` built, the FFI, and the group.
+
+Stated because the alternative — write the Tox layer first and wire the hand
+into it — leaves the project with no working game and a second network stack at
+the same time.
+
