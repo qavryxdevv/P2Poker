@@ -67,7 +67,7 @@ use super::joinwire;
 use super::portmap;
 use super::relay;
 use super::lobby::{LobbyStore, RateLimiter, TableAd, TableKind};
-use super::node::{worth_parsing, NodeCommand, NodeEvent, NodeState, REBROADCAST};
+use super::node::{worth_parsing, Events, NodeCommand, NodeEvent, NodeState, REBROADCAST};
 use super::swarm::{CONNECTION_CEILING, MAX_CONNECTIONS, MIN_CONNECTIONS};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
 use super::joinwire::DISPLAY_NAME_MAX;
@@ -226,6 +226,8 @@ pub async fn run(
     port: u16,
     profile_dir: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Advisory events are offered, not waited for. See `Events`.
+    let events = Events::new(events);
     let mut swarm = swarm::build(NodeConfig {
         identity,
         // Capacity from the start; the ANNOUNCE is what AutoNAT gates (D-002).
@@ -2244,6 +2246,16 @@ pub async fn run(
                             .await;
                     }
                 }
+                // Nothing is dropped silently. "No warnings" and "the warnings
+                // were thrown away" must not look the same in a log.
+                let lost = events.take_dropped();
+                if lost > 0 {
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "{lost} advisory event(s) dropped: the log could not                              keep up, and the node did not wait for it"
+                        )))
+                        .await;
+                }
                 // Told to the interface as well, which keeps its own copy and
                 // cannot see this clock.
                 let _ = events.send(NodeEvent::Swept { now_ms: now }).await;
@@ -2312,7 +2324,7 @@ pub async fn run(
 ///
 /// Sent whenever this client joins one or founds one, because the window that
 /// draws it must not have to guess a seat count.
-async fn report_params(events: &mpsc::Sender<NodeEvent>, f: &Formation) {
+async fn report_params(events: &Events, f: &Formation) {
     let ad = f.advert();
     let _ = events
         .send(NodeEvent::TableParams {
@@ -2331,7 +2343,7 @@ async fn report_params(events: &mpsc::Sender<NodeEvent>, f: &Formation) {
 /// The whole roster every time rather than a difference: a difference is only
 /// correct if the receiver never missed one, and this channel is bounded and
 /// drops under load by design.
-async fn report_roster(events: &mpsc::Sender<NodeEvent>, f: &Formation) {
+async fn report_roster(events: &Events, f: &Formation) {
     let seats = f
         .roster()
         .seats()
@@ -2485,7 +2497,7 @@ async fn show_own_table(
     now: u64,
     limits: &mut RateLimiter,
     store: &mut LobbyStore,
-    events: &mpsc::Sender<NodeEvent>,
+    events: &Events,
 ) {
     match advert::receive(bytes, *me, now, limits, store) {
         Ok(key) => {
@@ -2532,7 +2544,7 @@ async fn handle_gossip(
     from: libp2p::PeerId,
     topics: &Topics,
     state: &mut NodeState,
-    events: &mpsc::Sender<NodeEvent>,
+    events: &Events,
 ) -> gossipsub::MessageAcceptance {
     // Size first: free, the cap is the protocol's, and a message over it cannot
     // be a conforming one. `Reject`, because the sender chose the size.
@@ -2696,7 +2708,7 @@ async fn begin_hand(
     said: &mut Vec<Vec<u8>>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
     topic: Option<&gossipsub::IdentTopic>,
-    events: &mpsc::Sender<NodeEvent>,
+    events: &Events,
 ) {
     use crate::table::hand::Hand;
 
@@ -2794,7 +2806,7 @@ fn opening_for_hand_one(f: &Formation) -> Option<crate::table::hand::Opening> {
 /// becoming a redraw per action.
 async fn report_hand(
     h: &crate::table::hand::Hand,
-    events: &mpsc::Sender<NodeEvent>,
+    events: &Events,
     last: &mut Option<(Option<u8>, u64, u64, bool)>,
 ) -> Report {
     let hand_id = h.hand_id();

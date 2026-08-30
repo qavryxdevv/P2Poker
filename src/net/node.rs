@@ -329,6 +329,43 @@ pub enum NodeEvent {
 }
 
 impl NodeEvent {
+    /// Whether losing this event costs a line of log rather than correctness.
+    ///
+    /// **This is what keeps the node's own clock out of the hands of whatever
+    /// is drawing its log.** Every event used to leave with `send().await`, so
+    /// a full channel stopped the node's whole `select!` — its timers with it.
+    /// Measured on a busy DHT: the thirty-second housekeeping tick did not fire
+    /// for three minutes and the table advertisement went out once in a
+    /// two-hundred-second run, which is a table that takes minutes to form for
+    /// reasons that have nothing to do with the network.
+    ///
+    /// The division is by consequence, not by importance. Everything here is a
+    /// rendering of state the node already holds: drop one and a line is
+    /// missing. Everything not here is something the receiver's own fold
+    /// depends on — a seat, a roster, a card, a turn — and losing one would
+    /// leave the interface describing a hand that is not being played.
+    pub fn is_advisory(&self) -> bool {
+        matches!(
+            self,
+            NodeEvent::Listening(_)
+                | NodeEvent::PeerConnected(_)
+                | NodeEvent::PeerDisconnected(_)
+                | NodeEvent::PokerPeer { .. }
+                | NodeEvent::Discovered { .. }
+                | NodeEvent::DialFailed { .. }
+                | NodeEvent::LobbyPeer(_)
+                | NodeEvent::LocalPeer(_)
+                | NodeEvent::Reachability { .. }
+                | NodeEvent::PortMapped { .. }
+                | NodeEvent::Announced
+                | NodeEvent::Swept { .. }
+                | NodeEvent::TableRefused { .. }
+                | NodeEvent::Warning(_)
+        )
+    }
+}
+
+impl NodeEvent {
     /// Whether this changes anything on screen other than a line in the log.
     ///
     /// The window is repainted when the node speaks, and on a machine with no
@@ -575,5 +612,57 @@ mod wake_tests {
         for e in later {
             assert!(!e.changes_more_than_the_log(), "{e:?} is only a log line");
         }
+    }
+}
+
+/// The node's end of the event channel, with a rule about waiting.
+///
+/// **The node must not block on its own log.** Every event used to go out with
+/// `send().await`, and a full channel stops the whole `select!` — timers
+/// included. Measured on a busy DHT: the housekeeping tick did not fire for
+/// three minutes and the table advertisement went out once in a
+/// two-hundred-second run, so a third player who missed that one publish waited
+/// the rest of the run to see the table.
+///
+/// So an advisory event is offered and dropped if there is no room, and only an
+/// event the receiver's fold depends on is waited for. Nothing is dropped
+/// silently: the count is carried and reported, because "no warnings" and "the
+/// warnings were thrown away" must not look the same.
+#[derive(Clone)]
+pub struct Events {
+    tx: tokio::sync::mpsc::Sender<NodeEvent>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Events {
+    pub fn new(tx: tokio::sync::mpsc::Sender<NodeEvent>) -> Self {
+        Events {
+            tx,
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Offered or waited for, by [`NodeEvent::is_advisory`].
+    pub async fn send(&self, event: NodeEvent) -> Result<(), ()> {
+        if event.is_advisory() {
+            if self.tx.try_send(event).is_err() {
+                self.dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        self.tx.send(event).await.map_err(|_| ())
+    }
+
+    /// Resolves when every receiver is gone, so a background task that only
+    /// reports can stop when there is nobody left to report to.
+    pub async fn closed(&self) {
+        self.tx.closed().await
+    }
+
+    /// How many advisory events have been dropped, taken rather than read.
+    pub fn take_dropped(&self) -> u64 {
+        self.dropped
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 }

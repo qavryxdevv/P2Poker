@@ -187,7 +187,7 @@ pub fn renew_after(lifetime_seconds: u32) -> Duration {
 /// learns from the event channel closing — the receiver goes when the
 /// application does. A client that exits without releasing leaves a hole in a
 /// stranger's router for the two hours until it expires, which is litter.
-pub async fn keep_open(port: u16, events: tokio::sync::mpsc::Sender<NodeEvent>) {
+pub async fn keep_open(port: u16, events: super::node::Events) {
     // A router does not learn the protocol while this client runs, so a network
     // without one is a settled question — asked again only often enough that a
     // laptop moving between networks finds out.

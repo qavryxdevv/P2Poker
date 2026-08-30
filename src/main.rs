@@ -348,16 +348,12 @@ fn headless(player: Player, run: Run, join: Option<String>) {
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     rt.block_on(async move {
-        // **Sixty-four was throttling the protocol.** The node sends every
-        // event with `send().await`, so a full channel stops its whole
-        // `select!` — timers included. Measured: with a busy DHT the node's
-        // thirty-second housekeeping tick did not fire for three minutes, the
-        // table advertisement went out ONCE in a two-hundred-second run, and a
-        // third player who missed that one publish waited the rest of the run
-        // to see the table at all. A node's liveness must not depend on how
-        // fast something drains its log; until it does not, the buffer is large
-        // enough that it cannot.
-        let (tx, mut rx) = tokio::sync::mpsc::channel(65_536);
+        // Sixty-four, and the node blocked on it: every event went out with
+        // `send().await`, so a full channel stopped the node's whole `select!`
+        // — timers included. `net::node::Events` is the fix; this is the
+        // headroom under it. Big enough that an advisory event is dropped only
+        // under a burst worth knowing about, small enough to bound the memory.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4_096);
         // The receiving end must outlive the loop whether or not anything is
         // ever sent: an `mpsc::Receiver` whose senders are all gone completes
         // immediately and for ever, and its `select!` arm would spin.
@@ -498,9 +494,8 @@ fn windowed(player: Player, run: Run) -> Started {
         port,
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
-    // Large for the same reason as the headless path above: the node blocks on
-    // a full channel and its own timers starve behind whatever drains it.
-    let (tx, rx) = tokio::sync::mpsc::channel(65_536);
+    // The same headroom as the headless path, for the same reason.
+    let (tx, rx) = tokio::sync::mpsc::channel(4_096);
     // The other direction. Bounded, and the window never blocks on it: a full
     // queue means the node is busy, and a paint loop that waited for it would
     // freeze the client rather than drop a button press.

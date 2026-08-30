@@ -771,16 +771,33 @@ way was wrong. In order:
   moved the third player's arrival from log line 1851 to line 159 of the same
   run shape.
 
-### Still not right, and the buffer is a bandage on it
+### The proper fix, done
 
-**A node's liveness must not depend on how fast something drains its log.** With
-65 536 slots it takes a lot to stall, but the ticks still arrive in catch-up
-bursts, so the loop is still being starved by something — most likely raw event
-volume rather than backpressure now. The proper fix is that advisory events
-(`Warning`, `DialFailed`, `LobbyPeer`, `PeerConnected`, `PeerDisconnected`) must
-be sent with `try_send` and dropped when full, with only the few state-critical
-ones allowed to block. That is about a hundred call sites and should be done as
-one deliberate change, not folded into something else.
+`net::node::Events` now divides events by consequence rather than importance. An
+advisory one — a peer count, a dial failure, a warning, anything that is a
+rendering of state the node already holds — is **offered** and dropped if there
+is no room. Only an event the receiver's own fold depends on (a seat, a roster,
+a card, a turn) is waited for. Nothing is dropped silently: the count is carried
+and reported on the housekeeping tick, because *"no warnings"* and *"the
+warnings were thrown away"* must never look the same in a log.
+
+It is one wrapper and six signatures rather than a hundred call sites, because
+`Events::send` keeps the shape the call sites already had.
+
+Measured, three clients on one machine, table of three:
+
+| | before | after |
+|---|---|---|
+| table formed | not within 124 s | 33 s, 34 s, and once not within 110 s |
+| adverts published in 200 s | 1 | one per 30 s tick until the table fills |
+| advisory events dropped | n/a | 0 |
+
+**Two runs in three is not a cure.** The third still did not form, so something
+else is wrong as well — the founder's `lobby topic: 0 of 1 subscribed peer(s)`
+against both joiners' `0 of 2` is the standing clue, and it means the founder is
+missing one peer's subscription entirely. Delivery works anyway because an
+mDNS-discovered peer is an explicit peer and `publish` reaches those without the
+mesh, which is exactly why this took so long to see.
 
 Also unexplained: the founder often reports `lobby topic: 0 of 1 subscribed
 peer(s) in the mesh` while both joiners report `0 of 2`. Delivery works anyway,
