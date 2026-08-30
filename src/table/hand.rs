@@ -49,6 +49,7 @@ use crate::poker::engine::{
     betting_is_closed, first_to_act, initial_positions, next_to_act, only_one_live, post_blinds,
     round_complete, Positions,
 };
+use crate::poker::evaluator::evaluate_holdem;
 use crate::poker::state::{Card, Chips, Street};
 use crate::protocol::serialization::h;
 use crate::protocol::signatures::Domain;
@@ -58,7 +59,8 @@ use crate::mental_poker::reveal::RevealStage;
 
 use super::dealing::{self, Dealing, Identity, Refused, Share};
 use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, BoardReveal,
-    DealPrivate, DeckCommit, DeckInit, HandInit, NotOurs, RevealEntry, ShuffleProof, ShuffleStep};
+    DealPrivate, DeckCommit, DeckInit, HandInit, NotOurs, RevealEntry, ShowdownMuck,
+    ShowdownReveal, ShuffleProof, ShuffleStep};
 use super::stage::{Collective, Heard};
 
 /// What a step wants sent.
@@ -293,6 +295,12 @@ pub const ACTION_CAP: usize = 64;
 /// The cap on a `BOARD_REVEAL` body: a street code and at most three entries.
 pub const BOARD_REVEAL_CAP: usize = 1_024;
 
+/// The cap on a `SHOWDOWN_REVEAL` body: exactly two entries.
+pub const SHOWDOWN_REVEAL_CAP: usize = 512;
+
+/// The cap on a `SHOWDOWN_MUCK` body: one boolean.
+pub const SHOWDOWN_MUCK_CAP: usize = 64;
+
 /// How far this hand has got.
 ///
 /// One variant per stage, each carrying only what that stage needs, so a stage
@@ -425,6 +433,18 @@ pub struct Play {
     /// This client's own two, opened when `DEAL_PRIVATE` completed.
     cards: [Card; 2],
 
+    /// What each seat showed, by seat.
+    ///
+    /// Kept after the hand ends rather than dropped with the stage, because
+    /// D-020's five-second hold is what draws it: the screen holds the hands
+    /// that were shown, and a driver that had thrown them away would have
+    /// nothing to hold.
+    shown: Vec<Option<[Card; 2]>>,
+
+    /// Which seats forfeited, by seat. A mucked hand is never opened by
+    /// anybody: its owner never publishes the share that would open it.
+    mucked: Vec<bool>,
+
     step: Step,
 }
 
@@ -448,8 +468,22 @@ enum Step {
     /// silent stalls the hand exactly as an active one would.
     Opening { street: Street, stage: Collective },
 
-    /// The betting is over and the hand is waiting for the showdown or the
-    /// settlement. Not yet built.
+    /// The showdown: **one collective stage**, and every live seat owes exactly
+    /// one of `SHOWDOWN_REVEAL` and `SHOWDOWN_MUCK`.
+    ///
+    /// One stage and not one per seat, which is `PROTOCOL.md` §4.6's shape and
+    /// D-021's correction to its own first draft: the two types are the only
+    /// `event_class = 0` pair that shares a `sequence`, and that exclusivity is
+    /// what keeps the slot at capacity one.
+    ///
+    /// TDA order lives in `order` and is an **emission discipline**: a client
+    /// waits until every seat ahead of it has spoken before it speaks. The
+    /// stage does not care in what order it is filled, so a seat that speaks
+    /// early has committed a live-poker irregularity and nothing more — it
+    /// cannot see a card it was not going to see, or claim a pot it did not win.
+    Showdown { stage: Collective, order: Vec<SeatIdx> },
+
+    /// The betting is over and the pots are waiting to be settled.
     Ended,
 }
 
@@ -641,6 +675,8 @@ impl Hand {
                 | EventType::ActionBet
                 | EventType::ActionRaise
                 | EventType::ActionFold
+                | EventType::ShowdownReveal
+                | EventType::ShowdownMuck
         ) {
             return Err(Failed::Wire(WireError::WrongType));
         }
@@ -675,6 +711,7 @@ impl Hand {
             Phase::Playing { ref play, .. } => match play.step {
                 Step::Acting { .. } => self.on_action(bytes, kind, key, now_ms),
                 Step::Opening { .. } => self.on_board_reveal(bytes, key, now_ms),
+                Step::Showdown { .. } => self.on_showdown(bytes, kind, key, now_ms),
                 Step::Ended => Err(Failed::NothingFurther),
             },
             Phase::Between => Err(Failed::NothingFurther),
@@ -1471,6 +1508,8 @@ impl Hand {
             aggressor: None,
             actions: 0,
             cards,
+            shown: vec![None; n],
+            mucked: vec![false; n],
             step: Step::Ended,
         };
 
@@ -1760,7 +1799,8 @@ impl Hand {
             play.round.last_full_raise = play.round.big_blind;
 
             // Everybody but one has folded. No card needs opening, whatever
-            // street it is: there is nothing left to compare.
+            // street it is, and there is no showdown: nobody has to show a hand
+            // that nothing was called against, and nobody could open it anyway.
             if only_one_live(&play.round, &play.dealt) {
                 play.step = Step::Ended;
                 return Ok(Vec::new());
@@ -1770,13 +1810,7 @@ impl Hand {
         match next {
             Some(street) => self.open_board(street, key, now_ms),
             // The river's betting closed. The showdown is the next stage.
-            None => {
-                let Phase::Playing { play, .. } = &mut self.phase else {
-                    return Err(Failed::NothingFurther);
-                };
-                play.step = Step::Ended;
-                Ok(Vec::new())
-            }
+            None => self.begin_showdown(key, now_ms),
         }
     }
 
@@ -1959,6 +1993,447 @@ impl Hand {
         };
         self.slot = self.slot.then(parent);
         self.open_betting(street, key, now_ms)
+    }
+
+    /// The river's betting has closed: open the showdown.
+    ///
+    /// The order is TDA 17-A — the last aggressor on the river shows first, or
+    /// the first seat to act on the river if it was checked through, and then
+    /// clockwise. It decides **when** each client speaks and nothing else: the
+    /// stage is collective and completes whenever every live seat has spoken.
+    fn begin_showdown(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let button = self.mine.button_position;
+        let bb_seat = self.mine.bb_seat;
+        let seat_count = self.open.max_players;
+
+        let (live, order) = {
+            let Phase::Playing { play, .. } = &self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            let live: Vec<SeatIdx> = (0..seat_count)
+                .filter(|s| {
+                    let i = usize::from(*s);
+                    play.dealt.get(i).copied().unwrap_or(false)
+                        && !play.round.folded.get(i).copied().unwrap_or(true)
+                })
+                .collect();
+            if live.len() < 2 {
+                // One seat left. Nothing to compare and nothing to show.
+                let Phase::Playing { play, .. } = &mut self.phase else {
+                    return Err(Failed::NothingFurther);
+                };
+                play.step = Step::Ended;
+                return Ok(Vec::new());
+            }
+            // The aggressor, if there was one and it is still in the hand;
+            // otherwise the seat that would have opened the river's betting.
+            let first = play
+                .aggressor
+                .filter(|a| live.contains(a))
+                .or_else(|| {
+                    first_to_act(
+                        Street::River,
+                        &play.round,
+                        &play.dealt,
+                        button,
+                        bb_seat,
+                        seat_count,
+                    )
+                })
+                .unwrap_or(live[0]);
+            let at = live.iter().position(|s| *s == first).unwrap_or(0);
+            let order: Vec<SeatIdx> = live
+                .iter()
+                .cycle()
+                .skip(at)
+                .take(live.len())
+                .copied()
+                .collect();
+            (live, order)
+        };
+
+        let stage = Collective::closed(
+            self.slot.sequence,
+            EventType::ShowdownReveal.code(),
+            &live,
+        )
+        .ok_or(Failed::NotInThisStage)?;
+
+        {
+            let Phase::Playing { play, .. } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            // The owner may publish its own share now, and only now.
+            play.dealing
+                .advance(RevealStage::Showdown { showing: live });
+            play.step = Step::Showdown { stage, order };
+        }
+        self.speak_at_showdown(key, now_ms)
+    }
+
+    /// Speak at the showdown, if every seat ahead of this one has.
+    ///
+    /// This is the whole of the emission discipline. It is checked on every
+    /// arrival rather than scheduled, because "the seats ahead of me have
+    /// spoken" is a fact about the transcript and not about a timer.
+    fn speak_at_showdown(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let me = self.open.my_seat;
+        let (my_place, first) = {
+            let Phase::Playing { play, .. } = &self.phase else {
+                return Ok(Vec::new());
+            };
+            let Step::Showdown { stage, order } = &play.step else {
+                return Ok(Vec::new());
+            };
+            let Some(at) = order.iter().position(|s| *s == me) else {
+                // Not in the showdown: folded, or not dealt in.
+                return Ok(Vec::new());
+            };
+            if stage.heard(me).is_some() {
+                return Ok(Vec::new());
+            }
+            // Everybody ahead has to have spoken. Not "the stage is nearly
+            // complete" — a seat behind this one speaking early must not pull
+            // this one forward, because the whole point is that this client
+            // decides after seeing what it was entitled to see.
+            if order[..at].iter().any(|s| stage.heard(*s).is_none()) {
+                return Ok(Vec::new());
+            }
+            (at, order[0])
+        };
+
+        if self.shows_rather_than_mucks(my_place, first)? {
+            self.show(key, now_ms)
+        } else {
+            self.muck(key, now_ms)
+        }
+    }
+
+    /// Whether this client shows its hand or forfeits (D-021).
+    ///
+    /// The owner's words were *"if they find out they have lost, they muck"*, so
+    /// a beaten hand mucks by default and nobody is asked. Three cases force a
+    /// show, and all three are rules rather than preferences:
+    ///
+    /// * **First to show.** Somebody has to put a hand on the table.
+    /// * **Anybody is all in.** TDA 16, and `PROTOCOL.md` §4.6 states it: with a
+    ///   seat all in and the betting complete every live seat must show.
+    /// * **Nobody has shown yet that this hand cannot beat.** A hand that is
+    ///   winning or tied has no reason to muck and every reason not to.
+    fn shows_rather_than_mucks(
+        &self,
+        my_place: usize,
+        _first: SeatIdx,
+    ) -> Result<bool, Failed> {
+        if my_place == 0 {
+            return Ok(true);
+        }
+        let Phase::Playing { play, .. } = &self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+        let Step::Showdown { order, .. } = &play.step else {
+            return Err(Failed::NothingFurther);
+        };
+        // TDA 16: with anybody all in, nobody may muck.
+        if order
+            .iter()
+            .any(|s| play.round.stack.get(usize::from(*s)).copied() == Some(0))
+        {
+            return Ok(true);
+        }
+        let Some(board) = five_card_board(&play.dealing.board()) else {
+            // No complete board: this cannot be a river showdown, so there is
+            // nothing to compare against and showing is the safe answer.
+            return Ok(true);
+        };
+        let mine = evaluate_holdem(play.cards, &board);
+        let best_shown = play
+            .shown
+            .iter()
+            .flatten()
+            .map(|hole| evaluate_holdem(*hole, &board))
+            .max();
+        Ok(match best_shown {
+            // Ties show: a split pot is won by showing, not by mucking.
+            Some(best) => mine >= best,
+            None => true,
+        })
+    }
+
+    /// Publish this client's own two shares, which opens its hand.
+    fn show(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let me = self.open.my_seat;
+        let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
+        let my_key = *self.keys_by_seat(me).ok_or(Failed::NotInThisStage)?;
+
+        let (entries, cards) = {
+            let Phase::Playing { deal, table, play } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            let indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
+            let mut entries = Vec::new();
+            for index in indices {
+                // Computed straight from the deck rather than through
+                // `own_share`, and this is the one place that is right.
+                //
+                // This client's own share of its own card has been in its own
+                // token set since `DEAL_PRIVATE` — that is how it read the card
+                // at all — and a set takes one share per seat and never an
+                // update, so `own_share` would refuse it. What the wire needs is
+                // not a second entry in the set; it is the same share, proved
+                // again under the **showdown's** context, which is a different
+                // sequence and therefore a different proof. The token is the
+                // same value either way: it is a function of the secret and the
+                // ciphertext, and nothing else.
+                let (token, proof) = deal
+                    .deck
+                    .token(&deal.secret, &my_key, &table.deck, index, &ctx)
+                    .map_err(|_| Failed::BadToken {
+                        seat: me,
+                        why: "this client could not compute its own share",
+                    })?;
+                entries.push(RevealEntry {
+                    deck_index: index.get(),
+                    token: token.encode(),
+                    proof: proof.encode(),
+                });
+            }
+            // Its own hand goes on the table here, because nothing else will
+            // put it there: every other seat learns it from the message below,
+            // and this client is not a receiver of its own messages.
+            let cards = play.cards;
+            if let Some(slot) = play.shown.get_mut(usize::from(me)) {
+                *slot = Some(cards);
+            }
+            (entries, cards)
+        };
+        let _ = cards;
+
+        let body = ShowdownReveal { entries };
+        let bytes = self.say(
+            EventType::ShowdownReveal,
+            &body,
+            SHOWDOWN_REVEAL_CAP,
+            key,
+            now_ms,
+        )?;
+        let hash = self.opened(&bytes, EventType::ShowdownReveal)?.event_hash;
+        self.record_showdown(me, hash, true)?;
+        let mut out = vec![Send::Broadcast(bytes)];
+        out.append(&mut self.close_showdown_if_done()?);
+        Ok(out)
+    }
+
+    /// Forfeit every pot rather than show.
+    ///
+    /// A muck is the **absence** of a share, and this message only says so: the
+    /// two shares that would open this hand are never published, so no peer —
+    /// honest, modified, or all of them together — can open it. The forfeiture
+    /// needs no enforcement for the same reason.
+    fn muck(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let me = self.open.my_seat;
+        let body = ShowdownMuck { forfeit: true };
+        let bytes = self.say(
+            EventType::ShowdownMuck,
+            &body,
+            SHOWDOWN_MUCK_CAP,
+            key,
+            now_ms,
+        )?;
+        let hash = self.opened(&bytes, EventType::ShowdownMuck)?.event_hash;
+        self.record_showdown(me, hash, false)?;
+        let mut out = vec![Send::Broadcast(bytes)];
+        out.append(&mut self.close_showdown_if_done()?);
+        Ok(out)
+    }
+
+    /// Note that a seat has spoken at the showdown.
+    fn record_showdown(
+        &mut self,
+        seat: SeatIdx,
+        hash: Hash,
+        showed: bool,
+    ) -> Result<(), Failed> {
+        let Phase::Playing { play, .. } = &mut self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+        if !showed {
+            if let Some(slot) = play.mucked.get_mut(usize::from(seat)) {
+                *slot = true;
+            }
+        }
+        let Step::Showdown { stage, .. } = &mut play.step else {
+            return Err(Failed::NothingFurther);
+        };
+        match stage.hear(seat, hash) {
+            Heard::Counted | Heard::Bystander | Heard::Again => Ok(()),
+            Heard::Equivocation { .. } => Err(Failed::Equivocation { seat }),
+            Heard::Uninvited => Err(Failed::NotInThisStage),
+        }
+    }
+
+    /// One seat's showdown message.
+    fn on_showdown(
+        &mut self,
+        bytes: &[u8],
+        kind: EventType,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, kind)?;
+        let seat = self.seat_of(&opened.sender)?;
+        let ctx = self.deck_ctx(&opened.sender);
+        let me = self.open.my_seat;
+
+        {
+            let Phase::Playing { play, .. } = &self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            let Step::Showdown { stage, order } = &play.step else {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "the showdown were open",
+                });
+            };
+            if stage.heard(seat) == Some(opened.event_hash) {
+                return Ok(Vec::new());
+            }
+            if !order.contains(&seat) {
+                return Err(Failed::NotInThisStage);
+            }
+            // The first to show may not muck, and nobody may muck with a seat
+            // all in (TDA 16). Both are refusals of the message, not of the
+            // seat: a muck that is not allowed is not a muck.
+            if kind == EventType::ShowdownMuck {
+                if order.first() == Some(&seat) {
+                    return Err(Failed::Elsewhere {
+                        seat,
+                        what: "it were not first to show",
+                    });
+                }
+                if order
+                    .iter()
+                    .any(|s| play.round.stack.get(usize::from(*s)).copied() == Some(0))
+                {
+                    return Err(Failed::Elsewhere {
+                        seat,
+                        what: "nobody at this showdown were all in",
+                    });
+                }
+            }
+        }
+
+        if kind == EventType::ShowdownMuck {
+            let body: ShowdownMuck =
+                chained::payload(&opened, SHOWDOWN_MUCK_CAP).map_err(Failed::Wire)?;
+            if !body.forfeit {
+                return Err(Failed::BadToken {
+                    seat,
+                    why: "a muck that does not forfeit is not a muck",
+                });
+            }
+            self.record_showdown(seat, opened.event_hash, false)?;
+        } else {
+            let body: ShowdownReveal =
+                chained::payload(&opened, SHOWDOWN_REVEAL_CAP).map_err(Failed::Wire)?;
+            let cards = {
+                let Phase::Playing { deal, table, play } = &mut self.phase else {
+                    return Err(Failed::NothingFurther);
+                };
+                let indices = table.map.hole_cards(seat).ok_or(Failed::NotInThisStage)?;
+                let wanted: Vec<u8> = indices.iter().map(|i| i.get()).collect();
+                if body.entries.iter().map(|e| e.deck_index).collect::<Vec<_>>() != wanted {
+                    return Err(Failed::BadToken {
+                        seat,
+                        why: "not exactly this seat's own two hole cards",
+                    });
+                }
+                for entry in &body.entries {
+                    let index =
+                        table
+                            .map
+                            .index_from_wire(entry.deck_index)
+                            .ok_or(Failed::BadToken {
+                                seat,
+                                why: "an index this hand gave no role to",
+                            })?;
+                    let token =
+                        WireToken::decode(&entry.token).map_err(|_| Failed::BadToken {
+                            seat,
+                            why: "the share is not a point on the curve",
+                        })?;
+                    let proof = WireTokenProof::decode(&entry.proof).map_err(|_| {
+                        Failed::BadToken {
+                            seat,
+                            why: "the proof is not well formed",
+                        }
+                    })?;
+                    play.dealing
+                        .accept(
+                            &deal.as_ref(table),
+                            me,
+                            &Share {
+                                from: seat,
+                                index,
+                                token,
+                                proof: &proof,
+                            },
+                            &ctx,
+                        )
+                        .map_err(|e| refused(seat, e))?;
+                }
+                // Every share is in for those two indices — the `m-1` from
+                // `DEAL_PRIVATE` and now the owner's — so the hand opens.
+                let mut cards = Vec::with_capacity(2);
+                for index in indices {
+                    cards.push(play.dealing.open(&deal.as_ref(table), index).map_err(
+                        |_| Failed::BadToken {
+                            seat,
+                            why: "the reveal did not complete this seat's cards",
+                        },
+                    )?);
+                }
+                let cards: [Card; 2] =
+                    cards.try_into().map_err(|_| Failed::NotInThisStage)?;
+                if let Some(slot) = play.shown.get_mut(usize::from(seat)) {
+                    *slot = Some(cards);
+                }
+                cards
+            };
+            let _ = cards;
+            self.record_showdown(seat, opened.event_hash, true)?;
+        }
+
+        // Somebody speaking may be what makes it this client's turn.
+        let mut out = self.speak_at_showdown(key, now_ms)?;
+        out.append(&mut self.close_showdown_if_done()?);
+        Ok(out)
+    }
+
+    /// If every live seat has spoken, the showdown is over.
+    fn close_showdown_if_done(&mut self) -> Result<Vec<Send>, Failed> {
+        let parent = {
+            let Phase::Playing { play, .. } = &self.phase else {
+                return Ok(Vec::new());
+            };
+            let Step::Showdown { stage, .. } = &play.step else {
+                return Ok(Vec::new());
+            };
+            if !stage.complete() {
+                return Ok(Vec::new());
+            }
+            stage.hash().ok_or(Failed::NotInThisStage)?
+        };
+        self.slot = self.slot.then(parent);
+        let Phase::Playing { play, .. } = &mut self.phase else {
+            return Err(Failed::NothingFurther);
+        };
+        play.step = Step::Ended;
+        Ok(Vec::new())
     }
 
     /// Seal one body into the stage now open.
@@ -2189,6 +2664,47 @@ impl Hand {
             Phase::Playing { play, .. } => play.dealing.board(),
             _ => Vec::new(),
         }
+    }
+
+    /// The order the showdown runs in, TDA 17-A. Empty unless one is open.
+    pub fn showdown_order(&self) -> Vec<SeatIdx> {
+        match &self.phase {
+            Phase::Playing { play, .. } => match &play.step {
+                Step::Showdown { order, .. } => order.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// What a seat showed, if it showed.
+    ///
+    /// `None` for a seat that folded, mucked, or has not spoken yet — and the
+    /// three are not distinguished here on purpose, because to a reader of the
+    /// table they are the same thing: a hand nobody will ever see.
+    pub fn shown(&self, seat: SeatIdx) -> Option<[Card; 2]> {
+        match &self.phase {
+            Phase::Playing { play, .. } => *play.shown.get(usize::from(seat))?,
+            _ => None,
+        }
+    }
+
+    /// Whether a seat forfeited at the showdown.
+    pub fn mucked(&self, seat: SeatIdx) -> bool {
+        match &self.phase {
+            Phase::Playing { play, .. } => {
+                play.mucked.get(usize::from(seat)).copied().unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a showdown is open and this client has yet to speak in it.
+    pub fn showing(&self) -> bool {
+        matches!(
+            &self.phase,
+            Phase::Playing { play, .. } if matches!(play.step, Step::Showdown { .. })
+        )
     }
 
     /// Whether the betting is over and the hand is waiting to be settled.
@@ -2437,6 +2953,15 @@ pub struct Turn {
     pub legal: LegalActions,
     /// Everything committed this hand so far.
     pub pot: Chips,
+}
+
+/// A board of exactly five cards, or nothing.
+///
+/// `evaluate_holdem` wants `&[Card; 5]` and the board is a `Vec` that grows
+/// three, four, five. The conversion is here rather than at the call sites so
+/// that "the river is out" is asked once.
+fn five_card_board(board: &[Card]) -> Option<[Card; 5]> {
+    <[Card; 5]>::try_from(board).ok()
 }
 
 /// Which of the two action bodies is being sealed.
@@ -2833,6 +3358,167 @@ mod tests {
                 !a.cards().unwrap().contains(&card) && !b.cards().unwrap().contains(&card),
                 "one deck: a board card is nobody's hole card"
             );
+        }
+    }
+
+    /// A whole hand, checked down to a showdown.
+    ///
+    /// Four streets, five board cards, and one of the two seats putting its
+    /// hand on the table. Which one is not this test's business — the TDA order
+    /// falls out of the button, and the second seat shows or mucks by comparing
+    /// against what it was shown, which is D-021.
+    #[test]
+    fn two_clients_play_a_hand_to_showdown() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+        queue.push((1, deliver(&mut b, &a_deck, &key(11))));
+        queue.push((0, deliver(&mut a, &b_deck, &key(10))));
+
+        let keys = [key(10), key(11)];
+        for _ in 0..256 {
+            if let Some((from, sends)) = queue.pop() {
+                if sends.is_empty() {
+                    continue;
+                }
+                let to = 1 - from;
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let out = deliver(hand, &sends, &keys[usize::from(to)]);
+                queue.push((to, out));
+                continue;
+            }
+            if a.betting_over() && b.betting_over() {
+                break;
+            }
+            // Nothing in flight. Somebody owes an action.
+            let Some(turn) = a.turn().or_else(|| b.turn()) else {
+                panic!("nothing in flight, nobody to act, and the hand is not over");
+            };
+            let seat = turn.seat;
+            let hand: &mut Hand = if seat == 0 { &mut a } else { &mut b };
+            let turn = hand.turn().expect("that hand agrees it is to act");
+            let action = if turn.legal.can_check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            let out = hand.act(action, &keys[usize::from(seat)], NOW).unwrap();
+            queue.push((seat, out));
+        }
+
+        assert!(a.betting_over() && b.betting_over(), "the hand played out");
+        assert_eq!(a.board().len(), 5, "every street opened");
+        assert_eq!(a.board(), b.board(), "and both peers hold one board");
+        assert_eq!(a.street(), Some(Street::River));
+        assert_eq!(
+            a.pot(),
+            2 * 100,
+            "checked down: two big blinds and nothing more"
+        );
+        assert_eq!(a.slot(), b.slot(), "one chain, one stage");
+
+        // Exactly one of the two possibilities for each seat, and both peers
+        // agree about which.
+        let mut showed = 0;
+        for seat in 0..2u8 {
+            assert_eq!(a.shown(seat), b.shown(seat), "seat {seat}");
+            assert_eq!(a.mucked(seat), b.mucked(seat), "seat {seat}");
+            assert!(
+                a.shown(seat).is_some() != a.mucked(seat),
+                "seat {seat} either showed or mucked, never both and never neither"
+            );
+            if let Some(cards) = a.shown(seat) {
+                showed += 1;
+                let holder: &Hand = if seat == 0 { &a } else { &b };
+                assert_eq!(
+                    cards,
+                    holder.cards().unwrap(),
+                    "the hand on the table is the hand that seat held"
+                );
+            }
+        }
+        assert!(showed >= 1, "somebody has to show");
+
+        // And the decision was the right one. A seat mucks only when it cannot
+        // beat what is already on the table, which is D-021's rule and the
+        // whole reason the client is allowed to decide without asking.
+        let board = <[Card; 5]>::try_from(a.board().as_slice()).unwrap();
+        for seat in 0..2u8 {
+            if a.mucked(seat) {
+                let holder: &Hand = if seat == 0 { &a } else { &b };
+                let folded_hand = evaluate_holdem(holder.cards().unwrap(), &board);
+                let best_shown = (0..2u8)
+                    .filter_map(|s| a.shown(s))
+                    .map(|h| evaluate_holdem(h, &board))
+                    .max()
+                    .expect("something was shown");
+                assert!(
+                    folded_hand < best_shown,
+                    "seat {seat} mucked a hand that was not beaten"
+                );
+            }
+        }
+    }
+
+    /// A mucked hand is never opened, by anybody, ever.
+    ///
+    /// Not because the interface declines to draw it: because the share that
+    /// would open it was never published and no peer holds it.
+    #[test]
+    fn a_mucked_hand_stays_shut() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+        queue.push((1, deliver(&mut b, &a_deck, &key(11))));
+        queue.push((0, deliver(&mut a, &b_deck, &key(10))));
+        let keys = [key(10), key(11)];
+        for _ in 0..256 {
+            if let Some((from, sends)) = queue.pop() {
+                if sends.is_empty() {
+                    continue;
+                }
+                let to = 1 - from;
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let out = deliver(hand, &sends, &keys[usize::from(to)]);
+                queue.push((to, out));
+                continue;
+            }
+            if a.betting_over() && b.betting_over() {
+                break;
+            }
+            let Some(turn) = a.turn().or_else(|| b.turn()) else {
+                break;
+            };
+            let seat = turn.seat;
+            let hand: &mut Hand = if seat == 0 { &mut a } else { &mut b };
+            let action = if hand.turn().unwrap().legal.can_check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            let out = hand.act(action, &keys[usize::from(seat)], NOW).unwrap();
+            queue.push((seat, out));
+        }
+
+        for seat in 0..2u8 {
+            if a.mucked(seat) {
+                assert!(a.shown(seat).is_none(), "a mucked hand is not on the table");
+                assert!(b.shown(seat).is_none(), "and not on the other peer's");
+                // And the other peer is still one share short of it: the owner
+                // never published its own, which is the whole of the guarantee.
+                let map = b.index_map().expect("the map exists");
+                for index in map.hole_cards(seat).unwrap() {
+                    assert_eq!(
+                        b.outstanding_shares(index),
+                        Some(vec![seat]),
+                        "exactly the owner's share is missing"
+                    );
+                }
+            }
         }
     }
 
