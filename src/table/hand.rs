@@ -46,8 +46,8 @@ use crate::mental_poker::protocol::{Ciphertext, CtxFields, DeckCtx, DeckWire, Fi
 use crate::mental_poker::shuffle::{ChainParams, ShuffleChain, StepError};
 use crate::poker::actions::{Action, BettingRound, Illegal, LegalActions};
 use crate::poker::engine::{
-    betting_is_closed, first_to_act, initial_positions, next_to_act, only_one_live, post_blinds,
-    round_complete, Positions,
+    advance_positions, betting_is_closed, first_to_act, initial_positions, next_to_act,
+    only_one_live, post_blinds, round_complete, Positions,
 };
 use crate::poker::evaluator::{evaluate_holdem, HandRank};
 use crate::poker::pots::{award, build_pots};
@@ -192,6 +192,13 @@ pub struct Opening {
     /// How long a peer has to answer a cryptographic step, from the table's own
     /// parameters. Carried on the envelope of every stage this hand emits.
     pub crypto_step_timeout_ms: u32,
+    /// Where the button sits, when a previous hand decided it.
+    ///
+    /// `None` only for the **first** hand of a table, where nothing has decided
+    /// it yet and `provisional_button` stands in until the RNG beacon of §7.9
+    /// exists. From hand two onwards it is the dead-button rotation's answer,
+    /// and re-rolling it from `session_id` would move the button backwards.
+    pub button: Option<SeatIdx>,
 }
 
 impl Opening {
@@ -224,6 +231,8 @@ impl Opening {
             level: 1,
             my_seat: f.my_seat()?,
             crypto_step_timeout_ms: ad.crypto_step_timeout_ms,
+            // The first hand of a table: nothing has decided the button yet.
+            button: None,
         })
     }
 }
@@ -581,7 +590,9 @@ impl Hand {
         next_deadline_ms: u32,
     ) -> Result<(Hand, Vec<Send>), Failed> {
         let occupied: Vec<SeatIdx> = o.seats.iter().map(|(s, _, _)| *s).collect();
-        let button = provisional_button(&o.session_id, &occupied);
+        let button = o
+            .button
+            .unwrap_or_else(|| provisional_button(&o.session_id, &occupied));
         // Keyed on **chips**, not on occupancy. A busted seat is still an
         // occupied seat, so "two seats at the table" and "two players with
         // chips" part company the moment somebody busts — and heads-up is a
@@ -3028,6 +3039,99 @@ impl Hand {
         )
     }
 
+    /// Everything hand `k+1` needs, read off this hand's settled outcome.
+    ///
+    /// `None` until this hand has a terminal stage, and `None` when the table
+    /// is over — fewer than two seats with chips is the tournament's end
+    /// condition (`STATE_MACHINE.md` §9.3), not an error.
+    ///
+    /// Every input is derived from the chain rather than from anything local:
+    /// the stacks are the settlement every seat published byte-identically, the
+    /// parent is `TERMINAL(k)`, and the required emitter set is `P(k)` — the
+    /// seats this client accepted an event from this hand.
+    pub fn next_hand(&self) -> Option<Opening> {
+        let Phase::Playing { play, .. } = &self.phase else {
+            return None;
+        };
+        if !matches!(play.step, Step::Ended) {
+            return None;
+        }
+        // The settlement has been applied, so this is `TERMINAL(k)`'s stacks.
+        let stacks = &play.round.stack;
+        let alive: Vec<bool> = (0..usize::from(self.open.max_players))
+            .map(|i| stacks.get(i).copied().unwrap_or(0) > 0)
+            .collect();
+        // Fewer than two seats with chips: the tournament is decided. There is
+        // no hand `k+1` and saying so is the whole answer.
+        let positions = advance_positions(
+            Positions {
+                button: self.mine.button_position,
+                small_blind: self.mine.sb_position,
+                big_blind: self.mine.bb_seat,
+            },
+            &alive,
+            self.open.max_players,
+        )?;
+
+        // `TERMINAL(k)` is the stage hash of `HAND_COMPLETE`, which is what the
+        // slot's parent is once the settlement closed.
+        let terminal = self.slot.previous_event_hash;
+
+        // The roster at the start of hand `k+1`, which is this hand's final
+        // stacks — `PROTOCOL.md` §3.1's `stack_at_hand_start`.
+        let mut seats: Vec<(SeatIdx, [u8; 32], u64)> = Vec::new();
+        let mut roster = Vec::new();
+        for (seat, keyb, _) in &self.open.seats {
+            let stack = stacks.get(usize::from(*seat)).copied().unwrap_or(0);
+            seats.push((*seat, *keyb, stack));
+            roster.push(crate::protocol::transcript::RosterSeat {
+                seat: *seat,
+                app_public_key: *keyb,
+                stack_at_hand_start: stack,
+            });
+        }
+        let roster_hash = crate::protocol::transcript::roster_hash(&roster);
+        let hand_id = self.open.hand_id + 1;
+        let genesis = crate::protocol::transcript::genesis_hand(
+            &self.open.table_id,
+            hand_id,
+            &self.open.session_id,
+            &roster_hash,
+            &terminal,
+        );
+
+        // `R(k+1) = P(k)`: the seats that demonstrably took part in hand `k`.
+        // A seat that signed nothing is outside the required set from here on,
+        // which is D-013 and is how one silent seat costs exactly one hand
+        // rather than the table.
+        let required: Vec<SeatIdx> = (0..self.open.max_players)
+            .filter(|s| {
+                self.signed.get(usize::from(*s)).copied().unwrap_or(false)
+                    && alive.get(usize::from(*s)).copied().unwrap_or(false)
+            })
+            .collect();
+        if required.len() < 2 {
+            return None;
+        }
+
+        Some(Opening {
+            table_id: self.open.table_id,
+            hand_id,
+            session_id: self.open.session_id,
+            roster_hash,
+            genesis,
+            required,
+            seats,
+            max_players: self.open.max_players,
+            small_blind: self.open.small_blind,
+            big_blind: self.open.big_blind,
+            level: self.open.level,
+            my_seat: self.open.my_seat,
+            crypto_step_timeout_ms: self.open.crypto_step_timeout_ms,
+            button: Some(positions.button),
+        })
+    }
+
     /// Whether the betting is over and the hand is waiting to be settled.
     pub fn betting_over(&self) -> bool {
         matches!(
@@ -3375,6 +3479,7 @@ mod tests {
             level: 1,
             my_seat,
             crypto_step_timeout_ms: 30_000,
+            button: None,
         }
     }
 
@@ -3405,6 +3510,7 @@ mod tests {
             level: 1,
             my_seat,
             crypto_step_timeout_ms: 30_000,
+            button: None,
         }
     }
 
@@ -3821,6 +3927,94 @@ mod tests {
         } else {
             assert_eq!(stacks, vec![10_000, 10_000], "a tie splits it back");
         }
+    }
+
+    /// Hand two follows hand one, and both peers derive the same opening.
+    ///
+    /// This is the property the whole chain rests on at a hand boundary: two
+    /// peers that saw the same hand must agree on `GENESIS(k+1)` down to the
+    /// byte, or hand two forks with nobody lying. Every input is chained —
+    /// the settled stacks, `TERMINAL(k)`, and `P(k)`.
+    #[test]
+    fn hand_two_follows_hand_one() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+        queue.push((1, deliver(&mut b, &a_deck, &key(11))));
+        queue.push((0, deliver(&mut a, &b_deck, &key(10))));
+        let keys = [key(10), key(11)];
+        for _ in 0..256 {
+            if let Some((from, sends)) = queue.pop() {
+                if sends.is_empty() {
+                    continue;
+                }
+                let to = 1 - from;
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let out = deliver(hand, &sends, &keys[usize::from(to)]);
+                queue.push((to, out));
+                continue;
+            }
+            if a.betting_over() && b.betting_over() {
+                break;
+            }
+            let Some(turn) = a.turn().or_else(|| b.turn()) else {
+                break;
+            };
+            let seat = turn.seat;
+            let hand: &mut Hand = if seat == 0 { &mut a } else { &mut b };
+            let action = if hand.turn().unwrap().legal.can_check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            let out = hand.act(action, &keys[usize::from(seat)], NOW).unwrap();
+            queue.push((seat, out));
+        }
+
+        let next_a = a.next_hand().expect("hand two exists");
+        let next_b = b.next_hand().expect("and both peers say so");
+
+        assert_eq!(next_a.genesis, next_b.genesis, "one GENESIS(2), or a fork");
+        assert_eq!(next_a.roster_hash, next_b.roster_hash);
+        assert_eq!(next_a.required, next_b.required);
+        assert_eq!(next_a.seats, next_b.seats);
+        assert_eq!(next_a.button, next_b.button);
+        assert_eq!(next_a.hand_id, 2);
+        assert_eq!(
+            next_a.session_id, next_b.session_id,
+            "the session is the table's and does not change between hands"
+        );
+        assert_eq!(next_a.table_id, next_b.table_id);
+
+        // The button moved. Heads-up it alternates, which is TDA 34-B and is
+        // the one rotation a two-handed table has.
+        assert_ne!(
+            next_a.button,
+            Some(a.init().button_position),
+            "the button rotates"
+        );
+
+        // The stacks carried over, and they are what the settlement produced.
+        assert_eq!(
+            next_a.seats.iter().map(|(_, _, c)| *c).collect::<Vec<_>>(),
+            a.stacks(),
+            "hand two starts from hand one's chips"
+        );
+        assert_eq!(
+            next_a.seats.iter().map(|(_, _, c)| c).sum::<u64>(),
+            2 * 10_000,
+            "and no chip was created between hands"
+        );
+
+        // And hand two opens.
+        let (mut a2, from_a2) = Hand::open(next_a, &key(10), NOW, 30_000).unwrap();
+        let (mut b2, from_b2) = Hand::open(next_b, &key(11), NOW, 30_000).unwrap();
+        deliver(&mut b2, &from_a2, &key(11));
+        deliver(&mut a2, &from_b2, &key(10));
+        assert!(a2.dealt() && b2.dealt(), "stage 0 of hand two completed");
+        assert_eq!(a2.slot(), b2.slot(), "off one parent");
     }
 
     /// A mucked hand is never opened, by anybody, ever.

@@ -1062,17 +1062,31 @@ fn hole_cards(
     if !h.holding.contains(&seat) {
         return [Facing::Empty, Facing::Empty];
     }
-    match (h.cards, hero) {
-        (Some(cards), Some(me)) if me == seat => cards.map(|index| {
-            match p2p_poker::poker::state::Card::from_index(index) {
+    let face_up = |pair: [u8; 2]| {
+        pair.map(
+            |index| match p2p_poker::poker::state::Card::from_index(index) {
                 Ok(card) => Facing::up(card, true),
                 // A byte outside the deck cannot come from a card this client
                 // opened, so this is unreachable — and it draws a back rather
                 // than panicking, because a covered card is a correct thing to
                 // draw and a crashed table is not.
                 Err(_) => Facing::Down,
-            }
-        }),
+            },
+        )
+    };
+
+    // A seat that showed at the showdown is face-up for everybody, and stays
+    // that way while D-020's hold runs. This is what the hold is *for*: a
+    // player who cannot see what beat them learns nothing from the hand.
+    //
+    // Only the seats that actually showed. A folded or mucked hand is not drawn
+    // here, and could not be: its owner never published the share that would
+    // open it, so no peer holds the cards to draw.
+    if let Some(shown) = h.shown.get(usize::from(seat)).copied().flatten() {
+        return face_up(shown);
+    }
+    match (h.cards, hero) {
+        (Some(cards), Some(me)) if me == seat => face_up(cards),
         _ => [Facing::Down, Facing::Down],
     }
 }

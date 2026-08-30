@@ -328,6 +328,9 @@ pub async fn run(
     // The last turn told to the interface, so a stage per action does not
     // become a redraw per action.
     let mut turn_reported: Option<(Option<u8>, u64, u64)> = None;
+    // When the next hand may start. D-020's hold, and the only timer in this
+    // loop that is about a person rather than about the network.
+    let mut next_hand_at: Option<tokio::time::Instant> = None;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
 
     // Who mDNS has already told us about.
@@ -614,7 +617,10 @@ pub async fn run(
                                             table_closed = table_is_closed(f, &mut tournament_started);
                                             dht_effort(&mut swarm, table_closed);
                                             begin_hand(
-                                                f,
+                                                match opening_for_hand_one(f) {
+                                                    Some(o) => o,
+                                                    None => continue,
+                                                },
                                                 &app_key,
                                                 &mut hand,
                                                 &mut swarm,
@@ -664,6 +670,7 @@ pub async fn run(
                         deck_reported = None;
                         cards_reported = false;
                         turn_reported = None;
+                        next_hand_at = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -690,6 +697,7 @@ pub async fn run(
                         deck_reported = None;
                         cards_reported = false;
                         turn_reported = None;
+                        next_hand_at = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -800,7 +808,11 @@ pub async fn run(
                                         // are read from a complete set of
                                         // verified shares or not at all, so
                                         // there is no partial state to report.
-                                        report_hand(h, &events, &mut turn_reported).await;
+                                        if let Some(end) = report_hand(h, &events, &mut turn_reported).await {
+                                    next_hand_at = Some(
+                                        tokio::time::Instant::now() + end.pause(),
+                                    );
+                                }
                                         if let Some(cards) = h.cards().filter(|_| !cards_reported) {
                                             cards_reported = true;
                                             let _ = events
@@ -877,7 +889,10 @@ pub async fn run(
                                     // idempotent, because this one fires again
                                     // on every later table message.
                                     begin_hand(
-                                        f,
+                                        match opening_for_hand_one(f) {
+                                            Some(o) => o,
+                                            None => continue,
+                                        },
                                         &app_key,
                                         &mut hand,
                                         &mut swarm,
@@ -1735,6 +1750,7 @@ pub async fn run(
                         deck_reported = None;
                         cards_reported = false;
                         turn_reported = None;
+                        next_hand_at = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -1777,7 +1793,11 @@ pub async fn run(
                                             .publish(t.clone(), out);
                                     }
                                 }
-                                report_hand(h, &events, &mut turn_reported).await;
+                                if let Some(end) = report_hand(h, &events, &mut turn_reported).await {
+                                    next_hand_at = Some(
+                                        tokio::time::Instant::now() + end.pause(),
+                                    );
+                                }
                             }
                             // The player's own engine refused it, which means
                             // the window offered something it should not have.
@@ -1803,10 +1823,54 @@ pub async fn run(
                         deck_reported = None;
                         cards_reported = false;
                         turn_reported = None;
+                        next_hand_at = None;
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
                         }).await;
+                    }
+                }
+            }
+
+            // D-020's hold has run out: deal the next hand.
+            () = async {
+                match next_hand_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    // Nothing pending. `pending()` never completes, so this arm
+                    // is simply not in the race — which is what an `Option`
+                    // timer means in a `select!`.
+                    None => std::future::pending().await,
+                }
+            }, if next_hand_at.is_some() => {
+                next_hand_at = None;
+                let next = hand.as_ref().and_then(|h| h.next_hand());
+                hand = None;
+                hand_reported = false;
+                deck_reported = None;
+                cards_reported = false;
+                turn_reported = None;
+                match next {
+                    Some(opening) => {
+                        begin_hand(
+                            opening,
+                            &app_key,
+                            &mut hand,
+                            &mut swarm,
+                            table_topic.as_ref(),
+                            &events,
+                        )
+                        .await;
+                    }
+                    // Fewer than two seats with chips, or fewer than two that
+                    // took part in the hand just played. Either way there is no
+                    // hand k+1 and that is the tournament's end condition
+                    // rather than a fault.
+                    None => {
+                        let _ = events
+                            .send(NodeEvent::Warning(
+                                "the table has no next hand to deal".into(),
+                            ))
+                            .await;
                     }
                 }
             }
@@ -2257,23 +2321,20 @@ fn dht_effort(swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>, at_a_tabl
 /// as equivocation to everybody else — one seat, two different events, one
 /// stage — which is exactly the thing `table::stage` reports as a finding.
 async fn begin_hand(
-    f: &Formation,
+    opening: crate::table::hand::Opening,
     app_key: &ed25519_dalek::SigningKey,
     hand: &mut Option<crate::table::hand::Hand>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
     topic: Option<&gossipsub::IdentTopic>,
     events: &mpsc::Sender<NodeEvent>,
 ) {
-    use crate::table::hand::{Hand, Opening, Send as HandSend};
+    use crate::table::hand::{Hand, Send as HandSend};
 
     if hand.is_some() {
         return;
     }
-    let Some(opening) = Opening::from_formation(f, 1) else {
-        return;
-    };
     let now = super::node::now_unix_ms();
-    let deadline = f.advert().crypto_step_timeout_ms;
+    let deadline = opening.crypto_step_timeout_ms;
     match Hand::open(opening, app_key, now, deadline) {
         Ok((h, sends)) => {
             if let Some(t) = topic {
@@ -2300,6 +2361,15 @@ async fn begin_hand(
     }
 }
 
+/// The first hand's opening, once the roster has ratified.
+///
+/// A named function rather than the expression inline, because both roads into
+/// the first hand call it and an expression duplicated at two sites is an
+/// expression that can come to differ at two sites.
+fn opening_for_hand_one(f: &Formation) -> Option<crate::table::hand::Opening> {
+    crate::table::hand::Opening::from_formation(f, 1)
+}
+
 /// Tell the interface where the hand is, when it has moved.
 ///
 /// One function rather than a block at each call site, because the two call
@@ -2310,7 +2380,7 @@ async fn report_hand(
     h: &crate::table::hand::Hand,
     events: &mpsc::Sender<NodeEvent>,
     last: &mut Option<(Option<u8>, u64, u64)>,
-) {
+) -> Option<Ended> {
     let hand_id = h.hand_id();
     let turn = h.turn();
     let now = (
@@ -2319,7 +2389,7 @@ async fn report_hand(
         h.board().len() as u64,
     );
     if *last == Some(now) {
-        return;
+        return None;
     }
     let board_changed = last.map(|(_, _, b)| b) != Some(now.2);
     *last = Some(now);
@@ -2364,9 +2434,10 @@ async fn report_hand(
                 .await;
             if h.betting_over() {
                 let seats = u8::try_from(h.stacks().len()).unwrap_or(0);
-                let shown = (0..seats)
+                let shown: Vec<Option<[u8; 2]>> = (0..seats)
                     .map(|s| h.shown(s).map(|c| [c[0].index(), c[1].index()]))
                     .collect();
+                let anybody_showed = shown.iter().any(|s| s.is_some());
                 let _ = events
                     .send(NodeEvent::HandEnded {
                         hand_id,
@@ -2374,9 +2445,38 @@ async fn report_hand(
                         shown,
                     })
                     .await;
+                return Some(Ended { anybody_showed });
             }
         }
     }
+    None
+}
+
+impl Ended {
+    /// How long to hold the screen before the next hand.
+    ///
+    /// D-020: about five seconds at a showdown, so a player can see what beat
+    /// them. It is a **local** hold and not a stage — `HAND_INIT` is collective
+    /// and already tolerates a seat that is late, so nothing has to agree about
+    /// it and a client that wants none is still in protocol.
+    fn pause(&self) -> std::time::Duration {
+        if self.anybody_showed {
+            std::time::Duration::from_secs(5)
+        } else {
+            // Everybody folded: nothing to read. A beat rather than nothing, so
+            // the table does not jump straight into the next deal.
+            std::time::Duration::from_millis(800)
+        }
+    }
+}
+
+/// A hand that has just ended, and the one thing the pause depends on.
+struct Ended {
+    /// Whether anything was put on the table. D-020 holds the screen so a
+    /// player can read what beat them; a hand where everybody folded has
+    /// nothing to read, and holding a blank table for five seconds is worse
+    /// than not holding it.
+    anybody_showed: bool,
 }
 
 /// Whether the table has stopped being open to anybody.
