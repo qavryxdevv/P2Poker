@@ -16,6 +16,8 @@
 //! p2p-poker --host N --seats 6   a six-handed Sit-and-Go
 //! p2p-poker --host N --cash      a cash table, which deals with two
 //! p2p-poker --renderer software  draw without a graphics driver
+//! p2p-poker --no-mdns             do not look for players by multicast
+//! p2p-poker --port 4242           listen on a fixed port, to forward on a router
 //! ```
 //!
 //! `--renderer` is there to be overridden, not to be typed. The client draws
@@ -143,11 +145,26 @@ fn main() {
 
     let bounded = value_of("--for").and_then(|v| v.parse::<u64>().ok());
 
-    if has("--headless") {
-        headless(identity, app_key, settings, hosted, bounded, value_of("--join"));
-        return;
-    }
+    // Multicast discovery, on unless refused. `--no-mdns` exists to prove the
+    // other path: with it on, two clients on one wire find each other in under
+    // a second whatever the DHT does, so a run that means to test the DHT has
+    // to take it away first.
+    let local_discovery = !has("--no-mdns");
 
+    // A fixed port, for a player who can forward one.
+    //
+    // Zero means "whatever the OS gives", which is right for somebody behind a
+    // NAT they do not control and useless for somebody who can open a door:
+    // a forwarding rule names a number, and an ephemeral one is different every
+    // start. Naming it here makes that player reachable, which AutoNAT can then
+    // confirm — and a confirmed player becomes a relay for everybody else.
+    let port = value_of("--port")
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    // Parsed before the headless branch, so a value nobody understands is
+    // refused whether or not a window was going to open. A flag that is
+    // silently ignored in one mode is a flag somebody will trust in the other.
     let asked = value_of("--renderer");
     let draw = match asked.as_deref() {
         None | Some("auto") => Draw::Gl,
@@ -159,24 +176,31 @@ fn main() {
         }
     };
 
-    let outcome = windowed(
-        Player {
-            identity,
-            app_key,
-            profile_dir: dir,
-            settings,
+    let player = Player {
+        identity,
+        app_key,
+        profile_dir: dir,
+        settings,
+    };
+    let run = Run {
+        hosted,
+        bounded,
+        screen: if has("--table") {
+            Screen::Table
+        } else {
+            Screen::Lobby
         },
-        Run {
-            hosted,
-            bounded,
-            screen: if has("--table") {
-                Screen::Table
-            } else {
-                Screen::Lobby
-            },
-            draw,
-        },
-    );
+        draw,
+        local_discovery,
+        port,
+    };
+
+    if has("--headless") {
+        headless(player, run, value_of("--join"));
+        return;
+    }
+
+    let outcome = windowed(player, run);
 
     // Every local `windowed` held is dropped by now — the tokio runtime with the
     // node on it included. That ordering is the whole reason this decision is
@@ -308,14 +332,20 @@ fn again_in_software(args: &[String]) -> i32 {
 }
 
 /// The node, printing what happens. No window.
-fn headless(
-    identity: libp2p::identity::Keypair,
-    app_key: ed25519_dalek::SigningKey,
-    settings: p2p_poker::storage::settings::Settings,
-    hosted: Option<NodeCommand>,
-    bounded: Option<u64>,
-    join: Option<String>,
-) {
+fn headless(player: Player, run: Run, join: Option<String>) {
+    let Player {
+        identity,
+        app_key,
+        settings,
+        ..
+    } = player;
+    let Run {
+        hosted,
+        bounded,
+        local_discovery,
+        port,
+        ..
+    } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     rt.block_on(async move {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
@@ -324,7 +354,7 @@ fn headless(
         // immediately and for ever, and its `select!` arm would spin.
         let (commands, command_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
-            if let Err(e) = p2p_poker::net::run::run(identity, app_key, tx, command_rx).await {
+            if let Err(e) = p2p_poker::net::run::run(identity, app_key, tx, command_rx, local_discovery, port).await {
                 eprintln!("node stopped: {e}");
             }
         });
@@ -432,6 +462,8 @@ struct Run {
     bounded: Option<u64>,
     screen: Screen,
     draw: Draw,
+    local_discovery: bool,
+    port: u16,
 }
 
 fn windowed(player: Player, run: Run) -> Started {
@@ -446,6 +478,8 @@ fn windowed(player: Player, run: Run) -> Started {
         bounded,
         screen,
         draw,
+        local_discovery,
+        port,
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -467,7 +501,7 @@ fn windowed(player: Player, run: Run) -> Started {
         if let Some(command) = hosted {
             let _ = opening.send(command).await;
         }
-        if let Err(e) = p2p_poker::net::run::run(identity, node_key, tx, command_rx).await {
+        if let Err(e) = p2p_poker::net::run::run(identity, node_key, tx, command_rx, local_discovery, port).await {
             eprintln!("node stopped: {e}");
         }
     });

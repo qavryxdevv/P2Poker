@@ -35,7 +35,7 @@ observer, can see a card they are not entitled to.
 |---|---|
 | **Mental poker** | Barnett–Smart with Bayer–Groth shuffle proofs over secp256k1. `n`-of-`n` threshold ElGamal: every seat holds a share, and a card opens only when all of them are given. |
 | **Transcript** | Every event is canonical CBOR, signed Ed25519, and hash-chained. Two players who disagree about what happened can prove which of them is wrong. |
-| **Discovery** | BitTorrent Mainline DHT for finding strangers on the open internet; libp2p (QUIC, TCP, Noise/TLS, GossipSub, Kademlia) for talking to them; mDNS for the ones on your own network. |
+| **Discovery** | The public libp2p Kademlia DHT: every client announces itself a provider of one agreed key and asks who else is. Relays are found the same way, under `/libp2p/relay`, which is where go-libp2p's own AutoRelay looks. mDNS for players on your own network. |
 | **NAT** | Three ways to open a port: UPnP IGD, and PCP and NAT-PMP for the routers that speak those instead. AutoNAT v2 then decides whether this client is *actually* reachable — a router's confirmation is not the same claim. Circuit Relay v2 carries a hand when nothing opens, and DCUtR upgrades a relayed connection to a direct one. Relay capacity is judged against **measured** per-hand bytes rather than against a guess. |
 | **Poker** | A complete No-Limit Hold'em engine: blinds, dead button, side pots, TDA reopening rules. Around 120 000 random hands run in the test suite. |
 
@@ -88,6 +88,7 @@ Both print `TABLE FORMED session=…` with the same session identity.
 | `--table` | open on the table rather than the lobby |
 | `--for N` | stop after `N` seconds |
 | `--renderer gl` \| `software` | pin the renderer instead of letting it choose |
+| `--no-mdns` | do not look for players by multicast — how the DHT path gets tested |
 
 ### On a machine with no graphics driver
 

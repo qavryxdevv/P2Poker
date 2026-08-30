@@ -2,7 +2,6 @@
 //! a card (`docs/SPEC_CS.md` section 1). See `docs/NETWORK_STACK.md`.
 
 pub mod advert;
-pub mod dht;
 pub mod chained;
 pub mod formation;
 pub mod joinrpc;

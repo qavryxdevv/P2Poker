@@ -304,17 +304,26 @@ impl NetworkStatus {
     /// The order matters: a client that cannot be reached and has no relay
     /// cannot play, and saying "connected to 4 peers" while that is true would
     /// be the most misleading thing on the screen.
+    ///
+    /// **What is deliberately not here:** whether the relay's budget can carry a
+    /// hand. It used to lead — *"Relay found, but it cannot carry a hand"* — and
+    /// it was the wrong thing in the wrong place. Every public relay reports the
+    /// library defaults, so it became the permanent headline the moment this
+    /// client learned to find one; it named a table's problem while the player
+    /// was still reading a lobby; and it ended with *"see the note"*, a note
+    /// nothing on the screen offered. [`RelayStatus::adequate`] still carries
+    /// the finding, and `net::relay` still decides on it — at the point it
+    /// belongs, which is somebody sitting down.
     pub fn summary(&self) -> String {
-        if let Some(r) = &self.relay {
-            if !r.adequate {
-                return "Relay found, but it cannot carry a hand — see the note".into();
-            }
-        }
         match (self.public, self.relay.is_some(), self.peers) {
             (Some(false), false, _) => {
                 "Behind NAT and no relay found — tables may not be joinable".into()
             }
             (_, _, 0) => "Looking for peers".into(),
+            (_, true, n) => format!(
+                "Connected to {n} peer{} through a relay",
+                if n == 1 { "" } else { "s" }
+            ),
             (_, _, n) => format!("Connected to {n} peer{}", if n == 1 { "" } else { "s" }),
         }
     }
@@ -662,7 +671,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(bad_relay.summary().contains("cannot carry a hand"));
+        // The summary reports connectivity, not a table's budget: a relay
+        // with the library's limits is still a relay, and a player reading the
+        // lobby is not yet in a hand it could fail to carry.
+        assert!(!bad_relay.summary().contains("cannot carry a hand"));
+        assert!(bad_relay.summary().contains("through a relay"));
 
         let fine = NetworkStatus {
             peers: 4,

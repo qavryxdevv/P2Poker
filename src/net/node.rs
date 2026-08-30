@@ -9,15 +9,18 @@
 //! The acceptance criterion is that a client anywhere on the internet sees the
 //! open tables, and it takes both discovery layers to get there:
 //!
-//! 1. **Mainline** answers *where to try*. Announce under the fixed
-//!    `LOBBY_INFOHASH`, ask for peers, and get back addresses — of poker clients
-//!    and of anything else that happens to share the swarm.
-//! 2. **libp2p** settles who is actually there. A dial either completes a Noise
-//!    or TLS handshake with a peer that speaks `/p2p-poker/1`, or it does not,
-//!    and only then does the peer join the GossipSub mesh where adverts live.
+//! 1. **Kademlia** answers *who is there*. Every client announces itself a
+//!    provider of one agreed key on the public libp2p DHT and asks who else is,
+//!    and the record carries whatever addresses that client has — including a
+//!    circuit through a relay, which is what a player behind a NAT has instead
+//!    of an address of their own.
+//! 2. **The handshake** settles who is actually there. A dial either completes
+//!    a Noise or TLS handshake with a peer that speaks `/p2p-poker/1`, or it
+//!    does not, and only then does the peer join the GossipSub mesh where
+//!    adverts live.
 //!
 //! Most dials in step 2 fail, and that is the expected case rather than an
-//! error: the DHT list is a hint, and D-003 is satisfied by the ones that
+//! error: the provider list is a hint, and D-003 is satisfied by the ones that
 //! succeed.
 //!
 //! # Why the loop owns the stores
@@ -27,11 +30,9 @@
 //! this task — and would make the ordering of two writes a question somebody
 //! could get wrong.
 
-use std::collections::HashSet;
-use std::net::SocketAddrV4;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use libp2p::{gossipsub, multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{gossipsub, Multiaddr, PeerId};
 
 use super::lobby::{LobbyStore, RateLimiter};
 use crate::protocol::constants::AD_REBROADCAST_MS;
@@ -153,8 +154,13 @@ pub enum NodeEvent {
     /// a refused table would have told a user that a peer misbehaved when in
     /// fact this node had not finished starting up.
     Warning(String),
-    /// The announce under the lobby infohash succeeded.
-    Announced { port: u16 },
+    /// This client's own record is in the public lobby.
+    ///
+    /// It used to carry the port announced to Mainline. There is no port now:
+    /// a provider record carries multiaddrs, which is the whole reason for the
+    /// change — a player behind a NAT has no port worth announcing and does
+    /// have a circuit address.
+    Announced,
     /// A dial did not complete.
     ///
     /// Reported rather than discarded, because *most dials fail* is a true
@@ -256,19 +262,6 @@ impl NodeEvent {
     }
 }
 
-/// Turn a discovered `SocketAddrV4` into something the swarm can dial.
-///
-/// QUIC only for a discovered peer. The Mainline announce carries **one** port
-/// and this node announces its QUIC port, so a discovered address means QUIC and
-/// nothing else — constructing a TCP dial from it would be a guess, and a guess
-/// that fails looks exactly like a peer being offline.
-pub fn quic_dial_addr(addr: SocketAddrV4) -> Multiaddr {
-    Multiaddr::empty()
-        .with(Protocol::Ip4(*addr.ip()))
-        .with(Protocol::Udp(addr.port()))
-        .with(Protocol::QuicV1)
-}
-
 /// How often to re-publish this node's own adverts.
 ///
 /// Half the advert TTL, so one lost re-broadcast does not expire a table. That
@@ -291,16 +284,10 @@ pub fn now_unix_ms() -> u64 {
 pub struct NodeState {
     pub lobby: LobbyStore,
     pub limits: RateLimiter,
-    /// Peers already dialled this session, so a repeated DHT batch does not
-    /// re-dial the whole list every ten minutes.
-    dialled: HashSet<SocketAddrV4>,
     /// Whether AutoNAT has confirmed this node is reachable, which is what D-002
     /// gates relay volunteering on.
     public: bool,
 
-    /// This client's own address, as other peers report seeing it. See
-    /// [`fresh_dials`](NodeState::fresh_dials).
-    external: Option<std::net::Ipv4Addr>,
 }
 
 impl Default for NodeState {
@@ -314,46 +301,8 @@ impl NodeState {
         NodeState {
             lobby: LobbyStore::new(),
             limits: RateLimiter::new(),
-            dialled: HashSet::new(),
-            external: None,
             public: false,
         }
-    }
-
-    /// Which of a discovered batch are worth dialling now.
-    ///
-    /// Already-dialled addresses are dropped, because the DHT returns the same
-    /// peers every cycle and re-dialling all of them every ten minutes would be
-    /// a self-inflicted connection storm.
-    ///
-    /// **And so is this client's own address.** An announcement in the DHT
-    /// outlives the process that made it, and every run announces a fresh
-    /// ephemeral port, so after a dozen runs the swarm holds a dozen entries all
-    /// pointing at this household — every one of them a port nothing is
-    /// listening on any more. Measured on a developer machine: of the addresses
-    /// one cycle returned, the great majority were this node's own past selves,
-    /// and dialling them is where "46 dials failed" came from.
-    ///
-    /// A peer that genuinely shares this external address is behind the same
-    /// router, and mDNS is how those two find each other — a route out and back
-    /// in through one's own NAT is hairpinning, which many routers do not do at
-    /// all.
-    pub fn fresh_dials(&mut self, batch: &[SocketAddrV4]) -> Vec<SocketAddrV4> {
-        batch
-            .iter()
-            .copied()
-            .filter(|a| Some(*a.ip()) != self.external)
-            .filter(|a| self.dialled.insert(*a))
-            .collect()
-    }
-
-    /// Remember what the world says this client's address is.
-    ///
-    /// Learned from `identify`: every peer reports the address it saw us come
-    /// from. It is not a claim that the address is reachable — only AutoNAT can
-    /// say that — but it is enough to recognise our own reflection in the DHT.
-    pub fn set_external(&mut self, addr: std::net::Ipv4Addr) {
-        self.external = Some(addr);
     }
 
     pub fn set_public(&mut self, public: bool) {
@@ -386,43 +335,7 @@ pub fn worth_parsing(message: &gossipsub::Message, cap: usize) -> bool {
 mod tests {
     use super::*;
     use crate::protocol::constants::{AD_TTL_MS, LOBBY_MSG_MAX};
-    use std::net::Ipv4Addr;
 
-    fn v4(a: [u8; 4], port: u16) -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(a[0], a[1], a[2], a[3]), port)
-    }
-
-    /// A discovered address means QUIC, because that is the port this node
-    /// announces. Building a TCP dial from it would be a guess, and a failed
-    /// guess is indistinguishable from a peer being offline.
-    #[test]
-    fn a_discovered_address_dials_quic() {
-        let addr = quic_dial_addr(v4([203, 0, 113, 5], 4001));
-        assert_eq!(
-            addr.to_string(),
-            "/ip4/203.0.113.5/udp/4001/quic-v1",
-            "one address family, one transport, no guessing"
-        );
-    }
-
-    /// The DHT returns the same peers every cycle. Re-dialling all of them every
-    /// ten minutes would be a connection storm this node inflicted on itself.
-    #[test]
-    fn a_peer_is_dialled_once_per_session() {
-        let mut state = NodeState::new();
-        let batch = vec![v4([1, 1, 1, 1], 4001), v4([2, 2, 2, 2], 4001)];
-
-        assert_eq!(state.fresh_dials(&batch).len(), 2);
-        assert_eq!(state.fresh_dials(&batch).len(), 0, "the same batch again");
-
-        let mut wider = batch.clone();
-        wider.push(v4([3, 3, 3, 3], 4001));
-        assert_eq!(
-            state.fresh_dials(&wider),
-            vec![v4([3, 3, 3, 3], 4001)],
-            "and only what is new"
-        );
-    }
 
     /// The size gate is free and the cap is the protocol's, so it runs before
     /// anything looks inside the message.

@@ -44,6 +44,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher as _};
 use std::time::Duration;
 
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{
     autonat, connection_limits, dcutr, gossipsub, identify, identity, kad, request_response,
     kad::store::MemoryStore, noise, ping, relay,
@@ -170,7 +171,15 @@ pub struct PokerBehaviour {
     /// router, which is NAT hairpinning and which many routers simply do not do.
     /// The DHT is the wrong tool for a peer that is one hop away, and mDNS is
     /// the right one.
-    pub mdns: libp2p::mdns::tokio::Behaviour,
+    /// Peers on the same wire, found by multicast.
+    ///
+    /// Optional, and the reason is evidence rather than tidiness. Two clients
+    /// on one network find each other by mDNS in under a second, which is
+    /// excellent for playing and useless for **proving** that anything else
+    /// works: a test that dials through the DHT and then asserts two peers met
+    /// is satisfied either way, and would keep passing after the DHT path
+    /// broke. Turning it off is how the other path gets tested at all.
+    pub mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
 }
 
 /// The topics this node subscribes to.
@@ -197,6 +206,13 @@ pub struct NodeConfig {
     /// and it gates the announce rather than the capacity; see the module
     /// documentation for why the two were separated.
     pub relay_role: RelayRole,
+    /// Whether to look for peers by multicast on the local network.
+    ///
+    /// True for a client, because a player on the same wire should be found in
+    /// a second rather than in a minute. False when the point is to prove that
+    /// discovery over the DHT works, since mDNS would answer first and the
+    /// proof would be of nothing.
+    pub local_discovery: bool,
 }
 
 /// Build the node.
@@ -212,6 +228,7 @@ pub struct NodeConfig {
 /// Note that `with_relay_client` gives the behaviour closure a **second
 /// argument**; that is not optional and is why the closure below takes two.
 pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::error::Error>> {
+    let local_discovery = config.local_discovery;
     let local_peer_id = PeerId::from(config.identity.public());
     let relay_role = config.relay_role;
 
@@ -248,7 +265,22 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                 MemoryStore::new(local_peer_id),
                 ipfs_cfg,
             );
-            ipfs_kad.set_mode(Some(kad::Mode::Client));
+            // Automatic, not pinned to client.
+            //
+            // Client mode means never answering a query, which sounds polite and
+            // starves the routing table: nobody adds a node they never hear
+            // from, and a table built only from peers this node happened to
+            // speak to first does not span the key space. Measured with it
+            // pinned: two clients each announced themselves in the lobby, each
+            // read the lobby a hundred and thirty times over ten minutes, each
+            // found three or four other players — and never each other, because
+            // their walks landed on different nodes.
+            //
+            // `None` restores libp2p's own rule: client until there is a
+            // confirmed external address, server after. A client behind a NAT
+            // gains one when a relay accepts its reservation, so the node that
+            // starts answering queries is one that can actually be reached.
+            ipfs_kad.set_mode(None);
 
             let identify = identify::Behaviour::new(
                 identify::Config::new("/p2p-poker/1".into(), key.public())
@@ -297,13 +329,17 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                 ),
                 mem_limits: libp2p::memory_connection_limits::Behaviour::with_max_percentage(0.25),
                 upnp: libp2p::upnp::tokio::Behaviour::default(),
-                mdns: libp2p::mdns::tokio::Behaviour::new(
-                    libp2p::mdns::Config {
+                mdns: Toggle::from(if local_discovery {
+                    Some(libp2p::mdns::tokio::Behaviour::new(
+                        libp2p::mdns::Config {
                         query_interval: Duration::from_millis(MDNS_QUERY_INTERVAL_MS),
                         ..Default::default()
                     },
-                    local_peer_id,
-                )?,
+                        local_peer_id,
+                    )?)
+                } else {
+                    None
+                }),
             })
         })?
         .with_swarm_config(|c| {
@@ -416,6 +452,7 @@ mod tests {
     async fn the_node_builds() {
         let swarm = build(NodeConfig {
             identity: keypair(),
+            local_discovery: false,
             relay_role: RelayRole::Declined,
         })
         .expect("the stack builds");

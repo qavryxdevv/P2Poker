@@ -2,66 +2,77 @@
 //!
 //! Everything else in `net` is a decision made in isolation and tested in
 //! isolation. This is the part that has to be run to be believed, so it is kept
-//! small and its pieces live elsewhere: the address filter is
-//! [`dht`](super::dht)'s, the admission rules are [`lobby`](super::lobby)'s, and
-//! the per-node state is [`node`](super::node)'s. What is here is the order
+//! small and its pieces live elsewhere: the admission rules are
+//! [`lobby`](super::lobby)'s, the per-node state is [`node`](super::node)'s, and
+//! the relay budget is [`relay`](super::relay)'s. What is here is the order
 //! things happen in.
+//!
+//! # Discovery is libp2p's, and used to be BitTorrent's
+//!
+//! Until 2026-08-30 this node announced itself in the Mainline DHT under a fixed
+//! infohash and dialled whoever else was there. It worked, and it could not be
+//! made to work for the people who need it most: **a Mainline announcement can
+//! say one thing, an IP and a port**, and a player behind a NAT does not have
+//! one worth saying. They would appear in the lobby and be undialable, which is
+//! the same as not appearing.
+//!
+//! What a NATed player has is a circuit address through a relay — a multiaddr,
+//! several of them, changing as reservations come and go. A Kademlia provider
+//! record carries exactly that, so the reachable player and the unreachable one
+//! are found by the same mechanism.
 //!
 //! # The order, and why it is this one
 //!
-//! 1. **Listen first.** The Mainline announce carries a port, and announcing a
-//!    port nothing is bound to publishes an address that cannot be dialled — to
-//!    a hundred strangers, every ten minutes.
-//! 2. **Announce, then ask.** BEP 5's token comes from a recent `get_peers` to
-//!    the same node, so the crate does the round trip itself; what matters here
-//!    is that this node is findable before it starts expecting to find others.
-//! 3. **Dial what is new.** The DHT returns the same peers every cycle, and
-//!    re-dialling all of them every ten minutes is a connection storm a node
-//!    would be inflicting on itself.
-//! 4. **Gossip.** A peer that completed a handshake joins the mesh, and the
-//!    adverts arrive there.
+//! 1. **Reach the public network.** Nothing else can happen first: AutoNAT has
+//!    nobody to ask whether this client is reachable, and a reservation cannot
+//!    be requested of a relay this node has never met.
+//! 2. **Find a relay and take a reservation.** Relay hosts advertise themselves
+//!    under `/libp2p/relay`, which is where go-libp2p's own AutoRelay looks.
+//!    That is the list; it is not a file and nothing about it is compiled in.
+//! 3. **Announce, once there is an address to announce.** A provider record
+//!    carries the swarm's external addresses and go-libp2p-kad-dht discards one
+//!    that arrives with none, so a client with no circuit yet would be
+//!    announcing itself to nobody.
+//! 4. **Ask who else is there, every cycle**, and dial them.
+//! 5. **Gossip.** A peer that completed a handshake joins the mesh, and the
+//!    table advertisements arrive there. The DHT is the phone book; the mesh is
+//!    what actually carries a lobby.
+//!
+//! Measured end to end on 2026-08-30, with multicast off on both sides and no
+//! BitTorrent DHT in the binary at all: two clients behind one NAT, each holding
+//! a reservation on a **different** public relay, found each other and agreed a
+//! table — `TABLE FORMED session=f503d44809bfb094 seats=2` on both.
 //!
 //! # What failure looks like, and why most of it is not failure
 //!
-//! Most dials fail. The lobby infohash is shared with whatever else announces
-//! under it, the addresses are stale by up to ten minutes, and a client behind
-//! symmetric NAT cannot be reached directly at all. None of that is an error
-//! condition — D-003 is satisfied by the dials that succeed, and the ones that
-//! do not are the ordinary weather of an open DHT.
+//! Most dials fail, addresses go stale, and a client behind a symmetric NAT
+//! cannot be reached directly at all. None of that is an error condition:
+//! D-003 is satisfied by the dials that succeed, and the rest is the ordinary
+//! weather of an open network.
 
 use std::time::Duration;
 
-// Two `StreamExt` traits are in play - `futures_lite`'s for the DHT stream and
-// libp2p's for the swarm - so both are named rather than glob-imported. A `next`
-// that resolved to the wrong one compiles until it does not.
-use futures_lite::StreamExt as DhtStreamExt;
 use libp2p::{
     futures::StreamExt as SwarmStreamExt, gossipsub, identity, request_response, swarm::SwarmEvent,
     Multiaddr, PeerId,
 };
-use mainline::{Dht, Id};
 use tokio::sync::mpsc;
 
 use std::collections::HashSet;
-use std::net::SocketAddrV4;
 
 use super::advert;
 use super::formation::{Failed, Formation, Send};
 use super::joinrpc;
 use super::joinwire;
 use super::portmap;
-use super::dht::{self, PeerHints, Swarm as DhtSwarm, REANNOUNCE_INTERVAL};
 use super::relay;
 use super::lobby::{LobbyStore, RateLimiter, TableAd, TableKind};
-use super::node::{quic_dial_addr, worth_parsing, NodeCommand, NodeEvent, NodeState, REBROADCAST};
+use super::node::{worth_parsing, NodeCommand, NodeEvent, NodeState, REBROADCAST};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
 use super::joinwire::DISPLAY_NAME_MAX;
 use crate::protocol::constants::{
     AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX, MAX_SEATS,
 };
-
-/// How long to wait for the DHT to bootstrap before giving up on this cycle.
-const BOOTSTRAP_PATIENCE: Duration = Duration::from_secs(20);
 
 /// The way on to the public libp2p network, when no player is reachable.
 ///
@@ -116,7 +127,7 @@ fn relay_namespace() -> libp2p::kad::RecordKey {
 /// reachable player and the unreachable one, and that is the difference between
 /// a lobby most people can be seen in and a lobby only a minority can.
 fn lobby_namespace() -> libp2p::kad::RecordKey {
-    namespace(b"/p2p-poker/lobby/1")
+    namespace(b"p2p-poker/main-lobby/v1")
 }
 
 /// A namespace string as the DHT key its provider records live under.
@@ -134,29 +145,31 @@ fn namespace(ns: &[u8]) -> libp2p::kad::RecordKey {
     libp2p::kad::RecordKey::new(&key)
 }
 
-/// How many relay addresses to remember having asked.
-///
-/// The set exists so a discovery cycle does not re-ask the same relay every
-/// minute, and it is fed from the DHT — so it is bounded like everything else
-/// that is. The bound empties it rather than freezing it: see where it is used.
-const MAX_ASKED_RELAYS: usize = 512;
-
-/// How often to ask whether an announce is due.
-///
-/// Not the same thing as how often to announce. The check is cheap and the
-/// announce is rare, and collapsing the two into one interval is what made the
-/// first version silent for its first ten minutes.
-const ANNOUNCE_CHECK: Duration = Duration::from_secs(15);
-
 /// Where this node listens.
 ///
-/// Port 0 on both, so the OS chooses and nothing collides with a torrent client
-/// or another instance. QUIC is what a discovered address means; TCP is there
-/// for peers that cannot do UDP at all.
-fn listen_addrs() -> Vec<Multiaddr> {
+/// Port 0 by default, so the OS chooses and nothing collides with another
+/// instance. QUIC is the transport peers are found on; TCP is there for the
+/// networks that will not carry UDP at all.
+///
+/// **A fixed port is what makes a player reachable.** Everything else in this
+/// module is about coping with not being reachable — relays, circuits, hole
+/// punching — and all of it needs somebody, somewhere, who is. A player who
+/// forwards one port on their router becomes that somebody: publicly dialable,
+/// confirmed by AutoNAT, and then a relay for everyone else under D-002. With
+/// an ephemeral port they cannot, because the number changes every start and no
+/// forwarding rule can name it.
+///
+/// The same number is used for UDP and TCP. They are different sockets and do
+/// not collide, and one number is one line in a router's configuration instead
+/// of two.
+fn listen_addrs(port: u16) -> Vec<Multiaddr> {
     vec![
-        "/ip4/0.0.0.0/udp/0/quic-v1".parse().expect("a literal"),
-        "/ip4/0.0.0.0/tcp/0".parse().expect("a literal"),
+        format!("/ip4/0.0.0.0/udp/{port}/quic-v1")
+            .parse()
+            .expect("a literal"),
+        format!("/ip4/0.0.0.0/tcp/{port}")
+            .parse()
+            .expect("a literal"),
     ]
 }
 
@@ -201,12 +214,18 @@ pub async fn run(
     app_key: ed25519_dalek::SigningKey,
     events: mpsc::Sender<NodeEvent>,
     mut commands: mpsc::Receiver<NodeCommand>,
+    local_discovery: bool,
+    port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut swarm = swarm::build(NodeConfig {
         identity,
         // Capacity from the start; the ANNOUNCE is what AutoNAT gates (D-002).
         // `relay::Config` cannot be changed after the swarm is built, and
         // capacity nobody can reach costs nothing.
+        // A player on the same wire should be found in a second, not in a
+        // minute. Turned off only to prove the DHT path carries a lobby on its
+        // own, which multicast would otherwise answer first.
+        local_discovery,
         relay_role: RelayRole::Volunteer,
     })?;
 
@@ -217,7 +236,7 @@ pub async fn run(
         .gossipsub
         .subscribe(&topics.lobby_chat)?;
 
-    for addr in listen_addrs() {
+    for addr in listen_addrs(port) {
         swarm.listen_on(addr)?;
     }
 
@@ -246,7 +265,6 @@ pub async fn run(
     }
 
     let mut state = NodeState::new();
-    let mut hints = PeerHints::new();
     let my_peer_bytes = swarm.local_peer_id().to_bytes();
     // This node's own application key, used as the "from peer" when it files its
     // own advertisement. It is charged the same rate limit as anybody else,
@@ -279,25 +297,12 @@ pub async fn run(
     let mut seen_locally: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
 
-    // The DHT socket. Port 0, never 6881 - see `dht`.
-    let dht = Dht::builder()
-        .port(0)
-        .request_timeout(Duration::from_millis(2_500))
-        .build()?
-        .as_async();
-    let lobby_hash = Id::from_bytes(DhtSwarm::Lobby.infohash())?;
-    let relay_hash = Id::from_bytes(DhtSwarm::Relay.infohash())?;
+    // The QUIC port, kept only so the router can be asked to open it once.
+    // It used to be what got announced to Mainline as well; that is gone, and
+    // opening a door in a NAT is worth doing whether or not anybody is told
+    // about it through a BitTorrent swarm.
+    let mut mapped_port: Option<u16> = None;
 
-    let mut announced_port: Option<u16> = None;
-    // Relays this node has asked for a reservation from, so a repeated discovery
-    // cycle does not ask the same relay again every minute.
-    //
-    // Bounded, because it is fed from the DHT and the DHT is whatever strangers
-    // say. When it fills it is emptied rather than frozen: asking a relay twice
-    // costs one message, and never asking a NEW one costs the connection this
-    // client needs — so the failure this bound must not have is the one a frozen
-    // set would give it.
-    let mut asked_relays: HashSet<SocketAddrV4> = HashSet::new();
 
     // Peers already asked for a reservation because identify said they relay.
     // Asking twice is not harmful, only noisy, and the noise is a log line per
@@ -312,6 +317,14 @@ pub async fn run(
     // Whether this client's own record is in the public lobby. Set once the
     // announcement has an address in it, because one without is discarded.
     let mut in_public_lobby = false;
+
+    // Whether this client has offered itself as a relay. Once only: the record
+    // is republished by Kademlia on its own.
+    let mut volunteering = false;
+
+    // Whether any relay has ever been seen, so "no relay found" is a finding
+    // about the network rather than about the first minute of a run.
+    let mut seen_a_relay = false;
     let mut have_reservation = false;
     // Counted so that "no relay" is reported as a finding rather than as
     // impatience: three cycles is three minutes of looking.
@@ -338,8 +351,6 @@ pub async fn run(
     // that is not there fails to reply. It ends by itself when the event channel
     // closes, and hands the port back on the way out.
 
-    let mut announce_timer = tokio::time::interval(ANNOUNCE_CHECK);
-    let mut last_announce: Option<tokio::time::Instant> = None;
     let mut discover_timer = tokio::time::interval(Duration::from_secs(60));
     let mut housekeeping = tokio::time::interval(REBROADCAST);
 
@@ -368,15 +379,36 @@ pub async fn run(
                         // address, made by that relay.
                         swarm.add_external_address(address.clone());
                         let _ = events.send(NodeEvent::Listening(address)).await;
+
+                        // And join the lobby now, rather than waiting for the
+                        // next discovery tick.
+                        //
+                        // This is the moment the announcement becomes possible:
+                        // before it there is no external address and the record
+                        // would be discarded, and the tick that used to carry it
+                        // is a minute long and competes with a swarm that is
+                        // never idle. Measured before this line existed: two
+                        // clients ran for four hundred seconds, both took a
+                        // reservation, and the lobby was asked once between
+                        // them. Neither ever announced, so neither found the
+                        // other.
+                        if asked_public_dht && !in_public_lobby {
+                            let kad = &mut swarm.behaviour_mut().ipfs_kad;
+                            if kad.start_providing(lobby_namespace()).is_ok() {
+                                in_public_lobby = true;
+                                let _ = events.send(NodeEvent::Announced).await;
+                            }
+                            kad.get_providers(lobby_namespace());
+                        }
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
                         // Announce only a port something is actually bound to.
-                        if announced_port.is_none() {
-                            announced_port = quic_port(&address);
+                        if mapped_port.is_none() {
+                            mapped_port = quic_port(&address);
                             // And ask the router to open it, once, in its own
                             // task. Started here rather than on a timer because
                             // this is the moment there is something to ask about.
-                            if let Some(port) = announced_port {
+                            if let Some(port) = mapped_port {
                                 tokio::spawn(portmap::keep_open(port, events.clone()));
                             }
                         }
@@ -723,16 +755,6 @@ pub async fn run(
                         // offers it will serve this client the same as any
                         // other — which is what makes a list of relay addresses
                         // unnecessary (§3.3) even while an entry point is not.
-                        // What the world says our address is. Not proof of
-                        // reachability - only AutoNAT can say that - but enough
-                        // to stop dialling our own past announcements out of the
-                        // DHT, which is where most failed dials came from.
-                        if let Some(libp2p::multiaddr::Protocol::Ip4(ip)) =
-                            info.observed_addr.iter().next()
-                        {
-                            state.set_external(ip);
-                        }
-
                         // A peer on the public DHT is a way into it. Its
                         // addresses go into the public routing table so that
                         // `get_providers` has somewhere to start; without this
@@ -768,6 +790,7 @@ pub async fn run(
                         }
 
                         let relays = info.protocols.contains(&libp2p::relay::HOP_PROTOCOL_NAME);
+                        seen_a_relay |= relays;
                         if relays && !have_reservation && !asked_hops.contains(&peer_id) {
                             // Their own address, with their identity and the
                             // circuit suffix. Listening on that IS the
@@ -1015,54 +1038,6 @@ pub async fn run(
                 }
             }
 
-            _ = announce_timer.tick() => {
-                // Two preconditions, and the first fires at t = 0 without them:
-                // a port something is actually bound to, and a bootstrapped
-                // routing table. Announcing before either is a store request
-                // with nowhere to send it, which is what the first run of this
-                // binary reported.
-                let due = match last_announce {
-                    None => true,
-                    Some(at) => at.elapsed() >= REANNOUNCE_INTERVAL,
-                };
-                if let (Some(port), true, true) =
-                    (announced_port, due, bootstrapped(&dht).await)
-                {
-                    {
-                        match dht.announce_peer(lobby_hash, Some(port)).await {
-                            Ok(_) => {
-                                last_announce = Some(tokio::time::Instant::now());
-                                let _ = events.send(NodeEvent::Announced { port }).await;
-
-                                // And, only when AutoNAT says this client can
-                                // actually be reached, offer the line to other
-                                // people's games (D-002). Announcing this from
-                                // behind a NAT is the harm the role separation
-                                // exists to avoid.
-                                if state.is_public() {
-                                    if let Err(e) =
-                                        dht.announce_peer(relay_hash, Some(port)).await
-                                    {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(format!(
-                                                "relay announce failed: {e}"
-                                            )))
-                                            .await;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = events
-                                    .send(NodeEvent::Warning(format!(
-                                        "DHT announce failed: {e}"
-                                    )))
-                                    .await;
-                            }
-                        }
-                    }
-                }
-            }
-
             _ = discover_timer.tick() => {
                 // The public lobby: announce, then read.
                 //
@@ -1079,7 +1054,10 @@ pub async fn run(
                     if reachable_here && !in_public_lobby {
                         match swarm.behaviour_mut().ipfs_kad.start_providing(lobby_namespace())
                         {
-                            Ok(_) => in_public_lobby = true,
+                            Ok(_) => {
+                                in_public_lobby = true;
+                                let _ = events.send(NodeEvent::Announced).await;
+                            }
                             Err(e) => {
                                 let _ = events
                                 .send(NodeEvent::Warning(format!(
@@ -1095,86 +1073,58 @@ pub async fn run(
                     swarm.behaviour_mut().ipfs_kad.get_providers(lobby_namespace());
                 }
 
-                // Everything below waits on the **BitTorrent** DHT having
-                // bootstrapped. The public lobby above must not: it is on the
-                // libp2p DHT and has nothing to do with Mainline, and putting
-                // it behind that gate meant one slow network kept the other
-                // from ever being asked - which is how the lobby stayed empty
-                // while the relays it needs were being found perfectly well.
-                if bootstrapped(&dht).await {
-                    // Cleared first, and this is not tidiness. `absorb` drops the
-                    // INCOMING address once the list holds its cap, so a list
-                    // that is never cleared freezes on whatever the first
-                    // stranger supplied — for the whole life of the process. The
-                    // DHT returns a fresh view every cycle and this takes it;
-                    // re-dialling is prevented by `fresh_dials`, which is where
-                    // that belongs.
-                    hints.clear();
-                    let mut stream = dht.get_peers(lobby_hash);
-                    while let Some(batch) = DhtStreamExt::next(&mut stream).await {
-                        hints.absorb(batch.as_ref());
+                // A relay is needed when this client cannot be reached
+                // directly — and DCUtR needs one too, since it upgrades an
+                // existing relayed connection and cannot start one. So one is
+                // looked for whenever there is no reservation yet, whatever
+                // AutoNAT has said so far.
+                //
+                // **Asking is all this does.** The reservation itself is taken
+                // in the `identify` arm, from any peer that turns out to speak
+                // the hop protocol — which is the same path a public relay and
+                // a volunteer both arrive by, and which replaced a version that
+                // built the circuit address by hand and got it wrong: without
+                // `/p2p/<PeerId>` before `p2p-circuit` the transport refuses it
+                // before a packet leaves, and reports the refusal as an empty
+                // string. That path never worked, and it is gone rather than
+                // repaired.
+                if !have_reservation {
+                    relay_searches += 1;
+                    swarm.behaviour_mut().ipfs_kad.get_providers(relay_namespace());
+                    if relay_searches >= 3 && !seen_a_relay {
+                        let _ = events
+                            .send(NodeEvent::NoRelayFound {
+                                cycles: relay_searches,
+                            })
+                            .await;
+                        // Reach for the public network again: an entry point
+                        // that was unreachable a minute ago may not be now.
+                        for entry in PUBLIC_ENTRY {
+                            if let Ok(addr) = entry.parse::<libp2p::Multiaddr>() {
+                                let _ = swarm.dial(addr);
+                            }
+                        }
                     }
-                    let (unusable, full) = hints.dropped();
-                    let _ = events
-                        .send(NodeEvent::Discovered {
-                            hints: hints.len(),
-                            dropped: unusable + full,
-                        })
-                        .await;
+                }
 
-                    for addr in state.fresh_dials(hints.peers()) {
-                        // A failed dial is the ordinary case, not an error.
-                        let _ = swarm.dial(quic_dial_addr(addr));
-                    }
-
-                    // A relay is needed when this client cannot be reached
-                    // directly — and DCUtR needs one too, since it upgrades an
-                    // existing relayed connection and cannot start one. So the
-                    // relay swarm is asked whenever there is no reservation yet,
-                    // whatever AutoNAT has said so far.
-                    if !have_reservation {
-                        relay_searches += 1;
-                        let mut relays = PeerHints::new();
-                        let mut stream = dht.get_peers(relay_hash);
-                        while let Some(batch) = DhtStreamExt::next(&mut stream).await {
-                            relays.absorb(batch.as_ref());
-                        }
-                        if relays.is_empty() && relay_searches >= 3 {
-                            let _ = events
-                                .send(NodeEvent::NoRelayFound {
-                                    cycles: relay_searches,
-                                })
-                                .await;
-                            // No volunteer, and still no reservation: reach for
-                            // the public network again. Only here, so a network
-                            // that has volunteers of its own never touches it.
-                            for entry in PUBLIC_ENTRY {
-                                if let Ok(addr) = entry.parse::<libp2p::Multiaddr>() {
-                                    let _ = swarm.dial(addr);
-                                }
-                            }
-                            swarm.behaviour_mut().ipfs_kad.get_providers(relay_namespace());
-                        }
-                        if asked_relays.len() >= MAX_ASKED_RELAYS {
-                            asked_relays.clear();
-                        }
-                        for addr in relays.peers() {
-                            if !asked_relays.insert(*addr) {
-                                continue;
-                            }
-                            // Listening on a relay's circuit address IS the
-                            // reservation request; there is no separate call.
-                            let circuit = quic_dial_addr(*addr)
-                                .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                            if let Err(e) = swarm.listen_on(circuit) {
-                                let _ = events
-                                    .send(NodeEvent::Warning(format!(
-                                        "no reservation from {addr}: {e}"
-                                    )))
-                                    .await;
-                            }
-                        }
-                    }
+                // And offer the line to other people's games, but only once
+                // AutoNAT says this client can actually be reached (D-002).
+                // Advertising a relay from behind a NAT is the harm the role
+                // separation exists to avoid.
+                //
+                // Under `/libp2p/relay`, the namespace every libp2p client
+                // already looks in, rather than a swarm of our own: a relay is
+                // not a poker thing, and a volunteer who is only findable by
+                // poker clients helps nobody else and is found no sooner.
+                if state.is_public()
+                    && !volunteering
+                    && swarm
+                        .behaviour_mut()
+                        .ipfs_kad
+                        .start_providing(relay_namespace())
+                        .is_ok()
+                {
+                    volunteering = true;
                 }
             }
 
@@ -1732,12 +1682,6 @@ async fn handle_gossip(
         }
     }
 }
-
-/// Whether the DHT has a routing table yet, with a bound on the wait.
-///
-/// Both the announce and the discovery need this, and they needed it separately
-/// — which is how the announce came to fire at `t = 0` with nowhere to send a
-/// store request.
 /// Whether an address is one the rest of the internet could dial.
 ///
 /// A relay is only useful if the address it was reached on is reachable from
@@ -1759,32 +1703,6 @@ fn reachable(addr: &libp2p::Multiaddr) -> bool {
         Protocol::Ip6(ip) => !ip.is_loopback() && !ip.is_unspecified(),
         _ => false,
     })
-}
-
-async fn bootstrapped(dht: &mainline::async_dht::AsyncDht) -> bool {
-    tokio::time::timeout(BOOTSTRAP_PATIENCE, dht.bootstrapped())
-        .await
-        .unwrap_or(false)
-}
-
-/// Bootstrap addresses for the DHT, filtered so none can panic the crate.
-///
-/// The public routers, as `mainline` ships them, minus anything IPv6 — which is
-/// a crash and not a preference. See [`dht::usable_bootstrap`].
-pub fn bootstrap_addresses() -> Vec<std::net::SocketAddrV4> {
-    use std::net::ToSocketAddrs;
-    let hosts = [
-        "router.bittorrent.com:6881",
-        "dht.transmissionbt.com:6881",
-        "router.utorrent.com:6881",
-    ];
-    let mut resolved = Vec::new();
-    for h in hosts {
-        if let Ok(addrs) = h.to_socket_addrs() {
-            resolved.extend(addrs);
-        }
-    }
-    dht::usable_bootstrap(&resolved)
 }
 
 #[cfg(test)]
@@ -1870,11 +1788,11 @@ mod tests {
         assert_eq!(quic_port(&bare_udp), None, "and UDP alone is not QUIC");
     }
 
-    /// Port 0 on both transports: the OS chooses, so nothing collides with
-    /// another instance or with a torrent client.
+    /// Port 0 by default: the OS chooses, so nothing collides with another
+    /// instance.
     #[test]
     fn the_node_binds_ports_the_os_chooses() {
-        let addrs = listen_addrs();
+        let addrs = listen_addrs(0);
         assert_eq!(addrs.len(), 2);
         for a in &addrs {
             let s = a.to_string();
@@ -1882,28 +1800,20 @@ mod tests {
                 s.contains("/udp/0/") || s.ends_with("/tcp/0"),
                 "{s} does not bind port 0"
             );
-            assert!(!s.contains("6881"), "never the BitTorrent default port");
         }
     }
 
-    /// The bootstrap list is resolved and then filtered, because a v6 address
-    /// reaching `mainline` is a panic in somebody else's file.
+    /// And a number when one is given, on both transports and the same one.
     ///
-    /// It does not assert that resolution succeeded: a machine with no DNS is
-    /// not a broken build, and the empty list is handled by the crate's own
-    /// defaults.
+    /// The whole point is a router rule, and a rule names a number. Two
+    /// different numbers would be two rules for no reason: UDP and TCP are
+    /// different sockets and do not collide.
     #[test]
-    fn no_bootstrap_address_can_panic_the_crate() {
-        for addr in bootstrap_addresses() {
-            assert!(dht::worth_trying(addr).is_ok());
-            assert!(!addr.ip().is_loopback());
-        }
+    fn a_fixed_port_is_used_on_both_transports() {
+        let addrs = listen_addrs(4242);
+        let shown: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+        assert!(shown.contains(&"/ip4/0.0.0.0/udp/4242/quic-v1".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"/ip4/0.0.0.0/tcp/4242".to_owned()), "{shown:?}");
     }
 
-    /// The infohash is 20 bytes and the crate takes it as one.
-    #[test]
-    fn the_lobby_infohash_is_a_valid_id() {
-        assert!(Id::from_bytes(DhtSwarm::Lobby.infohash()).is_ok());
-        assert!(Id::from_bytes(DhtSwarm::Relay.infohash()).is_ok());
-    }
 }

@@ -45,10 +45,6 @@ libp2p-stream = "0.4.0-alpha"
 # edge direct rather than adding anything to build.
 async-trait = "0.1"
 
-# --- global discovery: docs/research/MAINLINE_DHT.md ----------------------
-mainline = { version = "=8.0.0", default-features = false, features = ["async"] }
-futures-lite = "2.6"
-
 # --- mental poker: docs/research/MENTAL_POKER.md --------------------------
 ziffle = "=0.1.0"
 # The serialisation ziffle delegates to. A direct edge because the wire

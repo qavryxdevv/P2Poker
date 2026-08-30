@@ -1082,8 +1082,10 @@ mod tests {
             peer: "12D3KooWabc".into(),
             adequate: false,
         });
+        // Still amber — a relay whose budget cannot carry a hand is worth a
+        // colour, even though it is no longer worth the whole sentence.
         assert_eq!(status_colour(&v), theme::WARN);
-        assert!(v.status.summary().contains("cannot carry a hand"));
+        assert!(!v.status.summary().contains("cannot carry a hand"));
 
         v.status = NetworkStatus {
             peers: 4,

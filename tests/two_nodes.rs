@@ -41,6 +41,10 @@ fn node() -> Swarm<PokerBehaviour> {
     swarm::build(NodeConfig {
         identity: identity::Keypair::generate_ed25519(),
         // The relay server is irrelevant here and its capacity costs nothing.
+        // Off. These dial a loopback address and then assert two peers met;
+        // with multicast on, a client running elsewhere on this machine could
+        // satisfy that assertion and the test would pass for the wrong reason.
+        local_discovery: false,
         relay_role: RelayRole::Volunteer,
     })
     .expect("the stack builds")

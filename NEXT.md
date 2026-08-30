@@ -35,13 +35,43 @@ circuit. Carrying a game over a public relay is arithmetically fine; what it
 needs is two or three reservations held at once and a session that survives a
 circuit being reset under it.
 
-### What is NOT proven
+### Mainline is gone
 
-That two clients find each other **through the DHT lobby** rather than through
-mDNS. The announcement succeeds and the query is answered; both test clients sit
-on one LAN, where mDNS would find them anyway. Until that is watched end to end,
-the Mainline announcement stays: replacing working discovery with an unproven
-one is not an improvement.
+Discovery is the public libp2p Kademlia DHT and nothing else. `--no-mdns` turns
+multicast off, which is how the DHT path gets tested at all — with it on, two
+clients on one wire find each other in a second whatever the DHT does.
+
+**It worked twice, end to end**, before the removal was finished: two clients,
+multicast off, each holding a reservation on a *different* public relay, agreed
+a table — `TABLE FORMED session=f503d44809bfb094 seats=2` on both.
+
+**And it has not worked since, and that is where tomorrow starts.** Four runs of
+eight to ten minutes each, after the removal was tidied up:
+
+* both clients announce themselves — `start_providing` succeeds and the log says
+  *listed in the public lobby*;
+* both read the lobby a hundred and thirty times and get real answers: five or
+  six other players, which are this machine's own earlier test profiles still
+  advertised in the DHT;
+* and **never each other**. One run connected to 325 peers and not once to its
+  counterpart.
+
+So the mechanism is not dead — records land and queries return them. Two
+particular records are not reaching the queries that want them. What has not
+been established, in order of suspicion:
+
+1. Whether go-libp2p stores an `ADD_PROVIDER` whose only addresses are circuit
+   addresses. It certainly drops one with **no** addresses — `handlers.go`, `if
+   len(pi.Addrs) < 1 { continue }` — and whether a relay address survives its
+   filtering was not checked.
+2. Whether two `get_providers` walks for one key converge on the same nodes from
+   a routing table this thin. Kademlia's client mode was the first suspect and
+   has been changed to automatic (`set_mode(None)`), which did not fix it.
+3. Whether the record needs longer than a ten-minute run to settle.
+
+The cheapest experiment for (1) is a third party: announce from this client and
+look for the record with a tool that is not this client — `ipfs dht findprovs`
+against the same key would settle it in one command.
 
 ## Two processes now form a table
 
@@ -179,30 +209,36 @@ candidates are `paint.rs`'s `RINGS = 16` and `BANDS = 14`.
 
 ## Next actions, in order
 
-1. **Prove the DHT lobby.** Two clients that cannot see each other by mDNS —
-   turn it off, or put one elsewhere — and watch one client's table appear in
-   the other's list. Everything below waits on this.
-2. **Then drop Mainline**, and take the owner's name for the key while doing it:
-   `p2p-poker/main-lobby/v1`. One change, not two.
-3. **The volunteer relay path has never worked.** `run.rs` builds its circuit
-   address without `/p2p/<PeerId>`, so the transport refuses it before a packet
-   is sent — and reports the refusal as an empty string, because
-   `TransportError::Other` is dropped on the way out. The identify path added
-   today is correct and is what actually obtains reservations.
-4. **A fixed port.** `listen_addrs()` asks for port 0 on both transports and
-   there is no flag, so a player cannot forward a port on their router and be
-   the reachable node everyone else needs. That is the cheapest way for this
-   network to have its first relay.
-5. **The hand, wired.** Formation ends at `session_id` and the engine starts at
+1. **Make two clients find each other in the lobby, repeatably.** See above for
+   what is known and the three things that are not. Everything below waits on
+   this: a lobby that lists strangers and not your friend is not a lobby.
+2. **The hand, wired.** Formation ends at `session_id` and the engine starts at
    `GENESIS(1)`. `table::dealing` already runs a hand between three peers in
    memory; nothing carries `HAND_INIT` and the deck messages between two.
-6. **Two machines on two networks.** Still rests on nothing.
-7. **The automatic renderer hop, in a VM.** Everything around it is tested; the
+3. **Two machines on two networks.** Still rests on nothing.
+4. **The automatic renderer hop, in a VM.** Everything around it is tested; the
    hop wants a machine with no OpenGL to prove itself on.
-8. **The table window's engine.** It draws a sample hand and says so. §22's rule
+5. **The table window's engine.** It draws a sample hand and says so. §22's rule
    — never display an unverified card as valid — is enforced by the type
    (`Facing::up` takes the verdict), so the wiring cannot break it by omission.
-9. Phase 11's audit.
+6. Phase 11's audit.
+
+### Done since, and worth not re-deriving
+
+* **A fixed port**: `--port N` binds both transports to it, so a player who can
+  forward one on their router becomes reachable — and a reachable player is a
+  relay for everyone else under D-002. Verified: `--port 47777` binds
+  `/ip4/…/tcp/47777` and `/ip4/…/udp/47777/quic-v1`.
+* **The volunteer relay path is fixed by deletion.** It built its circuit
+  address without `/p2p/<PeerId>`, which the transport refuses before a packet
+  leaves while reporting an empty string, so it had never worked. Reservations
+  now come from the `identify` path, which is where a public relay and a
+  volunteer arrive by the same road.
+* **The relay-budget headline is gone.** *"Relay found, but it cannot carry a
+  hand — see the note"* became the permanent first line the moment this client
+  learned to find a relay, named a table's problem to somebody reading a lobby,
+  and pointed at a note that did not exist. `net::relay` still decides it, at
+  the point it belongs.
 
 ### Also found and not yet fixed
 

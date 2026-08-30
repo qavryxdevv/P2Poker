@@ -130,9 +130,9 @@ impl AppState {
             NodeEvent::Discovered { hints, dropped } => {
                 self.note(format!("{hints} peers found, {dropped} unusable"));
             }
-            NodeEvent::Announced { port } => {
+            NodeEvent::Announced => {
                 self.status.dht_announced = true;
-                self.note(format!("announced udp/{port} in the lobby swarm"));
+                self.note("this client is listed in the public lobby".into());
             }
             NodeEvent::Reachability { public } => {
                 self.status.public = Some(public);
@@ -475,7 +475,7 @@ mod tests {
     /// number, because "16 MiB" tells a player nothing and "cannot carry a hand"
     /// tells them everything.
     #[test]
-    fn an_inadequate_relay_says_so_in_the_status() {
+    fn an_inadequate_relay_is_recorded_but_does_not_take_the_headline() {
         let mut s = AppState::new();
         s.apply(NodeEvent::Reserved {
             relay: peer(),
@@ -483,9 +483,16 @@ mod tests {
             seconds: Some(120),
             adequate: false,
         });
+        // The verdict is kept, because seating depends on it...
         assert!(!s.status.relay.as_ref().unwrap().adequate);
-        assert!(s.view().status.summary().contains("cannot carry a hand"));
+        // ...and it is in the log, where a player can go looking...
         assert!(s.log.back().unwrap().contains("NOT enough"));
+        // ...but it is not the headline. With no peers yet the headline is
+        // still "Looking for peers", which is the plainest true thing: a relay
+        // and nobody to play is not a relay problem.
+        let line = s.view().status.summary();
+        assert!(!line.contains("cannot carry a hand"), "{line}");
+        assert_eq!(line, "Looking for peers");
     }
 
     #[test]

@@ -45,6 +45,10 @@ const PATIENCE: Duration = Duration::from_secs(60);
 fn node(role: RelayRole) -> Swarm<PokerBehaviour> {
     swarm::build(NodeConfig {
         identity: identity::Keypair::generate_ed25519(),
+        // Off. These dial a loopback address and then assert two peers met;
+        // with multicast on, a client running elsewhere on this machine could
+        // satisfy that assertion and the test would pass for the wrong reason.
+        local_discovery: false,
         relay_role: role,
     })
     .expect("the stack builds")
