@@ -638,21 +638,30 @@ pub async fn run(
                                             // must stay as findable as it was.
                                             table_closed = table_is_closed(f, &mut tournament_started);
                                             dht_effort(&mut swarm, table_closed);
+                                            // The opening first, and the flag
+                                            // only if there was one. Setting
+                                            // the flag before asking closed the
+                                            // guard for ever on a peer whose
+                                            // roster had not ratified at that
+                                            // instant, and that peer then never
+                                            // dealt at all - which is exactly
+                                            // what a three-seat run showed:
+                                            // the table formed and one seat's
+                                            // HAND_INIT never came.
                                             if !ever_dealt {
-                                            ever_dealt = true;
-                                            begin_hand(
-                                                match opening_for_hand_one(f) {
-                                                    Some(o) => o,
-                                                    None => continue,
-                                                },
-                                                &app_key,
-                                                &mut hand,
-                                                &mut hand_by,
-                                                &mut swarm,
-                                                table_topic.as_ref(),
-                                                &events,
-                                            )
-                                            .await;
+                                                if let Some(o) = opening_for_hand_one(f) {
+                                                    ever_dealt = true;
+                                                    begin_hand(
+                                                        o,
+                                                        &app_key,
+                                                        &mut hand,
+                                                        &mut hand_by,
+                                                        &mut swarm,
+                                                        table_topic.as_ref(),
+                                                        &events,
+                                                    )
+                                                    .await;
+                                                }
                                             }
                                         }
                                     }
@@ -935,21 +944,21 @@ pub async fn run(
                                     // sites start the hand, and `begin_hand` is
                                     // idempotent, because this one fires again
                                     // on every later table message.
+                                    // See the note at the other road in.
                                     if !ever_dealt {
-                                    ever_dealt = true;
-                                    begin_hand(
-                                        match opening_for_hand_one(f) {
-                                            Some(o) => o,
-                                            None => continue,
-                                        },
-                                        &app_key,
-                                        &mut hand,
-                                        &mut hand_by,
-                                        &mut swarm,
-                                        table_topic.as_ref(),
-                                        &events,
-                                    )
-                                    .await;
+                                        if let Some(o) = opening_for_hand_one(f) {
+                                            ever_dealt = true;
+                                            begin_hand(
+                                                o,
+                                                &app_key,
+                                                &mut hand,
+                                                &mut hand_by,
+                                                &mut swarm,
+                                                table_topic.as_ref(),
+                                                &events,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                             }
@@ -2537,7 +2546,10 @@ async fn report_hand(
         turn.as_ref().map(|t| t.seat),
         h.pot(),
         h.board().len() as u64,
-        h.betting_over(),
+        // `over`, not `betting_over`: an aborted hand has also ended, and a
+        // key that could not tell the two apart would report the abort as
+        // "nothing changed" and never send `HandEnded`.
+        h.over(),
     );
     if *last == Some(now) {
         // Nothing new. In particular the clock is **not** re-armed: a mesh
@@ -2594,7 +2606,7 @@ async fn report_hand(
             let _ = events
                 .send(NodeEvent::NotYourTurn { hand_id, seat: None })
                 .await;
-            if h.betting_over() {
+            if h.over() {
                 let seats = u8::try_from(h.stacks().len()).unwrap_or(0);
                 let shown: Vec<Option<[u8; 2]>> = (0..seats)
                     .map(|s| h.shown(s).map(|c| [c[0].index(), c[1].index()]))

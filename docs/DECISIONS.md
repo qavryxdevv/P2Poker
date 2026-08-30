@@ -2163,8 +2163,12 @@ the pause. The reasons:
 * The client must not begin hand `k+1` while its own hold is running, or the
   cards vanish from under the player at the moment the new deal repaints.
 * A hand that ends with **everybody folding to one seat** has no showdown and
-  no cards to hold, so it has no pause. Holding a blank table for five seconds
-  is worse than not holding it. The same is true of a showdown in which every
+  no cards to hold. Holding a blank table for five seconds is worse than not
+  holding it, so that hand gets **a beat and not the hold** — 800 ms as
+  shipped, enough that the table does not jump straight into the next deal and
+  short enough that nobody is waiting on nothing. The number is in
+  `src/net/run.rs`'s `Ended::pause`, beside the five seconds, so the two are
+  read together. The same is true of a showdown in which every
   losing seat mucked: there is one hand to look at, which is the winner's, and
   whether that is worth five seconds is the same question as any other showdown.
 * The hold covers the **revealed** hole cards and the board together, because a
@@ -2273,7 +2277,9 @@ its own.
 ### Interaction with D-020
 
 The five-second hold starts when the **showdown is over** — every seat has
-shown or mucked — and not at the first reveal. Holding from the first show
+shown or mucked — and not at the first reveal. An **aborted** hand takes the
+short beat rather than the hold, for the same reason a fold-out does: there is
+nothing on the table to read. Holding from the first show
 would freeze the table in the middle of a sequence the player is watching
 unfold. What is held is what the transcript ended with: the hands that were
 shown, and the board.
