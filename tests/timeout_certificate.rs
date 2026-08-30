@@ -391,3 +391,51 @@ fn a_peers_certificate_arriving_first_does_not_silence_this_client() {
         );
     }
 }
+
+
+/// **Two survivors must open the next hand at the same table.**
+///
+/// `R(k+1)` and the reconnection allowance both go into hand `k+1`'s genesis,
+/// so a peer that derives them differently derives a different hand and refuses
+/// its neighbour's. Deriving them from `signed` — this client's own record of
+/// whose events it accepted — cannot be right: a hand ended by a
+/// witness-independent terminal closes at whatever each peer had reached, and
+/// the tail of a hand is exactly where two honest records differ. Measured over
+/// the network as hand four opening with `[0, 2]` on one survivor and
+/// `[0, 1, 2]` on the other, each refusing the other with *"dealt_in differs
+/// from what I derived"*.
+#[test]
+fn both_survivors_derive_the_same_next_hand() {
+    let (mut t, opening) = Table::open_with_seat_two_silent();
+    t.settle(opening, NOW);
+
+    let mut queue = Vec::new();
+    for s in 0..2usize {
+        for Send::Broadcast(b) in t.hands[s]
+            .vote_on_timeouts(&t.keys[s], LATE)
+            .expect("a vote is sealed")
+        {
+            queue.push(b);
+        }
+    }
+    t.settle(queue, LATE);
+    for s in 0..2usize {
+        assert!(t.hands[s].aborted().is_some(), "seat {s} never ended the hand");
+    }
+
+    // The two peers deliberately hold different records of who was heard from:
+    // that is the state this is about, and it must not reach the genesis.
+    let zero = t.hands[0].next_hand().expect("seat 0 opens the next hand");
+    let one = t.hands[1].next_hand().expect("seat 1 opens the next hand");
+
+    assert_eq!(zero.required, one.required, "the required sets differ");
+    assert_eq!(zero.grace, one.grace, "the reconnection allowances differ");
+    assert_eq!(zero.genesis, one.genesis, "the genesis differs");
+    assert_eq!(zero.roster_hash, one.roster_hash, "the roster hashes differ");
+    assert_eq!(zero.button, one.button, "the button differs");
+    assert!(
+        !zero.required.contains(&2),
+        "the certified seat is still required: {:?}",
+        zero.required
+    );
+}

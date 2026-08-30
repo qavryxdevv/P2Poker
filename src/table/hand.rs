@@ -4268,6 +4268,31 @@ impl Hand {
         let mut present_run = self.open.present_run.clone();
         grace.resize(n, GRACE_HANDS);
         present_run.resize(n, 0);
+        // **What counts as having taken part must be agreed, not observed.**
+        // `signed` is this client's own record of whose events it accepted, and
+        // two honest peers legitimately differ in it: a hand ended by a
+        // witness-independent terminal closes at whatever each peer had reached,
+        // so the tail of a hand is exactly where their records diverge. Both
+        // `grace` and `R(k+1)` go into the next hand's genesis, so a difference
+        // there is not a cosmetic one — measured, as two survivors opening hand
+        // four at the same genesis with `dealt_in` `[0, 2]` and `[0, 1, 2]` and
+        // each refusing the other's.
+        //
+        // A certificate is the shared record: it is accepted only when every
+        // voter has signed the same thing, so two peers that applied one agree
+        // about it by construction. Where a certificate is possible — three
+        // seats or more, D-023's floor — absence means *certified* absence and
+        // nothing else. Heads-up there can be no certificate at all, and this
+        // falls back to observation, which is safe for the only reason it is
+        // ever safe: with one other peer there is nobody to disagree with.
+        let by_certificate = self.open.required.len() >= 3;
+        let took_part = |me: &Self, seat: usize| -> bool {
+            if by_certificate {
+                !me.certified.contains(&(seat as SeatIdx))
+            } else {
+                me.signed.get(seat).copied().unwrap_or(false)
+            }
+        };
         for seat in 0..n {
             if !alive.get(seat).copied().unwrap_or(false) {
                 continue;
@@ -4284,7 +4309,7 @@ impl Hand {
                 present_run[seat] = 0;
                 continue;
             }
-            if self.signed.get(seat).copied().unwrap_or(false) {
+            if took_part(self, seat) {
                 present_run[seat] = present_run[seat].saturating_add(1);
                 if present_run[seat] >= REPLENISH_AFTER && grace[seat] < GRACE_HANDS {
                     grace[seat] += 1;
@@ -4300,12 +4325,28 @@ impl Hand {
         // A seat that signed nothing is outside the required set from here on,
         // which is D-013 and is how one silent seat costs exactly one hand
         // rather than the table.
-        let required: Vec<SeatIdx> = (0..self.open.max_players)
-            .filter(|s| {
-                self.signed.get(usize::from(*s)).copied().unwrap_or(false)
-                    && alive.get(usize::from(*s)).copied().unwrap_or(false)
-            })
-            .collect();
+        // Where certificates are possible this is `R(k)` less the seats the
+        // table certified absent, which is derived from the previous genesis
+        // and from evidence every peer holds. A seat cannot join `R` by being
+        // heard from: it joins by being in the roster the table ratified.
+        let required: Vec<SeatIdx> = if by_certificate {
+            self.open
+                .required
+                .iter()
+                .copied()
+                .filter(|s| {
+                    took_part(self, usize::from(*s))
+                        && alive.get(usize::from(*s)).copied().unwrap_or(false)
+                })
+                .collect()
+        } else {
+            (0..self.open.max_players)
+                .filter(|s| {
+                    took_part(self, usize::from(*s))
+                        && alive.get(usize::from(*s)).copied().unwrap_or(false)
+                })
+                .collect()
+        };
         if required.len() < 2 {
             return None;
         }

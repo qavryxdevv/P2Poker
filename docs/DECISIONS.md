@@ -2583,3 +2583,33 @@ nothing, and the two live peers sit one sequence apart for the rest of the hand
 reach the other's subject. The fix is three `report_message_validation_result`
 calls, one before each exit; the shape of the bug is worth more than the fix,
 because it is invisible at the seat count everybody tests at.
+
+
+### What decides `R(k+1)` and the allowance, after D-023
+
+Both go into hand `k+1`'s genesis, so a peer that derives either differently
+derives a different hand and refuses its neighbour's. They were derived from
+`signed` — this client's own record of whose events it accepted — and that
+cannot be right for anything the genesis carries: a hand ended by a
+witness-independent terminal closes at whatever each peer had reached, so the
+tail of a hand is exactly where two honest records differ.
+
+Measured, on three clients with one killed: hand four opened with `dealt_in`
+`[0, 2]` on one survivor and `[0, 1, 2]` on the other, each refusing the other
+with *"dealt_in differs from what I derived"*. The certificate machinery had
+worked perfectly for three hands before that and the table still stopped.
+
+**A certificate is the shared record.** It is accepted only when every voter has
+signed the same subject, so two peers that applied one agree about it by
+construction. So where a certificate is possible — three seats or more, D-023's
+floor — absence means *certified* absence:
+
+* `R(k+1) = R(k)` less the seats certified absent in hand `k`, and less any seat
+  with no stack. A seat cannot join `R` by being heard from; it joins by being
+  in the roster the table ratified.
+* The allowance is charged for a certified seat and accrues for every other,
+  rather than being charged for silence.
+
+Heads-up there can be no certificate, and this falls back to observation. That
+is safe for the only reason it is ever safe: with one other peer there is nobody
+to disagree with, and if the two do disagree the table is over regardless.
