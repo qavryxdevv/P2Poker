@@ -29,7 +29,7 @@
 //!   slot for stage 1 is computed and handed back, which is where that work
 //!   starts.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ed25519_dalek::SigningKey;
 
@@ -61,7 +61,8 @@ use crate::mental_poker::reveal::RevealStage;
 use super::dealing::{self, Dealing, Identity, Refused, Share};
 use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, BoardReveal,
     DealPrivate, DeckCommit, DeckInit, HandAbort, HandComplete, HandInit, NotOurs, PotAward,
-    Refund, RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep};
+    Refund, RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep, TimeoutCert,
+    TimeoutVote};
 use super::stage::{Collective, Heard};
 
 /// What a step wants sent.
@@ -361,6 +362,33 @@ pub const SHOWDOWN_MUCK_CAP: usize = 64;
 /// seat lists, plus four vectors of that length.
 pub const HAND_COMPLETE_CAP: usize = 4_096;
 
+/// The group base of the betting actions, and what a vote names when the
+/// stage it is about is a betting one.
+///
+/// Five types are legal at one betting `sequence` and which one the seat would
+/// have chosen is exactly what nobody knows, because it never spoke. The group
+/// base names the group and commits to no member. `PROTOCOL.md` §4.8 pins it,
+/// because the value is inside `subject_digest`: two clients that each picked a
+/// reasonable member would produce different digests, their votes would land in
+/// different slots, and **no certificate would ever assemble**.
+pub const ACTION_GROUP: u16 = 0x0500;
+
+/// The cap on a `TIMEOUT_VOTE` body: six small numbers and a hash.
+pub const TIMEOUT_VOTE_CAP: usize = 128;
+
+/// The cap on a `TIMEOUT_CERT` body: a digest and up to `MAX_SEATS - 1`
+/// embedded signed votes.
+pub const TIMEOUT_CERT_CAP: usize = 4_096;
+
+/// How many certificates against one seat make it sit out.
+///
+/// `PROTOCOL.md` §8.3: after three, the seat is marked sitting out at the next
+/// hand boundary — it keeps its stack, posts dead money, takes no cards and
+/// drains. That is the tournament's dead seat, and it exists only where
+/// `|V| >= 2`, because below the floor no certificate has any effect and the
+/// counter never increments.
+pub const MAX_CONSECUTIVE_AUTO_ACTIONS: u8 = 3;
+
 /// How many hands a seat may miss and still be dealt back in.
 ///
 /// **Denominated in hands, and that is the whole design.** A reconnection
@@ -652,6 +680,28 @@ struct StepHeard {
 /// One hand in progress.
 pub struct Hand {
     open: Opening,
+    /// Votes heard about each subject, by the digest that identifies it.
+    ///
+    /// A vote alone is not evidence and does nothing; only a complete set —
+    /// one from **every** seat in `V(subject)` — becomes a certificate. Kept as
+    /// the signed bytes, because a certificate embeds them whole so that it
+    /// carries its own proof and needs nothing from the receiver's store.
+    votes: BTreeMap<Hash, BTreeMap<SeatIdx, Vec<u8>>>,
+    /// Subjects this client has already voted about, so it votes once.
+    voted: BTreeSet<Hash>,
+    /// The certificate stage now open, if one is.
+    certifying: Option<Certifying>,
+    /// Seats a completed certificate has named.
+    ///
+    /// `V(subject)` shrinks by this and by nothing else, and only on acceptance
+    /// of a certificate that itself cleared the floor — which makes the
+    /// shrinkage inductive and unbuyable with assertions. That is the whole of
+    /// D-008: an attacker that could shrink `V` by asserting would reach
+    /// `|V| = 1` at any table size and certify alone.
+    certified: Vec<SeatIdx>,
+    /// Consecutive certificates against each seat, towards
+    /// [`MAX_CONSECUTIVE_AUTO_ACTIONS`].
+    strikes: Vec<u8>,
     /// When the stage now open was reached, on this peer's own clock.
     ///
     /// A **cryptographic** stage that stalls is what
@@ -818,6 +868,11 @@ impl Hand {
         Ok((
             Hand {
                 signed,
+                votes: BTreeMap::new(),
+                voted: BTreeSet::new(),
+                certifying: None,
+                certified: Vec::new(),
+                strikes: vec![0; usize::from(o.max_players)],
                 opened_at_ms,
                 stage_at_ms: opened_at_ms,
                 stage_seq: 0,
@@ -867,6 +922,8 @@ impl Hand {
                 | EventType::ShowdownMuck
                 | EventType::HandComplete
                 | EventType::HandAbort
+                | EventType::TimeoutVote
+                | EventType::TimeoutCert
         ) {
             return Err(Failed::Wire(WireError::WrongType));
         }
@@ -887,6 +944,15 @@ impl Hand {
         // to. It is the one message that can arrive at a stage nobody completed.
         if kind == EventType::HandAbort {
             return self.on_hand_abort(bytes, now_ms);
+        }
+        // A vote and a certificate **reference** the stage they are about
+        // rather than occupying it, so they are answered from whatever phase
+        // this client is in and never routed through it.
+        if kind == EventType::TimeoutVote {
+            return self.on_timeout_vote(bytes, key, now_ms);
+        }
+        if kind == EventType::TimeoutCert {
+            return self.on_timeout_cert(bytes, key, now_ms);
         }
 
         let out = self.dispatch(bytes, kind, key, now_ms);
@@ -1954,7 +2020,6 @@ impl Hand {
         key: &SigningKey,
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
-        let seat_count = self.open.max_players;
         {
             let Phase::Playing { play, .. } = &mut self.phase else {
                 return Err(Failed::NothingFurther);
@@ -1980,6 +2045,20 @@ impl Hand {
             event_hash,
         ));
 
+        self.after_action(seat, key, now_ms)
+    }
+
+    /// Whose turn it is after a seat has acted — however it acted.
+    ///
+    /// Shared by the seat's own action and by a certificate acting for it, so
+    /// the two cannot leave the round in different places.
+    fn after_action(
+        &mut self,
+        seat: SeatIdx,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let seat_count = self.open.max_players;
         let next = {
             let Phase::Playing { play, .. } = &self.phase else {
                 return Err(Failed::NothingFurther);
@@ -3127,6 +3206,485 @@ impl Hand {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // The decision clock that is not this client's own word for it
+    // ---------------------------------------------------------------------
+
+    /// The subject this client would vote about, if its own timer has expired.
+    ///
+    /// One subject at a time and only the seats the open stage is waiting for.
+    /// Everything in it is a function of the stage rather than of an opinion:
+    /// two honest voters build the identical body and therefore the identical
+    /// `subject_digest`, which is what lets their votes be counted together.
+    fn subject_now(&self, seat: SeatIdx) -> Option<TimeoutVote> {
+        let acting = matches!(
+            &self.phase,
+            Phase::Playing { play, .. } if matches!(play.step, Step::Acting { .. })
+        );
+        Some(TimeoutVote {
+            subject_sequence: self.slot.sequence,
+            subject_seat: seat,
+            // A betting stage has five legal types and no expected one, so the
+            // group base names the group (`PROTOCOL.md` §4.8).
+            subject_event_type: if acting {
+                ACTION_GROUP
+            } else {
+                self.stage_type()?
+            },
+            parent_event_hash: self.slot.previous_event_hash,
+            // The parent stage's own `next_deadline_ms`, which is normative
+            // (§8.2) — so a voter cannot choose a shorter one and a receiver
+            // can check the value rather than trust it.
+            deadline_ms: self.next_deadline_for(self.owed_type()?),
+            kind: if acting { 1 } else { 2 },
+        })
+    }
+
+    /// The event type the open stage is collecting, if it collects one.
+    fn stage_type(&self) -> Option<u16> {
+        Some(match &self.phase {
+            Phase::Init(_) => EventType::HandInit.code(),
+            Phase::Deck { .. } => EventType::DeckInit.code(),
+            Phase::Shuffling { heard, .. } => {
+                if heard.is_some() {
+                    EventType::ShuffleProof.code()
+                } else {
+                    EventType::ShuffleStep.code()
+                }
+            }
+            Phase::Committing { .. } => EventType::DeckCommit.code(),
+            Phase::Dealing { .. } => EventType::DealPrivate.code(),
+            Phase::Playing { play, .. } => match play.step {
+                Step::Opening { .. } => EventType::BoardReveal.code(),
+                Step::Showdown { .. } => EventType::ShowdownReveal.code(),
+                Step::Settling { .. } => EventType::HandComplete.code(),
+                Step::Acting { .. } => ACTION_GROUP,
+                Step::Ended => return None,
+            },
+            Phase::Aborted(_) | Phase::Between => return None,
+        })
+    }
+
+    /// The type whose deadline the open stage runs under.
+    fn owed_type(&self) -> Option<EventType> {
+        match self.stage_type()? {
+            ACTION_GROUP => Some(EventType::ActionFold),
+            other => EventType::try_from(other).ok(),
+        }
+    }
+
+    /// The voter set for a subject: everybody dealt in but the subject, less
+    /// the seats a completed certificate has already named.
+    fn voters(&self, subject: SeatIdx) -> Vec<SeatIdx> {
+        self.mine
+            .dealt_in
+            .iter()
+            .copied()
+            .filter(|s| *s != subject && !self.certified.contains(s))
+            .collect()
+    }
+
+    /// Vote about every seat this client's own timer has run out on.
+    ///
+    /// Called by the node, because the deadline is measured on the node's own
+    /// monotonic clock and the hand cannot ask what time it is. A vote says
+    /// only *"my timer expired and I have accepted nothing from that seat at
+    /// this stage"* — it is not an accusation, it does nothing alone, and it is
+    /// not evidence against anybody until a complete set exists.
+    pub fn vote_on_timeouts(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        if self.over() || !self.past_stage_deadline(now_ms) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for seat in self.waiting_for() {
+            // Never about oneself, and never twice.
+            if seat == self.open.my_seat {
+                continue;
+            }
+            let Some(subject) = self.subject_now(seat) else {
+                continue;
+            };
+            let digest = subject.subject_digest();
+            if self.voted.contains(&digest) {
+                continue;
+            }
+            // Below the floor a certificate has no effect whatever, so a vote
+            // towards one is noise on the wire and an invitation to an
+            // implementer to reach for a quorum. It is not sent at all.
+            if self.voters(seat).len() < 2 {
+                continue;
+            }
+            let bytes = self.say_at(
+                EventType::TimeoutVote,
+                &subject,
+                TIMEOUT_VOTE_CAP,
+                key,
+                now_ms,
+            )?;
+            self.voted.insert(digest);
+            self.take_vote(digest, self.open.my_seat, bytes.clone(), subject);
+            out.push(Send::Broadcast(bytes));
+            out.append(&mut self.certify_if_unanimous(key, now_ms)?);
+        }
+        Ok(out)
+    }
+
+    /// Record one vote, whoever it came from.
+    fn take_vote(&mut self, digest: Hash, from: SeatIdx, bytes: Vec<u8>, _v: TimeoutVote) {
+        self.votes.entry(digest).or_default().insert(from, bytes);
+    }
+
+    /// A vote from a peer.
+    fn on_timeout_vote(
+        &mut self,
+        bytes: &[u8],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, EventType::TimeoutVote)?;
+        let seat = self.seat_of(&opened.sender)?;
+        let body: TimeoutVote =
+            chained::payload(&opened, TIMEOUT_VOTE_CAP).map_err(Failed::Wire)?;
+
+        // A voter may not vote about itself, and may not vote about a stage
+        // this client is not at — the second is what stops a replay of a vote
+        // into a different position in the hand.
+        if body.subject_seat == seat {
+            return Err(Failed::Elsewhere {
+                seat,
+                what: "it were not the subject of its own vote",
+            });
+        }
+        let Some(mine) = self.subject_now(body.subject_seat) else {
+            return Err(Failed::NotYet);
+        };
+        if !mine.same_subject(&body) {
+            // Not a fault: a peer whose stage differs from this client's is a
+            // peer one step away, and the mesh does not order two messages.
+            return Err(Failed::NotYet);
+        }
+        if !self.voters(body.subject_seat).contains(&seat) {
+            return Err(Failed::NotInThisStage);
+        }
+        self.take_vote(mine.subject_digest(), seat, bytes.to_vec(), body);
+        // The vote that completes the set is what produces the certificate, so
+        // the two are one call: there is no state in which unanimity has been
+        // reached and nobody has said so.
+        self.certify_if_unanimous(key, now_ms)
+    }
+
+    /// Emit a certificate once every voter has said the same thing.
+    fn certify_if_unanimous(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        if self.certifying.is_some() {
+            return Ok(Vec::new());
+        }
+        // The first subject this client holds a complete set for. Complete
+        // means **every** seat in the voter set, which is what unanimity is:
+        // there is no quorum and no reduction.
+        let mut found = None;
+        for digest in self.votes.keys().copied().collect::<Vec<_>>() {
+            let Some(subject) = self.subject_of(&digest) else {
+                continue;
+            };
+            let voters = self.voters(subject.subject_seat);
+            if voters.len() < 2 {
+                continue;
+            }
+            let held = self.votes.get(&digest).map(|m| m.len()).unwrap_or(0);
+            if held >= voters.len() {
+                found = Some((digest, subject, voters));
+                break;
+            }
+        }
+        let Some((digest, subject, voters)) = found else {
+            return Ok(Vec::new());
+        };
+        // Ascending by voter seat, which the wire requires and which is what
+        // makes one set of votes one byte string.
+        let votes: Vec<Vec<u8>> = self
+            .votes
+            .get(&digest)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
+        let body = TimeoutCert {
+            subject_digest: digest,
+            votes,
+        };
+        let bytes = self.say_at(
+            EventType::TimeoutCert,
+            &body,
+            TIMEOUT_CERT_CAP,
+            key,
+            now_ms,
+        )?;
+        let hash = self.opened(&bytes, EventType::TimeoutCert)?.event_hash;
+        let mut stage = Collective::closed(
+            self.slot.sequence,
+            EventType::TimeoutCert.code(),
+            &voters,
+        )
+        .ok_or(Failed::NotInThisStage)?;
+        stage.hear(self.open.my_seat, hash);
+        self.certifying = Some(Certifying { subject, stage });
+        Ok(vec![Send::Broadcast(bytes)])
+    }
+
+    /// The subject a digest is about, from a vote this client holds.
+    fn subject_of(&self, digest: &Hash) -> Option<TimeoutVote> {
+        for seat in &self.mine.dealt_in {
+            let s = self.subject_now(*seat)?;
+            if s.subject_digest() == *digest {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    /// Seal into the stage now open, without advancing it.
+    ///
+    /// A vote and a certificate **reference** their stage rather than occupying
+    /// it — that is what `event_class` 1 and 2 are for — so they are sealed at
+    /// the same slot as the stage they are about.
+    fn say_at<T: minicbor::Encode<()>>(
+        &self,
+        kind: EventType,
+        body: &T,
+        cap: usize,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, Failed> {
+        chained::seal(
+            kind,
+            &self.slot,
+            body,
+            key,
+            now_ms,
+            self.next_deadline_for(kind),
+            cap,
+        )
+        .map_err(Failed::Wire)
+    }
+
+    /// Whether the stage now open has outlived its own deadline.
+    fn past_stage_deadline(&self, now_ms: u64) -> bool {
+        let Some(owed) = self.owed_type() else {
+            return false;
+        };
+        now_ms.saturating_sub(self.stage_at_ms) >= u64::from(self.next_deadline_for(owed))
+    }
+
+    /// A certificate from a peer, or this client's own coming back.
+    fn on_timeout_cert(
+        &mut self,
+        bytes: &[u8],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let opened = self.opened(bytes, EventType::TimeoutCert)?;
+        let seat = self.seat_of(&opened.sender)?;
+        let body: TimeoutCert =
+            chained::payload(&opened, TIMEOUT_CERT_CAP).map_err(Failed::Wire)?;
+
+        let Some(subject) = self.subject_of(&body.subject_digest) else {
+            // A certificate about a stage this client is not at. Held, not
+            // refused: the mesh does not order two messages.
+            return Err(Failed::NotYet);
+        };
+        let voters = self.voters(subject.subject_seat);
+
+        // **The floor, before anything else is spent on it.** Below two voters
+        // a certificate is inert: not accepted, not chained, not evidence, no
+        // effect at all. At `|V| = 1` "unanimity" is the signature of the one
+        // party with an interest in the outcome, which is the whole reason
+        // heads-up cannot have this and falls back to the hand deadline.
+        if voters.len() < 2 {
+            return Ok(Vec::new());
+        }
+        if !voters.contains(&seat) {
+            return Err(Failed::NotInThisStage);
+        }
+
+        // Every embedded vote checked as an event in its own right, against
+        // the key inside it. A certificate carries its own proof and needs
+        // nothing from this receiver's store to be checkable.
+        let mut heard: BTreeSet<SeatIdx> = BTreeSet::new();
+        for raw in &body.votes {
+            let v = self.opened(raw, EventType::TimeoutVote)?;
+            let voter = self.seat_of(&v.sender)?;
+            let vote: TimeoutVote =
+                chained::payload(&v, TIMEOUT_VOTE_CAP).map_err(Failed::Wire)?;
+            if !vote.same_subject(&subject) {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "every carried vote were about one subject",
+                });
+            }
+            if !voters.contains(&voter) {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "every voter were in the voter set",
+                });
+            }
+            if !heard.insert(voter) {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "no seat had voted twice",
+                });
+            }
+        }
+        // **Unanimity, and no quorum reduction.** Every seat still in the
+        // voter set, or the certificate says nothing.
+        if heard.len() != voters.len() {
+            return Err(Failed::Elsewhere {
+                seat,
+                what: "every seat in the voter set had signed",
+            });
+        }
+
+        let stage = match &mut self.certifying {
+            Some(c) if c.subject.same_subject(&subject) => &mut c.stage,
+            Some(_) => return Err(Failed::NotInThisStage),
+            None => {
+                let stage = Collective::closed(
+                    self.slot.sequence,
+                    EventType::TimeoutCert.code(),
+                    &voters,
+                )
+                .ok_or(Failed::NotInThisStage)?;
+                self.certifying = Some(Certifying { subject, stage });
+                let Some(c) = self.certifying.as_mut() else {
+                    unreachable!("just set")
+                };
+                &mut c.stage
+            }
+        };
+        if stage.heard(seat) == Some(opened.event_hash) {
+            return Ok(Vec::new());
+        }
+        match stage.hear(seat, opened.event_hash) {
+            Heard::Counted | Heard::Bystander | Heard::Again => {}
+            Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
+            Heard::Uninvited => return Err(Failed::NotInThisStage),
+        }
+        if !stage.complete() {
+            // This client may still owe its own copy: every voter emits one.
+            return self.certify_if_unanimous(key, now_ms);
+        }
+        self.apply_certificate(key, now_ms)
+    }
+
+    /// Every voter has certified: do what the certificate says.
+    fn apply_certificate(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let taken = self.certifying.take().ok_or(Failed::NothingFurther)?;
+        let subject = taken.subject;
+        let parent = taken.stage.hash().ok_or(Failed::NotInThisStage)?;
+
+        // The voter set shrinks here and **only** here — on acceptance of a
+        // certificate that itself cleared the floor. That is what makes the
+        // shrinkage inductive: an attacker cannot reach `|V| = 1` by asserting,
+        // because every step towards it had to clear the floor too.
+        if !self.certified.contains(&subject.subject_seat) {
+            self.certified.push(subject.subject_seat);
+        }
+        if let Some(n) = self.strikes.get_mut(usize::from(subject.subject_seat)) {
+            *n = n.saturating_add(1);
+        }
+        self.note_signed(subject.subject_seat);
+
+        match subject.kind {
+            // An action deadline. The engine acts for the seat: **check** when
+            // nothing is owed and **fold** when facing a bet — never fold a
+            // hand that could check for free. The round then continues among
+            // the remaining players and the hand plays out normally. Nothing
+            // aborts and nothing waits.
+            1 => {
+                let seat = subject.subject_seat;
+                let action = {
+                    let Phase::Playing { play, .. } = &self.phase else {
+                        return Err(Failed::NothingFurther);
+                    };
+                    if play.round.to_call(seat) == 0 {
+                        Action::Check
+                    } else {
+                        Action::Fold
+                    }
+                };
+                {
+                    let Phase::Playing { play, .. } = &mut self.phase else {
+                        return Err(Failed::NothingFurther);
+                    };
+                    play.round
+                        .apply(seat, action)
+                        .map_err(|what| Failed::Illegal { seat, what })?;
+                    play.actions = play.actions.saturating_add(1);
+                }
+                // The stage is closed by the **certificate** stage's own hash,
+                // because the betting stage it was about has none: nobody
+                // wrote it. The two are at one sequence in two classes, which
+                // is what `event_class` is for.
+                self.slot = self.slot.then(parent);
+                self.mark_stage(now_ms);
+                self.after_action(seat, key, now_ms)
+            }
+            // A cryptographic deadline. The hand ends and the seat is named —
+            // **as evidence only**. No chips move: an abort restores every
+            // stack, and D-010 forbids reading `attributed` to move one.
+            _ => {
+                self.slot = self.slot.then(parent);
+                self.mark_stage(now_ms);
+                let named = self
+                    .open
+                    .seats
+                    .iter()
+                    .find(|(s, _, _)| *s == subject.subject_seat)
+                    .map(|(_, k, _)| *k);
+                self.abort_named(named, key, now_ms)
+            }
+        }
+    }
+
+    /// Give up on the hand, naming a seat as the evidence says.
+    fn abort_named(
+        &mut self,
+        named: Option<[u8; 32]>,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        if matches!(self.phase, Phase::Aborted(_)) {
+            return Ok(Vec::new());
+        }
+        let mut body = HandAbort::on_deadline(self.mine.stacks.clone());
+        if let Some(k) = named {
+            body.attributed = vec![k];
+        }
+        let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
+        self.phase = Phase::Aborted(Abort::Told { cause: 1 });
+        Ok(vec![Send::Broadcast(bytes)])
+    }
+
+    /// How many certificates have been accepted against a seat this hand.
+    ///
+    /// At [`MAX_CONSECUTIVE_AUTO_ACTIONS`] the seat is marked sitting out at
+    /// the next hand boundary — it keeps its stack, posts dead money, takes no
+    /// cards and drains, which is a tournament's dead seat. It exists only
+    /// where `|V| >= 2`: below the floor no certificate has an effect and this
+    /// never increments.
+    pub fn strikes_against(&self, seat: SeatIdx) -> u8 {
+        self.strikes.get(usize::from(seat)).copied().unwrap_or(0)
+    }
+
     /// Seal one body into the stage now open.
     fn say<T: minicbor::Encode<()>>(
         &self,
@@ -3633,7 +4191,18 @@ impl Hand {
             // seats on screen that owe the table nothing.
             Phase::Shuffling { chain, .. } => chain.whose_turn().into_iter().collect(),
             Phase::Committing { stage, .. } | Phase::Dealing { stage, .. } => stage.waiting_for(),
-            Phase::Playing { .. } | Phase::Aborted(_) | Phase::Between => Vec::new(),
+            // Once the cards are out the answer is still "who owes the open
+            // stage", and it was `Vec::new()` — which made the whole deadline
+            // path blind to a betting stall, because that path asks exactly
+            // this question and would have found nobody to vote about.
+            Phase::Playing { play, .. } => match &play.step {
+                Step::Acting { to_act } => vec![*to_act],
+                Step::Opening { stage, .. }
+                | Step::Showdown { stage, .. }
+                | Step::Settling { stage, .. } => stage.waiting_for(),
+                Step::Ended => Vec::new(),
+            },
+            Phase::Aborted(_) | Phase::Between => Vec::new(),
         }
     }
 
@@ -3848,6 +4417,18 @@ pub struct Turn {
 /// that "the river is out" is asked once.
 fn five_card_board(board: &[Card]) -> Option<[Card; 5]> {
     <[Card; 5]>::try_from(board).ok()
+}
+
+/// A certificate stage that is being filled.
+///
+/// Collective in its own right, at the subject stage's own `sequence` and in
+/// `event_class = 2`, so it references the stalled stage rather than occupying
+/// it. Its `stage_hash` is taken over the **whole** set of certificates rather
+/// than over one chosen copy — which is what stops two honest emitters who
+/// embedded different valid signatures for one vote from forking the stage.
+struct Certifying {
+    subject: TimeoutVote,
+    stage: Collective,
 }
 
 /// What follows a closed betting round.
@@ -4619,6 +5200,180 @@ mod tests {
         o.seats[2].2 = 0;
         let (h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
         assert_eq!(h.init().dealt_in, vec![0, 1]);
+    }
+
+    /// Three seats to the first betting decision, so the deadline path has
+    /// something to be about.
+    fn three_to_the_bet() -> ([Hand; 3], [SigningKey; 3]) {
+        let keys = [key(10), key(11), key(12)];
+        let (mut a, from_a) = Hand::open(opening3(0), &keys[0], NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening3(1), &keys[1], NOW, 30_000).unwrap();
+        let (mut c, from_c) = Hand::open(opening3(2), &keys[2], NOW, 30_000).unwrap();
+
+        let mut pending: Vec<(SeatIdx, Vec<Send>)> = vec![(0, from_a), (1, from_b), (2, from_c)];
+        for _ in 0..64 {
+            if pending.is_empty() {
+                break;
+            }
+            let mut next: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+            for (from, sends) in std::mem::take(&mut pending) {
+                for seat in 0..3u8 {
+                    if seat == from {
+                        continue;
+                    }
+                    let hand: &mut Hand = match seat {
+                        0 => &mut a,
+                        1 => &mut b,
+                        _ => &mut c,
+                    };
+                    let out = deliver(hand, &sends, &keys[usize::from(seat)]);
+                    if !out.is_empty() {
+                        next.push((seat, out));
+                    }
+                }
+            }
+            pending = next;
+        }
+        ([a, b, c], keys)
+    }
+
+    /// **One peer cannot take the action from a player who was about to act.**
+    ///
+    /// This is the property the whole mechanism exists for. A single vote is
+    /// not evidence and does nothing: without every other seat's signature
+    /// there is no certificate, and without a certificate nothing moves.
+    #[test]
+    fn one_vote_forces_nothing() {
+        let (mut hands, keys) = three_to_the_bet();
+        let up = hands[0].turn().expect("somebody is to act").seat;
+        let rogue = (0..3u8).find(|s| *s != up).expect("a third seat");
+        let late = NOW + 60_000;
+
+        let votes = hands[usize::from(rogue)]
+            .vote_on_timeouts(&keys[usize::from(rogue)], late)
+            .unwrap();
+        assert_eq!(votes.len(), 1, "a rogue may say its own timer expired");
+
+        // Nobody else votes. Deliver the rogue's vote everywhere and check that
+        // the seat it names is still the one to act, on every peer.
+        for seat in 0..3u8 {
+            if seat == rogue {
+                continue;
+            }
+            let out = deliver(&mut hands[usize::from(seat)], &votes, &keys[usize::from(seat)]);
+            assert!(out.is_empty(), "a lone vote produces no certificate");
+        }
+        for (seat, hand) in hands.iter().enumerate() {
+            assert_eq!(
+                hand.turn().map(|t| t.seat),
+                Some(up),
+                "seat {seat} still has the same player to act"
+            );
+        }
+    }
+
+    /// Unanimity of the voter set does force it, and the effect is the one the
+    /// rules give: **check when nothing is owed, fold when facing a bet**.
+    #[test]
+    fn unanimity_acts_for_a_seat_that_did_not() {
+        let (mut hands, keys) = three_to_the_bet();
+        let up = hands[0].turn().expect("somebody is to act").seat;
+        let owed = hands[0].turn().unwrap().to_call;
+        let voters: Vec<u8> = (0..3u8).filter(|s| *s != up).collect();
+        let late = NOW + 60_000;
+
+        // Both voters' own timers expire. Each says so.
+        let mut said: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+        for v in &voters {
+            let out = hands[usize::from(*v)]
+                .vote_on_timeouts(&keys[usize::from(*v)], late)
+                .unwrap();
+            assert_eq!(out.len(), 1, "seat {v} votes once");
+            said.push((*v, out));
+        }
+
+        // Deliver everything to everybody until it settles: the second vote to
+        // arrive completes the set and produces a certificate, and the
+        // certificates then complete their own stage.
+        for _ in 0..8 {
+            let mut next: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+            for (from, sends) in std::mem::take(&mut said) {
+                for seat in 0..3u8 {
+                    if seat == from {
+                        continue;
+                    }
+                    let out =
+                        deliver(&mut hands[usize::from(seat)], &sends, &keys[usize::from(seat)]);
+                    if !out.is_empty() {
+                        next.push((seat, out));
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            said = next;
+        }
+
+        // The seat that said nothing has been acted for, on both voters.
+        for v in &voters {
+            let hand = &hands[usize::from(*v)];
+            assert_ne!(
+                hand.turn().map(|t| t.seat),
+                Some(up),
+                "seat {v} still waits for the seat the certificate acted for"
+            );
+            if owed > 0 {
+                assert!(
+                    hand.folded()[usize::from(up)],
+                    "facing a bet, the certificate folds"
+                );
+            } else {
+                assert!(
+                    !hand.folded()[usize::from(up)],
+                    "with nothing owed it checks, and never folds for free"
+                );
+            }
+            assert_eq!(hand.strikes_against(up), 1, "and it counts as one strike");
+        }
+    }
+
+    /// Heads-up the mechanism is inert, which is the point rather than a gap.
+    ///
+    /// The voter set is the one opponent, so "unanimity" would be the signature
+    /// of the single party with an interest in the outcome. Below the floor a
+    /// vote is not even sent.
+    #[test]
+    fn heads_up_nobody_votes() {
+        let keys = [key(10), key(11)];
+        let (mut a, from_a) = Hand::open(opening(0), &keys[0], NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &keys[1], NOW, 30_000).unwrap();
+        deliver(&mut b, &from_a, &keys[1]);
+        deliver(&mut a, &from_b, &keys[0]);
+
+        let late = NOW + 60_000;
+        assert!(
+            a.vote_on_timeouts(&keys[0], late).unwrap().is_empty(),
+            "with one voter there is nothing a vote could become"
+        );
+        assert!(b.vote_on_timeouts(&keys[1], late).unwrap().is_empty());
+    }
+
+    /// Before its own timer expires a peer says nothing, whatever anybody else
+    /// claims. The deadline is measured on the peer's own clock and on no
+    /// other, so an early vote is one this client never joins.
+    #[test]
+    fn nobody_votes_early() {
+        let (mut hands, keys) = three_to_the_bet();
+        let up = hands[0].turn().expect("somebody is to act").seat;
+        let other = (0..3u8).find(|s| *s != up).unwrap();
+        assert!(
+            hands[usize::from(other)]
+                .vote_on_timeouts(&keys[usize::from(other)], NOW + 1_000)
+                .unwrap()
+                .is_empty(),
+            "one second in, nobody's timer has expired"
+        );
     }
 
     /// A mucked hand is never opened, by anybody, ever.

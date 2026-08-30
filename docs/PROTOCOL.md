@@ -3222,6 +3222,26 @@ Codes `0x0600`–`0x06FF`. Full semantics in §8.
 (§8.2) **and** this client has not accepted a valid event for that stage **from
 `subject_seat`**.
 
+**`subject_event_type` for a betting stage, normatively.** A cryptographic
+stage has one type and every voter names it. A **betting** stage has five —
+`ACTION_CHECK` through `ACTION_FOLD` are all legal at one `sequence`, and which
+one the seat would have chosen is precisely what nobody knows, because it never
+spoke. So the value is the **group base `0x0500`**, which names the group and
+commits to no member of it.
+
+It has to be pinned, and this is the same defect this document records against
+`role_code` in §4.5 and the street code in §4.7, with a worse consequence: the
+field is inside `subject_digest`, so two conforming clients that each picked a
+reasonable member — `ACTION_FOLD` because that is the effect, `ACTION_CHECK`
+because it is the first — produce different digests, their votes land in
+different slots, **no certificate ever assembles, and the whole path is
+unreachable with nothing to attribute the failure to**. A gate that cannot be
+reached is not a gate.
+
+`0x0500` is chosen over any member because it is the one value that is a
+function of the stage rather than of a guess about the seat, and over a fresh
+sentinel because the group base already exists and means exactly this.
+
 **The legality condition is per subject, normatively (M5).** The condition is
 *"nothing from `subject_seat` at that stage"*, and it is stated in exactly those
 words here, in the receiver check below, and in §8.3. The reading discarded is
@@ -3240,7 +3260,7 @@ in this paragraph, which records its withdrawal.
 |---|---|---|
 | `n(0) subject_sequence` | `u64` | the stage that failed to complete |
 | `n(1) subject_seat` | `u8` | the seat that failed to emit |
-| `n(2) subject_event_type` | `u16` | what was expected from that seat |
+| `n(2) subject_event_type` | `u16` | what was expected from that seat; the stage's own type, or `0x0500` for a betting stage — see below |
 | `n(3) parent_event_hash` | `bytes[32]` | `stage_hash(subject_sequence - 1)` |
 | `n(4) deadline_ms` | `u32` | the `next_deadline_ms` carried by the parent stage's events |
 | `n(5) kind` | `u16` | `1` = action deadline, `2` = cryptographic-step deadline |

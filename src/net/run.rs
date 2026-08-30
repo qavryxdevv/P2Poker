@@ -1941,6 +1941,27 @@ pub async fn run(
             _ = stall.tick() => {
                 let now = super::node::now_unix_ms();
                 let Some(h) = hand.as_mut() else { continue };
+
+                // Say so first, if this client's own timer has run out on
+                // somebody. A vote is not an accusation and does nothing
+                // alone; only a complete set becomes a certificate, and only a
+                // certificate moves anything. Where there are three seats or
+                // more this is the answer, and the abort below is what happens
+                // when it is not available — heads-up, where "unanimity" would
+                // be the one opponent.
+                match h.vote_on_timeouts(&app_key, now) {
+                    Ok(sends) if !sends.is_empty() => {
+                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!("the clock: {e}")))
+                            .await;
+                    }
+                }
+
+                let Some(h) = hand.as_mut() else { continue };
                 if !h.may_abandon(now) {
                     continue;
                 }
