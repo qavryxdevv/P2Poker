@@ -271,31 +271,62 @@ rules: being first, anybody being all in (TDA 16), and not being beaten — a ti
 shows, because a split pot is won by showing. A muck is the **absence** of a
 share, so no peer can open that hand and the forfeiture needs no enforcement.
 
-### The gap: no buttons
+### Measured: a hand crosses the real network
 
-`Hand::act` exists and `Hand::turn` says what is legal, and **nothing in the
-client calls either**. `src/net/run.rs` drives the hand from arriving events;
-there is no path from a click to an action. That is the next thing a player
-would notice, and it is small: the table window has the seats and the pot
-already.
+Two headless processes on one machine, `--host` and `--join`, a two-seat
+Sit-and-Go. Both logs, from one run:
+
+```
+A: hand #1: the deck is being prepared     B: hand #1 is waiting for seat 0
+   hand #1: seat 1 is shuffling               hand #1 has begun
+   hand #1: the deck is shuffled and sealed   hand #1: seat 0 is shuffling
+   hand #1: your cards are dealt              hand #1: the deck is shuffled and sealed
+                                              hand #1: your turn — 50 to call
+                                              hand #1: your cards are dealt
+```
+
+So `HAND_INIT`, `DECK_INIT`, a two-link shuffle chain — a 3432 B step and a
+5547 B proof each way — `DECK_COMMIT` and `DEAL_PRIVATE` all crossed GossipSub
+between two processes, and the betting reached a human decision. The transport
+carries a hand. That had never been shown before and was the largest open
+question in this file.
+
+`50 to call` is also the heads-up rule working: the button is the small blind
+and acts first pre-flop.
+
+It stopped there because a headless client has nobody to press a button — which
+is what the action clock now answers.
+
+### The buttons, the next hand and the clock
+
+The action bar reaches the engine: `TableAction` → `NodeCommand::Act` →
+`Hand::act`, through the same `BettingRound::apply` every receiver runs.
+
+A table plays more than one hand. `next_hand()` derives hand `k+1` from the
+chain alone — settled stacks, `TERMINAL(k)`, `P(k)` — and two peers agree on
+`GENESIS(k+1)` down to the byte. The button rotates by the dead-button rule
+through `engine::advance_positions`. D-020's hold sits between the hands: five
+seconds when somebody showed, a beat when everybody folded.
+
+And there is a clock. A seat that goes quiet in a **betting** stage is answered
+by its own client checking or folding for it — version 1 has no `TIMEOUT_VOTE`
+and no `TIMEOUT_CERT` (D-015), so that is the whole of the answer, and a seat
+that goes quiet in a **cryptographic** stage still has none.
 
 ### What is next, in order
 
-1. **The action buttons.** `turn()` → three or four buttons and a raise slider;
-   the click calls `act()` and `run.rs` publishes what it returns.
-2. Hand `k+1`: `TERMINAL(k)`, `GENESIS(k+1)`, the dead-button rotation via
-   `engine::advance_positions` — which exists, is tested, and is still called by
-   nothing — and D-020's five-second hold before the next deal starts.
-3. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
+1. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
    carried inside `HAND_COMPLETE`; the checkpoint **stage** is not there, and
    `PROTOCOL.md` §12 says T61 then fires at `hand_deadline_ms` after every
    settled hand.
-4. The RNG beacon, replacing `provisional_button`.
-5. The stage-timeout path. Every stage seals a `next_deadline_ms` and nothing
-   yet acts when one passes.
-6. A hand between two real processes over GossipSub. Everything above is proved
-   between two states in one test; the transport has never carried a
-   `SHUFFLE_PROOF`.
+2. **`hand_deadline_ms`**, which is the only answer version 1 has to a seat
+   going quiet in a *cryptographic* stage. The action clock covers the betting
+   ones; a stalled shuffle still stops the hand for ever.
+3. The RNG beacon, replacing `provisional_button`.
+4. Three seats and more over the real network. Everything measured so far is
+   heads-up, and heads-up hides a whole class of defect — it hid the duplicate
+   handling for two milestones.
+5. Two machines on two networks. Still rests on nothing.
 
 ### Four defects found by pointing a critic at the design, not at the code
 
