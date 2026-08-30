@@ -686,6 +686,14 @@ pub struct Hand {
     /// the peers all say their clocks ran out and nothing ever happens — so the
     /// count is reported rather than inferred.
     tally: Option<(SeatIdx, usize, usize, Hash)>,
+    /// `event_hash` of every `TIMEOUT_CERT` this client has verified, its own
+    /// included. An abort that names a subject carries the hash of the
+    /// certificate that justifies the naming (§4.10), and this is what lets a
+    /// receiver check that claim against something it verified itself rather
+    /// than take the emitter's word for it.
+    certs: BTreeSet<Hash>,
+    /// Diagnostic: what the certificate path last decided.
+    cert_note: Vec<String>,
     /// The last seat a certificate acted for, and what it did.
     ///
     /// Read once by the node so it can say so: an action nobody took is the one
@@ -881,6 +889,8 @@ impl Hand {
             Hand {
                 signed,
                 tally: None,
+                certs: BTreeSet::new(),
+                cert_note: Vec::new(),
                 acted_for: None,
                 votes: BTreeMap::new(),
                 voted: BTreeSet::new(),
@@ -1066,6 +1076,10 @@ impl Hand {
         if stage.heard(seat) == Some(opened.event_hash) {
             return Ok(Vec::new());
         }
+        // Verified above, in full: every carried vote opened, every voter in
+        // the set, unanimity complete. Remembered from here so an abort that
+        // names it can be checked.
+        self.certs.insert(opened.event_hash);
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
@@ -3095,13 +3109,27 @@ impl Hand {
                     what: "this build could check the evidence it carries",
                 })
             }
-            other => {
+            // The certified-subject path (§4.10, D-023). A named subject is
+            // accepted only against a certificate this client verified itself:
+            // `certs` holds nothing it did not open, check for unanimity and
+            // count. An abort whose certificate has not arrived yet is
+            // **held**, not refused — the mesh does not order two messages, and
+            // refusing here would turn ordinary weather into a fault.
+            1 => {
+                let Some(h) = body.cert_hash else {
+                    return Err(Failed::Elsewhere {
+                        seat,
+                        what: "a named subject came with the certificate naming it",
+                    });
+                };
+                if !self.certs.contains(&h) {
+                    return Err(Failed::NotYet);
+                }
+            }
+            _ => {
                 return Err(Failed::Elsewhere {
                     seat,
-                    what: match other {
-                        1 => "a certificate existed, which this version never produces",
-                        _ => "this build implemented that cause",
-                    },
+                    what: "this build implemented that cause",
                 })
             }
         }
@@ -3504,6 +3532,13 @@ impl Hand {
         )
         .ok_or(Failed::NotInThisStage)?;
         stage.hear(self.open.my_seat, hash);
+        self.certs.insert(hash);
+        // The one line worth an operator's attention: from here the table has
+        // said something about a seat with everybody's signature behind it.
+        self.cert_note.push(format!(
+            "the table has certified seat {}'s timeout, unanimously among {:?}",
+            subject.subject_seat, voters
+        ));
         self.certifying = Some(Certifying { subject, stage });
         Ok(vec![Send::Broadcast(bytes)])
     }
@@ -3722,7 +3757,11 @@ impl Hand {
                     .iter()
                     .find(|(s, _, _)| *s == subject.subject_seat)
                     .map(|(_, k, _)| *k);
-                self.abort_named(named, key, now_ms)
+                // The **certificate**, not the stage: §4.10 says `cert_hash`
+                // is the `event_hash` of a `TIMEOUT_CERT`. This client's own
+                // copy is the one it can prove it holds.
+                let cert = taken.stage.heard(self.open.my_seat);
+                self.abort_named(named, cert, key, now_ms)
             }
         }
     }
@@ -3731,6 +3770,7 @@ impl Hand {
     fn abort_named(
         &mut self,
         named: Option<[u8; 32]>,
+        cert_hash: Option<Hash>,
         key: &SigningKey,
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
@@ -3738,8 +3778,12 @@ impl Hand {
             return Ok(Vec::new());
         }
         let mut body = HandAbort::on_deadline(self.mine.stacks.clone());
-        if let Some(k) = named {
+        // The two travel together or not at all: a named subject without the
+        // certificate that named it is an accusation on a peer's word, and
+        // `HandAbort::consistent` refuses that shape in both directions.
+        if let (Some(k), Some(h)) = (named, cert_hash) {
             body.attributed = vec![k];
+            body.cert_hash = Some(h);
         }
         let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
         self.phase = Phase::Aborted(Abort::Told { cause: 1 });
@@ -3747,6 +3791,13 @@ impl Hand {
     }
 
     /// How the vote count stands, taken rather than read.
+    pub fn take_cert_note(&mut self) -> Option<String> {
+        if self.cert_note.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.cert_note).join(" | "))
+    }
+
     pub fn take_tally(&mut self) -> Option<(SeatIdx, usize, usize, Hash)> {
         self.tally.take()
     }

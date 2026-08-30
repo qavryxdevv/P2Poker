@@ -2530,3 +2530,44 @@ a stalled cryptographic stage below the floor, and no version of this restores
 a certificate that moves a chip — D-010 removed that outcome and it stays
 removed.
 
+
+### What D-023 changes in §4.10, measured rather than reasoned
+
+D-015 had left §4.10's certified-subject row standing as *unreachable, therefore
+reject*. Restoring the certificate made it reachable, and nothing had told the
+abort path. The result was a hand that ran the whole clock machinery correctly
+and then threw the answer away: three clients, one killed mid-hand, both
+survivors voting, agreeing on the subject digest, reaching unanimity and each
+emitting a certificate — and then each **refusing the other's abort**, because
+`apply_certificate` built `HAND_ABORT{attributed = [X], cert_hash = None}` and
+`HandAbort::consistent` forbids exactly that shape. Neither peer could end the
+hand, and the table stopped.
+
+Two things follow, and both are now enforced rather than assumed:
+
+* An abort that names a subject **carries the certificate that named it** —
+  `cert_hash = event_hash` of a `TIMEOUT_CERT`, as §4.10 always said. Naming and
+  proof travel together or not at all.
+* A receiver accepts such an abort only against a certificate **it verified
+  itself**. It keeps the `event_hash` of every `TIMEOUT_CERT` it opened, checked
+  vote by vote against the voter set and found unanimous; an abort naming any
+  other hash is not accepted, and one naming a certificate that has simply not
+  arrived yet is **held**, because the mesh does not order two messages.
+
+That second point is what stops the obvious attack on the first: without it,
+`cert_hash` would be a 32-byte string a rogue peer could invent, and naming a
+subject would cost it nothing.
+
+### The certificate needs the mesh to forward, and it was not forwarding
+
+Found in the same run. `validate_messages()` means GossipSub passes nothing on
+until the application reports a verdict, and every arm of the hand-event branch
+returned to the top of the loop without reporting one — so a client forwarded
+**no hand traffic at all**. Between three directly-meshed peers this hides:
+delivery to a direct peer needs no forwarding. It stops hiding the moment a peer
+dies mid-broadcast. Its last event reaches one survivor, that survivor relays
+nothing, and the two live peers sit one sequence apart for the rest of the hand
+— each naming a different seat as late, each holding one vote, neither able to
+reach the other's subject. The fix is three `report_message_validation_result`
+calls, one before each exit; the shape of the bug is worth more than the fix,
+because it is invisible at the seat count everybody tests at.
