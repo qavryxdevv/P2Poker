@@ -592,3 +592,145 @@ fn a_settled_hand_discards_a_late_abort() {
         "the settlement was reverted to the hand's starting stacks"
     );
 }
+
+
+/// Three seats, and from the `cut`th delivery onward **seat 2 is heard by
+/// nobody**. It keeps emitting and keeps advancing on its own; the other two
+/// stop where they last needed it. That is a peer whose last broadcast reached
+/// the network and no listener, which is what the measured run actually was.
+///
+/// `None` when that cut does not produce the divergence — the point at which a
+/// seat owes something is a property of the deal, not a number worth asserting.
+fn diverged(cut: usize) -> Option<(Vec<Hand>, Vec<SigningKey>)> {
+    let keys: Vec<SigningKey> = (0..3u8).map(|s| key(10 + s)).collect();
+    let mut hands: Vec<Hand> = Vec::new();
+    let mut queue: Vec<(usize, Vec<u8>)> = Vec::new();
+    for s in 0..3u8 {
+        let (h, out) =
+            Hand::open(opening3(s), &keys[usize::from(s)], NOW, 30_000).expect("the hand opens");
+        hands.push(h);
+        for Send::Broadcast(b) in out {
+            queue.push((usize::from(s), b));
+        }
+    }
+
+    let mut delivered = 0usize;
+    for _ in 0..400 {
+        if queue.is_empty() {
+            break;
+        }
+        for (from, bytes) in std::mem::take(&mut queue) {
+            for to in 0..3usize {
+                if to == from {
+                    continue;
+                }
+                if from == 2 && delivered > cut {
+                    continue;
+                }
+                delivered += 1;
+                match hands[to].on_event(&bytes, &keys[to], NOW) {
+                    Ok(out) => {
+                        for Send::Broadcast(b) in out {
+                            queue.push((to, b));
+                        }
+                    }
+                    Err(Failed::NotYet) => hands[to].hold(bytes.clone()),
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    let ahead = hands[2].slot().sequence > hands[0].slot().sequence;
+    let owed = hands[0].waiting_for().contains(&2) && hands[1].waiting_for().contains(&2);
+    let together = hands[0].slot().sequence == hands[1].slot().sequence;
+    (ahead && owed && together).then_some((hands, keys))
+}
+
+/// **The certificate its own subject can apply.**
+///
+/// This is the divergence the whole position-free path exists for, and it was
+/// measured over the network before it was written down: seat 0 emitted the
+/// event the others were waiting on, they never received it, they voted,
+/// certified and ended the hand — and seat 0, which had moved past that stage
+/// *because* it did the thing they never saw, could not rebuild the subject
+/// from its own cursor and held their certificate for ever. The two then ran
+/// hands two to six with different participation sets under identical genesis
+/// hashes, and nothing was refused anywhere.
+///
+/// The peer least able to be standing at the stage a certificate is about is
+/// the subject of it. That is not a corner: it is the ordinary shape of the
+/// event.
+#[test]
+fn the_subject_applies_a_certificate_about_a_stage_it_has_left() {
+    const LATE_ENOUGH: u64 = NOW + 600_000;
+
+    let Some((mut hands, keys)) = (4..40).find_map(diverged) else {
+        panic!("no cut point left seat 2 ahead of a table still waiting for it");
+    };
+
+    // The two that can still hear each other vote, agree and certify — and
+    // everything they say is offered to the subject as well.
+    let mut appeal: Vec<Vec<u8>> = Vec::new();
+    for s in 0..2usize {
+        for Send::Broadcast(b) in hands[s]
+            .vote_on_timeouts(&keys[s], LATE_ENOUGH)
+            .expect("a vote is sealed")
+        {
+            appeal.push(b);
+        }
+    }
+    for _ in 0..10 {
+        if appeal.is_empty() {
+            break;
+        }
+        for bytes in std::mem::take(&mut appeal) {
+            let _ = hands[2].on_event(&bytes, &keys[2], LATE_ENOUGH);
+            for to in 0..2usize {
+                if let Ok(out) = hands[to].on_event(&bytes, &keys[to], LATE_ENOUGH) {
+                    for Send::Broadcast(b) in out {
+                        appeal.push(b);
+                    }
+                }
+            }
+        }
+    }
+
+    for s in 0..2usize {
+        assert!(
+            hands[s].aborted().is_some(),
+            "seat {s} never ended the hand it certified"
+        );
+    }
+
+    // **The point.** The subject was never at the stage it was certified for,
+    // and it still applied the certificate: it recorded it, it ended the hand,
+    // and it agrees with the others about who plays the next one.
+    assert!(
+        hands[2].verified_certificates() >= 1,
+        "the subject verified no certificate about itself"
+    );
+    assert!(
+        hands[2].aborted().is_some(),
+        "the subject is still playing a hand the table has ended"
+    );
+
+    let next: Vec<_> = (0..3usize)
+        .map(|s| hands[s].next_hand().expect("a next hand"))
+        .collect();
+    for s in 1..3usize {
+        assert_eq!(
+            next[0].required, next[s].required,
+            "seat {s} derives a different required set from seat 0"
+        );
+        assert_eq!(
+            next[0].genesis, next[s].genesis,
+            "seat {s} derives a different genesis from seat 0"
+        );
+    }
+    assert!(
+        !next[0].required.contains(&2),
+        "the certified seat is still required: {:?}",
+        next[0].required
+    );
+}

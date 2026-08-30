@@ -378,6 +378,32 @@ pub const HAND_COMPLETE_CAP: usize = 4_096;
 /// different slots, and **no certificate would ever assemble**.
 pub const ACTION_GROUP: u16 = 0x0500;
 
+/// What a verified certificate is remembered as.
+///
+/// The hash alone was not enough: an abort names a subject, and a receiver
+/// checking that name against a bare set of hashes could only ask *"is this a
+/// certificate?"* and never *"is it a certificate about the seat you are
+/// naming?"*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CertFact {
+    pub subject_seat: SeatIdx,
+    pub kind: u16,
+}
+
+/// A `TIMEOUT_CERT` checked from its own bytes, with nothing taken on trust.
+#[derive(Clone, Debug)]
+struct VerifiedCert {
+    event_hash: Hash,
+    emitter: SeatIdx,
+    subject: TimeoutVote,
+    voters: BTreeSet<SeatIdx>,
+    raw: Vec<u8>,
+}
+
+/// The most subject digests one hand may bank. Four per seat is well past
+/// `MAX_CONSECUTIVE_AUTO_ACTIONS` and bounds what a flood can cost.
+const BANKED_CAP: usize = crate::protocol::constants::MAX_SEATS as usize * 4;
+
 /// The cap on a `TIMEOUT_VOTE` body: six small numbers and a hash.
 pub const TIMEOUT_VOTE_CAP: usize = 128;
 
@@ -696,7 +722,18 @@ pub struct Hand {
     /// certificate that justifies the naming (§4.10), and this is what lets a
     /// receiver check that claim against something it verified itself rather
     /// than take the emitter's word for it.
-    certs: BTreeSet<Hash>,
+    certs: BTreeMap<Hash, CertFact>,
+    /// Subject digests already applied to the roster, so a redelivery counts
+    /// once and two genuine certifications of one seat count twice.
+    banked: BTreeSet<Hash>,
+    /// One fully verified certificate's bytes, for this client's own abort to
+    /// carry as evidence. This client's own sealed copy wins where it is a
+    /// voter — §4.10's *"it verified that certificate itself"* — and otherwise
+    /// the first peer copy it checked.
+    proof: Option<(Hash, Vec<u8>)>,
+    /// R4: a betting stage certified while this client was elsewhere. The two
+    /// chains cannot be reconciled, so this is reported and not repaired.
+    forked: Option<String>,
     /// What is left of **this** client's own per-hand thinking reserve.
     ///
     /// Local, and deliberately so. Every peer budgets the *whole* reserve for
@@ -904,7 +941,10 @@ impl Hand {
             Hand {
                 signed,
                 tally: None,
-                certs: BTreeSet::new(),
+                certs: BTreeMap::new(),
+                banked: BTreeSet::new(),
+                proof: None,
+                forked: None,
                 bank_left_ms: o.time_bank_ms,
                 shuffle_note: None,
                 cert_note: Vec::new(),
@@ -971,6 +1011,30 @@ impl Hand {
         if hand_id != self.open.hand_id {
             return Err(Failed::NotYet);
         }
+        // **Above the sequence guards, deliberately.** §4.10 says an abort's
+        // position in the chain is checked loosely and that this is on purpose;
+        // §4.8 says a certificate *references* its stage rather than occupying
+        // it. Both were being dropped at `sequence < slot.sequence` before
+        // their handlers were ever reached — and the peer least able to be
+        // standing at the stage a certificate is about is the subject of it,
+        // which is exactly the peer that has to hear it.
+        // An abort is answered from **any** phase and from any position: it is
+        // §3.2's witness-independent terminal, it has no required emitter set,
+        // and two peers that saw different prefixes of a hand must still be
+        // able to accept each other's. A strict parent check would have each
+        // reject the other's artefact, which is the deadlock again by a third
+        // route.
+        if kind == EventType::HandAbort {
+            return self.on_hand_abort(bytes, now_ms);
+        }
+        if kind == EventType::TimeoutCert {
+            return self.on_timeout_cert(bytes, key, now_ms);
+        }
+        // A vote stays below the guards. `on_timeout_vote` rebuilds the subject
+        // from this client's own position, which a passed-stage receiver cannot
+        // do, so it would answer `NotYet` for ever — and `NotYet` is held in a
+        // bounded FIFO that the five-second re-send would then fill with stale
+        // votes until every genuinely early event had been evicted.
         if sequence < self.slot.sequence {
             // A stage this hand has left. Not a fault and not worth a word: the
             // mesh delivers a message more than once as a matter of course.
@@ -980,20 +1044,11 @@ impl Hand {
             return Err(Failed::NotYet);
         }
 
-        // An abort is answered from **any** phase, because it is answered by
-        // the receiver's own state rather than by where this client's hand got
-        // to. It is the one message that can arrive at a stage nobody completed.
-        if kind == EventType::HandAbort {
-            return self.on_hand_abort(bytes, now_ms);
-        }
         // A vote and a certificate **reference** the stage they are about
         // rather than occupying it, so they are answered from whatever phase
         // this client is in and never routed through it.
         if kind == EventType::TimeoutVote {
             return self.on_timeout_vote(bytes, key, now_ms);
-        }
-        if kind == EventType::TimeoutCert {
-            return self.on_timeout_cert(bytes, key, now_ms);
         }
 
         let out = self.dispatch(bytes, kind, key, now_ms);
@@ -3129,7 +3184,14 @@ impl Hand {
     /// hand by claiming a deadline that has not passed here. `Failed::NotYet`
     /// is exactly the buffer — the caller holds it and replays it.
     fn on_hand_abort(&mut self, bytes: &[u8], now_ms: u64) -> Result<Vec<Send>, Failed> {
-        let opened = self.opened(bytes, EventType::HandAbort)?;
+        let opened = chained::open_in_hand(
+            bytes,
+            HAND_ABORT_CAP,
+            EventType::HandAbort,
+            &self.open.table_id,
+            self.open.hand_id,
+        )
+        .map_err(Failed::Wire)?;
         let seat = self.seat_of(&opened.sender)?;
 
         // **A hand is decided or aborted, never both** (§4.10). A receiver
@@ -3191,8 +3253,33 @@ impl Hand {
                         what: "a named subject came with the certificate naming it",
                     });
                 };
-                if !self.certs.contains(&h) {
+                // Held, not refused: the mesh does not order two messages, and
+                // an abort whose certificate has not arrived yet is ordinary
+                // weather.
+                let Some(fact) = self.certs.get(&h).copied() else {
                     return Err(Failed::NotYet);
+                };
+                // **A certificate about somebody else is not a licence to name
+                // this one.** A bare set of hashes could only answer "is this a
+                // certificate?"; the fact answers "is it a certificate about
+                // the seat you are naming, for a deadline that ends a hand?".
+                if fact.kind != 2 {
+                    return Err(Failed::Elsewhere {
+                        seat,
+                        what: "the certificate ended a hand rather than taking an action",
+                    });
+                }
+                let names = self
+                    .open
+                    .seats
+                    .iter()
+                    .find(|(s, _, _)| *s == fact.subject_seat)
+                    .map(|(_, k, _)| *k);
+                if body.attributed.first().copied() != names {
+                    return Err(Failed::Elsewhere {
+                        seat,
+                        what: "the seat named were the one its certificate is about",
+                    });
                 }
             }
             _ => {
@@ -3560,6 +3647,14 @@ impl Hand {
         // `cert: not started, one is already in progress` on one survivor while
         // the other had emitted and was waiting for it.
         if let Some(c) = &self.certifying {
+            // **Never about itself.** The subject must ACCEPT a certificate
+            // naming it — that is the whole point of the position-free path —
+            // but it must not EMIT one: every voter answers a certificate from
+            // outside the voter set with `NotInThisStage`, which the node turns
+            // into a GossipSub `Reject` against a peer that did nothing wrong.
+            if c.subject.subject_seat == self.open.my_seat {
+                return Ok(Vec::new());
+            }
             if c.stage.heard(self.open.my_seat).is_some() {
                 return Ok(Vec::new());
             }
@@ -3575,7 +3670,7 @@ impl Hand {
             }
             let bytes = self.seal_certificate(&digest, key, now_ms)?;
             let hash = self.opened(&bytes, EventType::TimeoutCert)?.event_hash;
-            self.certs.insert(hash);
+            self.note_own_certificate(hash, &bytes, &subject);
             let complete = match self.certifying.as_mut() {
                 Some(c) => {
                     c.stage.hear(self.open.my_seat, hash);
@@ -3601,6 +3696,10 @@ impl Hand {
             let Some(subject) = self.subject_of(&digest) else {
                 continue;
             };
+            // Never about itself: see the note above.
+            if subject.subject_seat == self.open.my_seat {
+                continue;
+            }
             let voters = self.voters(subject.subject_seat);
             if voters.len() < 2 {
                 continue;
@@ -3640,7 +3739,7 @@ impl Hand {
         )
         .ok_or(Failed::NotInThisStage)?;
         stage.hear(self.open.my_seat, hash);
-        self.certs.insert(hash);
+        self.note_own_certificate(hash, &bytes, &subject);
         // The one line worth an operator's attention: from here the table has
         // said something about a seat with everybody's signature behind it.
         self.cert_note.push(format!(
@@ -3723,6 +3822,225 @@ impl Hand {
         now_ms.saturating_sub(self.stage_at_ms) >= u64::from(self.next_deadline_for(owed))
     }
 
+
+    /// This client's own certificate, remembered as a fact and kept as proof.
+    ///
+    /// Its own copy wins over any peer's for `proof`, because §4.10 asks the
+    /// emitter of an abort to have *verified that certificate itself* and a
+    /// copy this client sealed is the strongest form of that.
+    fn note_own_certificate(&mut self, hash: Hash, bytes: &[u8], subject: &TimeoutVote) {
+        self.certs.insert(
+            hash,
+            CertFact {
+                subject_seat: subject.subject_seat,
+                kind: subject.kind,
+            },
+        );
+        self.proof = Some((hash, bytes.to_vec()));
+    }
+
+    /// A `TIMEOUT_CERT` checked from its own bytes, with nothing taken on
+    /// trust and nothing read from this receiver's position in the hand.
+    ///
+    /// **This is what lets the subject of a certificate apply it.** The peer
+    /// least able to be standing at the stage a certificate is about is the one
+    /// it names — it moved on precisely because it did the thing the voters
+    /// never saw — so a check that starts from the receiver's own slot can only
+    /// ever refuse it. The artefact proves its own position instead: every
+    /// carried vote's **signed** envelope must name the stage the subject names,
+    /// which is a binding the voter put its own key behind and is strictly
+    /// stronger than anything this receiver's cursor could offer.
+    fn verify_certificate(&self, raw: &[u8]) -> Result<VerifiedCert, Failed> {
+        // The frame cap on the envelope, the body cap on the payload: a
+        // `SignedEvent` wrapping two whole votes is larger than the body it
+        // carries, and opening it under the body's cap read as a malformed
+        // event.
+        let opened = chained::open_in_hand(
+            raw,
+            FRAME_CAP,
+            EventType::TimeoutCert,
+            &self.open.table_id,
+            self.open.hand_id,
+        )
+        .map_err(Failed::Wire)?;
+        let body: TimeoutCert =
+            chained::payload(&opened, TIMEOUT_CERT_CAP).map_err(Failed::Wire)?;
+
+        // Free, and before a single signature is checked: a certificate
+        // claiming a hundred votes must cost a length comparison rather than a
+        // hundred verifications.
+        let max_voters = usize::from(crate::protocol::constants::MAX_SEATS) - 1;
+        if body.votes.len() < 2 || body.votes.len() > max_voters {
+            return Err(Failed::Elsewhere {
+                seat: self.open.my_seat,
+                what: "a voter set inside the protocol's bounds",
+            });
+        }
+        let emitter = self.seat_of(&opened.sender)?;
+
+        let mut voters: BTreeSet<SeatIdx> = BTreeSet::new();
+        let mut subject: Option<TimeoutVote> = None;
+        for vote in &body.votes {
+            let v = chained::open_in_hand(
+                vote,
+                FRAME_CAP,
+                EventType::TimeoutVote,
+                &self.open.table_id,
+                self.open.hand_id,
+            )
+            .map_err(Failed::Wire)?;
+            let voter = self.seat_of(&v.sender)?;
+            if !voters.insert(voter) {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "no seat had voted twice",
+                });
+            }
+            let named: TimeoutVote =
+                chained::payload(&v, TIMEOUT_VOTE_CAP).map_err(Failed::Wire)?;
+            match &subject {
+                None => subject = Some(named),
+                Some(first) => {
+                    if !named.same_subject(first) {
+                        return Err(Failed::Elsewhere {
+                            seat: emitter,
+                            what: "every carried vote were about one subject",
+                        });
+                    }
+                }
+            }
+            if voter == named.subject_seat {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "the subject were not a voter about itself",
+                });
+            }
+            // **The anti-replay binding, and the voter signed it.** A vote
+            // sealed at one stage cannot be counted towards a subject at
+            // another, for any receiver, with or without a cursor of its own.
+            if v.envelope.sequence != named.subject_sequence
+                || v.envelope.previous_event_hash != named.parent_event_hash
+            {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "each vote were sealed at the stage it names",
+                });
+            }
+        }
+        let Some(subject) = subject else {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "a certificate carried the votes it is made of",
+            });
+        };
+        if opened.envelope.sequence != subject.subject_sequence
+            || opened.envelope.previous_event_hash != subject.parent_event_hash
+        {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "the certificate were sealed at the stage its votes name",
+            });
+        }
+        // Recomputed, never read from the body: a name the sender may choose is
+        // not a name.
+        if subject.subject_digest() != body.subject_digest {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "the digest were the one its own votes hash to",
+            });
+        }
+        // **Held, not refused.** A subject this client does not have dealt in
+        // is a disagreement about who is playing, which is what this whole path
+        // exists to resolve — and `run.rs` turns anything but `NotYet` into a
+        // GossipSub `Reject`, which is how an honest peer stops being
+        // forwarded.
+        if !self.mine.dealt_in.contains(&subject.subject_seat) {
+            return Err(Failed::NotYet);
+        }
+        if subject.subject_sequence >= crate::protocol::constants::MAX_STAGES_PER_HAND {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "a stage index this hand can have",
+            });
+        }
+        let betting = subject.subject_event_type == ACTION_GROUP;
+        if betting != (subject.kind == 1) {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "the kind matched the stage type",
+            });
+        }
+        // **The security floor of the whole position-free path.**
+        // `next_deadline_for` reads nothing but this hand's `Opening`, whose
+        // parameters are inside `table_params_hash` and thence every genesis, so
+        // two colluding peers cannot certify a seat at a deadline shorter than
+        // this table's own. On the in-position road this comes free from
+        // rebuilding the subject; here it has to be restored explicitly, or the
+        // carrier really would weaken D-023.
+        let owed = if betting {
+            Some(EventType::ActionFold)
+        } else {
+            EventType::try_from(subject.subject_event_type).ok()
+        };
+        let Some(owed) = owed else {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "a stage type this catalogue defines",
+            });
+        };
+        if subject.deadline_ms != self.next_deadline_for(owed) {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "the deadline this table's parameters give",
+            });
+        }
+        if !voters.contains(&emitter) {
+            return Err(Failed::NotInThisStage);
+        }
+
+        Ok(VerifiedCert {
+            event_hash: opened.event_hash,
+            emitter,
+            subject,
+            voters,
+            raw: raw.to_vec(),
+        })
+    }
+
+    /// The roster half of a certificate: a set insert, and nothing positional.
+    ///
+    /// Keyed on the **subject digest** and not on the seat, because one hand may
+    /// legitimately certify one seat at two stages — that is what
+    /// [`MAX_CONSECUTIVE_AUTO_ACTIONS`] counts — and those two must count twice
+    /// while a redelivery of either counts once.
+    fn bank_certificate(&mut self, c: &VerifiedCert) -> bool {
+        // The roster freezes with the terminal, or `next_hand` is racing a wall
+        // clock against the mesh.
+        if self.over() || self.banked.len() >= BANKED_CAP {
+            return false;
+        }
+        self.certs.insert(
+            c.event_hash,
+            CertFact {
+                subject_seat: c.subject.subject_seat,
+                kind: c.subject.kind,
+            },
+        );
+        if self.proof.is_none() {
+            self.proof = Some((c.event_hash, c.raw.clone()));
+        }
+        if !self.banked.insert(c.subject.subject_digest()) {
+            return false;
+        }
+        if !self.certified.contains(&c.subject.subject_seat) {
+            self.certified.push(c.subject.subject_seat);
+        }
+        if let Some(n) = self.strikes.get_mut(usize::from(c.subject.subject_seat)) {
+            *n = n.saturating_add(1);
+        }
+        true
+    }
+
     /// What accepting a certificate does to the roster, once it has had its
     /// effect and not before.
     ///
@@ -3754,116 +4072,126 @@ impl Hand {
         key: &SigningKey,
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
-        let opened = self.opened(bytes, EventType::TimeoutCert)?;
-        let seat = self.seat_of(&opened.sender)?;
-        let body: TimeoutCert =
-            chained::payload(&opened, TIMEOUT_CERT_CAP).map_err(Failed::Wire)?;
+        let c = self.verify_certificate(bytes)?;
+        let seat = c.emitter;
 
-        let Some(subject) = self.subject_of(&body.subject_digest) else {
-            // A certificate about a stage this client is not at. Held, not
-            // refused: the mesh does not order two messages.
-            //
-            // **Said out loud, because this is where a table silently splits.**
-            // The one peer most likely to have moved past the stage is the
-            // subject itself — it moved on precisely because it did the thing
-            // the others never saw. It then holds this for ever, never shrinks
-            // its own roster, and plays a table the others have already left,
-            // with no error anywhere. Measured: one survivor certified a live
-            // seat and dropped it, that seat never applied the certificate
-            // about itself, and the two ran different rosters under identical
-            // genesis hashes for five hands.
-            self.cert_note.push(format!(
-                "cert: from seat {seat} about a stage this client has left                  (now at sequence {}) — HELD, and if it is about this seat the                  table has left this client behind",
-                self.slot.sequence
-            ));
-            return Err(Failed::NotYet);
-        };
-        let voters = self.voters(subject.subject_seat);
-
-        // **The floor, before anything else is spent on it.** Below two voters
-        // a certificate is inert: not accepted, not chained, not evidence, no
+        // **The floor, before anything is spent on it.** Below two voters a
+        // certificate is inert: not accepted, not chained, not evidence, no
         // effect at all. At `|V| = 1` "unanimity" is the signature of the one
         // party with an interest in the outcome, which is the whole reason
         // heads-up cannot have this and falls back to the hand deadline.
-        if voters.len() < 2 {
+        if self.mine.dealt_in.len() < 3 || c.voters.len() < 2 {
             return Ok(Vec::new());
         }
-        if !voters.contains(&seat) {
-            return Err(Failed::NotInThisStage);
-        }
-
-        // Every embedded vote checked as an event in its own right, against
-        // the key inside it. A certificate carries its own proof and needs
-        // nothing from this receiver's store to be checkable.
-        let mut heard: BTreeSet<SeatIdx> = BTreeSet::new();
-        for raw in &body.votes {
-            let v = self.opened(raw, EventType::TimeoutVote)?;
-            let voter = self.seat_of(&v.sender)?;
-            let vote: TimeoutVote =
-                chained::payload(&v, TIMEOUT_VOTE_CAP).map_err(Failed::Wire)?;
-            if !vote.same_subject(&subject) {
-                return Err(Failed::Elsewhere {
-                    seat,
-                    what: "every carried vote were about one subject",
-                });
-            }
-            if !voters.contains(&voter) {
-                return Err(Failed::Elsewhere {
-                    seat,
-                    what: "every voter were in the voter set",
-                });
-            }
-            if !heard.insert(voter) {
-                return Err(Failed::Elsewhere {
-                    seat,
-                    what: "no seat had voted twice",
-                });
-            }
-        }
-        // **Unanimity, and no quorum reduction.** Every seat still in the
-        // voter set, or the certificate says nothing.
-        if heard.len() != voters.len() {
+        let nominal: BTreeSet<SeatIdx> = self
+            .mine
+            .dealt_in
+            .iter()
+            .copied()
+            .filter(|s| *s != c.subject.subject_seat)
+            .collect();
+        if !c.voters.is_subset(&nominal) {
             return Err(Failed::Elsewhere {
                 seat,
-                what: "every seat in the voter set had signed",
+                what: "every voter were dealt in",
             });
         }
+        // **Checked in the direction that can only tighten.** A receiver whose
+        // own `certified` is shorter than the emitters' derives a *larger*
+        // voter set — which is precisely the subject's own position — so a
+        // shortfall is this client's incompleteness talking and is held, never
+        // refused. Every other error becomes a GossipSub `Reject`, and
+        // repeatedly rejecting an honest peer is how it stops being forwarded.
+        let mine: BTreeSet<SeatIdx> =
+            self.voters(c.subject.subject_seat).into_iter().collect();
+        if !mine.is_subset(&c.voters) {
+            self.cert_note.push(format!(
+                "cert: from seat {seat} about seat {} with voters {:?}; this client \
+                 derives {mine:?} and is missing a certificate the emitters hold — HELD",
+                c.subject.subject_seat, c.voters
+            ));
+            return Err(Failed::NotYet);
+        }
 
+        // The roster half, wherever this client happens to stand.
+        let banked = self.bank_certificate(&c);
+
+        let in_position = self.slot.sequence == c.subject.subject_sequence
+            && self.slot.previous_event_hash == c.subject.parent_event_hash;
+
+        if !in_position {
+            if banked && c.subject.kind == 1 {
+                // A betting stage is single-writer. The subject advanced with
+                // its own action's `stage_hash_single`; the voters advanced
+                // with the certificate stage's hash. Two parents at one
+                // sequence, and there is no reconciliation: `BettingRound`
+                // validates legality but never turn order, so replaying would
+                // take a decision for a seat on a street it is not acting in
+                // and succeed in silence — and §3.2 forbids the alternative,
+                // because the hash has already been chained from. Reported,
+                // not repaired.
+                self.forked = Some(format!(
+                    "the table acted for seat {} at sequence {} and played on; this \
+                     client is at sequence {} on a branch of its own, and the two \
+                     cannot be reconciled",
+                    c.subject.subject_seat, c.subject.subject_sequence, self.slot.sequence
+                ));
+            }
+            if banked && c.subject.kind == 2 {
+                // Convergent: `abort_terminal(k)` is a function of `GENESIS(k)`
+                // and of nothing in the middle of the hand, so a peer ending the
+                // hand from anywhere ends it where everyone else does.
+                let named = self
+                    .open
+                    .seats
+                    .iter()
+                    .find(|(s, _, _)| *s == c.subject.subject_seat)
+                    .map(|(_, k, _)| *k);
+                let proof = self.proof.as_ref().map(|(h, _)| *h);
+                return self.abort_named(named, proof, key, now_ms);
+            }
+            return Ok(Vec::new());
+        }
+
+        // In position: the collective stage, so that every voter's copy is
+        // counted and the stage closes the way every other stage does.
+        let voters: Vec<SeatIdx> = c.voters.iter().copied().collect();
+        let subject = c.subject;
         let stage = match &mut self.certifying {
-            Some(c) if c.subject.same_subject(&subject) => &mut c.stage,
-            Some(_) => return Err(Failed::NotInThisStage),
+            Some(cur) if cur.subject.same_subject(&subject) => &mut cur.stage,
+            // A stale certificate must not destroy a live certification about
+            // something else.
+            Some(_) => return Err(Failed::NotYet),
             None => {
+                // **The subject's sequence, not this client's slot.**
+                // `stage_hash_collective` hashes the sequence, so a peer that
+                // built the stage at its own cursor would compute a parent no
+                // other peer computed. A no-op while every peer is in position,
+                // and a fork the moment one is not.
                 let stage = Collective::closed(
-                    self.slot.sequence,
+                    subject.subject_sequence,
                     EventType::TimeoutCert.code(),
                     &voters,
                 )
                 .ok_or(Failed::NotInThisStage)?;
                 self.certifying = Some(Certifying { subject, stage });
-                let Some(c) = self.certifying.as_mut() else {
+                let Some(cur) = self.certifying.as_mut() else {
                     unreachable!("just set")
                 };
-                &mut c.stage
+                &mut cur.stage
             }
         };
-        if stage.heard(seat) == Some(opened.event_hash) {
+        if stage.heard(seat) == Some(c.event_hash) {
             return Ok(Vec::new());
         }
-        // **Only here, and only after all of the above.** Every carried vote
-        // has been opened as an event in its own right, every voter checked
-        // against the set, and unanimity found — so this hash names something
-        // this client verified rather than something it was told. `certs` is
-        // what `on_hand_abort` checks a named subject against, so anything else
-        // reaching this set is a one-message hand void: an abort that names a
-        // player on one peer's word. This insert was written into
-        // `on_hand_init` by a bad edit, which put **every `HAND_INIT` hash of
-        // the hand** — a value every peer holds — into the set, and left this
-        // path putting nothing in it at all.
-        self.certs.insert(opened.event_hash);
-        match stage.hear(seat, opened.event_hash) {
+        match stage.hear(seat, c.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
-            Heard::Uninvited => return Err(Failed::NotInThisStage),
+            // The stage here was built from the first certificate's voter set,
+            // and an emitter outside it means the two peers derived different
+            // sets. That is this client being behind, not the sender being
+            // wrong, so it is held rather than rejected.
+            Heard::Uninvited => return Err(Failed::NotYet),
         }
         if !stage.complete() {
             // This client may still owe its own copy: every voter emits one.

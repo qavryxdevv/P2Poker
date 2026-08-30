@@ -139,6 +139,52 @@ pub fn open(
     expected: EventType,
     slot: &Slot,
 ) -> Result<Opened, WireError> {
+    open_inner(
+        bytes,
+        cap,
+        expected,
+        &slot.table_id,
+        slot.hand_id,
+        Some(slot),
+    )
+}
+
+/// Open an event by **which chain** it belongs to, not **where in it**.
+///
+/// `table_id`, `hand_id`, the catalogue envelope check and `verify_strict` are
+/// not relaxed, in that order — only the two positional comparisons are, and
+/// only for callers that have a clause saying they must be:
+///
+/// * `Hand::on_hand_abort`. §3.2's terminal is witness-independent: it has no
+///   required emitter set and no chain position, and §4.10 states the exemption
+///   in terms — a strict parent check would have two peers each reject the
+///   other's artefact, which is the deadlock again by another route.
+/// * `Hand::on_timeout_cert`, and the votes it carries. `event_class` 1 and 2
+///   **reference** a stage rather than occupying it (§4.8); the position is in
+///   the payload, and the receiver re-checks it there against every carried
+///   vote's own signed envelope — a binding the voter itself signed, which is
+///   stronger than anything the receiver's own cursor could offer.
+///
+/// No third caller may be added without a clause of its own.
+pub fn open_in_hand(
+    bytes: &[u8],
+    cap: usize,
+    expected: EventType,
+    table_id: &Hash,
+    hand_id: u64,
+) -> Result<Opened, WireError> {
+    open_inner(bytes, cap, expected, table_id, hand_id, None)
+}
+
+/// One decoder and one signature check, so the two entry points cannot drift.
+fn open_inner(
+    bytes: &[u8],
+    cap: usize,
+    expected: EventType,
+    table_id: &Hash,
+    hand_id: u64,
+    position: Option<&Slot>,
+) -> Result<Opened, WireError> {
     let signed: SignedEvent = from_canonical(bytes, cap)
         .map_err(|_| WireError::Malformed("not a canonical signed event"))?;
     let envelope: EventBody = from_canonical(&signed.body, cap)
@@ -154,19 +200,21 @@ pub fn open(
     // The slot, field by field, with a distinct message for each: "a message
     // from another table", "from another hand" and "from another game" are three
     // different situations and only the last of them is a parameter fork.
-    if envelope.table_id != slot.table_id {
+    if envelope.table_id != *table_id {
         return Err(WireError::Envelope("an event of another table"));
     }
-    if envelope.hand_id != slot.hand_id {
+    if envelope.hand_id != hand_id {
         return Err(WireError::Envelope("an event of another hand"));
     }
-    if envelope.sequence != slot.sequence {
-        return Err(WireError::Envelope("an event at another stage"));
-    }
-    if envelope.previous_event_hash != slot.previous_event_hash {
-        return Err(WireError::Envelope(
-            "a different parent: the sender is on another chain",
-        ));
+    if let Some(slot) = position {
+        if envelope.sequence != slot.sequence {
+            return Err(WireError::Envelope("an event at another stage"));
+        }
+        if envelope.previous_event_hash != slot.previous_event_hash {
+            return Err(WireError::Envelope(
+                "a different parent: the sender is on another chain",
+            ));
+        }
     }
 
     let key = VerifyingKey::from_bytes(&envelope.sender_public_key)
