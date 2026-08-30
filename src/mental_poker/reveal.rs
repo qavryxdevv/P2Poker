@@ -36,9 +36,29 @@
 //! implied, because a rule that looks like a privacy defence and is not one is
 //! worse than no rule: it invites a reader to stop looking.
 //!
-//! What [`token_addressed_to`] does buy is real but narrower — an honest client
-//! does not act on a token that was not for it, so a lazy or buggy peer is
-//! caught rather than tolerated, and a hole card is never opened by accident.
+//! ## Every legal share is broadcast, and that is the protocol's word
+//!
+//! An earlier version of this module addressed a hole card's share to the card's
+//! owner and refused one aimed anywhere else. That is the **point-to-point model
+//! `PROTOCOL.md` §4.6 withdrew** — the section says so in those terms, and it
+//! withdrew it because the privacy argument that justified it ("the other seats
+//! receive no token at all") is false under the shipped design. Privacy is
+//! §3.4's counting argument: every hole card is one share short for everybody
+//! but its owner, and it is short because **the owner never publishes its own**,
+//! which is `NotEntitled::OwnHoleCard` below and is the one rule here that
+//! carries the property.
+//!
+//! Keeping the addressed model was not merely redundant, it was **wrong in a way
+//! that breaks the showdown**: under it every peer discards the `m-1` shares it
+//! receives for somebody else's hole card, so `SHOWDOWN_REVEAL` — which
+//! `PROTOCOL.md` §4.6 describes as *"2 × 131 bytes"* opening a hand because the
+//! rest is already on the transcript — would have nothing to combine with, and
+//! a showdown would need a fresh round from every seat. Mucking would then be a
+//! cryptographic question instead of the policy question D-021 treats it as.
+//!
+//! So [`entitlement`] answers **whether** a share may be issued, and no longer
+//! **to whom**. There is no addressee: `Audience` and `token_addressed_to` are
+//! gone rather than left as a variant nothing produces.
 //!
 //! # A full token set that does not open a card is a soundness fault (C-10)
 //!
@@ -58,15 +78,6 @@ use std::collections::BTreeMap;
 use crate::poker::state::{SeatIdx, Street};
 
 use super::deck::{CardIndex, DeckIndexMap, Role};
-
-/// Who a reveal token is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Audience {
-    /// Every seat at the table. Board cards, and hole cards at showdown.
-    Broadcast,
-    /// One seat, and no other. A hole card belongs to its owner until showdown.
-    Only(SeatIdx),
-}
 
 /// Why a token may not be issued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +117,7 @@ pub fn entitlement(
     index: CardIndex,
     from: SeatIdx,
     stage: &RevealStage,
-) -> Result<Audience, NotEntitled> {
+) -> Result<(), NotEntitled> {
     let role = map.role(index.get()).ok_or(NotEntitled::UnusedIndex {
         index: index.get(),
     })?;
@@ -129,21 +140,25 @@ pub fn entitlement(
                     at: street_now,
                 });
             }
-            Ok(Audience::Broadcast)
+            Ok(())
         }
         Role::HoleFirst(owner) | Role::HoleSecond(owner) => match stage {
             RevealStage::Betting(_) => {
                 if from == owner {
-                    // The owner holds the last share. It never publishes it,
-                    // and it never needs to: it decrypts with its own key.
+                    // The owner holds the last share. It never publishes it
+                    // before showdown, and it never needs to: it decrypts with
+                    // its own key. This is the whole of hole-card privacy.
                     Err(NotEntitled::OwnHoleCard { seat: owner })
                 } else {
-                    Ok(Audience::Only(owner))
+                    // Everybody else's share for this card is broadcast and
+                    // every peer keeps it. That is what makes a showdown one
+                    // message: the other `m-1` shares are already held.
+                    Ok(())
                 }
             }
             RevealStage::Showdown { showing } => {
                 if showing.contains(&owner) {
-                    Ok(Audience::Broadcast)
+                    Ok(())
                 } else {
                     Err(NotEntitled::NotShowing { seat: owner })
                 }
@@ -152,40 +167,6 @@ pub fn entitlement(
     }
 }
 
-
-/// Why a received token should not have arrived here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Misdirected {
-    /// The token was for another seat's eyes.
-    ///
-    /// Dropped rather than used. It is **not** evidence of cheating: the
-    /// envelope carries no addressee, so the same bytes sent to the right seat
-    /// would be correct, and a colluding sender would not have used this channel
-    /// anyway (`SPEC_CS.md` §18).
-    ForAnotherSeat { intended: SeatIdx },
-    /// The token was not due at all.
-    NotDue(NotEntitled),
-}
-
-/// Whether a token that arrived here is one this seat should act on.
-///
-/// The receiving half of [`entitlement`]. An honest client checks it so that a
-/// hole card is never opened by accident and a peer that publishes what it
-/// should have addressed is caught rather than silently followed.
-pub fn token_addressed_to(
-    map: &DeckIndexMap,
-    index: CardIndex,
-    from: SeatIdx,
-    me: SeatIdx,
-    stage: &RevealStage,
-) -> Result<(), Misdirected> {
-    match entitlement(map, index, from, stage) {
-        Err(e) => Err(Misdirected::NotDue(e)),
-        Ok(Audience::Broadcast) => Ok(()),
-        Ok(Audience::Only(x)) if x == me => Ok(()),
-        Ok(Audience::Only(x)) => Err(Misdirected::ForAnotherSeat { intended: x }),
-    }
-}
 
 /// A full verified token set failed to open a card.
 ///
@@ -340,7 +321,7 @@ mod tests {
                 if ok { "allowed" } else { "refused" }
             );
             if ok {
-                assert_eq!(got.unwrap(), Audience::Broadcast);
+                assert_eq!(got, Ok(()));
             }
         }
 
@@ -353,15 +334,23 @@ mod tests {
         );
         assert_eq!(
             entitlement(&m, m.turn(), 3, &RevealStage::Betting(Street::Turn)),
-            Ok(Audience::Broadcast)
+            Ok(())
         );
     }
 
-    /// The rule the game's privacy rests on: a token for somebody else's hole
-    /// card goes to its owner and to nobody else. The ciphertext is public, so a
-    /// broadcast token is the whole of the secret.
+    /// The rule the game's privacy actually rests on, and it is one rule: the
+    /// **owner** may not publish its own share before showdown.
+    ///
+    /// Everybody else's share for that card is broadcast and every peer keeps
+    /// it. That is not a weakening — `PROTOCOL.md` §3.4's counting argument is
+    /// what makes the card private, and it is exactly this: `m-1` shares are
+    /// public, the `m`-th is the owner's, and `m-1` of `m` opens nothing.
+    /// Addressing the other shares to the owner bought nothing (the envelope
+    /// carries no addressee, so a colluding sender is unaffected) and cost the
+    /// showdown, which needs those `m-1` shares to be on every peer's
+    /// transcript.
     #[test]
-    fn a_hole_card_token_is_addressed_to_its_owner_alone() {
+    fn only_the_owner_is_barred_from_its_own_hole_card() {
         let m = map(6, 0);
         let owner = m.deal_order()[2];
         let [first, second] = m.hole_cards(owner).unwrap();
@@ -372,11 +361,7 @@ mod tests {
                 if from == owner {
                     assert_eq!(got, Err(NotEntitled::OwnHoleCard { seat: owner }));
                 } else {
-                    assert_eq!(
-                        got,
-                        Ok(Audience::Only(owner)),
-                        "seat {from} must send to {owner} and not broadcast"
-                    );
+                    assert_eq!(got, Ok(()), "seat {from}'s share is broadcast");
                 }
             }
         }
@@ -391,9 +376,16 @@ mod tests {
         let [first, _] = m.hole_cards(owner).unwrap();
 
         for at in [Street::PreFlop, Street::Flop, Street::Turn, Street::River] {
+            // The other seats' shares are held by everybody...
             assert_eq!(
                 entitlement(&m, first, owner + 1, &RevealStage::Betting(at)),
-                Ok(Audience::Only(owner)),
+                Ok(()),
+                "the other seats' shares are public at {at:?}"
+            );
+            // ...and the one that would open the card is still the owner's.
+            assert_eq!(
+                entitlement(&m, first, owner, &RevealStage::Betting(at)),
+                Err(NotEntitled::OwnHoleCard { seat: owner }),
                 "still private at {at:?}"
             );
         }
@@ -411,9 +403,9 @@ mod tests {
         };
 
         let [a, _] = m.hole_cards(shows).unwrap();
-        assert_eq!(entitlement(&m, a, 2, &stage), Ok(Audience::Broadcast));
+        assert_eq!(entitlement(&m, a, 2, &stage), Ok(()));
         // Even the owner may publish now: the card is public either way.
-        assert_eq!(entitlement(&m, a, shows, &stage), Ok(Audience::Broadcast));
+        assert_eq!(entitlement(&m, a, shows, &stage), Ok(()));
 
         let [b, _] = m.hole_cards(mucks).unwrap();
         assert_eq!(
@@ -444,43 +436,49 @@ mod tests {
     }
 
 
-    /// The receiving half. A token for somebody else's hole card is dropped
-    /// rather than used, so an honest client never opens a card by accident.
+    /// Every seat keeps every share, and that is the point.
+    ///
+    /// The old shape of this test asserted the opposite — that a share for seat
+    /// 0's card reaching seat 2 was misdirected and dropped. Under the broadcast
+    /// model `PROTOCOL.md` §4.6 owns, seat 2 keeping it is exactly what makes
+    /// seat 0's showdown one message instead of a fresh round from everybody.
     #[test]
-    fn a_token_meant_for_another_seat_is_dropped() {
+    fn every_seat_keeps_every_share_but_the_owner_s_own() {
         let m = map(4, 0);
         let owner = m.deal_order()[0];
-        let other = m.deal_order()[1];
         let [card, _] = m.hole_cards(owner).unwrap();
         let stage = RevealStage::Betting(Street::Flop);
 
-        assert_eq!(token_addressed_to(&m, card, other, owner, &stage), Ok(()));
-        assert_eq!(
-            token_addressed_to(&m, card, other, m.deal_order()[2], &stage),
-            Err(Misdirected::ForAnotherSeat { intended: owner }),
-            "seat 2 has no business holding a share of seat 0 card"
-        );
+        for from in 0..4u8 {
+            let got = entitlement(&m, card, from, &stage);
+            if from == owner {
+                assert_eq!(
+                    got,
+                    Err(NotEntitled::OwnHoleCard { seat: owner }),
+                    "the owner's own share is the one that never travels"
+                );
+            } else {
+                assert_eq!(got, Ok(()), "seat {from}'s share is for everybody");
+            }
+        }
     }
 
-    /// A board token is for everybody, so it is never misdirected — and one that
-    /// is not due yet is refused for that reason rather than for its audience.
+    /// A board share is due from the street it belongs to, and not before.
     #[test]
-    fn a_board_token_reaches_every_seat_once_it_is_due() {
+    fn a_board_share_is_due_from_its_own_street() {
         let m = map(4, 0);
         let flop = m.flop()[0];
-        for me in 0..4u8 {
-            assert_eq!(
-                token_addressed_to(&m, flop, 1, me, &RevealStage::Betting(Street::Flop)),
-                Ok(())
-            );
-            assert_eq!(
-                token_addressed_to(&m, flop, 1, me, &RevealStage::Betting(Street::PreFlop)),
-                Err(Misdirected::NotDue(NotEntitled::StreetNotReached {
-                    needs: Street::Flop,
-                    at: Street::PreFlop
-                }))
-            );
-        }
+        assert_eq!(
+            entitlement(&m, flop, 1, &RevealStage::Betting(Street::Flop)),
+            Ok(())
+        );
+        assert_eq!(
+            entitlement(&m, flop, 1, &RevealStage::Betting(Street::PreFlop)),
+            Err(NotEntitled::StreetNotReached {
+                needs: Street::Flop,
+                at: Street::PreFlop
+            })
+        );
     }
 
     #[test]

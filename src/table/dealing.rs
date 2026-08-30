@@ -9,8 +9,8 @@
 //!
 //! A share arriving from the network passes three gates, cheapest first:
 //!
-//! 1. **Is it due, and is it for me?** [`token_addressed_to`] — the street has
-//!    been reached, and a hole card's share is addressed to its owner. Free.
+//! 1. **Is it due?** [`entitlement`] — the street has been reached, and the
+//!    sender is not publishing its own hole card's share. Free.
 //! 2. **Does it verify** against *this* peer's own final deck? ~0.1 ms.
 //! 3. **Does the set want it?** One share per seat per card, never an update.
 //!
@@ -24,9 +24,9 @@
 //!
 //! It does not decide *when* to publish a share, and it does not publish one.
 //! [`Dealing::own_share`] computes this peer's own and hands it back; whether it
-//! goes on the wire, and to whom, is the protocol layer's — and for a hole card
-//! that is not this peer's, the answer comes from [`entitlement`], which returns
-//! an addressee rather than a permission.
+//! goes on the wire is the protocol layer's. There is no *to whom*: every legal
+//! share is broadcast (`PROTOCOL.md` §4.6), every peer keeps every share it
+//! receives, and that is what makes a showdown one message per revealing seat.
 
 use std::collections::BTreeMap;
 
@@ -36,7 +36,7 @@ use crate::mental_poker::backend::{
 use crate::mental_poker::deck::{CardIndex, DeckIndexMap, Role};
 use crate::mental_poker::protocol::{Ciphertext, DeckCtx, Final, VerifyOutcome, Verified};
 use crate::mental_poker::reveal::{
-    entitlement, token_addressed_to, Audience, Misdirected, NotEntitled, RevealStage, SetError,
+    entitlement, NotEntitled, RevealStage, SetError,
     SoundnessFault, TokenSet,
 };
 use crate::poker::state::{Card, SeatIdx, Street};
@@ -47,8 +47,10 @@ pub type FinalDeck = Final<Verified<Vec<Ciphertext>>>;
 /// Why a share was not taken.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Refused {
-    /// It was not due, or it was for somebody else's eyes.
-    NotForUs(Misdirected),
+    /// It was not due: the street has not been reached, the index has no role
+    /// this hand, or the sender is the card's owner publishing its own share
+    /// before showdown — which is the one rule hole-card privacy rests on.
+    NotDue(NotEntitled),
     /// It did not verify against this peer's own final deck, or the check could
     /// not be run at all — [`VerifyOutcome`] carries which, and only the first
     /// is evidence.
@@ -173,7 +175,7 @@ impl Dealing {
     /// Where a share for `index` should be sent, if this peer may issue one.
     ///
     /// The protocol layer's question, answered here so it has one answer.
-    pub fn audience(&self, index: CardIndex, from: SeatIdx) -> Result<Audience, NotEntitled> {
+    pub fn due(&self, index: CardIndex, from: SeatIdx) -> Result<(), NotEntitled> {
         entitlement(&self.map, index, from, &self.stage)
     }
 
@@ -214,9 +216,12 @@ impl Dealing {
         share: &Share<'_>,
         ctx: &DeckCtx,
     ) -> Result<(), Refused> {
-        // 1. Free: is it due, and is it ours to hold?
-        token_addressed_to(&self.map, share.index, share.from, me, &self.stage)
-            .map_err(Refused::NotForUs)?;
+        // 1. Free: is it due at all? Not "is it for us" — every legal share is
+        // broadcast and every peer keeps every one of them, which is what makes
+        // a showdown 2 x 131 bytes instead of a fresh round.
+        let _ = me;
+        entitlement(&self.map, share.index, share.from, &self.stage)
+            .map_err(Refused::NotDue)?;
 
         // 2. ~0.1 ms: does it verify against this peer's own final deck?
         let key = deal

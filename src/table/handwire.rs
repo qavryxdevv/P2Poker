@@ -356,6 +356,143 @@ impl DealPrivate {
     }
 }
 
+/// `BOARD_REVEAL 0x0402`: the shares that open one street's board cards.
+///
+/// Collective, and **every dealt-in seat owes one, folded seats included**. That
+/// is the price of `n`-of-`n`: a folded player still holds a key share until the
+/// hand ends, and a folded player who goes silent stalls the hand exactly as an
+/// active one would. It is not a rule this layer may soften — a board card needs
+/// every share that exists, and a seat that folded did not stop existing.
+///
+/// The cards themselves never travel. Every peer derives them from the same
+/// shares against the same committed deck, which is why no receiver can ever be
+/// shown a card it did not verify itself (`SPEC_CS.md` §22).
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct BoardReveal {
+    /// §4.7's street code — `3` flop, `4` turn, `5` river. Never `0`: there is
+    /// no board before the flop and so no `BOARD_REVEAL` for it.
+    #[n(0)]
+    pub street: u16,
+    #[n(1)]
+    pub entries: Vec<RevealEntry>,
+}
+
+/// `SHOWDOWN_REVEAL 0x0403`: the sender's own two shares, which open its hand.
+///
+/// The whole showdown is this one message per seat, because the other `m-1`
+/// shares for those two indices have been on the transcript since
+/// `DEAL_PRIVATE`. Two entries, 131 bytes each.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct ShowdownReveal {
+    /// Exactly the sender's own two hole-card indices, ascending.
+    #[n(0)]
+    pub entries: Vec<RevealEntry>,
+}
+
+/// `SHOWDOWN_MUCK 0x0404`: the alternative to showing, under D-021's policy.
+///
+/// A seat emits **exactly one** of this and [`ShowdownReveal`] at the showdown
+/// stage. They are the one pair of `event_class = 0` types that share a
+/// `sequence`, so a seat that emitted both would have put two bodies in one slot
+/// and manufactured an equivocation proof against itself. The exclusivity is
+/// what keeps that slot at capacity one, and it is safe to leave it there
+/// because no rule anywhere permits a seat to both show and muck.
+///
+/// It is illegal under `MANDATORY_REVEAL`, and illegal in any showdown where a
+/// seat is all in (TDA 16) — there every live seat must show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct ShowdownMuck {
+    /// Must be `true`. Irrevocably forfeits all claim to every pot in this hand.
+    ///
+    /// A field that may hold one value looks like a field that should not
+    /// exist, and it is the protocol's: a body with no fields at all encodes to
+    /// the same bytes whatever it means, and this one has to be able to gain a
+    /// second field later without the first hand of that version being an
+    /// equivocation against the last hand of this one.
+    #[n(0)]
+    pub forfeit: bool,
+}
+
+/// One pot and where it went, inside [`HandComplete`].
+///
+/// Every list ascending and unique. `odd_chips` names the seats that received
+/// the remainder when a pot did not divide, distributed clockwise from the
+/// button — which is a rule and not a rounding convenience, because two peers
+/// that split a remainder differently disagree about a stack for ever.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct PotAward {
+    #[n(0)]
+    pub size: u64,
+    #[n(1)]
+    pub eligible: Vec<u8>,
+    #[n(2)]
+    pub winners: Vec<u8>,
+    #[n(3)]
+    pub odd_chips: Vec<u8>,
+}
+
+/// The spec's `(u8, u64)` refund pair, named.
+///
+/// A two-field `#[cbor(array)]` struct and a two-element tuple are the same
+/// bytes; the name is here because `refunds.0` and `refunds.1` at the call site
+/// are two numbers nobody can tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct Refund {
+    #[n(0)]
+    pub seat: u8,
+    #[n(1)]
+    pub amount: u64,
+}
+
+/// `HAND_COMPLETE 0x0801`: the hand's terminal stage.
+///
+/// Collective, and **every field is derived**, so there is no writer: each seat
+/// computes the byte-identical body from its own engine and signs its own copy.
+/// A receiver recomputes all of it — the pot layering, the eligible sets, the
+/// winners and the odd-chip distribution — rather than believing any of it.
+///
+/// The required emitter set is the set that emitted `HAND_INIT`, and it is
+/// deliberately not narrowed within the hand: a seat that signed `HAND_INIT` and
+/// then went quiet blocks this stage and the hand ends at its deadline. Exactly
+/// one hand pays for a seat going silent, the one it went silent in.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct HandComplete {
+    #[n(0)]
+    pub pots: Vec<PotAward>,
+    /// Uncalled excess, returned **before** the pots are awarded.
+    #[n(1)]
+    pub refunds: Vec<Refund>,
+    /// One per occupied seat ascending. Must sum to zero — chips are conserved
+    /// and a hand that created or destroyed one is a hand nobody may accept.
+    #[n(2)]
+    pub deltas: Vec<i64>,
+    #[n(3)]
+    pub final_stacks: Vec<u64>,
+    /// Seats reaching zero, ascending.
+    #[n(4)]
+    pub busted: Vec<u8>,
+    #[cbor(n(5), with = "minicbor::bytes")]
+    pub state_hash: [u8; 32],
+}
+
+impl HandComplete {
+    /// Whether the deltas conserve chips.
+    ///
+    /// Checked as an `i128` sum rather than an `i64` one: ten seats of `i64`
+    /// can overflow, and an overflow here would turn "this hand invented money"
+    /// into "this hand is fine", which is the wrong direction for the one
+    /// invariant the whole settlement rests on.
+    pub fn conserves_chips(&self) -> bool {
+        self.deltas.iter().map(|d| i128::from(*d)).sum::<i128>() == 0
+    }
+}
+
 /// The street code `PROTOCOL.md` §4.7 defines: **the number of board cards**.
 ///
 /// Pre-flop `0`, flop `3`, turn `4`, river `5`. Not the engine's `Street`
@@ -491,6 +628,80 @@ mod tests {
         assert_eq!(minicbor::decode::<ActionAmount>(&bytes).unwrap(), raise);
         assert_eq!(raise.head().seat, 3);
         assert_eq!(raise.head().action_index, 8);
+    }
+
+    #[test]
+    fn a_hand_complete_survives_the_wire_and_counts_its_chips() {
+        let done = HandComplete {
+            pots: vec![PotAward {
+                size: 300,
+                eligible: vec![0, 1, 2],
+                winners: vec![1],
+                odd_chips: vec![],
+            }],
+            refunds: vec![Refund {
+                seat: 2,
+                amount: 50,
+            }],
+            deltas: vec![-100, 200, -100],
+            final_stacks: vec![900, 1200, 900],
+            busted: vec![],
+            state_hash: [7u8; 32],
+        };
+        let bytes = minicbor::to_vec(&done).unwrap();
+        assert_eq!(minicbor::decode::<HandComplete>(&bytes).unwrap(), done);
+        assert!(done.conserves_chips());
+
+        let invented = HandComplete {
+            deltas: vec![-100, 201, -100],
+            ..done
+        };
+        assert!(!invented.conserves_chips(), "a hand may not invent a chip");
+    }
+
+    /// Ten seats of `i64` can overflow an `i64` sum. The check must not answer
+    /// "this hand is fine" because the arithmetic wrapped.
+    #[test]
+    fn the_chip_count_does_not_wrap() {
+        let wrapping = HandComplete {
+            pots: vec![],
+            refunds: vec![],
+            deltas: vec![i64::MAX, i64::MAX, 2],
+            final_stacks: vec![],
+            busted: vec![],
+            state_hash: [0u8; 32],
+        };
+        assert!(!wrapping.conserves_chips());
+    }
+
+    #[test]
+    fn the_reveal_bodies_survive_the_wire() {
+        let entry = RevealEntry {
+            deck_index: 4,
+            token: vec![1u8; 33],
+            proof: vec![2u8; 98],
+        };
+        let board = BoardReveal {
+            street: street_code(Street::Flop),
+            entries: vec![entry.clone(), entry.clone(), entry.clone()],
+        };
+        let bytes = minicbor::to_vec(&board).unwrap();
+        assert_eq!(minicbor::decode::<BoardReveal>(&bytes).unwrap(), board);
+        assert_eq!(
+            board.street as usize,
+            board.entries.len(),
+            "the flop's code is its own entry count, which is why it was chosen"
+        );
+
+        let show = ShowdownReveal {
+            entries: vec![entry.clone(), entry],
+        };
+        let bytes = minicbor::to_vec(&show).unwrap();
+        assert_eq!(minicbor::decode::<ShowdownReveal>(&bytes).unwrap(), show);
+
+        let muck = ShowdownMuck { forfeit: true };
+        let bytes = minicbor::to_vec(muck).unwrap();
+        assert_eq!(minicbor::decode::<ShowdownMuck>(&bytes).unwrap(), muck);
     }
 
     fn body() -> HandInit {

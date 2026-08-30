@@ -18,7 +18,7 @@ use p2p_poker::mental_poker::backend::{
 };
 use p2p_poker::mental_poker::deck::{CardIndex, DeckIndexMap};
 use p2p_poker::mental_poker::protocol::{CtxFields, DeckCtx, ProofPosition};
-use p2p_poker::mental_poker::reveal::{Audience, RevealStage};
+use p2p_poker::mental_poker::reveal::{NotEntitled, RevealStage};
 use p2p_poker::mental_poker::shuffle::{ChainParams, ShuffleChain};
 use p2p_poker::poker::actions::{Action, BettingRound};
 use p2p_poker::poker::engine::{first_to_act, next_to_act, post_blinds, round_complete};
@@ -131,10 +131,10 @@ fn exchange(t: &Table, peers: &mut [Dealing], index: CardIndex, ctx: &DeckCtx) {
             .own_share(&deal, &t.identity(from), index, ctx)
             .expect("a peer can always compute its own share");
 
-        // And the rest goes where the policy says, and nowhere else.
-        let recipients: Vec<SeatIdx> = match peers[from as usize].audience(index, from) {
-            Ok(Audience::Broadcast) => (0..SEATS as u8).filter(|&s| s != from).collect(),
-            Ok(Audience::Only(x)) => vec![x],
+        // And the rest is broadcast, because every legal share is
+        // (`PROTOCOL.md` §4.6). There is no addressee to compute.
+        let recipients: Vec<SeatIdx> = match peers[from as usize].due(index, from) {
+            Ok(()) => (0..SEATS as u8).filter(|&s| s != from).collect(),
             Err(_) => vec![],
         };
 
@@ -178,18 +178,18 @@ fn three_peers_deal_and_play_one_hand() {
                 .expect("the owner holds n of n shares");
             hole.push((seat, card));
 
-            // Nobody else does — and the shortfall is larger than it first
-            // looks, which is the stronger property. Every share of a hole card
-            // is addressed to its owner, so a third seat holds only its **own**
-            // share and lacks every other. It is not one share short of seeing
-            // the card; it is `n - 1` short.
+            // Nobody else does, and the shortfall is **exactly one share** —
+            // the owner's. Every other share was broadcast and every peer kept
+            // it (`PROTOCOL.md` §4.6), which is what makes a showdown one
+            // message. The card stays private because `n - 1` of `n` opens
+            // nothing at all, which is §3.4's counting argument and the only
+            // thing holding it up.
             for other in (0..SEATS as u8).filter(|&s| s != seat) {
-                let expected: Vec<SeatIdx> =
-                    (0..SEATS as u8).filter(|&s| s != other).collect();
                 match peers[other as usize].open(&t.deal(), index) {
                     Err(NotOpenable::Waiting { outstanding }) => assert_eq!(
-                        outstanding, expected,
-                        "seat {other} holds only its own share of seat {seat}'s card"
+                        outstanding,
+                        vec![seat],
+                        "seat {other} is short exactly seat {seat}'s own share"
                     ),
                     got => panic!("seat {other} should not open another hand: {got:?}"),
                 }
@@ -239,7 +239,7 @@ fn three_peers_deal_and_play_one_hand() {
             };
             let refused = peers[1].accept(&t.deal(), 1, &share, &ctx);
             assert!(
-                matches!(refused, Err(Refused::NotForUs(_))),
+                matches!(refused, Err(Refused::NotDue(_))),
                 "a board share before its street is not due: {refused:?}"
             );
         }
@@ -361,41 +361,66 @@ fn three_peers_deal_and_play_one_hand() {
     }
 }
 
-/// A peer that has not reached showdown cannot be handed somebody else's hole
-/// card, however valid the share is. This is the rule the whole game rests on
-/// against an *honest-but-buggy* peer; against a colluding one nothing here
-/// helps and `SPEC_CS.md` §18 says so.
+/// Every peer holds every share but the owner's, and still cannot read the
+/// card. This is `PROTOCOL.md` §3.4's counting argument, executed.
+///
+/// The previous version of this test asserted the opposite — that a share of
+/// seat 0's card reaching seat 2 was misdirected and refused. That was the
+/// point-to-point model §4.6 withdrew, and holding to it would have broken the
+/// showdown: `SHOWDOWN_REVEAL` is one message precisely because the other `m-1`
+/// shares are already on every peer's transcript.
+///
+/// What is asserted instead is the property that actually protects the card:
+/// `m-1` shares open nothing, and the `m`-th is the owner's and never travels.
 #[test]
-fn a_share_of_another_hand_is_refused_at_the_receiver() {
+fn every_peer_holds_all_but_one_share_and_still_cannot_read_the_card() {
     let t = set_up();
     let ctx = reveal_ctx(9);
-    let mut me = Dealing::new(t.map.clone(), (0..SEATS as u8).collect());
+    let mut bystander = Dealing::new(t.map.clone(), (0..SEATS as u8).collect());
 
-    // Seat 0's second hole card, and seat 1 offers its share to seat 2.
     let victim = 0u8;
     let index = t.map.hole_cards(victim).unwrap()[1];
-    let (token, proof) = t
-        .hand
-        .token(&t.secrets[1], t.keys[1].as_ref().unwrap(), &t.deck, index, &ctx)
-        .unwrap();
 
-    let share = Share {
-        from: 1,
-        index,
-        token,
-        proof: &proof,
-    };
-    let refused = me.accept(&t.deal(), 2, &share, &ctx);
+    // Every seat but the owner hands its share to a seat that is not the owner
+    // either, and every one of them is taken.
+    for from in (0..SEATS as u8).filter(|&s| s != victim) {
+        let (token, proof) = t
+            .hand
+            .token(
+                &t.secrets[from as usize],
+                t.keys[from as usize].as_ref().unwrap(),
+                &t.deck,
+                index,
+                &ctx,
+            )
+            .unwrap();
+        let share = Share {
+            from,
+            index,
+            token,
+            proof: &proof,
+        };
+        bystander
+            .accept(&t.deal(), 2, &share, &ctx)
+            .expect("every seat's share but the owner's is broadcast and kept");
+    }
+
+    // One short, and the one it is short of is the owner's.
+    assert_eq!(
+        bystander.outstanding(index).unwrap(),
+        vec![victim],
+        "exactly the owner's share is missing, and it is missing from everybody"
+    );
     assert!(
-        matches!(refused, Err(Refused::NotForUs(_))),
-        "seat 2 has no business holding a share of seat 0's card: {refused:?}"
+        bystander.open(&t.deal(), index).is_err(),
+        "m-1 of m shares must open nothing at all"
     );
 
-    // And the set was not filled by the attempt.
+    // And the owner may not publish it before showdown. That one rule is the
+    // whole of hole-card privacy.
     assert_eq!(
-        me.outstanding(index).unwrap().len(),
-        SEATS,
-        "a refused share fills nothing"
+        bystander.due(index, victim),
+        Err(NotEntitled::OwnHoleCard { seat: victim })
     );
 }
 

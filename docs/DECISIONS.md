@@ -2209,24 +2209,57 @@ every other peer at the table acting together. The forfeiture is enforced the
 same way — a seat with no share on the transcript is a seat no settlement can
 award a pot to.
 
+### The order is an emission discipline, not extra stages
+
+**Corrected before any code was written.** The first draft of this decision said
+the showdown becomes a sequence of single-writer stages, one per seat. That is
+wrong against `PROTOCOL.md` §4.6, which makes the showdown **one collective
+stage**: `SHOWDOWN_REVEAL` and `SHOWDOWN_MUCK` are the one pair of
+`event_class = 0` types that share a `sequence`, and a seat emits exactly one of
+them — that exclusivity is what keeps the slot at capacity one, and splitting
+the stage would have thrown it away for nothing.
+
+TDA order is achieved by **when each client speaks**, not by where its message
+sits. The stage completes when every required seat has spoken; it does not care
+in what order they did. So:
+
+* the first-to-show emits at once;
+* every other client waits until it has seen the reveals of the seats ahead of
+  it in TDA order, and then emits its own reveal or its muck.
+
+A seat that speaks out of turn has committed a live-poker irregularity and
+nothing more: it cannot see a card it was not going to see, cannot claim a pot
+it did not win, and cannot stall anybody. There is nothing to enforce and so
+nothing is enforced.
+
+The required-to-show set must still be **exactly determined before the stage
+opens**, because a collective stage needs its required set — §4.6 says as much.
+It is every seat still live at the showdown; each of them owes one message.
+
 ### What it does cost, stated plainly
 
-* **The showdown becomes sequential.** Under `MandatoryReveal` it is one
-  collective stage; under this policy it is one single-writer stage per seat, in
-  an order derived from the betting. That is up to `m` round trips where there
-  was one, and each needs its own deadline.
 * **The hand driver has to track the aggressor.** `poker::actions` deliberately
   does not (`src/poker/actions.rs:113`) — its legality predicate has no use for
   it. The driver keeps it, because the showdown order is the one place the
   identity of the last aggressor changes what happens.
 * **A stalled showdown is a stalled hand.** A seat that neither shows nor mucks
   is the ordinary crypto-stall case and ends at the hand deadline (T57), with
-  every stack restored. No new terminus.
+  every stack restored. No new terminus. Note that the emission discipline makes
+  a *slow* showdown normal, so the deadline has to be the hand's and not a tight
+  per-message one.
 * **`HAND_COMPLETE` ranks only the hands that were shown.** Under
   `MandatoryReveal` the settlement is derivable from a transcript that contains
   every hand; here it is derivable from a transcript that contains the shown
   ones and a muck for each of the rest, which is equally complete and equally
   checkable — but it is a different derivation and the two must not be confused.
+
+### Mucking is illegal when anybody is all in
+
+TDA 16, and `PROTOCOL.md` §4.6 states it: *with at least one player all-in and
+betting complete, every live player must show and none may muck.* So the policy
+does not simply replace `MandatoryReveal` — it selects between the two per hand,
+and an all-in showdown is a mandatory-reveal showdown. A client that offered the
+muck button there would be offering an action the receiver must refuse.
 
 ### The client may muck for its owner
 
