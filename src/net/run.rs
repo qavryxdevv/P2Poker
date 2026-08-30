@@ -1280,6 +1280,30 @@ pub async fn run(
                             // people this client is here for, and a cap that
                             // could refuse a player would be doing the opposite.
                             swarm.behaviour_mut().conn_limits.bypass_peer_id(&peer_id);
+                            // **Say again what topics this client is on.**
+                            // GossipSub exchanges subscriptions once, when a
+                            // connection is established, and measured on three
+                            // clients on one machine that exchange is
+                            // unreliable: the founder had both joiners
+                            // connected and identified and knew of **no** peer
+                            // subscribed to the lobby, so `publish` answered
+                            // `NoPeersSubscribedToTopic` and the table never
+                            // formed. Each joiner meanwhile saw exactly one of
+                            // its two neighbours. A table formed in 33 s when
+                            // the founder saw both and never when it did not,
+                            // across nine runs.
+                            //
+                            // There is no per-peer "send my subscriptions"
+                            // call, so this is the primitive that exists:
+                            // dropping and retaking the topic re-announces it
+                            // to everyone connected. It fires once per poker
+                            // peer, because `poker_peers` is a set, and the gap
+                            // it opens is one iteration of this loop.
+                            for t in [&topics.lobby, &topics.lobby_chat] {
+                                let g = &mut swarm.behaviour_mut().gossipsub;
+                                let _ = g.unsubscribe(t);
+                                let _ = g.subscribe(t);
+                            }
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: false })
                                 .await;
@@ -2246,11 +2270,20 @@ pub async fn run(
                         .filter(|(_, subscribed)| subscribed.contains(&&hash))
                         .map(|(p, _)| p.to_string().chars().rev().take(6).collect::<String>())
                         .collect();
-                    if known > 0 || mesh > 0 {
+                    // **Both sides of the comparison, named.** A table forms
+                    // exactly when the founder sees every joiner subscribed to
+                    // the lobby topic, and fails when it sees one of two while
+                    // reporting both connected — measured, five runs. A count
+                    // cannot say WHICH peer is connected and not subscribed,
+                    // and that is the whole question.
+                    let connected: Vec<String> = poker_peers
+                        .iter()
+                        .map(|p| p.to_string().chars().rev().take(6).collect::<String>())
+                        .collect();
+                    if known > 0 || mesh > 0 || !connected.is_empty() {
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "lobby topic: {mesh} of {known} subscribed peer(s) in the mesh                                  {who:?}; {} poker peer(s) connected",
-                                poker_peers.len()
+                                "lobby topic: {mesh} of {known} subscribed {who:?};                                  connected {connected:?}"
                             )))
                             .await;
                     }
