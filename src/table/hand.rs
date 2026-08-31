@@ -3869,13 +3869,12 @@ impl Hand {
     /// emitter of an abort to have *verified that certificate itself* and a
     /// copy this client sealed is the strongest form of that.
     fn note_own_certificate(&mut self, hash: Hash, bytes: &[u8], subject: &TimeoutVote) {
-        self.certs.insert(
-            hash,
-            CertFact {
-                subject_seat: subject.subject_seat,
-                kind: subject.kind,
-            },
-        );
+        // The roster effect, on the same evidence a receiver banks on: this
+        // client holds a complete unanimous set of votes, which is what a
+        // certificate *is*.
+        self.bank(subject, hash, bytes);
+        // And its own copy wins as the proof an abort carries, because §4.10
+        // asks the emitter to have verified that certificate itself.
         self.proof = Some((hash, bytes.to_vec()));
     }
 
@@ -4149,28 +4148,45 @@ impl Hand {
     /// [`MAX_CONSECUTIVE_AUTO_ACTIONS`] counts — and those two must count twice
     /// while a redelivery of either counts once.
     fn bank_certificate(&mut self, c: &VerifiedCert) -> bool {
+        self.bank(&c.subject, c.event_hash, &c.raw)
+    }
+
+    /// The same, from the pieces, for a certificate this client sealed itself.
+    ///
+    /// **Both roads bank, and that is the whole point.** The roster effect
+    /// rests on a complete unanimous vote set, and a peer that assembled one
+    /// and sealed a certificate from it holds exactly the evidence a peer that
+    /// received one holds. Banking only on receipt made the two disagree in the
+    /// ordinary case: at three seats the voter set is two, so a certificate
+    /// about the third completes its collective stage only if BOTH voters'
+    /// copies arrive — and if one of them is the peer that went quiet, the
+    /// emitter never completes the stage, never reaches `apply_certificate`,
+    /// and never shrinks its own roster. Measured: the subject banked the
+    /// certificate about itself and dropped to `[1, 2]` while its author stayed
+    /// at `[0, 1, 2]`, and the two forked at the next genesis.
+    fn bank(&mut self, subject: &TimeoutVote, event_hash: Hash, raw: &[u8]) -> bool {
         // The roster freezes with the terminal, or `next_hand` is racing a wall
         // clock against the mesh.
         if self.over() || self.banked.len() >= BANKED_CAP {
             return false;
         }
         self.certs.insert(
-            c.event_hash,
+            event_hash,
             CertFact {
-                subject_seat: c.subject.subject_seat,
-                kind: c.subject.kind,
+                subject_seat: subject.subject_seat,
+                kind: subject.kind,
             },
         );
         if self.proof.is_none() {
-            self.proof = Some((c.event_hash, c.raw.clone()));
+            self.proof = Some((event_hash, raw.to_vec()));
         }
-        if !self.banked.insert(c.subject.subject_digest()) {
+        if !self.banked.insert(subject.subject_digest()) {
             return false;
         }
-        if !self.certified.contains(&c.subject.subject_seat) {
-            self.certified.push(c.subject.subject_seat);
+        if !self.certified.contains(&subject.subject_seat) {
+            self.certified.push(subject.subject_seat);
         }
-        if let Some(n) = self.strikes.get_mut(usize::from(c.subject.subject_seat)) {
+        if let Some(n) = self.strikes.get_mut(usize::from(subject.subject_seat)) {
             *n = n.saturating_add(1);
         }
         true

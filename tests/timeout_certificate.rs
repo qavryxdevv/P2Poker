@@ -869,3 +869,77 @@ fn a_settlement_that_arrives_after_an_abort_replaces_its_terminal() {
         );
     }
 }
+
+
+/// **The author of a certificate and its reader derive the same roster.**
+///
+/// At three seats the voter set is two, so a certificate about the third
+/// completes its collective stage only if BOTH voters' copies arrive. If one of
+/// them is the peer that has gone quiet — which is the ordinary case, since a
+/// table loses one seat at a time — the author never completes the stage, never
+/// reaches `apply_certificate`, and, while the roster effect was banked only on
+/// receipt, never shrank its own roster.
+///
+/// Measured over the network before it was written down: the subject banked the
+/// certificate about itself and opened the next hand with `[1, 2]` while the
+/// peer that had written that certificate opened it with `[0, 1, 2]`. Two
+/// genesis hashes, one table, no refusal anywhere until they tried to speak.
+///
+/// **To make this fail:** take the `self.bank(...)` call out of
+/// `Hand::note_own_certificate`.
+#[test]
+fn the_author_of_a_certificate_banks_it_like_everybody_else() {
+    let (mut t, opening) = Table::open_with_seat_two_silent();
+    t.settle(opening, NOW);
+
+    // Both survivors vote. Seat 1 is given both votes; seat 0 keeps only its
+    // own, so only seat 1 can assemble a certificate.
+    let mut votes: Vec<(usize, Vec<u8>)> = Vec::new();
+    for s in 0..2usize {
+        for Send::Broadcast(b) in t.hands[s]
+            .vote_on_timeouts(&t.keys[s], LATE)
+            .expect("a vote is sealed")
+        {
+            votes.push((s, b));
+        }
+    }
+    let mut certs: Vec<Vec<u8>> = Vec::new();
+    for (from, bytes) in votes {
+        let to = 1 - from;
+        for Send::Broadcast(b) in t.hands[to]
+            .on_event(&bytes, &t.keys[to], LATE)
+            .expect("a vote from the other survivor is accepted")
+        {
+            certs.push(b);
+        }
+    }
+    assert!(!certs.is_empty(), "somebody should certify once both votes are in");
+
+    // Seat 1's certificate reaches seat 0. **Seat 0's never reaches seat 1** —
+    // in the case this is about, the other voter is the one that went away, so
+    // seat 1's collective stage stays one copy short for ever.
+    let _ = t.hands[0].on_event(&certs[0], &t.keys[0], LATE);
+
+    // Both give the hand up on their own deadline, which is what happened over
+    // the network, and is the only way either gets a terminal here.
+    for s in 0..2usize {
+        let _ = t.hands[s].abort_now(
+            p2p_poker::table::hand::Abort::Deadline,
+            &t.keys[s],
+            LATE,
+        );
+    }
+
+    let zero = t.hands[0].next_hand().expect("seat 0 opens the next hand");
+    let one = t.hands[1].next_hand().expect("seat 1 opens the next hand");
+    assert_eq!(
+        one.required, zero.required,
+        "the author of the certificate kept a roster its reader had already shrunk"
+    );
+    assert_eq!(one.genesis, zero.genesis, "and so they forked at the genesis");
+    assert!(
+        !one.required.contains(&2),
+        "the certified seat is still required: {:?}",
+        one.required
+    );
+}
