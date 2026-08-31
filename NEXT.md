@@ -1428,6 +1428,46 @@ lacks the history. Worth stating plainly, because the natural thing to do while
 moving off GossipSub is to leave that loop behind.
 
 
+
+### The result D-019 was taken for: four hands, two networks, one real client
+
+`tools/two-network-ssh.ps1 -Seconds 300` — the same script that measured the
+libp2p path, running the same released binary, which now carries Tox by default:
+
+```
+here  : this table's traffic rides a Tox group, 382e1d5b
+        in the table's Tox group 382e1d5b; the hand rides it from here
+there : this table's traffic is on a Tox group, 382e1d5b; waiting to be invited
+        in the table's Tox group 382e1d5b; the hand rides it from here
+
+hands here 4, there 4, at the same genesis 4
+agreed on: ad111fde, b2e971ae, ad8d44af, d0baf112
+```
+
+All four **opened and finished** at both ends, on identical genesis hashes,
+across the boundary. No probe and no example: this is the client.
+
+Set that beside what the same script measured on 2026-08-31 before any of this,
+in the run where DCUtR did not get through:
+
+> the far end reached `the deck is shuffled and sealed` and never spoke about
+> that hand again; this end reached `your turn`, then
+> `NoPeersSubscribedToTopic` five times, then the deadline — **0 hands**.
+
+That run is why D-019 exists, and this one is its answer. The relay counters are
+still in the output and still say the same thing — *five reservations too small
+to carry a hand* — and it no longer matters, because the hand is not on a
+circuit that has a byte cap.
+
+**What is still not proven** is unchanged and worth repeating, because it is the
+first thing lost when a result is passed on: the two machines share one public
+address, so this is two subnets with a router between them and not a NAT to
+traverse. That is a **harder** case for Tox than two real networks, since the
+DHT publishes both under one address and a hole punch would ask the router to
+hairpin — which is exactly why the relay list is not optional. It is not a
+weaker one. Hole punching between two different NATs needs an endpoint outside
+this building.
+
 ### The client itself now plays on Tox
 
 Two real clients, `--features tox`, no probe and no example:
