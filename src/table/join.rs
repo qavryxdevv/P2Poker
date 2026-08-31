@@ -59,6 +59,26 @@ pub struct JoinRequest {
     pub join_nonce: Hash,
     /// The table being joined — must equal the advert's signing key.
     pub table_id: Hash,
+    /// This player's **Tox** public key, so the founder can reach it (D-019).
+    ///
+    /// A Tox group invitation takes a friend number and there is no "invite
+    /// this key", so the founder and the joiner must be Tox friends before an
+    /// invitation is possible at all. `tox_friend_add_norequest` makes that
+    /// automatic from a public key alone — no request, nothing for anybody to
+    /// accept — and this is the field it reads. Without it the only way in is
+    /// joining by `chat_id` through Tox's DHT, which is the path measured to
+    /// work only while a group is new.
+    ///
+    /// `None` when the joiner has no Tox, which a build without
+    /// `--features tox` does not. A founder whose table is on Tox has nothing
+    /// to invite such a player to and says so; it is not a fault in the
+    /// request.
+    ///
+    /// **It is not an identity.** `app_public_key` is who this player is, is
+    /// checked against the envelope's sender, and is what every signature is
+    /// verified under. This is a transport address that happens to be a key,
+    /// and it authorises nothing.
+    pub tox_key: Option<[u8; 32]>,
 }
 
 /// Why a founder will not seat this request.
@@ -509,6 +529,8 @@ mod tests {
             founder_peer_id: b"founder".to_vec(),
             timestamp_unix_ms: 1_700_000_000_000,
             expires_at_unix_ms: 1_700_000_090_000,
+            founder_tox_key: None,
+            tox_chat_id: None,
         };
         a.hand_deadline_ms = hand_deadline_min_ms(6, 20_000, 5_000, 30_000, 7_000, 0) as u32;
         a
@@ -523,6 +545,7 @@ mod tests {
             advert_hash: [0xAA; 32],
             app_public_key: [key; 32],
             peer_id: vec![peer; 12],
+                tox_key: None,
             display_name: format!("hrac {key}"),
             requested_seat: seat,
             password_proof: None,

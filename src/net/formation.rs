@@ -302,6 +302,7 @@ impl Formation {
             buyin: my_buyin,
             join_nonce,
             table_id,
+            tox_key: None,
         };
         let bytes = joinwire::publish_join_request(&request, &app, now_ms)?;
         // The hash the founder will echo is the hash of the bytes that went out,
@@ -907,6 +908,8 @@ mod tests {
             timestamp_unix_ms: NOW,
             expires_at_unix_ms: NOW + 90_000,
 
+            founder_tox_key: None,
+            tox_chat_id: None,
         }
     }
 

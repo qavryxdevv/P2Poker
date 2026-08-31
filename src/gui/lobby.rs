@@ -479,6 +479,8 @@ mod tests {
             founder_peer_id: Vec::new(),
             timestamp_unix_ms: NOW,
             expires_at_unix_ms: NOW + 90_000,
+            founder_tox_key: None,
+            tox_chat_id: None,
         };
         a.hand_deadline_ms = hand_deadline_min_ms(6, 20_000, 5_000, 30_000, 7_000, 0) as u32;
         a

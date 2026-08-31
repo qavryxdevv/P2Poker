@@ -94,6 +94,8 @@ fn ad(founder_app: [u8; 32], founder_peer: Vec<u8>) -> TableAd {
         founder_peer_id: founder_peer,
         timestamp_unix_ms: NOW,
         expires_at_unix_ms: NOW + 90_000,
+        founder_tox_key: None,
+        tox_chat_id: None,
     }
 }
 

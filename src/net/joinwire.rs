@@ -166,6 +166,27 @@ pub struct JoinRequestBody {
     pub join_nonce: [u8; 32],
     #[cbor(n(8), with = "minicbor::bytes")]
     pub table_id: [u8; 32],
+    /// This player's **Tox** public key, so the founder can reach it (D-019).
+    ///
+    /// A Tox group invitation takes a friend number and there is no "invite
+    /// this key", so the founder and the joiner must be Tox friends before an
+    /// invitation is possible at all. `tox_friend_add_norequest` makes that
+    /// automatic from a public key alone — no request, nothing for anybody to
+    /// accept — and this is the field it reads. Without it the only way in is
+    /// joining by `chat_id` through Tox's DHT, which is the path measured to
+    /// work only while a group is new.
+    ///
+    /// `None` when the joiner has no Tox, which a build without
+    /// `--features tox` does not. A founder whose table is on Tox has nothing
+    /// to invite such a player to and says so; it is not a fault in the
+    /// request.
+    ///
+    /// **It is not an identity.** `app_public_key` is who this player is, is
+    /// checked against the envelope's sender, and is what every signature is
+    /// verified under. This is a transport address that happens to be a key,
+    /// and it authorises nothing.
+    #[cbor(n(9), with = "minicbor::bytes")]
+    pub tox_key: Option<[u8; 32]>,
 }
 
 /// `0x0202 JOIN_ACCEPT`, four fields.
@@ -370,6 +391,7 @@ pub fn publish_join_request(
         buyin: req.buyin,
         join_nonce: req.join_nonce,
         table_id: req.table_id,
+        tox_key: req.tox_key,
     };
     seal_unchained(
         EventType::JoinRequest,
@@ -411,6 +433,7 @@ pub fn receive_join_request(bytes: &[u8]) -> Result<(JoinRequest, [u8; 32], Hash
         buyin: b.buyin,
         join_nonce: b.join_nonce,
         table_id: b.table_id,
+        tox_key: b.tox_key,
     };
     Ok((req, o.sender, o.event_hash))
 }
@@ -675,6 +698,7 @@ mod tests {
             buyin: 1_500,
             join_nonce: [5u8; 32],
             table_id: [6u8; 32],
+            tox_key: None,
         }
     }
 
@@ -779,6 +803,35 @@ mod tests {
         let (back, _, _) = receive_join_request(&wire).unwrap();
         assert_eq!(back.requested_seat, None);
         assert_eq!(back.password_proof, None);
+    }
+
+    /// The joiner's Tox key survives, present and absent, and is **under the
+    /// signature** like everything else in the request.
+    ///
+    /// Absent matters as much as present: a build without `--features tox` has
+    /// no Tox key, and a decoder that turned that into thirty-two zero bytes
+    /// would hand the founder a key to add as a friend - one that belongs to
+    /// nobody, and that the founder would then wait for.
+    #[test]
+    fn the_joiners_tox_key_survives_present_and_absent() {
+        let mut req = request();
+        assert_eq!(req.tox_key, None, "a request carries no Tox key by default");
+        let wire = publish_join_request(&req, &key(3), NOW).unwrap();
+        assert_eq!(receive_join_request(&wire).unwrap().0.tox_key, None);
+
+        req.tox_key = Some([0xC3u8; 32]);
+        let wire = publish_join_request(&req, &key(3), NOW).unwrap();
+        let (back, _, _) = receive_join_request(&wire).unwrap();
+        assert_eq!(back.tox_key, Some([0xC3u8; 32]));
+        assert_eq!(back, req, "and nothing else moved");
+
+        // It is covered by the signature: the type has no field a receiver
+        // reads outside it, and `a_single_altered_byte_is_refused` below holds
+        // for a request carrying one just as it does for one that does not.
+        let mut flipped = wire.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 1;
+        assert!(receive_join_request(&flipped).is_err());
     }
 
     /// One flipped bit anywhere and nothing is accepted. The whole message is

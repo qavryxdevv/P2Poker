@@ -96,6 +96,8 @@ fn demo_ad(name: &str) -> TableAd {
         founder_peer_id: Vec::new(),
         timestamp_unix_ms: NOW,
         expires_at_unix_ms: NOW + 90_000,
+        founder_tox_key: None,
+        tox_chat_id: None,
     }
 }
 

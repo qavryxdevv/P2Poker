@@ -134,6 +134,22 @@ pub struct TableAd {
     pub founder_peer_id: Vec<u8>,
     pub timestamp_unix_ms: u64,
     pub expires_at_unix_ms: u64,
+    /// The founder's **Tox** public key: how a joiner is reached so that an
+    /// invitation into the table's group is possible at all (D-019). `None`
+    /// means this table's traffic is not on Tox.
+    ///
+    /// Outside `table_params_hash`, like `founder_peer_id` and for the same
+    /// reason — identity and routing. See `advert::AdBody` for the full
+    /// argument and for why hashing it would make a restarted founder's table
+    /// permanently unjoinable.
+    pub founder_tox_key: Option<[u8; 32]>,
+    /// The chat id of the group that carries this table.
+    ///
+    /// **Not how anybody joins** — members arrive by invitation, because
+    /// joining by chat id goes through Tox's DHT and that path decays. It is
+    /// what a joiner compares the group it was invited into against, so that a
+    /// founder cannot quietly put the table somewhere nobody advertised.
+    pub tox_chat_id: Option<[u8; 32]>,
 }
 
 /// Why an advert was not admitted.
@@ -505,7 +521,28 @@ impl TableAd {
             founder_peer_id,
             timestamp_unix_ms: now_ms,
             expires_at_unix_ms: now_ms + AD_TTL_MS,
+            // Filled by [`TableAd::on_tox`] once the group exists. It cannot be
+            // filled here: the table is decided before the group is created,
+            // and a builder that took a chat id would have to be handed one
+            // that does not exist yet.
+            founder_tox_key: None,
+            tox_chat_id: None,
         }
+    }
+
+    /// Say that this table's traffic rides a Tox group (D-019).
+    ///
+    /// Called after the group is created, on the advert about to be published.
+    /// Neither field enters `table_params_hash`, so adding them does not make
+    /// this a different table — which is what lets the founder advertise first
+    /// and say where the traffic is a moment later, and what lets a restarted
+    /// founder come back on a new group without every client marking the table
+    /// permanently unjoinable.
+    #[must_use]
+    pub fn on_tox(mut self, founder_tox_key: [u8; 32], chat_id: [u8; 32]) -> Self {
+        self.founder_tox_key = Some(founder_tox_key);
+        self.tox_chat_id = Some(chat_id);
+        self
     }
 
     /// The rated Sit-and-Go, exactly as `PROTOCOL.md` §13 fixes it.
@@ -880,6 +917,8 @@ mod tests {
             founder_peer_id: vec![1, 2, 3],
             timestamp_unix_ms: NOW,
             expires_at_unix_ms: NOW + 90_000,
+            founder_tox_key: None,
+            tox_chat_id: None,
         }
     }
 

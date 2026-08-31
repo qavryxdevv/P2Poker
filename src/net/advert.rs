@@ -140,6 +140,42 @@ pub struct AdBody {
     pub timestamp_unix_ms: u64,
     #[n(28)]
     pub expires_at_unix_ms: u64,
+    /// The founder's **Tox** public key, and the chat id of the group that
+    /// carries this table's traffic (D-019).
+    ///
+    /// # What they are for, and they are not the same thing
+    ///
+    /// The **key** is how a joiner is reached. A Tox group invitation takes a
+    /// friend number, not an address, so the founder and the joiner must be Tox
+    /// friends before an invitation is possible — and `tox_friend_add_norequest`
+    /// makes that automatic from a public key, with no request and nothing for
+    /// anybody to accept. Without this field there is no route to an
+    /// invitation, and the only alternative is joining by `chat_id` through
+    /// Tox's DHT, which is the path measured to work only while a group is new.
+    ///
+    /// The **chat id** is not how anybody joins. It is what a joiner compares
+    /// the group it was invited into **against**: an invitation says nothing
+    /// about which group it is for, so a founder could invite a player into a
+    /// different one — and a table whose traffic is on a group nobody
+    /// advertised is a table nobody else can audit. Publishing it turns that
+    /// from unnoticeable into a check.
+    ///
+    /// # Both are `Option`, and both are outside `table_params_hash`
+    ///
+    /// `Option`, because a build without `--features tox` advertises a table it
+    /// carries on the swarm and must not be forced to invent a key it does not
+    /// have. Absent means *this table is not on Tox*.
+    ///
+    /// **Outside the digest**, for exactly the reason `founder_peer_id` is
+    /// (§3.1): identity and routing. A founder that restarts comes back with a
+    /// different Tox identity and a different group, which is legitimate — and
+    /// if these were hashed, §7.2 rule 7 would see changed parameters and every
+    /// client holding the table would mark it permanently unjoinable. That is
+    /// `table_name`'s bug with a different field in it.
+    #[cbor(n(30), with = "minicbor::bytes")]
+    pub founder_tox_key: Option<[u8; 32]>,
+    #[cbor(n(31), with = "minicbor::bytes")]
+    pub tox_chat_id: Option<[u8; 32]>,
 }
 
 impl From<&TableAd> for AdBody {
@@ -180,6 +216,8 @@ impl From<&TableAd> for AdBody {
             founder_peer_id: a.founder_peer_id.clone(),
             timestamp_unix_ms: a.timestamp_unix_ms,
             expires_at_unix_ms: a.expires_at_unix_ms,
+            founder_tox_key: a.founder_tox_key,
+            tox_chat_id: a.tox_chat_id,
         }
     }
 }
@@ -233,6 +271,8 @@ impl TryFrom<AdBody> for TableAd {
             founder_peer_id: b.founder_peer_id,
             timestamp_unix_ms: b.timestamp_unix_ms,
             expires_at_unix_ms: b.expires_at_unix_ms,
+            founder_tox_key: b.founder_tox_key,
+            tox_chat_id: b.tox_chat_id,
         })
     }
 }
@@ -555,6 +595,8 @@ mod tests {
             founder_peer_id: b"12D3KooWfake".to_vec(),
             timestamp_unix_ms: NOW,
             expires_at_unix_ms: NOW + 90_000,
+            founder_tox_key: None,
+            tox_chat_id: None,
         };
         a.hand_deadline_ms = hand_deadline_min_ms(
             a.max_players,
@@ -813,6 +855,47 @@ mod tests {
 
     /// The six things section 3.1 excludes **by name**, each checked separately.
     ///
+    /// The Tox fields survive the wire in both states, and `on_tox` is what
+    /// puts them there.
+    ///
+    /// Both are `Option` because a build without `--features tox` advertises a
+    /// table it carries on the swarm and must not invent a key it does not
+    /// have. Absent means *this table is not on Tox*, and that has to stay
+    /// distinguishable from thirty-two zero bytes, which is a key.
+    #[test]
+    fn the_tox_fields_survive_the_wire_in_both_states() {
+        let plain = ad();
+        assert_eq!(
+            plain.founder_tox_key, None,
+            "a table is not on Tox unless it says so"
+        );
+        assert_eq!(plain.tox_chat_id, None);
+
+        let key = [0xA1u8; 32];
+        let chat = [0xB2u8; 32];
+        let on_tox = plain.clone().on_tox(key, chat);
+        assert_eq!(on_tox.founder_tox_key, Some(key));
+        assert_eq!(on_tox.tox_chat_id, Some(chat));
+
+        for a in [&plain, &on_tox] {
+            let body = AdBody::from(a);
+            let bytes = minicbor::to_vec(&body).expect("it encodes");
+            let back: AdBody = minicbor::decode(&bytes).expect("and decodes");
+            let round: TableAd = back.try_into().expect("into an advert");
+            assert_eq!(&round, a, "and nothing moved on the way");
+        }
+
+        // An advert naming a Tox group is still under the lobby's cap: the two
+        // fields are sixty-six bytes and there is not much room to spare.
+        let bytes = minicbor::to_vec(AdBody::from(&on_tox)).expect("it encodes");
+        assert!(
+            bytes.len() <= crate::protocol::constants::TABLE_AD_MAX,
+            "an advert on Tox is {} bytes, over the {} cap",
+            bytes.len(),
+            crate::protocol::constants::TABLE_AD_MAX
+        );
+    }
+
     /// The first version of `table_params_hash` hashed the encoded body with
     /// three of them zeroed, and `table_name` was not one of the three. That was
     /// a live bug with no adversary in it: a founder who fixes a typo in the
@@ -839,6 +922,22 @@ mod tests {
             (
                 "founder_peer_id",
                 Box::new(|a: &mut TableAd| a.founder_peer_id = b"somewhere else".to_vec()),
+            ),
+            (
+                // **The pair that would have been the same bug again.** A
+                // founder that restarts comes back with a different Tox
+                // identity and a different group, which is legitimate - and if
+                // either were hashed, rule 7 would see changed parameters and
+                // every client holding the table would mark it permanently
+                // unjoinable. That is `table_name`'s defect with a different
+                // field in it, which is why both sit beside `founder_peer_id`
+                // among section 3.1's exclusions rather than inside the digest.
+                "founder_tox_key",
+                Box::new(|a: &mut TableAd| a.founder_tox_key = Some([7u8; 32])),
+            ),
+            (
+                "tox_chat_id",
+                Box::new(|a: &mut TableAd| a.tox_chat_id = Some([8u8; 32])),
             ),
             (
                 "the timestamps",

@@ -328,6 +328,8 @@ mod tests {
             founder_peer_id: b"12D3KooWfounder".to_vec(),
             timestamp_unix_ms: 1_700_000_000_000,
             expires_at_unix_ms: 1_700_000_090_000,
+            founder_tox_key: None,
+            tox_chat_id: None,
         };
         a.hand_deadline_ms = hand_deadline_min_ms(
             a.max_players,

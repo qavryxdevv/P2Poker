@@ -2692,6 +2692,9 @@ fn new_table(
         founder_peer_id,
         timestamp_unix_ms: now_ms,
         expires_at_unix_ms: now_ms + AD_TTL_MS,
+        // `TableAd::on_tox` fills these once the group exists; see there.
+        founder_tox_key: None,
+        tox_chat_id: None,
     }
 }
 

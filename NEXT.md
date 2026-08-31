@@ -1400,8 +1400,33 @@ endpoint outside this building.
    identity, a group has a stable non-zero `chat_id`, a packet over the MTU is
    refused rather than truncated, and two instances add each other with no
    request passing between them.
-3. **The Tox public key and `chat_id` in the advertisement and the join
-   request**, which is the wire change the invitation route needs.
+3. ~~The Tox public key and `chat_id` in the advertisement and the join
+   request~~ **done.** Three fields, all `Option`, all append-only:
+   `LOBBY_TABLE_AD` `n(30) founder_tox_key` and `n(31) tox_chat_id`, and
+   `JOIN_REQUEST` `n(9) tox_key`. Absent means *not on Tox*, which a build
+   without the feature is, and which has to stay distinguishable from
+   thirty-two zero bytes - a decoder that conflated them would hand a founder a
+   key belonging to nobody and then wait for it.
+
+   **Both advert fields are outside `table_params_hash`,** beside
+   `founder_peer_id` and for its reason: identity and routing. Hashing them
+   would have been `table_name`'s bug with a different field in it - a founder
+   that restarts comes back with a different Tox identity and a different
+   group, which is legitimate, and §7.2 rule 7 would see changed parameters and
+   mark the table permanently unjoinable at every client holding it. The
+   exclusion test carries both now, so it cannot be undone quietly.
+
+   **The `chat_id` is not how anybody joins**, and that is the point of
+   publishing it. Members arrive by invitation because joining by chat id goes
+   through Tox's DHT and that path decays; what the published id is *for* is
+   the comparison - an invitation says nothing about which group it is for, so
+   without it a founder could put the table on a group nobody advertised and
+   nothing would look wrong. `TableAd::on_tox` fills both after the group
+   exists, which is possible only because neither is hashed.
+
+   What is owed to `PROTOCOL.md`: the three field indices and the sentence that
+   they are excluded from §3.1's digest. The decision is D-019's and is made;
+   the numbering is the document's to record.
 4. ~~A `TableTransport` implementation over it~~ **done, and the whole stack is
    proven end to end.** `tox::table` owns the instance on a dedicated thread -
    `tox_iterate` wants a steady loop on one thread, which is the same
