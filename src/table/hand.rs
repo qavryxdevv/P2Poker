@@ -1432,7 +1432,19 @@ impl Hand {
         )
         .map_err(Failed::Wire)?;
         let step_hash = self.opened(&step, EventType::ShuffleStep)?.event_hash;
-        self.slot = self.slot.then(stage_hash_single(
+
+        // **Nothing is moved until the chain has taken the step.** The slot used
+        // to advance here, before the proof was even sealed, so any failure
+        // afterwards left the slot one stage ahead of the chain — and
+        // `whose_turn()` therefore still said *this seat*. The next event that
+        // reached `shuffle_if_mine` ran the whole thing again, and
+        // `ShuffleChain::accept_step` reserves the position **before** it
+        // verifies (C-9, so a bad prover cannot make everyone re-verify), so
+        // the retry answered `AlreadySubmitted` and the seat could never take
+        // its turn. That is the refusal that has been appearing in live runs
+        // for a day: `seat N's shuffle: a second attempt at a position that
+        // already has one`, always about this client's own contribution.
+        let after_step = self.slot.then(stage_hash_single(
             self.slot.sequence,
             EventType::ShuffleStep.code(),
             self.open.my_seat,
@@ -1447,7 +1459,7 @@ impl Hand {
         };
         let proof_event = chained::seal(
             EventType::ShuffleProof,
-            &self.slot,
+            &after_step,
             &body,
             key,
             now_ms,
@@ -1455,21 +1467,43 @@ impl Hand {
             SHUFFLE_PROOF_CAP,
         )
         .map_err(Failed::Wire)?;
-        let proof_hash = self.opened(&proof_event, EventType::ShuffleProof)?.event_hash;
+        let proof_hash = chained::open(
+            &proof_event,
+            FRAME_CAP,
+            EventType::ShuffleProof,
+            &after_step,
+        )
+        .map_err(Failed::Wire)?
+        .event_hash;
 
         // This client's own step goes through `accept_step` like anybody
         // else's, which costs it the 42 ms of verifying its own argument. That
         // is the price of having one path into the chain: a second, trusting
         // path would be a path an attacker only has to find once.
         let me = self.open.my_seat;
+        let proof_seq = after_step.sequence;
         let Phase::Shuffling { deal, chain, .. } = &mut self.phase else {
             unreachable!("just matched")
         };
+        let taken = chain.steps_taken();
+        let turn = chain.whose_turn();
         chain
-            .accept_step(&deal.deck, me, next, &body.proof, self.slot.sequence)
-            .map_err(|e| step_failure(me, e))?;
-        self.slot = self.slot.then(stage_hash_single(
-            self.slot.sequence,
+            .accept_step(&deal.deck, me, next, &body.proof, proof_seq)
+            .map_err(|e| step_failure(me, e))
+            .map_err(|e| {
+                // The instrument that was missing. Every diagnostic for this
+                // family was on the path that verifies a PEER's proof, and the
+                // refusal that keeps appearing in live runs is about this
+                // client's own — so a day of logs said which seat and never
+                // which road.
+                self.shuffle_note = Some(format!(
+                    "own shuffle refused at round {round}: chain step {taken},                      turn {turn:?}, proof sequence {proof_seq}, slot {}",
+                    self.slot.sequence
+                ));
+                e
+            })?;
+        self.slot = after_step.then(stage_hash_single(
+            proof_seq,
             EventType::ShuffleProof.code(),
             me,
             proof_hash,
@@ -5487,6 +5521,10 @@ fn step_failure(seat: SeatIdx, e: StepError) -> Failed {
         StepError::AlreadySubmitted => Failed::BadShuffle {
             seat,
             why: "a second attempt at a position that already has one",
+        },
+        StepError::OutOfRange { .. } => Failed::BadShuffle {
+            seat,
+            why: "a seat and a position this chain admits",
         },
         StepError::Rejected(_) => Failed::BadShuffle {
             seat,

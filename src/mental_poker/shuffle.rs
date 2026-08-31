@@ -46,6 +46,8 @@
 //! independent of this discipline, and that is exactly why **both** are
 //! required: neither is the other's excuse.
 
+use crate::mental_poker::protocol::NotAdmitted;
+use crate::protocol::constants::MAX_SEATS;
 use crate::poker::state::SeatIdx;
 
 use super::protocol::{
@@ -99,6 +101,13 @@ pub enum StepError {
     /// duplicate-suppression that keeps a peer from spending every other
     /// client's core on repeated verification, and it must be visible as that.
     AlreadySubmitted,
+    /// A seat or a position outside what this table and this chain admit.
+    ///
+    /// Separate from [`AlreadySubmitted`](StepError::AlreadySubmitted) because
+    /// the two were one answer, and a seat refused for being out of range was
+    /// told it had already submitted — about a first attempt, every hand, on a
+    /// chain that was waiting for it.
+    OutOfRange { seat: SeatIdx, position: u8 },
     /// The step did not verify. Whether this is evidence against the emitter is
     /// the distinction [`VerifyOutcome`] carries.
     Rejected(VerifyOutcome),
@@ -266,10 +275,20 @@ impl ShuffleChain {
         // attempt, so it can no longer take its step, so the chain can never
         // complete and the hand aborts. That is C-6 rule 4 — the chain is
         // abandoned, never shortened.
-        let seats = u8::try_from(self.order.len()).expect("`open` bounds the chain below 256");
+        let positions =
+            u8::try_from(self.order.len()).expect("`open` bounds the chain below 256");
         self.admission
-            .admit(from, k as u8, seats)
-            .map_err(|_| StepError::AlreadySubmitted)?;
+            .admit(from, k as u8, MAX_SEATS, positions)
+            // **Not collapsed into one answer.** Both were reported as
+            // `AlreadySubmitted`, so a seat refused for being out of range was
+            // told it had already submitted — which is what a day of logs said,
+            // about a seat that had submitted nothing.
+            .map_err(|e| match e {
+                NotAdmitted::AlreadySubmitted { .. } => StepError::AlreadySubmitted,
+                NotAdmitted::OutOfRange { seat, position } => {
+                    StepError::OutOfRange { seat, position }
+                }
+            })?;
 
         let ctx = self.ctx_for(k, sequence);
         // The first link shuffles the open deck, which this chain does not hold

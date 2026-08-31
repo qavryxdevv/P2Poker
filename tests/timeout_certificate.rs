@@ -943,3 +943,149 @@ fn the_author_of_a_certificate_banks_it_like_everybody_else() {
         one.required
     );
 }
+
+
+/// **The hand after a seat is dropped must be dealable.**
+///
+/// Nothing checked that. Every test stopped at the `Opening` the survivors
+/// derive, and over the network every hand after a drop stalled at the same
+/// point — `own shuffle refused at round 1: chain step 1, turn Some(2)`, which
+/// says the chain was waiting for exactly the seat it was refusing.
+///
+/// The cause is that a seat index and a position in the shuffle order are two
+/// quantities, and `ShuffleAdmission::admit` bounded both by one argument that
+/// the chain filled with the order's length. Drop a LOW seat and the survivors
+/// keep their numbers: at three seats with seat 0 certified absent the order is
+/// `[1, 2]`, two entries, and seat 2 is refused at position 1 for being seat 2.
+/// It could never take its turn, so the chain could never complete, so the hand
+/// always stalled — and the refusal said "a second attempt at a position that
+/// already has one" about a first attempt, because the two answers were
+/// collapsed into one.
+///
+/// **To make this fail:** bound the seat and the position by the same argument
+/// again in `ShuffleAdmission::admit`.
+#[test]
+fn the_hand_after_a_low_seat_is_dropped_can_still_shuffle() {
+    // Seat 0 is the one that goes quiet, so the survivors are 1 and 2 and their
+    // indices outrun the length of the order they form.
+    let keys: Vec<SigningKey> = (0..3u8).map(|s| key(10 + s)).collect();
+    let mut hands: Vec<Hand> = Vec::new();
+    let mut queue: Vec<Vec<u8>> = Vec::new();
+    for s in 1..3u8 {
+        let (h, out) =
+            Hand::open(opening3(s), &keys[usize::from(s)], NOW, 30_000).expect("the hand opens");
+        hands.push(h);
+        for Send::Broadcast(b) in out {
+            queue.push(b);
+        }
+    }
+    // `hands[0]` is seat 1 and `hands[1]` is seat 2 from here.
+    let seat_of = [1usize, 2usize];
+
+    for _ in 0..400 {
+        if queue.is_empty() {
+            break;
+        }
+        for bytes in std::mem::take(&mut queue) {
+            for to in 0..2usize {
+                match hands[to].on_event(&bytes, &keys[seat_of[to]], NOW) {
+                    Ok(out) => {
+                        for Send::Broadcast(b) in out {
+                            queue.push(b);
+                        }
+                    }
+                    Err(Failed::NotYet) => {
+                        let _ = hands[to].hold(bytes.clone());
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    assert!(
+        hands[0].waiting_for().contains(&0),
+        "the two survivors should be waiting on seat 0, not {:?}",
+        hands[0].waiting_for()
+    );
+
+    // They certify seat 0 absent and the hand ends.
+    let mut appeal: Vec<Vec<u8>> = Vec::new();
+    for to in 0..2usize {
+        for Send::Broadcast(b) in hands[to]
+            .vote_on_timeouts(&keys[seat_of[to]], LATE)
+            .expect("a vote is sealed")
+        {
+            appeal.push(b);
+        }
+    }
+    for _ in 0..10 {
+        if appeal.is_empty() {
+            break;
+        }
+        for bytes in std::mem::take(&mut appeal) {
+            for to in 0..2usize {
+                if let Ok(out) = hands[to].on_event(&bytes, &keys[seat_of[to]], LATE) {
+                    for Send::Broadcast(b) in out {
+                        appeal.push(b);
+                    }
+                }
+            }
+        }
+    }
+
+    let next: Vec<_> = (0..2usize)
+        .map(|to| hands[to].next_hand().expect("a next hand"))
+        .collect();
+    assert_eq!(next[0].required, vec![1, 2], "seat 0 should be out");
+
+    // **The hand after.** Two shufflers, seats 1 and 2, and seat 2's index is
+    // the length of the order.
+    let mut second: Vec<Hand> = Vec::new();
+    let mut queue: Vec<Vec<u8>> = Vec::new();
+    for to in 0..2usize {
+        let (h, out) = Hand::open(next[to].clone(), &keys[seat_of[to]], LATE, 30_000)
+            .expect("the next hand opens");
+        second.push(h);
+        for Send::Broadcast(b) in out {
+            queue.push(b);
+        }
+    }
+    let mut refusals: Vec<String> = Vec::new();
+    for _ in 0..400 {
+        if queue.is_empty() {
+            break;
+        }
+        for bytes in std::mem::take(&mut queue) {
+            for to in 0..2usize {
+                match second[to].on_event(&bytes, &keys[seat_of[to]], LATE) {
+                    Ok(out) => {
+                        for Send::Broadcast(b) in out {
+                            queue.push(b);
+                        }
+                    }
+                    Err(Failed::NotYet) => {
+                        let _ = second[to].hold(bytes.clone());
+                    }
+                    Err(e) => refusals.push(e.to_string()),
+                }
+            }
+        }
+    }
+
+    for to in 0..2usize {
+        if let Some(n) = second[to].take_shuffle_note() {
+            refusals.push(n);
+        }
+    }
+    assert!(
+        refusals.is_empty(),
+        "the hand after the drop was refused something: {refusals:?}"
+    );
+    for to in 0..2usize {
+        assert!(
+            second[to].shuffled(),
+            "seat {} never got a shuffled deck in the hand after the drop",
+            seat_of[to]
+        );
+    }
+}

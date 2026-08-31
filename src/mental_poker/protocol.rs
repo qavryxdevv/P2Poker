@@ -569,8 +569,27 @@ impl ShuffleAdmission {
     ///
     /// Called **before** `verify_shuffle`, never after: the point is to spend
     /// nothing on a proof that is not allowed to exist.
-    pub fn admit(&mut self, seat: u8, position: u8, seats: u8) -> Result<(), NotAdmitted> {
-        if seat >= seats || position >= seats {
+    /// **Two bounds, because they are two quantities.** A seat index and a
+    /// position in the shuffle order are not the same number and do not have
+    /// the same range: the order holds the seats that are dealt in, so at a
+    /// table of three with one seat certified absent it has two entries while
+    /// the remaining seats are still numbered 1 and 2.
+    ///
+    /// One parameter served both, and the caller passed the order's length, so
+    /// **`seat >= seats` refused any seat whose index reached the number of
+    /// shufflers** — on its first attempt, with nothing submitted. It could
+    /// then never take its turn, the chain could never complete, and every hand
+    /// stalled at the same point. Measured over four hands of one live run:
+    /// `own shuffle refused at round 1: chain step 1, turn Some(2)`, which says
+    /// the chain was waiting for exactly the seat it was refusing.
+    pub fn admit(
+        &mut self,
+        seat: u8,
+        position: u8,
+        seats: u8,
+        positions: u8,
+    ) -> Result<(), NotAdmitted> {
+        if seat >= seats || position >= positions {
             return Err(NotAdmitted::OutOfRange { seat, position });
         }
         if !self.seen.insert((seat, position)) {
@@ -1106,15 +1125,63 @@ mod tests {
         );
     }
 
+    /// **A seat index and a position in the shuffle order are two quantities.**
+    ///
+    /// The order holds the seats that are dealt in, so at a table of three with
+    /// one seat certified absent it has two entries while the remaining seats
+    /// are still numbered 1 and 2. One parameter bounded both and the caller
+    /// passed the order's length, so seat 2 was refused at position 1 of 2 — on
+    /// its first attempt, with nothing submitted. It could then never take its
+    /// turn, the chain could never complete, and every hand stalled at the same
+    /// point: `own shuffle refused at round 1: chain step 1, turn Some(2)`,
+    /// which says the chain was waiting for exactly the seat it refused.
+    ///
+    /// **To make this fail:** bound `position` and `seat` by the same argument
+    /// again.
+    #[test]
+    fn a_seat_may_shuffle_at_a_position_below_its_own_index() {
+        let mut admission = ShuffleAdmission::default();
+        // Two shufflers, seats 1 and 2, which is a three-seat table that has
+        // certified one seat absent.
+        assert_eq!(
+            admission.admit(1, 0, 10, 2),
+            Ok(()),
+            "seat 1 takes position 0 of 2"
+        );
+        assert_eq!(
+            admission.admit(2, 1, 10, 2),
+            Ok(()),
+            "and seat 2 takes position 1 of 2, which is the case that stalled"
+        );
+
+        // Both bounds still bite, in their own directions.
+        assert_eq!(
+            admission.admit(10, 0, 10, 2),
+            Err(NotAdmitted::OutOfRange {
+                seat: 10,
+                position: 0
+            }),
+            "a seat outside the table"
+        );
+        assert_eq!(
+            admission.admit(1, 2, 10, 2),
+            Err(NotAdmitted::OutOfRange {
+                seat: 1,
+                position: 2
+            }),
+            "a position outside the order"
+        );
+    }
+
     #[test]
     fn one_shuffle_proof_per_seat_per_position() {
         let mut admission = ShuffleAdmission::default();
-        assert_eq!(admission.admit(0, 0, 6), Ok(()));
-        assert_eq!(admission.admit(0, 1, 6), Ok(()), "a different position is fine");
-        assert_eq!(admission.admit(1, 0, 6), Ok(()), "a different seat is fine");
+        assert_eq!(admission.admit(0, 0, 6, 6), Ok(()));
+        assert_eq!(admission.admit(0, 1, 6, 6), Ok(()), "a different position is fine");
+        assert_eq!(admission.admit(1, 0, 6, 6), Ok(()), "a different seat is fine");
 
         assert_eq!(
-            admission.admit(0, 0, 6),
+            admission.admit(0, 0, 6, 6),
             Err(NotAdmitted::AlreadySubmitted { seat: 0, position: 0 }),
             "a second proof is a protocol violation, not something to verify"
         );
@@ -1127,11 +1194,11 @@ mod tests {
     fn a_seat_or_position_outside_the_table_is_refused() {
         let mut admission = ShuffleAdmission::default();
         assert_eq!(
-            admission.admit(6, 0, 6),
+            admission.admit(6, 0, 6, 6),
             Err(NotAdmitted::OutOfRange { seat: 6, position: 0 })
         );
         assert_eq!(
-            admission.admit(0, 200, 6),
+            admission.admit(0, 200, 6, 6),
             Err(NotAdmitted::OutOfRange { seat: 0, position: 200 })
         );
         assert!(admission.is_empty(), "neither was recorded");
@@ -1143,11 +1210,11 @@ mod tests {
         let mut admission = ShuffleAdmission::default();
         for seat in 0..10 {
             for position in 0..10 {
-                assert_eq!(admission.admit(seat, position, 10), Ok(()));
+                assert_eq!(admission.admit(seat, position, 10, 10), Ok(()));
             }
         }
         assert_eq!(admission.len(), 100);
-        assert!(admission.admit(0, 0, 10).is_err());
+        assert!(admission.admit(0, 0, 10, 10).is_err());
     }
 
 

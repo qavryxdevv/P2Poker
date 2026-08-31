@@ -299,11 +299,11 @@ fn proof_flooding_is_refused_before_the_expensive_work() {
     // Rejecting one bogus proof costs 10 to 36 ms at every seat, so one peer on
     // a slow link could otherwise burn most of a core at every other client.
     let mut admission = ShuffleAdmission::default();
-    assert_eq!(admission.admit(2, 2, 6), Ok(()));
+    assert_eq!(admission.admit(2, 2, 6, 6), Ok(()));
 
     for _ in 0..1000 {
         assert_eq!(
-            admission.admit(2, 2, 6),
+            admission.admit(2, 2, 6, 6),
             Err(NotAdmitted::AlreadySubmitted { seat: 2, position: 2 })
         );
     }
@@ -314,7 +314,7 @@ fn proof_flooding_is_refused_before_the_expensive_work() {
 fn an_out_of_range_seat_or_position_never_reaches_a_structure() {
     let mut admission = ShuffleAdmission::default();
     for (seat, position) in [(6u8, 0u8), (0, 6), (255, 255)] {
-        assert!(admission.admit(seat, position, 6).is_err());
+        assert!(admission.admit(seat, position, 6, 6).is_err());
     }
     assert!(admission.is_empty());
 }
