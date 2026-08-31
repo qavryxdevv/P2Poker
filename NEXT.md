@@ -1298,9 +1298,16 @@ implementation's, and it is the third thing D-019 now owes a document.
 
 ### What is next, in order
 
-1. **The fragmentation layer**, because nothing else can be tested without it:
-   every message this protocol sends but the smallest is over Tox's 1372-byte
-   ceiling. Bounded before allocation, per the finding above.
+1. ~~The fragmentation layer~~ **done**: `table::fragment`, eleven tests, and
+   it is deliberately **not** under `src/tox` - nothing in it knows what Tox is,
+   the MTU and the sender are parameters, so its tests run on a machine with no
+   C toolchain. The bounds are the point: the claimed fragment count is refused
+   against a `MAX_FRAGMENTS` **derived from `HAND_ABORT_MAX`** before a byte is
+   allocated, part-built messages per sender are capped and the **oldest** is
+   dropped rather than the newest refused (refusing the newest lets a sender
+   that once filled the table wedge itself out of it), a stalled stream is
+   swept on a timer, a duplicate fragment is free and a *rewritten* one costs
+   the whole message.
 2. **The NGC group itself**: `tox_group_new` at the founder,
    `tox_friend_add_norequest` on both sides from the roster,
    `tox_group_invite_friend`, and `tox_group_send_custom_packet` with `lossless`

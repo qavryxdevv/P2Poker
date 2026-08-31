@@ -10,4 +10,7 @@ pub mod handwire;
 pub mod stage;
 pub mod transport;
 pub mod formation;
+/// Carrying a message over a transport whose packets are smaller than it
+/// (D-019: every Tox channel caps at about 1372 bytes).
+pub mod fragment;
 pub mod join;
