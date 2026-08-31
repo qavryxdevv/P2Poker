@@ -878,8 +878,32 @@ way. `next_ctx(seq)` is `ctx_for(steps_taken(), seq)`, the prover passes
 proof stage, which is the same number. `ctx_for` reads only chain parameters,
 the position and `keys[k]`.
 
-So the next step is not more log-reading. It is to make a failing argument say
-what it disagreed about — the two `DeckCtx` field sets side by side, and the
+### Both are now instrumented, and neither has recurred
+
+`ShuffleChain::ctx_report` prints the three parts of a proof's context that can
+vary — position, sequence, and the signer key at that position, with the order
+beside them. The verifier prints it when it refuses; **the prover prints it on
+success**, because one side's account of a disagreement is not a comparison.
+
+A settlement mismatch now names what differs: both `final_stacks` vectors and
+both pot counts. It used to say only *"seat N holds a different settlement"*, so
+two engines disagreeing about a pot, about a winner, or about a fold one of them
+never saw all read identically in a log.
+
+**Neither has fired since.** Five kill runs after the shuffle-admission fix: no
+shuffle refusal at all, and the settlement mismatch did not recur. Both were
+last seen at the moment the killed client leaves, which is the most turbulent
+point of a run, so the next occurrence is the thing to wait for rather than to
+provoke — and when it comes it will say what it disagreed about.
+
+Two things checked and ruled out along the way, so they are not re-derived:
+`on_shuffle_proof` compares the input deck hash **before** it verifies and that
+check passes, so prover and verifier hold the same deck; and this client's own
+timeout action follows the same rule the certificate does — check when nothing
+is owed, fold when facing a bet — so a self-fold and a certified check cannot
+be two different hands.
+
+The step that remains is to make a failing argument say — the two `DeckCtx` field sets side by side, and the
 input deck hash each side used — because the note as written says where the
 chain was and not what the proof was checked against.
 
