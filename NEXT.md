@@ -1005,6 +1005,31 @@ turbulent point of a run, and neither has recurred in the five runs since.
   This is also the clearest argument for the item below it: across two networks
   mDNS is irrelevant, and the DHT and relay path — the one that would carry a
   real game — is exercised by nothing here.
-* **Two machines on two networks.** Everything measured so far is three
-  processes on one, which is the environment least likely to show a NAT,
-  relay or forwarding fault.
+* **Two machines on two networks — the script is written, the tunnel is not
+  up.** `tools/two-network-ssh.ps1` runs one node here and one on a machine
+  reached over SSH, and reports what crossed: whether they met at all, whether
+  an advert crossed, whether a table formed, and how many relay reservations
+  and direct connections each end saw.
+
+  It is blocked on something only a person can do. The far end
+  (`user@172.16.0.20`) is a private address behind OpenVPN, and all three
+  tunnel adapters read `Disconnected` — the services and the GUI are running,
+  the tunnel is not. The script checks reachability **first** and stops there
+  naming the adapters, because an SSH that hangs for two minutes reads as a
+  broken test rather than a closed tunnel.
+
+  Two things it will need after that, and it says so rather than guessing: if
+  the far end runs Linux it needs a Linux build, and this machine cannot make
+  one — only `x86_64-pc-windows-msvc` is installed, there is no cross-linker
+  (`cc`, `clang`, `zig` all absent) and WSL has no distro. Either install Rust
+  there or a Linux toolchain here.
+
+  And one caveat worth keeping in front of whoever reads the result: **if the
+  far end is reached through the tunnel, the tunnel is one more network with no
+  NAT in the middle.** The script warns when the route goes through a tun/tap
+  adapter. A success under those conditions proves discovery and forwarding
+  across a real boundary; it does not prove hole punching.
+
+  `tools/two-network-test.ps1` — the Hyper-V one — cannot substitute: its own
+  notes say both endpoints share one external address, so nothing needs
+  punching. It also needs an elevated shell, which this session does not have.
