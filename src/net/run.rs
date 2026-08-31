@@ -834,7 +834,23 @@ pub async fn run(
                         if let Some(h) = hand.as_mut() {
                             use crate::table::hand::Failed;
                             let now = super::node::now_unix_ms();
-                            match h.on_event(&message.data, &app_key, now) {
+                            // **One verdict, one place to report it.** Every arm
+                            // of this match used to leave by its own `continue`,
+                            // and with `validate_messages()` set an arm that
+                            // forgot to report first made this node a black hole
+                            // for its own table's traffic — which is exactly what
+                            // happened, to all three of them at once, and cost a
+                            // day: two survivors of a dropped peer sat a stage
+                            // apart because the bytes that would have closed the
+                            // gap were at a neighbour that would not relay them.
+                            //
+                            // A missing report is not a mistake that can be
+                            // tested for cheaply — it needs three real nodes with
+                            // two of them unmeshed — so the shape is what
+                            // prevents it. `None` is the one deliberate way out
+                            // and it means *this was not a hand event*.
+                            let verdict: Option<gossipsub::MessageAcceptance> =
+                                match h.on_event(&message.data, &app_key, now) {
                                 Ok(sends) => {
                                     // Anything held for a stage this client had
                                     // not reached is judged again now, because
@@ -982,19 +998,7 @@ pub async fn run(
                                     // an unreported message is never passed on
                                     // — so a peer that hears an event only
                                     // through this one never hears it at all.
-                                    // That is how two survivors of a dropped
-                                    // peer end up a stage apart with no way
-                                    // back: the missing bytes exist, at a
-                                    // neighbour that would not relay them.
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .gossipsub
-                                        .report_message_validation_result(
-                                            &message_id,
-                                            &propagation_source,
-                                            gossipsub::MessageAcceptance::Accept,
-                                        );
-                                    continue;
+                                    Some(gossipsub::MessageAcceptance::Accept)
                                 }
                                 // A peer one stage ahead. Held, not refused:
                                 // GossipSub does not order two messages.
@@ -1013,7 +1017,7 @@ pub async fn run(
                                     // both relayed and stored, sixty-four at a
                                     // time, evicting the genuine early events
                                     // the queue exists for.
-                                    let verdict = match h.hold(message.data.clone()) {
+                                    Some(match h.hold(message.data.clone()) {
                                         Holding::Kept => gossipsub::MessageAcceptance::Accept,
                                         // Somebody else's hand: nothing is
                                         // known to be wrong with it and this
@@ -1024,20 +1028,14 @@ pub async fn run(
                                         Holding::Malformed => {
                                             gossipsub::MessageAcceptance::Reject
                                         }
-                                    };
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .gossipsub
-                                        .report_message_validation_result(
-                                            &message_id,
-                                            &propagation_source,
-                                            verdict,
-                                        );
-                                    continue;
+                                    })
                                 }
                                 // Not a hand event at all - fall through to the
-                                // formation, which is what it will be.
-                                Err(Failed::Wire(joinwire::WireError::WrongType)) => {}
+                                // formation, which is what it will be. The one
+                                // way out of this match that reports nothing,
+                                // because the formation handler below reports
+                                // for it.
+                                Err(Failed::Wire(joinwire::WireError::WrongType)) => None,
                                 Err(e) => {
                                     if let Some(n) = h.take_shuffle_note() {
                                         let _ = events
@@ -1057,27 +1055,22 @@ pub async fn run(
                                     let _ = events
                                         .send(NodeEvent::Warning(format!("hand: {e}")))
                                         .await;
-                                    // **Reported before leaving, or this
-                                    // node forwards nothing.** Every arm of
-                                    // this branch returns to the top of the
-                                    // loop, and with `validate_messages()` set
-                                    // an unreported message is never passed on
-                                    // — so a peer that hears an event only
-                                    // through this one never hears it at all.
-                                    // That is how two survivors of a dropped
-                                    // peer end up a stage apart with no way
-                                    // back: the missing bytes exist, at a
-                                    // neighbour that would not relay them.
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .gossipsub
-                                        .report_message_validation_result(
-                                            &message_id,
-                                            &propagation_source,
-                                            gossipsub::MessageAcceptance::Reject,
-                                        );
-                                    continue;
+                                    Some(gossipsub::MessageAcceptance::Reject)
                                 }
+                            };
+                            // The single exit. A hand event never leaves this
+                            // branch without the mesh being told what became of
+                            // it.
+                            if let Some(v) = verdict {
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .report_message_validation_result(
+                                        &message_id,
+                                        &propagation_source,
+                                        v,
+                                    );
+                                continue;
                             }
                         }
 

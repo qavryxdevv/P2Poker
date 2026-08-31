@@ -961,10 +961,22 @@ turbulent point of a run, and neither has recurred in the five runs since.
 
 ### Coverage that is missing rather than broken
 
-* **The forwarding fix has no test.** The in-process harness delivers every
-  message to every survivor, which is a mesh that forwards — by construction it
-  cannot see a client that fails to. It needs three libp2p nodes with two of
-  them not directly meshed.
+* **The forwarding fix has no test, and now has a shape instead.** The
+  in-process harness delivers every message to every survivor, which is a mesh
+  that forwards — by construction it cannot see a client that fails to — and the
+  real thing needs three libp2p nodes with two of them unmeshed *and* a formed
+  table between them, which is a large and flaky test guarding three lines.
+
+  So the hand branch was restructured rather than tested: the match now yields
+  `Option<MessageAcceptance>` and there is **one** report and **one** `continue`
+  after it. An arm cannot leave without saying what became of the message,
+  because there is no way out of the match that reaches the top of the loop.
+  `None` is the single deliberate exception and it means *this was not a hand
+  event* — the formation handler below reports for it.
+
+  The three-node test is still the only thing that would prove forwarding
+  end to end, and it is still not written. What changed is that the defect it
+  would catch can no longer be written by accident.
 * **Formation is about 80 per cent.** Ten of twelve runs formed after the
   subscription re-announce, against roughly two of six before, and the failures
   are not characterised. The `lobby topic:` line names both sides now, so a
