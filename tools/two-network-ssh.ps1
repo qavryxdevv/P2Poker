@@ -92,6 +92,15 @@ tunnel up and run this again — nothing else here can reach it.
     Fail "$hostPart does not accept TCP/22 and no tunnel adapter explains it. Check the far machine is on and its firewall admits ssh."
 }
 
+# A private far address is a routed boundary, not a NAT. This is the caveat most
+# likely to be dropped when the result is repeated to somebody else, so it is
+# said at the top of the run and not only in the notes: a success here proves
+# discovery, relay and forwarding across a real boundary, and says nothing at
+# all about hole punching, which needs an endpoint outside this building.
+if ($hostPart -match '^(10)\.|^(192)\.(168)\.|^(172)\.(1[6-9]|2[0-9]|3[01])\.|^(169)\.(254)\.') {
+    Warn "$hostPart is a private address: this is two subnets with a router between them, which is a real boundary but NOT a NAT to traverse. A success here does not prove hole punching."
+}
+
 if ($iface -match 'OpenVPN|TAP|Wintun|WireGuard') {
     Warn "the far end is reached THROUGH $iface. A tunnel is one more network with no NAT in the middle, so a success here does not prove NAT traversal — say so when reporting the result."
 }

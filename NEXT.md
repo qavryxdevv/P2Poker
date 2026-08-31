@@ -524,7 +524,8 @@ advertising a shorter deadline than any preset offers.
 5. `HAND_ABORT` causes 2 and 3 — a failed shuffle or reveal proof. They embed
    up to two 32 768 B `SignedEvent`s, so they need a larger `FRAME_CAP` than
    this client opens. It emits neither and refuses one it is sent.
-6. Two machines on two networks. Still rests on nothing.
+6. Two machines on two networks. **Done** - see below; the remaining
+   coverage hole is a NAT, not a second network.
 
 ### Four defects found by pointing a critic at the design, not at the code
 
@@ -564,7 +565,9 @@ hand has already left.
 3. **Why two clients on one machine do not find each other**, when two on
    different VLANs do. Not blocking, but a test that only passes on two
    computers is a test nobody runs.
-4. **Two machines on two networks.** Still rests on nothing.
+4. **Two machines on two networks.** Done, measured, and written up below.
+   What is still untested is a NAT between the two, which needs an endpoint
+   outside this building.
 5. **The automatic renderer hop, in a VM.** Everything around it is tested; the
    hop wants a machine with no OpenGL to prove itself on.
 6. **The rest of the table window.** The hero's hole cards are drawn from the
@@ -1005,31 +1008,61 @@ turbulent point of a run, and neither has recurred in the five runs since.
   This is also the clearest argument for the item below it: across two networks
   mDNS is irrelevant, and the DHT and relay path — the one that would carry a
   real game — is exercised by nothing here.
-* **Two machines on two networks — the script is written, the tunnel is not
-  up.** `tools/two-network-ssh.ps1` runs one node here and one on a machine
-  reached over SSH, and reports what crossed: whether they met at all, whether
-  an advert crossed, whether a table formed, and how many relay reservations
-  and direct connections each end saw.
+* **Two machines on two networks — done, and it works.** This was the last
+  coverage hole worth the name: everything else ever measured was three
+  processes on one host, which is the one environment where NAT, the relay and
+  forwarding have almost no way to show themselves.
 
-  It is blocked on something only a person can do. The far end
-  (`user@172.16.0.20`) is a private address behind OpenVPN, and all three
-  tunnel adapters read `Disconnected` — the services and the GUI are running,
-  the tunnel is not. The script checks reachability **first** and stops there
-  naming the adapters, because an SSH that hangs for two minutes reads as a
-  broken test rather than a closed tunnel.
+  The far end is `user@172.16.0.20`, a machine on a VLAN behind the router,
+  reached over SSH. `tools/two-network-ssh.ps1` runs a host node here and a
+  joining node there, **with `--no-mdns` at both ends**, and compares the two
+  logs. Measured, 120 s:
 
-  Two things it will need after that, and it says so rather than guessing: if
-  the far end runs Linux it needs a Linux build, and this machine cannot make
-  one — only `x86_64-pc-windows-msvc` is installed, there is no cross-linker
-  (`cc`, `clang`, `zig` all absent) and WSL has no distro. Either install Rust
-  there or a Linux toolchain here.
+  | | here | there |
+  |---|---|---|
+  | poker peers met | 1 | 1 |
+  | table formed | yes | yes |
+  | hands | 1 | 1 |
+  | relay reservations | 1 | 1 |
+  | direct connections | — | 8 |
 
-  And one caveat worth keeping in front of whoever reads the result: **if the
-  far end is reached through the tunnel, the tunnel is one more network with no
-  NAT in the middle.** The script warns when the route goes through a tun/tap
-  adapter. A success under those conditions proves discovery and forwarding
-  across a real boundary; it does not prove hole punching.
+  Session `888f295d` at both ends and one hand at genesis `55f97eeb` at both
+  ends. Equal hand counts would only say the two played; **equal genesis says
+  they played the same hand**, which is why the script compares hashes and not
+  counts.
 
-  `tools/two-network-test.ps1` — the Hyper-V one — cannot substitute: its own
-  notes say both endpoints share one external address, so nothing needs
-  punching. It also needs an elevated shell, which this session does not have.
+  So the DHT lobby, the relay reservation and cross-subnet discovery have now
+  all run. With multicast taken away there is nothing else that could have done
+  the finding.
+
+  **What it still does not prove: hole punching.** The route to the far end
+  goes through `vEthernet (lan)` — a Hyper-V switch onto the LAN — and the far
+  address is private. Two subnets with a router between them is a real
+  boundary and not a NAT to traverse. The script now says so at the top of
+  every run against a private address, next to the tun/tap warning it already
+  had - that caveat is the first thing lost when a result is repeated to
+  somebody else. A test that traverses a NAT needs an endpoint outside this
+  building.
+
+  **And one number worth keeping:** `TABLE FORMED` was the *last* line of a
+  120 s run at both ends. On one machine a table forms in seconds. Across the
+  boundary it took nearly the whole window, and the whole of that delay is
+  before the table exists — the DHT lobby has to publish and the far end has to
+  find it. Every error line in either log is a failed dial to an unrelated
+  public IPFS bootstrap node, so the delay is not failure and retry inside this
+  protocol; it is provider-record propagation. Anybody measuring across
+  networks should budget for it rather than reading a short run as "they never
+  met".
+
+  Packaging this found four defects, all in the script and none in the
+  protocol, recorded in ee4b269 because each is the kind that reads as a
+  protocol failure: reachability probed by ping against a host that drops ping
+  and permits 22; the far node started under `Start-Process
+  -RedirectStandardOutput`, which over ssh captures nothing and looks like a
+  crash; Windows OpenSSH silently refusing a key on removable media, reported
+  as `Permission denied (publickey)`; and `$isWindows`, which PowerShell 7 owns
+  as read-only.
+
+  `tools/two-network-test.ps1` — the Hyper-V one — never could have
+  substituted: its own notes say both endpoints share one external address, so
+  nothing needed punching there either.
