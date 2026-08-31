@@ -2547,11 +2547,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // Two changes, both conservative:
                 //
                 // * **Back off while nothing moves, reset when it does.** A
-                //   table that is advancing re-sends nothing, because the chain
-                //   position changes faster than the first tick. A stuck one
-                //   still gets its first repeat after five seconds, then ten,
-                //   twenty, forty - bounded, and it stops growing at the hand's
-                //   own deadline anyway.
+                //   stuck table gets its first repeat after five seconds, then
+                //   ten, twenty, forty - bounded, and it stops growing at the
+                //   hand's own deadline anyway.
+                //
+                //   **An advancing table re-sends on every tick, and this
+                //   sentence used to claim it re-sent nothing.** The reset puts
+                //   `resend_ticks` at 0 and the increment immediately after puts
+                //   it at 1, which **is** a power of two - so a position that
+                //   changes every tick is due every tick. That is not a defect
+                //   and the code is left alone: `said` is cleared between hands
+                //   (see the `HAND_COMPLETE` note below), so what an advancing
+                //   table repeats is the last three stages of the hand it is
+                //   playing, which is exactly the peer that is one or two stages
+                //   behind. The wrong half was the claim, and a reader who
+                //   believed it would either mis-measure the bandwidth or
+                //   "correct" the code and delete a working safety net.
                 // * **Only the recent stages.** A peer more than a few stages
                 //   behind is not going to be caught up by repetition; that is
                 //   what a catch-up request is for, and it does not exist yet.

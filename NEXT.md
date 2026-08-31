@@ -2483,6 +2483,33 @@ waits before emitting `HAND_INIT`. What it needs is a decision about the failure
 case, because a seat that never joins would otherwise hold the table for ever.
 Filed rather than written in a hurry.
 
+**And the seat was not forked when it opened hand 1 — that came later.** All four
+nodes checked agreed on hand 1's genesis, `23b81f1d`. `n2` was on the same chain
+and simply **received nothing**: it entered the group at 15.1 s and, up to its
+own clock running out at 66.2 s, not one fragment of the hand reached it, while
+the founder played through to hand 22. It forked afterwards, when its own hand 1
+aborted and it opened a hand 2 the others had left behind long before.
+
+**Nothing in the client can catch it up, and the loop that looks like it should
+says so itself.** The re-send window is *the last `RESEND_STAGES = 3` stages of
+the hand being played*, and `said` is cleared between hands, so by 15.1 s the
+founder no longer held hand 1's stage 0 to repeat. The comment in that loop is
+explicit that this is deliberate: *"a peer more than a few stages behind is not
+going to be caught up by repetition; that is what a catch-up request is for, and
+it does not exist yet."* So the two ways out are the gate above (cheap, local) or
+that request (general), and the second is the larger piece.
+
+**One thing in that loop did need correcting, and it is the comment rather than
+the code.** It claimed *"a table that is advancing re-sends nothing, because the
+chain position changes faster than the first tick"*. It does the opposite: the
+reset puts `resend_ticks` at 0 and the increment immediately after puts it at 1,
+which **is** a power of two, so a position changing every tick is due every tick.
+The code is right and is left alone — `said` holds only the current hand, so what
+an advancing table repeats is the last three stages of the hand in progress,
+which is precisely the peer that is one or two stages behind. What was wrong was
+the sentence, and a reader who believed it would either mis-measure the bandwidth
+or "correct" the code and delete a working safety net.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that
