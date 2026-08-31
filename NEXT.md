@@ -2232,7 +2232,12 @@ reason apiece.
 `--headless --autoplay`, each in its own profile — and reads back what **every**
 node saw, not only the founder. One machine, `target/release`, 300 s a run, Tox
 path, machine otherwise quiet. **One run per point**, so treat the tenths as
-noise:
+noise — and see *"What a build with the game on gossipsub does"* below for how
+weak one run per point is: **formation failed in 2 of 5 runs there**, and a
+failure landing on one of these six points would have put a zero in this table
+instead of a number. The two Tox three-seat runs that exist agree (8.6 and 7.7),
+so the figures are stable where they were repeated; the table is an observation
+that has not been repeated at every size, not a measured slope:
 
 | seats | s / hand | every seat in the group | every seat finishing hands |
 |---|---|---|---|
@@ -2331,6 +2336,66 @@ The harness now keeps its logs whenever a seat is slower than 60 s, because the
 one run that would have answered *"connection, or refusal?"* was deleted as a
 success.
 
+
+## What a build with the game on gossipsub does, and why that is not a comparison
+
+**First, the framing, corrected by the owner.** D-019 is not two transports
+competing. **libp2p carries the public lobby, the join RPC, the roster and the
+ratification; Tox carries the table's game traffic**, and a build without Tox is
+not released. So `--no-default-features` is not a rival configuration to measure
+the shipping one against — it is the *old* arrangement, the one D-019 moved away
+from, and the only honest question to ask of it is what it does, not which wins.
+
+Measured with `tools/table-run.ps1`, same machine, same harness:
+
+| seats | runs | what happened |
+|---|---|---|
+| 3 | 3 | one **NO TABLE**, then 19.0 and 18.8 s/hand |
+| 6 | 1 | 6.2 s/hand, **one seat forked** — 4 of its 6 hands on a genesis the founder never had, and it finished 2 |
+| 9 | 2 | one **NO TABLE**, then 55 hands at 7.1 s/hand |
+
+### The finding is about repeatability, and it lands on my own earlier table
+
+**Formation failed in 2 of 5 runs.** Both failures were `NO TABLE` inside 240–300
+seconds, with every seat seated — in the nine-seat one the founder reached *9
+seated* at 270 s and the run ended before ratification. That is the known
+formation flake, and the repeats say it is intermittent rather than a property of
+this build: the same sizes formed on the next attempt.
+
+**Which means the seat-count table above it is one run per point on a quantity
+that can come back as nothing.** It is presented as a curve — 7.7, 10.3, 11.2,
+12.9, 15.8, 14.1 — and it reads as a measured slope. What it actually is: six
+single runs, none of which happened to hit the flake. The two Tox three-seat runs
+that do exist agree closely (8.6 and 7.7 s/hand), and the two libp2p three-seat
+runs agree closely with each other (19.0 and 18.8), so the figures **are** stable
+within a transport. But a table drawn from one run per point cannot say that, and
+this section is where it is admitted rather than left to a reader to notice.
+
+**And the shape is not the same across the two.** libp2p is slower than Tox at
+three seats (19 s against 7.7) and faster at nine (7.1 against 15.8). Two
+measurements each is not enough to explain that, and since a game on gossipsub is
+not a configuration this project ships, it is recorded and not chased.
+
+### The instrument defect it exposed
+
+The nine-seat failure was read, by me, as a subscription failure, on the strength
+of this line:
+
+```
+lobby topic: 0 of 8 subscribed ["xJQP24", "UYMnLV", … eight names …]; connected […]
+```
+
+It measures two different quantities and the wording collapsed them. `mesh` is
+the count of peers **grafted** into the gossipsub mesh for the topic; `known` and
+`who` are the peers **subscribed** to it. So the true reading is *all eight are
+subscribed and none is grafted* — the opposite of what the sentence says, with
+the eight subscribers listed immediately after the word `subscribed`.
+
+The comment three lines above the code already had the right words —
+*"both peers subscribed, neither grafted"* — and the message had lost them. Not
+grafted means adverts arrive only by gossip pull, which is exactly the *"a table
+that should form in seconds took minutes"* symptom that comment records. The line
+now reads `0 of 8 subscribed peers grafted; subscribed […]; connected […]`.
 
 ## Still open
 
