@@ -30,7 +30,137 @@
 
 pub mod sys;
 
-use std::ffi::{c_int, CString};
+use std::ffi::{c_int, c_void, CString};
+
+
+/// Something toxcore reported during one [`iterate`](Tox::iterate).
+///
+/// **None of these is authority.** A packet arriving over the table's group
+/// says nothing about who wrote it: the `chat_id` travels in a public lobby
+/// advertisement, so anybody invited can send. Who signed a message is decided
+/// after reassembly, by the signature inside it against the ratified roster,
+/// exactly as `table::transport` says. `peer` and `friend` here are routing
+/// hints and rate-limiting keys and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// A fragment of the game protocol. Goes to `table::fragment`.
+    GroupPacket {
+        group: u32,
+        peer: u32,
+        data: Vec<u8>,
+    },
+    /// A friend invited this client into a group.
+    ///
+    /// Answered with [`accept_invite`](Tox::accept_invite) **only** when the
+    /// friend is one this client added from a ratified roster. An invitation
+    /// from anybody else is an invitation to a table this client is not
+    /// joining.
+    GroupInvite { friend: u32, invite: Vec<u8> },
+    /// A friend's connection came up or went down. `0` is down, `1` TCP,
+    /// `2` UDP - `Tox_Connection`'s own values.
+    FriendConnection { friend: u32, status: i32 },
+    /// A friend request arrived. **Never accepted**: this client adds friends
+    /// from the roster with `tox_friend_add_norequest` and answers no requests,
+    /// because a request from a stranger is a stranger. Reported so that a
+    /// flood of them is visible rather than silent.
+    FriendRequestIgnored,
+}
+
+/// Where the C callbacks put what they are given, for the length of one
+/// `tox_iterate` and no longer.
+///
+/// toxcore documents that callbacks fire only from inside `tox_iterate`, which
+/// is what makes a stack-allocated sink correct: it is passed as `user_data`,
+/// every callback runs before that call returns, and the pointer is dead
+/// afterwards. Nothing here outlives the call, so there is no shared mutable
+/// state and no lock.
+#[derive(Default)]
+struct Sink {
+    events: Vec<Event>,
+}
+
+/// Turn a `user_data` pointer back into the sink, or do nothing.
+///
+/// A null pointer means somebody called `tox_iterate` without a sink, which
+/// this module never does — but a callback that dereferenced null would be a
+/// crash in C, so it is checked rather than assumed.
+unsafe fn sink<'a>(user_data: *mut c_void) -> Option<&'a mut Sink> {
+    if user_data.is_null() {
+        None
+    } else {
+        Some(&mut *user_data.cast::<Sink>())
+    }
+}
+
+unsafe extern "C" fn on_group_packet(
+    _tox: *mut sys::Tox,
+    group: u32,
+    peer: u32,
+    data: *const u8,
+    len: usize,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    // A null with a non-zero length would be a toxcore bug; treated as empty
+    // rather than dereferenced, because this is the one place a C mistake
+    // becomes a Rust crash.
+    let bytes = if data.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data, len).to_vec()
+    };
+    s.events.push(Event::GroupPacket {
+        group,
+        peer,
+        data: bytes,
+    });
+}
+
+unsafe extern "C" fn on_group_invite(
+    _tox: *mut sys::Tox,
+    friend: u32,
+    invite: *const u8,
+    invite_len: usize,
+    _group_name: *const u8,
+    _group_name_len: usize,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    let bytes = if invite.is_null() || invite_len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(invite, invite_len).to_vec()
+    };
+    // The group's own name is not read. It is a string the inviter chose, it
+    // decides nothing, and a table is identified by its `table_id` and its
+    // roster - never by what somebody called a chat room.
+    s.events.push(Event::GroupInvite {
+        friend,
+        invite: bytes,
+    });
+}
+
+unsafe extern "C" fn on_friend_connection(
+    _tox: *mut sys::Tox,
+    friend: u32,
+    status: c_int,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    s.events.push(Event::FriendConnection { friend, status });
+}
+
+unsafe extern "C" fn on_friend_request(
+    _tox: *mut sys::Tox,
+    _public_key: *const u8,
+    _message: *const u8,
+    _length: usize,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    // Deliberately not acted on. See `Event::FriendRequestIgnored`.
+    s.events.push(Event::FriendRequestIgnored);
+}
 
 /// A running Tox instance.
 ///
@@ -50,6 +180,16 @@ pub enum Failed {
     New(c_int),
     /// A bootstrap address this client could not even hand to toxcore.
     Address(&'static str),
+    /// A toxcore call refused. The name is the C function, so a log line can be
+    /// looked up in `tox.h` without guessing which call it came from, and the
+    /// number is that call's own error enum.
+    Api { call: &'static str, error: c_int },
+    /// A packet handed to [`send`](Tox::send) that the transport cannot carry.
+    ///
+    /// Never reached from the protocol's own path: `table::fragment` cuts every
+    /// message to the MTU first. It is here so that a caller which forgets is
+    /// refused rather than truncated.
+    TooLong { len: usize },
 }
 
 impl std::fmt::Display for Failed {
@@ -58,6 +198,10 @@ impl std::fmt::Display for Failed {
             Self::Options(e) => write!(f, "tox options could not be allocated ({e})"),
             Self::New(e) => write!(f, "the tox instance could not be created (Tox_Err_New {e})"),
             Self::Address(w) => write!(f, "a bootstrap address is unusable: {w}"),
+            Self::Api { call, error } => write!(f, "{call} refused ({error})"),
+            Self::TooLong { len } => {
+                write!(f, "a {len}-byte packet, over what a Tox packet carries")
+            }
         }
     }
 }
@@ -111,6 +255,15 @@ impl Tox {
             if ptr.is_null() || err != sys::TOX_ERR_NEW_OK {
                 return Err(Failed::New(err));
             }
+
+            // Registered once, here, rather than by a caller who might forget:
+            // an instance with no callbacks receives nothing and reports no
+            // error, which is the quietest way this could fail.
+            sys::tox_callback_group_custom_packet(ptr, Some(on_group_packet));
+            sys::tox_callback_group_invite(ptr, Some(on_group_invite));
+            sys::tox_callback_friend_connection_status(ptr, Some(on_friend_connection));
+            sys::tox_callback_friend_request(ptr, Some(on_friend_request));
+
             Ok(Self { ptr })
         }
     }
@@ -158,11 +311,200 @@ impl Tox {
         }))
     }
 
-    /// One turn of toxcore's own loop. Everything it does happens here.
-    pub fn iterate(&mut self) {
-        // SAFETY: valid pointer, and no user data is passed because no callback
-        // that would read it is registered yet.
-        unsafe { sys::tox_iterate(self.ptr, std::ptr::null_mut()) };
+    /// One turn of toxcore's own loop, and what it reported.
+    ///
+    /// Everything toxcore does happens here: packets are received, callbacks
+    /// fire, timers run. The sink lives on the stack for exactly the length of
+    /// the call, which is correct because toxcore fires callbacks only from
+    /// inside `tox_iterate` — so the pointer handed to C cannot outlive the
+    /// frame that owns it.
+    pub fn iterate(&mut self) -> Vec<Event> {
+        let mut sink = Sink::default();
+        // SAFETY: valid pointer; `sink` outlives the call and the callbacks
+        // that read it can only run inside it.
+        unsafe {
+            sys::tox_iterate(self.ptr, (&raw mut sink).cast::<c_void>());
+        }
+        sink.events
+    }
+
+    // -----------------------------------------------------------------------
+    // Friends, which exist here only so that a group invitation is possible
+    // -----------------------------------------------------------------------
+
+    /// Add a friend from a public key, with no request and nothing to accept.
+    ///
+    /// The key comes from the ratified roster and from nowhere else. This is
+    /// the whole of this client's friend policy: it adds who the roster says
+    /// and answers no requests, so a stranger cannot become a friend by asking.
+    pub fn add_friend(&mut self, public_key: &[u8; 32]) -> Result<u32, Failed> {
+        let mut err: c_int = 0;
+        // SAFETY: the key is exactly `TOX_PUBLIC_KEY_SIZE`.
+        let n = unsafe { sys::tox_friend_add_norequest(self.ptr, public_key.as_ptr(), &mut err) };
+        if err == 0 {
+            Ok(n)
+        } else {
+            Err(Failed::Api {
+                call: "tox_friend_add_norequest",
+                error: err,
+            })
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The group that carries the table
+    // -----------------------------------------------------------------------
+
+    /// Create the table's group. The founder does this and nobody else.
+    ///
+    /// **Private, not public.** A public group announces itself in Tox's DHT,
+    /// and that announcement is the path measured on 2026-08-27 to work only
+    /// while a group is new — a host up twenty seconds was found in thirty-one,
+    /// a host up six minutes was never found in three hundred. Members arrive
+    /// here by invitation, so the announcement is not wanted: it is a way to be
+    /// found by people who are not being invited.
+    pub fn new_group(&mut self, name: &str, self_name: &str) -> Result<u32, Failed> {
+        let mut err: c_int = 0;
+        // SAFETY: both slices are valid for the call and their lengths are
+        // passed alongside them.
+        let g = unsafe {
+            sys::tox_group_new(
+                self.ptr,
+                sys::TOX_GROUP_PRIVACY_STATE_PRIVATE,
+                name.as_ptr(),
+                name.len(),
+                self_name.as_ptr(),
+                self_name.len(),
+                &mut err,
+            )
+        };
+        if err == 0 {
+            Ok(g)
+        } else {
+            Err(Failed::Api {
+                call: "tox_group_new",
+                error: err,
+            })
+        }
+    }
+
+    /// The group's chat id, which is what the table advertises.
+    pub fn chat_id(&self, group: u32) -> Result<[u8; sys::TOX_GROUP_CHAT_ID_SIZE], Failed> {
+        let mut out = [0u8; sys::TOX_GROUP_CHAT_ID_SIZE];
+        let mut err: c_int = 0;
+        // SAFETY: the buffer is exactly `TOX_GROUP_CHAT_ID_SIZE`.
+        let ok = unsafe {
+            sys::tox_group_get_chat_id(self.ptr, group, out.as_mut_ptr(), &mut err)
+        };
+        if ok && err == 0 {
+            Ok(out)
+        } else {
+            Err(Failed::Api {
+                call: "tox_group_get_chat_id",
+                error: err,
+            })
+        }
+    }
+
+    /// Invite a friend into the group. The founder does this for each seat the
+    /// roster ratified.
+    pub fn invite(&mut self, group: u32, friend: u32) -> Result<(), Failed> {
+        let mut err: c_int = 0;
+        // SAFETY: valid pointer; both numbers are toxcore's own handles.
+        let ok = unsafe { sys::tox_group_invite_friend(self.ptr, group, friend, &mut err) };
+        Self::ok(ok && err == 0, "tox_group_invite_friend", err)
+    }
+
+    /// Accept an invitation from a friend this client added from the roster.
+    ///
+    /// The caller checks that: an invitation is an offer, and this client joins
+    /// tables it decided to join.
+    pub fn accept_invite(&mut self, friend: u32, invite: &[u8], self_name: &str) -> Result<u32, Failed> {
+        let mut err: c_int = 0;
+        // SAFETY: both slices are valid for the call; no password is used,
+        // which is a null pointer and a zero length.
+        let g = unsafe {
+            sys::tox_group_invite_accept(
+                self.ptr,
+                friend,
+                invite.as_ptr(),
+                invite.len(),
+                self_name.as_ptr(),
+                self_name.len(),
+                std::ptr::null(),
+                0,
+                &mut err,
+            )
+        };
+        if err == 0 {
+            Ok(g)
+        } else {
+            Err(Failed::Api {
+                call: "tox_group_invite_accept",
+                error: err,
+            })
+        }
+    }
+
+    /// Send one fragment of the game protocol, losslessly.
+    ///
+    /// **Lossless**, always: this carries chained events, and a chain with a
+    /// hole in it is not a chain. `table::fragment` has already cut the message
+    /// to fit, and a caller that hands over more than the packet holds gets a
+    /// refusal rather than a truncation.
+    pub fn send(&mut self, group: u32, data: &[u8]) -> Result<(), Failed> {
+        if data.len() > sys::TOX_GROUP_MAX_CUSTOM_LOSSLESS_PACKET_LENGTH {
+            return Err(Failed::TooLong { len: data.len() });
+        }
+        let mut err: c_int = 0;
+        // SAFETY: the slice is valid for the call and its length is passed.
+        let ok = unsafe {
+            sys::tox_group_send_custom_packet(self.ptr, group, true, data.as_ptr(), data.len(), &mut err)
+        };
+        Self::ok(ok && err == 0, "tox_group_send_custom_packet", err)
+    }
+
+    /// A peer's public key, for matching a group member against the roster.
+    pub fn peer_key(&self, group: u32, peer: u32) -> Result<[u8; 32], Failed> {
+        let mut out = [0u8; 32];
+        let mut err: c_int = 0;
+        // SAFETY: the buffer is exactly `TOX_PUBLIC_KEY_SIZE`.
+        let ok = unsafe {
+            sys::tox_group_peer_get_public_key(self.ptr, group, peer, out.as_mut_ptr(), &mut err)
+        };
+        if ok && err == 0 {
+            Ok(out)
+        } else {
+            Err(Failed::Api {
+                call: "tox_group_peer_get_public_key",
+                error: err,
+            })
+        }
+    }
+
+    /// Remove a peer the roster no longer seats. Founder only.
+    pub fn kick(&mut self, group: u32, peer: u32) -> Result<(), Failed> {
+        let mut err: c_int = 0;
+        // SAFETY: valid pointer; both numbers are toxcore's own handles.
+        let ok = unsafe { sys::tox_group_kick_peer(self.ptr, group, peer, &mut err) };
+        Self::ok(ok && err == 0, "tox_group_kick_peer", err)
+    }
+
+    /// Leave the group, which is what leaving the table does.
+    pub fn leave(&mut self, group: u32) -> Result<(), Failed> {
+        let mut err: c_int = 0;
+        // SAFETY: valid pointer; a null part message with zero length is the
+        // documented way to leave without one.
+        let ok = unsafe { sys::tox_group_leave(self.ptr, group, std::ptr::null(), 0, &mut err) };
+        Self::ok(ok && err == 0, "tox_group_leave", err)
+    }
+
+    fn ok(good: bool, call: &'static str, error: c_int) -> Result<(), Failed> {
+        if good {
+            Ok(())
+        } else {
+            Err(Failed::Api { call, error })
+        }
     }
 }
 
@@ -201,6 +543,164 @@ mod tests {
             tox.address(),
             other.address(),
             "two instances must not share an identity"
+        );
+    }
+
+    /// The group exists locally before anybody is connected to anything.
+    ///
+    /// `tox_group_new` is local state, so this runs offline and in a
+    /// millisecond — which matters, because it is the part of the group flow a
+    /// test can check without a network, and the rest cannot be checked without
+    /// one.
+    #[test]
+    fn a_group_is_created_and_has_a_chat_id() {
+        let mut tox = Tox::new().expect("a tox instance");
+        let group = tox.new_group("TwoNet", "host").expect("a group");
+        let id = tox.chat_id(group).expect("its chat id");
+        assert!(
+            id.iter().any(|b| *b != 0),
+            "a chat id of thirty-two zero bytes is one nothing wrote"
+        );
+        assert_eq!(tox.chat_id(group).unwrap(), id, "and it does not move");
+
+        // A second group is a second identity, which is what makes a chat id
+        // worth publishing in an advertisement.
+        let other = tox.new_group("Other", "host").expect("a second group");
+        assert_ne!(tox.chat_id(other).unwrap(), id);
+
+        tox.leave(group).expect("leaving is allowed");
+    }
+
+    /// The MTU is refused rather than truncated.
+    ///
+    /// `table::fragment` cuts every message to fit, so nothing on the
+    /// protocol's own path reaches this — it is here so that a caller which
+    /// forgets loses a packet loudly instead of sending most of one.
+    #[test]
+    fn a_packet_over_the_mtu_is_refused() {
+        let mut tox = Tox::new().expect("a tox instance");
+        let group = tox.new_group("TwoNet", "host").expect("a group");
+        let too_big = vec![0u8; sys::TOX_GROUP_MAX_CUSTOM_LOSSLESS_PACKET_LENGTH + 1];
+        assert_eq!(
+            tox.send(group, &too_big),
+            Err(Failed::TooLong {
+                len: too_big.len()
+            })
+        );
+        // And the size `table::fragment` actually produces is accepted by the
+        // length check. It fails later for want of a peer, which is a different
+        // refusal and is the one that proves the bound is not the blocker.
+        let biggest = vec![0u8; sys::TOX_GROUP_MAX_CUSTOM_LOSSLESS_PACKET_LENGTH];
+        assert!(
+            !matches!(tox.send(group, &biggest), Err(Failed::TooLong { .. })),
+            "a full packet must not be refused for its size"
+        );
+    }
+
+    /// Two instances add each other from public keys alone, with no request and
+    /// nothing to accept — which is what makes "a joining player is
+    /// automatically invited" possible without a click.
+    #[test]
+    fn two_instances_add_each_other_without_a_request() {
+        let mut a = Tox::new().expect("a");
+        let mut b = Tox::new().expect("b");
+        // The first 32 bytes of a Tox address are the public key; the rest is
+        // nospam and a checksum, which `tox_friend_add_norequest` does not take.
+        let a_key: [u8; 32] = a.address()[..32].try_into().unwrap();
+        let b_key: [u8; 32] = b.address()[..32].try_into().unwrap();
+
+        let fb = a.add_friend(&b_key).expect("a adds b");
+        let fa = b.add_friend(&a_key).expect("b adds a");
+        assert_eq!(fb, 0, "the first friend is number zero");
+        assert_eq!(fa, 0);
+
+        // No friend request was sent, so neither reports one. `iterate` is
+        // called because that is the only thing that would deliver one.
+        for _ in 0..5 {
+            for e in a.iterate() {
+                assert_ne!(e, Event::FriendRequestIgnored, "nothing was requested");
+            }
+            for e in b.iterate() {
+                assert_ne!(e, Event::FriendRequestIgnored);
+            }
+        }
+    }
+
+    /// **The whole group flow over a real network**: two instances befriend
+    /// each other, connect, the founder invites, the joiner accepts, and a
+    /// custom lossless packet crosses.
+    ///
+    /// `#[ignore]` because it needs the network and takes tens of seconds — a
+    /// friend connection over local discovery is usually seconds, over the DHT
+    /// it is not. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test --features tox -- --ignored the_group_carries_a_packet
+    /// ```
+    ///
+    /// It is the first end-to-end evidence D-019 can have, and it is here
+    /// rather than in `tests/` because it needs `sys` and the private helpers.
+    #[test]
+    #[ignore = "needs a network and tens of seconds"]
+    fn the_group_carries_a_packet() {
+        let mut a = Tox::new().expect("a");
+        let mut b = Tox::new().expect("b");
+        let a_key: [u8; 32] = a.address()[..32].try_into().unwrap();
+        let b_key: [u8; 32] = b.address()[..32].try_into().unwrap();
+        let friend_of_a = a.add_friend(&b_key).expect("a adds b");
+        b.add_friend(&a_key).expect("b adds a");
+
+        let group = a.new_group("TwoNet", "host").expect("a group");
+        let mut invited = false;
+        let mut joined: Option<u32> = None;
+        let mut got: Option<Vec<u8>> = None;
+        let payload = b"the deck is shuffled and sealed";
+
+        // Sixty seconds of turning both loops. Long, because a friend
+        // connection is not instant and there is nothing useful to do until it
+        // is up.
+        for _ in 0..6_000 {
+            for e in a.iterate() {
+                if let Event::FriendConnection { friend, status } = e {
+                    // Up, either over UDP or through a TCP relay. Which one it
+                    // is does not matter here and is exactly the thing that
+                    // matters for D-019 across two networks.
+                    if friend == friend_of_a && status != 0 && !invited {
+                        a.invite(group, friend).expect("the invitation goes");
+                        invited = true;
+                    }
+                }
+            }
+            for e in b.iterate() {
+                match e {
+                    Event::GroupInvite { friend, invite } => {
+                        joined = Some(
+                            b.accept_invite(friend, &invite, "player")
+                                .expect("the invitation is accepted"),
+                        );
+                    }
+                    Event::GroupPacket { data, .. } => got = Some(data),
+                    _ => {}
+                }
+            }
+            if joined.is_some() && got.is_none() {
+                // Sent every turn until one arrives: the joiner is in the group
+                // before the founder knows it, so the first few are sent to
+                // nobody.
+                let _ = a.send(group, payload);
+            }
+            if got.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(invited, "the friend connection never came up");
+        assert!(joined.is_some(), "the invitation was never accepted");
+        assert_eq!(
+            got.as_deref(),
+            Some(payload.as_slice()),
+            "a custom lossless packet crossed the group"
         );
     }
 

@@ -1308,10 +1308,28 @@ implementation's, and it is the third thing D-019 now owes a document.
    that once filled the table wedge itself out of it), a stalled stream is
    swept on a timer, a duplicate fragment is free and a *rewritten* one costs
    the whole message.
-2. **The NGC group itself**: `tox_group_new` at the founder,
-   `tox_friend_add_norequest` on both sides from the roster,
-   `tox_group_invite_friend`, and `tox_group_send_custom_packet` with `lossless`
-   set. All four are in `v0.2.23`'s header.
+2. ~~The NGC group itself~~ **done, and measured end to end.**
+   `the_group_carries_a_packet` runs the whole route between two instances and
+   it took **ten seconds**: both add each other from public keys with
+   `tox_friend_add_norequest` - no request sent, nothing to accept - the friend
+   connection comes up, the founder calls `tox_group_invite_friend`, the joiner
+   answers its `group_invite` callback with `tox_group_invite_accept`, and a
+   custom **lossless** packet crosses. It is `#[ignore]`d because it needs a
+   network and tens of seconds:
+
+   ```text
+   cargo test --features tox -- --ignored the_group_carries_a_packet
+   ```
+
+   That is the first end-to-end evidence D-019 can have, and it is evidence for
+   the specific thing the decision rests on: **the group was created `PRIVATE`
+   and nobody searched the DHT for it.** The decaying announce path measured on
+   2026-08-27 is not on this route at all.
+
+   Five more tests run offline in a millisecond: an instance starts with its own
+   identity, a group has a stable non-zero `chat_id`, a packet over the MTU is
+   refused rather than truncated, and two instances add each other with no
+   request passing between them.
 3. **The Tox public key and `chat_id` in the advertisement and the join
    request**, which is the wire change the invitation route needs.
 4. **A `TableTransport` implementation over it**, behind the seam

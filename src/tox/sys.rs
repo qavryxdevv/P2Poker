@@ -80,3 +80,171 @@ extern "C" {
     /// `tox.h:698`
     pub fn tox_self_get_address(tox: *const Tox, address: *mut u8);
 }
+
+// ---------------------------------------------------------------------------
+// Friends
+// ---------------------------------------------------------------------------
+//
+// A group invitation needs a **friend number**, not a public key
+// (`tox_group_invite_friend`, `tox.h:4693`), so the founder and the joiner must
+// be Tox friends before an invitation is possible at all. That would be a user
+// interaction and a round trip, except for `tox_friend_add_norequest`: it adds
+// a friend from a 32-byte public key alone, with no request sent and nothing to
+// accept. Both ends add each other from the ratified roster and the invitation
+// follows.
+//
+// This is what keeps D-019's central claim true. The decision says group
+// discovery through Tox's DHT is not on the critical path *because members
+// arrive by invitation* - and joining by `chat_id` with `tox_group_join` IS
+// that path, the one measured on 2026-08-27 to work only while a group is new.
+
+extern "C" {
+    /// `tox.h:958`
+    pub fn tox_friend_add_norequest(
+        tox: *mut Tox,
+        public_key: *const u8,
+        error: *mut c_int,
+    ) -> u32;
+    /// `tox.h:1489`
+    pub fn tox_callback_friend_request(tox: *mut Tox, callback: tox_friend_request_cb);
+    /// `tox.h:1306`
+    pub fn tox_callback_friend_connection_status(
+        tox: *mut Tox,
+        callback: tox_friend_connection_status_cb,
+    );
+}
+
+/// `tox.h:1477`
+pub type tox_friend_request_cb = Option<
+    unsafe extern "C" fn(
+        tox: *mut Tox,
+        public_key: *const u8,
+        message: *const u8,
+        length: usize,
+        user_data: *mut c_void,
+    ),
+>;
+
+/// `tox.h:1292`. `Tox_Connection` is an enum: 0 none, 1 TCP, 2 UDP.
+pub type tox_friend_connection_status_cb = Option<
+    unsafe extern "C" fn(
+        tox: *mut Tox,
+        friend_number: u32,
+        connection_status: c_int,
+        user_data: *mut c_void,
+    ),
+>;
+
+// ---------------------------------------------------------------------------
+// Groups (NGC)
+// ---------------------------------------------------------------------------
+
+/// `tox.h:3162`. The group announces itself in the DHT, which is the path that
+/// decays; this client creates **private** groups and invites into them.
+pub const TOX_GROUP_PRIVACY_STATE_PUBLIC: c_int = 0;
+/// `tox.h:3173`
+pub const TOX_GROUP_PRIVACY_STATE_PRIVATE: c_int = 1;
+
+/// `tox.h:3106`. The reason `table::fragment` exists.
+pub const TOX_GROUP_MAX_CUSTOM_LOSSLESS_PACKET_LENGTH: usize = 1373;
+
+extern "C" {
+    /// `tox.h:3330`
+    pub fn tox_group_new(
+        tox: *mut Tox,
+        privacy_state: c_int,
+        group_name: *const u8,
+        group_name_length: usize,
+        name: *const u8,
+        name_length: usize,
+        error: *mut c_int,
+    ) -> u32;
+    /// `tox.h:3539`
+    pub fn tox_group_leave(
+        tox: *mut Tox,
+        group_number: u32,
+        part_message: *const u8,
+        length: usize,
+        error: *mut c_int,
+    ) -> bool;
+    /// `tox.h:4040`
+    pub fn tox_group_get_chat_id(
+        tox: *const Tox,
+        group_number: u32,
+        chat_id: *mut u8,
+        error: *mut c_int,
+    ) -> bool;
+    /// `tox.h:4475`
+    pub fn tox_group_send_custom_packet(
+        tox: *const Tox,
+        group_number: u32,
+        lossless: bool,
+        data: *const u8,
+        length: usize,
+        error: *mut c_int,
+    ) -> bool;
+    /// `tox.h:4693`
+    pub fn tox_group_invite_friend(
+        tox: *const Tox,
+        group_number: u32,
+        friend_number: u32,
+        error: *mut c_int,
+    ) -> bool;
+    /// `tox.h:4766`
+    pub fn tox_group_invite_accept(
+        tox: *mut Tox,
+        friend_number: u32,
+        invite_data: *const u8,
+        length: usize,
+        name: *const u8,
+        name_length: usize,
+        password: *const u8,
+        password_length: usize,
+        error: *mut c_int,
+    ) -> u32;
+    /// `tox.h:5393`
+    pub fn tox_group_kick_peer(
+        tox: *const Tox,
+        group_number: u32,
+        peer_id: u32,
+        error: *mut c_int,
+    ) -> bool;
+    /// `tox.h:3840`
+    pub fn tox_group_peer_get_public_key(
+        tox: *const Tox,
+        group_number: u32,
+        peer_id: u32,
+        public_key: *mut u8,
+        error: *mut c_int,
+    ) -> bool;
+
+    /// `tox.h:4793`
+    pub fn tox_callback_group_invite(tox: *mut Tox, callback: tox_group_invite_cb);
+    /// `tox.h:4617`
+    pub fn tox_callback_group_custom_packet(tox: *mut Tox, callback: tox_group_custom_packet_cb);
+}
+
+/// `tox.h:4780`
+pub type tox_group_invite_cb = Option<
+    unsafe extern "C" fn(
+        tox: *mut Tox,
+        friend_number: u32,
+        invite_data: *const u8,
+        invite_data_length: usize,
+        group_name: *const u8,
+        group_name_length: usize,
+        user_data: *mut c_void,
+    ),
+>;
+
+/// `tox.h:4608`
+pub type tox_group_custom_packet_cb = Option<
+    unsafe extern "C" fn(
+        tox: *mut Tox,
+        group_number: u32,
+        peer_id: u32,
+        data: *const u8,
+        data_length: usize,
+        user_data: *mut c_void,
+    ),
+>;
