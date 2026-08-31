@@ -121,6 +121,17 @@ pub struct ToxTable {
 }
 
 impl ToxTable {
+    /// Send one whole message without waiting. **Not async.**
+    ///
+    /// The node loop publishes from inside arms that already hold the swarm,
+    /// and an `await` there would be an await in the middle of handling one
+    /// event. The channel is bounded, so a caller that outruns the driver gets
+    /// `false` rather than a stall — and a message dropped here is re-sent by
+    /// the loop that exists because no transport in this design keeps history.
+    pub fn try_broadcast(&self, bytes: &[u8]) -> bool {
+        bytes.len() <= fragment::MAX_MESSAGE && self.out.try_send(bytes.to_vec()).is_ok()
+    }
+
     /// The group's `chat_id`, or `None` while there is not one yet.
     pub fn chat_id(&self) -> Option<[u8; 32]> {
         *self.chat.borrow()

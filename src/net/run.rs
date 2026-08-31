@@ -384,6 +384,11 @@ pub async fn run(
     // roster rather than from the chain.
     let mut ever_dealt = false;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
+    // Empty unless this table's game traffic rides a Tox group (D-019), and
+    // empty for ever in a build without `--features tox`. The lobby, the join
+    // RPC and the ratification stay on the mesh either way; what moves is the
+    // hand. See `net::toxsink` for why the cfg lives there and not here.
+    let mut tox_sink = super::toxsink::TableSink::none();
 
     // Who mDNS has already told us about.
     //
@@ -518,6 +523,274 @@ pub async fn run(
     ));
     let mut housekeeping = tokio::time::interval(REBROADCAST);
 
+    // **The hand's own handling, in one place and called from two.**
+    //
+    // A table's game traffic rides GossipSub or, under D-019, a Tox group — and
+    // the answer to a hand event is the same either way: apply it, replay what
+    // was held for a stage this client had not reached, publish what comes out,
+    // and report what the interface needs. Only the *verdict* differs, and only
+    // because GossipSub has one and Tox does not.
+    //
+    // A macro rather than a function because the body reads and writes a dozen
+    // of this loop's own locals — `said`, `act_by`, `next_hand_at`, four
+    // report-once flags — and threading them through a signature would mean a
+    // struct refactor across a file whose most delicate property (one verdict,
+    // one place to report it) was a day's debugging to arrive at. Expanding the
+    // same tokens at both sites cannot make the two drift; two copies could.
+    //
+    // Every name it touches is declared above this point, which is what makes
+    // `macro_rules!` hygiene resolve them to the loop's own bindings.
+    macro_rules! hand_event {
+        ($h:expr, $bytes:expr) => {{
+            use crate::table::hand::Failed;
+            let now = super::node::now_unix_ms();
+                            match $h.on_event($bytes, &app_key, now) {
+                            Ok(sends) => {
+                                // Anything held for a stage this client had
+                                // not reached is judged again now, because
+                                // this event may have been the one that
+                                // reached it. Without this a peer that ran
+                                // ahead is parked for ever: the mesh does
+                                // not re-send, and a hand of 2m+4 stages
+                                // hears out-of-order messages as a matter
+                                // of course rather than as an exception.
+                                let (mut more, held_failures) = $h.replay_early(&app_key, now);
+                                let mut sends = sends;
+                                sends.append(&mut more);
+                                for e in held_failures {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "a held event was refused: {e}"
+                                        )))
+                                        .await;
+                                }
+                                publish_hand(
+                                    sends,
+                                    table_topic.as_ref(),
+                                    &mut swarm,
+                                    &mut said,
+                                    &tox_sink,
+                                );
+                                // Outside `dealt()`: a certificate is
+                                // decided at cryptographic stages too, and
+                                // gating the report on cards being out
+                                // delayed every note until some later
+                                // event happened to take another path.
+                                if let Some(n) = $h.take_cert_note() {
+                                    let _ = events.send(NodeEvent::Warning(n)).await;
+                                }
+                                // The prover's side of a shuffle context.
+                                // It used to be emitted only on success and
+                                // so never reached the error arm below; a
+                                // refused proof now ends the hand with a
+                                // `cause = 2` abort, which is an `Ok` with
+                                // sends, so the refusal's own note arrives
+                                // here too.
+                                if let Some(n) = $h.take_shuffle_note() {
+                                    let _ = events.send(NodeEvent::Warning(n)).await;
+                                }
+                                // The one condition this client cannot
+                                // repair and must not hide.
+                                if let Some(f) = $h.take_fork() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "this hand has forked: {f}"
+                                        )))
+                                        .await;
+                                }
+                                if $h.dealt() {
+                                    if !hand_reported {
+                                        hand_reported = true;
+                                        let init = $h.init();
+                                        let _ = events
+                                            .send(NodeEvent::HandBegan {
+                                                hand_id: init.hand_id,
+                                                button: init.button_position,
+                                                dealt_in: init.dealt_in.clone(),
+                                            })
+                                            .await;
+                                    }
+                                    let deck = ($h.shuffler(), $h.shuffled());
+                                    if deck_reported != Some(deck) {
+                                        deck_reported = Some(deck);
+                                        let _ = events
+                                            .send(NodeEvent::DeckProgress {
+                                                hand_id: $h.hand_id(),
+                                                shuffling: deck.0,
+                                                ready: deck.1,
+                                            })
+                                            .await;
+                                    }
+                                    // The cards, once and once only. They
+                                    // are read from a complete set of
+                                    // verified shares or not at all, so
+                                    // there is no partial state to report.
+                                            // How the count stands. A vote that is
+                                    // never counted is the quietest way
+                                    // this machinery can fail: everybody
+                                    // says their clock ran out and nothing
+                                    // happens.
+                                    if let Some((subject, held, need, d)) = $h.take_tally() {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "seat {subject} @{}: {held}/{need} agree",
+                                                short_hash(&d)
+                                            )))
+                                            .await;
+                                    }
+                                    // A seat the table acted for, once.
+                                    if let Some((seat, what)) = $h.take_certified_action() {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "the table acted for seat {seat}: {what:?}"
+                                            )))
+                                            .await;
+                                    }
+                                    if let Some(why) = $h.aborted() {
+                                        act_by = None;
+                                        // **Which abort, and not one
+                                        // sentence for all of them.** This
+                                        // said "a peer ended the hand on
+                                        // its own deadline" whatever
+                                        // happened, and since `cause = 2`
+                                        // exists that is sometimes simply
+                                        // untrue: a hand ended by a proof
+                                        // that does not hold ends in
+                                        // seconds, names a seat, and has
+                                        // nothing to do with anybody's
+                                        // clock. A player told the wrong
+                                        // reason looks for the wrong fault.
+                                        let said = match why {
+                                            crate::table::hand::Abort::BadShuffle { seat } => {
+                                                format!(
+                                                    "seat {seat}'s shuffle proof does not hold; the hand is void and every stack is restored"
+                                                )
+                                            }
+                                            crate::table::hand::Abort::BadReveal { seat } => {
+                                                format!(
+                                                    "seat {seat}'s reveal proof does not hold against the committed deck; the hand is void and every stack is restored"
+                                                )
+                                            }
+                                            crate::table::hand::Abort::Told { cause: 2 } => {
+                                                "a peer proved a shuffle did not hold; the hand is void and every stack is restored".into()
+                                            }
+                                            crate::table::hand::Abort::Told { cause: 3 } => {
+                                                "a peer proved a reveal share did not hold; the hand is void and every stack is restored".into()
+                                            }
+                                            _ => "a peer ended the hand on its own deadline; every stack is restored".into(),
+                                        };
+                                        let _ = events
+                                            .send(NodeEvent::Warning(said))
+                                            .await;
+                                        next_hand_at = Some(
+                                            tokio::time::Instant::now()
+                                                + std::time::Duration::from_millis(800),
+                                        );
+                                    }
+                                    let report =
+                                        report_hand($h, &events, &mut turn_reported).await;
+                                    if let Some(end) = report.ended {
+                                        next_hand_at = Some(
+                                            tokio::time::Instant::now() + end.pause(),
+                                        );
+                                    }
+                                    act_by = report.clock.apply(act_by, $h.action_deadline());
+                                    if let Some(cards) = $h.cards().filter(|_| !cards_reported) {
+                                        cards_reported = true;
+                                        let _ = events
+                                            .send(NodeEvent::CardsDealt {
+                                                hand_id: $h.hand_id(),
+                                                seats: $h.init().dealt_in.clone(),
+                                            })
+                                            .await;
+                                        let _ = events
+                                            .send(NodeEvent::HoleCards {
+                                                hand_id: $h.hand_id(),
+                                                cards: [cards[0].index(), cards[1].index()],
+                                            })
+                                            .await;
+                                    }
+                                } else {
+                                    let _ = events
+                                        .send(NodeEvent::HandWaiting {
+                                            hand_id: $h.hand_id(),
+                                            seats: $h.waiting_for(),
+                                        })
+                                        .await;
+                                }
+                                // **Reported before leaving, or this
+                                // node forwards nothing.** Every arm of
+                                // this branch returns to the top of the
+                                // loop, and with `validate_messages()` set
+                                // an unreported message is never passed on
+                                // — so a peer that hears an event only
+                                // through this one never hears it at all.
+                                Some(gossipsub::MessageAcceptance::Accept)
+                            }
+                            // A peer one stage ahead. Held, not refused:
+                            // GossipSub does not order two messages.
+                            Err(Failed::NotYet) => {
+                                if let Some(n) = $h.take_cert_note() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!("{n} | HELD")))
+                                        .await;
+                                }
+                                // **What is said to the mesh depends on
+                                // what was kept.** Accepting an event this
+                                // client could not verify forwards it in
+                                // this client's own name, and `NotYet` is
+                                // reachable before any signature is
+                                // checked — so unsigned junk used to be
+                                // both relayed and stored, sixty-four at a
+                                // time, evicting the genuine early events
+                                // the queue exists for.
+                                Some(match $h.hold($bytes.to_vec()) {
+                                    Holding::Kept => gossipsub::MessageAcceptance::Accept,
+                                    // Somebody else's hand, and verified:
+                                    // the table identity and the signature
+                                    // held, only the `hand_id` is not this
+                                    // client's. Relayed, because a peer one
+                                    // hand behind is exactly the
+                                    // intermediary a peer one hand ahead
+                                    // needs — it is simply not kept.
+                                    Holding::AnotherHand => {
+                                        gossipsub::MessageAcceptance::Accept
+                                    }
+                                    Holding::Malformed => {
+                                        gossipsub::MessageAcceptance::Reject
+                                    }
+                                })
+                            }
+                            // Not a hand event at all - fall through to the
+                            // formation, which is what it will be. The one
+                            // way out of this match that reports nothing,
+                            // because the formation handler below reports
+                            // for it.
+                            Err(Failed::Wire(joinwire::WireError::WrongType)) => None,
+                            Err(e) => {
+                                if let Some(n) = $h.take_shuffle_note() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(n))
+                                        .await;
+                                }
+                                if let Some(n) = $h.take_settle_note() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(n))
+                                        .await;
+                                }
+                                if let Some(n) = $h.take_cert_note() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(n))
+                                        .await;
+                                }
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!("hand: {e}")))
+                                    .await;
+                                Some(gossipsub::MessageAcceptance::Reject)
+                            }
+                        }
+        }};
+    }
     loop {
         tokio::select! {
             event = SwarmStreamExt::select_next_some(&mut swarm) => {
@@ -726,6 +999,7 @@ pub async fn run(
                                                         &mut swarm,
                                                         table_topic.as_ref(),
                                                         &events,
+                                                        &tox_sink,
                                                     )
                                                     .await;
                                                 }
@@ -857,268 +1131,12 @@ pub async fn run(
                         // so without this it would fall through to the
                         // formation and be refused as malformed.
                         if let Some(h) = hand.as_mut() {
-                            use crate::table::hand::Failed;
-                            let now = super::node::now_unix_ms();
-                            // **One verdict, one place to report it.** Every arm
-                            // of this match used to leave by its own `continue`,
-                            // and with `validate_messages()` set an arm that
-                            // forgot to report first made this node a black hole
-                            // for its own table's traffic — which is exactly what
-                            // happened, to all three of them at once, and cost a
-                            // day: two survivors of a dropped peer sat a stage
-                            // apart because the bytes that would have closed the
-                            // gap were at a neighbour that would not relay them.
-                            //
-                            // A missing report is not a mistake that can be
-                            // tested for cheaply — it needs three real nodes with
-                            // two of them unmeshed — so the shape is what
-                            // prevents it. `None` is the one deliberate way out
-                            // and it means *this was not a hand event*.
+                            // The hand, through the shared handling. The macro is
+                            // defined above the loop and this is one of its two call
+                            // sites; the other is the Tox group's. See there for why it
+                            // is a macro, and for what the verdict is.
                             let verdict: Option<gossipsub::MessageAcceptance> =
-                                match h.on_event(&message.data, &app_key, now) {
-                                Ok(sends) => {
-                                    // Anything held for a stage this client had
-                                    // not reached is judged again now, because
-                                    // this event may have been the one that
-                                    // reached it. Without this a peer that ran
-                                    // ahead is parked for ever: the mesh does
-                                    // not re-send, and a hand of 2m+4 stages
-                                    // hears out-of-order messages as a matter
-                                    // of course rather than as an exception.
-                                    let (mut more, held_failures) = h.replay_early(&app_key, now);
-                                    let mut sends = sends;
-                                    sends.append(&mut more);
-                                    for e in held_failures {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(format!(
-                                                "a held event was refused: {e}"
-                                            )))
-                                            .await;
-                                    }
-                                    publish_hand(
-                                        sends,
-                                        table_topic.as_ref(),
-                                        &mut swarm,
-                                        &mut said,
-                                    );
-                                    // Outside `dealt()`: a certificate is
-                                    // decided at cryptographic stages too, and
-                                    // gating the report on cards being out
-                                    // delayed every note until some later
-                                    // event happened to take another path.
-                                    if let Some(n) = h.take_cert_note() {
-                                        let _ = events.send(NodeEvent::Warning(n)).await;
-                                    }
-                                    // The prover's side of a shuffle context.
-                                    // It used to be emitted only on success and
-                                    // so never reached the error arm below; a
-                                    // refused proof now ends the hand with a
-                                    // `cause = 2` abort, which is an `Ok` with
-                                    // sends, so the refusal's own note arrives
-                                    // here too.
-                                    if let Some(n) = h.take_shuffle_note() {
-                                        let _ = events.send(NodeEvent::Warning(n)).await;
-                                    }
-                                    // The one condition this client cannot
-                                    // repair and must not hide.
-                                    if let Some(f) = h.take_fork() {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(format!(
-                                                "this hand has forked: {f}"
-                                            )))
-                                            .await;
-                                    }
-                                    if h.dealt() {
-                                        if !hand_reported {
-                                            hand_reported = true;
-                                            let init = h.init();
-                                            let _ = events
-                                                .send(NodeEvent::HandBegan {
-                                                    hand_id: init.hand_id,
-                                                    button: init.button_position,
-                                                    dealt_in: init.dealt_in.clone(),
-                                                })
-                                                .await;
-                                        }
-                                        let deck = (h.shuffler(), h.shuffled());
-                                        if deck_reported != Some(deck) {
-                                            deck_reported = Some(deck);
-                                            let _ = events
-                                                .send(NodeEvent::DeckProgress {
-                                                    hand_id: h.hand_id(),
-                                                    shuffling: deck.0,
-                                                    ready: deck.1,
-                                                })
-                                                .await;
-                                        }
-                                        // The cards, once and once only. They
-                                        // are read from a complete set of
-                                        // verified shares or not at all, so
-                                        // there is no partial state to report.
-                                                // How the count stands. A vote that is
-                                        // never counted is the quietest way
-                                        // this machinery can fail: everybody
-                                        // says their clock ran out and nothing
-                                        // happens.
-                                        if let Some((subject, held, need, d)) = h.take_tally() {
-                                            let _ = events
-                                                .send(NodeEvent::Warning(format!(
-                                                    "seat {subject} @{}: {held}/{need} agree",
-                                                    short_hash(&d)
-                                                )))
-                                                .await;
-                                        }
-                                        // A seat the table acted for, once.
-                                        if let Some((seat, what)) = h.take_certified_action() {
-                                            let _ = events
-                                                .send(NodeEvent::Warning(format!(
-                                                    "the table acted for seat {seat}: {what:?}"
-                                                )))
-                                                .await;
-                                        }
-                                        if let Some(why) = h.aborted() {
-                                            act_by = None;
-                                            // **Which abort, and not one
-                                            // sentence for all of them.** This
-                                            // said "a peer ended the hand on
-                                            // its own deadline" whatever
-                                            // happened, and since `cause = 2`
-                                            // exists that is sometimes simply
-                                            // untrue: a hand ended by a proof
-                                            // that does not hold ends in
-                                            // seconds, names a seat, and has
-                                            // nothing to do with anybody's
-                                            // clock. A player told the wrong
-                                            // reason looks for the wrong fault.
-                                            let said = match why {
-                                                crate::table::hand::Abort::BadShuffle { seat } => {
-                                                    format!(
-                                                        "seat {seat}'s shuffle proof does not hold; the hand is void and every stack is restored"
-                                                    )
-                                                }
-                                                crate::table::hand::Abort::BadReveal { seat } => {
-                                                    format!(
-                                                        "seat {seat}'s reveal proof does not hold against the committed deck; the hand is void and every stack is restored"
-                                                    )
-                                                }
-                                                crate::table::hand::Abort::Told { cause: 2 } => {
-                                                    "a peer proved a shuffle did not hold; the hand is void and every stack is restored".into()
-                                                }
-                                                crate::table::hand::Abort::Told { cause: 3 } => {
-                                                    "a peer proved a reveal share did not hold; the hand is void and every stack is restored".into()
-                                                }
-                                                _ => "a peer ended the hand on its own deadline; every stack is restored".into(),
-                                            };
-                                            let _ = events
-                                                .send(NodeEvent::Warning(said))
-                                                .await;
-                                            next_hand_at = Some(
-                                                tokio::time::Instant::now()
-                                                    + std::time::Duration::from_millis(800),
-                                            );
-                                        }
-                                        let report =
-                                            report_hand(h, &events, &mut turn_reported).await;
-                                        if let Some(end) = report.ended {
-                                            next_hand_at = Some(
-                                                tokio::time::Instant::now() + end.pause(),
-                                            );
-                                        }
-                                        act_by = report.clock.apply(act_by, h.action_deadline());
-                                        if let Some(cards) = h.cards().filter(|_| !cards_reported) {
-                                            cards_reported = true;
-                                            let _ = events
-                                                .send(NodeEvent::CardsDealt {
-                                                    hand_id: h.hand_id(),
-                                                    seats: h.init().dealt_in.clone(),
-                                                })
-                                                .await;
-                                            let _ = events
-                                                .send(NodeEvent::HoleCards {
-                                                    hand_id: h.hand_id(),
-                                                    cards: [cards[0].index(), cards[1].index()],
-                                                })
-                                                .await;
-                                        }
-                                    } else {
-                                        let _ = events
-                                            .send(NodeEvent::HandWaiting {
-                                                hand_id: h.hand_id(),
-                                                seats: h.waiting_for(),
-                                            })
-                                            .await;
-                                    }
-                                    // **Reported before leaving, or this
-                                    // node forwards nothing.** Every arm of
-                                    // this branch returns to the top of the
-                                    // loop, and with `validate_messages()` set
-                                    // an unreported message is never passed on
-                                    // — so a peer that hears an event only
-                                    // through this one never hears it at all.
-                                    Some(gossipsub::MessageAcceptance::Accept)
-                                }
-                                // A peer one stage ahead. Held, not refused:
-                                // GossipSub does not order two messages.
-                                Err(Failed::NotYet) => {
-                                    if let Some(n) = h.take_cert_note() {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(format!("{n} | HELD")))
-                                            .await;
-                                    }
-                                    // **What is said to the mesh depends on
-                                    // what was kept.** Accepting an event this
-                                    // client could not verify forwards it in
-                                    // this client's own name, and `NotYet` is
-                                    // reachable before any signature is
-                                    // checked — so unsigned junk used to be
-                                    // both relayed and stored, sixty-four at a
-                                    // time, evicting the genuine early events
-                                    // the queue exists for.
-                                    Some(match h.hold(message.data.clone()) {
-                                        Holding::Kept => gossipsub::MessageAcceptance::Accept,
-                                        // Somebody else's hand, and verified:
-                                        // the table identity and the signature
-                                        // held, only the `hand_id` is not this
-                                        // client's. Relayed, because a peer one
-                                        // hand behind is exactly the
-                                        // intermediary a peer one hand ahead
-                                        // needs — it is simply not kept.
-                                        Holding::AnotherHand => {
-                                            gossipsub::MessageAcceptance::Accept
-                                        }
-                                        Holding::Malformed => {
-                                            gossipsub::MessageAcceptance::Reject
-                                        }
-                                    })
-                                }
-                                // Not a hand event at all - fall through to the
-                                // formation, which is what it will be. The one
-                                // way out of this match that reports nothing,
-                                // because the formation handler below reports
-                                // for it.
-                                Err(Failed::Wire(joinwire::WireError::WrongType)) => None,
-                                Err(e) => {
-                                    if let Some(n) = h.take_shuffle_note() {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(n))
-                                            .await;
-                                    }
-                                    if let Some(n) = h.take_settle_note() {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(n))
-                                            .await;
-                                    }
-                                    if let Some(n) = h.take_cert_note() {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(n))
-                                            .await;
-                                    }
-                                    let _ = events
-                                        .send(NodeEvent::Warning(format!("hand: {e}")))
-                                        .await;
-                                    Some(gossipsub::MessageAcceptance::Reject)
-                                }
-                            };
+                                hand_event!(h, &message.data);
                             // The single exit. A hand event never leaves this
                             // branch without the mesh being told what became of
                             // it.
@@ -1179,6 +1197,7 @@ pub async fn run(
                                                 &mut swarm,
                                                 table_topic.as_ref(),
                                                 &events,
+                                                &tox_sink,
                                             )
                                             .await;
                                         }
@@ -2118,6 +2137,7 @@ pub async fn run(
                                     table_topic.as_ref(),
                                     &mut swarm,
                                     &mut said,
+                                    &tox_sink,
                                 );
                                 let report =
                                     report_hand(h, &events, &mut turn_reported).await;
@@ -2164,6 +2184,28 @@ pub async fn run(
 
             // Say again what this client already said, while the stage it
             // said it in is still open.
+            // **A message from the table's Tox group (D-019).**
+            //
+            // The same handling as the mesh's, through the same macro, because
+            // the answer to a hand event does not depend on what carried it.
+            //
+            // The verdict is discarded, and that is the one real difference
+            // between the two transports. GossipSub needs one because
+            // `validate_messages()` withholds forwarding until the application
+            // reports a verdict; a Tox group forwards nothing on this client's
+            // behalf, so there is nobody to tell and nothing to withhold. The
+            // macro still computes it, because computing it is what holds an
+            // early event and refuses a malformed one.
+            //
+            // Inert in a build without the feature: `TableSink::next` is a
+            // future that never resolves when there is no Tox table, so this
+            // branch contributes nothing to the `select!`.
+            Some(item) = tox_sink.next() => {
+                if let Some(h) = hand.as_mut() {
+                    let _ = hand_event!(h, &item.bytes);
+                }
+            }
+
             _ = resend.tick() => {
                 let (Some(h), Some(t)) = (hand.as_ref(), table_topic.as_ref()) else {
                     continue;
@@ -2219,7 +2261,7 @@ pub async fn run(
                         if let Some(n) = h.take_cert_note() {
                             let _ = events.send(NodeEvent::Warning(n)).await;
                         }
-                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said);
+                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said, &tox_sink);
                     }
                     Ok(_) => {
                         if let Some(n) = h.take_cert_note() {
@@ -2240,7 +2282,7 @@ pub async fn run(
                 act_by = None;
                 match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
                     Ok(sends) => {
-                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said);
+                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said, &tox_sink);
                         // **And name the cause when the transport is the cause.**
                         // A player reading "the hand ran out of time" looks for
                         // a slow opponent. Across two networks the opponent was
@@ -2299,7 +2341,7 @@ pub async fn run(
                 let now = super::node::now_unix_ms();
                 match h.act(action, &app_key, now) {
                     Ok(sends) => {
-                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said);
+                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said, &tox_sink);
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "your clock ran out — {action:?} for you"
@@ -2384,6 +2426,7 @@ pub async fn run(
                             &mut swarm,
                             table_topic.as_ref(),
                             &events,
+                            &tox_sink,
                         )
                         .await;
                     }
@@ -2933,6 +2976,7 @@ async fn begin_hand(
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
     topic: Option<&gossipsub::IdentTopic>,
     events: &Events,
+    tox: &super::toxsink::TableSink,
 ) {
     use crate::table::hand::Hand;
 
@@ -2948,7 +2992,7 @@ async fn begin_hand(
             // fact the one that goes missing: it is published the moment the
             // roster ratifies, which is before the last joiner has been
             // grafted into anybody's mesh for this topic.
-            publish_hand(sends, topic, swarm, said);
+            publish_hand(sends, topic, swarm, said, tox);
             // What this hand hangs off, said out loud. Two peers that opened
             // hand one from different views of the formation produce different
             // genesis values, and every message each sends is then "a different
@@ -2991,14 +3035,32 @@ async fn begin_hand(
 /// where it is filled. Sixty-four is more messages than a hand of ten seats
 /// produces before the deal, and dropping the oldest is the right direction:
 /// the oldest is the one a peer is least likely to still be waiting for.
+/// Put this client's own events on whichever transport the table has.
+///
+/// **One door for both.** D-019 moves a table's game traffic onto a Tox group
+/// and leaves the lobby, the join RPC and the ratification on libp2p, so a node
+/// may hold both at once — the table's mesh still carrying `PLAYER_LIST` and
+/// `TABLE_READY` while the hand rides the group. Which one a hand event takes is
+/// decided here and nowhere else: two call sites choosing separately is how the
+/// same hand comes to be half on each.
+///
+/// `said` is appended either way, because the reason for it does not depend on
+/// the transport. Neither GossipSub nor a Tox group keeps history, and a peer
+/// that joined after a publish never sees it — measured on both, and on the Tox
+/// side it killed a hand with neither end reporting anything wrong.
 fn publish_hand(
     sends: Vec<crate::table::hand::Send>,
     topic: Option<&gossipsub::IdentTopic>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
     said: &mut Vec<Vec<u8>>,
+    tox: &super::toxsink::TableSink,
 ) {
     for crate::table::hand::Send::Broadcast(out) in sends {
-        if let Some(t) = topic {
+        if tox.is_on_tox() {
+            // A refusal here is a full channel, not a lost table: the driver is
+            // behind, and the five-second re-send is what covers it.
+            tox.try_broadcast(&out);
+        } else if let Some(t) = topic {
             let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), out.clone());
         }
         if said.len() >= 64 {
