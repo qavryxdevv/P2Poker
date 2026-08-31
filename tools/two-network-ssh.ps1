@@ -63,14 +63,20 @@ if (-not (Test-Path $KeyPath)) {
     Fail "no key at $KeyPath. It lives on the USB volume; plug it in or pass -KeyPath."
 }
 
-$pinged = Test-Connection -ComputerName $hostPart -Count 2 -Quiet -ErrorAction SilentlyContinue
+# **TCP, not ICMP.** The first version tested with `Test-Connection` and would
+# have refused to run against the very machine this was written for: its
+# firewall drops ping and permits port 22, so `ping` said unreachable while ssh
+# worked. A reachability test has to probe the port the work goes over.
+$probe  = Test-NetConnection -ComputerName $hostPart -Port 22 -WarningAction SilentlyContinue
+$open   = $probe.TcpTestSucceeded
+$pinged = Test-Connection -ComputerName $hostPart -Count 1 -Quiet -ErrorAction SilentlyContinue
 $route  = Find-NetRoute -RemoteIPAddress $hostPart -ErrorAction SilentlyContinue | Select-Object -First 1
 $iface  = if ($route) { (Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue).Name } else { $null }
 
-Note "ping: $pinged"
+Note "tcp/22: $open   (icmp: $pinged - blocked by a firewall is normal and not a failure)"
 Note "route: $(if ($iface) { $iface } else { 'none' })"
 
-if (-not $pinged) {
+if (-not $open) {
     $vpn = Get-NetAdapter | Where-Object {
         $_.InterfaceDescription -match 'OpenVPN|TAP|Wintun|WireGuard'
     }
@@ -83,46 +89,67 @@ That address is a private range on the far side of one of them. Bring the
 tunnel up and run this again — nothing else here can reach it.
 "@
     }
-    Fail "$hostPart does not answer and no tunnel adapter explains it. Check the far machine is on."
+    Fail "$hostPart does not accept TCP/22 and no tunnel adapter explains it. Check the far machine is on and its firewall admits ssh."
 }
 
 if ($iface -match 'OpenVPN|TAP|Wintun|WireGuard') {
     Warn "the far end is reached THROUGH $iface. A tunnel is one more network with no NAT in the middle, so a success here does not prove NAT traversal — say so when reporting the result."
 }
 
+# --- the key, on terms Windows OpenSSH will accept ---------------------------
+# The key lives on removable media, whose permissions are wide open, and
+# Windows OpenSSH REFUSES a private key others can read — "bad permissions",
+# then "Permission denied (publickey)", which reads like a rejected key rather
+# than an unread one. Git's ssh is more forgiving, so this only bites here.
+#
+# So: a copy in this user's temp, its inheritance broken and its ACL cut to
+# this account alone, removed again in the `finally` at the end.
+Step "preparing a copy of the key Windows OpenSSH will load"
+$privKey = Join-Path $env:TEMP ('twonet-' + [IO.Path]::GetFileName($KeyPath))
+Copy-Item -Path $KeyPath -Destination $privKey -Force
+$acl = Get-Acl $privKey
+$acl.SetAccessRuleProtection($true, $false)
+$acl.Access | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
+$me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')
+$acl.AddAccessRule($rule)
+Set-Acl -Path $privKey -AclObject $acl
+Note "using $privKey (removed when this finishes)"
+
+try {
+
 # --- what is over there ------------------------------------------------------
 Step "asking the far end what it is"
-$ssh = @('-i', $KeyPath, '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes', $Target)
+$ssh = @('-i', $privKey, '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes', $Target)
 $uname = & ssh @ssh 'uname -s -m 2>/dev/null || ver' 2>&1
 if ($LASTEXITCODE -ne 0) {
     Fail "ssh to $Target failed: $uname"
 }
 Note "far end: $uname"
 
-$isWindows = $uname -match 'Windows|Microsoft'
-$remoteDir = if ($isWindows) { 'C:\p2p-poker-test' } else { '~/p2p-poker-test' }
+# Not `$isWindows`: PowerShell 7 owns `$IsWindows` as a read-only automatic
+# variable and variable names are case-insensitive, so assigning to it is a
+# hard error — and one that fires only on PS7, after the ssh round trip.
+$farIsWindows = $uname -match 'Windows|Microsoft'
+$remoteDir = if ($farIsWindows) { 'C:\p2p-poker-test' } else { '~/p2p-poker-test' }
 
 # --- the binary --------------------------------------------------------------
-if ($isWindows) {
+if ($farIsWindows) {
     if (-not (Test-Path $Binary)) { Fail "no binary at $Binary. cargo build --release" }
     Step "copying the Windows binary over"
-    & ssh @ssh "mkdir -p '$remoteDir' 2>/dev/null || md `"$remoteDir`"" | Out-Null
-    & scp -i $KeyPath -o StrictHostKeyChecking=accept-new $Binary "${Target}:$remoteDir/p2p-poker.exe"
+    # cmd's `md` fails when the directory is already there, which is fine.
+    & ssh @ssh "md $remoteDir" 2>$null | Out-Null
+    & scp -i $privKey -o StrictHostKeyChecking=accept-new $Binary "${Target}:$remoteDir/p2p-poker.exe"
     if ($LASTEXITCODE -ne 0) { Fail "scp failed" }
     $remoteExe = "$remoteDir/p2p-poker.exe"
 } else {
     Step "checking the far end can build for itself"
     $cargo = & ssh @ssh 'command -v cargo || true' 2>&1
     if (-not $cargo) {
-        Fail @"
-the far end runs $uname and has no cargo, and THIS machine cannot build for it:
-`rustup target list --installed` holds only x86_64-pc-windows-msvc and there is
-no cross-linker (no cc, clang or zig). One of these, and the script says which
-rather than guessing:
-  * install Rust on the far end and re-run, or
-  * install a Linux target and linker here, or
-  * build in WSL — which is also not installed on this machine.
-"@
+        $why = "the far end runs $uname and has no cargo, and this machine cannot build for it: "
+        $why += "only x86_64-pc-windows-msvc is installed, there is no cross-linker, and WSL has no distro. "
+        $why += "Install Rust on the far end, or a Linux target and linker here."
+        Fail $why
     }
     Note "cargo: $cargo — building there from a copy of the tree"
     & ssh @ssh "mkdir -p '$remoteDir'" | Out-Null
@@ -131,26 +158,46 @@ rather than guessing:
 
 # --- run both ends at once ---------------------------------------------------
 Step "running both ends for $Seconds s"
-$localLog  = Join-Path $env:TEMP 'twonet-local.log'
-$remoteLog = "$remoteDir/twonet-remote.log"
+$localLog       = Join-Path $env:TEMP 'twonet-local.log'
+$remoteLogLocal = Join-Path $env:TEMP 'twonet-remote.log'
 
-$remoteCmd = "cd '$remoteDir' && ./p2p-poker.exe --headless --profile ./profile --join $TableName --for $Seconds > '$remoteLog' 2>&1"
+# **Run synchronously over the ssh session and capture here.** The first
+# version started the far node with `Start-Process -RedirectStandardOutput`,
+# which produced a zero-byte log and a node that looked like it had crashed —
+# it had not; nothing was captured. Holding the session open and reading its
+# stdout is both simpler and the only version that produced a result.
+#
+# **`--no-mdns` on both ends.** Two machines on different subnets cannot find
+# each other by multicast anyway, so leaving it on would not have changed the
+# outcome - but it would have left the result arguable, and the whole point of
+# reaching across the boundary is to say the DHT lobby and the relay are what
+# did the finding. With it off there is nothing else it could have been.
+$remoteCmd = if ($farIsWindows) {
+    "cd $remoteDir && rmdir /s /q profile 2>nul & p2p-poker.exe --headless --no-mdns --profile $remoteDir\profile --join $TableName --for $Seconds"
+} else {
+    "cd '$remoteDir' && rm -rf profile && ./p2p-poker --headless --no-mdns --profile ./profile --join $TableName --for $Seconds"
+}
 $far = Start-Job -ScriptBlock {
-    param($ssh, $cmd)
-    & ssh @ssh $cmd 2>&1
-} -ArgumentList (,$ssh), $remoteCmd
+    param($ssh, $cmd, $out)
+    & ssh @ssh $cmd 2>&1 | Set-Content -Path $out
+} -ArgumentList (,$ssh), $remoteCmd, $remoteLogLocal
+
+# A fresh profile at this end as well. Without it the second run of this script
+# comes back as the first run's player, with its keys and its history, and a
+# result that depends on what an earlier run left behind is not a measurement.
+Remove-Item -Recurse -Force "$env:TEMP\twonet-profile" -ErrorAction SilentlyContinue
 
 # This end hosts the table, so the far end has something to look for.
 $here = Start-Process -FilePath $Binary -PassThru -NoNewWindow -RedirectStandardOutput $localLog `
-    -ArgumentList @('--headless', '--profile', "$env:TEMP\twonet-profile", '--host', $TableName,
-                    '--seats', '2', '--min', '2', '--for', "$Seconds")
+    -ArgumentList @('--headless', '--no-mdns', '--profile', "$env:TEMP\twonet-profile",
+                    '--host', $TableName, '--seats', '2', '--min', '2', '--for', "$Seconds")
 
 Wait-Process -Id $here.Id -Timeout ($Seconds + 60) -ErrorAction SilentlyContinue
 Receive-Job $far -Wait -AutoRemoveJob | Out-Null
 
 # --- what actually happened --------------------------------------------------
 Step "reading both logs"
-$remoteText = & ssh @ssh "cat '$remoteLog'" 2>&1
+$remoteText = Get-Content $remoteLogLocal -ErrorAction SilentlyContinue
 $localText  = Get-Content $localLog -ErrorAction SilentlyContinue
 
 function Count($text, $pattern) { ($text | Select-String -Pattern $pattern -AllMatches).Count }
@@ -174,4 +221,23 @@ if ((Count $remoteText 'the table is set') -gt 0) {
     Write-Host "RESULT  they never met. Discovery across the boundary is the whole finding." -ForegroundColor Red
 }
 
-Note "logs: $localLog and ${Target}:$remoteLog"
+Note "logs: $localLog and $remoteLogLocal"
+
+# The genesis hashes are the only thing that says the two really played the same
+# hand rather than two hands with the same name.
+$hereG  = ($localText  | Select-String -Pattern 'opens at genesis (\S+)' -AllMatches).Matches |
+          ForEach-Object { $_.Groups[1].Value }
+$thereG = ($remoteText | Select-String -Pattern 'opens at genesis (\S+)' -AllMatches).Matches |
+          ForEach-Object { $_.Groups[1].Value }
+$shared = @($hereG | Where-Object { $thereG -contains $_ })
+Note "hands here $($hereG.Count), there $($thereG.Count), at the same genesis $($shared.Count)"
+if ($shared.Count -gt 0) {
+    $list = $shared -join ', '
+    Write-Host "        agreed on: $list" -ForegroundColor Green
+}
+
+}
+finally {
+    # The key copy never outlives the run, whatever happened during it.
+    Remove-Item $privKey -Force -ErrorAction SilentlyContinue
+}
