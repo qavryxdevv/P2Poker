@@ -229,6 +229,48 @@ impl Tox {
     /// tree for libp2p, then pin Tox to it with `start_port`/`end_port`. That
     /// is a separate piece of work and is not pretended to here.
     pub fn new() -> Result<Self, Failed> {
+        Self::open(None, true)
+    }
+
+    /// An instance whose identity is fixed by a secret key.
+    ///
+    /// The Tox address that follows is then the same on every start, which is
+    /// what makes a two-machine measurement reproducible: both ends can be told
+    /// the other's public key before either of them runs, instead of one having
+    /// to learn it from the other at run time.
+    ///
+    /// **Not for a player's identity.** The client's own keys come from
+    /// `storage::profile`; this exists for `examples/tox_link` and for tests,
+    /// where a stable, disposable identity is the point.
+    pub fn with_secret_key(secret: &[u8; 32]) -> Result<Self, Failed> {
+        Self::open(Some(secret), true)
+    }
+
+    /// An instance that will not use UDP at all, so every connection goes
+    /// through a TCP relay.
+    ///
+    /// # Why this exists, and it is a measurement finding rather than a taste
+    ///
+    /// Two machines behind **one** router but on **different subnets** cannot
+    /// reach each other over Tox's UDP path, and the reason is structural: the
+    /// DHT publishes both under the same public address, so a hole punch asks
+    /// the router to hairpin a packet back to itself, and Tox's only
+    /// non-public path is LAN discovery, which is multicast and does not cross
+    /// a subnet boundary. Measured 2026-08-31: both ends UDP-connected to the
+    /// DHT in nine seconds and no friend connection in a hundred and fifty.
+    ///
+    /// libp2p succeeds in that topology because DCUtR exchanges **private**
+    /// address candidates as well as public ones, and the two subnets are
+    /// routable to each other. Tox has no equivalent.
+    ///
+    /// A TCP relay is a third party with an address of its own, so nothing has
+    /// to hairpin. That makes this the fallback for the one topology where
+    /// D-019's transport is otherwise worse than the one it replaces.
+    pub fn tcp_only(secret: &[u8; 32]) -> Result<Self, Failed> {
+        Self::open(Some(secret), false)
+    }
+
+    fn open(secret: Option<&[u8; 32]>, udp: bool) -> Result<Self, Failed> {
         // SAFETY: `tox_options_new` either returns a valid pointer or null and
         // sets the error, which is checked before the pointer is used.
         unsafe {
@@ -239,7 +281,7 @@ impl Tox {
             }
 
             sys::tox_options_set_ipv6_enabled(opts, true);
-            sys::tox_options_set_udp_enabled(opts, true);
+            sys::tox_options_set_udp_enabled(opts, udp);
             // On, and said so rather than left to the default: a client that
             // depends on a default is a client that changes behaviour when the
             // vendored tree moves.
@@ -248,6 +290,15 @@ impl Tox {
             // also the one discovery path that keeps working when the internet
             // does not.
             sys::tox_options_set_local_discovery_enabled(opts, true);
+
+            if let Some(key) = secret {
+                sys::tox_options_set_savedata_type(opts, sys::TOX_SAVEDATA_TYPE_SECRET_KEY);
+                // The pointer must outlive `tox_new`, which toxcore documents
+                // and which is why `key` is borrowed by the caller's frame
+                // rather than built here: a temporary would be dropped before
+                // the call below reads it.
+                sys::tox_options_set_savedata_data(opts, key.as_ptr(), key.len());
+            }
 
             let mut err: c_int = 0;
             let ptr = sys::tox_new(opts, &mut err);
@@ -301,6 +352,41 @@ impl Tox {
         } else {
             Err(Failed::New(err))
         }
+    }
+
+    /// Add one TCP relay.
+    ///
+    /// **A different list from [`bootstrap`](Tox::bootstrap)'s.** `tox_bootstrap`
+    /// takes DHT nodes, which are reached over UDP; a client with UDP disabled
+    /// bootstraps through relays and reaches nothing without at least one of
+    /// these. Most public Tox nodes are both, at the same address and key, but
+    /// they have to be handed over twice because toxcore keeps two lists.
+    ///
+    /// Worth adding even when UDP is on: it is the fallback toxcore uses when
+    /// a peer cannot be reached directly, and a relay is a third party with an
+    /// address of its own — which is exactly what two hosts behind one router
+    /// need, since neither can hairpin a packet to the other.
+    pub fn add_tcp_relay(&mut self, host: &str, port: u16, public_key: &[u8; 32]) -> Result<(), Failed> {
+        let host = CString::new(host).map_err(|_| Failed::Address("it contains a NUL byte"))?;
+        let mut err: c_int = 0;
+        // SAFETY: `host` outlives the call; the key is exactly 32 bytes.
+        let ok = unsafe {
+            sys::tox_add_tcp_relay(self.ptr, host.as_ptr(), port, public_key.as_ptr(), &mut err)
+        };
+        Self::ok(ok && err == sys::TOX_ERR_BOOTSTRAP_OK, "tox_add_tcp_relay", err)
+    }
+
+    /// Whether this instance has reached the Tox network at all.
+    ///
+    /// `0` none, `1` through a TCP relay, `2` UDP — `Tox_Connection`'s own
+    /// values. **The first thing to look at when nothing happens**: two
+    /// instances on one machine find each other by local discovery without ever
+    /// touching the DHT, so a test that passes there says nothing about
+    /// whether bootstrapping worked. Across two networks it is the whole
+    /// question, and without this the answer looks identical to a firewall.
+    pub fn connection(&self) -> i32 {
+        // SAFETY: the pointer is valid for the lifetime of `self`.
+        unsafe { sys::tox_self_get_connection_status(self.ptr) }
     }
 
     /// How long toxcore wants before the next [`iterate`](Tox::iterate).

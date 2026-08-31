@@ -43,6 +43,14 @@ pub const TOX_ERR_NEW_OK: c_int = 0;
 pub const TOX_ERR_BOOTSTRAP_OK: c_int = 0;
 pub const TOX_ERR_OPTIONS_NEW_OK: c_int = 0;
 
+/// `tox_options.h:54`
+pub const TOX_SAVEDATA_TYPE_NONE: c_int = 0;
+/// `tox_options.h:64`. Thirty-two bytes of secret key, and the identity that
+/// follows from it is the same every start — which is what makes a two-machine
+/// measurement reproducible instead of needing each end to learn the other's
+/// key at run time.
+pub const TOX_SAVEDATA_TYPE_SECRET_KEY: c_int = 2;
+
 extern "C" {
     /// `tox_options.h:452`
     pub fn tox_options_new(error: *mut c_int) -> *mut Tox_Options;
@@ -60,6 +68,15 @@ extern "C" {
     pub fn tox_options_set_start_port(options: *mut Tox_Options, port: u16);
     /// `tox_options.h:352`
     pub fn tox_options_set_end_port(options: *mut Tox_Options, port: u16);
+    /// `tox_options.h:364`
+    pub fn tox_options_set_savedata_type(options: *mut Tox_Options, savedata_type: c_int);
+    /// `tox_options.h:368`. The pointer must outlive `tox_new`; toxcore reads
+    /// it there and does not copy.
+    pub fn tox_options_set_savedata_data(
+        options: *mut Tox_Options,
+        data: *const u8,
+        length: usize,
+    ) -> bool;
 
     /// `tox.h:504`
     pub fn tox_new(options: *const Tox_Options, error: *mut c_int) -> *mut Tox;
@@ -73,12 +90,26 @@ extern "C" {
         public_key: *const u8,
         error: *mut c_int,
     ) -> bool;
+    /// `tox.h:600`. A **TCP relay**, which is a different list from the DHT
+    /// nodes `tox_bootstrap` takes: with UDP disabled, bootstrapping reaches
+    /// nothing without at least one of these. Measured 2026-08-31 — with
+    /// `udp_enabled(false)` and no relay added, `tox_self_get_connection_status`
+    /// stays at `none` for ever and it looks exactly like a dead network.
+    pub fn tox_add_tcp_relay(
+        tox: *mut Tox,
+        host: *const c_char,
+        port: u16,
+        public_key: *const u8,
+        error: *mut c_int,
+    ) -> bool;
     /// `tox.h:672`
     pub fn tox_iteration_interval(tox: *const Tox) -> u32;
     /// `tox.h:680`
     pub fn tox_iterate(tox: *mut Tox, user_data: *mut c_void);
     /// `tox.h:698`
     pub fn tox_self_get_address(tox: *const Tox, address: *mut u8);
+    /// `tox.h:646`. `Tox_Connection`: 0 none, 1 TCP, 2 UDP.
+    pub fn tox_self_get_connection_status(tox: *const Tox) -> c_int;
 }
 
 // ---------------------------------------------------------------------------

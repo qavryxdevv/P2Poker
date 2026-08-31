@@ -1296,6 +1296,76 @@ byte over a stale group went `UDP direct` in three seconds as friends.
 the join request, both 32 bytes. That is `PROTOCOL.md`'s to make, not an
 implementation's, and it is the third thing D-019 now owes a document.
 
+
+### Measured across two networks: the group carries 3.4 MB each way
+
+`tools/two-network-tox.ps1`, 150 s, the same two machines the libp2p runs used:
+
+```
+here : self 2  sent 2930  received 2524  bytes_in 3 445 260
+there: self 2  sent 2610  received 2599  bytes_in 3 547 635
+here : friend up after 13.6s        there: friend up after 12.7s
+there: joined the group after 12.7s
+here : FIRST PACKET after 17.1s     there: FIRST PACKET after 16.0s
+RESULT  the group carried traffic BOTH ways across the boundary
+```
+
+**A libp2p relay circuit stops at 128 KiB.** This run moved twenty-seven times
+that in each direction and did not stop — which is the whole of D-019's case,
+now measured rather than argued. The invitation crossed in under thirteen
+seconds and nobody searched the DHT for the group: it is created `PRIVATE` and
+its `chat_id` is never looked up.
+
+### It failed three times first, and each failure is worth keeping
+
+**1. A Tox friendship is two-sided.** The first probe had only the joiner call
+`tox_friend_add_norequest`. The other end has never heard of the caller and does
+not answer it, so the result was 150 s of silence that read exactly like an
+unreachable machine. In the client this cannot happen — both ends take both keys
+off the ratified roster — but the probe had no roster, so identities are now
+seeded and each end is told the other's key with `--peer` before either starts.
+
+**2. Nothing said whether either end had reached the Tox network at all.**
+`tox_self_get_connection_status` was not bound, so "no friend connection" and
+"never bootstrapped" looked identical. It is bound now and printed on every
+change, and it immediately showed both ends UDP-connected in nine seconds — which
+moved the question from *"is the network there"* to *"why can these two not find
+each other"*.
+
+**3. And the answer to that was: the relay list was missing.** toxcore keeps
+**two** lists. `tox_bootstrap` takes DHT nodes, reached over UDP.
+`tox_add_tcp_relay` takes relays, and it had never been called. With
+`udp_enabled(false)` and no relay the connection status stays at `none` for
+ever; with UDP on, both ends reach the DHT and still cannot reach *each other*.
+
+The owner's correction is what closed it: **a client holds connections to
+several relays at all times, even with UDP working** — qTox does — because a
+relay is the fallback for a peer that cannot be reached directly, and that is
+the answer to a NAT. Every node is now added twice, to the DHT and to the relay
+list on every TCP port it advertises, from the public list at
+`https://nodes.tox.chat/json` filtered to nodes reporting both up. Ten nodes,
+twenty-six relay entries.
+
+### Why it needed the relays here, and it is the interesting part
+
+**Both machines share one public address**, measured: `198.51.100.17` from each.
+They are on different subnets behind one router. So Tox's DHT publishes both
+under the same address and a hole punch asks the router to hairpin a packet back
+to itself, which consumer routers generally will not do; and Tox's only
+non-public path is LAN discovery, which is multicast and does not cross a subnet
+boundary.
+
+**libp2p succeeds in that topology and Tox does not**, because DCUtR exchanges
+*private* address candidates as well as public ones and the two subnets are
+routable to each other — that is why the libp2p runs got direct connections here
+at all. Tox has no equivalent. What it has instead is the relay, which is a
+third party with an address of its own, so nothing needs to hairpin.
+
+So this bench is **harder** for Tox than a genuine pair of networks would be,
+and the result stands anyway. What it does not prove remains what it did not
+prove for libp2p: NAT traversal between two different NATs, which needs an
+endpoint outside this building.
+
 ### What is next, in order
 
 1. ~~The fragmentation layer~~ **done**: `table::fragment`, eleven tests, and
@@ -1337,10 +1407,13 @@ implementation's, and it is the third thing D-019 now owes a document.
    `FromTable::claimed` stays advisory, because a chat id travels in a public
    advertisement and "it arrived over the table's group" is worth nothing as a
    claim about authorship.
-5. **The measurement across two networks**, which is the only thing that
-   settles whether D-019 was right. `tools/two-network-ssh.ps1` already runs
-   both ends and compares genesis hashes; it needs a Tox-side count next to the
-   relay counts it prints now.
+5. ~~The measurement across two networks~~ **done, and it passed** - see
+   above. `tools/two-network-tox.ps1` runs both ends and reports it.
+6. **The node list has to update itself.** It is baked in as of 2026-08-31,
+   which is fine for a measurement and wrong for a client: a hardcoded list goes
+   stale and takes the fallback with it. It needs a bundled list for the first
+   run, a cached copy refreshed from `https://nodes.tox.chat/json`, and every
+   bound `SPEC_CS.md` §27 asks of anything fetched from the network.
 
 The vendored trees are **fetched at pinned commits by `tools/build-tox.ps1`,
 not committed** — 12.7 MB for a transport whose whole point is a measurement
