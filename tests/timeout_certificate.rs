@@ -696,9 +696,9 @@ fn the_subject_applies_a_certificate_about_a_stage_it_has_left() {
         }
     }
 
-    for s in 0..2usize {
+    for (s, hand) in hands.iter().enumerate().take(2) {
         assert!(
-            hands[s].aborted().is_some(),
+            hand.aborted().is_some(),
             "seat {s} never ended the hand it certified"
         );
     }
@@ -1075,8 +1075,8 @@ fn the_hand_after_a_low_seat_is_dropped_can_still_shuffle() {
     // The shuffle note is emitted on success too — the prover's own context,
     // which exists to be compared against a verifier's when one refuses — so
     // only the ones that name a refusal count here.
-    for to in 0..2usize {
-        if let Some(n) = second[to].take_shuffle_note() {
+    for hand in second.iter_mut().take(2) {
+        if let Some(n) = hand.take_shuffle_note() {
             if n.contains("refused") || n.contains("refusal") {
                 refusals.push(n);
             }

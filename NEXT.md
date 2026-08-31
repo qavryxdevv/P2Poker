@@ -1962,6 +1962,72 @@ not committed** — 12.7 MB for a transport whose whole point is a measurement
 that has not been taken. `vendor/ziffle` is committed, so this is the exception;
 the script carries the argument and says what would change the answer.
 
+## Every reference in the corpus, checked on every `cargo test`
+
+`S1-B` was found by a reader following a citation cycle: `PROTOCOL.md` §4.4 says
+the seed-to-button rule is `STATE_MACHINE.md`'s, T10 points at §7.9, and §7.9
+says the constructions are `PROTOCOL.md`'s. Every document named another as the
+owner and none wrote the value.
+
+That is the inverse of what D-011 rule 1 guards against. The rule exists because
+two copies of a value drift apart, so the corpus has been swept for duplicates
+more than once — and **a duplicate sweep cannot see this failure at all**, because
+there is nothing to compare. The reader is simply sent somewhere there is nothing.
+
+Half of that class is decidable by machine: the address does not exist. That half
+is now `tests/corpus_references.rs`.
+
+**Two things it got wrong first, and both are in the test as comments, because
+each is a way the next version of it will go wrong again.**
+
+`SPEC_CS.md` is the original specification and numbers its sections as plain
+`N. Title` lines with no markdown heading, so a heading-only parser reads it as
+having none — and then all **489** references into it look dangling. A tool
+reporting 489 defects in a corpus this carefully kept is a tool that is wrong,
+which is how it was caught before anything was filed. The guard that follows is
+in the test: *a document parsed as having no sections is a parser that does not
+understand it*.
+
+That guard then fired on its own first run, on `DECISIONS.md` — which numbers its
+entries `D-001` and has no section marks at all. It is a **source** of references
+and never a target, so the guard is derived from the documents actually pointed
+at rather than from a list of live ones. A list would have had to be maintained;
+the derivation cannot go stale.
+
+The match is also tight on purpose. A bare `§` in this corpus usually means *this*
+document's section, and a loose window paired one with whatever document name
+stood a few words earlier — twenty-three hits, most of them exactly that. The mark
+must follow the name immediately, with nothing between but a possessive.
+
+**Result: 1 305 live cross-document references, four defects, three of them
+filed.** The three are `S1-C` on `DECISIONS.md`'s open list. Each needs an
+editorial decision rather than a renumber, and for two the cited content is not
+in the cited document at all:
+
+* **`NETWORK_STACK.md` §12.12** — cited by `CRYPTOGRAPHY.md`, `PROTOCOL.md` and
+  `STATE_MACHINE.md`, all three, as the authority for *no two-network test has
+  been run*. §12 has no subsections, and the claim is now **false**: the runs are
+  measured above. A rewrite, not a renumber.
+* **`CRYPTOGRAPHY.md` §3.2** — where `PROTOCOL.md` §2.8 sent its BLAKE3 rationale
+  under D-011 rule 1. §3 is *Constructions considered and rejected*, no
+  subsections; the content is in §1's table, §9's table and OQ-6.
+* **`CRYPTOGRAPHY.md` §4.7** — `THREAT_MODEL.md` X4 names it as where the
+  canonical encoding gate lives. §4 is *The group, and why*, the elliptic curve.
+  The gate is `PROTOCOL.md`'s and `NETWORK_STACK.md`'s; this half of the citation
+  has no home.
+
+The fourth was fixed here: `CRYPTOGRAPHY.md` §0 is cited by `PROTOCOL.md` for a
+rule it quotes verbatim, and the preamble carrying it had no heading. The number
+was already chosen by its citers, so writing it down invented nothing.
+
+**And the test asserts it did the work.** A tight matcher is a matcher that can
+quietly stop matching, leaving a green test that checks nothing — so the count of
+references it resolved is asserted against a floor. A parser that breaks fails
+loudly instead of passing.
+
+The half this does not settle is whether the section it lands in actually contains
+the thing. That needs a reader, and the three rows above are what a reader found.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that

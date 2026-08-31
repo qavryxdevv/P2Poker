@@ -386,7 +386,17 @@ fn headless(player: Player, run: Run, join: Option<String>) {
         // immediately and for ever, and its `select!` arm would spin.
         let (commands, command_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
-            if let Err(e) = p2p_poker::net::run::run(identity, app_key, tx, command_rx, local_discovery, port, profile_dir, autoplay).await {
+            let cfg = p2p_poker::net::run::Run {
+                identity,
+                app_key,
+                events: tx,
+                commands: command_rx,
+                local_discovery,
+                port,
+                profile_dir,
+                autoplay,
+            };
+            if let Err(e) = p2p_poker::net::run::run(cfg).await {
                 eprintln!("node stopped: {e}");
             }
         });
@@ -548,7 +558,17 @@ fn windowed(player: Player, run: Run) -> Started {
         if let Some(command) = hosted {
             let _ = opening.send(command).await;
         }
-        if let Err(e) = p2p_poker::net::run::run(identity, node_key, tx, command_rx, local_discovery, port, node_dir, autoplay).await {
+        let cfg = p2p_poker::net::run::Run {
+            identity,
+            app_key: node_key,
+            events: tx,
+            commands: command_rx,
+            local_discovery,
+            port,
+            profile_dir: node_dir,
+            autoplay,
+        };
+        if let Err(e) = p2p_poker::net::run::run(cfg).await {
             eprintln!("node stopped: {e}");
         }
     });

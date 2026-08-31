@@ -1,5 +1,7 @@
 # CRYPTOGRAPHY.md
 
+## 0. Scope, conventions, and the decisions applied here
+
 Binding specification of the cryptography used by the p2p-poker client.
 
 Required by `SPEC_CS.md` §29, which demands that this document state **exactly which

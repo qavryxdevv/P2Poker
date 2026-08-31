@@ -218,16 +218,34 @@ pub struct Hosted {
     pub key: ed25519_dalek::SigningKey,
 }
 
-pub async fn run(
-    identity: identity::Keypair,
-    app_key: ed25519_dalek::SigningKey,
-    events: mpsc::Sender<NodeEvent>,
-    mut commands: mpsc::Receiver<NodeCommand>,
-    local_discovery: bool,
-    port: u16,
-    profile_dir: std::path::PathBuf,
-    autoplay: Option<std::time::Duration>,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// What one node needs to start, in one value.
+///
+/// These were positional arguments until `--autoplay` made an eighth. A caller
+/// reads the field names; the alternative is eight positions of which two are a
+/// `bool` and a `u16` next to each other.
+pub struct Run {
+    pub identity: identity::Keypair,
+    pub app_key: ed25519_dalek::SigningKey,
+    pub events: mpsc::Sender<NodeEvent>,
+    pub commands: mpsc::Receiver<NodeCommand>,
+    pub local_discovery: bool,
+    pub port: u16,
+    pub profile_dir: std::path::PathBuf,
+    /// Seat this node plays itself, deciding after this long. `None` is a human.
+    pub autoplay: Option<std::time::Duration>,
+}
+
+pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
+    let Run {
+        identity,
+        app_key,
+        events,
+        mut commands,
+        local_discovery,
+        port,
+        profile_dir,
+        autoplay,
+    } = cfg;
     // Advisory events are offered, not waited for. See `Events`.
     let events = Events::new(events);
     let mut swarm = swarm::build(NodeConfig {

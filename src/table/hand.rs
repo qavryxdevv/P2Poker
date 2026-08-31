@@ -1642,7 +1642,7 @@ impl Hand {
         chain
             .accept_step(&deal.deck, me, next, &body.proof, proof_seq)
             .map_err(|e| step_failure(me, e))
-            .map_err(|e| {
+            .inspect_err(|_| {
                 // The instrument that was missing. Every diagnostic for this
                 // family was on the path that verifies a PEER's proof, and the
                 // refusal that keeps appearing in live runs is about this
@@ -1652,7 +1652,6 @@ impl Hand {
                     "own shuffle refused at round {round}: chain step {taken}, turn {turn:?}, slot {} | prover {mine}",
                     self.slot.sequence
                 ));
-                e
             })?;
         // Said on success too, once per hand per shuffler. A verifier's
         // refusal names what IT checked against; without the prover's side
@@ -8005,7 +8004,7 @@ mod tests {
             event_hash: [b; 32],
         };
 
-        let mut tries_for = |want: SeatIdx| -> u32 {
+        let tries_for = |want: SeatIdx| -> u32 {
             for n in 0u32..10_000 {
                 let mut mine = [0u8; 32];
                 mine[..4].copy_from_slice(&n.to_be_bytes());
