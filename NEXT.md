@@ -909,44 +909,66 @@ chain was and not what the proof was checked against.
 
 ## Still open
 
-* **A seat certified absent never re-enters**, because `next_hand`'s
-  `by_certificate` branch only ever filters `self.open.required`. D-024 makes
-  that permanence immediate and audible for the first time; it does not change
-  it, and whether it is right is a rules question nobody has answered.
-* **The kind-1 fork is unrepairable at the receiver** and is now reported by
-  name. A betting stage is single-writer, so a subject certified out of position
-  and the voters are on two branches at one sequence, and §3.2 forbids
-  redefining a `stage_hash` already chained from.
-* **`src/protocol/slot.rs` and `src/protocol/antireplay.rs` have no callers.**
-  Both are fully written and documented as *"one site, for the whole project"*,
-  and the only reference to either outside their own files is `pub mod` in
-  `src/protocol/mod.rs`. §5.2.1's eight-tuple anti-replay key does not exist at
-  runtime. Wire it in or delete it, but it must not stay a third opinion about
-  replay that nothing runs.
-* **The second half of §4.10's precedence rule** — a receiver that applied an
-  abort and later accepts a complete `HAND_COMPLETE` replaces its terminal — is
-  still not implemented.
+Checked against the tree on the day this was written, and three entries that
+stood here are gone because they are done: the anti-replay modules are deleted
+(D-025), §4.10's second half is implemented, and the shuffle refusal that was
+*"seen once and not explained"* is explained and fixed — it was
+`ShuffleAdmission::admit` bounding a seat index and a chain position with one
+argument.
 
-* `STATE_HASH` / `STATE_ACK` — the hash is computed inside `HAND_COMPLETE` and
-  the stage that carries it does not exist. §12's T61 fires after every settled
-  hand and has nothing to fire on.
-* The RNG beacon, which `provisional_button` stands in for.
-* `HAND_ABORT` causes 2 and 3: this build refuses them rather than check
+### Protocol features that do not exist yet
+
+* **`STATE_HASH` / `STATE_ACK`.** The hash is computed inside `HAND_COMPLETE`
+  and the stage that carries it does not exist, so §12's T61 fires after every
+  settled hand and has nothing to fire on. `src/protocol/checkpoint.rs` and
+  `seats.rs` are the draft of §6.2's records and are deliberately kept unwired
+  for this; `tests/anti_replay_authority.rs` holds them to that.
+* **The RNG beacon.** `provisional_button` stands in for it, in nine places in
+  `table/hand.rs`.
+* **`HAND_ABORT` causes 2 and 3.** This build refuses them rather than check
   evidence it cannot verify, and the embedded evidence needs a larger
   `FRAME_CAP`.
-* Two machines on two networks. Everything measured so far is three processes on
-  one.
-* **Seen once and not explained**: `hand: seat 2's shuffle: a second attempt at
-  a position that already has one`, on one survivor of a kill run, while the
-  other saw nothing and the table played on. Every ordinary duplicate is already
-  silent — a re-sent event carries a sequence the receiver has left, and
-  `on_event` returns `Ok` for those without a word — so this was a second
-  arrival at a sequence the receiver had **not** left, which the obvious paths
-  do not produce. It matters more than it looks: with validation verdicts now
-  reported, a refusal is a `Reject`, and repeatedly rejecting an honest peer is
-  how it loses mesh score. Reproduce before fixing; do not guess a duplicate
-  check into the shuffle chain.
-* The forwarding fix has no test. This harness delivers every message to every
-  survivor, which is a mesh that forwards — by construction it cannot see a
-  client that fails to. It needs three libp2p nodes with two of them not
-  directly meshed.
+
+### Rules questions nobody has answered
+
+* **A seat certified absent never re-enters.** `next_hand` only ever filters
+  `self.open.required`, in both branches since the roster was made monotone.
+  D-013 says one silent seat should cost one hand and not the table, and this
+  costs the table. It is consistent and it may be wrong.
+* **The kind-1 fork is unrepairable at the receiver.** A betting stage is
+  single-writer, so a subject certified out of position and the voters are on
+  two branches at one sequence, and §3.2 forbids redefining a `stage_hash`
+  already chained from. It is reported by name and nothing more.
+* **A withheld `HAND_ABORT`, released at a stage of the attacker's choosing.**
+  The receiver's own expired deadline still gates it, so the attacker chooses
+  the moment inside a window the receiver had already entered. Whether that is
+  worth closing, and at what cost to the witness-independent terminal, is not
+  settled.
+
+### Two disagreements that have instruments and no explanation
+
+Both were last seen at the moment a killed client leaves, which is the most
+turbulent point of a run, and neither has recurred in the five runs since.
+
+* **A shuffle proof that fails verification** (`the argument does not hold for
+  this pair of decks`). Ruled out: the input deck hash is compared before
+  verification and passes, so both hold the same deck. `ctx_report` now prints
+  the three parts of the context that can vary, from **both** sides.
+* **A settlement mismatch.** Ruled out: this client's own timeout action follows
+  the same rule the certificate does, so a self-fold and a certified check
+  cannot be two different hands. The refusal now prints both `final_stacks`
+  vectors and both pot counts.
+
+### Coverage that is missing rather than broken
+
+* **The forwarding fix has no test.** The in-process harness delivers every
+  message to every survivor, which is a mesh that forwards — by construction it
+  cannot see a client that fails to. It needs three libp2p nodes with two of
+  them not directly meshed.
+* **Formation is about 80 per cent.** Ten of twelve runs formed after the
+  subscription re-announce, against roughly two of six before, and the failures
+  are not characterised. The `lobby topic:` line names both sides now, so a
+  failing run says whether the founder could see the joiners at all.
+* **Two machines on two networks.** Everything measured so far is three
+  processes on one, which is the environment least likely to show a NAT,
+  relay or forwarding fault.
