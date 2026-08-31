@@ -954,7 +954,7 @@ pub async fn run(
                                                                 act_by = None;
                                             let _ = events
                                                 .send(NodeEvent::Warning(
-                                                    "a peer ended the hand on its own deadline;                                                      every stack is restored"
+                                                    "a peer ended the hand on its own deadline; every stack is restored"
                                                         .into(),
                                                 ))
                                                 .await;
@@ -2346,7 +2346,7 @@ pub async fn run(
                         alone_said = true;
                         let _ = events
                             .send(NodeEvent::Warning(
-                                "no other poker client has been reached yet — a table                                  hosted now is one nobody can see. On one machine that                                  is local discovery failing; across networks it is the                                  relay."
+                                "no other poker client has been reached yet — a table hosted now is one nobody can see. On one machine that is local discovery failing; across networks it is the relay."
                                     .into(),
                             ))
                             .await;
@@ -2357,7 +2357,7 @@ pub async fn run(
                     if known > 0 || mesh > 0 || !connected.is_empty() {
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "lobby topic: {mesh} of {known} subscribed {who:?};                                  connected {connected:?}"
+                                "lobby topic: {mesh} of {known} subscribed {who:?}; connected {connected:?}"
                             )))
                             .await;
                     }
@@ -2368,7 +2368,7 @@ pub async fn run(
                 if lost > 0 {
                     let _ = events
                         .send(NodeEvent::Warning(format!(
-                            "{lost} advisory event(s) dropped: the log could not                              keep up, and the node did not wait for it"
+                            "{lost} advisory event(s) dropped: the log could not keep up, and the node did not wait for it"
                         )))
                         .await;
                 }

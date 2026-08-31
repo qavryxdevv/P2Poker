@@ -461,7 +461,7 @@ mod tests {
             let advertised = sng_hand_deadline_ms(n);
             assert!(
                 advertised >= minimum,
-                "at {n} seats the advert offers {bank} ms of reserve and only {advertised} ms                  of deadline, against a floor of {minimum}"
+                "at {n} seats the advert offers {bank} ms of reserve and only {advertised} ms of deadline, against a floor of {minimum}"
             );
         }
     }

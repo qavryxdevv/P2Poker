@@ -456,7 +456,7 @@ mod tests {
         assert!(only_one_live(&r, &dealt), "the hand is over now");
         assert!(
             !round_complete(&r, &dealt),
-            "and the round is NOT complete - the survivor has not acted, which              is exactly why this needs its own condition"
+            "and the round is NOT complete - the survivor has not acted, which is exactly why this needs its own condition"
         );
         // The survivor is still technically able to act, which is the trap.
         assert!(can_act(&r, &dealt, 1));

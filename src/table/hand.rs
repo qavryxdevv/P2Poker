@@ -1502,7 +1502,7 @@ impl Hand {
                 // client's own — so a day of logs said which seat and never
                 // which road.
                 self.shuffle_note = Some(format!(
-                    "own shuffle refused at round {round}: chain step {taken},                      turn {turn:?}, slot {} | prover {mine}",
+                    "own shuffle refused at round {round}: chain step {taken}, turn {turn:?}, slot {} | prover {mine}",
                     self.slot.sequence
                 ));
                 e
@@ -1628,14 +1628,14 @@ impl Hand {
                 if matches!(e, StepError::AlreadySubmitted) {
                     return Failed::Elsewhere {
                         seat,
-                        what: "no step had been taken at this position — chain                                position and slot sequence are in the log",
+                        what: "no step had been taken at this position — chain position and slot sequence are in the log",
                     };
                 }
                 step_failure(seat, e)
             })
             .map_err(|e| {
                 self.shuffle_note = Some(format!(
-                    "shuffle refusal from seat {seat}: chain at step {taken},                      slot sequence {}, round {} | verifier {report}",
+                    "shuffle refusal from seat {seat}: chain at step {taken}, slot sequence {}, round {} | verifier {report}",
                     self.slot.sequence, body.shuffle_round
                 ));
                 e
@@ -3195,7 +3195,7 @@ impl Hand {
             let theirs_stacks = theirs.final_stacks.clone();
             let pots = (mine.pots.len(), theirs.pots.len());
             self.settle_note = Some(format!(
-                "settlement disagreement with seat {seat}: mine {ours:?}                  theirs {theirs_stacks:?}, pots {} against {}",
+                "settlement disagreement with seat {seat}: mine {ours:?} theirs {theirs_stacks:?}, pots {} against {}",
                 pots.0, pots.1
             ));
             return Err(Failed::DeckDisagrees {
@@ -4562,7 +4562,7 @@ impl Hand {
             .filter(|s| self.signed.get(usize::from(*s)).copied().unwrap_or(false))
             .collect();
         format!(
-            "roster from: required {:?} certified {:?} strikes {:?} grace {:?}              signed {signed:?} stacked {stacked:?} by_certificate={}",
+            "roster from: required {:?} certified {:?} strikes {:?} grace {:?} signed {signed:?} stacked {stacked:?} by_certificate={}",
             self.open.required,
             self.certified,
             self.strikes,

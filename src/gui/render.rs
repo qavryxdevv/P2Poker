@@ -1189,11 +1189,11 @@ mod tests {
         assert!(style.text_styles[&TextStyle::Heading].size >= 22.0);
         assert!(
             style.text_styles[&TextStyle::Small].size >= 14.0,
-            "even the smallest text in the client has a floor, and it is the              size the body text used to be"
+            "even the smallest text in the client has a floor, and it is the size the body text used to be"
         );
         assert!(
             style.spacing.interact_size.y >= 30.0,
-            "a row too short to click comfortably reads as cramped however              large the letters in it are"
+            "a row too short to click comfortably reads as cramped however large the letters in it are"
         );
     }
 
