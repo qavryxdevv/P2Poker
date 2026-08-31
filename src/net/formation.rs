@@ -37,7 +37,9 @@ use ed25519_dalek::SigningKey;
 use super::joinwire::{self, WireError};
 use super::lobby::TableAd;
 use crate::poker::state::Hash;
-use crate::protocol::constants::{MAX_AD_LIFETIME_MS, MAX_SEATS};
+use crate::protocol::constants::{
+    LIST_MAX_AGE_MS, MAX_AD_LIFETIME_MS, MAX_CLOCK_SKEW_MS, MAX_SEATS,
+};
 use crate::protocol::transcript::{genesis_setup, session_id, Ratification};
 use crate::table::formation::{password_proof, Roster, SeatEntry};
 use crate::table::join::{
@@ -657,7 +659,25 @@ impl Formation {
 
     /// A `PLAYER_LIST` from the founder — a proposal, checked every time.
     pub fn on_player_list(&mut self, bytes: &[u8], now_ms: u64) -> Result<Vec<Send>, Failed> {
-        let (list, sender) = joinwire::receive_player_list(bytes)?;
+        let (list, sender, emitted_at) = joinwire::receive_player_list_at(bytes)?;
+        // **A stale list, with nothing to compare it against.** Until the first
+        // list arrives a client has no serial, so `admit_list` was given `None`
+        // and accepted any serial at all — including a genuine list from an
+        // hour ago, replayed by anybody who had seen it. The joiner then
+        // adopts a roster nobody is holding, ratifies against it, is refused by
+        // the founder because the serial is stale, and waits for the next real
+        // list; repeated, that is a joiner held out of a table for free.
+        //
+        // The list carries no time of its own, but the founder signed its
+        // envelope. Bounded on both sides against this client's own local view,
+        // which is what `lobby::admit` does with an advert and is not a value
+        // anything hashes (D-012).
+        if emitted_at > now_ms.saturating_add(MAX_CLOCK_SKEW_MS) {
+            return Err(Failed::List(ListRefused::Stale));
+        }
+        if now_ms.saturating_sub(emitted_at) > LIST_MAX_AGE_MS {
+            return Err(Failed::List(ListRefused::Stale));
+        }
         let held = if self.serial == 0 { None } else { Some(self.serial) };
         let roster = admit_list(&list, &sender, held, &self.under).map_err(Failed::List)?;
         self.roster = roster;

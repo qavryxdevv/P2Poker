@@ -275,6 +275,14 @@ pub enum AcceptRefused {
     BuyinNotOurs { asked: u64, given: u64 },
     /// The roster is not well formed.
     Roster(RosterRejected),
+    /// Emitted too long ago, or too far ahead of this client's own clock.
+    ///
+    /// A list carries no time of its own; this is its **envelope's**, which the
+    /// founder signed. The check matters most where there is nothing else to
+    /// check against: until the first list arrives a client holds no serial, so
+    /// any serial is admissible and a genuine list from an hour ago is a valid
+    /// one.
+    Stale,
 }
 
 /// The joiner's check on a `JOIN_ACCEPT`.
@@ -354,6 +362,13 @@ pub enum ListRefused {
     /// this that is a warning.
     ParametersMismatch,
     Roster(RosterRejected),
+    /// Emitted too long ago, or too far ahead of this client's own clock.
+    ///
+    /// A list carries no time of its own; this is its **envelope's**, which the
+    /// founder signed. It matters most where there is nothing else to check
+    /// against: until the first list arrives a client holds no serial, so any
+    /// serial is admissible and a genuine list from an hour ago is a valid one.
+    Stale,
 }
 
 /// The joiner's check on a `PLAYER_LIST`.

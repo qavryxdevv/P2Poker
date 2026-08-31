@@ -533,6 +533,19 @@ pub fn publish_player_list(
 }
 
 pub fn receive_player_list(bytes: &[u8]) -> Result<(PlayerList, [u8; 32]), WireError> {
+    receive_player_list_at(bytes).map(|(l, s, _)| (l, s))
+}
+
+/// The same, and the founder's own signed emission time with it.
+///
+/// A list carries no timestamp of its own, but its **envelope** does and the
+/// founder signed it. Discarding it left a client with no serial of its own —
+/// which is every client until the first list arrives — with nothing to say
+/// against a genuine list from an hour ago, replayed by anybody who had seen
+/// it.
+pub fn receive_player_list_at(
+    bytes: &[u8],
+) -> Result<(PlayerList, [u8; 32], u64), WireError> {
     let o = open(bytes, JOIN_RESP_MAX, EventType::PlayerList)?;
     let b: PlayerListBody = payload_of(&o, JOIN_RESP_MAX)?;
     Ok((
@@ -542,6 +555,7 @@ pub fn receive_player_list(bytes: &[u8]) -> Result<(PlayerList, [u8; 32]), WireE
             list_serial: b.list_serial,
         },
         o.sender,
+        o.envelope.emitted_at_unix_ms,
     ))
 }
 
@@ -668,6 +682,37 @@ mod tests {
 
     /// The round trip, for each of the five, over the wire this client actually
     /// writes. Nothing in the corpus had ever encoded one of these.
+    /// **A list's age is its envelope's, and the founder signed it.**
+    ///
+    /// The body carries no time at all. Discarding the envelope's left a client
+    /// with no serial of its own — which is every client until the first list
+    /// arrives — with nothing to say against a genuine list from an hour ago,
+    /// replayed by anybody who had seen it.
+    ///
+    /// **To make this fail:** have `receive_player_list_at` return `0`, or the
+    /// time of decoding, instead of `o.envelope.emitted_at_unix_ms`.
+    #[test]
+    fn a_player_list_carries_the_time_its_founder_sealed_it() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let list = PlayerList {
+            roster: vec![],
+            table_params_hash: [3; 32],
+            list_serial: 7,
+        };
+        let old = 1_700_000_000_000u64;
+        let wire = publish_player_list(&list, &key, old).unwrap();
+        let (back, sender, at) = receive_player_list_at(&wire).unwrap();
+        assert_eq!(back.list_serial, 7);
+        assert_eq!(sender, key.verifying_key().to_bytes());
+        assert_eq!(at, old, "the emission time is the founder's, not the reader's");
+
+        // A second sealing an hour later is a different time, so a receiver can
+        // tell the two apart even though every field of the body is identical.
+        let fresh = publish_player_list(&list, &key, old + 3_600_000).unwrap();
+        let (_, _, later) = receive_player_list_at(&fresh).unwrap();
+        assert_eq!(later, old + 3_600_000);
+    }
+
     #[test]
     fn every_formation_message_survives_the_wire() {
         let joiner = key(3);

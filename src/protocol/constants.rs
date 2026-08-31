@@ -96,6 +96,15 @@ pub const MAX_EMBEDDED_EVENT: usize = 32_768;
 
 pub const AD_TTL_MS: u64 = 90_000;
 pub const AD_REBROADCAST_MS: u64 = 30_000;
+
+/// How old a `PLAYER_LIST` may be before a client refuses it.
+///
+/// A founder re-sends its list as the roster changes and a joiner needs one
+/// promptly, so this is generous rather than tight: what it has to exclude is a
+/// genuine list from long ago being replayed at a client that has no serial of
+/// its own to compare it with. Three re-broadcast intervals, on the same
+/// reasoning as `AD_TTL_MS`.
+pub const LIST_MAX_AGE_MS: u64 = 90_000;
 pub const MAX_AD_LIFETIME_MS: u64 = 300_000;
 pub const MAX_CLOCK_SKEW_MS: u64 = 120_000;
 pub const PRESENCE_TTL_MS: u64 = 120_000;
