@@ -1195,7 +1195,15 @@ impl Hand {
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
-            Heard::Uninvited => return Err(Failed::NotInThisStage),
+            // **Held, not refused.** By the time a contribution reaches a
+            // collective stage its sender has already been resolved to a seat
+            // at this table, so `Uninvited` does not mean "a stranger" — it
+            // means this client derived an accepted set that does not hold
+            // that seat, which after a certificate is a roster this client and
+            // its neighbour disagree about by one entry. `run.rs` turns
+            // anything but `NotYet` into a GossipSub `Reject`, and repeatedly
+            // rejecting an honest peer is how it stops being forwarded.
+            Heard::Uninvited => return Err(Failed::NotYet),
         }
         if !stage.complete() {
             return Ok(Vec::new());
@@ -1324,7 +1332,15 @@ impl Hand {
             // would refuse the honest sender's own key on its next copy.
             Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
-            Heard::Uninvited => return Err(Failed::NotInThisStage),
+            // **Held, not refused.** By the time a contribution reaches a
+            // collective stage its sender has already been resolved to a seat
+            // at this table, so `Uninvited` does not mean "a stranger" — it
+            // means this client derived an accepted set that does not hold
+            // that seat, which after a certificate is a roster this client and
+            // its neighbour disagree about by one entry. `run.rs` turns
+            // anything but `NotYet` into a GossipSub `Reject`, and repeatedly
+            // rejecting an honest peer is how it stops being forwarded.
+            Heard::Uninvited => return Err(Failed::NotYet),
         }
         if !stage.complete() {
             return Ok(Vec::new());
@@ -1748,7 +1764,15 @@ impl Hand {
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
-            Heard::Uninvited => return Err(Failed::NotInThisStage),
+            // **Held, not refused.** By the time a contribution reaches a
+            // collective stage its sender has already been resolved to a seat
+            // at this table, so `Uninvited` does not mean "a stranger" — it
+            // means this client derived an accepted set that does not hold
+            // that seat, which after a certificate is a roster this client and
+            // its neighbour disagree about by one entry. `run.rs` turns
+            // anything but `NotYet` into a GossipSub `Reject`, and repeatedly
+            // rejecting an honest peer is how it stops being forwarded.
+            Heard::Uninvited => return Err(Failed::NotYet),
         }
         if !stage.complete() {
             return Ok(Vec::new());
@@ -1922,7 +1946,15 @@ impl Hand {
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
-            Heard::Uninvited => return Err(Failed::NotInThisStage),
+            // **Held, not refused.** By the time a contribution reaches a
+            // collective stage its sender has already been resolved to a seat
+            // at this table, so `Uninvited` does not mean "a stranger" — it
+            // means this client derived an accepted set that does not hold
+            // that seat, which after a certificate is a roster this client and
+            // its neighbour disagree about by one entry. `run.rs` turns
+            // anything but `NotYet` into a GossipSub `Reject`, and repeatedly
+            // rejecting an honest peer is how it stops being forwarded.
+            Heard::Uninvited => return Err(Failed::NotYet),
         }
         if !stage.complete() {
             return Ok(Vec::new());
@@ -2488,7 +2520,15 @@ impl Hand {
             match stage.hear(seat, opened.event_hash) {
                 Heard::Counted | Heard::Bystander | Heard::Again => {}
                 Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
-                Heard::Uninvited => return Err(Failed::NotInThisStage),
+                // **Held, not refused.** By the time a contribution reaches a
+            // collective stage its sender has already been resolved to a seat
+            // at this table, so `Uninvited` does not mean "a stranger" — it
+            // means this client derived an accepted set that does not hold
+            // that seat, which after a certificate is a roster this client and
+            // its neighbour disagree about by one entry. `run.rs` turns
+            // anything but `NotYet` into a GossipSub `Reject`, and repeatedly
+            // rejecting an honest peer is how it stops being forwarded.
+            Heard::Uninvited => return Err(Failed::NotYet),
             }
             if !stage.complete() {
                 return Ok(Vec::new());
@@ -3206,7 +3246,15 @@ impl Hand {
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
-            Heard::Uninvited => return Err(Failed::NotInThisStage),
+            // **Held, not refused.** By the time a contribution reaches a
+            // collective stage its sender has already been resolved to a seat
+            // at this table, so `Uninvited` does not mean "a stranger" — it
+            // means this client derived an accepted set that does not hold
+            // that seat, which after a certificate is a roster this client and
+            // its neighbour disagree about by one entry. `run.rs` turns
+            // anything but `NotYet` into a GossipSub `Reject`, and repeatedly
+            // rejecting an honest peer is how it stops being forwarded.
+            Heard::Uninvited => return Err(Failed::NotYet),
         }
         self.close_settlement_if_done()
     }
@@ -4020,7 +4068,15 @@ impl Hand {
         match late.stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
-            Heard::Uninvited => return Err(Failed::NotInThisStage),
+            // **Held, not refused.** By the time a contribution reaches a
+            // collective stage its sender has already been resolved to a seat
+            // at this table, so `Uninvited` does not mean "a stranger" — it
+            // means this client derived an accepted set that does not hold
+            // that seat, which after a certificate is a roster this client and
+            // its neighbour disagree about by one entry. `run.rs` turns
+            // anything but `NotYet` into a GossipSub `Reject`, and repeatedly
+            // rejecting an honest peer is how it stops being forwarded.
+            Heard::Uninvited => return Err(Failed::NotYet),
         }
         if late.stage.complete() {
             let hash = late.stage.hash().ok_or(Failed::NotInThisStage)?;
@@ -4541,6 +4597,14 @@ impl Hand {
             return None;
         }
         Some(std::mem::take(&mut self.cert_note).join(" | "))
+    }
+
+    /// The required emitter set this hand is being played under.
+    ///
+    /// So the node can say *the table changes* only when it does, rather than
+    /// printing a derivation after every hand of an unchanged table.
+    pub fn required_now(&self) -> Vec<SeatIdx> {
+        self.open.required.clone()
     }
 
     /// Every input the next hand's roster is derived from, in one line.

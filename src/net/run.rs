@@ -813,23 +813,24 @@ pub async fn run(
                         // seats a ratification that has to travel through a
                         // third seat simply never arrives, and the table never
                         // starts with nobody able to say why.
-                        match table.as_mut() {
-                            None => {
-                                // No table here to judge it against. `Ignore`
-                                // and not `Reject`: nothing about the message is
-                                // known to be wrong, this client just cannot
-                                // tell, and blaming a sender for that would cost
-                                // an honest peer its score.
-                                let _ = swarm.behaviour_mut().gossipsub
-                                    .report_message_validation_result(
-                                        &message_id,
-                                        &propagation_source,
-                                        gossipsub::MessageAcceptance::Ignore,
-                                    );
-                                continue;
-                            }
-                            Some(_) => gossipsub::MessageAcceptance::Accept,
-                        };
+                        // No table here to judge it against. `Ignore` and not
+                        // `Reject`: nothing about the message is known to be
+                        // wrong, this client just cannot tell, and blaming a
+                        // sender for that would cost an honest peer its score.
+                        //
+                        // Written as a guard rather than as a `match` yielding a
+                        // verdict, because the `Some` arm's verdict was read by
+                        // nothing — and a verdict computed and not reported is
+                        // exactly the bug this whole path was repaired for.
+                        if table.is_none() {
+                            let _ = swarm.behaviour_mut().gossipsub
+                                .report_message_validation_result(
+                                    &message_id,
+                                    &propagation_source,
+                                    gossipsub::MessageAcceptance::Ignore,
+                                );
+                            continue;
+                        }
                         // The hand first, if there is one. A `HAND_INIT`
                         // decodes as neither a player list nor a ratification,
                         // so without this it would fall through to the
@@ -1326,13 +1327,30 @@ pub async fn run(
                             // There is no per-peer "send my subscriptions"
                             // call, so this is the primitive that exists:
                             // dropping and retaking the topic re-announces it
-                            // to everyone connected. It fires once per poker
-                            // peer, because `poker_peers` is a set, and the gap
-                            // it opens is one iteration of this loop.
-                            for t in [&topics.lobby, &topics.lobby_chat] {
-                                let g = &mut swarm.behaviour_mut().gossipsub;
-                                let _ = g.unsubscribe(t);
-                                let _ = g.subscribe(t);
+                            // to everyone connected.
+                            //
+                            // **Only when this peer is not already known to be
+                            // on the topic**, because the re-announce is not
+                            // free: peers that receive the `UNSUBSCRIBE` prune
+                            // this client from their mesh for that topic and
+                            // have to re-graft it on a later heartbeat. Where
+                            // the ordinary exchange worked — which is most of
+                            // the time — there is nothing to repair and this
+                            // does nothing.
+                            let lobby_hash = topics.lobby.hash();
+                            let already = swarm
+                                .behaviour()
+                                .gossipsub
+                                .all_peers()
+                                .any(|(p, subscribed)| {
+                                    *p == peer_id && subscribed.contains(&&lobby_hash)
+                                });
+                            if !already {
+                                for t in [&topics.lobby, &topics.lobby_chat] {
+                                    let g = &mut swarm.behaviour_mut().gossipsub;
+                                    let _ = g.unsubscribe(t);
+                                    let _ = g.subscribe(t);
+                                }
                             }
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: false })
@@ -2240,23 +2258,26 @@ pub async fn run(
                 }
             }, if next_hand_at.is_some() => {
                 next_hand_at = None;
-                // **At the derivation, not at the end of the hand.** The
-                // first version reported these when `over()` first became true,
-                // which is before a late certificate is banked, so it described
-                // a state the derivation never saw.
-                if let Some(h) = hand.as_ref() {
-                    let _ = events
-                        .send(NodeEvent::Warning(h.roster_derivation()))
-                        .await;
-                }
+                // **Said when the roster moves, and only then.** Reported at
+                // the derivation rather than at the end of the hand, because a
+                // late certificate is banked in between and the earlier version
+                // described a state the derivation never saw. But a table where
+                // nobody leaves has nothing to explain, and two lines of
+                // required sets, allowances and strike counts after every hand
+                // are two lines a player has to read past to find out what
+                // happened to theirs.
                 let next = hand.as_ref().and_then(|h| h.next_hand());
-                if let Some(o) = next.as_ref() {
-                    let _ = events
-                        .send(NodeEvent::Warning(format!(
-                            "roster to: required {:?}",
-                            o.required
-                        )))
-                        .await;
+                if let (Some(h), Some(o)) = (hand.as_ref(), next.as_ref()) {
+                    if o.required != h.required_now() {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "the table changes: required {:?} -> {:?}. {}",
+                                h.required_now(),
+                                o.required,
+                                h.roster_derivation()
+                            )))
+                            .await;
+                    }
                 }
                 hand = None;
                 hand_reported = false;
