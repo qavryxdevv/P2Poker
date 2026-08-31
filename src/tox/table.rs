@@ -30,7 +30,9 @@
 //! reason a chat id travelling in a public advertisement costs nothing.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as sync_mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::table::fragment::{self, Reassembler};
@@ -97,6 +99,28 @@ pub enum Command {
     Leave,
 }
 
+/// What the driver is having trouble with, for a caller that wants to say so.
+///
+/// **Counters and not events**, because the driver has no channel to the
+/// interface and should not grow one: it runs on its own thread, and a channel
+/// it could block on is a channel that could stop `tox_iterate`.
+///
+/// They exist because two stalls in a row were diagnosed by reading logs that
+/// said nothing at all. A group send that toxcore refuses is the whole
+/// mechanism by which a busy table falls behind, and it was being swallowed.
+#[derive(Default)]
+pub struct Trouble {
+    /// Fragments toxcore would not take. The queue was full or the group had
+    /// nobody in it; either way the message stays and is tried again.
+    pub refused: AtomicU64,
+    /// Whole messages waiting to go out. A number that does not come down is a
+    /// transport that has stopped keeping up, which at a table shows as seats
+    /// being certified late for saying things they did say.
+    pub waiting: AtomicU64,
+    /// Fragments handed to toxcore and accepted.
+    pub sent: AtomicU64,
+}
+
 /// The handle the rest of the client holds.
 ///
 /// Implements [`TableTransport`], so nothing above it knows a Tox group is
@@ -115,12 +139,18 @@ pub struct ToxTable {
     /// constructor that blocked until it did would block the client's startup
     /// on a socket.
     chat: tokio::sync::watch::Receiver<Option<[u8; 32]>>,
+    trouble: Arc<Trouble>,
     /// Kept so a caller can wait for the thread to finish on shutdown, and so
     /// that dropping the handle does not orphan it silently.
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ToxTable {
+    /// What the transport is having trouble with, if anything.
+    pub fn trouble(&self) -> &Trouble {
+        &self.trouble
+    }
+
     /// Send one whole message without waiting. **Not async.**
     ///
     /// The node loop publishes from inside arms that already hold the swarm,
@@ -242,10 +272,12 @@ pub fn spawn(tox: Tox, setup: Setup) -> ToxTable {
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<FromTable>(256);
     let (ctl_tx, ctl_rx) = sync_mpsc::channel::<Command>();
     let (chat_tx, chat_rx) = tokio::sync::watch::channel::<Option<[u8; 32]>>(None);
+    let trouble = Arc::new(Trouble::default());
+    let theirs = Arc::clone(&trouble);
 
     let thread = std::thread::Builder::new()
         .name("tox-table".into())
-        .spawn(move || run(tox, setup, out_rx, in_tx, ctl_rx, chat_tx))
+        .spawn(move || run(tox, setup, out_rx, in_tx, ctl_rx, chat_tx, theirs))
         .expect("a thread for the table's transport");
 
     ToxTable {
@@ -253,6 +285,7 @@ pub fn spawn(tox: Tox, setup: Setup) -> ToxTable {
         inbox: in_rx,
         control: ctl_tx,
         chat: chat_rx,
+        trouble,
         thread: Some(thread),
     }
 }
@@ -265,6 +298,7 @@ fn run(
     inbox: tokio::sync::mpsc::Sender<FromTable>,
     control: sync_mpsc::Receiver<Command>,
     chat: tokio::sync::watch::Sender<Option<[u8; 32]>>,
+    trouble: Arc<Trouble>,
 ) {
     // Tox friend number -> that friend's public key, so an invitation can be
     // matched against the roster rather than accepted from whoever sends one.
@@ -338,7 +372,7 @@ fn run(
                 }
                 tox.iterate();
                 if let Some(g) = group {
-                    flush(&mut tox, g, &mut pending, &mut next_id);
+                    flush(&mut tox, g, &mut pending, &mut next_id, &trouble);
                 }
                 std::thread::sleep(tox.interval().min(MAX_TICK));
             }
@@ -438,7 +472,7 @@ fn run(
             pending.push(message);
         }
         if let Some(g) = group {
-            flush(&mut tox, g, &mut pending, &mut next_id);
+            flush(&mut tox, g, &mut pending, &mut next_id, &trouble);
         }
 
         if last_sweep.elapsed() >= SWEEP_EVERY {
@@ -472,7 +506,16 @@ const FLUSH_TURNS: usize = 30;
 /// interleave two half-sent ones — the reassembler at the far end would then be
 /// holding two part-built messages from one sender, which it bounds, and the
 /// older of them would be the one dropped.
-fn flush(tox: &mut Tox, group: u32, pending: &mut Vec<Vec<u8>>, next_id: &mut u32) {
+fn flush(
+    tox: &mut Tox,
+    group: u32,
+    pending: &mut Vec<Vec<u8>>,
+    next_id: &mut u32,
+    trouble: &Trouble,
+) {
+    trouble
+        .waiting
+        .store(pending.len() as u64, Ordering::Relaxed);
     while let Some(message) = pending.first() {
         let Ok(parts) = fragment::split(message, *next_id, fragment::TOX_PACKET) else {
             // Longer than the protocol builds. Dropped rather than retried for
@@ -483,16 +526,29 @@ fn flush(tox: &mut Tox, group: u32, pending: &mut Vec<Vec<u8>>, next_id: &mut u3
         let mut sent_all = true;
         for part in &parts {
             if tox.send(group, part).is_err() {
+                trouble.refused.fetch_add(1, Ordering::Relaxed);
                 sent_all = false;
                 break;
             }
+            trouble.sent.fetch_add(1, Ordering::Relaxed);
         }
         if !sent_all {
+            // **The whole message stays, and its fragments go again from the
+            // start.** Half a message at the far end is a reassembly that never
+            // completes and is swept; sending the rest under a new id would be
+            // two half-messages instead of one. The duplicate fragments the far
+            // end already has cost it a comparison each.
+            trouble
+                .waiting
+                .store(pending.len() as u64, Ordering::Relaxed);
             return;
         }
         *next_id = next_id.wrapping_add(1);
         pending.remove(0);
     }
+    trouble
+        .waiting
+        .store(pending.len() as u64, Ordering::Relaxed);
 }
 
 /// Publish the group's id to anybody waiting for it, once and only once.

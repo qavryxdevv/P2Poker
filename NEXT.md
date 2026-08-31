@@ -517,8 +517,11 @@ advertising a shorter deadline than any preset offers.
    for itself in one run** - see below. It found the re-send loop still
    publishing to the mesh on a Tox table, which cost a seat its place at the
    table. Four hands at three seats now, exact agreement, no certificates. What
-   is still untried is **more** than three, and a table that fills to six or ten
-   is where the next one of these will be.
+   is still untried is **more** than six, and a table that fills to ten is where
+   the next one of these will be. Six seats plays: seven hands in a hundred and
+   fifty seconds, all six agreeing, no certificate. See the timing section above
+   for what a hand costs at each size, and why the earlier "slow at six seats"
+   reading was wrong.
 2. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
    carried inside `HAND_COMPLETE`; the checkpoint **stage** is not there, and
    `PROTOCOL.md` §12 says T61 then fires at `hand_deadline_ms` after every
@@ -1431,6 +1434,87 @@ moving off GossipSub is to leave that loop behind.
 
 
 
+
+
+### How long a hand takes, and it was not the network
+
+Six seats looked slow — one hand in three hundred seconds, then a stall after
+the deal. Two things were read into that which were not true, and finding out
+which cost less than fixing the wrong one would have.
+
+**It was the clock, not the transport.** A headless client has nobody at the
+keyboard, so every seat sits out its whole allowance. Measured at six seats:
+
+```
+41,1s  the deck is shuffled and sealed
+41,5s  n5 your turn        96,5s  n5 your clock ran out   <- 55 s
+96,5s  n4 your turn       151,5s  n4 your clock ran out   <- 55 s
+```
+
+Fifty-five seconds a seat: `action_timeout_ms` 20, `action_grace_ms` 5 and a
+30-second time bank. Six seats is 330 s for **one betting round** and over
+twenty minutes for a hand, none of it network. Two counters say the same from
+the other side: **no send was ever refused by toxcore and the queue never had
+anything waiting**, across every six-seat run.
+
+`--autoplay` was added for exactly this and nothing else. It acts as soon as it
+is this client's turn, or after `N` ms, and it **calls** where the ordinary
+timeout folds — a table that folds every hand preflop measures nothing about how
+long a hand takes. It is a measurement flag and it says so: it puts its owner's
+chips in, which is what the ordinary timeout deliberately refuses to do. The
+timeout's own behaviour is untouched.
+
+**The floor, measured:**
+
+| seats | per hand |
+|---|---|
+| 2 | 8.6 s |
+| 3 | 12.9 s |
+| 6 | 13.5 s steady state |
+
+And where a six-handed hand's time goes, stamped from one run:
+
+```
+56,7s  hand #2 opens        60,4s  the deck is sealed   <- 3.7 s, six shuffle links
+60,4s                       61,1s  the first turn      <- 0.7 s, the deal
+61,1s                       63,9s  the hand is over    <- 2.8 s, four streets
+63,9s                       68,9s  hand #3 opens       <- 5.0 s, the pause
+```
+
+**Seven seconds of work and five of pause.** The single largest lever on how
+fast a table plays is therefore not the protocol and not Tox: it is the hold
+between hands, which is a policy dial. The shuffle chain is 3.7 s at six seats
+and is the part that cannot be shortened without changing the cryptography — it
+is `m` sequential links by construction, because each shuffler must shuffle the
+previous output.
+
+The 36 s per hand quoted from an earlier run was an arithmetic mistake: 180 s
+divided by five hands, counting a 27-second startup and a hand the run cut in
+half.
+
+### What was changed for it, and what was deliberately not
+
+**The re-send loop backs off and narrows.** It repeated every event of the hand
+to every member every five seconds — at six seats about fifty fragments per
+client per tick, three hundred deliveries a second across the group, without
+pause. It now re-sends on ticks 1, 2, 4, 8… since the chain position last moved,
+resetting when it does, and only events from the last three stages. A table that
+is advancing re-sends nothing at all.
+
+**No catch-up from a cache, and no chat history.** It was considered and is not
+needed: the counters say the transport was never the constraint. It is also less
+available than it looks — qTox keeps history in its **own** database, and Tox
+delivers nothing old to a member who was not there, so "the client has history"
+would not have let a peer fetch what it missed. If a future measurement shows
+the transport behind, the counters will say so and a targeted request over
+`tox_group_send_custom_private_packet` is the shape to build; until then it is
+machinery for a problem that has not appeared.
+
+**Two counters, because two stalls in a row were diagnosed from logs that said
+nothing.** The driver counts fragments refused, fragments sent and whole
+messages waiting, and the node says *"the table's transport is behind"* when
+either is non-zero. A seat certified late for something it did say looks, in
+every other line this client writes, exactly like a seat that said nothing.
 
 ### Three seats on Tox, and the defect it found in one run
 

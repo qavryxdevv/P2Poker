@@ -226,6 +226,7 @@ pub async fn run(
     local_discovery: bool,
     port: u16,
     profile_dir: std::path::PathBuf,
+    autoplay: Option<std::time::Duration>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Advisory events are offered, not waited for. See `Events`.
     let events = Events::new(events);
@@ -345,6 +346,22 @@ pub async fn run(
     // seat that goes quiet in a *cryptographic* stage has no answer here at
     // all, and that is `hand_deadline_ms`, which is not built.
     let mut act_by: Option<tokio::time::Instant> = None;
+
+    /// Bring this client's own turn forward, for a measurement run.
+    ///
+    /// **This is the only thing `--autoplay` changes about the clock**, and it
+    /// can only ever make the deadline earlier: `min` against what the protocol
+    /// derived, never a replacement for it. A measurement mode that could
+    /// extend a deadline would be measuring a different table.
+    fn hurry(
+        at: Option<tokio::time::Instant>,
+        autoplay: Option<std::time::Duration>,
+    ) -> Option<tokio::time::Instant> {
+        match (at, autoplay) {
+            (Some(at), Some(d)) => Some(at.min(tokio::time::Instant::now() + d)),
+            (at, _) => at,
+        }
+    }
     // When this hand may be given up on. The only terminus a stalled
     // CRYPTOGRAPHIC stage has in version 1: nobody votes and nobody certifies,
     // so each peer runs its own timer and the abort is buffered at a receiver
@@ -394,6 +411,15 @@ pub async fn run(
     // id matches the advertisement's, which is the one moment worth reporting -
     // before it, the hand has a transport that reaches nobody.
     let mut tox_group_said = false;
+    // The last refusal count reported, so a steady state says nothing and a
+    // rising one says it every five seconds.
+    let mut tox_refused_said: u64 = 0;
+    // **How the re-send loop backs off.** `at` is the chain position it last
+    // saw, and `ticks` counts five-second ticks since that position moved. A
+    // table that is advancing re-sends almost nothing; a stuck one still gets
+    // its first repeat after five seconds.
+    let mut resend_at: u64 = u64::MAX;
+    let mut resend_ticks: u32 = 0;
 
     // Who mDNS has already told us about.
     //
@@ -699,7 +725,7 @@ pub async fn run(
                                             tokio::time::Instant::now() + end.pause(),
                                         );
                                     }
-                                    act_by = report.clock.apply(act_by, $h.action_deadline());
+                                    act_by = hurry(report.clock.apply(act_by, $h.action_deadline()), autoplay);
                                     if let Some(cards) = $h.cards().filter(|_| !cards_reported) {
                                         cards_reported = true;
                                         let _ = events
@@ -2282,7 +2308,7 @@ pub async fn run(
                                     next_hand_at =
                                         Some(tokio::time::Instant::now() + end.pause());
                                 }
-                                act_by = report.clock.apply(act_by, h.action_deadline());
+                                act_by = hurry(report.clock.apply(act_by, h.action_deadline()), autoplay);
                             }
                             // The player's own engine refused it, which means
                             // the window offered something it should not have.
@@ -2361,6 +2387,21 @@ pub async fn run(
                             .await;
                     }
                 }
+                // **Say when the transport is behind, once it is.** A seat
+                // certified late for something it did say looks, from every log
+                // this client writes, like a seat that said nothing. The
+                // difference is here.
+                let (refused, waiting, sent) = tox_sink.trouble();
+                if waiting > 0 || refused > tox_refused_said {
+                    tox_refused_said = refused;
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "the table's transport is behind: {waiting} message(s) queued,                              {refused} fragment(s) refused of {} offered",
+                            refused + sent
+                        )))
+                        .await;
+                }
+
                 let Some(h) = hand.as_ref() else { continue };
                 // A hand that is over is a hand nobody is waiting on.
                 if h.over() || said.is_empty() {
@@ -2378,16 +2419,59 @@ pub async fn run(
                 // lost to a transport that never repeated itself. Heads-up hid
                 // it, because two peers both in the group before the first hand
                 // have nothing to re-send.
-                if tox_sink.is_on_tox() {
-                    for out in &said {
-                        tox_sink.try_broadcast(out);
-                    }
-                } else if let Some(t) = table_topic.as_ref() {
-                    for out in &said {
-                        let _ = swarm
-                            .behaviour_mut()
-                            .gossipsub
-                            .publish(t.clone(), out.clone());
+                // **Backed off, and narrowed.** Blindly repeating every event
+                // of the hand every five seconds is spam, and it is spam that
+                // grows with the table: at six seats `said` holds about fourteen
+                // messages, several of them nine kilobytes, so each client was
+                // pushing roughly fifty fragments per tick to five peers - three
+                // hundred deliveries a second across the group, without pause,
+                // for as long as the hand lasted. Measured at six seats: the
+                // deck chain completed and the betting then stalled with **no
+                // send refused by toxcore at all**, which is what a transport
+                // that is being drowned rather than blocked looks like.
+                //
+                // Two changes, both conservative:
+                //
+                // * **Back off while nothing moves, reset when it does.** A
+                //   table that is advancing re-sends nothing, because the chain
+                //   position changes faster than the first tick. A stuck one
+                //   still gets its first repeat after five seconds, then ten,
+                //   twenty, forty - bounded, and it stops growing at the hand's
+                //   own deadline anyway.
+                // * **Only the recent stages.** A peer more than a few stages
+                //   behind is not going to be caught up by repetition; that is
+                //   what a catch-up request is for, and it does not exist yet.
+                //   Repeating the whole hand on its behalf costs every other
+                //   seat the bandwidth.
+                let here = h.slot().sequence;
+                if here != resend_at {
+                    resend_at = here;
+                    resend_ticks = 0;
+                }
+                resend_ticks = resend_ticks.saturating_add(1);
+                // 1, 2, 4, 8, ... ticks: a power of two and nothing between.
+                let due = resend_ticks.is_power_of_two();
+                if due {
+                    let window = here.saturating_sub(RESEND_STAGES);
+                    let recent: Vec<&Vec<u8>> = said
+                        .iter()
+                        .filter(|b| {
+                            crate::net::chained::peek(b, TABLE_FRAME_PEEK)
+                                .map(|(_, _, seq)| seq >= window)
+                                .unwrap_or(true)
+                        })
+                        .collect();
+                    if tox_sink.is_on_tox() {
+                        for out in recent {
+                            tox_sink.try_broadcast(out);
+                        }
+                    } else if let Some(t) = table_topic.as_ref() {
+                        for out in recent {
+                            let _ = swarm
+                                .behaviour_mut()
+                                .gossipsub
+                                .publish(t.clone(), (*out).clone());
+                        }
                     }
                 }
             }
@@ -2503,8 +2587,18 @@ pub async fn run(
                 // never raise: a client that put its owner's chips in while
                 // they were away would be playing for them, and this is only
                 // keeping the table moving.
+                //
+                // **`--autoplay` is the deliberate exception and calls**, which
+                // is why it is a measurement flag and not a setting. Folding
+                // ends hands early, and a run of hands that all end preflop
+                // measures nothing about how long a hand takes; calling carries
+                // every hand to a showdown, which is the long case and the one
+                // worth knowing. It plays for you, on purpose, and it says so
+                // in `--help`.
                 let action = if turn.legal.can_check {
                     crate::poker::actions::Action::Check
+                } else if autoplay.is_some() {
+                    crate::poker::actions::Action::Call
                 } else {
                     crate::poker::actions::Action::Fold
                 };
@@ -2513,15 +2607,17 @@ pub async fn run(
                     Ok(sends) => {
                         publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said, &tox_sink);
                         let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "your clock ran out — {action:?} for you"
-                            )))
+                            .send(NodeEvent::Warning(if autoplay.is_some() {
+                                format!("autoplay: {action:?}")
+                            } else {
+                                format!("your clock ran out — {action:?} for you")
+                            }))
                             .await;
                         let report = report_hand(h, &events, &mut turn_reported).await;
                         if let Some(end) = report.ended {
                             next_hand_at = Some(tokio::time::Instant::now() + end.pause());
                         }
-                        act_by = report.clock.apply(act_by, h.action_deadline());
+                        act_by = hurry(report.clock.apply(act_by, h.action_deadline()), autoplay);
                     }
                     Err(e) => {
                         let _ = events
@@ -3241,6 +3337,20 @@ async fn begin_hand(
 /// the transport. Neither GossipSub nor a Tox group keeps history, and a peer
 /// that joined after a publish never sees it — measured on both, and on the Tox
 /// side it killed a hand with neither end reporting anything wrong.
+/// How many stages back a re-send reaches.
+///
+/// A peer one stage behind is the ordinary case — the mesh does not order two
+/// messages and a stage boundary crossing in flight is weather. Three is that
+/// case with room, and a peer further back than three stages has lost enough
+/// that repetition is the wrong tool.
+const RESEND_STAGES: u64 = 3;
+
+/// The cap for peeking at a message this client itself produced.
+///
+/// Its own bytes, so the bound is a formality — but a decoder with no bound is
+/// a decoder with no bound, and `HAND_ABORT` is the largest thing it builds.
+const TABLE_FRAME_PEEK: usize = crate::protocol::constants::HAND_ABORT_MAX;
+
 fn publish_hand(
     sends: Vec<crate::table::hand::Send>,
     topic: Option<&gossipsub::IdentTopic>,

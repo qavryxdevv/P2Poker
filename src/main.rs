@@ -18,6 +18,8 @@
 //! p2p-poker --renderer software  draw without a graphics driver
 //! p2p-poker --no-mdns             do not look for players by multicast
 //! p2p-poker --port 4242           listen on a fixed port, to forward on a router
+//! p2p-poker --autoplay [ms]       act at once (or after ms): a measurement mode
+//!                                 that plays for you, for timing a hand
 //! ```
 //!
 //! `--renderer` is there to be overridden, not to be typed. The client draws
@@ -145,6 +147,29 @@ fn main() {
 
     let bounded = value_of("--for").and_then(|v| v.parse::<u64>().ok());
 
+    // **A measurement flag, and it plays for you.**
+    //
+    // A headless client has nobody at the keyboard, so every seat sits out its
+    // whole clock - `action_timeout_ms` plus the grace plus the time bank,
+    // which is 55 s at the rated preset. Six seats is then 330 s for one
+    // betting round and over twenty minutes for a hand, and none of that is the
+    // network. Measured 2026-08-31, and it was being read as a slow transport.
+    //
+    // `--autoplay` acts as soon as it is this client's turn, or after `N`
+    // milliseconds if a number follows, so that a run measures how long a hand
+    // takes when nobody is thinking. It **calls** where the timeout would fold,
+    // because a table that folds every hand preflop measures nothing.
+    //
+    // It is not a setting and not a bot: it puts its owner's chips in, which is
+    // exactly what the ordinary timeout refuses to do.
+    let autoplay = if has("--autoplay") {
+        Some(std::time::Duration::from_millis(
+            value_of("--autoplay").and_then(|v| v.parse().ok()).unwrap_or(0),
+        ))
+    } else {
+        None
+    };
+
     // Multicast discovery, on unless refused. `--no-mdns` exists to prove the
     // other path: with it on, two clients on one wire find each other in under
     // a second whatever the DHT does, so a run that means to test the DHT has
@@ -193,6 +218,7 @@ fn main() {
         draw,
         local_discovery,
         port,
+        autoplay,
     };
 
     if has("--headless") {
@@ -344,6 +370,7 @@ fn headless(player: Player, run: Run, join: Option<String>) {
         bounded,
         local_discovery,
         port,
+        autoplay,
         ..
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
@@ -359,7 +386,7 @@ fn headless(player: Player, run: Run, join: Option<String>) {
         // immediately and for ever, and its `select!` arm would spin.
         let (commands, command_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(async move {
-            if let Err(e) = p2p_poker::net::run::run(identity, app_key, tx, command_rx, local_discovery, port, profile_dir).await {
+            if let Err(e) = p2p_poker::net::run::run(identity, app_key, tx, command_rx, local_discovery, port, profile_dir, autoplay).await {
                 eprintln!("node stopped: {e}");
             }
         });
@@ -476,6 +503,9 @@ struct Run {
     draw: Draw,
     local_discovery: bool,
     port: u16,
+    /// `--autoplay`: act at once, or after this long. A measurement mode that
+    /// plays for its owner; see where it is parsed.
+    autoplay: Option<std::time::Duration>,
 }
 
 fn windowed(player: Player, run: Run) -> Started {
@@ -492,6 +522,7 @@ fn windowed(player: Player, run: Run) -> Started {
         draw,
         local_discovery,
         port,
+        autoplay,
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     // The same headroom as the headless path, for the same reason.
@@ -517,7 +548,7 @@ fn windowed(player: Player, run: Run) -> Started {
         if let Some(command) = hosted {
             let _ = opening.send(command).await;
         }
-        if let Err(e) = p2p_poker::net::run::run(identity, node_key, tx, command_rx, local_discovery, port, node_dir).await {
+        if let Err(e) = p2p_poker::net::run::run(identity, node_key, tx, command_rx, local_discovery, port, node_dir, autoplay).await {
             eprintln!("node stopped: {e}");
         }
     });

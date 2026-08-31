@@ -206,6 +206,34 @@ impl TableSink {
         }
     }
 
+    /// What the transport is having trouble with: fragments refused, whole
+    /// messages waiting, fragments sent. All zeroes when there is no Tox.
+    ///
+    /// Reported rather than kept, because two stalls in a row were diagnosed
+    /// from logs that said nothing: a group send toxcore refuses is the whole
+    /// mechanism by which a busy table falls behind, and it was swallowed.
+    pub fn trouble(&self) -> (u64, u64, u64) {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => {
+                    let x = t.trouble();
+                    (
+                        x.refused.load(Ordering::Relaxed),
+                        x.waiting.load(Ordering::Relaxed),
+                        x.sent.load(Ordering::Relaxed),
+                    )
+                }
+                None => (0, 0, 0),
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            (0, 0, 0)
+        }
+    }
+
     /// Tell the driver what the roster decided. Nothing, when there is no Tox.
     #[allow(unused_variables)]
     pub fn tell(&self, seat: Seat) {
