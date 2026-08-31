@@ -1022,11 +1022,15 @@ pub async fn run(
                                     // the queue exists for.
                                     Some(match h.hold(message.data.clone()) {
                                         Holding::Kept => gossipsub::MessageAcceptance::Accept,
-                                        // Somebody else's hand: nothing is
-                                        // known to be wrong with it and this
-                                        // client simply cannot judge it.
+                                        // Somebody else's hand, and verified:
+                                        // the table identity and the signature
+                                        // held, only the `hand_id` is not this
+                                        // client's. Relayed, because a peer one
+                                        // hand behind is exactly the
+                                        // intermediary a peer one hand ahead
+                                        // needs — it is simply not kept.
                                         Holding::AnotherHand => {
-                                            gossipsub::MessageAcceptance::Ignore
+                                            gossipsub::MessageAcceptance::Accept
                                         }
                                         Holding::Malformed => {
                                             gossipsub::MessageAcceptance::Reject
@@ -2259,16 +2263,24 @@ pub async fn run(
                 deck_reported = None;
                 cards_reported = false;
                 turn_reported = None;
-                // **And the re-send buffer, which nothing cleared here.** The
-                // five-second loop re-broadcasts this client's own events
-                // because GossipSub keeps no history and a peer grafted after
-                // a publish never sees it. That reason expires with the hand:
-                // every stored event names hand k, and after the boundary each
-                // re-send is an event of a hand nobody is playing — refused by
-                // every peer, and before the hold queue was made to verify,
-                // stored by every peer. The four other `said.clear()` sites are
-                // all leaving the table; this one is the ordinary case.
-                said.clear();
+                // **All of hand k goes, except the one event hand k ended
+                // with.** The five-second loop re-broadcasts this client's own
+                // events because GossipSub keeps no history and a peer grafted
+                // after a publish never sees it. That reason expires with the
+                // hand for every event but the terminal: a peer that missed
+                // `HAND_COMPLETE` or `HAND_ABORT` is stuck on hand k, and the
+                // terminal is precisely what would free it. Clearing the lot
+                // left it to time that peer's own stage deadline out instead.
+                //
+                // Everything else is an event of a hand nobody is playing —
+                // refused by every peer, and, before the hold queue was made to
+                // verify, stored by every peer.
+                if let Some(last) = said.pop() {
+                    said.clear();
+                    said.push(last);
+                } else {
+                    said.clear();
+                }
                 match next {
                     Some(opening) => {
                         begin_hand(

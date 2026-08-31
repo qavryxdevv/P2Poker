@@ -4675,24 +4675,27 @@ impl Hand {
         let Ok((kind, hand_id, _)) = chained::peek(&bytes, FRAME_CAP) else {
             return Holding::Malformed;
         };
-        if hand_id != self.open.hand_id {
-            // A hand this client is not playing. Not a fault — a peer that ran
-            // ahead is doing nothing wrong — but holding it is pointless:
-            // `replay_early` re-runs the same guard, `early` does not survive
-            // into the next hand, and the bytes would sit here until they
-            // pushed something useful out.
-            return Holding::AnotherHand;
-        }
-        if chained::open_in_hand(
-            &bytes,
-            FRAME_CAP,
-            kind,
-            &self.open.table_id,
-            self.open.hand_id,
-        )
-        .is_err()
-        {
+        // **Verified first, and classified second.** The order was the other
+        // way round, so an event of another hand was answered before its
+        // signature was looked at — and the node turns that answer into
+        // `Ignore`, which does not forward. A peer one hand behind is exactly
+        // the intermediary a peer one hand ahead needs, so that quietly undid
+        // the forwarding property for every next-hand event crossing a table
+        // wider than a full mesh.
+        //
+        // The event is opened against **the hand it names**, which leaves the
+        // table identity and the signature doing all the work — that is what a
+        // relay decision may rest on, and a `hand_id` this client is not
+        // playing is not a fault in the sender.
+        if chained::open_in_hand(&bytes, FRAME_CAP, kind, &self.open.table_id, hand_id).is_err() {
             return Holding::Malformed;
+        }
+        if hand_id != self.open.hand_id {
+            // A hand this client is not playing. Worth relaying and not worth
+            // holding: `replay_early` re-runs the same guard, `early` does not
+            // survive into the next hand, and the bytes would sit here until
+            // they pushed something useful out.
+            return Holding::AnotherHand;
         }
         // Bounded: this is fed from the network, and everything fed from the
         // network is bounded where it is consumed.
