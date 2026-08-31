@@ -2309,12 +2309,27 @@ column is `finished`, and the harness says so where the column is printed.
 
 ### What is left
 
-A seat still takes **10 to 40 seconds** to enter the group, and once **125 s**,
-which is friend-connection latency rather than the invitation — the table waits
-for it, which is why one nine-seat run's first hand took 122 s and is excluded
-from the steady-state figure. The harness now keeps its logs whenever a seat is
-slower than 60 s, because the run that would have answered *"connection, or
-refusal?"* was deleted as a success.
+A seat takes **10 to 40 seconds** to enter the group, and once took **125 s**.
+The table waits for the last one, which is why a nine-seat run's first hand took
+122 s and is excluded from the steady-state figure.
+
+**That is toxcore's pacing, not ours, and it is worth writing down rather than
+chasing.** `LAN_DISCOVERY_INTERVAL` is **10 seconds**
+(`vendor/c-toxcore/toxcore/LAN_discovery.h:23`) and `friend_connection.c:934`
+sends a LAN discovery packet once per interval; local discovery is enabled in our
+options, so two clients on one wire find each other on that cadence and not
+faster. Our invite sweep adds up to 5 s on top of it in the retry case only — the
+up-edge path still invites immediately. Observed entries at 10.1, 15.1, 20.1,
+25.1, 35.2 and 40.2 s are that cadence; the 125 s outlier is a friend connection
+that needed several rounds or fell back to the DHT.
+
+The lever that would actually shorten time-to-first-hand is not making discovery
+faster: it is whether a table must wait for **every** seat before hand 1. That is
+a protocol question and not an implementation's to answer.
+
+The harness now keeps its logs whenever a seat is slower than 60 s, because the
+one run that would have answered *"connection, or refusal?"* was deleted as a
+success.
 
 
 ## Still open
