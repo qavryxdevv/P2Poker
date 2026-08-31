@@ -839,7 +839,14 @@ Five things a `deny.toml` has to handle, all verified:
    byte-identical to what was published, including when it is wrong. The counts in
    the table above are of *declared* expressions and are unchanged.
 
-**Our own licence is decided, and not by a licensing decision.** D-019 puts the
+**Our own licence is decided, declared, and unconditional.** The crate's
+`license` field says `GPL-3.0-or-later` and `LICENSE` carries the text; the Tox
+feature is in `default` because the owner has settled that a build without it is
+not released, so there is no configuration in which this client is anything
+else. `--no-default-features` exists for a contributor with no C toolchain and
+is never a release.
+
+**And it was decided by a transport choice, not a licensing one.** D-019 puts the
 table's traffic on a Tox group, `c-toxcore` is **GPL-3.0 and not LGPL** — verified
 against the repository's own `LICENSE` on 2026-08-30 — and linking it makes this
 whole client GPL-3.0. MIT, Apache-2.0 and the dual form are foreclosed. Nothing in
@@ -865,7 +872,7 @@ Recorded as obligations rather than quietly omitted, because §28 asks for
 |---|---|---|
 | `Cargo.lock` committed | **done** | repository root |
 | `cargo audit` clean or explicitly justified | **runs; 4 findings, all justified in §4**; no CI job | Phase 7 |
-| `cargo deny` configured | **`deny.toml` does not exist.** With no config its allow-list is empty, so `cargo deny check licenses` emits 588 `rejected` errors over the graph it walks — every crate, including MIT — plus one `unlicensed` error for `p2p-poker`. It is installed but is not currently a usable gate | Phase 7 |
+| `cargo deny` configured | **`deny.toml` does not exist.** With no config its allow-list is empty, so `cargo deny check licenses` emits 588 `rejected` errors over the graph it walks — every crate, including MIT. **The one `unlicensed` error, which was for `p2p-poker` itself, is fixed:** the crate now declares `license = "GPL-3.0-or-later"` and the repository carries the verbatim GPLv3 as `LICENSE`. It had neither, which is a gap `cargo deny` was reporting correctly and nobody had read as a finding about *us* rather than about the tree. The rest is still not a usable gate | Phase 7 |
 | `ziffle` vendored with `[patch.crates.io]` | **done 2026-08-29** — §3.1, `vendor/ziffle/PROVENANCE.md`; `cargo build` and `cargo test` clean against the vendored copy | landed |
 | The vendored digest survives its own lockfile | **done, and it needed doing.** Patching ziffle to a path makes cargo drop the `source` and `checksum` lines from its `Cargo.lock` entry, so `ba79285…` is now in **no** machine-checked file. `PROVENANCE.md` §2.2's per-file sha256 table is the replacement and is what a re-audit compares against | landed; §8.2 |
 | A designated fallback for ziffle, with a rev | **done** — §11, `paritytech/mental-poker` @ `e05744b4…` | landed |

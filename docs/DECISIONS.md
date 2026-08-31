@@ -2022,6 +2022,26 @@ acceptable to depend on, because it requires somebody to have forwarded a port,
 and a client whose playability rests on that is a client most people cannot use.
 A transport that does not have a per-circuit byte cap is worth its price.
 
+### Settled 2026-08-31: no build without Tox is released
+
+The owner's decision, and it removes the last conditional from everything below:
+the feature is in `default`, the shipped binary always carries Tox, and the
+client's licence is therefore **GPL-3.0-or-later without qualification** rather
+than "GPL-3.0 if you enable a feature".
+
+Three things that had been left open are done with it. The crate declares
+`license = "GPL-3.0-or-later"`; the repository carries the verbatim GPLv3 as
+`LICENSE`, which it had never had; and `README.md`'s *"Licence: not yet chosen"*
+is replaced by the standard notice. `DEPENDENCIES.md` §7 recorded a
+`cargo deny` `unlicensed` error against `p2p-poker` itself — that was this gap,
+reported correctly and read as noise.
+
+`--no-default-features` still builds and is a development convenience: a
+contributor with no C toolchain, or a test run with no business opening a
+socket. It is never a release, and the one place the distinction can still be
+seen by a person — a Tox table joined by a client that has no Tox — says so at
+the moment of joining rather than at the hand's deadline.
+
 ### The price, stated plainly because it is a one-way door
 
 **`c-toxcore` is GPL-3.0, not LGPL.** Verified 2026-08-30 by reading the

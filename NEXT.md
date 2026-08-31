@@ -1481,16 +1481,33 @@ and a Tox group forwards nothing on this client's behalf.
 feature *off* formed a table and agreed on genesis `412e4e13` and `b738bc9b`,
 all three.
 
-### One thing this does not do yet
+### The mixed-transport table, and why it is not a shipping concern
 
-**A table can be on Tox for some seats and not others.** A joiner whose build
-has no Tox joins a Tox table over the mesh, and its hand events go to a
-GossipSub topic the others have stopped reading. It is told so —
-*"this table's traffic is on Tox and this build has none; the hand will not
-reach it"* — and it is told at the moment it joins rather than at the deadline,
-which is the best that can be done without either refusing the join or carrying
-the hand on both transports. Refusing is `PROTOCOL.md`'s call: it would be a
-rule about which builds may sit at which tables.
+A table can in principle be on Tox for some seats and not others: a joiner whose
+build has no Tox joins over the mesh, and its hand events go to a GossipSub
+topic the others have stopped reading. It is told so at the moment it joins
+rather than at the deadline — *"this table's traffic is on Tox and this build
+has none; the hand will not reach it"*.
+
+**The owner has settled it: a build without Tox is not released.** So the
+feature is in `default` and the case is a development one — `--no-default-features`
+for a contributor with no C toolchain, or a test run with no business opening a
+socket. The warning stays because a developer build can still wander onto a real
+table and should say so, not because a player will ever see it.
+
+Three things follow from that and are done:
+
+* **`license = "GPL-3.0-or-later"` and a `LICENSE` file.** The repository had
+  neither, which is why `cargo deny check licenses` reported this crate itself
+  as `unlicensed`. `c-toxcore` declares `GPL-3.0-or-later` in every source file
+  and linking it makes this client that, so the licence is now stated without an
+  "if" — D-019 closed *"the project licence has never been chosen"* by a
+  transport decision rather than a licensing one, and the tree now says so.
+* **`README.md`'s "Licence: not yet chosen" is gone**, with the standard notice
+  and the one-line build instruction in its place.
+* **`build.rs` says what to do** when the vendored C is missing, instead of
+  panicking on a path nobody recognises — which is now the first thing a fresh
+  clone hits, because the default build needs it.
 
 ### What is next, in order
 

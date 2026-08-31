@@ -80,6 +80,13 @@ $expected = @(
     'gdi32.dll','imm32.dll','iphlpapi.dll','kernel32.dll','ntdll.dll','ole32.dll',
     'oleaut32.dll','opengl32.dll','pdh.dll','powrprof.dll','psapi.dll','shcore.dll',
     'shell32.dll','user32.dll','uxtheme.dll','ws2_32.dll',
+    # SChannel, which is Windows' own TLS. `attohttpc` is built with
+    # `tls-native` so that fetching the Tox node list needs no second crypto
+    # library and no rustls provider to choose between - see the argument in
+    # `Cargo.toml`. Both are system DLLs, so the single-file claim is untouched;
+    # they are listed here because a name nobody has vouched for should warn,
+    # and these two now have a reason on the record.
+    'crypt32.dll','secur32.dll',
     # The software renderer's road to WARP. All four are Windows' own: `dxgi`
     # and `setupapi` are genuine imports, `d3d12` and `dcomp` are loaded at
     # runtime. Read out of the PE import table, which gained exactly two names

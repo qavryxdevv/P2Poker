@@ -136,7 +136,19 @@ mod tox {
     /// upstream ever moves an A/V file into the first block, the build says so
     /// instead of failing at a missing header sixty files later.
     fn sources(cmakelists: &Path) -> Vec<String> {
-        let text = std::fs::read_to_string(cmakelists).expect("the vendored CMakeLists.txt");
+        let text = std::fs::read_to_string(cmakelists).unwrap_or_else(|_| {
+            panic!(
+                "{} is not there.\n\n\
+                 The `tox` feature is on by default because the released binary always \n\
+                 carries Tox (D-019). It needs the vendored C, which is fetched at pinned \n\
+                 commits rather than committed:\n\n    \
+                 pwsh tools/build-tox.ps1\n\n\
+                 To build without it - no C toolchain, or a test run with no business \n\
+                 opening a socket:\n\n    \
+                 cargo build --no-default-features\n",
+                cmakelists.display()
+            )
+        });
         let mut out = Vec::new();
         let mut inside = false;
         let mut seen_block = false;

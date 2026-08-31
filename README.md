@@ -196,4 +196,36 @@ enforceable and enforced; one *person* per seat is not, and is not claimed.
 
 ## Licence
 
-Not yet chosen.
+**GPL-3.0-or-later.** The full text is in [`LICENSE`](LICENSE).
+
+It is not a preference. A table's game traffic rides a Tox group (D-019),
+`c-toxcore` declares `GPL-3.0-or-later` in every source file, and linking it
+makes this whole client that. `DECISIONS.md`'s D-019 records the trade under
+"The price" and calls it a one-way door: MIT, Apache-2.0 and the dual form are
+foreclosed, and the open item *"the project licence has never been chosen"* is
+closed by a transport decision rather than by a licensing one.
+
+The released binary always carries Tox, so the licence is unconditional.
+`--no-default-features` builds without it and is a development convenience — a
+contributor with no C toolchain, or a test run with no business opening a socket
+— never a release.
+
+    This program is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
+
+    This program is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+    more details.
+
+    You should have received a copy of the GNU General Public License along
+    with this program. If not, see <https://www.gnu.org/licenses/>.
+
+### Building it
+
+The default build needs the vendored C fetched once, at pinned commits:
+
+    pwsh tools/build-tox.ps1
+    cargo build --release

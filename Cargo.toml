@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Decentralised No-Limit Texas Hold'em over libp2p and BitTorrent Mainline DHT"
+# **GPL-3.0-or-later, and it is not a preference.** D-019 puts a table's game
+# traffic on a Tox group; `c-toxcore` declares `GPL-3.0-or-later` in every
+# source file, and linking it makes this whole client that. The decision is
+# recorded in D-019 under "The price", which calls it a one-way door and means
+# it: MIT, Apache-2.0 and the dual form are foreclosed.
+#
+# `LICENSE` is the verbatim GPLv3 text. Without both this field and that file,
+# `cargo deny check licenses` reports this crate itself as `unlicensed` — which
+# is what it was.
+license = "GPL-3.0-or-later"
 # No `repository`, `authors` or `homepage`. The crate is `publish = false`, so
 # none of them reaches a registry, and each is a place for somebody's name to
 # end up in a file that gets copied about. Set `repository` if this is ever
@@ -172,10 +182,18 @@ cc = "1"
 # somebody can see, and so that the tree still builds for anyone without a C
 # toolchain.
 #
-# It is NOT in `default`. Turning it on also requires `tools/build-tox.ps1` to
-# have built libsodium once.
+# **It IS in `default`,** because a build without it is not a build that ships.
+# The owner's decision: the released binary always carries Tox, so the licence
+# is unconditional and the `license` field above states it without an "if".
+#
+# `--no-default-features` still builds, and that is what it is for: a
+# contributor without a C toolchain, or a test run that has no business opening
+# a socket. It is a development convenience and never a release.
+#
+# Building the default needs `tools/build-tox.ps1` to have run once, which
+# fetches the vendored C at pinned commits and builds libsodium.
 [features]
-default = []
+default = ["tox"]
 tox = ["dep:attohttpc", "dep:serde_json"]
 
 # --- only under `--features tox` -------------------------------------------
