@@ -234,6 +234,30 @@ impl TableSink {
         }
     }
 
+    /// Invitations into the table's group that toxcore refused.
+    ///
+    /// **Separate from `trouble`, because it is a different condition with a
+    /// different remedy.** Those three counters say *the transport is behind*;
+    /// this one says *a seat is not in the group*, which shows at the table as
+    /// a player who is seated, counted in the roster, and never dealt to. The
+    /// two were indistinguishable in a log until a run at three seats put a
+    /// seat outside the group for a hundred seconds while it opened hands of
+    /// its own that nobody else held.
+    pub fn invites_refused(&self) -> u64 {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().invites_refused.load(Ordering::Relaxed),
+                None => 0,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            0
+        }
+    }
+
     /// Tell the driver what the roster decided. Nothing, when there is no Tox.
     #[allow(unused_variables)]
     pub fn tell(&self, seat: Seat) {

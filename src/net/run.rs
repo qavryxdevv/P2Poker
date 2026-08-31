@@ -432,6 +432,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // The last refusal count reported, so a steady state says nothing and a
     // rising one says it every five seconds.
     let mut tox_refused_said: u64 = 0;
+    let mut tox_invites_said: u64 = 0;
     // **How the re-send loop backs off.** `at` is the chain position it last
     // saw, and `ticks` counts five-second ticks since that position moved. A
     // table that is advancing re-sends almost nothing; a stuck one still gets
@@ -2432,6 +2433,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         .send(NodeEvent::Warning(format!(
                             "the table's transport is behind: {waiting} message(s) queued,                              {refused} fragment(s) refused of {} offered",
                             refused + sent
+                        )))
+                        .await;
+                }
+
+                // **And when a seat is outside the group, which is not the same
+                // thing.** A refused invitation leaves a player seated, counted
+                // in the roster and never dealt to; the transport counters above
+                // are all zero while it happens, because there is nothing wrong
+                // with the transport.
+                let invites = tox_sink.invites_refused();
+                if invites > tox_invites_said {
+                    tox_invites_said = invites;
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "a seat is not in the table's group yet: {invites} invitation(s) refused so far"
                         )))
                         .await;
                 }

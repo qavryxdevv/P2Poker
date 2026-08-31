@@ -2218,6 +2218,81 @@ next person to add an entry rather than look. The three gates that did go in —
 references, constants, dependencies — each carry at most three exceptions with a
 reason apiece.
 
+## The table breaks between eight seats and nine, and `MAX_SEATS` is ten
+
+The seat-count table stopped at six because six clients had been started by
+hand. `tools/table-run.ps1` starts N of them — one founder, N-1 joiners, all
+`--headless --autoplay`, each in its own profile — and reads back what every
+node saw, not only the founder. Measured on one machine, `target/release`,
+300 s per run, Tox path:
+
+| seats | s / hand | every seat in the group | every seat finishing hands |
+|---|---|---|---|
+| 3 | 7.7 | yes | yes |
+| 6 | 10.3 | yes | yes |
+| 7 | 11.2 | yes | yes |
+| 8 | 12.9 | yes | yes |
+| **9** | **42.3** | yes | **no — one seat forked** |
+| **10** | **61.1** | **no — two never joined** | **no — three finished none** |
+
+Two to eight is a gentle slope: **10.3 s at six, 12.9 s at eight**, and the
+earlier 13.5 s figure for six was measured before the re-send backoff landed.
+Then it falls over. Nine seats is **three times** eight, with the founder
+opening 6 hands while six of its joiners opened 10 — *the founder was behind its
+own table* — and seat 7 opening four hands on a genesis nobody else had. At ten,
+two seats never entered the Tox group at all and three finished no hand.
+
+**The protocol permits ten seats and the client cannot play ten.** `MAX_SEATS`
+is 10 and `hand_deadline_min_ms` is derived for ten, so nothing refuses such a
+table; it just does not work.
+
+### What the instrument had to learn to see this
+
+**`TABLE FORMED session=… seats=N` is not evidence that a seat played.** It
+reports the roster a peer holds, and a peer that heard no hand still holds it.
+In the first three-seat run a seat was invited into the group at **100 s**,
+having asked to join at 1.5 s; in between it opened its own hands, played none
+of them, and finished by printing `TABLE FORMED session=<the same id> seats=3`.
+Every scripted test in this project reads that line back as the pass condition,
+and it cannot tell the two runs apart.
+
+**And matching genesis hashes are not evidence either — including in my own
+first version of this harness.** `genesis_hand` is a hash of the table id, the
+hand number, the session, the roster hash, the terminal-zero and the ratifiers:
+every value a peer holds the moment the roster ratifies. Two peers agree on hand
+N's genesis *without exchanging a single hand message*. At ten seats, `n4` never
+entered the group and agreed on all five hands it opened while finishing none.
+**Opening a hand is local; finishing one is not**, so the participation column is
+`finished`, and the harness now says so where the column is printed.
+
+### One cause found and fixed: an invitation was an event, not a condition
+
+The founder invited a seat only from the `FriendConnection` up-edge, and
+`invited` is appended to only when `tox_group_invite_friend` **succeeds**. So a
+refused invitation was never retried — the one trigger had gone by, and the next
+up-edge for that friend arrives when the connection drops and comes back. At a
+table that means a seated player sits outside the group until the network
+happens to hiccup, which is the 100-second case above.
+
+It is now a swept condition: every friend that is connected, on the roster and
+not yet invited, every five seconds, and still immediately on the up-edge so the
+ordinary case is unchanged. `pending_invites` is split out and pinned by
+`an_invitation_is_owed_by_a_condition_and_not_by_an_edge`, whose third case is
+the one that was wrong.
+
+A counter came with it, because **a seat arriving late is two different failures
+that look identical in a log**: either the friend connection has not come up —
+only waiting fixes that — or an invitation was attempted and refused.
+`Trouble::invites_refused` separates them, and the node loop says *"a seat is not
+in the table's group yet"*, which is a different sentence from *"the table's
+transport is behind"* on purpose.
+
+**That fix is not the whole of the nine-and-ten cliff.** The founder falling
+behind its own table at nine seats is not explained by invitations, and the
+transport counters were **zero** through the ten-seat run — no send refused,
+nothing queued. So it is not the transport either, and the next measurement is
+where the founder's time goes at nine, with the fix in place.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that

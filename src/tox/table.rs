@@ -119,6 +119,14 @@ pub struct Trouble {
     pub waiting: AtomicU64,
     /// Fragments handed to toxcore and accepted.
     pub sent: AtomicU64,
+    /// Invitations the founder tried to send and toxcore refused.
+    ///
+    /// **Here because a seat arriving late is two different failures that look
+    /// the same in a log.** Either the friend connection has not come up yet —
+    /// nothing to invite over, and only waiting fixes it — or the invitation
+    /// was attempted and refused. Measured at six seats, group entry landed at
+    /// 15, 35, 40, 40 and 40 seconds, and nothing said which of the two it was.
+    pub invites_refused: AtomicU64,
 }
 
 /// The handle the rest of the client holds.
@@ -320,6 +328,19 @@ fn run(
     announce(&tox, group, &chat);
 
     let mut invited: Vec<u32> = Vec::new();
+    // Which friends toxcore currently reports as up. **Kept because an
+    // invitation is a condition, not an event.** It was sent only from the
+    // `FriendConnection` up-edge, so an invitation that toxcore refused was
+    // never retried: `invited` is only appended to when `invite` succeeds, and
+    // the one trigger had already passed. The next up-edge for that friend
+    // comes when the connection drops and returns, which at a table means a
+    // seated player sits outside the group until the network hiccups.
+    //
+    // Observed once at three seats: a seat entered the group at **100 s**,
+    // having asked to join at 1.5 s, and in between opened its own hands on a
+    // genesis nobody else held. It never played a hand and still printed
+    // `TABLE FORMED seats=3`.
+    let mut connected: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut reassembler: Reassembler<u32> = Reassembler::new(fragment::TOX_PACKET);
     let mut next_id: u32 = 0;
     let mut last_sweep = Instant::now();
@@ -383,15 +404,15 @@ fn run(
         for e in tox.iterate() {
             match e {
                 Event::FriendConnection { friend, status } if status != 0 => {
-                    // The founder invites every seat the roster names, once its
-                    // friend connection is up. Before that there is nothing to
-                    // invite: an invitation is carried over the friendship.
+                    // Up. The founder invites every seat the roster names, once
+                    // its friend connection is up — before that there is nothing
+                    // to invite, because an invitation is carried over the
+                    // friendship. Trying here as well as in the sweep only makes
+                    // the common case immediate; `invite_pending` is what makes
+                    // it certain.
+                    connected.insert(friend);
                     if matches!(setup.role, Role::Host) {
-                        if let (Some(g), false) = (group, invited.contains(&friend)) {
-                            if friends.contains_key(&friend) && tox.invite(g, friend).is_ok() {
-                                invited.push(friend);
-                            }
-                        }
+                        invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
                     }
                 }
                 Event::FriendConnection { friend, .. } => {
@@ -399,6 +420,7 @@ fn run(
                     // reconnects is invited again — a group membership does not
                     // survive a client restart, and a peer that came back
                     // without one would sit outside the table for ever.
+                    connected.remove(&friend);
                     invited.retain(|f| *f != friend);
                 }
                 Event::GroupInvite { friend, invite } => {
@@ -477,6 +499,12 @@ fn run(
 
         if last_sweep.elapsed() >= SWEEP_EVERY {
             reassembler.sweep(millis());
+            // Every seat that is connected, on the roster and not yet in — see
+            // `invite_pending`. Cheap: it does nothing at all once every friend
+            // has been invited, which is the state a table spends its life in.
+            if matches!(setup.role, Role::Host) {
+                invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
+            }
             last_sweep = Instant::now();
         }
 
@@ -497,6 +525,60 @@ fn run(
 /// Leaving must not become waiting, so it is a fixed number rather than a wait
 /// for an empty queue: at `MAX_TICK` this is at most a second and a half.
 const FLUSH_TURNS: usize = 30;
+
+/// Invite every seat that is connected, on the roster and not in the group yet.
+///
+/// **An invitation is a condition, not an event, and this is the difference.**
+/// It used to be sent only from the `FriendConnection` up-edge. Two things
+/// followed. A refusal from `tox_group_invite_friend` was never retried, since
+/// `invited` is only appended to when the call succeeds and the trigger had
+/// already gone by; and the next up-edge for that friend arrives when the
+/// connection drops and returns, so a seated player could sit outside the table
+/// until the network happened to hiccup.
+///
+/// Called from the up-edge as well, so the ordinary case is still immediate.
+/// The sweep is what makes it certain rather than likely.
+fn invite_pending(
+    tox: &mut Tox,
+    group: Option<u32>,
+    friends: &HashMap<u32, [u8; 32]>,
+    connected: &std::collections::HashSet<u32>,
+    invited: &mut Vec<u32>,
+    trouble: &Trouble,
+) {
+    let Some(g) = group else { return };
+    for friend in pending_invites(connected, friends, invited) {
+        if tox.invite(g, friend).is_ok() {
+            invited.push(friend);
+        } else {
+            // Counted rather than logged: a refusal here is ordinary while the
+            // group is settling, and the number is only interesting if it does
+            // not stop growing.
+            trouble.invites_refused.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Who is owed an invitation: connected, on the roster, not invited yet.
+///
+/// Split out from [`invite_pending`] because it is the half that had the defect
+/// and the half that can be tested without a Tox instance. Sorted so a caller
+/// invites in a stable order — nothing depends on it, and a `HashSet`'s order
+/// changing between runs is the kind of thing that makes a flake look like a
+/// protocol problem.
+fn pending_invites(
+    connected: &std::collections::HashSet<u32>,
+    friends: &HashMap<u32, [u8; 32]>,
+    invited: &[u32],
+) -> Vec<u32> {
+    let mut out: Vec<u32> = connected
+        .iter()
+        .copied()
+        .filter(|f| friends.contains_key(f) && !invited.contains(f))
+        .collect();
+    out.sort_unstable();
+    out
+}
 
 /// Send what is queued, one message at a time.
 ///
@@ -590,6 +672,45 @@ fn millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An invitation is owed by a **condition**, not by an event.
+    ///
+    /// The defect this pins: the founder invited a seat only from the
+    /// `FriendConnection` up-edge, and `invited` is appended to only when
+    /// `tox_group_invite_friend` succeeds. A refusal therefore lost the seat
+    /// until the connection dropped and came back — and measured once at three
+    /// seats, that took **a hundred seconds**, during which the seat opened
+    /// hands on a genesis nobody else held, played none of them, and still
+    /// finished by printing `TABLE FORMED seats=3`.
+    ///
+    /// Four cases, and the third is the one that was wrong.
+    #[test]
+    fn an_invitation_is_owed_by_a_condition_and_not_by_an_edge() {
+        let friends: HashMap<u32, [u8; 32]> = [(1u32, [1u8; 32]), (2, [2u8; 32]), (3, [3u8; 32])]
+            .into_iter()
+            .collect();
+        let set = |xs: &[u32]| xs.iter().copied().collect::<std::collections::HashSet<u32>>();
+
+        // Connected, on the roster, not yet invited: owed.
+        assert_eq!(pending_invites(&set(&[1, 2]), &friends, &[]), vec![1, 2]);
+
+        // Already invited: not owed again. A second invitation is not harmful,
+        // but sending one every five seconds for the life of a table is.
+        assert_eq!(pending_invites(&set(&[1, 2]), &friends, &[1]), vec![2]);
+
+        // **The case the edge got wrong.** The friend is connected and the
+        // invitation was refused, so it is not in `invited` — and there will be
+        // no second up-edge. The sweep must still owe it.
+        assert_eq!(pending_invites(&set(&[3]), &friends, &[1, 2]), vec![3]);
+
+        // Connected but not a seat at this table: never owed. The founder
+        // invites the roster, not everyone toxcore has a friendship with.
+        assert_eq!(pending_invites(&set(&[9]), &friends, &[]), Vec::<u32>::new());
+
+        // Not connected: nothing to invite over, which is the case the edge
+        // handled correctly and this must not change.
+        assert_eq!(pending_invites(&set(&[]), &friends, &[]), Vec::<u32>::new());
+    }
 
     /// **The whole stack, between two real Tox instances**: a nine-kilobyte
     /// message — the size of a `SHUFFLE_STEP` — handed to `broadcast` at one
