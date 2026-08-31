@@ -350,6 +350,29 @@ const _: () = assert!(PEEK_CAP >= FRAME_CAP);
 /// that no single seat's contribution decides the button, and `session_id` is a
 /// hash of the ratifications, which is not the same guarantee.
 ///
+/// # And it is biasable by whoever ratifies last, which is worse than provisional
+///
+/// `session_id` is a hash over the ratifications' `event_hash`es (§4.3), and an
+/// event hash covers the whole signed envelope — including `emitted_at_unix_ms`,
+/// a number its emitter picks. `TABLE_READY` also carries `capability_set`, a
+/// list of byte strings the emitter controls outright. So the last seat to
+/// ratify can re-sign its own with a different timestamp, recompute
+/// `session_id`, and stop when the button lands where it wants.
+///
+/// `the_last_seat_to_ratify_can_choose_the_button` measures it: **under a
+/// hundred hashes** to choose any seat at a six-handed table. The dead-button
+/// rule makes that worth doing — the initial button fixes who posts which blind
+/// in hand one and who acts last, and every later button is a rotation of it.
+///
+/// This is exactly what §4.4's commit-and-reveal beacon exists to stop, and the
+/// reason this function is documented as *not the rule* rather than as a
+/// simplification. **What blocks replacing it is not the beacon**: `RNG_COMMIT`,
+/// `RNG_REVEAL` and `seed` are fully specified. It is that no document says how
+/// to get a button out of the seed — `PROTOCOL.md` §4.4 says the rule is in
+/// `STATE_MACHINE.md`, §7.9 says the constructions are `PROTOCOL.md`'s and that
+/// the engine computes neither value, and T10 points at §7.9. A citation cycle
+/// with nothing at the centre.
+///
 /// One function, so replacing it is one change.
 pub fn provisional_button(session_id: &Hash, occupied: &[SeatIdx]) -> SeatIdx {
     debug_assert!(!occupied.is_empty());
@@ -7940,6 +7963,78 @@ mod tests {
             wide[s] = true;
         }
         assert_eq!(at(8, wide, 3), (7, 0), "the ring wraps past the empty seats");
+    }
+
+    /// **The last seat to ratify can choose the button.**
+    ///
+    /// `provisional_button` reads `session_id`, and `session_id` is a hash over
+    /// the ratifications' `event_hash`es. An event hash covers the whole signed
+    /// envelope, and the envelope carries `emitted_at_unix_ms` — a number its
+    /// emitter picks. `TABLE_READY` also carries `capability_set`, a list of
+    /// byte strings the emitter controls outright.
+    ///
+    /// So a seat that ratifies last can re-sign its own `TABLE_READY` with a
+    /// different timestamp, recompute `session_id`, and stop when the button
+    /// lands where it wants. At a table of `m` seats it needs about `m`
+    /// attempts for a chosen seat, and a few hundred for a chosen seat with
+    /// confidence: milliseconds of work.
+    ///
+    /// This test does not attack the client — it computes the same function the
+    /// client does, over hashes an attacker can produce, and counts how few
+    /// tries it takes. What it demonstrates is that **the initial button is not
+    /// unbiased**, which is exactly what `PROTOCOL.md` §4.4's beacon exists to
+    /// fix and why `provisional_button` is documented as *not the rule*.
+    ///
+    /// The dead-button rule makes the initial button worth choosing: it fixes
+    /// who posts which blind in hand one and who acts last, and every later
+    /// button is a rotation of it.
+    #[test]
+    fn the_last_seat_to_ratify_can_choose_the_button() {
+        use crate::protocol::transcript::{session_id, Ratification};
+
+        let table_id = [1u8; 32];
+        let params = [2u8; 32];
+        let roster_zero = [3u8; 32];
+        let occupied: Vec<SeatIdx> = vec![0, 1, 2, 3, 4, 5];
+
+        // Two seats have ratified and their hashes are fixed. The third is the
+        // attacker's, and it varies only its own event hash - which is what
+        // re-signing with a different timestamp gives it.
+        let fixed = |seat: u8, b: u8| Ratification {
+            seat,
+            event_hash: [b; 32],
+        };
+
+        let mut tries_for = |want: SeatIdx| -> u32 {
+            for n in 0u32..10_000 {
+                let mut mine = [0u8; 32];
+                mine[..4].copy_from_slice(&n.to_be_bytes());
+                let rats = vec![fixed(0, 0xAA), fixed(1, 0xBB), Ratification { seat: 2, event_hash: mine }];
+                let sid = session_id(&table_id, &params, &roster_zero, &rats);
+                if provisional_button(&sid, &occupied) == want {
+                    return n + 1;
+                }
+            }
+            u32::MAX
+        };
+
+        // Every seat at the table is reachable, and cheaply.
+        for want in &occupied {
+            let tries = tries_for(*want);
+            assert!(
+                tries < 1_000,
+                "seat {want} took {tries} tries, which is still trivial but means \
+                 this test is measuring something other than what it thinks"
+            );
+        }
+
+        // And the cost of picking a specific one is what an attacker would
+        // actually pay: a handful of hashes.
+        let worst = occupied.iter().map(|w| tries_for(*w)).max().unwrap();
+        assert!(
+            worst < 100,
+            "choosing the button cost {worst} hashes, which is still nothing"
+        );
     }
 
     /// Every peer derives one button from one session, or stage 0 cannot

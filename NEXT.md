@@ -526,7 +526,12 @@ advertising a shorter deadline than any preset offers.
    carried inside `HAND_COMPLETE`; the checkpoint **stage** is not there, and
    `PROTOCOL.md` §12 says T61 then fires at `hand_deadline_ms` after every
    settled hand.
-3. The RNG beacon, replacing `provisional_button`.
+3. The RNG beacon, replacing `provisional_button`. **Blocked on one paragraph
+   nobody has written, and the gap now has a measured cost** - the last seat to
+   ratify can choose the button in under a hundred hashes. See the section
+   below: the beacon's messages, commitment and seed are fully specified, and no
+   document says how a seed becomes a button. Every one of them names another as
+   the owner.
 4. **The Tox transport (D-019).** The relay is why: a hand carried over a
    libp2p circuit dies at 128 KiB, measured. c-toxcore builds and links here
    now; see the D-019 section below for what it found and what is left.
@@ -1437,6 +1442,66 @@ moving off GossipSub is to leave that loop behind.
 
 
 
+
+### The initial button is biasable, and the beacon that would fix it is blocked on a citation cycle
+
+Two findings from picking up the RNG beacon, and the second is why the first is
+still there.
+
+**1. Whoever ratifies last can choose the button. Measured.**
+
+`provisional_button` reads `session_id`; `session_id` (§4.3) is a hash over the
+ratifications' `event_hash`es; an event hash covers the whole signed envelope,
+including `emitted_at_unix_ms`, a number its emitter picks. `TABLE_READY` also
+carries `capability_set`, a list of byte strings the emitter controls outright.
+
+So the last seat to ratify re-signs its own `TABLE_READY` with a different
+timestamp, recomputes `session_id`, and stops when the button lands where it
+wants. `the_last_seat_to_ratify_can_choose_the_button` does exactly that
+arithmetic over hashes an attacker can produce and counts the cost: **under a
+hundred hashes to choose any seat at a six-handed table.** Milliseconds.
+
+It is worth choosing. The dead-button rule means the initial button fixes who
+posts which blind in hand one and who acts last, and every later button is a
+rotation of it — so one grind biases the whole session's position.
+
+This is not a new decision to make: `PROTOCOL.md` §4.4's commit-and-reveal
+beacon exists for precisely this, and `provisional_button` has always been
+documented as *not the rule*. What is new is that the gap has a measured cost
+rather than a theoretical one, and that is now written where the next reader
+will be — on the function itself.
+
+**2. And the beacon cannot be finished, because nothing owns its last step.**
+
+`RNG_COMMIT` (0x0301), `RNG_REVEAL` (0x0302), the five-part `commitment_i` and
+the `seed` combine are all fully specified, to the domain string. What is not
+specified anywhere is how to turn `seed` into a button position:
+
+* `PROTOCOL.md` §4.4: *"The seed determines the seat permutation and the initial
+  button position, **by a deterministic rule specified in `STATE_MACHINE.md`**."*
+* `STATE_MACHINE.md` T10: *"derive seat permutation and initial `button_pos`
+  from it (**§7.9**)"*
+* `STATE_MACHINE.md` §7.9: *"**The engine does not compute either value**"*, and
+  *"`commitment_i` and `seed` are defined in **`PROTOCOL.md` §4.4**"*.
+
+A citation cycle with nothing at the centre. Grepped the whole corpus including
+`research/`: no seat permutation rule and no button rule exists.
+
+This is the failure mode D-011 rule 1 was adopted against, arriving from the
+other side. The rule is normally *"two copies drift, so name one owner"*; here
+every document named the other as owner and the value was written by none. A
+sweep for **owner-named-but-absent** is a different check from a sweep for
+duplicates, and this is the first instance of it found.
+
+**What is owed:** one paragraph, in one of the two documents, saying how `seed`
+becomes a permutation and a button. It is a small piece of text and it is the
+only thing between the client and an unbiasable button; the code for two
+collective stages in the setup chain is ordinary work by comparison.
+
+Implementing it with a rule chosen here would be inventing a wire value — two
+clients built from the corpus and from this repository would seat players
+differently — so it is recorded and not guessed.
+
 ### The table's own topic was never re-announced, and a seat can still miss a ratification
 
 A three-seat run went 0 hands at the founder and 17 at the other two, playing as
@@ -1913,8 +1978,11 @@ argument.
   settled hand and has nothing to fire on. `src/protocol/checkpoint.rs` and
   `seats.rs` are the draft of §6.2's records and are deliberately kept unwired
   for this; `tests/anti_replay_authority.rs` holds them to that.
-* **The RNG beacon.** `provisional_button` stands in for it, in nine places in
-  `table/hand.rs`.
+* **The RNG beacon.** `provisional_button` stands in for it. It is not merely
+  provisional: **it is biasable by whoever ratifies last, measured at under a
+  hundred hashes to choose any seat.** The beacon is specified up to the seed
+  and no further - the seed-to-button rule is named as another document's in
+  every document that mentions it. See the section above.
 * **`HAND_ABORT` causes 2 and 3 are done** - see above. What is left of the
   cause register is `4` (the §6.3 divergence terminus) and `6` (D-014's
   anti-cheat void), and both need machinery that does not exist yet rather than
