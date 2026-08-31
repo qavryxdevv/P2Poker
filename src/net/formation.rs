@@ -393,7 +393,10 @@ impl Formation {
 
     /// How many ratifications are waiting for a roster. For the test that
     /// bounds it.
-    #[cfg(test)]
+    ///
+    /// Public rather than `cfg(test)`: an integration test outside the crate
+    /// is where the queue's behaviour under a replayed recording is actually
+    /// checked, and a counter is the only way to see a slot being wasted.
     pub fn held_early(&self) -> usize {
         self.early.len()
     }
@@ -751,6 +754,25 @@ impl Formation {
                 // Held rather than dropped. Everything about it is signed and
                 // self-contained, so it is judged again — in full — when the
                 // list it names arrives.
+                //
+                // **But only if it could still become valid.** A ratification
+                // naming a serial this client has already passed never will:
+                // `admit_ready` compares against the held serial and `adopt`
+                // only ever moves forward. Keeping one wasted a slot in a queue
+                // of ten and pushed out a genuine early ratification — and the
+                // bytes are somebody's real signed event, so a bystander who
+                // had merely watched an earlier round could refill the queue
+                // from its own recording and hold up the table without a key.
+                let stale = joinwire::receive_table_ready(
+                    bytes,
+                    &self.under.table_id,
+                    &self.genesis(),
+                )
+                .map(|(ready, _, _)| ready.list_serial < self.serial)
+                .unwrap_or(true);
+                if stale {
+                    return Ok(vec![]);
+                }
                 if self.early.len() >= MAX_SEATS as usize {
                     self.early.pop_front();
                 }

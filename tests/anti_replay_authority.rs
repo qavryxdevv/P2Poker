@@ -649,3 +649,45 @@ fn a_seat_that_ratifies_twice_is_named_rather_than_letting_the_last_one_win() {
          every later genesis"
     );
 }
+
+
+/// **A ratification that can never become valid is not kept.**
+///
+/// A `TABLE_READY` that does not fit the roster this client holds is held
+/// rather than refused, because on a mesh the ratification and the list it
+/// ratifies race and the loser is usually the list. But one naming a serial
+/// this client has already passed will never fit: `admit_ready` compares
+/// against the held serial and `adopt` only moves forward.
+///
+/// Keeping it wasted a slot in a queue of ten and pushed a genuine early
+/// ratification out of it — and the bytes are a real seat's real signed event,
+/// so a bystander who had merely watched an earlier round could refill the
+/// queue from its own recording and hold the table up without a key of its own.
+///
+/// **To make this fail:** delete the `stale` guard from
+/// `Formation::on_table_ready`.
+#[test]
+fn a_ratification_for_a_serial_already_passed_is_not_held() {
+    let mut t = Table::new();
+    t.add(1);
+    // Every ratification broadcast so far names the serial the table had then.
+    let recorded = t.seen_ready.clone();
+    assert!(!recorded.is_empty(), "somebody ratified at the first serial");
+
+    // The roster moves on, which raises the serial and clears what was held.
+    t.add(2);
+    let before = t.founder.held_early();
+
+    // A bystander replays everything it heard at the earlier serial.
+    for _ in 0..4 {
+        for bytes in &recorded {
+            let _ = t.founder.on_table_ready(bytes);
+        }
+    }
+    assert_eq!(
+        t.founder.held_early(),
+        before,
+        "ratifications for a serial the table has passed were kept, and the \
+         queue holds ten"
+    );
+}

@@ -810,6 +810,34 @@ Two things to establish, with instrumentation and not by reading:
   three seats, but a three-seat table that loses one is exactly the case, and
   the fallback it lands in is the unstable one.
 
+## The replays the anti-replay review listed, and what became of them
+
+It named seven that actually work against the running code. Five are closed,
+each with a test shown to fail without the fix:
+
+| | Closed by |
+|---|---|
+| Unsigned junk floods the hold queue, and the victim forwards it in its own name | `Hand::hold` opens the event before keeping it, and the node's verdict follows what was kept |
+| `said` is never cleared at a hand boundary, so hand *k* poisons hand *k+1* | cleared where the next hand opens |
+| `ratified.insert` overwrites, and `session_id` is built from those hashes | first copy wins, second differing one named |
+| An expired advert is re-admitted | refused with the same predicate the sweep already uses |
+| A stale `PLAYER_LIST` is accepted while this client's serial is 0 | bounded against the founder's own signed envelope time |
+| A stale-ratification recording refills the formation queue | one that can never become valid is not held |
+
+**Two are open, and neither is a queue:**
+
+* **A withheld `HAND_ABORT`, released at a stage of the attacker's choosing.**
+  Since D-024 the abort is routed above the sequence guards on purpose, so an
+  old one is accepted at a later stage — but `on_hand_abort` still gates cause 1
+  on this receiver's **own** expired deadline, so the attacker chooses only the
+  moment inside a window the receiver had already entered. Whether that is worth
+  closing, and at what cost to the witness-independent terminal, is not settled.
+* **Naming a double signer at a single-writer stage**, which is knowingly given
+  up: the second body arrives under the stage cursor and is dropped without
+  comparison. Accepted because detection has no consumer — no `EquivocationProof`
+  object exists, and `Failed::Equivocation` becomes a warning and a `Reject`
+  aimed at whoever relayed it.
+
 ## Still open
 
 * **A seat certified absent never re-enters**, because `next_hand`'s
