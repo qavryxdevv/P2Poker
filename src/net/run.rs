@@ -389,6 +389,11 @@ pub async fn run(
     // RPC and the ratification stay on the mesh either way; what moves is the
     // hand. See `net::toxsink` for why the cfg lives there and not here.
     let mut tox_sink = super::toxsink::TableSink::none();
+    // Said once, when the group is really joined. On the founder that is
+    // immediate; on a joiner it is after an invitation arrives **and** its chat
+    // id matches the advertisement's, which is the one moment worth reporting -
+    // before it, the hand has a transport that reaches nobody.
+    let mut tox_group_said = false;
 
     // Who mDNS has already told us about.
     //
@@ -968,6 +973,7 @@ pub async fn run(
                                             }
                                         }
                                         report_roster(&events, f).await;
+                                seat_on_tox(f, &tox_sink);
                                         if let Some(session) = f.session() {
                                             let _ = events.send(NodeEvent::TableReal {
                                                 key: f.table_id(),
@@ -1027,9 +1033,16 @@ pub async fn run(
                                         }
                                         report_params(&events, f).await;
                                         report_roster(&events, f).await;
+                                seat_on_tox(f, &tox_sink);
                                     }
                                     Err(Failed::Refused { reason, .. }) => {
                                         table = None;
+                                        // The Tox group goes with the table. Dropping the handle
+                                        // tells the driver to leave and joins its thread, which
+                                        // flushes what it still holds - the last message of a hand
+                                        // is exactly what sits in that queue.
+                                        tox_sink.clear();
+                            tox_group_said = false;
                                         if let Some(t) = table_topic.take() {
                                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                                         }
@@ -1065,6 +1078,12 @@ pub async fn run(
                         // here is a player looking at a button that appears to
                         // have done nothing.
                         table = None;
+                        // The Tox group goes with the table. Dropping the handle
+                        // tells the driver to leave and joins its thread, which
+                        // flushes what it still holds - the last message of a hand
+                        // is exactly what sits in that queue.
+                        tox_sink.clear();
+                            tox_group_said = false;
                         if let Some(t) = table_topic.take() {
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
@@ -1174,6 +1193,7 @@ pub async fn run(
                                     }
                                 }
                                 report_roster(&events, f).await;
+                                seat_on_tox(f, &tox_sink);
                                 if let Some(session) = f.session() {
                                     let _ = events
                                         .send(NodeEvent::TableReal {
@@ -1969,6 +1989,67 @@ pub async fn run(
                         // the dialog offered — `SeatEntry::admissible` admits
                         // exactly one value there.
                         let buyin = if tournament { ad.start_stack } else { buyin };
+
+                        // **The group first, and the advertisement second.**
+                        // D-019: the table's game traffic rides a Tox group and
+                        // the advertisement names it, so the group has to exist
+                        // before the advert is signed — an advert amended after
+                        // publication is a second advert, and §7.2 rule 7 would
+                        // read the pair as a founder changing the table.
+                        //
+                        // A failure here is not a failure to found a table. The
+                        // table forms on the mesh exactly as it did before and
+                        // the advert names no group, which is what a build
+                        // without the feature always says.
+                        let ad = match tox_sink.start(
+                            &profile_dir,
+                            super::toxsink::Role::Host,
+                            &ad.table_name,
+                            &nickname,
+                            Vec::new(),
+                        ) {
+                            Ok(Some(mine)) => {
+                                match tox_sink
+                                    .chat_id_ready(std::time::Duration::from_secs(5))
+                                    .await
+                                {
+                                    Some(chat) => {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "this table's traffic rides a Tox group, {}",
+                                                short_hash(&chat)
+                                            )))
+                                            .await;
+                                        ad.on_tox(mine, chat)
+                                    }
+                                    None => {
+                                        // The group did not appear. Rather than
+                                        // advertise a table whose group nobody
+                                        // can check, the sink is given up and
+                                        // the table rides the mesh.
+                                        tox_sink.clear();
+                            tox_group_said = false;
+                                        let _ = events
+                                            .send(NodeEvent::Warning(
+                                                "the Tox group did not come up; this table stays on the mesh"
+                                                    .into(),
+                                            ))
+                                            .await;
+                                        ad
+                                    }
+                                }
+                            }
+                            Ok(None) => ad,
+                            Err(e) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "no Tox for this table ({e}); it stays on the mesh"
+                                    )))
+                                    .await;
+                                ad
+                            }
+                        };
+
                         match advert::publish(&ad, &table_key) {
                             Ok(bytes) => {
                                 let hash = advert_hash_of(&bytes);
@@ -1992,6 +2073,7 @@ pub async fn run(
                                         let _ = events.send(NodeEvent::Hosting { key }).await;
                                         report_params(&events, table.as_ref().unwrap()).await;
                                         report_roster(&events, table.as_ref().unwrap()).await;
+                        if let Some(f) = table.as_ref() { seat_on_tox(f, &tox_sink); }
                                         // Published first, shown second: a table
                                         // appears in its founder's own lobby when
                                         // the network has taken it, and not when
@@ -2067,6 +2149,60 @@ pub async fn run(
                                 continue;
                             }
                         };
+                        // **The Tox side before the request is sealed.** What
+                        // `Formation::join` returns is already signed, so a key
+                        // added afterwards would be a field outside the
+                        // signature - the one thing a receiver would be right to
+                        // ignore.
+                        //
+                        // Only if the table says it is on Tox: the advert
+                        // carries the founder's key and the group's chat id or
+                        // it carries neither, and a joiner that started an
+                        // instance for a table on the mesh would be a socket and
+                        // a DHT presence for nothing.
+                        let my_tox_key = match held.ad.founder_tox_key {
+                            None => None,
+                            Some(founder_tox) => {
+                                match tox_sink.start(
+                                    &profile_dir,
+                                    super::toxsink::Role::Joiner {
+                                        founder: founder_tox,
+                                        // Passed through so the driver can check
+                                        // the group it is invited into is the one
+                                        // advertised: an invitation says nothing
+                                        // about which group it is for.
+                                        chat_id: held.ad.tox_chat_id,
+                                    },
+                                    &held.ad.table_name,
+                                    &nickname,
+                                    vec![founder_tox],
+                                ) {
+                                    Ok(k) => {
+                                        match k {
+                                            Some(_) => {
+                                                let _ = events.send(NodeEvent::Warning(format!(
+                                                    "this table's traffic is on a Tox group, {}; waiting to be invited",
+                                                    held.ad.tox_chat_id.map(|c| short_hash(&c))
+                                                        .unwrap_or_else(|| "unnamed".into())
+                                                ))).await;
+                                            }
+                                            None => {
+                                                let _ = events.send(NodeEvent::Warning(
+                                                    "this table's traffic is on Tox and this build has none; the hand will not reach it"
+                                                        .into())).await;
+                                            }
+                                        }
+                                        k
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(NodeEvent::Warning(format!(
+                                            "no Tox for this table ({e}); the hand will not reach it"
+                                        ))).await;
+                                        None
+                                    }
+                                }
+                            }
+                        };
                         match Formation::join(
                             app_key.clone(),
                             held.ad.clone(),
@@ -2079,6 +2215,7 @@ pub async fn run(
                             password.as_deref(),
                             nonce,
                             now,
+                            my_tox_key,
                         ) {
                             Ok((f, request)) => {
                                 let topic = joinrpc::table_topic(&key);
@@ -2160,6 +2297,12 @@ pub async fn run(
                     }
 
                     NodeCommand::LeaveTable => {
+                        // The Tox group goes with the table. Dropping the handle
+                        // tells the driver to leave and joins its thread, which
+                        // flushes what it still holds - the last message of a hand
+                        // is exactly what sits in that queue.
+                        tox_sink.clear();
+                            tox_group_said = false;
                         if let Some(t) = table_topic.take() {
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
@@ -2207,6 +2350,17 @@ pub async fn run(
             }
 
             _ = resend.tick() => {
+                if !tox_group_said {
+                    if let Some(chat) = tox_sink.chat_id() {
+                        tox_group_said = true;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "in the table's Tox group {}; the hand rides it from here",
+                                short_hash(&chat)
+                            )))
+                            .await;
+                    }
+                }
                 let (Some(h), Some(t)) = (hand.as_ref(), table_topic.as_ref()) else {
                     continue;
                 };
@@ -2607,6 +2761,29 @@ async fn report_params(events: &Events, f: &Formation) {
 /// The whole roster every time rather than a difference: a difference is only
 /// correct if the receiver never missed one, and this channel is bounded and
 /// drops under load by design.
+/// Tell the Tox driver which seats the roster now holds.
+///
+/// Called wherever the roster is reported, because the two answer the same
+/// question: who is at this table. The founder adds each as a Tox friend and
+/// invites it into the group; a seat with no Tox key is one this table cannot
+/// reach that way and is passed over.
+///
+/// **Idempotent, and it has to be.** The roster is re-reported on every change,
+/// and `Command::Seated` for a key already added is a `tox_friend_add_norequest`
+/// that refuses and changes nothing. Diffing instead would mean keeping a
+/// second copy of the roster in this loop to diff against, which is a second
+/// answer to the same question.
+fn seat_on_tox(f: &Formation, tox: &super::toxsink::TableSink) {
+    if !tox.is_on_tox() {
+        return;
+    }
+    for e in f.roster().seats() {
+        if let Some(k) = e.tox_key {
+            tox.tell(super::toxsink::Seat::Took(k));
+        }
+    }
+}
+
 async fn report_roster(events: &Events, f: &Formation) {
     let seats = f
         .roster()

@@ -1427,6 +1427,71 @@ libp2p, and D-019 does not remove the need for it — it changes which transport
 lacks the history. Worth stating plainly, because the natural thing to do while
 moving off GossipSub is to leave that loop behind.
 
+
+### The client itself now plays on Tox
+
+Two real clients, `--features tox`, no probe and no example:
+
+```
+host : this table's traffic rides a Tox group, f4473d33
+       in the table's Tox group f4473d33; the hand rides it from here
+join : this table's traffic is on a Tox group, f4473d33; waiting to be invited
+       in the table's Tox group f4473d33; the hand rides it from here
+both : the table is set: session 954e3d40
+       hand #1 opens at genesis 97e8121b
+       the deck is shuffled and sealed ... your turn - 50 to call
+       hand #2 opens at genesis d3334d08
+```
+
+The table forms on libp2p exactly as it did — discovery, the lobby, the join
+RPC, the roster, the ratification — and the **hand** rides the group. Hand 1
+completed with an agreed terminal at both ends, because hand 2 opened at the
+same genesis at both; hand 2 then reached the deal and the betting.
+
+**The whole route, end to end and unattended:** the founder creates a private
+group, names it in the advertisement, and takes each joiner's Tox key off its
+`JOIN_REQUEST`; the joiner reads the founder's key and the chat id from the
+advertisement, adds the founder, and waits; the founder adds each seat and
+invites when its friend connection comes up; the joiner accepts, **reads the id
+back and compares it against the advertisement**, and only then takes the group
+as its own. Nobody clicked anything and nobody searched a DHT for a group.
+
+### What the loop looks like now, and what it deliberately does not
+
+`net::toxsink::TableSink` is the only place with a `#[cfg]`. `run.rs` reads
+identically in both builds: an empty sink says no to `is_on_tox`, refuses
+`try_broadcast`, and has a `next()` that **never resolves**, so its `select!`
+branch is inert. A build with no C toolchain compiles and behaves exactly as it
+did.
+
+`publish_hand` is the one door. Two call sites choosing a transport separately
+is how one hand ends up half on each, so the choice is made once and `said` is
+appended either way — the re-send loop is a property of any transport without
+history, which both of these are.
+
+The inbound handling is one macro expanded at two sites rather than a function,
+because it reads and writes a dozen of the loop's own locals and threading them
+through a signature would be a struct refactor across the file whose most
+delicate property — one verdict, one place to report it — was a day's debugging
+to arrive at. The Tox branch discards the verdict, which is the only real
+difference: GossipSub withholds forwarding until the application reports one,
+and a Tox group forwards nothing on this client's behalf.
+
+**Verified that the old path is untouched**: three headless processes with the
+feature *off* formed a table and agreed on genesis `412e4e13` and `b738bc9b`,
+all three.
+
+### One thing this does not do yet
+
+**A table can be on Tox for some seats and not others.** A joiner whose build
+has no Tox joins a Tox table over the mesh, and its hand events go to a
+GossipSub topic the others have stopped reading. It is told so —
+*"this table's traffic is on Tox and this build has none; the hand will not
+reach it"* — and it is told at the moment it joins rather than at the deadline,
+which is the best that can be done without either refusing the join or carrying
+the hand on both transports. Refusing is `PROTOCOL.md`'s call: it would be a
+rule about which builds may sit at which tables.
+
 ### What is next, in order
 
 1. ~~The fragmentation layer~~ **done**: `table::fragment`, eleven tests, and

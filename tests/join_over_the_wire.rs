@@ -174,6 +174,7 @@ async fn run() -> ([u8; 32], [u8; 32]) {
         None,
         [7u8; 32],
         NOW,
+        None,
     )
     .expect("the request builds");
 
@@ -334,6 +335,7 @@ async fn the_two_seats_are_the_ones_the_founder_assigned() {
         None,
         [7u8; 32],
         NOW,
+        None,
     )
     .unwrap();
 

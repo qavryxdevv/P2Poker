@@ -499,6 +499,7 @@ impl Table {
             None,
             [seed; 32],
             NOW,
+            None,
         )
         .unwrap();
 

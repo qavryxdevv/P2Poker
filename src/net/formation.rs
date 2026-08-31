@@ -280,6 +280,13 @@ impl Formation {
         password: Option<&[u8]>,
         join_nonce: Hash,
         now_ms: u64,
+        // `my_tox_key`: this client's **Tox** public key, when the table's
+        // advertisement says its traffic rides a group (D-019). A parameter and
+        // not something set afterwards, because what this returns is already
+        // sealed - a field added to a signed request is a field outside its
+        // signature, which is the one thing a receiver would be right to
+        // ignore.
+        my_tox_key: Option<[u8; 32]>,
     ) -> Result<(Self, Vec<u8>), Failed> {
         let under = JoinedUnder::pin(ad, advert_hash, table_id);
 
@@ -298,12 +305,12 @@ impl Formation {
             app_public_key: app.verifying_key().to_bytes(),
             peer_id: my_peer_id.clone(),
             display_name: my_name.clone(),
+            tox_key: my_tox_key,
             requested_seat,
             password_proof: proof,
             buyin: my_buyin,
             join_nonce,
             table_id,
-            tox_key: None,
         };
         let bytes = joinwire::publish_join_request(&request, &app, now_ms)?;
         // The hash the founder will echo is the hash of the bytes that went out,
@@ -985,6 +992,7 @@ mod tests {
                 None,
                 [seed; 32],
                 NOW,
+                None,
             )
             .expect("the request builds");
 
@@ -1088,6 +1096,7 @@ mod tests {
             None,
             [2u8; 32],
             NOW,
+            None,
         )
         .unwrap();
 
@@ -1137,6 +1146,7 @@ mod tests {
             None,
             [2u8; 32],
             NOW,
+            None,
         )
         .unwrap();
 
@@ -1192,6 +1202,7 @@ mod tests {
             None,
             [2u8; 32],
             NOW,
+            None,
         )
         .unwrap();
 
@@ -1284,6 +1295,7 @@ mod tests {
             None,
             [2u8; 32],
             NOW,
+            None,
         )
         .unwrap();
         for s in t.founder.on_join_request(&request, &peer(2), NOW).unwrap() {
@@ -1326,6 +1338,7 @@ mod tests {
             None,
             [2u8; 32],
             NOW,
+            None,
         )
         .unwrap();
         t.founder
@@ -1345,6 +1358,7 @@ mod tests {
             None,
             [9u8; 32],
             NOW,
+            None,
         )
         .unwrap();
         let out = t
@@ -1381,6 +1395,7 @@ mod tests {
             None,
             [2u8; 32],
             NOW,
+            None,
         )
         .unwrap();
 
@@ -1411,6 +1426,7 @@ mod tests {
             None,
             [2u8; 32],
             NOW,
+            None,
         )
         .unwrap();
         t.founder.on_join_request(&first, &peer(2), NOW).unwrap();
@@ -1427,6 +1443,7 @@ mod tests {
             None,
             [3u8; 32],
             NOW,
+            None,
         )
         .unwrap();
         let out = t.founder.on_join_request(&request, &peer(3), NOW).unwrap();
@@ -1486,6 +1503,7 @@ mod tests {
                 None,
                 [2u8; 32],
                 NOW,
+                None,
             )
             .err(),
             Some(Failed::Join(JoinRefused::BadPassword))
@@ -1504,6 +1522,7 @@ mod tests {
             Some(b"neotevri"),
             [2u8; 32],
             NOW,
+            None,
         )
         .unwrap();
         let out = f.on_join_request(&wrong, &peer(2), NOW).unwrap();
@@ -1527,6 +1546,7 @@ mod tests {
             Some(b"otevri se"),
             [2u8; 32],
             NOW,
+            None,
         )
         .unwrap();
         f.on_join_request(&right, &peer(2), NOW).unwrap();
@@ -1553,6 +1573,7 @@ mod tests {
             None,
             [2u8; 32],
             NOW,
+            None,
         )
         .unwrap();
         t.founder.on_join_request(&first, &peer(2), NOW).unwrap();
@@ -1570,6 +1591,7 @@ mod tests {
             None,
             [3u8; 32],
             NOW,
+            None,
         )
         .unwrap();
         t.founder.on_join_request(&second, &peer(3), NOW).unwrap();
