@@ -241,6 +241,11 @@ pub fn admit_join(
         peer_id: req.peer_id.clone(),
         display_name: req.display_name.clone(),
         buyin: req.buyin,
+        // Carried from the request unchanged. It is how the founder reaches
+        // this player to invite it into the table's Tox group (D-019), and it
+        // is checked against nothing here because there is nothing to check it
+        // against: it is an address, not a claim.
+        tox_key: req.tox_key,
     };
 
     // The whole roster is re-formed with the new entry rather than the entry
@@ -584,6 +589,7 @@ mod tests {
             peer_id: vec![9u8; 12],
             display_name: "prvni".into(),
             buyin: 500,
+            tox_key: None,
         }]);
         let e = admit_join(
             &request(1, 1, None),
@@ -625,6 +631,7 @@ mod tests {
             peer_id: vec![1u8; 12], // the same node as the request below
             display_name: "ja".into(),
             buyin: 500,
+            tox_key: None,
         }]);
         assert_eq!(
             admit_join(
@@ -649,6 +656,7 @@ mod tests {
             peer_id: vec![9u8; 12],
             display_name: "ja".into(),
             buyin: 500,
+            tox_key: None,
         }]);
         assert_eq!(
             admit_join(
@@ -672,6 +680,7 @@ mod tests {
             peer_id: vec![9u8; 12],
             display_name: "tam".into(),
             buyin: 500,
+            tox_key: None,
         }]);
         assert_eq!(
             admit_join(
@@ -707,6 +716,7 @@ mod tests {
                 peer_id: vec![i + 10; 12],
                 display_name: format!("s{i}"),
                 buyin: 500,
+                tox_key: None,
             })
             .collect();
         assert_eq!(
@@ -861,6 +871,7 @@ mod tests {
             peer_id: vec![1u8; 12],
             display_name: "ja".into(),
             buyin: 500,
+            tox_key: None,
         }
     }
 
@@ -979,6 +990,7 @@ mod tests {
             peer_id: vec![9u8; 12],
             display_name: "nekdo".into(),
             buyin: 500,
+            tox_key: None,
         };
         assert_eq!(
             admit_accept(
@@ -1005,6 +1017,7 @@ mod tests {
                 peer_id: vec![9u8; 12],
                 display_name: "prvni".into(),
                 buyin: 500,
+                tox_key: None,
             },
             me(),
         ]

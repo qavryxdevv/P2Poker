@@ -96,6 +96,22 @@ pub struct SeatWire {
     pub display_name: Vec<u8>,
     #[n(4)]
     pub buyin: u64,
+    /// This seat's **Tox** public key, when it gave one (D-019).
+    ///
+    /// How the founder reaches this player to invite it into the table's group,
+    /// and how every other seat reaches it if the roster ever needs to. It comes
+    /// from the seat's own `JOIN_REQUEST` and is carried unchanged.
+    ///
+    /// **It is not in `roster_hash`.** That covers the seat, the application key
+    /// and the stack and nothing else, which is right: a transport address is
+    /// not part of who is playing, and a player whose Tox key changed would
+    /// otherwise be at a different table with the same people.
+    ///
+    /// **And it is not an identity.** `app_public_key` is who this player is and
+    /// is what every signature is verified under. This authorises nothing; it is
+    /// an address that happens to be a key.
+    #[cbor(n(5), with = "minicbor::bytes")]
+    pub tox_key: Option<[u8; 32]>,
 }
 
 impl SeatWire {
@@ -106,6 +122,7 @@ impl SeatWire {
             peer_id: e.peer_id.clone(),
             display_name: e.display_name.as_bytes().to_vec(),
             buyin: e.buyin,
+            tox_key: e.tox_key,
         }
     }
 
@@ -129,6 +146,7 @@ impl SeatWire {
             peer_id: self.peer_id,
             display_name,
             buyin: self.buyin,
+            tox_key: self.tox_key,
         })
     }
 }
@@ -684,6 +702,7 @@ mod tests {
             peer_id: vec![seat; 38],
             display_name: format!("seat {seat}"),
             buyin: 1_000 + seat as u64,
+            tox_key: None,
         }
     }
 
@@ -803,6 +822,57 @@ mod tests {
         let (back, _, _) = receive_join_request(&wire).unwrap();
         assert_eq!(back.requested_seat, None);
         assert_eq!(back.password_proof, None);
+    }
+
+    /// A seat's Tox key reaches every other seat through `PLAYER_LIST`.
+    ///
+    /// The founder takes it off the `JOIN_REQUEST` and puts it in the roster;
+    /// this is the hop after that. Without it only the founder could invite
+    /// anybody, and a table whose founder leaves would have no route back into
+    /// its own group.
+    ///
+    /// It is **not** in `roster_hash`, which covers the seat, the application
+    /// key and the stack — a transport address is not part of who is playing,
+    /// and a player whose Tox key changed would otherwise be at a different
+    /// table with the same people.
+    #[test]
+    fn a_seats_tox_key_reaches_the_other_seats() {
+        let table = key(11);
+        let mut with_key = entry(1);
+        with_key.tox_key = Some([0xD4u8; 32]);
+        let seats = vec![entry(0), with_key.clone(), entry(2)];
+
+        let list = PlayerList {
+            roster: seats.clone(),
+            table_params_hash: [7u8; 32],
+            list_serial: 1,
+        };
+        let wire = publish_player_list(&list, &table, NOW).unwrap();
+        let (back, _) = receive_player_list(&wire).unwrap();
+        assert_eq!(back.roster[1].tox_key, Some([0xD4u8; 32]), "carried");
+        assert_eq!(back.roster[0].tox_key, None, "and absent stays absent");
+        assert_eq!(back.roster, seats, "and nothing else moved");
+
+        // The roster's digest does not move with it.
+        use crate::protocol::transcript::{roster_hash, RosterSeat};
+        let digest = |list: &[SeatEntry]| {
+            let rs: Vec<RosterSeat> = list
+                .iter()
+                .map(|e| RosterSeat {
+                    seat: e.seat,
+                    app_public_key: e.app_public_key,
+                    stack_at_hand_start: e.buyin,
+                })
+                .collect();
+            roster_hash(&rs)
+        };
+        let mut without = seats.clone();
+        without[1].tox_key = None;
+        assert_eq!(
+            digest(&seats),
+            digest(&without),
+            "a transport address must not change which table this is"
+        );
     }
 
     /// The joiner's Tox key survives, present and absent, and is **under the

@@ -742,6 +742,7 @@ mod tests {
                     peer_id: vec![1u8; 8],
                     display_name: "   ".into(),
                     buyin: 500,
+                    tox_key: None,
                 },
                 SeatEntry {
                     seat: 1,
@@ -749,6 +750,7 @@ mod tests {
                     peer_id: vec![2u8; 8],
                     display_name: "Alice".into(),
                     buyin: 500,
+                    tox_key: None,
                 },
             ],
             &ad(2),

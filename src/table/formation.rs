@@ -62,6 +62,21 @@ pub struct SeatEntry {
     pub display_name: String,
     /// The buy-in, which **is** this seat's `stack_at_hand_start` at hand 0.
     pub buyin: u64,
+    /// This seat's **Tox** public key, when it gave one (D-019).
+    ///
+    /// How the founder reaches this player to invite it into the table's group,
+    /// and how every other seat reaches it if the roster ever needs to. It comes
+    /// from the seat's own `JOIN_REQUEST` and is carried unchanged.
+    ///
+    /// **It is not in `roster_hash`.** That covers the seat, the application key
+    /// and the stack and nothing else, which is right: a transport address is
+    /// not part of who is playing, and a player whose Tox key changed would
+    /// otherwise be at a different table with the same people.
+    ///
+    /// **And it is not an identity.** `app_public_key` is who this player is and
+    /// is what every signature is verified under. This authorises nothing; it is
+    /// an address that happens to be a key.
+    pub tox_key: Option<[u8; 32]>,
 }
 
 /// Why a seat entry is not admissible.
@@ -358,6 +373,7 @@ mod tests {
             peer_id: vec![peer; 12],
             display_name: format!("hrac {seat}"),
             buyin,
+            tox_key: None,
         }
     }
 
