@@ -909,9 +909,13 @@ pub async fn run(
                                     if let Some(n) = h.take_cert_note() {
                                         let _ = events.send(NodeEvent::Warning(n)).await;
                                     }
-                                    // The prover's side of a shuffle context,
-                                    // which is emitted on success and so never
-                                    // reaches the error arm below.
+                                    // The prover's side of a shuffle context.
+                                    // It used to be emitted only on success and
+                                    // so never reached the error arm below; a
+                                    // refused proof now ends the hand with a
+                                    // `cause = 2` abort, which is an `Ok` with
+                                    // sends, so the refusal's own note arrives
+                                    // here too.
                                     if let Some(n) = h.take_shuffle_note() {
                                         let _ = events.send(NodeEvent::Warning(n)).await;
                                     }
@@ -972,13 +976,33 @@ pub async fn run(
                                                 )))
                                                 .await;
                                         }
-                                        if h.aborted().is_some() {
-                                                                act_by = None;
+                                        if let Some(why) = h.aborted() {
+                                            act_by = None;
+                                            // **Which abort, and not one
+                                            // sentence for all of them.** This
+                                            // said "a peer ended the hand on
+                                            // its own deadline" whatever
+                                            // happened, and since `cause = 2`
+                                            // exists that is sometimes simply
+                                            // untrue: a hand ended by a proof
+                                            // that does not hold ends in
+                                            // seconds, names a seat, and has
+                                            // nothing to do with anybody's
+                                            // clock. A player told the wrong
+                                            // reason looks for the wrong fault.
+                                            let said = match why {
+                                                crate::table::hand::Abort::BadShuffle { seat } => {
+                                                    format!(
+                                                        "seat {seat}'s shuffle proof does not hold; the hand is void and every stack is restored"
+                                                    )
+                                                }
+                                                crate::table::hand::Abort::Told { cause: 2 } => {
+                                                    "a peer proved a shuffle did not hold; the hand is void and every stack is restored".into()
+                                                }
+                                                _ => "a peer ended the hand on its own deadline; every stack is restored".into(),
+                                            };
                                             let _ = events
-                                                .send(NodeEvent::Warning(
-                                                    "a peer ended the hand on its own deadline; every stack is restored"
-                                                        .into(),
-                                                ))
+                                                .send(NodeEvent::Warning(said))
                                                 .await;
                                             next_hand_at = Some(
                                                 tokio::time::Instant::now()

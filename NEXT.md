@@ -977,6 +977,124 @@ Not changed, and these are decisions rather than omissions:
 * **Nothing about hole-punch success rate.** Two runs are two runs. What is
   solid is the mechanism and the numbers above; the rate needs many more.
 
+## `HAND_ABORT cause = 2` is implemented, and it found a size the corpus cannot send
+
+A refused shuffle proof used to cost ninety seconds and name nobody.
+`accept_step` spends a seat's one attempt **before** verifying the argument
+(C-9), deliberately, so a bogus proof cannot be retried — which means the chain
+can never complete once one is refused. There was nothing left to wait for and
+every peer waited anyway, until `hand_deadline_ms`, and then aborted with
+`attributed = []`.
+
+§4.10 has always had the answer: `cause = 2`, whose evidence *carries its own
+disproof*, and whose acceptance row is **accept at once** — no deadline, no
+certificate, no other seat's agreement. That row is also the most dangerous
+sentence in the abort table, because one message with it would otherwise let any
+seat void any hand it disliked. What makes it safe is that the permission is
+conditional on arithmetic every receiver redoes.
+
+### The gate, and what a hostile accuser cannot reach
+
+`Hand::bad_shuffle_holds` accepts only when **this client's own** run over the
+two carried frames returns `VerifyOutcome::Invalid`. In order:
+
+1. Exactly two entries, the step then the proof.
+2. Both open **in this hand** — table, hand, catalogue envelope, signature — and
+   both are signed by the seat the abort names. Position is *not* checked and
+   must not be: the accused's frames sit at the stalled stage, which is exactly
+   where the receiver's cursor is not.
+3. The receiver's chain must be at the accused's position, and the proof's two
+   deck hashes must match the step's deck and the receiver's own input deck.
+   Otherwise it **holds** the abort rather than refusing it — refusing would
+   punish a peer for the receiver's own position, and `run.rs` turns anything
+   but `NotYet` into a GossipSub `Reject`.
+4. The argument, against the receiver's **own** input deck, at the context its
+   own chain derives, from the **proof's own signed `sequence`**. The accuser
+   supplies none of those three. It supplies two frames the accused signed, and
+   nothing it chooses enters the verification.
+
+**`CouldNotVerify` holds, it does not confirm.** The first version tested
+`verdict.is_ok()`, which accepted on *any* error — including the one outcome
+`VerifyOutcome` exists to separate out, *verification could not be attempted,
+never evidence against anybody*. That would have let an accuser end a hand at
+any receiver whose verifier was unavailable: the gate's whole purpose, defeated
+through the arm that looks like agreement. It matches now, and the third arm
+holds.
+
+Four tests on the gate, and the one that matters most is the refusal: seat 1's
+own genuine, verifying frames dressed up as evidence against seat 1 are rejected
+and **the hand goes on**. The confirming test re-seals a real proof at its own
+slot with the argument replaced by zeroes - correctly signed by the accused,
+wrong only in the argument, which is the only shape that tests anything.
+
+A fifth test changed rather than appeared, and the change is the feature:
+`an_argument_that_does_not_hold_is_refused_as_a_shuffle` asserted
+`Failed::BadShuffle` and now asserts an `Ok` carrying a `cause = 2` naming the
+seat, with both frames, no certificate, and a body every receiver's own
+`consistent` admits. It is renamed to say what it now checks. The distinction
+its old name drew is still drawn next door: a mismatched deck hash is
+`Failed::BadDeck`, because only a failed *argument* is decidable from the frames
+themselves and therefore only that is evidence.
+
+Cause 3 (the reveal proof) is still refused rather than accepted, for the reason
+cause 2 was until now: accepting an abort whose evidence cannot be checked is
+taking a peer's word for the end of a hand.
+
+### The finding: §4.10's evidence bound does not fit in the frame that carries it
+
+§4.10's field table bounds `n(3) evidence` at *two `SignedEvent`s, each ≤
+`MAX_EMBEDDED_EVENT` = 32 768 B*. **Two of those is 65 536 bytes, which is
+`GOSSIP_MAX_TRANSMIT` exactly** — before the envelope, the signature,
+`attributed`, `cert_hash`, `deltas`, `final_stacks`, and CBOR's own framing. A
+conforming peer can build a `HAND_ABORT` this corpus calls legal that the
+table's transport cannot carry: the sender's own GossipSub refuses it at
+`publish`, so the hand it was meant to end runs to its deadline instead and
+nobody ever sees the message.
+
+The corpus is not self-contradictory so much as split across two documents.
+`PROTOCOL.md` §13 sizes embedded evidence against `TABLE_FRAME_MAX` (262 144 B,
+the **table stream**); `NETWORK_STACK.md` §6.2 caps GossipSub at 65 536. A table
+whose traffic is on the stream — or on the Tox group D-019 moves it to — has the
+room. This client publishes hand events on GossipSub, so this client does not.
+
+What was done about it is stated and is not a fix: `ABORT_EVIDENCE_MAX = 24 576`
+is a **transport-honest** bound, tighter than §4.10's, so it refuses nothing
+§4.10 permits *that could have arrived* — a larger one could not have been sent.
+Three compile-time assertions hold it there, and the second is the one that
+matters:
+
+```rust
+const _: () = assert!(HAND_ABORT_MAX <= GOSSIP_MAX_TRANSMIT);
+const _: () = assert!(2 * MAX_EMBEDDED_EVENT + ABORT_FIXED_MAX > GOSSIP_MAX_TRANSMIT);
+const _: () = assert!(ABORT_EVIDENCE_MAX <= MAX_EMBEDDED_EVENT);
+```
+
+The middle one asserts that the conflict **exists**, so a later pass that raises
+`ABORT_EVIDENCE_MAX` to `MAX_EMBEDDED_EVENT` — which looks exactly like bringing
+the client into line with the protocol — breaks the build instead of shipping
+aborts nobody can send.
+
+Real sizes are far below either bound: a `SHUFFLE_STEP` is about 9 KB and a
+`SHUFFLE_PROOF` about 5.6 KB, so no cause-2 abort this client builds comes near
+it. The bound decides what is *refused*, not what is sent.
+
+**Owed to `PROTOCOL.md`, and an implementation may not decide it:** either a
+smaller per-element bound in §4.10's table, or hand traffic on the stream. Both
+are wire decisions.
+
+### Two smaller things the same pass turned up
+
+* **`consistent` did not bound `evidence` at all.** The decoder's cap bounds the
+  whole body, so a two-entry `evidence` could never be enormous — but a
+  hundred-entry one of small elements passed every check and reached a gate that
+  reads `evidence[0]` and `evidence[1]`. The count and the per-element size are
+  both refused now, before anything is opened.
+* **`peek` runs before the type is known**, so it cannot use a per-type cap and
+  now takes the largest chained frame any type may have. What that gives an
+  attacker is written down where the constant is: one CBOR decode of up to
+  `HAND_ABORT_CAP` instead of `FRAME_CAP`, for bytes libp2p has already read and
+  buffered, retaining nothing — every `open` still uses its own type's cap.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that
@@ -995,9 +1113,12 @@ argument.
   for this; `tests/anti_replay_authority.rs` holds them to that.
 * **The RNG beacon.** `provisional_button` stands in for it, in nine places in
   `table/hand.rs`.
-* **`HAND_ABORT` causes 2 and 3.** This build refuses them rather than check
-  evidence it cannot verify, and the embedded evidence needs a larger
-  `FRAME_CAP`.
+* **`HAND_ABORT` cause 3.** The reveal proof. Cause 2 is done - see above -
+  and cause 3 is refused rather than accepted for the reason cause 2 was:
+  accepting an abort whose evidence cannot be checked is taking a peer's word
+  for the end of a hand. The caps it needs are already in place; what it needs
+  is the reveal path's own non-mutating verify, the shape `next_ctx` and
+  `last_verified` gave cause 2.
 
 ### Rules questions nobody has answered
 

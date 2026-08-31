@@ -90,6 +90,57 @@ pub const JOIN_RESP_MAX: usize = 16_384;
 pub const TABLE_FRAME_MAX: usize = 262_144;
 pub const MAX_EMBEDDED_EVENT: usize = 32_768;
 
+/// Everything a `HAND_ABORT` carries except `n(3) evidence`.
+///
+/// `attributed` is at most `MAX_SEATS` keys of 32 B, `cert_hash` is 33, and
+/// `deltas` and `final_stacks` are one number per seat each. Two kilobytes is
+/// several times that and is deliberately loose: it is subtracted from a
+/// transmit budget, so an over-estimate costs a little evidence room and an
+/// under-estimate would let a legal abort be built that cannot be sent.
+pub const ABORT_FIXED_MAX: usize = 2_048;
+
+/// The largest embedded `SignedEvent` a `HAND_ABORT` may carry **on this
+/// transport**, and it is smaller than the protocol's own bound.
+///
+/// # `PROTOCOL.md` §4.10's bound does not fit in the frame that carries it
+///
+/// §4.10's field table bounds `n(3) evidence` at *two `SignedEvent`s, each
+/// ≤ `MAX_EMBEDDED_EVENT` = 32 768 B*. Two of those is **65 536 bytes, which is
+/// `GOSSIP_MAX_TRANSMIT` exactly** — before the envelope, before the signature,
+/// before `attributed`, `cert_hash`, `deltas` and `final_stacks`, and before
+/// CBOR's own framing. A conforming peer can therefore build a `HAND_ABORT` that
+/// this corpus calls legal and that the table's transport cannot carry: the
+/// sender's own GossipSub refuses it at `publish`, so the hand it was meant to
+/// end runs to its deadline instead and the message is never seen by anybody.
+///
+/// The corpus is not self-contradictory about this so much as split across two
+/// documents: `PROTOCOL.md` §13 sizes the evidence against `TABLE_FRAME_MAX`
+/// (262 144 B, the **table stream**), and `NETWORK_STACK.md` §6.2 caps
+/// GossipSub at 65 536. A table whose traffic is on the stream — or on the Tox
+/// group D-019 moves it to — has the room. This client publishes hand events on
+/// GossipSub, so this client does not.
+///
+/// # What this constant does about it
+///
+/// It states the transport-honest bound and proves it fits, below. This client
+/// emits no evidence larger than this and this is what its abort decoder
+/// allows, which is **tighter than §4.10 and therefore refuses nothing §4.10
+/// permits that could have arrived** — a larger one could not have been sent.
+///
+/// It is not a fix for the contradiction, which is `PROTOCOL.md`'s to make: it
+/// is either a smaller per-element bound in §4.10's table, or hand traffic on
+/// the stream. Both are wire decisions and neither is one an implementation may
+/// take on its own.
+///
+/// The real sizes are far below either bound — a `SHUFFLE_STEP` is about 9 KB
+/// and a `SHUFFLE_PROOF` about 5.6 KB — so no cause-2 abort this client builds
+/// comes near it. The bound matters for what is *refused*, not for what is sent.
+pub const ABORT_EVIDENCE_MAX: usize = 24_576;
+
+/// The whole of a `HAND_ABORT` at its largest: the fixed part and two evidence
+/// entries.
+pub const HAND_ABORT_MAX: usize = 2 * ABORT_EVIDENCE_MAX + ABORT_FIXED_MAX;
+
 // ---------------------------------------------------------------------------
 // Lobby and transport timing
 // ---------------------------------------------------------------------------
@@ -356,6 +407,18 @@ const _: () = assert!(TABLE_AD_SIGNED_MAX <= LOBBY_MSG_MAX);
 const _: () = assert!(LOBBY_MSG_MAX <= GOSSIP_MAX_TRANSMIT);
 const _: () = assert!(LOBBY_CHAT_MAX <= LOBBY_MSG_MAX);
 const _: () = assert!(MAX_EMBEDDED_EVENT <= TABLE_FRAME_MAX);
+
+/// The abort must fit in the frame that carries it. This is the assertion the
+/// corpus does not make and whose absence let §4.10's bound stand: it fails the
+/// build rather than the hand.
+const _: () = assert!(HAND_ABORT_MAX <= GOSSIP_MAX_TRANSMIT);
+/// And the reason this client's bound is its own rather than §4.10's: two of
+/// §4.10's would not fit. Written as an assertion so that a later pass which
+/// raises `ABORT_EVIDENCE_MAX` to `MAX_EMBEDDED_EVENT` — which looks like
+/// bringing the client into line with the protocol — breaks the build instead
+/// of shipping aborts nobody can send.
+const _: () = assert!(2 * MAX_EMBEDDED_EVENT + ABORT_FIXED_MAX > GOSSIP_MAX_TRANSMIT);
+const _: () = assert!(ABORT_EVIDENCE_MAX <= MAX_EMBEDDED_EVENT);
 const _: () = assert!(SNAPSHOT_RESP_MAX <= TABLE_FRAME_MAX);
 
 /// One lost rebroadcast must not expire an advert, and one lost heartbeat must

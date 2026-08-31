@@ -24,6 +24,7 @@
 //! and I say 1" is.
 
 use crate::poker::state::{Hash, SeatIdx, Street};
+use crate::protocol::constants::ABORT_EVIDENCE_MAX;
 
 /// The body of a `HAND_INIT`, in `PROTOCOL.md` §4.3's field order.
 ///
@@ -637,6 +638,28 @@ impl HandAbort {
         }
     }
 
+    /// `cause = 2`: a shuffle proof that does not hold, with the two frames
+    /// that prove it.
+    ///
+    /// `attributed` names the seat's key, and there is **no `cert_hash`**:
+    /// `PROTOCOL.md` §4.10 pairs `attributed` with a certificate only on the
+    /// `cause = 1` path, where the accusation rests on other seats agreeing
+    /// that a deadline passed. Here it rests on arithmetic every receiver can
+    /// redo, so a certificate would add nothing and [`consistent`] does not ask
+    /// for one — its check is `cause == 1 && !attributed.is_empty()`.
+    ///
+    /// [`consistent`]: HandAbort::consistent
+    pub fn on_bad_shuffle(accused: [u8; 32], evidence: [Vec<u8>; 2], stacks: Vec<u64>) -> Self {
+        HandAbort {
+            cause: 2,
+            attributed: vec![accused],
+            cert_hash: None,
+            evidence: evidence.into(),
+            deltas: vec![0; stacks.len()],
+            final_stacks: stacks,
+        }
+    }
+
     /// Whether this body is one the receiver's own rules allow, given the
     /// stacks that receiver holds from the genesis of the hand.
     ///
@@ -654,6 +677,18 @@ impl HandAbort {
         }
         if matches!(self.cause, 2 | 3) == self.evidence.is_empty() {
             return Err("evidence is required for causes 2 and 3 and forbidden elsewhere");
+        }
+        // **And bounded, which nothing checked.** The decoder's cap bounds the
+        // whole body, so a two-entry `evidence` could not have been enormous —
+        // but a *hundred*-entry one of small elements passed every test here
+        // and reached a gate that reads `evidence[0]` and `evidence[1]`. The
+        // count is §4.10's, and the per-element bound is this client's
+        // transport-honest one; both are refused before anything is opened.
+        if self.evidence.len() > 2 {
+            return Err("more evidence than the two entries a cause may carry");
+        }
+        if self.evidence.iter().any(|e| e.len() > ABORT_EVIDENCE_MAX) {
+            return Err("an evidence entry larger than the transport can carry");
         }
         if self.deltas.iter().any(|d| *d != 0) {
             return Err("an abort that moves a chip");

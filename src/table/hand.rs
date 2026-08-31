@@ -44,6 +44,7 @@ use crate::mental_poker::deck::{CardIndex, DeckIndexMap};
 use crate::mental_poker::protocol::{Ciphertext, CtxFields, DeckCtx, DeckWire, Final,
     ProofPosition, Verified};
 use crate::mental_poker::shuffle::{ChainParams, ShuffleChain, StepError};
+use crate::mental_poker::protocol::{DeckCrypto, VerifyOutcome};
 use crate::poker::actions::{Action, BettingRound, Illegal, LegalActions};
 use crate::poker::engine::{
     advance_positions, betting_is_closed, first_to_act, initial_positions, next_to_act,
@@ -303,6 +304,24 @@ pub const HAND_INIT_CAP: usize = 512;
 /// that a peer cannot make this client hold much by sending nonsense.
 const FRAME_CAP: usize = 16_384;
 
+/// The cap for [`chained::peek`], which runs **before** the type is known.
+///
+/// `peek` cannot use a per-type cap, because reading the type is what it is
+/// for. So it takes the largest chained frame any type may have, which is
+/// [`HAND_ABORT_CAP`] — an abort carrying two embedded events is several times
+/// [`FRAME_CAP`], and peeking it under `FRAME_CAP` would report it as malformed
+/// and reject the one message that ends a hand nobody else can end.
+///
+/// **What this gives an attacker, stated rather than left to be discovered:**
+/// one CBOR decode of up to this many bytes instead of up to `FRAME_CAP`, for
+/// any frame on the table topic. It is bounded above by `GOSSIP_MAX_TRANSMIT`,
+/// which libp2p has already read and buffered before this code sees it, so the
+/// marginal cost is a decode of bytes that are already in memory. Nothing is
+/// retained: a frame that peeks as the wrong type never reaches an `open`, and
+/// every `open` still uses its own type's cap.
+const PEEK_CAP: usize = HAND_ABORT_CAP;
+const _: () = assert!(PEEK_CAP >= FRAME_CAP);
+
 /// Where the button sits, until the RNG beacon exists to decide it.
 ///
 /// **Provisional and named as such.** `STATE_MACHINE.md` T10 gives this to the
@@ -470,13 +489,21 @@ pub const GRACE_HANDS: u8 = 2;
 /// How many hands a seat must be present for to earn one unit back.
 pub const REPLENISH_AFTER: u8 = 15;
 
-/// The cap on a `HAND_ABORT` body.
+/// The cap on a `HAND_ABORT` body **and on its frame**, which for this one type
+/// are the same number.
 ///
-/// Enough for the hand-deadline path, which carries no evidence. Causes 2 and 3
-/// embed up to two `SignedEvent`s of 32 768 B each and will need both a larger
-/// cap and a larger [`FRAME_CAP`]; this client emits neither and refuses one it
-/// is sent, which is stated here rather than discovered later.
-pub const HAND_ABORT_CAP: usize = 4_096;
+/// Sized for causes 2 and 3, which embed two `SignedEvent`s — the step whose
+/// deck is disputed and the proof that fails on it. See
+/// [`ABORT_EVIDENCE_MAX`](crate::protocol::constants::ABORT_EVIDENCE_MAX) for
+/// why that bound is this client's own and smaller than `PROTOCOL.md` §4.10's:
+/// two of §4.10's would not fit in a GossipSub frame, so an abort built to it
+/// could never be sent.
+///
+/// It is used at both levels because `on_hand_abort` opens the frame with it
+/// and then decodes the payload with it. Passing [`FRAME_CAP`] for the frame
+/// and this for the payload would refuse every abort that needs the room, at
+/// the outer decode, before the payload cap was ever consulted.
+pub const HAND_ABORT_CAP: usize = crate::protocol::constants::HAND_ABORT_MAX;
 
 /// How far this hand has got.
 ///
@@ -689,6 +716,33 @@ pub enum Abort {
     Deadline,
     /// A cause this client accepted from a peer.
     Told { cause: u16 },
+    /// `cause = 2`: a `SHUFFLE_PROOF` that does not hold for the pair of decks
+    /// it names.
+    ///
+    /// The one abort this client emits that names a seat **and needs no
+    /// certificate**, because it needs no witnesses: the evidence is
+    /// self-authenticating. Every receiver that holds the same input deck runs
+    /// the same verification over the same two signed frames and reaches the
+    /// same verdict, so `PROTOCOL.md` §4.10 says *accept at once* rather than
+    /// buffering it behind a deadline.
+    ///
+    /// It replaces ninety seconds of silence with one message. Before it, a
+    /// refused proof left the chain unable to complete — `accept_step` spends
+    /// the seat's one attempt before verifying, so there is no retry (C-6 rule
+    /// 4) — and every peer sat until `hand_deadline_ms` and aborted with
+    /// nobody named.
+    ///
+    /// **The evidence is deliberately not in this variant.** The phase is
+    /// queried by `aborted()`, which every status read calls, and a variant
+    /// holding two frames would make `Abort` fifteen kilobytes and stop it
+    /// being `Copy` — so a question about what happened would copy the proof
+    /// of it. The frames go straight into the message in
+    /// [`Hand::abort_bad_shuffle`] and are not kept afterwards: they were
+    /// broadcast, and a receiver that needs them has them.
+    BadShuffle {
+        /// The seat whose proof failed. Named in `attributed`.
+        seat: SeatIdx,
+    },
 }
 
 /// The deck every stage from `DECK_COMMIT` onwards is about.
@@ -733,6 +787,19 @@ struct StepHeard {
     round: u8,
     seat: SeatIdx,
     deck: Vec<Ciphertext>,
+    /// The frame this step arrived in, kept verbatim.
+    ///
+    /// A `cause = 2` abort must carry the step **and** the proof, because a
+    /// Bayer-Groth argument is about a pair of decks and the proof event names
+    /// its decks by hash only. A receiver holds the input deck from its own
+    /// chain; the output deck exists nowhere but here.
+    ///
+    /// Kept rather than re-encoded, and that is the whole reason the field is
+    /// bytes and not a decoded body: the evidence has to be the signed frame
+    /// the accused seat produced, and re-encoding a decoded body is a frame
+    /// this client signed nothing of and whose signature would not verify.
+    /// One step is held at a time, so this is about nine kilobytes.
+    bytes: Vec<u8>,
 }
 
 /// One hand in progress.
@@ -1023,7 +1090,7 @@ impl Hand {
         // duplicate of a stage already left has to be told from a message of
         // another kind entirely — the first is ordinary GossipSub weather and
         // the second belongs to somebody else's handler.
-        let (kind, hand_id, sequence) = chained::peek(bytes, FRAME_CAP).map_err(Failed::Wire)?;
+        let (kind, hand_id, sequence) = chained::peek(bytes, PEEK_CAP).map_err(Failed::Wire)?;
         if !matches!(
             kind,
             EventType::HandInit
@@ -1580,6 +1647,7 @@ impl Hand {
             round: body.shuffle_round,
             seat,
             deck,
+            bytes: bytes.to_vec(),
         });
         Ok(Vec::new())
     }
@@ -1634,28 +1702,58 @@ impl Hand {
         let deck = held.deck.clone();
         let taken = chain.steps_taken();
         let report = chain.ctx_report(taken, self.slot.sequence);
-        chain
-            .accept_step(&deal.deck, seat, deck, &body.proof, self.slot.sequence)
-            .map_err(|e| {
-                // Seen twice and unexplained, so the refusal carries what would
-                // settle it: whether the chain had already taken this position
-                // while the slot had not moved past it. Guessing at this cost
-                // two wrong hypotheses already.
-                if matches!(e, StepError::AlreadySubmitted) {
-                    return Failed::Elsewhere {
-                        seat,
-                        what: "no step had been taken at this position — chain position and slot sequence are in the log",
-                    };
-                }
-                step_failure(seat, e)
-            })
-            .map_err(|e| {
-                self.shuffle_note = Some(format!(
-                    "shuffle refusal from seat {seat}: chain at step {taken}, slot sequence {}, round {} | verifier {report}",
-                    self.slot.sequence, body.shuffle_round
-                ));
-                e
-            })?;
+        let outcome = chain.accept_step(&deal.deck, seat, deck, &body.proof, self.slot.sequence);
+
+        // **The step's own frame, kept only when it is about to be evidence.**
+        // Nine kilobytes cloned on every proof would be nine kilobytes cloned
+        // for nothing on the path that is taken every time.
+        //
+        // `Invalid` and nothing else. `CouldNotVerify` is *never* evidence
+        // against anybody - `VerifyOutcome` exists to carry exactly that
+        // distinction - and the procedural refusals (out of turn, already
+        // submitted, out of range) are facts about this receiver's chain rather
+        // than about the proof, so a receiver re-running the argument would
+        // find nothing wrong with it and refuse the accusation. Emitting a
+        // cause 2 for any of them would be broadcasting an accusation that
+        // every honest peer rejects, which ends no hand and names this client
+        // as the one making things up.
+        let evidence = match &outcome {
+            Err(StepError::Rejected(VerifyOutcome::Invalid(_))) => {
+                Some([held.bytes.clone(), bytes.to_vec()])
+            }
+            _ => None,
+        };
+
+        if let Err(e) = outcome {
+            self.shuffle_note = Some(format!(
+                "shuffle refusal from seat {seat}: chain at step {taken}, slot sequence {}, round {} | verifier {report}",
+                self.slot.sequence, body.shuffle_round
+            ));
+            if let Some(evidence) = evidence {
+                // §4.10 cause 2, and it is the difference between a hand that
+                // ends now and a hand that ends in ninety seconds with nobody
+                // named. `accept_step` has already spent this seat's one
+                // attempt (C-6 rule 4), so the chain can never complete: there
+                // is nothing left to wait for and the only question was how
+                // long everybody waits to find out.
+                return self.abort_bad_shuffle(seat, evidence, key, now_ms);
+            }
+            // Seen twice and unexplained, so the refusal carries what would
+            // settle it: whether the chain had already taken this position
+            // while the slot had not moved past it. Guessing at this cost two
+            // wrong hypotheses already.
+            if matches!(e, StepError::AlreadySubmitted) {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "no step had been taken at this position — chain position and slot sequence are in the log",
+                });
+            }
+            return Err(step_failure(seat, e));
+        }
+
+        let Phase::Shuffling { heard, .. } = &mut self.phase else {
+            unreachable!("just matched")
+        };
         *heard = None;
 
         let hash = stage_hash_single(
@@ -3332,6 +3430,50 @@ impl Hand {
         Ok(vec![Send::Broadcast(bytes)])
     }
 
+    /// `cause = 2`: the shuffle proof from `seat` does not hold, and here are
+    /// the two frames that say so.
+    ///
+    /// Separate from [`abort_now`](Hand::abort_now) because the evidence goes
+    /// only into the message and never into the phase, and because this is the
+    /// one abort with no waiting in it: §4.10's gate for causes 2 and 3 is
+    /// *accept at once*, so the hand ends on this message rather than at
+    /// everybody's deadline ninety seconds later.
+    ///
+    /// The caller has already had the proof refused by the chain. This does not
+    /// re-verify it — it is the accuser, and an accuser that could be talked out
+    /// of its own finding by running it twice would be a different bug — but
+    /// every **receiver** does, which is what makes the accusation checkable
+    /// rather than believed.
+    fn abort_bad_shuffle(
+        &mut self,
+        seat: SeatIdx,
+        evidence: [Vec<u8>; 2],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        if matches!(self.phase, Phase::Aborted(_)) {
+            return Ok(Vec::new());
+        }
+        let accused = self
+            .open
+            .seats
+            .iter()
+            .find(|(s, _, _)| *s == seat)
+            .map(|(_, k, _)| *k)
+            .ok_or(Failed::NotInThisStage)?;
+        let body =
+            HandAbort::on_bad_shuffle(accused, evidence, self.mine.stacks.clone());
+        // Checked against this client's own rules before it is signed. An
+        // emitter that sends what every receiver must refuse has ended nobody's
+        // hand and told nobody why, and the two bounds `consistent` now carries
+        // are exactly the ones an emitter can breach by accident.
+        body.consistent(&self.mine.stacks)
+            .map_err(|what| Failed::Elsewhere { seat, what })?;
+        let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
+        self.give_up(Abort::BadShuffle { seat });
+        Ok(vec![Send::Broadcast(bytes)])
+    }
+
     /// A peer's abort.
     ///
     /// **Buffered, not refused**, until this receiver's own trigger is present.
@@ -3387,14 +3529,21 @@ impl Hand {
                     return Err(Failed::NotYet);
                 }
             }
-            // Causes 2 and 3 carry their own disproof and are accepted at once
-            // — but this client neither emits nor verifies that evidence yet,
-            // and accepting an abort whose evidence it cannot check would be
-            // taking a peer's word for the end of a hand.
-            2 | 3 => {
+            // §4.10: *accept at once* - the evidence carries its own disproof.
+            // At once, and not on this peer's word: this client redoes the
+            // verification over the two signed frames and accepts only if the
+            // proof really does fail. Anything else and a seat could void any
+            // hand by shouting `cause = 2` over a proof that is perfectly good.
+            2 => self.bad_shuffle_holds(&body, seat)?,
+            // Cause 3 is the reveal proof, and this client neither emits nor
+            // verifies that evidence. Refused rather than accepted, for the
+            // reason cause 2 was until this pass: accepting an abort whose
+            // evidence cannot be checked is taking a peer's word for the end of
+            // a hand.
+            3 => {
                 return Err(Failed::Elsewhere {
                     seat,
-                    what: "this build could check the evidence it carries",
+                    what: "this build could check the reveal evidence it carries",
                 })
             }
             // The certified-subject path (§4.10, D-023). A named subject is
@@ -3449,6 +3598,153 @@ impl Hand {
 
         self.give_up(Abort::Told { cause: body.cause });
         Ok(Vec::new())
+    }
+
+    /// Does the `cause = 2` evidence really disprove the proof it names?
+    ///
+    /// §4.10 lets this abort end the hand **at once**, with no deadline and no
+    /// certificate behind it, which makes it the one message a hostile seat
+    /// could use to void any hand it disliked. What stops that is that the
+    /// permission is conditional on arithmetic every receiver redoes: the abort
+    /// is accepted only when this client's own run over the two frames *fails*.
+    /// A `cause = 2` over a good proof is refused, and the hand goes on.
+    ///
+    /// # What is checked, in order, and why the order is that
+    ///
+    /// 1. Two entries, the step then the proof. §4.10 bounds the count at two
+    ///    and `consistent` has already refused anything else.
+    /// 2. Both frames open **in this hand** - table identity, hand, catalogue
+    ///    envelope and signature - and both are signed by the seat the abort
+    ///    names. An accusation carrying somebody else's frames proves nothing
+    ///    about the seat it names. Position is not checked, and must not be:
+    ///    the accused's frames sit at the stalled stage, which is exactly where
+    ///    this receiver's cursor is not.
+    /// 3. This client is still shuffling and its chain can name the context. If
+    ///    it cannot - the hand has moved on, or it never got this far - it
+    ///    **holds** the abort rather than refusing it. Refusing would punish a
+    ///    peer for this client's own position, and the hand's deadline is the
+    ///    backstop, which is where this message left everybody before.
+    /// 4. The argument, against **this client's own input deck**, at the context
+    ///    its own chain derives, from the *proof's own signed* `sequence`. The
+    ///    emitter of the abort supplies none of those three: it supplies two
+    ///    frames the accused signed, and nothing it chooses enters the
+    ///    verification.
+    fn bad_shuffle_holds(&self, body: &HandAbort, from: SeatIdx) -> Result<(), Failed> {
+        let [step_bytes, proof_bytes] = match body.evidence.as_slice() {
+            [a, b] => [a, b],
+            _ => {
+                return Err(Failed::Elsewhere {
+                    seat: from,
+                    what: "a cause-2 abort carried the step and the proof it disputes",
+                })
+            }
+        };
+        let accused_key = body.attributed.first().copied().ok_or(Failed::Elsewhere {
+            seat: from,
+            what: "a cause-2 abort named the seat it accuses",
+        })?;
+        let accused = self
+            .open
+            .seats
+            .iter()
+            .find(|(_, k, _)| *k == accused_key)
+            .map(|(s, _, _)| *s)
+            .ok_or(Failed::Elsewhere {
+                seat: from,
+                what: "the seat it accuses were at this table",
+            })?;
+
+        // Opened by chain identity, not by position: the accused's frames are
+        // at the stage the chain stalled on, which is not where this receiver's
+        // cursor sits, and a strict parent check would refuse every one of them.
+        let open_one = |bytes: &[u8], kind: EventType| -> Result<chained::Opened, Failed> {
+            let o = chained::open_in_hand(
+                bytes,
+                FRAME_CAP,
+                kind,
+                &self.open.table_id,
+                self.open.hand_id,
+            )
+            .map_err(Failed::Wire)?;
+            if o.sender != accused_key {
+                return Err(Failed::Elsewhere {
+                    seat: from,
+                    what: "both frames were signed by the seat the abort accuses",
+                });
+            }
+            Ok(o)
+        };
+        let step = open_one(step_bytes, EventType::ShuffleStep)?;
+        let proof = open_one(proof_bytes, EventType::ShuffleProof)?;
+
+        let step_body: ShuffleStep =
+            chained::payload(&step, SHUFFLE_STEP_CAP).map_err(Failed::Wire)?;
+        let proof_body: ShuffleProof =
+            chained::payload(&proof, SHUFFLE_PROOF_CAP).map_err(Failed::Wire)?;
+
+        let Phase::Shuffling { deal, chain, .. } = &self.phase else {
+            // Held, not refused. See point 3 above.
+            return Err(Failed::NotYet);
+        };
+        if chain.whose_turn() != Some(accused) {
+            return Err(Failed::NotYet);
+        }
+        // The deck the proof is *about*, and the two hashes the proof itself
+        // names. Checking them here is not redundant with the argument: it is
+        // what makes "these two frames belong together" a fact rather than an
+        // assumption, and it costs a hash where the argument costs 42 ms.
+        let deck = unflatten(&step_body.deck).ok_or(Failed::Elsewhere {
+            seat: from,
+            what: "the step it carries held fifty-two cards",
+        })?;
+        if proof_body.output_deck_hash != deck_hash(&deck)
+            || proof_body.input_deck_hash != input_deck_hash(chain.last_verified())
+        {
+            // The two frames are not about each other, or not about this
+            // client's chain. Either way this receiver cannot be the judge of
+            // it, and the deadline remains the backstop.
+            return Err(Failed::NotYet);
+        }
+
+        // **The proof's own `sequence`, which the accused signed.** Not the
+        // abort emitter's and not this client's cursor: the accused chose it
+        // when it signed, so an emitter cannot shift the context to make a good
+        // proof look bad, and an accused that signed a wrong one produced a
+        // proof that fails at every honest peer anyway - which is the same
+        // finding by the same route.
+        let ctx = chain
+            .next_ctx(proof.envelope.sequence)
+            .ok_or(Failed::NotYet)?;
+        let verdict = match chain.last_verified() {
+            None => deal.deck.verify_initial_shuffle(&deck, &proof_body.proof, &ctx),
+            Some(prev) => deal
+                .deck
+                .verify_shuffle(prev.as_ref(), &deck, &proof_body.proof, &ctx),
+        };
+        match verdict {
+            // The accusation is false: the proof holds here. Refused, and the
+            // hand carries on - which is the whole reason this gate exists.
+            Ok(_) => Err(Failed::Elsewhere {
+                seat: from,
+                what: "the proof it calls invalid does not verify at this client either",
+            }),
+            // Confirmed, by this client's own arithmetic over frames the
+            // accused signed. §4.10's *accept at once*.
+            Err(VerifyOutcome::Invalid(_)) => Ok(()),
+            // **And this is why the verdict is matched rather than tested with
+            // `is_err`.** `CouldNotVerify` is not a finding about the proof: it
+            // is this client saying it could not run the check, and
+            // `VerifyOutcome` exists to carry exactly that distinction — *never
+            // evidence against anybody*. Treating it as confirmation would let
+            // an accuser end a hand at any receiver whose own verifier was
+            // unavailable, which is the failure mode the whole gate is here to
+            // prevent, reached through the one arm that looks like agreement.
+            //
+            // Held, not refused: nothing is known to be wrong with the abort,
+            // this client simply cannot judge it, and the hand's deadline
+            // remains the backstop.
+            Err(VerifyOutcome::CouldNotVerify(_)) => Err(Failed::NotYet),
+        }
     }
 
     /// Whether this hand's own deadline has passed.
@@ -4748,7 +5044,7 @@ impl Hand {
         // Opening the event proves the signature and that it belongs to this
         // table and this hand, and relaxes only the position — which is the
         // one thing that was ever in question about a held event.
-        let Ok((kind, hand_id, _)) = chained::peek(&bytes, FRAME_CAP) else {
+        let Ok((kind, hand_id, _)) = chained::peek(&bytes, PEEK_CAP) else {
             return Holding::Malformed;
         };
         // **Verified first, and classified second.** The order was the other
@@ -6605,6 +6901,195 @@ mod tests {
         }
     }
 
+    /// Drive two peers until seat 0 holds seat 1's `SHUFFLE_STEP` and has not
+    /// yet seen its `SHUFFLE_PROOF`, and hand back both frames.
+    ///
+    /// That is the only state in which seat 0 can judge an accusation about
+    /// them: its chain is at seat 1's position, so it holds the input deck the
+    /// proof is against and derives the same context. One event later it has
+    /// accepted the proof and moved on, and the gate holds the abort instead of
+    /// ruling on it.
+    fn shuffling_with_a_step_in_hand() -> (Hand, Hand, Vec<u8>, Vec<u8>) {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let keys = [key(10), key(11)];
+        // The opening exchange, in the order every other two-peer test here
+        // uses: each peer hears the other's `HAND_INIT`, then each hears the
+        // other's `DECK_INIT`. A queue seeded before that runs the frames out
+        // of order and every one of them is `NotYet`.
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> = vec![
+            (1, deliver(&mut b, &a_deck, &key(11))),
+            (0, deliver(&mut a, &b_deck, &key(10))),
+        ];
+        let mut step: Option<Vec<u8>> = None;
+        let mut proof: Option<Vec<u8>> = None;
+
+        'outer: for _ in 0..64 {
+            let Some((from, sends)) = queue.pop() else { break };
+            let to = 1 - from;
+            let mut produced = Vec::new();
+            for Send::Broadcast(frame) in &sends {
+                let (kind, _, _) = chained::peek(frame, PEEK_CAP).unwrap();
+                if from == 1 && kind == EventType::ShuffleStep {
+                    step = Some(frame.clone());
+                }
+                if from == 1 && kind == EventType::ShuffleProof {
+                    proof = Some(frame.clone());
+                    break 'outer;
+                }
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let mut more = hand.on_event(frame, &keys[usize::from(to)], NOW).unwrap();
+                produced.append(&mut more);
+            }
+            queue.push((to, produced));
+        }
+
+        let step = step.expect("seat 1 took its step");
+        let proof = proof.expect("and proved it");
+        assert!(
+            matches!(&a.phase, Phase::Shuffling { chain, heard, .. }
+                     if chain.whose_turn() == Some(1) && heard.is_some()),
+            "seat 0 holds the step and is waiting for the proof"
+        );
+        (a, b, step, proof)
+    }
+
+    /// **A `cause = 2` abort over a proof that is perfectly good ends nobody's
+    /// hand.**
+    ///
+    /// This is the whole reason the acceptance gate exists. §4.10 lets causes 2
+    /// and 3 be accepted *at once* — no deadline, no certificate, no other
+    /// seat's agreement — which would otherwise make one message enough for any
+    /// seat to void any hand it did not like the look of. The permission is
+    /// conditional on arithmetic every receiver redoes, and here the arithmetic
+    /// says the proof holds.
+    #[test]
+    fn a_cause_two_abort_over_a_valid_proof_is_refused() {
+        let (mut a, mut b, step, proof) = shuffling_with_a_step_in_hand();
+
+        // Seat 1's own frames, genuine and verifying, dressed up as evidence
+        // against seat 1.
+        let sends = b
+            .abort_bad_shuffle(1, [step, proof], &key(11), NOW)
+            .expect("the accusation is well formed - it is simply false");
+        let Send::Broadcast(abort) = &sends[0];
+
+        let err = a
+            .on_event(abort, &key(10), NOW)
+            .expect_err("a false accusation is refused");
+        assert!(
+            matches!(&err, Failed::Elsewhere { what, .. }
+                     if what.contains("does not verify at this client either")),
+            "and it says why: {err}"
+        );
+        assert!(
+            a.aborted().is_none(),
+            "the hand goes on - which is the point"
+        );
+    }
+
+    /// **A proof that really does not hold ends the hand on one message.**
+    ///
+    /// The other half of the gate, and the reason `cause = 2` exists at all.
+    /// Before it, a refused proof left the chain unable to complete —
+    /// `accept_step` spends the seat's one attempt before verifying, so there
+    /// is no retry — and every peer sat until `hand_deadline_ms` and then
+    /// aborted with nobody named. Here the hand is over at once and the seat
+    /// whose proof failed is named, with the two frames that say so attached.
+    ///
+    /// The bad proof is **correctly signed by the accused** and wrong only in
+    /// its argument, which is the only shape that tests anything: a frame with
+    /// a broken signature never reaches the argument at all.
+    #[test]
+    fn a_cause_two_abort_over_a_proof_that_fails_ends_the_hand() {
+        let (a, b, step, proof) = shuffling_with_a_step_in_hand();
+
+        // Re-seal seat 1's proof at its own slot with the argument replaced by
+        // zeroes. Same seat, same position, same parent, same deck hashes —
+        // everything the gate checks before the argument still holds, and the
+        // argument does not.
+        let opened = chained::open_in_hand(
+            &proof,
+            FRAME_CAP,
+            EventType::ShuffleProof,
+            &a.open.table_id,
+            a.open.hand_id,
+        )
+        .unwrap();
+        let mut body: ShuffleProof =
+            chained::payload(&opened, SHUFFLE_PROOF_CAP).unwrap();
+        body.proof = vec![0u8; body.proof.len()];
+        let slot = chained::Slot {
+            table_id: opened.envelope.table_id,
+            hand_id: opened.envelope.hand_id,
+            sequence: opened.envelope.sequence,
+            previous_event_hash: opened.envelope.previous_event_hash,
+        };
+        let bad = chained::seal(
+            EventType::ShuffleProof,
+            &slot,
+            &body,
+            &key(11),
+            NOW,
+            30_000,
+            SHUFFLE_PROOF_CAP,
+        )
+        .unwrap();
+
+        let accused = a.open.seats[1].1;
+        let abort = HandAbort::on_bad_shuffle(accused, [step, bad], b.mine.stacks.clone());
+        a.bad_shuffle_holds(&abort, 0)
+            .expect("the argument does not hold, and this client says so itself");
+    }
+
+    /// Evidence signed by somebody other than the seat the abort names proves
+    /// nothing about that seat, and is refused before any argument is verified.
+    #[test]
+    fn cause_two_evidence_must_be_signed_by_the_seat_it_accuses() {
+        let (a, b, step, proof) = shuffling_with_a_step_in_hand();
+
+        // Seat 1's frames, but the abort names seat 0. Seat 0 signed neither.
+        let accused = a.open.seats[0].1;
+        let body = HandAbort::on_bad_shuffle(
+            accused,
+            [step, proof],
+            b.mine.stacks.clone(),
+        );
+        let err = a
+            .bad_shuffle_holds(&body, 1)
+            .expect_err("frames the accused never signed prove nothing");
+        assert!(
+            matches!(&err, Failed::Elsewhere { what, .. }
+                     if what.contains("signed by the seat the abort accuses")),
+            "{err}"
+        );
+    }
+
+    /// An abort this client cannot judge is **held**, never refused.
+    ///
+    /// Refusing would punish a peer for this receiver's own position in the
+    /// hand, and `run.rs` turns anything but `NotYet` into a GossipSub
+    /// `Reject` — so a receiver one stage behind would score down the peer
+    /// carrying the one message that ends the hand.
+    #[test]
+    fn a_cause_two_abort_is_held_when_this_client_cannot_judge_it() {
+        let (mut a, mut b, step, proof) = shuffling_with_a_step_in_hand();
+
+        // Move seat 0 past the position the evidence is about by giving it the
+        // proof. Now its chain is somewhere else and it can no longer derive
+        // the context the argument was made in.
+        let _ = a.on_event(&proof, &key(10), NOW).unwrap();
+
+        let sends = b.abort_bad_shuffle(1, [step, proof], &key(11), NOW).unwrap();
+        let Send::Broadcast(abort) = &sends[0];
+        assert!(
+            matches!(a.on_event(abort, &key(10), NOW), Err(Failed::NotYet)),
+            "held, not refused"
+        );
+    }
+
     /// An action out of turn is refused and names who was up.
     #[test]
     fn acting_out_of_turn_is_refused() {
@@ -6832,11 +7317,23 @@ mod tests {
         assert!(!b.shuffled());
     }
 
-    /// An argument that does not hold is a different failure from a mismatched
-    /// hash: it names the shuffle, because the consequence is that the chain
-    /// can never complete and the hand is abandoned rather than shortened.
+    /// An argument that does not hold **ends the hand at once**, with the seat
+    /// named and the two frames that prove it attached.
+    ///
+    /// This used to assert `Failed::BadShuffle`, and the refusal was the whole
+    /// of the answer: the chain could never complete — `accept_step` spends the
+    /// seat's one attempt before verifying, so there is no retry — and every
+    /// peer waited out `hand_deadline_ms` to reach an abort that named nobody.
+    /// §4.10's `cause = 2` is what that ninety seconds was standing in for, and
+    /// the outcome is now an `Ok` carrying it.
+    ///
+    /// The distinction the old name drew is still real and is still drawn: a
+    /// mismatched deck hash is a different failure from a failed argument, and
+    /// [`a_proof_that_names_another_deck_is_refused`] above still asserts
+    /// `Failed::BadDeck` for it. Only an argument that verifiably does not hold
+    /// is evidence, because only that is decidable from the frames themselves.
     #[test]
-    fn an_argument_that_does_not_hold_is_refused_as_a_shuffle() {
+    fn an_argument_that_does_not_hold_ends_the_hand_with_cause_two() {
         let (_a, mut b, shuffle) = ready_to_shuffle();
         let Send::Broadcast(step) = &shuffle[0];
         let Send::Broadcast(proof) = &shuffle[1];
@@ -6852,9 +7349,41 @@ mod tests {
                 p.proof[n / 2] ^= 0xff;
             },
         );
-        let e = b.on_event(&broken, &key(11), NOW).unwrap_err();
-        assert!(matches!(e, Failed::BadShuffle { seat: 0, .. }), "{e}");
+        let sends = b
+            .on_event(&broken, &key(11), NOW)
+            .expect("the hand ends on this message rather than at its deadline");
+        assert_eq!(sends.len(), 1, "one abort, broadcast");
         assert!(!b.shuffled(), "and the chain did not advance");
+        assert_eq!(
+            b.aborted(),
+            Some(Abort::BadShuffle { seat: 0 }),
+            "the seat whose proof failed is named"
+        );
+
+        // The message really is a `cause = 2` carrying both frames, and it says
+        // so on the wire rather than only in this client's own phase.
+        let Send::Broadcast(bytes) = &sends[0];
+        let opened = chained::open_in_hand(
+            bytes,
+            HAND_ABORT_CAP,
+            EventType::HandAbort,
+            &b.open.table_id,
+            b.open.hand_id,
+        )
+        .unwrap();
+        let body: HandAbort = chained::payload(&opened, HAND_ABORT_CAP).unwrap();
+        assert_eq!(body.cause, 2);
+        assert_eq!(body.evidence.len(), 2, "the step and the proof");
+        assert_eq!(
+            body.attributed,
+            vec![b.open.seats[0].1],
+            "and it names seat 0 by key"
+        );
+        assert!(body.cert_hash.is_none(), "no certificate: none is needed");
+        assert!(
+            body.consistent(&b.mine.stacks).is_ok(),
+            "an abort every receiver's own rules admit"
+        );
     }
 
     /// The round-0 input hash is a constant, and it is the same constant for
