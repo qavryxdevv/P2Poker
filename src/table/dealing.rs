@@ -216,10 +216,55 @@ impl Dealing {
         share: &Share<'_>,
         ctx: &DeckCtx,
     ) -> Result<(), Refused> {
+        let _ = me;
+        // Steps 1 and 2, which are exactly [`would_verify`] and are called
+        // through it rather than repeated here: a second copy of a
+        // verification is a second copy that can drift, and the whole value of
+        // `HAND_ABORT cause = 3` is that the accused's judge and the accuser
+        // ran the same check.
+        let verified = self.verified_share(deal, share, ctx)?;
+
+        // 3. One share per seat per card, never an update.
+        self.set_mut(share.index)?
+            .add(share.from, share.index, verified)
+            .map_err(Refused::NotWanted)
+    }
+
+    /// Is this share due here, and does its proof hold against this peer's own
+    /// final deck? **Changes nothing.**
+    ///
+    /// The judging half of [`accept`](Self::accept) with the recording half cut
+    /// off. It exists for `PROTOCOL.md` §4.10's `cause = 3`, whose acceptance
+    /// gate is *the evidence verifies* and which must therefore run the check
+    /// over a share that is **not** this receiver's to record: it belongs to a
+    /// stage the accused was at, carried inside somebody else's abort, and
+    /// recording it would be accepting a contribution that arrived as an
+    /// exhibit.
+    ///
+    /// The distinctions in [`Refused`] are the point of returning it whole. Only
+    /// `DidNotVerify(VerifyOutcome::Invalid(_))` is evidence against the signer.
+    /// `NotDue`, `UnknownSeat` and `CouldNotVerify` are statements about what
+    /// *this* peer holds, and a gate that read them as agreement would let an
+    /// accuser end a hand at every receiver that happened to be behind.
+    pub fn would_verify(
+        &self,
+        deal: &Deal<'_>,
+        share: &Share<'_>,
+        ctx: &DeckCtx,
+    ) -> Result<(), Refused> {
+        self.verified_share(deal, share, ctx).map(|_| ())
+    }
+
+    /// Steps 1 and 2, once, for both callers above.
+    fn verified_share(
+        &self,
+        deal: &Deal<'_>,
+        share: &Share<'_>,
+        ctx: &DeckCtx,
+    ) -> Result<VerifiedToken, Refused> {
         // 1. Free: is it due at all? Not "is it for us" — every legal share is
         // broadcast and every peer keeps every one of them, which is what makes
         // a showdown 2 x 131 bytes instead of a fresh round.
-        let _ = me;
         entitlement(&self.map, share.index, share.from, &self.stage)
             .map_err(Refused::NotDue)?;
 
@@ -229,15 +274,9 @@ impl Dealing {
             .get(share.from as usize)
             .and_then(|k| k.as_ref())
             .ok_or(Refused::UnknownSeat { seat: share.from })?;
-        let verified = deal
-            .hand
+        deal.hand
             .verify_token(key, deal.deck, share.index, share.token, share.proof, ctx)
-            .map_err(Refused::DidNotVerify)?;
-
-        // 3. One share per seat per card, never an update.
-        self.set_mut(share.index)?
-            .add(share.from, share.index, verified)
-            .map_err(Refused::NotWanted)
+            .map_err(Refused::DidNotVerify)
     }
 
     /// Open a card, if every share is in.

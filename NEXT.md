@@ -915,12 +915,18 @@ chain was and not what the proof was checked against.
 The second run across the boundary is more interesting than the first, because
 it failed — and it failed in the one way only two networks can show.
 
-| | run 1, 120 s | run 2, 300 s |
-|---|---|---|
-| table formed | yes | yes |
-| hands agreed | 1, genesis `55f97eeb` | 1, genesis `1a2db2ab` |
-| direct connections at the far end | 8 | **0** |
-| hands the far end finished | 1 | **0** |
+| | run 1, 120 s | run 2, 300 s | run 3, 300 s |
+|---|---|---|---|
+| table formed | yes | yes | yes |
+| hands agreed | 1, `55f97eeb` | 1, `1a2db2ab` | **5**, all five hashes |
+| direct connections, far end | 8 | **0** | 13 |
+| hands the far end finished | 1 | **0** | 5 |
+
+Run 3 is the strongest cross-network result so far and it is the same finding
+from the other side: thirteen direct connections at the far end, five whole
+hands, and both ends agreeing on all five genesis hashes. The variable that
+moves is not the run length - runs 2 and 3 were both 300 s - it is whether DCUtR
+got through.
 
 In run 2 the far end reached `hand #1: the deck is shuffled and sealed` and
 then said nothing about that hand ever again. This end reached `your turn — 50
@@ -1036,9 +1042,39 @@ its old name drew is still drawn next door: a mismatched deck hash is
 `Failed::BadDeck`, because only a failed *argument* is decidable from the frames
 themselves and therefore only that is evidence.
 
-Cause 3 (the reveal proof) is still refused rather than accepted, for the reason
-cause 2 was until now: accepting an abort whose evidence cannot be checked is
-taking a peer's word for the end of a hand.
+### Cause 3, the same shape over one frame
+
+Done in the same pass. A reveal share carries its own token and its own proof,
+and the deck they are checked against is the committed one every seat already
+holds - so the evidence is **one** frame where cause 2 needs two.
+
+Three pieces made it possible without duplicating a verification:
+
+* `Dealing::would_verify` is `accept` with the recording half cut off, and
+  `accept` now calls **through** it. A second copy of a check is a second copy
+  that can drift, and the whole value of the cause is that the accuser and every
+  judge ran the same one.
+* `Failed::RevealDisproved` is split out of `BadToken` for exactly
+  `DidNotVerify(VerifyOutcome::Invalid(_))`. `NotDue`, `UnknownSeat` and
+  `CouldNotVerify` stay `BadToken`, because a receiver that is behind or cannot
+  run the check has found nothing about the sender.
+* It is caught in `on_event`, above the three reveal handlers, because that is
+  where the offending frame still exists - the handlers all run inside a borrow
+  of `self.phase`, where neither the abort nor the note could be built. One
+  catch costs three restructurings and one variant.
+
+And one hazard the shuffle case did not have: `deck_ctx` builds the context from
+**this client's own** `slot.sequence`. Re-deriving evidence that way would make a
+perfectly good share fail wherever the receiver had moved on - turning a false
+accusation into one that *succeeds*, at exactly the peers that were ahead. The
+gate uses `deck_ctx_at` with the frame's own signed `sequence` instead.
+
+The gate answers three ways rather than two, and the third is the one that
+matters: any entry `Invalid` accepts, every entry verified refuses, and anything
+else - `NotDue`, `UnknownSeat`, `CouldNotVerify`, an index or a token this client
+cannot decode - **holds**. Undecodable bytes are attributable under §4.0, but as
+a tier-1 `cause = 6` finding, not this one, so they are held rather than quietly
+promoted to a different accusation.
 
 ### The finding: §4.10's evidence bound does not fit in the frame that carries it
 
@@ -1113,12 +1149,10 @@ argument.
   for this; `tests/anti_replay_authority.rs` holds them to that.
 * **The RNG beacon.** `provisional_button` stands in for it, in nine places in
   `table/hand.rs`.
-* **`HAND_ABORT` cause 3.** The reveal proof. Cause 2 is done - see above -
-  and cause 3 is refused rather than accepted for the reason cause 2 was:
-  accepting an abort whose evidence cannot be checked is taking a peer's word
-  for the end of a hand. The caps it needs are already in place; what it needs
-  is the reveal path's own non-mutating verify, the shape `next_ctx` and
-  `last_verified` gave cause 2.
+* **`HAND_ABORT` causes 2 and 3 are done** - see above. What is left of the
+  cause register is `4` (the §6.3 divergence terminus) and `6` (D-014's
+  anti-cheat void), and both need machinery that does not exist yet rather than
+  evidence handling that does.
 
 ### Rules questions nobody has answered
 

@@ -660,6 +660,25 @@ impl HandAbort {
         }
     }
 
+    /// `cause = 3`: a reveal share whose proof does not hold against the
+    /// committed deck, with the one frame that carries it.
+    ///
+    /// **One entry, where `cause = 2` needs two.** A shuffle argument is about a
+    /// *pair* of decks and the proof event names them by hash only, so the step
+    /// has to travel with it. A reveal share carries its own token and its own
+    /// proof, and the deck they are checked against is the committed one every
+    /// seat already holds — there is nothing else to send.
+    pub fn on_bad_reveal(accused: [u8; 32], evidence: Vec<u8>, stacks: Vec<u64>) -> Self {
+        HandAbort {
+            cause: 3,
+            attributed: vec![accused],
+            cert_hash: None,
+            evidence: vec![evidence],
+            deltas: vec![0; stacks.len()],
+            final_stacks: stacks,
+        }
+    }
+
     /// Whether this body is one the receiver's own rules allow, given the
     /// stacks that receiver holds from the genesis of the hand.
     ///

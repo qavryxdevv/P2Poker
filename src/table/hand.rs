@@ -112,6 +112,20 @@ pub enum Failed {
     /// A reveal contribution was not what the stage required, or its proof did
     /// not verify against the committed deck.
     BadToken { seat: SeatIdx, why: &'static str },
+    /// A reveal share's proof is **provably** wrong against the committed deck.
+    ///
+    /// Split out of [`BadToken`](Failed::BadToken) because it is the one reveal
+    /// failure that is evidence rather than a statement about this receiver:
+    /// `Refused::DidNotVerify(VerifyOutcome::Invalid(_))` and nothing else.
+    /// `NotDue`, `UnknownSeat` and `CouldNotVerify` all stay `BadToken`,
+    /// because a receiver that is behind, or that cannot run the check, has
+    /// found nothing about the sender.
+    ///
+    /// It never leaves `on_event`: it is caught there and turned into a
+    /// `HAND_ABORT cause = 3` carrying the offending frame. A variant rather
+    /// than a string comparison on `BadToken`'s `why`, because control flow
+    /// keyed on prose is control flow that a copy-edit breaks.
+    RevealDisproved { seat: SeatIdx },
     /// A seat offered an action the rules do not allow.
     ///
     /// Attributable and never corrected: `PROTOCOL.md` §4.7 is explicit that an
@@ -159,6 +173,10 @@ impl std::fmt::Display for Failed {
                 write!(f, "seat {seat} holds a different {what}")
             }
             Self::BadToken { seat, why } => write!(f, "seat {seat}'s reveal: {why}"),
+            Self::RevealDisproved { seat } => write!(
+                f,
+                "seat {seat}'s reveal proof does not hold against the committed deck"
+            ),
             Self::Illegal { seat, what } => write!(f, "seat {seat} cannot do that: {what:?}"),
             Self::Elsewhere { seat, what } => {
                 write!(f, "seat {seat} is acting as though {what}")
@@ -743,6 +761,18 @@ pub enum Abort {
         /// The seat whose proof failed. Named in `attributed`.
         seat: SeatIdx,
     },
+    /// `cause = 3`: a reveal share whose proof does not hold against the
+    /// committed deck.
+    ///
+    /// The same shape as [`BadShuffle`](Abort::BadShuffle) and for the same
+    /// reason — self-authenticating evidence, so no certificate and no
+    /// deadline — over one frame instead of two: a reveal share carries its own
+    /// token and proof, and the deck they are checked against is the committed
+    /// one every seat already holds.
+    BadReveal {
+        /// The seat whose share failed. Named in `attributed`.
+        seat: SeatIdx,
+    },
 }
 
 /// The deck every stage from `DECK_COMMIT` onwards is about.
@@ -1164,7 +1194,18 @@ impl Hand {
 
         let out = self.dispatch(bytes, kind, key, now_ms);
         self.mark_stage(now_ms);
-        out
+        // **Caught here, because here is where the frame still exists.** A
+        // reveal share proved wrong is `PROTOCOL.md` §4.10's `cause = 3`, whose
+        // evidence is the offending event itself — and the three reveal
+        // handlers all run inside a borrow of `self.phase`, where neither the
+        // abort nor the note could be built. One catch above them costs three
+        // restructurings and a variant.
+        match out {
+            Err(Failed::RevealDisproved { seat }) => {
+                self.abort_bad_reveal(seat, bytes.to_vec(), key, now_ms)
+            }
+            other => other,
+        }
     }
 
     /// The phase's own handler for an event that passed the guards.
@@ -3474,6 +3515,42 @@ impl Hand {
         Ok(vec![Send::Broadcast(bytes)])
     }
 
+    /// `cause = 3`: the reveal share from `seat` does not hold against the
+    /// committed deck, and here is the frame that carries it.
+    ///
+    /// The reveal twin of [`abort_bad_shuffle`](Hand::abort_bad_shuffle), and
+    /// everything said there applies: accepted at once by §4.10, so no
+    /// certificate and no deadline, and safe only because every receiver redoes
+    /// the check itself.
+    ///
+    /// One frame, not two. A reveal share carries its own token and its own
+    /// proof; the deck they are checked against is the committed one, which
+    /// every seat of the hand already holds.
+    fn abort_bad_reveal(
+        &mut self,
+        seat: SeatIdx,
+        evidence: Vec<u8>,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        if matches!(self.phase, Phase::Aborted(_)) {
+            return Ok(Vec::new());
+        }
+        let accused = self
+            .open
+            .seats
+            .iter()
+            .find(|(s, _, _)| *s == seat)
+            .map(|(_, k, _)| *k)
+            .ok_or(Failed::NotInThisStage)?;
+        let body = HandAbort::on_bad_reveal(accused, evidence, self.mine.stacks.clone());
+        body.consistent(&self.mine.stacks)
+            .map_err(|what| Failed::Elsewhere { seat, what })?;
+        let bytes = self.say(EventType::HandAbort, &body, HAND_ABORT_CAP, key, now_ms)?;
+        self.give_up(Abort::BadReveal { seat });
+        Ok(vec![Send::Broadcast(bytes)])
+    }
+
     /// A peer's abort.
     ///
     /// **Buffered, not refused**, until this receiver's own trigger is present.
@@ -3535,17 +3612,10 @@ impl Hand {
             // proof really does fail. Anything else and a seat could void any
             // hand by shouting `cause = 2` over a proof that is perfectly good.
             2 => self.bad_shuffle_holds(&body, seat)?,
-            // Cause 3 is the reveal proof, and this client neither emits nor
-            // verifies that evidence. Refused rather than accepted, for the
-            // reason cause 2 was until this pass: accepting an abort whose
-            // evidence cannot be checked is taking a peer's word for the end of
-            // a hand.
-            3 => {
-                return Err(Failed::Elsewhere {
-                    seat,
-                    what: "this build could check the reveal evidence it carries",
-                })
-            }
+            // The reveal half of the same rule, and the same gate: accepted
+            // at once, and only after this client's own check over the frame
+            // the accused signed says the share really is wrong.
+            3 => self.bad_reveal_holds(&body, seat)?,
             // The certified-subject path (§4.10, D-023). A named subject is
             // accepted only against a certificate this client verified itself:
             // `certs` holds nothing it did not open, check for unanimity and
@@ -3745,6 +3815,153 @@ impl Hand {
             // remains the backstop.
             Err(VerifyOutcome::CouldNotVerify(_)) => Err(Failed::NotYet),
         }
+    }
+
+    /// Does the `cause = 3` evidence really disprove the share it names?
+    ///
+    /// The reveal twin of [`bad_shuffle_holds`](Hand::bad_shuffle_holds), and
+    /// the same rule decides it: §4.10 accepts causes 2 and 3 **at once**, so
+    /// the abort ends the hand only when this client's own check over the frame
+    /// the accused signed says the share really is wrong.
+    ///
+    /// # The three-way answer, and why it is three and not two
+    ///
+    /// * **Any entry `Invalid`** — the share is provably wrong against the
+    ///   committed deck. Accept; the hand is over.
+    /// * **Every entry verified** — the accusation is false. Refuse, and the
+    ///   hand goes on. This is the direction the gate exists for.
+    /// * **Anything else** — `NotDue`, `UnknownSeat`, `CouldNotVerify`, an
+    ///   index or a token this client cannot decode. None of those is a finding
+    ///   about the sender; they are findings about this receiver's own position
+    ///   and equipment. **Hold**, and let the hand's deadline be the backstop.
+    ///   Refusing would score down a peer for carrying a message this client
+    ///   merely could not judge.
+    ///
+    /// The evidence may be any of the three reveal events, because all three
+    /// carry `RevealEntry` lists and any of them can be wrong. Which one it is
+    /// comes from peeking the frame, and the frame's own signed `sequence`
+    /// builds the context — never this client's cursor, which is somewhere else
+    /// by construction.
+    fn bad_reveal_holds(&self, body: &HandAbort, from: SeatIdx) -> Result<(), Failed> {
+        let [frame] = match body.evidence.as_slice() {
+            [a] => [a],
+            _ => {
+                return Err(Failed::Elsewhere {
+                    seat: from,
+                    what: "a cause-3 abort carried exactly the one frame it disputes",
+                })
+            }
+        };
+        let accused_key = body.attributed.first().copied().ok_or(Failed::Elsewhere {
+            seat: from,
+            what: "a cause-3 abort named the seat it accuses",
+        })?;
+        let accused = self
+            .open
+            .seats
+            .iter()
+            .find(|(_, k, _)| *k == accused_key)
+            .map(|(s, _, _)| *s)
+            .ok_or(Failed::Elsewhere {
+                seat: from,
+                what: "the seat it accuses were at this table",
+            })?;
+
+        let (kind, _, _) = chained::peek(frame, PEEK_CAP).map_err(Failed::Wire)?;
+        let cap = match kind {
+            EventType::DealPrivate => DEAL_PRIVATE_CAP,
+            EventType::BoardReveal => BOARD_REVEAL_CAP,
+            EventType::ShowdownReveal => SHOWDOWN_REVEAL_CAP,
+            _ => {
+                return Err(Failed::Elsewhere {
+                    seat: from,
+                    what: "the frame it carries were a reveal at all",
+                })
+            }
+        };
+        // By chain identity, not position: the frame sits at the stage the
+        // accused was at, which is not where this receiver's cursor is.
+        let opened = chained::open_in_hand(
+            frame,
+            FRAME_CAP,
+            kind,
+            &self.open.table_id,
+            self.open.hand_id,
+        )
+        .map_err(Failed::Wire)?;
+        if opened.sender != accused_key {
+            return Err(Failed::Elsewhere {
+                seat: from,
+                what: "the frame were signed by the seat the abort accuses",
+            });
+        }
+        let entries: Vec<RevealEntry> = match kind {
+            EventType::DealPrivate => {
+                chained::payload::<DealPrivate>(&opened, cap)
+                    .map_err(Failed::Wire)?
+                    .entries
+            }
+            EventType::BoardReveal => {
+                chained::payload::<BoardReveal>(&opened, cap)
+                    .map_err(Failed::Wire)?
+                    .entries
+            }
+            _ => {
+                chained::payload::<ShowdownReveal>(&opened, cap)
+                    .map_err(Failed::Wire)?
+                    .entries
+            }
+        };
+
+        // Whichever phase still holds a deck and a share store. Outside both,
+        // this client has nothing to check against and holds.
+        let (deal, table, dealing) = match &self.phase {
+            Phase::Dealing { deal, table, dealing, .. } => (deal, table, &**dealing),
+            Phase::Playing { deal, table, play } => (deal, table, &*play.dealing),
+            _ => return Err(Failed::NotYet),
+        };
+
+        let ctx = self.deck_ctx_at(&accused_key, opened.envelope.sequence);
+        let mut unjudgeable = false;
+        for entry in &entries {
+            let Some(index) = table.map.index_from_wire(entry.deck_index) else {
+                unjudgeable = true;
+                continue;
+            };
+            let (Ok(token), Ok(proof)) = (
+                WireToken::decode(&entry.token),
+                WireTokenProof::decode(&entry.proof),
+            ) else {
+                // Bytes that are not a point or not a proof are attributable
+                // under §4.0 — but as a **tier-1** finding under `cause = 6`,
+                // not as this cause. `cause = 3` is *this share does not verify*
+                // and nothing else, so an undecodable one is held rather than
+                // quietly promoted to a different accusation.
+                unjudgeable = true;
+                continue;
+            };
+            let share = Share {
+                from: accused,
+                index,
+                token,
+                proof: &proof,
+            };
+            match dealing.would_verify(&deal.as_ref(table), &share, &ctx) {
+                Err(Refused::DidNotVerify(VerifyOutcome::Invalid(_))) => return Ok(()),
+                Ok(()) => {}
+                Err(_) => unjudgeable = true,
+            }
+        }
+
+        if unjudgeable {
+            // Nothing here is known to be wrong; this client simply could not
+            // finish the check.
+            return Err(Failed::NotYet);
+        }
+        Err(Failed::Elsewhere {
+            seat: from,
+            what: "the share it calls invalid verifies at this client",
+        })
     }
 
     /// Whether this hand's own deadline has passed.
@@ -4999,12 +5216,26 @@ impl Hand {
     /// made for one of them verify for another. A test that shares one passes
     /// and the wire does not.
     fn deck_ctx(&self, sender: &[u8; 32]) -> DeckCtx {
+        self.deck_ctx_at(sender, self.slot.sequence)
+    }
+
+    /// The same context at a **named** stage.
+    ///
+    /// Live traffic is judged at this client's own cursor, which is what
+    /// [`deck_ctx`](Hand::deck_ctx) passes. Evidence is not: a `cause = 3`
+    /// abort carries a frame from the stage the accused was at, and re-deriving
+    /// its context from the receiver's cursor would make a perfectly good share
+    /// fail wherever the two differ — turning a false accusation into one that
+    /// succeeds, at exactly the receivers that had moved on. The gate passes
+    /// the frame's own signed `sequence` instead, which the accused chose and
+    /// no accuser can alter.
+    fn deck_ctx_at(&self, sender: &[u8; 32], sequence: u64) -> DeckCtx {
         DeckCtx::build(&CtxFields {
             protocol_version: crate::protocol::messages::PROTOCOL_VERSION,
             table_id: self.open.table_id,
             session_id: self.open.session_id,
             hand_id: self.open.hand_id,
-            sequence: self.slot.sequence,
+            sequence,
             position: ProofPosition::NotAShuffleStep,
             sender_public_key: *sender,
         })
@@ -5803,9 +6034,15 @@ fn refused(seat: SeatIdx, e: Refused) -> Failed {
             seat,
             why: "a share the rules do not allow at this point in the hand",
         },
+        // **The one arm that is evidence, and it is separated here rather than
+        // at the four call sites.** `VerifyOutcome` already carries the
+        // distinction the whole of `cause = 3` rests on: `Invalid` is a finding
+        // about the signer, `CouldNotVerify` is a finding about this peer's own
+        // ability to check and is *never* evidence against anybody.
+        Refused::DidNotVerify(VerifyOutcome::Invalid(_)) => Failed::RevealDisproved { seat },
         Refused::DidNotVerify(_) => Failed::BadToken {
             seat,
-            why: "the proof does not hold against the committed deck",
+            why: "the proof could not be checked against the committed deck here",
         },
         Refused::NotWanted(_) => Failed::BadToken {
             seat,
@@ -7257,6 +7494,144 @@ mod tests {
         deliver(&mut b, &a_deck, &key(11));
         let shuffle = deliver(&mut a, &b_deck, &key(10));
         (a, b, shuffle)
+    }
+
+    /// Two clients up to the point where seat 0 has published its
+    /// `DEAL_PRIVATE` and seat 1 is in `Dealing`, waiting for it.
+    ///
+    /// Seat 1 must be at that stage and not past it: the reveal context is
+    /// built from a `sequence`, and a receiver that has moved on derives a
+    /// different one. Everything up to the deal is delivered; the deal itself
+    /// is handed back untouched.
+    fn ready_to_deal() -> (Hand, Hand, Vec<u8>, Vec<u8>) {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        deliver(&mut b, &a_deck, &key(11));
+        let a_shuffle = deliver(&mut a, &b_deck, &key(10));
+        let b_shuffle = deliver(&mut b, &a_shuffle, &key(11));
+        let a_more = deliver(&mut a, &b_shuffle, &key(10));
+
+        let mut deal: Option<Vec<u8>> = None;
+        let mut other: Option<Vec<u8>> = None;
+        for Send::Broadcast(frame) in &a_more {
+            let (kind, _, _) = chained::peek(frame, PEEK_CAP).unwrap();
+            if kind == EventType::DealPrivate {
+                deal = Some(frame.clone());
+                break;
+            }
+            // Something seat 0 signed this hand that is not a reveal, for the
+            // test that the gate refuses evidence of the wrong kind.
+            other = Some(frame.clone());
+            b.on_event(frame, &key(11), NOW).unwrap();
+        }
+        let deal = deal.expect("seat 0 published its shares for seat 1's cards");
+        let other = other.expect("and something before it that is not a reveal");
+        assert!(
+            matches!(b.phase, Phase::Dealing { .. }),
+            "seat 1 is at the deal and has not heard it"
+        );
+        (a, b, deal, other)
+    }
+
+    /// **A reveal share that does not hold ends the hand at once**, with the
+    /// seat named and the frame that proves it attached.
+    ///
+    /// The reveal half of `cause = 2`. The tampering swaps the two entries'
+    /// tokens: both still decode — they are each other's, and each is a
+    /// perfectly good curve point — so the message survives every structural
+    /// check and dies at the DLEQ, which is the only failure that is evidence.
+    #[test]
+    fn a_reveal_share_that_does_not_hold_ends_the_hand_with_cause_three() {
+        let (_a, mut b, deal, _other) = ready_to_deal();
+        let broken = tamper::<DealPrivate>(
+            &deal,
+            EventType::DealPrivate,
+            &b.slot(),
+            DEAL_PRIVATE_CAP,
+            |d| {
+                let first = d.entries[0].token.clone();
+                d.entries[0].token = d.entries[1].token.clone();
+                d.entries[1].token = first;
+            },
+        );
+
+        let sends = b
+            .on_event(&broken, &key(11), NOW)
+            .expect("the hand ends on this message rather than at its deadline");
+        assert_eq!(sends.len(), 1, "one abort, broadcast");
+        assert_eq!(
+            b.aborted(),
+            Some(Abort::BadReveal { seat: 0 }),
+            "the seat whose share failed is named"
+        );
+
+        let Send::Broadcast(bytes) = &sends[0];
+        let opened = chained::open_in_hand(
+            bytes,
+            HAND_ABORT_CAP,
+            EventType::HandAbort,
+            &b.open.table_id,
+            b.open.hand_id,
+        )
+        .unwrap();
+        let body: HandAbort = chained::payload(&opened, HAND_ABORT_CAP).unwrap();
+        assert_eq!(body.cause, 3);
+        assert_eq!(body.evidence.len(), 1, "one frame: the share carries its own");
+        assert_eq!(body.attributed, vec![b.open.seats[0].1]);
+        assert!(body.cert_hash.is_none(), "no certificate: none is needed");
+        assert!(body.consistent(&b.mine.stacks).is_ok());
+    }
+
+    /// **A `cause = 3` abort over a share that is perfectly good ends nobody's
+    /// hand**, which is the direction the gate exists for.
+    #[test]
+    fn a_cause_three_abort_over_a_valid_share_is_refused() {
+        let (_a, b, deal, _other) = ready_to_deal();
+        let accused = b.open.seats[0].1;
+        let body = HandAbort::on_bad_reveal(accused, deal, b.mine.stacks.clone());
+        let err = b
+            .bad_reveal_holds(&body, 0)
+            .expect_err("a false accusation is refused");
+        assert!(
+            matches!(&err, Failed::Elsewhere { what, .. }
+                     if what.contains("verifies at this client")),
+            "and it says why: {err}"
+        );
+    }
+
+    /// Evidence that is not a reveal at all is refused before any share is
+    /// checked, and evidence the accused never signed with it.
+    #[test]
+    fn cause_three_evidence_must_be_a_reveal_the_accused_signed() {
+        let (_a, b, deal, other) = ready_to_deal();
+
+        // Seat 0's frame, but the abort names seat 1.
+        let wrong_seat = HandAbort::on_bad_reveal(
+            b.open.seats[1].1,
+            deal.clone(),
+            b.mine.stacks.clone(),
+        );
+        let err = b.bad_reveal_holds(&wrong_seat, 0).unwrap_err();
+        assert!(
+            matches!(&err, Failed::Elsewhere { what, .. }
+                     if what.contains("signed by the seat the abort accuses")),
+            "{err}"
+        );
+
+        // And a frame that is not a reveal event at all.
+        let init = HandAbort::on_bad_reveal(
+            b.open.seats[0].1,
+            other,
+            b.mine.stacks.clone(),
+        );
+        let err = b.bad_reveal_holds(&init, 0).unwrap_err();
+        assert!(
+            matches!(&err, Failed::Elsewhere { what, .. }
+                     if what.contains("were a reveal at all")),
+            "{err}"
+        );
     }
 
     /// A deck that is not fifty-two cards never reaches the crypto at all.

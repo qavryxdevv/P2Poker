@@ -996,8 +996,16 @@ pub async fn run(
                                                         "seat {seat}'s shuffle proof does not hold; the hand is void and every stack is restored"
                                                     )
                                                 }
+                                                crate::table::hand::Abort::BadReveal { seat } => {
+                                                    format!(
+                                                        "seat {seat}'s reveal proof does not hold against the committed deck; the hand is void and every stack is restored"
+                                                    )
+                                                }
                                                 crate::table::hand::Abort::Told { cause: 2 } => {
                                                     "a peer proved a shuffle did not hold; the hand is void and every stack is restored".into()
+                                                }
+                                                crate::table::hand::Abort::Told { cause: 3 } => {
+                                                    "a peer proved a reveal share did not hold; the hand is void and every stack is restored".into()
                                                 }
                                                 _ => "a peer ended the hand on its own deadline; every stack is restored".into(),
                                             };
