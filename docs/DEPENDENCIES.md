@@ -320,9 +320,12 @@ Recorded as **accepted with justification** rather than fixed, because we could 
 fix it: the justification was a fact about mainline's usage, not a guarantee, which
 is why §8 lists "a pinned crate moves" as a re-audit trigger. What actually ended it
 was neither an upgrade nor a re-audit — the dependency was removed for an unrelated
-reason, and the register kept the acceptance for months afterwards. **That is the
-failure this section is now an example of**, and it is why §8 gains "a crate leaves
-the build" as a trigger of its own.
+reason, and the register kept the acceptance. **That is the failure this section is
+now an example of**, and it is why §8 gains "a crate leaves the build" as a trigger
+of its own. The gap was one day — `c7e6317` on 2026-08-30, this correction on
+2026-08-31 — which is the argument for the trigger rather than against it: a
+register that is wrong within a day of a routine commit is wrong by default, and
+only a check that runs makes it right by default.
 
 ### 3.4 `paste 1.0.15` — RUSTSEC-2024-0436, unmaintained
 

@@ -173,7 +173,7 @@ and collected in §12. Per `SPEC_CS.md` §36 an open question is preferred to an
 invention.
 
 **All seven research documents listed in the Phase 0 brief exist and were read.
-No gap to report on that account.** `docs/GUI_STACK.md` research exists but is not
+No gap to report on that account.** `docs/research/GUI_STACK.md` research exists but is not
 load-bearing for this document.
 
 ### What this protocol does not claim
@@ -3196,7 +3196,7 @@ where `current_bet == 0` is the same number.
 *Receiver must validate:* everything above, by **re-running the engine locally
 from its own state**. `SPEC_CS.md` §11 is explicit that the engine must not trust
 that the counterparty sends legal actions. The specific predicates are
-`docs/POKER_RULES.md` A3, A4 and A5, in particular
+`docs/research/POKER_RULES.md` A3, A4 and A5, in particular
 
 ```
 can_reopen(p)  ⇔  !acted_this_round[p]

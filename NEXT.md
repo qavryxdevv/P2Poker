@@ -2028,7 +2028,7 @@ loudly instead of passing.
 The half this does not settle is whether the section it lands in actually contains
 the thing. That needs a reader, and the three rows above are what a reader found.
 
-## The register said it had been checked, three days earlier, and it had not
+## The register was verified on Friday and wrong on Sunday
 
 The reference sweep above settled *the address is wrong*. The next question in
 the same family is cheaper still and nobody had asked it: **which of the crates
@@ -2052,21 +2052,31 @@ five of its sections went on describing the removed group as current:
 An accepted advisory is a decision a reader relies on. This one was about a
 crate that is not there.
 
-**What made it findable was the claim that it had been checked.** §5 carried a
-blockquote dated **2026-08-28**:
+**What made it findable was the claim that it had been checked — and that claim
+was true when it was written.** §5 carries a blockquote dated **2026-08-28**:
 
 > Every `name`+`version` in every §5 table was matched against a `[[package]]`
 > entry in `Cargo.lock` ... **All 122 rows matched; nothing had drifted.**
 
-Running exactly that: **7 of 122 do not match.** The same blockquote asserted
-§1's figures were 425 / 611 / 186 while §1's own table said 461 / 646 / 185 —
-two statements of the same three numbers, in one file, already apart. Measured
-today: **461 / 659 / 198**.
+`c7e6317` landed on **2026-08-30**. Running the same check on **2026-08-31**:
+**7 of 122 do not match.**
 
-That claim is mechanical, dated and specific, which is what makes it the hardest
-kind to disbelieve. `DECISIONS.md`'s `G6-R2-m` already says a claim that
-something was checked must be checked against the thing. This is the first time
-the claim itself was the finding.
+**The gap is one day, and that is the part worth keeping.** This is not an old
+document nobody opens. It is `CRYPTOGRAPHY.md` §0's rule arriving from the other
+side — *a claim that was true when made and is false now, left reading as
+evidence that the check is current*. A verification claim carries no expiry, so
+it gets more wrong with every commit, and the register's own §8.1 trigger 1
+(*`Cargo.lock` changes at all*) had fired the day before and nothing ran.
+
+The same blockquote also asserted §1's figures were 425 / 611 / 186 while §1's
+own table said 461 / 646 / 185 — two statements of the same three numbers, in
+one file, already apart before any of this. Measured today: **461 / 659 / 198**.
+
+`DECISIONS.md`'s `G6-R2-m` already says a claim that something was checked must
+be checked against the thing. What is new is that the claim was **honest, dated
+and mechanical**, which is the hardest kind to disbelieve — and still wrong two
+days later. A register that is wrong within a day of a routine commit is wrong
+by default; only a check that runs makes it right by default.
 
 **It is fixed rather than filed, because `cargo audit` could be run.** The
 2026-08-31 run — 1 233 advisories, 660 lockfile packages — returns three
@@ -2139,6 +2149,74 @@ obvious one — passes on all 87 and always has. What found `PRESENCE_TTL_MS` wa
 asking whether the **name** was defined twice. The corpus's number was in the
 code, in a constant with the right name, guarded by a passing assertion. Nothing
 was missing. There was a second one, and the second one was the one that ran.
+
+## And one step further: the transport spec describes a discovery layer we do not run
+
+The register above was stale because a crate left. The crate left because the
+**mechanism** changed. The document that specifies the mechanism was never told.
+
+`c7e6317` replaced Mainline DHT discovery with a libp2p Kademlia provider record.
+**33 sections of `NETWORK_STACK.md` still specify Mainline.** The phrase *provider
+record* appears in that file once.
+
+* **§3 is a top-level section titled `LOBBY_INFOHASH`** — specifying a constant
+  this pass deleted from `src/protocol/constants.rs`. §3.2 derives it, §3.3
+  argues the construction, §3.4 covers distribution and integrity.
+* **§3.5 derives a user-facing disclosure obligation** — *what a fixed public
+  infohash costs, and it must be told to the user* — from a mechanism that is
+  gone.
+* **§11.4** is *Mainline DHT limits*. Four more mentions in §10.1, four in §12,
+  three in §13.
+* The status line read **"No implementation exists yet"** while two-network runs
+  are measured in this file.
+
+**This is the only finding in the sweep that breaks interoperability rather than
+a reader.** A second client built from `NETWORK_STACK.md` announces in Mainline
+and never finds ours. Everything else found here misleads somebody; this one
+makes conforming code fail.
+
+**It is not rewritten, for the same reason `S1-B` is still open.** Restating
+§11.4's limits for Kademlia means measuring libp2p's real query, record and
+provider bounds. Re-deriving §3.5's disclosure means deciding what a fixed
+provider-record key costs a user's privacy, which is not the infohash argument
+with a word changed and is not an implementation's to choose. Both are research,
+and inventing either would put a number on the wire that no second client would
+agree with.
+
+**What was done instead:** a dated notice at the head of the document naming the
+33 sections, instructing a reader to treat §§3, 10.1, 11.4, 12 and 13 as history,
+and stating what the client actually does — `lobby_namespace` on
+`sha2-256("p2p-poker/main-lobby/v1")`, `relay_namespace` on
+`sha2-256("/libp2p/relay")`. The false status line is corrected. Filed as `S1-E`.
+
+### The file-path sweep that found it, and why it is not a test
+
+Every `src/…`, `tests/…` and `docs/…` path the live corpus cites, against the
+tree: **187 citations, 24 distinct paths missing.** A reader clears almost all of
+them, and that is the result:
+
+* **Eleven** are `tests/adversarial/*.rs`, and `THREAT_MODEL.md` §5.5 says in its
+  own words that they are *"planned locations, not existing code"*, with the
+  column headed **Test module (planned)**. Not defects. The document was ahead of
+  the sweep.
+* **Six** are paths inside other people's crates — arkworks' `src/curves/mod.rs`,
+  libp2p's `src/behaviour.rs` and `src/copy_future.rs`, `rand`'s `src/rngs/os.rs`,
+  Kubo's `docs/config.md`. Correct citations of upstream source.
+* **Three** are past-tense records of files D-025 deleted (`slot.rs`,
+  `antireplay.rs`, `staleness.rs`). Correct as written.
+
+Which leaves four real ones, all fixed here: `dht.rs` in `NETWORK_STACK.md`'s
+§23 module map (the last live reference to the deleted module), `docs/GUI_STACK.md`
+and `docs/POKER_RULES.md` (both are under `docs/research/`), and
+`docs/ARCHITECTURE.md` — cited **nine times across five documents** as the
+deferred owner of the §23 source tree *"at the start of Phase 2"*, which has long
+since passed. That last one is `S1-B`'s shape with an expired deadline.
+
+**So this sweep stays a one-off.** A gate here would carry seventeen exceptions
+for four findings, and an allow-list that outnumbers the findings teaches the
+next person to add an entry rather than look. The three gates that did go in —
+references, constants, dependencies — each carry at most three exceptions with a
+reason apiece.
 
 ## Still open
 

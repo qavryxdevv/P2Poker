@@ -2,8 +2,39 @@
 
 Specification of the transport and discovery layer of `p2p-poker`.
 
+> ## ⚠ The discovery layer this document specifies is not the one the client runs
+>
+> **Measured 2026-08-31.** `c7e6317` (2026-08-30) replaced Mainline DHT discovery
+> with a **libp2p Kademlia provider record**, and removed the `mainline` crate,
+> `src/net/dht.rs` and both infohashes from the build. This document was not
+> rewritten. **33 of its sections still specify Mainline**, including:
+>
+> * **§3, titled `LOBBY_INFOHASH`** — an entire top-level section specifying a
+>   constant deleted from `src/protocol/constants.rs` in this pass;
+> * **§3.5**, which derives a **user-facing disclosure obligation** from what a
+>   fixed public infohash costs;
+> * **§11.4**, "Mainline DHT limits", and §§10.1, 12, 13.
+>
+> The word *provider record* appears once in the whole file. **A second client
+> built from this document would announce in Mainline and never find ours**,
+> which is the most serious kind of divergence this corpus can carry.
+>
+> What the client actually does: `net::run::lobby_namespace` announces under
+> `sha2-256("p2p-poker/main-lobby/v1")` and `relay_namespace` under
+> `sha2-256("/libp2p/relay")`, keyed the way go-libp2p's routing discovery keys a
+> namespace. A provider record carries whatever multiaddrs a node has — circuit
+> addresses included — which is why the change was made: a Mainline announcement
+> can say one `IP:port`, and a player behind a NAT has none worth saying.
+>
+> **This notice is not the rewrite.** Restating §11.4's limits for Kademlia, and
+> re-deriving §3.5's disclosure for a fixed rendezvous key, is research rather
+> than editing and is filed as `DECISIONS.md` `S1-E`. Until it is done, **read
+> §§3, 10.1, 11.4, 12 and 13 as history.**
+
 **Status:** Phase 0 output, binding for Phase 7 (libp2p transport) and Phase 8
-(Mainline DHT discovery + GossipSub lobby). No implementation exists yet.
+(discovery + GossipSub lobby). **The status line said "No implementation exists
+yet" until 2026-08-31**; the transport is implemented, and two-network runs are
+measured in `NEXT.md`.
 
 **Authority order.** `docs/SPEC_CS.md` is the specification and wins over
 everything here. `docs/DECISIONS.md` (D-001 … D-013) is binding owner decision and
@@ -623,9 +654,12 @@ is written back there in the same pass as this section.
 ## 1. Layers, and the rule that constrains all of them
 
 **Module this document governs** (`SPEC_CS.md` §23, interim mapping pending
-`docs/ARCHITECTURE.md` in Phase 2): `src/net/` — `dht.rs`, `swarm.rs`, `lobby.rs`,
+`docs/ARCHITECTURE.md` in Phase 2): `src/net/` — `swarm.rs`, `run.rs`, `lobby.rs`,
 `streams.rs` — plus the `InMemoryTransport` of §1.3, which sits behind the same
-upward trait. The other four specification documents name their own modules in
+upward trait. **`dht.rs` stood in this list until 2026-08-31 and had been deleted
+with `mainline`** (§5.8 of `DEPENDENCIES.md`); global discovery is a Kademlia
+provider record in `run.rs`. The four named are representative, not the whole
+module, which now holds sixteen files. The other four specification documents name their own modules in
 their own §1; the separation of transport, poker engine and cryptographic deck
 that `SPEC_CS.md` §23 requires is the separation between those five mappings.
 
