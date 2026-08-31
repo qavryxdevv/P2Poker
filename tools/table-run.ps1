@@ -45,7 +45,11 @@ param(
     [ValidateRange(2, 10)][int]$Seats = 6,
     [ValidateRange(30, 3600)][int]$Seconds = 300,
     [string]$Exe,
-    [switch]$KeepLogs
+    [switch]$KeepLogs,
+    # A seat slower than this to enter the Tox group keeps the logs, however
+    # well the rest of the run went. Sixty seconds is far outside the ordinary
+    # spread, which has been 10-25 s in every run measured.
+    [int]$LateGroupSeconds = 60
 )
 
 $ErrorActionPreference = 'Stop'
@@ -240,6 +244,18 @@ if ($forked.Count -gt 0) {
 }
 if ($deaf.Count -gt 0) {
     Write-Warning "$($deaf.Count) seat(s) opened hands and finished none - they heard nobody: $($deaf.Node -join ', ')"
+    $KeepLogs = $true
+}
+
+# **A seat that took a long time to get into the group is worth keeping even
+# when the run is otherwise perfect.** A nine-seat run played ten hands with
+# zero settlement disagreements and every seat dealt in throughout - and one
+# seat had entered the group at 125 s. The run counted as a success, the logs
+# were deleted, and the question it could have answered (a friend connection
+# that had not come up, or an invitation refused?) went with them.
+$slow = @($nodes | Where-Object { $null -ne $_.Group -and $_.Group -gt $LateGroupSeconds })
+if ($slow.Count -gt 0) {
+    Write-Warning ("{0} seat(s) took longer than {1} s to enter the group: {2}" -f $slow.Count, $LateGroupSeconds, (($slow | ForEach-Object { '{0} at {1} s' -f $_.Node, $_.Group.ToString('F1', $inv) }) -join ', '))
     $KeepLogs = $true
 }
 

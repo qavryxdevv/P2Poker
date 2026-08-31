@@ -2218,13 +2218,21 @@ next person to add an entry rather than look. The three gates that did go in —
 references, constants, dependencies — each carry at most three exceptions with a
 reason apiece.
 
-## The table breaks between eight seats and nine, and `MAX_SEATS` is ten
+## Ten seats play, and the thing that stopped them was an invitation
 
-The seat-count table stopped at six because six clients had been started by
-hand. `tools/table-run.ps1` starts N of them — one founder, N-1 joiners, all
-`--headless --autoplay`, each in its own profile — and reads back what every
-node saw, not only the founder. Measured on one machine, `target/release`,
-300 s per run, Tox path:
+> **This section replaces one written an hour earlier and headed *"The table
+> breaks between eight seats and nine"*. That heading was wrong.** The break was
+> not a seat count. It was a defect in how the founder invited a seat into the
+> Tox group, and the same run that found it also measured it — badly, because
+> the nine- and ten-seat points were taken while a nineteen-thread `cargo test`
+> ran on the same machine. Both are corrected below, and the controlled
+> comparison that settles the cause is at the end.
+
+`tools/table-run.ps1` starts N clients — one founder, N-1 joiners, all
+`--headless --autoplay`, each in its own profile — and reads back what **every**
+node saw, not only the founder. One machine, `target/release`, 300 s a run, Tox
+path, machine otherwise quiet. **One run per point**, so treat the tenths as
+noise:
 
 | seats | s / hand | every seat in the group | every seat finishing hands |
 |---|---|---|---|
@@ -2232,51 +2240,23 @@ node saw, not only the founder. Measured on one machine, `target/release`,
 | 6 | 10.3 | yes | yes |
 | 7 | 11.2 | yes | yes |
 | 8 | 12.9 | yes | yes |
-| **9** | **42.3** | yes | **no — one seat forked** |
-| **10** | **61.1** | **no — two never joined** | **no — three finished none** |
+| 9 | 15.8 | yes | yes |
+| 10 | 14.1 | yes | yes |
 
-Two to eight is a gentle slope: **10.3 s at six, 12.9 s at eight**, and the
+**A gentle slope with no cliff, and ten is inside the noise of nine.** The
 earlier 13.5 s figure for six was measured before the re-send backoff landed.
-Then it falls over. Nine seats is **three times** eight, with the founder
-opening 6 hands while six of its joiners opened 10 — *the founder was behind its
-own table* — and seat 7 opening four hands on a genesis nobody else had. At ten,
-two seats never entered the Tox group at all and three finished no hand.
 
-**The protocol permits ten seats and the client cannot play ten.** `MAX_SEATS`
-is 10 and `hand_deadline_min_ms` is derived for ten, so nothing refuses such a
-table; it just does not work.
-
-### What the instrument had to learn to see this
-
-**`TABLE FORMED session=… seats=N` is not evidence that a seat played.** It
-reports the roster a peer holds, and a peer that heard no hand still holds it.
-In the first three-seat run a seat was invited into the group at **100 s**,
-having asked to join at 1.5 s; in between it opened its own hands, played none
-of them, and finished by printing `TABLE FORMED session=<the same id> seats=3`.
-Every scripted test in this project reads that line back as the pass condition,
-and it cannot tell the two runs apart.
-
-**And matching genesis hashes are not evidence either — including in my own
-first version of this harness.** `genesis_hand` is a hash of the table id, the
-hand number, the session, the roster hash, the terminal-zero and the ratifiers:
-every value a peer holds the moment the roster ratifies. Two peers agree on hand
-N's genesis *without exchanging a single hand message*. At ten seats, `n4` never
-entered the group and agreed on all five hands it opened while finishing none.
-**Opening a hand is local; finishing one is not**, so the participation column is
-`finished`, and the harness now says so where the column is printed.
-
-### One cause found and fixed: an invitation was an event, not a condition
+### The defect: an invitation was an event, not a condition
 
 The founder invited a seat only from the `FriendConnection` up-edge, and
 `invited` is appended to only when `tox_group_invite_friend` **succeeds**. So a
 refused invitation was never retried — the one trigger had gone by, and the next
-up-edge for that friend arrives when the connection drops and comes back. At a
-table that means a seated player sits outside the group until the network
-happens to hiccup, which is the 100-second case above.
+up-edge for that friend arrives when the connection drops and comes back. A
+seated player then sits outside the group until the network happens to hiccup.
 
-It is now a swept condition: every friend that is connected, on the roster and
-not yet invited, every five seconds, and still immediately on the up-edge so the
-ordinary case is unchanged. `pending_invites` is split out and pinned by
+It is now a swept condition — connected **and** on the roster **and** not yet
+invited, every five seconds — as well as an edge, so the ordinary case is
+unchanged. `pending_invites` is split out and pinned by
 `an_invitation_is_owed_by_a_condition_and_not_by_an_edge`, whose third case is
 the one that was wrong.
 
@@ -2284,14 +2264,58 @@ A counter came with it, because **a seat arriving late is two different failures
 that look identical in a log**: either the friend connection has not come up —
 only waiting fixes that — or an invitation was attempted and refused.
 `Trouble::invites_refused` separates them, and the node loop says *"a seat is not
-in the table's group yet"*, which is a different sentence from *"the table's
-transport is behind"* on purpose.
+in the table's group yet"*, deliberately a different sentence from *"the table's
+transport is behind"*.
 
-**That fix is not the whole of the nine-and-ten cliff.** The founder falling
-behind its own table at nine seats is not explained by invitations, and the
-transport counters were **zero** through the ten-seat run — no send refused,
-nothing queued. So it is not the transport either, and the next measurement is
-where the founder's time goes at nine, with the fix in place.
+### What it cost, measured against itself
+
+Nine seats, same machine, quiet, 300 s, same harness. **The only difference is
+the binary** — the pre-fix one built from `14f3bb0` in a throwaway worktree:
+
+| | founder's hands | seats on a genesis the founder never had | s / hand |
+|---|---|---|---|
+| **before** | opened 6, finished 3 | **7 of 8** | 43.6 |
+| **after** | opened 11, finished 10 | 0 | 15.8 |
+
+Before the fix the table **split in two**: the founder and one joiner on one
+chain with 6 hands, the other seven on another with 18. Both halves reported
+`TABLE FORMED session=… seats=9`.
+
+**This is what the controlled comparison was for.** Two things had changed
+between the broken measurement and the healthy one — the fix, and a machine that
+was no longer running a test suite — and attributing the improvement to the fix
+without separating them would have been a guess. It was worth separating: the
+nine clients were also measured using **0.3 of 24 cores** and 5.8 GB of 31 GB, so
+contention was never a plausible cause, and the controlled run confirms it.
+
+### Two things the instrument had to learn, and both are about evidence
+
+**`TABLE FORMED session=… seats=N` is not evidence that a seat played.** It
+reports the roster a peer holds, and a peer that heard no hand still holds it. In
+the first three-seat run a seat entered the group at **100 s** having asked to
+join at 1.5 s; in between it opened its own hands, played none, and finished by
+printing `TABLE FORMED` with the same session id as the seats that were playing.
+That line is the pass condition every scripted test in this project reads back,
+and it cannot tell the two runs apart.
+
+**Matching genesis hashes are not evidence either — including in the first
+version of this harness.** `genesis_hand` is a hash of the table id, the hand
+number, the session, the roster hash, the terminal-zero and the ratifiers: every
+value a peer holds the moment the roster ratifies. Two peers agree on hand N's
+genesis *without exchanging a single hand message*. At ten seats, pre-fix, a node
+that never entered the group agreed on all five hands it opened and finished
+none. **Opening a hand is local; finishing one is not**, so the participation
+column is `finished`, and the harness says so where the column is printed.
+
+### What is left
+
+A seat still takes **10 to 40 seconds** to enter the group, and once **125 s**,
+which is friend-connection latency rather than the invitation — the table waits
+for it, which is why one nine-seat run's first hand took 122 s and is excluded
+from the steady-state figure. The harness now keeps its logs whenever a seat is
+slower than 60 s, because the run that would have answered *"connection, or
+refusal?"* was deleted as a success.
+
 
 ## Still open
 
