@@ -977,8 +977,11 @@ turbulent point of a run, and neither has recurred in the five runs since.
   The three-node test is still the only thing that would prove forwarding
   end to end, and it is still not written. What changed is that the defect it
   would catch can no longer be written by accident.
-* **Formation is about 80 per cent, and the failure is now characterised.**
-  Four of five runs formed in 33 s. The fifth:
+* **Formation: five of five most recently, ten of twelve before that, and the
+  failure is characterised.** The best single run so far is 8 s. The number
+  moves between batches by more than the change between them, so treat any one
+  batch as weak evidence — what is solid is the failure's shape. From an earlier
+  batch of five, the one that failed:
 
   ```
   founder : (no lobby-topic line at all — it was connected to nobody)
