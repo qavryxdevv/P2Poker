@@ -778,6 +778,9 @@ pub struct Hand {
     bank_left_ms: u32,
     /// Diagnostic: what a refused shuffle step looked like from here.
     shuffle_note: Option<String>,
+    /// Diagnostic: what two engines disagreed about when a settlement did not
+    /// match.
+    settle_note: Option<String>,
     /// Diagnostic: what the certificate path last decided.
     cert_note: Vec<String>,
     /// The last seat a certificate acted for, and what it did.
@@ -982,6 +985,7 @@ impl Hand {
                 late: None,
                 bank_left_ms: o.time_bank_ms,
                 shuffle_note: None,
+                settle_note: None,
                 cert_note: Vec::new(),
                 acted_for: None,
                 votes: BTreeMap::new(),
@@ -1487,6 +1491,7 @@ impl Hand {
         };
         let taken = chain.steps_taken();
         let turn = chain.whose_turn();
+        let mine = chain.ctx_report(taken, proof_seq);
         chain
             .accept_step(&deal.deck, me, next, &body.proof, proof_seq)
             .map_err(|e| step_failure(me, e))
@@ -1497,11 +1502,16 @@ impl Hand {
                 // client's own — so a day of logs said which seat and never
                 // which road.
                 self.shuffle_note = Some(format!(
-                    "own shuffle refused at round {round}: chain step {taken},                      turn {turn:?}, proof sequence {proof_seq}, slot {}",
+                    "own shuffle refused at round {round}: chain step {taken},                      turn {turn:?}, slot {} | prover {mine}",
                     self.slot.sequence
                 ));
                 e
             })?;
+        // Said on success too, once per hand per shuffler. A verifier's
+        // refusal names what IT checked against; without the prover's side
+        // there is nothing to compare it with, and the disagreement is by
+        // construction between two peers rather than inside one.
+        self.shuffle_note = Some(format!("prover {mine}"));
         self.slot = after_step.then(stage_hash_single(
             proof_seq,
             EventType::ShuffleProof.code(),
@@ -1607,6 +1617,7 @@ impl Hand {
 
         let deck = held.deck.clone();
         let taken = chain.steps_taken();
+        let report = chain.ctx_report(taken, self.slot.sequence);
         chain
             .accept_step(&deal.deck, seat, deck, &body.proof, self.slot.sequence)
             .map_err(|e| {
@@ -1624,7 +1635,7 @@ impl Hand {
             })
             .map_err(|e| {
                 self.shuffle_note = Some(format!(
-                    "shuffle refusal from seat {seat}: chain at step {taken},                      slot sequence {}, round {}",
+                    "shuffle refusal from seat {seat}: chain at step {taken},                      slot sequence {}, round {} | verifier {report}",
                     self.slot.sequence, body.shuffle_round
                 ));
                 e
@@ -3175,6 +3186,18 @@ impl Hand {
         // here: a body that differs anywhere means two engines disagree about
         // the hand, which is a divergence and not a preference.
         if theirs != **mine {
+            // **And say what differs.** "Seat N holds a different settlement"
+            // named the peer and nothing else, so the one occurrence a day of
+            // running produced could not be told from any other: two engines
+            // disagreeing about a pot, about a winner, or about a fold nobody
+            // saw all read the same in the log.
+            let ours = mine.final_stacks.clone();
+            let theirs_stacks = theirs.final_stacks.clone();
+            let pots = (mine.pots.len(), theirs.pots.len());
+            self.settle_note = Some(format!(
+                "settlement disagreement with seat {seat}: mine {ours:?}                  theirs {theirs_stacks:?}, pots {} against {}",
+                pots.0, pots.1
+            ));
             return Err(Failed::DeckDisagrees {
                 seat,
                 what: "settlement",
@@ -4503,6 +4526,10 @@ impl Hand {
     /// two apart from outside.
     pub fn verified_certificates(&self) -> usize {
         self.certs.len()
+    }
+
+    pub fn take_settle_note(&mut self) -> Option<String> {
+        self.settle_note.take()
     }
 
     pub fn take_shuffle_note(&mut self) -> Option<String> {

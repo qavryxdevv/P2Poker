@@ -868,6 +868,12 @@ pub async fn run(
                                     if let Some(n) = h.take_cert_note() {
                                         let _ = events.send(NodeEvent::Warning(n)).await;
                                     }
+                                    // The prover's side of a shuffle context,
+                                    // which is emitted on success and so never
+                                    // reaches the error arm below.
+                                    if let Some(n) = h.take_shuffle_note() {
+                                        let _ = events.send(NodeEvent::Warning(n)).await;
+                                    }
                                     // The one condition this client cannot
                                     // repair and must not hide.
                                     if let Some(f) = h.take_fork() {
@@ -1034,6 +1040,11 @@ pub async fn run(
                                 Err(Failed::Wire(joinwire::WireError::WrongType)) => {}
                                 Err(e) => {
                                     if let Some(n) = h.take_shuffle_note() {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(n))
+                                            .await;
+                                    }
+                                    if let Some(n) = h.take_settle_note() {
                                         let _ = events
                                             .send(NodeEvent::Warning(n))
                                             .await;

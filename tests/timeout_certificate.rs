@@ -1072,9 +1072,14 @@ fn the_hand_after_a_low_seat_is_dropped_can_still_shuffle() {
         }
     }
 
+    // The shuffle note is emitted on success too — the prover's own context,
+    // which exists to be compared against a verifier's when one refuses — so
+    // only the ones that name a refusal count here.
     for to in 0..2usize {
         if let Some(n) = second[to].take_shuffle_note() {
-            refusals.push(n);
+            if n.contains("refused") || n.contains("refusal") {
+                refusals.push(n);
+            }
         }
     }
     assert!(

@@ -227,6 +227,28 @@ impl ShuffleChain {
     /// shuffler's key are what make a proof untransferable between positions and
     /// between seats, and a caller that could choose them could hand back the
     /// context of the step it wants to impersonate.
+    /// The three parts of a proof's context that vary, in one line.
+    ///
+    /// Everything else in `CtxFields` is a chain parameter fixed when the chain
+    /// opened, so a prover and a verifier that disagree disagree about one of
+    /// these — and until this existed the only way to tell which was to guess.
+    pub fn ctx_report(&self, k: usize, sequence: u64) -> String {
+        let key = self
+            .keys
+            .get(k)
+            .map(|k| {
+                k.iter()
+                    .take(4)
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| "none".into());
+        format!(
+            "ctx: position {k}, sequence {sequence}, signer {key}, order {:?}",
+            self.order
+        )
+    }
+
     fn ctx_for(&self, k: usize, sequence: u64) -> DeckCtx {
         DeckCtx::build(&CtxFields {
             protocol_version: self.params.protocol_version,
