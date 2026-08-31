@@ -580,3 +580,72 @@ fn unsigned_junk_is_neither_held_nor_forwarded() {
     assert_eq!(refused, 80, "junk was kept");
     assert_eq!(h.held(), 0, "the queue took bytes it could not verify");
 }
+
+
+/// **Formation is a collective stage and answers a double signer like one.**
+///
+/// `session_id` is computed from the ratification `event_hash`es and goes into
+/// every subsequent hand's genesis. The map they were collected in used
+/// `insert`, so a seat that ratified twice at one `list_serial` overwrote its
+/// own first copy, and which one a peer held was decided by arrival order —
+/// two honest peers, two orders, two tables that can never speak to each other.
+///
+/// The second copy needs no forged signature. `event_hash` covers the envelope,
+/// so one seat re-sealing the same body a millisecond later produces a
+/// different hash and `admit_ready` has nothing to object to. This test does
+/// exactly that, by replaying a ratification the table already accepted through
+/// a fresh seal.
+///
+/// **To make this fail:** put `self.ratified.insert(...)` back in
+/// `Formation::take_ratification` in place of the first-copy-wins match.
+#[test]
+fn a_seat_that_ratifies_twice_is_named_rather_than_letting_the_last_one_win() {
+    use p2p_poker::net::formation::Failed as FormFailed;
+
+    let mut t = Table::new();
+    for seed in 1..=2u8 {
+        t.add(seed);
+    }
+    let settled = t.founder.session().expect("the table forms");
+
+    // One seat's own ratification, re-sealed a millisecond later. Same body,
+    // same serial, same roster — a different envelope, so a different hash.
+    let (body, _, first_hash) = joinwire::receive_table_ready(
+        t.seen_ready.last().expect("somebody ratified"),
+        &t.table_id,
+        &t.founder.genesis(),
+    )
+    .expect("the ratification this table already took");
+    let seat_key = key(2);
+    let again = joinwire::publish_table_ready(
+        &body,
+        &t.table_id,
+        &t.founder.genesis(),
+        &seat_key,
+        NOW + 1,
+        t.ad.join_deadline_ms,
+    )
+    .expect("an honest seat can seal the same body again");
+    let (_, _, second_hash) = joinwire::receive_table_ready(
+        &again,
+        &t.table_id,
+        &t.founder.genesis(),
+    )
+    .expect("and it verifies");
+    assert_ne!(
+        first_hash, second_hash,
+        "the two copies must differ, or this test proves nothing"
+    );
+
+    let outcome = t.founder.on_table_ready(&again);
+    assert!(
+        matches!(outcome, Err(FormFailed::RatifiedTwice { .. })),
+        "the second ratification was taken instead of named: {outcome:?}"
+    );
+    assert_eq!(
+        t.founder.session(),
+        Some(settled),
+        "the session identity moved under a second ratification, and it is in \
+         every later genesis"
+    );
+}

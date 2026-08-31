@@ -73,6 +73,20 @@ pub enum Failed {
     /// A message arrived out of order — an acceptance with nothing outstanding,
     /// a ratification before any roster.
     OutOfOrder(&'static str),
+    /// One seat, two different ratifications at one `list_serial`.
+    ///
+    /// Formation **is** a collective stage — a fixed set of seats each emitting
+    /// once — and every other collective stage in this client answers a second
+    /// differing copy with first-copy-wins and a named seat. This one kept a
+    /// map and overwrote, so which of the two a peer ended up holding was
+    /// decided by arrival order, and `session_id` is computed from those
+    /// hashes and goes into **every subsequent hand's genesis**. Two honest
+    /// peers, two orders, two tables that can never speak.
+    ///
+    /// The second copy needs no forged signature: the `event_hash` covers the
+    /// envelope, so one seat re-signing the same body a millisecond later
+    /// produces a different hash.
+    RatifiedTwice { seat: u8 },
 }
 
 impl From<WireError> for Failed {
@@ -733,7 +747,19 @@ impl Formation {
             joinwire::receive_table_ready(bytes, &self.under.table_id, &self.genesis())?;
         admit_ready(&ready, &sender, &self.roster, self.serial, &self.under)
             .map_err(Failed::Ready)?;
-        self.ratified.insert(ready.my_seat, event_hash);
+        // **First copy wins, and a second differing one is named.** This was
+        // `insert`, which overwrote.
+        match self.ratified.get(&ready.my_seat) {
+            Some(first) if *first == event_hash => return Ok(()),
+            Some(_) => {
+                return Err(Failed::RatifiedTwice {
+                    seat: ready.my_seat,
+                })
+            }
+            None => {
+                self.ratified.insert(ready.my_seat, event_hash);
+            }
+        }
         self.settle();
         Ok(())
     }
