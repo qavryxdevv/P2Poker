@@ -977,10 +977,31 @@ turbulent point of a run, and neither has recurred in the five runs since.
   The three-node test is still the only thing that would prove forwarding
   end to end, and it is still not written. What changed is that the defect it
   would catch can no longer be written by accident.
-* **Formation is about 80 per cent.** Ten of twelve runs formed after the
-  subscription re-announce, against roughly two of six before, and the failures
-  are not characterised. The `lobby topic:` line names both sides now, so a
-  failing run says whether the founder could see the joiners at all.
+* **Formation is about 80 per cent, and the failure is now characterised.**
+  Four of five runs formed in 33 s. The fifth:
+
+  ```
+  founder : (no lobby-topic line at all — it was connected to nobody)
+  joiner 2: 0 of 1 subscribed ["R5oyWW"]; connected ["R5oyWW"]     <- sees joiner 3
+  joiner 3: 0 of 1 subscribed ["W6wVZG"]; connected ["W6wVZG"]     <- sees joiner 2
+  ```
+
+  **The two joiners found each other and neither found the founder, and the
+  founder found nobody.** Its log holds no `found … on this network` and no
+  `another poker client` — only failed dials to internet peers. `mdns` queries
+  every 15 s, so it had six chances in the window and its responder did not
+  answer the joiners' queries either. That is one process's multicast being
+  dead for a run, on a Windows host with several virtual adapters
+  (`172.27.224.1` is in its listen set), and it is not fixable from inside the
+  client.
+
+  What *is* fixable is that it said nothing. `hosting T`, then `public lobby:
+  nobody else yet`, then silence — indistinguishable from a table waiting for
+  players when it is the opposite. The housekeeping tick now says so once.
+
+  This is also the clearest argument for the item below it: across two networks
+  mDNS is irrelevant, and the DHT and relay path — the one that would carry a
+  real game — is exercised by nothing here.
 * **Two machines on two networks.** Everything measured so far is three
   processes on one, which is the environment least likely to show a NAT,
   relay or forwarding fault.

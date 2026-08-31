@@ -323,6 +323,9 @@ pub async fn run(
     // seat and read as equivocation to everybody else.
     let mut hand: Option<crate::table::hand::Hand> = None;
     let mut hand_reported = false;
+    // Said once while this client has reached nobody, and again if it is ever
+    // alone a second time.
+    let mut alone_said = false;
     // The last deck state told to the interface, so that `2m` chain stages do
     // not become `2m` identical lines in a player's log.
     let mut deck_reported: Option<(Option<u8>, bool)> = None;
@@ -2330,6 +2333,27 @@ pub async fn run(
                         .iter()
                         .map(|p| p.to_string().chars().rev().take(6).collect::<String>())
                         .collect();
+                    // **A table nobody can see is worth saying out loud.**
+                    // Measured: one run in five, the founder found no local peer
+                    // at all — no mDNS discovery, no connection — while the two
+                    // joiners found each other. Its log said `hosting T`, then
+                    // `public lobby: nobody else yet`, and nothing else for the
+                    // rest of the run. From the outside that is
+                    // indistinguishable from a table waiting for players, and
+                    // it is the opposite: the players are there and this client
+                    // is alone.
+                    if connected.is_empty() && !alone_said {
+                        alone_said = true;
+                        let _ = events
+                            .send(NodeEvent::Warning(
+                                "no other poker client has been reached yet — a table                                  hosted now is one nobody can see. On one machine that                                  is local discovery failing; across networks it is the                                  relay."
+                                    .into(),
+                            ))
+                            .await;
+                    }
+                    if !connected.is_empty() {
+                        alone_said = false;
+                    }
                     if known > 0 || mesh > 0 || !connected.is_empty() {
                         let _ = events
                             .send(NodeEvent::Warning(format!(
