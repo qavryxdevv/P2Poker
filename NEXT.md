@@ -1402,11 +1402,32 @@ endpoint outside this building.
    request passing between them.
 3. **The Tox public key and `chat_id` in the advertisement and the join
    request**, which is the wire change the invitation route needs.
-4. **A `TableTransport` implementation over it**, behind the seam
-   `src/table/transport.rs` was written for — the protocol does not change, and
-   `FromTable::claimed` stays advisory, because a chat id travels in a public
-   advertisement and "it arrived over the table's group" is worth nothing as a
-   claim about authorship.
+4. ~~A `TableTransport` implementation over it~~ **done, and the whole stack is
+   proven end to end.** `tox::table` owns the instance on a dedicated thread -
+   `tox_iterate` wants a steady loop on one thread, which is the same
+   arrangement `ChannelTransport` has with the swarm and for the same reason -
+   and the client reaches it through channels. Fragmentation lives in the
+   driver: a caller hands over a whole message and nothing above the module
+   ever sees a fragment.
+
+   Measured: `a_whole_message_crosses_the_group_in_one_piece` hands 9 000 bytes
+   - a `SHUFFLE_STEP` - to `broadcast` at one end and takes them whole out of
+   `next` at the other, seven fragments across a private group, in **11.8 s**.
+
+   `FromTable::claimed` is left `None`, deliberately. A group peer id resolves
+   to a **Tox** key, which is not a player's signing key and is not evidence
+   about one; who signed is settled after reassembly against the ratified
+   roster. Three other transport-only decisions all read from that roster: who
+   to add as a friend, when to invite, and - **only from the founder the
+   advertisement named** - when to accept one. A friend on the roster who is
+   not the founder has no business inviting anybody, and the driver refuses it.
+
+   Two smaller things worth keeping: a full inbox **drops** rather than blocks,
+   because blocking there would stop `tox_iterate` and a transport that stalls
+   the network to wait for its own reader loses the connection as well as the
+   message; and the driver sends one message at a time while its fragments are
+   being accepted, because pushing the next onto a refusal would interleave two
+   half-sent ones.
 5. ~~The measurement across two networks~~ **done, and it passed** - see
    above. `tools/two-network-tox.ps1` runs both ends and reports it.
 6. ~~The node list has to update itself~~ **done**: `tox::nodes`, seven tests.

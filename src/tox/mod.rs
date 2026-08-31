@@ -30,6 +30,7 @@
 
 pub mod nodes;
 pub mod sys;
+pub mod table;
 
 use std::ffi::{c_int, c_void, CString};
 
@@ -594,6 +595,20 @@ impl Tox {
         }
     }
 }
+
+/// # Safety
+///
+/// `Tox` owns its pointer exclusively — nothing else holds a copy, `tox_kill`
+/// runs exactly once in [`Drop`], and every method takes `&self` or `&mut self`
+/// so the borrow checker already forbids two threads touching one instance at
+/// the same time. What `Send` adds is the right to *move* it to another thread,
+/// which `tox::table` needs: `tox_iterate` wants a steady loop on one thread of
+/// its own.
+///
+/// **`Sync` is deliberately not implemented.** Two threads calling into one
+/// instance concurrently is exactly what toxcore forbids without its
+/// experimental thread-safety option, which this client does not set.
+unsafe impl Send for Tox {}
 
 impl Drop for Tox {
     fn drop(&mut self) {
