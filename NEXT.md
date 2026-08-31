@@ -510,22 +510,32 @@ path: *"a stalled hand takes tens of minutes to end rather than seconds"*.
 Exercising it against two real processes needs a run of that length, or a table
 advertising a shorter deadline than any preset offers.
 
+
 ### What is next, in order
 
 1. **Three seats and more over the real network.** Everything measured so far
    is heads-up, and heads-up hides a whole class of defect — it hid the
    duplicate handling for two milestones. This is now the cheapest way to find
    the next real bug, because the machinery to run it already exists.
-3. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
+2. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
    carried inside `HAND_COMPLETE`; the checkpoint **stage** is not there, and
    `PROTOCOL.md` §12 says T61 then fires at `hand_deadline_ms` after every
    settled hand.
-4. The RNG beacon, replacing `provisional_button`.
-5. `HAND_ABORT` causes 2 and 3 — a failed shuffle or reveal proof. They embed
-   up to two 32 768 B `SignedEvent`s, so they need a larger `FRAME_CAP` than
-   this client opens. It emits neither and refuses one it is sent.
+3. The RNG beacon, replacing `provisional_button`.
+4. **The Tox transport (D-019).** The relay is why: a hand carried over a
+   libp2p circuit dies at 128 KiB, measured. c-toxcore builds and links here
+   now; see the D-019 section below for what it found and what is left.
+5. `HAND_ABORT` causes 2 and 3 — **done**, see below. What is left of the cause
+   register is `4` and `6`, and both need machinery that does not exist rather
+   than evidence handling that does.
 6. Two machines on two networks. **Done** - see below; the remaining
    coverage hole is a NAT, not a second network.
+
+(This list ran 1, 3, 4, 5, 6 for several passes: item 2 - a hand between two
+real processes - was struck when it was measured and the numbering was never
+closed up. Worth noting only because a gap in a numbered list reads as a lost
+item, and somebody will eventually go looking for the one that was never
+there.)
 
 ### Four defects found by pointing a critic at the design, not at the code
 
@@ -1212,19 +1222,97 @@ feature is in `Cargo.toml` today), then pin Tox to it with
 `tox_options_set_start_port` / `set_end_port`. That is a separate piece of work
 and is not pretended to.
 
+### Two more findings from reading the API, both requirement-level
+
+Neither sinks D-019. Both change what has to be built, and both were invisible
+until somebody read `tox.h` with the sizes of this protocol's messages in mind.
+
+**1. Every Tox channel caps at ~1372 bytes, so fragmentation is mandatory.**
+
+```
+TOX_GROUP_MAX_CUSTOM_LOSSLESS_PACKET_LENGTH   1373
+TOX_GROUP_MAX_CUSTOM_LOSSY_PACKET_LENGTH      1373
+TOX_GROUP_MAX_MESSAGE_LENGTH                  1372
+TOX_MAX_CUSTOM_PACKET_SIZE                    1373
+TOX_MAX_MESSAGE_LENGTH                        1372
+```
+
+There is no larger channel. File transfer is the only unbounded path and it is a
+file transfer, not a message. So the choice is not *which* Tox channel avoids
+fragmenting — it is that this protocol fragments.
+
+What that costs, in this protocol's own numbers: a `SHUFFLE_STEP` is about 9 KB,
+so **seven** fragments; a `SHUFFLE_PROOF` about 5.6 KB, **five**; a `cause = 2`
+`HAND_ABORT` carrying both is about 15 KB, **twelve**; and the largest this
+client will build one is `HAND_ABORT_MAX` = 51 200 B, **thirty-eight**.
+
+It is not hard — the channel is lossless and ordered per sender — but it is real
+machinery and it is fed from the network, so `SPEC_CS.md` §27 applies to every
+part of it: the fragment count a sender may claim is bounded before anything is
+allocated, the number of part-built messages per peer is bounded, and a stream
+that stops half way is dropped on a timer rather than held. A reassembly buffer
+that trusts a sender's `total` is the same defect as a container keyed on a
+sender-chosen quantity, which this project has refused twice already.
+
+One consolation, and it is the reason the relay problem is still solved: **a
+fragment count is not a byte cap.** A libp2p circuit stops at 128 KiB and the
+hand dies; Tox has no such ceiling, so a hand costs more packets and no
+deadline.
+
+**2. An invitation needs a friendship, so a Tox public key has to reach the
+roster.**
+
+`tox_group_invite_friend` takes a **friend number**, not an address — there is
+no "invite this public key". The owner's step *"a player joining the table is
+automatically invited into the Tox group"* therefore has a hidden prerequisite:
+the founder and the joiner must already be Tox friends.
+
+The good news is that it needs no user interaction and no friend *request*.
+`tox_friend_add_norequest(tox, public_key)` adds a friend from a 32-byte public
+key alone. So both ends add each other from the ratified roster and the
+invitation follows:
+
+1. The table advertisement carries the founder's Tox **public key** and the
+   group's `chat_id`.
+2. The join RPC carries the joiner's Tox public key.
+3. Both sides call `tox_friend_add_norequest` on the other, from the roster.
+4. When the friend connection comes up, the founder calls
+   `tox_group_invite_friend`; the joiner's `group_invite` callback answers with
+   `tox_group_invite_accept`.
+
+**This is what keeps D-019's central claim true.** The decision says group
+discovery through Tox's DHT is not on the critical path *because members arrive
+by invitation*, and that matters because a public NGC group is findable only
+while it is new (measured 2026-08-27: a host up 20 s found in 31 s, a host up
+six minutes never found in 300 s). Joining by `chat_id` with
+`tox_group_join` **is** that decaying path. Joining by invitation is not, and
+now there is a route to an invitation that no user has to click.
+
+It also uses the path that was measured to work: friend connections have LAN
+discovery and hole punching, and the same two nodes that could not exchange a
+byte over a stale group went `UDP direct` in three seconds as friends.
+
+**The wire change this asks for** is one field in the advertisement and one in
+the join request, both 32 bytes. That is `PROTOCOL.md`'s to make, not an
+implementation's, and it is the third thing D-019 now owes a document.
+
 ### What is next, in order
 
-1. **The NGC group itself**: `tox_group_new` at the founder,
-   `tox_group_invite_friend`, `tox_group_send_custom_packet` with `lossless`
-   set. All three are in `v0.2.23`'s header.
-2. **`chat_id` in the table advertisement**, so a joiner has something to be
-   invited to.
-3. **A `TableTransport` implementation over it**, behind the seam
+1. **The fragmentation layer**, because nothing else can be tested without it:
+   every message this protocol sends but the smallest is over Tox's 1372-byte
+   ceiling. Bounded before allocation, per the finding above.
+2. **The NGC group itself**: `tox_group_new` at the founder,
+   `tox_friend_add_norequest` on both sides from the roster,
+   `tox_group_invite_friend`, and `tox_group_send_custom_packet` with `lossless`
+   set. All four are in `v0.2.23`'s header.
+3. **The Tox public key and `chat_id` in the advertisement and the join
+   request**, which is the wire change the invitation route needs.
+4. **A `TableTransport` implementation over it**, behind the seam
    `src/table/transport.rs` was written for — the protocol does not change, and
    `FromTable::claimed` stays advisory, because a chat id travels in a public
    advertisement and "it arrived over the table's group" is worth nothing as a
    claim about authorship.
-4. **The measurement across two networks**, which is the only thing that
+5. **The measurement across two networks**, which is the only thing that
    settles whether D-019 was right. `tools/two-network-ssh.ps1` already runs
    both ends and compares genesis hashes; it needs a Tox-side count next to the
    relay counts it prints now.
