@@ -1409,11 +1409,32 @@ endpoint outside this building.
    claim about authorship.
 5. ~~The measurement across two networks~~ **done, and it passed** - see
    above. `tools/two-network-tox.ps1` runs both ends and reports it.
-6. **The node list has to update itself.** It is baked in as of 2026-08-31,
-   which is fine for a measurement and wrong for a client: a hardcoded list goes
-   stale and takes the fallback with it. It needs a bundled list for the first
-   run, a cached copy refreshed from `https://nodes.tox.chat/json`, and every
-   bound `SPEC_CS.md` §27 asks of anything fetched from the network.
+6. ~~The node list has to update itself~~ **done**: `tox::nodes`, seven tests.
+   A bundled list for the first run and for an offline one, a cache refreshed
+   from `https://nodes.tox.chat/json` once a day, written through a temporary
+   and renamed so an interrupted write leaves the old one. Measured: 20 nodes
+   fetched, 45 relay entries, and the two-network run still passes with it -
+   2.7 MB each way in 120 s.
+
+   **And one rule that is this client's own: the fetched list is added to the
+   bundled one and never replaces it.** A node list decides who a client
+   bootstraps from, so whoever serves it can choose a client's whole view of the
+   network; a client that swapped its list could be moved onto an attacker's DHT
+   by one bad response, without anything looking wrong. The union costs a few
+   duplicate entries and removes that outcome - a hostile list can add nodes and
+   cannot take away the ones compiled in, and reaching one honest node is
+   enough. qTox replaces. The difference is one line of code and a failure mode.
+   The same reasoning makes `(host, port, key)` the identity, so a list cannot
+   quietly re-key a bundled entry.
+
+   Getting there cost two wrong turns in one dependency, both recorded in
+   `Cargo.toml` because the second looks like the fix for the first:
+   `tls-rustls` takes rustls's default provider (`aws-lc-rs`) while libp2p
+   brings `ring`, and two providers make rustls refuse to choose *at run time*;
+   `tls-rustls-webpki-roots-ring` is broken upstream in attohttpc 0.30.1 - it
+   sets `rustls/ring` but not `__rustls`, which is what `src/tls/mod.rs` gates
+   the implementation on, so it builds with TLS compiled out and every request
+   answers "TLS is disabled".
 
 The vendored trees are **fetched at pinned commits by `tools/build-tox.ps1`,
 not committed** — 12.7 MB for a transport whose whole point is a measurement

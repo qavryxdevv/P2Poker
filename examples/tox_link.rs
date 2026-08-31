@@ -109,62 +109,40 @@ fn main() {
         std::process::exit(2);
     }
 
-    // **The public node list, with each node's own TCP relay ports.**
+    // **The node list, kept current by the client rather than baked in.**
     //
-    // Fetched from `https://nodes.tox.chat/json` on 2026-08-31 and filtered to
-    // those reporting both UDP and TCP up. Baked in rather than fetched at run
-    // time, because a measurement that depends on a web service is a
-    // measurement that changes when the web service does - and because the
-    // whole point of these runs is to compare one against another.
+    // `nodes::load` is the bundled list plus whatever a previous fetch cached,
+    // and `nodes::refresh` updates the cache from `https://nodes.tox.chat/json`
+    // when it is a day old. A fetched list is **added** to the bundled one and
+    // never replaces it, so a bad day at that host - or a hostile one - can add
+    // nodes and cannot take away the ones this binary shipped with.
     //
-    // Each node is added **twice**: to the DHT list over UDP, and to the relay
-    // list on every TCP port it advertises. That is what a real client does -
-    // qTox holds connections to several relays at all times, even with UDP
-    // working, because a relay is the fallback for a peer that cannot be
-    // reached directly and a NAT is exactly that case. The first version of
-    // this probe added no relays at all and hardcoded three nodes on one port.
-    const NODES: &[(&str, u16, &str, &[u16])] = &[
-    ("144.217.167.73", 33445, "7E5668E0EE09E19F320AD47902419331FFEE147BB3606769CFBE921A2A2FD34C", &[33445, 3389]),
-    ("205.185.115.131", 53, "3091C6BEB2A993F1C6300C16549FABA67098FF3D62C6D253828B531470B53D68", &[3389, 33445, 443, 53]),
-    ("3.0.24.15", 33445, "E20ABCF38CDBFFD7D04B29C956B33F7B27A3BB7AF0618101617B036E4AEA402D", &[33445]),
-    ("139.162.110.188", 33445, "F76A11284547163889DDC89A7738CF271797BF5E5E220643E97AD3C7E7903D55", &[443, 33445, 3389]),
-    ("144.172.88.203", 33445, "2016A0F2797EE3A8B004BA623F11AAFC8146F1B8F45107232A1A1AECCE856674", &[33445, 443]),
-    ("172.104.215.182", 33445, "DA2BD927E01CD05EBCC2574EBE5BEBB10FF59AE0B2105A7D1E2B40E49BB20239", &[443, 3389, 33445]),
-    ("188.214.122.30", 33445, "2A9F7A620581D5D1B09B004624559211C5ED3D1D712E8066ACDB0896A7335705", &[3389, 33445]),
-    ("43.198.227.166", 33445, "AD13AB0D434BCE6C83FE2649237183964AE3341D0AFB3BE1694B18505E4E135E", &[3389, 33445]),
-    ("95.181.230.108", 33445, "B5FFECB4E4C26409EBB88DB35793E7B39BFA3BA12AC04C096950CB842E3E130A", &[3389, 33445]),
-    ("188.245.84.166", 33445, "96B66D300BA2B59B98FC42DB1325E7092388F0379593E680ABDBEA03B9C9CE03", &[443, 3389, 33445]),
-    ];
-
+    // Each node goes into **two** toxcore lists: the DHT over UDP, and the
+    // relay list on every TCP port it advertises. The relays are not optional
+    // and not a fallback that waits for UDP to fail: a real client holds
+    // connections to several of them at all times, because a relay is the only
+    // route to a peer that cannot be reached directly. Measured on this bench,
+    // without them two machines sharing a public address never connect at all.
+    let profile = std::env::temp_dir();
+    if p2p_poker::tox::nodes::stale(&profile, 0) {
+        match p2p_poker::tox::nodes::refresh(&profile) {
+            Ok(n) => println!("node list refreshed: {n} nodes"),
+            Err(e) => println!("node list not refreshed ({e}); using what is cached"),
+        }
+    }
+    let node_list = p2p_poker::tox::nodes::load(&profile);
     let mut relays = 0;
-    for (host, udp_port, key_hex, tcp_ports) in NODES {
-        let mut key = [0u8; 32];
-        let ok = key_hex.as_bytes().chunks(2).enumerate().all(|(i, pair)| {
-            match (std::str::from_utf8(pair).ok(), i < 32) {
-                (Some(s), true) => match u8::from_str_radix(s, 16) {
-                    Ok(b) => {
-                        key[i] = b;
-                        true
-                    }
-                    Err(_) => false,
-                },
-                _ => false,
-            }
-        });
-        if !ok {
-            println!("node {host} has an unreadable key");
-            continue;
+    for n in &node_list {
+        if let Err(e) = tox.bootstrap(&n.host, n.udp_port, &n.key) {
+            println!("bootstrap {} refused: {e}", n.host);
         }
-        if let Err(e) = tox.bootstrap(host, *udp_port, &key) {
-            println!("bootstrap {host} refused: {e}");
-        }
-        for port in *tcp_ports {
-            if tox.add_tcp_relay(host, *port, &key).is_ok() {
+        for port in &n.tcp_ports {
+            if tox.add_tcp_relay(&n.host, *port, &n.key).is_ok() {
                 relays += 1;
             }
         }
     }
-    println!("{} nodes, {relays} relay entries", NODES.len());
+    println!("{} nodes, {relays} relay entries", node_list.len());
 
     let me = tox.address();
     let key_hex: String = me[..32].iter().map(|b| format!("{b:02X}")).collect();

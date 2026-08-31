@@ -28,6 +28,7 @@
 //! authorship. That is `table::transport`'s rule and this module is one more
 //! implementation under it.
 
+pub mod nodes;
 pub mod sys;
 
 use std::ffi::{c_int, c_void, CString};

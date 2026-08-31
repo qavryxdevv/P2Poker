@@ -176,4 +176,41 @@ cc = "1"
 # have built libsodium once.
 [features]
 default = []
-tox = []
+tox = ["dep:attohttpc", "dep:serde_json"]
+
+# --- only under `--features tox` -------------------------------------------
+#
+# The Tox node list has to update itself: a list baked into a binary goes stale
+# and takes the relay fallback down with it, and the relay fallback is what
+# makes a NAT survivable. So the client fetches `https://nodes.tox.chat/json`,
+# which is what every Tox client does.
+#
+# `attohttpc` is already in the tree - `igd-next` pulls it in for UPnP - but
+# without TLS, so this turns its rustls feature on rather than adding a client.
+# `rustls` itself is already here for libp2p. `serde_json` is new and is one
+# crate for one document.
+[dependencies.attohttpc]
+version = "0.30"
+optional = true
+default-features = false
+# **`tls-native`, and not rustls, after trying rustls twice.**
+#
+# `tls-rustls` takes rustls's *default* provider, which is `aws-lc-rs`, while
+# libp2p already brings `ring`. Two providers in one graph and rustls refuses to
+# choose: it panics at the first request with "could not automatically determine
+# the process-level CryptoProvider" - a runtime failure from a feature choice.
+#
+# `tls-rustls-webpki-roots-ring` looks like the fix and is broken upstream in
+# 0.30.1: it sets `rustls/ring` but not `__rustls`, and `src/tls/mod.rs` gates
+# the whole implementation on `__rustls`, so the build succeeds with TLS
+# compiled out and every request answers "TLS is disabled".
+#
+# `tls-native` is schannel on Windows - no second crypto library, the OS trust
+# store, nothing to choose - and this client's shipped binary is Windows.
+# On Linux it is OpenSSL, which is a build dependency worth knowing about
+# before that target is taken seriously.
+features = ["tls-native", "compress"]
+
+[dependencies.serde_json]
+version = "1"
+optional = true
