@@ -838,6 +838,51 @@ each with a test shown to fail without the fix:
   object exists, and `Failed::Equivocation` becomes a warning and a `Reject`
   aimed at whoever relayed it.
 
+## The shuffle refusal, closed — and the one behind it
+
+**Closed.** `ShuffleAdmission::admit` bounded a seat index and a position in the
+shuffle order with one argument, and `accept_step` filled it with the order's
+length. Drop a **low** seat and the survivors keep their numbers: at three seats
+with seat 0 certified absent the order is `[1, 2]` and seat 2 was refused at
+position 1 for being seat 2 — first attempt, nothing submitted, every hand,
+for as long as the table kept dealing. And both `NotAdmitted` answers were
+mapped to `AlreadySubmitted`, so it reported a duplicate that never existed,
+which is what sent two investigations the wrong way.
+
+It was found by an instrument, not by reading: every diagnostic for this family
+was on the path that verifies a **peer's** proof, and the refusal was about the
+client's own. The note added to `shuffle_if_mine` printed
+`chain step 1, turn Some(2)` on the first run that hit it — the chain waiting
+for exactly the seat it was refusing. The regression test plays the hand after
+the drop, which nothing did before, and reproduces that line verbatim when one
+bound is put back.
+
+### And the one it was hiding
+
+With that gone, a live run shows a different refusal, once:
+
+```
+n2: shuffle refusal from seat 0: chain at step 0, slot sequence 3, round 0
+n2: hand: seat 0's shuffle: the argument does not hold for this pair of decks
+```
+
+A genuine verification failure of a peer's first shuffle proof. Both peers hold
+the same genesis for that hand — `90c6a1f0`, seats `[0, 1]` — so it is not a
+roster disagreement, and by C-6 rule 4 the chain is then abandoned and the hand
+costs one deal. The two agreed again at the next hand, because an abort's
+terminal is a function of the genesis alone.
+
+Checked and **not** the cause: prover and verifier derive the context the same
+way. `next_ctx(seq)` is `ctx_for(steps_taken(), seq)`, the prover passes
+`slot.sequence + 1` at its step and the verifier passes its own slot at the
+proof stage, which is the same number. `ctx_for` reads only chain parameters,
+the position and `keys[k]`.
+
+So the next step is not more log-reading. It is to make a failing argument say
+what it disagreed about — the two `DeckCtx` field sets side by side, and the
+input deck hash each side used — because the note as written says where the
+chain was and not what the proof was checked against.
+
 ## Still open
 
 * **A seat certified absent never re-enters**, because `next_hand`'s
