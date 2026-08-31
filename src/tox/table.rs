@@ -232,7 +232,13 @@ const SWEEP_EVERY: Duration = Duration::from_secs(5);
 /// `tox` is moved onto that thread and stays there. The returned handle is the
 /// only way to reach it, and dropping the handle stops it.
 pub fn spawn(tox: Tox, setup: Setup) -> ToxTable {
-    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    // **Deep enough for a re-send burst plus the event that matters.** The node
+    // re-broadcasts everything it has said every five seconds, which is up to
+    // sixty-four messages at once, and a fresh action arriving while that
+    // backlog is in the channel must not be the one dropped. `try_broadcast`
+    // refuses silently when it is full, and refusing a *re-send* is free while
+    // refusing a new event costs a seat its deadline.
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<FromTable>(256);
     let (ctl_tx, ctl_rx) = sync_mpsc::channel::<Command>();
     let (chat_tx, chat_rx) = tokio::sync::watch::channel::<Option<[u8; 32]>>(None);

@@ -2361,18 +2361,34 @@ pub async fn run(
                             .await;
                     }
                 }
-                let (Some(h), Some(t)) = (hand.as_ref(), table_topic.as_ref()) else {
-                    continue;
-                };
+                let Some(h) = hand.as_ref() else { continue };
                 // A hand that is over is a hand nobody is waiting on.
                 if h.over() || said.is_empty() {
                     continue;
                 }
-                for out in &said {
-                    let _ = swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(t.clone(), out.clone());
+                // **Through whichever transport the table has, which this loop
+                // did not do and had to.** It published to the mesh only, so a
+                // table on Tox re-sent nothing at all - and a Tox group keeps no
+                // history exactly as GossipSub keeps none, which is the whole
+                // reason this loop exists.
+                //
+                // Measured at three seats, which is where it showed: one seat's
+                // messages did not reach the other two, it was certified late
+                // twice, its grace ran out and the roster dropped it. A seat
+                // lost to a transport that never repeated itself. Heads-up hid
+                // it, because two peers both in the group before the first hand
+                // have nothing to re-send.
+                if tox_sink.is_on_tox() {
+                    for out in &said {
+                        tox_sink.try_broadcast(out);
+                    }
+                } else if let Some(t) = table_topic.as_ref() {
+                    for out in &said {
+                        let _ = swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .publish(t.clone(), out.clone());
+                    }
                 }
             }
 

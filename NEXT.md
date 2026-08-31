@@ -513,10 +513,12 @@ advertising a shorter deadline than any preset offers.
 
 ### What is next, in order
 
-1. **Three seats and more over the real network.** Everything measured so far
-   is heads-up, and heads-up hides a whole class of defect — it hid the
-   duplicate handling for two milestones. This is now the cheapest way to find
-   the next real bug, because the machinery to run it already exists.
+1. ~~Three seats and more over the real network~~ **done at three, and it paid
+   for itself in one run** - see below. It found the re-send loop still
+   publishing to the mesh on a Tox table, which cost a seat its place at the
+   table. Four hands at three seats now, exact agreement, no certificates. What
+   is still untried is **more** than three, and a table that fills to six or ten
+   is where the next one of these will be.
 2. `STATE_HASH` / `STATE_ACK` checkpoints. Checkpoint 8's hash is computed and
    carried inside `HAND_COMPLETE`; the checkpoint **stage** is not there, and
    `PROTOCOL.md` §12 says T61 then fires at `hand_deadline_ms` after every
@@ -1428,6 +1430,67 @@ lacks the history. Worth stating plainly, because the natural thing to do while
 moving off GossipSub is to leave that loop behind.
 
 
+
+
+### Three seats on Tox, and the defect it found in one run
+
+The top of the list for several passes — *everything measured is heads-up, and
+heads-up hides a whole class of defect* — and the first three-seat run on Tox
+found one immediately.
+
+**Before:**
+
+```
+node 0: certificates 2, hands cfe61e0e c6b7d73b
+node 1: certificates 0, hands cfe61e0e
+node 2: certificates 2, hands cfe61e0e c6b7d73b
+```
+
+Seat 1 was certified late **twice** by the other two, unanimously; its two
+strikes exhausted its grace and the roster dropped it —
+`required [0, 1, 2] -> [0, 2]`, `by_certificate=true`. Its own log records one
+expired clock, not two, so its messages were not reaching the other seats. A
+seat that was alive, in the group, and dealt in, lost the table.
+
+**The cause was mine, and it was the thing I had already written down.** The
+five-second re-send loop published to the **mesh only**. A table on Tox
+therefore re-sent nothing at all — and a Tox group keeps no history exactly as
+GossipSub keeps none, which is the entire reason that loop exists. It is
+recorded two sections above, from the probe that proved it, and the integration
+left the loop on the old transport anyway.
+
+Heads-up hid it perfectly: two peers that are both in the group before the first
+hand have nothing to re-send.
+
+**After**, and a longer run:
+
+```
+node 0: certs 0, aborts 0, hands 5efd05c1 28bcfcc9 ff81cd29 efae6fc3
+node 1: certs 0, aborts 0, hands 5efd05c1 28bcfcc9 ff81cd29 efae6fc3
+node 2: certs 0, aborts 0, hands 5efd05c1 28bcfcc9 ff81cd29 efae6fc3
+```
+
+Four hands, three seats, exact agreement, no certificate and no abort in seven
+minutes. The libp2p path at three seats is unchanged: `--no-default-features`,
+two hands, all three agreeing, no certificates.
+
+One thing was fixed alongside it rather than after the next run finds it: the
+driver's outbound channel was sixty-four deep and the re-send burst is up to
+sixty-four messages, so a fresh action could be the one refused. It is 512 now.
+Refusing a re-send is free; refusing a new event costs a seat its deadline.
+
+### And a coverage item that Tox retires
+
+`AnotherHand => Accept` and the three-node forwarding test were about GossipSub,
+where a message to the third seat may have to travel *through* the second, and a
+client that fails to relay is invisible to any harness that delivers to
+everybody. **A Tox group delivers to every member**, so there is no relaying by
+peers to get wrong and no forwarding property to test.
+
+The verdict machinery stays exactly as it is, because the mesh still carries the
+formation and because `--no-default-features` still plays whole hands on it. What
+goes is the *missing test*: it would now be testing a path the released client
+does not use for hands.
 
 ### The result D-019 was taken for: four hands, two networks, one real client
 
