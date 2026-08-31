@@ -498,14 +498,7 @@ pub const TIMEOUT_VOTE_CAP: usize = 128;
 /// embedded signed votes.
 pub const TIMEOUT_CERT_CAP: usize = 4_096;
 
-/// How many certificates against one seat make it sit out.
-///
-/// `PROTOCOL.md` §8.3: after three, the seat is marked sitting out at the next
-/// hand boundary — it keeps its stack, posts dead money, takes no cards and
-/// drains. That is the tournament's dead seat, and it exists only where
-/// `|V| >= 2`, because below the floor no certificate has any effect and the
-/// counter never increments.
-pub const MAX_CONSECUTIVE_AUTO_ACTIONS: u8 = 3;
+pub use crate::protocol::constants::MAX_CONSECUTIVE_AUTO_ACTIONS;
 
 /// How many hands a seat may miss and still be dealt back in.
 ///
@@ -541,7 +534,7 @@ pub const REPLENISH_AFTER: u8 = 15;
 /// could never be sent.
 ///
 /// It is used at both levels because `on_hand_abort` opens the frame with it
-/// and then decodes the payload with it. Passing [`FRAME_CAP`] for the frame
+/// and then decodes the payload with it. Passing `FRAME_CAP` for the frame
 /// and this for the payload would refuse every abort that needs the room, at
 /// the outer decode, before the payload cap was ever consulted.
 pub const HAND_ABORT_CAP: usize = crate::protocol::constants::HAND_ABORT_MAX;
@@ -778,7 +771,7 @@ pub enum Abort {
     /// holding two frames would make `Abort` fifteen kilobytes and stop it
     /// being `Copy` — so a question about what happened would copy the proof
     /// of it. The frames go straight into the message in
-    /// [`Hand::abort_bad_shuffle`] and are not kept afterwards: they were
+    /// `Hand::abort_bad_shuffle` and are not kept afterwards: they were
     /// broadcast, and a receiver that needs them has them.
     BadShuffle {
         /// The seat whose proof failed. Named in `attributed`.

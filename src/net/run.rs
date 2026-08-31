@@ -4,7 +4,7 @@
 //! isolation. This is the part that has to be run to be believed, so it is kept
 //! small and its pieces live elsewhere: the admission rules are
 //! [`lobby`](super::lobby)'s, the per-node state is [`node`](super::node)'s, and
-//! the relay budget is [`relay`](super::relay)'s. What is here is the order
+//! the relay budget is [`relay`]'s. What is here is the order
 //! things happen in.
 //!
 //! # Discovery is libp2p's, and used to be BitTorrent's
@@ -570,9 +570,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut peerbook_timer = tokio::time::interval(Duration::from_secs(600));
     // Presence, on the same rhythm the table advertisements use and for the
     // same reason: three of these fit inside the time it takes to be forgotten,
-    // so two lost messages do not empty a pane that should not be empty.
+    // so two lost messages do not empty a pane that should not be empty. The
+    // rate is a wire value and is `PROTOCOL.md` §12's, not this module's.
     let mut presence_timer = tokio::time::interval(Duration::from_millis(
-        super::lobbytalk::PRESENCE_EVERY_MS,
+        crate::protocol::constants::PRESENCE_HEARTBEAT_MS,
     ));
     let mut housekeeping = tokio::time::interval(REBROADCAST);
 
@@ -1447,7 +1448,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         // Another one of us, or a stranger on the same DHT?
-                        if info.protocol_version == super::swarm::PROTOCOL_VERSION
+                        if info.protocol_version == super::swarm::IDENTIFY_PROTOCOL
                             && poker_peers.insert(peer_id)
                         {
                             // Never subject to the cap. The whole point of a

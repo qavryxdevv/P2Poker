@@ -322,7 +322,13 @@ pub const ZERO32: [u8; 32] = [0u8; 32];
 pub const UNCHAINED_HAND_ID: u64 = u64::MAX;
 
 /// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// **Re-exported, not defined.** This was a second `pub const PROTOCOL_VERSION:
+/// u16 = 1` while `protocol::constants` held the first, and the two are read by
+/// different halves of the client: this one fills the wire field and validates
+/// it on receipt, the register's is hashed into the transcript. They agreed. A
+/// version bump is one edit, and it would have moved one of them.
+pub use super::constants::PROTOCOL_VERSION;
 
 /// What is signed and hashed (`PROTOCOL.md` §2.3).
 ///

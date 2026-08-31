@@ -27,6 +27,11 @@ use crate::poker::state::Chips;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const PROTOCOL_MAJOR: u16 = 1;
 
+/// The libp2p identify protocol name.
+///
+/// Held here and used from `net::swarm`, which defined its own copy of this
+/// string under the name `PROTOCOL_VERSION` — a third meaning for a name that
+/// already had two.
 pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/1";
 pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/1";
 pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/1";
@@ -34,24 +39,13 @@ pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/1";
 pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/1";
 pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/1";
 
-/// The string the lobby infohash is derived from, so the constant below is
-/// checkable rather than arbitrary.
-pub const LOBBY_DERIVATION_STRING: &str = "p2p-poker/mainline-lobby/v1";
-
-/// The fixed Mainline DHT infohash every client announces under
-/// (`SPEC_CS.md` §3).
-pub const LOBBY_INFOHASH: [u8; 20] = [
-    0xfd, 0x7c, 0x0d, 0x69, 0x43, 0x3e, 0x32, 0xe4, 0x25, 0xdb, 0x3c, 0xa2, 0xb7, 0xd7, 0x71, 0x89,
-    0x28, 0x73, 0x9f, 0x01,
-];
-
-pub const RELAY_DERIVATION_STRING: &str = "p2p-poker/mainline-relay/v1";
-
-/// Where relay volunteers announce, kept apart from the player lobby.
-pub const RELAY_INFOHASH: [u8; 20] = [
-    0x9c, 0x18, 0xd8, 0xc8, 0x0f, 0x69, 0xde, 0x3a, 0xa0, 0x79, 0xb2, 0xef, 0x51, 0x9b, 0xc4, 0xbb,
-    0xb6, 0x7e, 0x1c, 0xc1,
-];
+// **The two Mainline infohashes and their derivation strings are gone.**
+// `c7e6317` took BitTorrent out of the binary and the lobby became a libp2p
+// Kademlia provider record; `net::run::lobby_namespace` and `relay_namespace`
+// are where a client announces now. The constants outlived the crate by some
+// months, guarded by two compile-time assertions and a test that compared them
+// with each other - all three passed, none of them reached anything, and a
+// reader had four public constants saying the lobby was somewhere it was not.
 
 // ---------------------------------------------------------------------------
 // Table and chain shape
@@ -71,6 +65,13 @@ pub const MAX_RETAINED_HAND_RECORDS: usize = 4_096;
 
 pub const MAX_CBOR_NESTING_DEPTH: usize = 8;
 pub const MAX_DISPUTES_PER_SENDER_PER_HAND: usize = 8;
+/// How many certificates against one seat make it sit out.
+///
+/// `PROTOCOL.md` §8.3: after three, the seat is marked sitting out at the next
+/// hand boundary — it keeps its stack, posts dead money, takes no cards and
+/// drains. That is the tournament's dead seat, and it exists only where
+/// `|V| >= 2`, because below the floor no certificate has any effect and the
+/// counter never increments.
 pub const MAX_CONSECUTIVE_AUTO_ACTIONS: u8 = 3;
 
 // ---------------------------------------------------------------------------
@@ -421,20 +422,20 @@ const _: () = assert!(2 * MAX_EMBEDDED_EVENT + ABORT_FIXED_MAX > GOSSIP_MAX_TRAN
 const _: () = assert!(ABORT_EVIDENCE_MAX <= MAX_EMBEDDED_EVENT);
 const _: () = assert!(SNAPSHOT_RESP_MAX <= TABLE_FRAME_MAX);
 
-/// One lost rebroadcast must not expire an advert, and one lost heartbeat must
-/// not drop a player from the lobby.
-const _: () = assert!(AD_REBROADCAST_MS * 2 <= AD_TTL_MS);
-const _: () = assert!(PRESENCE_HEARTBEAT_MS * 2 <= PRESENCE_TTL_MS);
+/// **Two** lost rebroadcasts must not expire an advert, and two lost heartbeats
+/// must not drop a player from the lobby.
+///
+/// `NETWORK_STACK.md` \u{a7}10.3 states the relation as **3x** for both rows and
+/// these constants satisfy it exactly. The assertion said `2 *` for a long time,
+/// which is a weaker claim than the corpus makes and than the comment above it
+/// made: it would have admitted a pair that tolerates one loss, not two.
+const _: () = assert!(AD_REBROADCAST_MS * 3 <= AD_TTL_MS);
+const _: () = assert!(PRESENCE_HEARTBEAT_MS * 3 <= PRESENCE_TTL_MS);
 
 /// The boundary window sits above the stage numbers and below the boundary
 /// checkpoint, with room for every seat.
 const _: () = assert!(BOUNDARY_SEQUENCE_BASE > MAX_STAGES_PER_HAND);
 const _: () = assert!(BOUNDARY_CHECKPOINT_BASE > BOUNDARY_SEQUENCE_BASE + MAX_SEATS as u64);
-
-/// Players and relays announce under different infohashes, or a relay
-/// volunteer would be dialled as a player.
-const _: () = assert!(LOBBY_INFOHASH.len() == 20);
-const _: () = assert!(RELAY_INFOHASH.len() == 20);
 
 /// The rated deadline is inside the range every advert must satisfy.
 const _: () = assert!(RATED_HAND_DEADLINE_MS <= HAND_DEADLINE_CAP_MS);
@@ -560,15 +561,6 @@ mod tests {
     }
 
     #[test]
-    fn the_two_infohashes_differ() {
-        // Compile-time asserts cover their length; this one compares values,
-        // and it matters: a relay volunteer announced under the player
-        // infohash would be dialled as a player.
-        assert_ne!(LOBBY_INFOHASH, RELAY_INFOHASH);
-        assert_ne!(LOBBY_INFOHASH, [0u8; 20]);
-    }
-
-    #[test]
     fn preset_ids_round_trip_and_a_third_name_is_refused() {
         for p in [PresetId::RatedSngPokerthV1, PresetId::Custom] {
             assert_eq!(PresetId::parse(p.as_str()), Some(p));
@@ -582,4 +574,36 @@ mod tests {
         }
     }
 
+    /// The lobby presence pair is `PROTOCOL.md` \u{a7}12's, and it was not.
+    ///
+    /// **What this pins, and why a compile-time assertion did not.** These two
+    /// constants and the assertion beside them were correct and **dead**:
+    /// `net::lobbytalk` carried a second `PRESENCE_TTL_MS` at `90_000` with a
+    /// `PRESENCE_EVERY_MS` at `30_000`, and those were what the client sent and
+    /// expired on. The assertion guarded numbers nothing reached, so it read as
+    /// protection and protected nothing.
+    ///
+    /// The drift has a clean explanation. `AD_TTL_MS` / `AD_REBROADCAST_MS` are
+    /// `90_000` / `30_000`, and `lobbytalk`'s comment said presence held *"the
+    /// same relationship the table advertisements have with their own TTL"*.
+    /// The relationship is 3x; what was copied was the values.
+    ///
+    /// **The failure it caused is only visible against a conforming peer**,
+    /// which is why our own two-node runs never showed it. A conforming client
+    /// sends presence every `40_000`. A client expiring at `90_000` drops it
+    /// after two consecutive losses - 80 000 ms is inside, 120 000 ms is not -
+    /// so a player sitting in the lobby vanishes and comes back. That is exactly
+    /// the property `lobbytalk`'s comment claimed to have.
+    #[test]
+    fn the_presence_pair_is_the_one_the_corpus_publishes() {
+        assert_eq!(PRESENCE_TTL_MS, 120_000, "PROTOCOL.md \u{a7}12 and its register");
+        assert_eq!(PRESENCE_HEARTBEAT_MS, 40_000, "PROTOCOL.md \u{a7}12");
+        assert_eq!(
+            PRESENCE_TTL_MS,
+            3 * PRESENCE_HEARTBEAT_MS,
+            "NETWORK_STACK.md \u{a7}10.3 puts presence in the same 3\u{d7} relation as \
+             the advert row, and the whole point of the ratio is that two lost \
+             heartbeats do not remove somebody who is sitting there"
+        );
+    }
 }

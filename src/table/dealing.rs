@@ -183,7 +183,7 @@ impl Dealing {
     ///
     /// Never published for a hole card of this seat — it is the share nobody
     /// else can supply, which is the whole of why the card is private — and the
-    /// caller is what decides that, from [`audience`](Self::audience).
+    /// caller is what decides that, from [`due`](Self::due).
     pub fn own_share(
         &mut self,
         deal: &Deal<'_>,

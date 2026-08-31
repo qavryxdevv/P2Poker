@@ -11,7 +11,7 @@
 //!
 //! So the cfg lives here, once, behind an API that is the same either way. A
 //! build without the feature gets a sink that is always empty, whose
-//! [`next`](TableSink::next) never resolves, and whose branch in the `select!`
+//! [`next`](crate::net::toxsink::TableSink::next) never resolves, and whose branch in the `select!`
 //! is therefore inert. The loop reads identically in both.
 //!
 //! # What rides it, and what does not

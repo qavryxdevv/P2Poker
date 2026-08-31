@@ -74,12 +74,16 @@ corrected in place and the correction is recorded in §9.7.
 | Figure | Value | How |
 |---|---|---|
 | Crates **compiled into the client** | **461** | `cargo tree --edges normal`, unique name+version, minus `p2p-poker` itself |
-| Crates **recorded in `Cargo.lock`** | **646** | `[[package]]` entries, minus `p2p-poker` itself |
-| Locked but never compiled | **185** | the difference |
+| Crates **recorded in `Cargo.lock`** | **659** | `[[package]]` entries, minus `p2p-poker` itself |
+| Locked but never compiled | **198** | the difference |
 
-`cargo audit` prints "**647** crate dependencies" because it counts the root package
-too. 647 − 1 = 646; 462 − 1 = 461. The two figures in this table both exclude the
-root, so they are directly comparable. **(a)**
+**Re-measured 2026-08-31.** The compiled figure was right; the other two were not,
+and had been 646 / 185. `tests/corpus_dependencies.rs` now measures all three on
+every `cargo test`, so the next reader gets a failure rather than a number.
+
+`cargo audit` counts the root package too, so its figure is one higher than the
+lockfile row above: 660 − 1 = 659; 462 − 1 = 461. The two figures in this table both
+exclude the root, so they are directly comparable. **(a)**
 
 **These numbers were 425 / 611 / 186 when this register was first written**, and the
 drift is worth naming rather than quietly overwriting: **+13** came from local
@@ -276,9 +280,22 @@ capability to make a scanner quiet is the wrong trade. The alternative — all
 discovery through Mainline DHT, relay volunteers under a second infohash, dropping
 both `dns` and `kad` — is on `DECISIONS.md`'s open list with its cost stated.
 
-### 3.3 `lru 0.16.4` — RUSTSEC-2026-0253, unsound
+### 3.3 `lru 0.16.4` — RUSTSEC-2026-0253, unsound. **Spent: the crate left the build.**
 
-Use-after-free / double-free from missing panic safety in `LruCache::pop()`: if a
+> **Corrected 2026-08-31.** `lru` is not in `Cargo.lock` and neither is `mainline`,
+> the dependency that brought it. `c7e6317` — *"Discovery is libp2p's now, and
+> BitTorrent is out of the binary"* — removed the crate; this section, §3.7, §4's
+> table row and §5.8 were not told, so an accepted unsoundness stood in the register
+> for a crate that is not there. **An accepted advisory is a decision a reader
+> relies on**, which is why this is corrected in place rather than deleted: the
+> acceptance below was sound when it was made, and what changed is that there is
+> nothing left to accept. The measurement is `tests/corpus_dependencies.rs`, which
+> now fails if any row in §5 names a crate the lockfile does not have.
+>
+> §4 carries the confirming run: `cargo audit` on 2026-08-31, 1 233 advisories
+> against 660 lockfile packages, and RUSTSEC-2026-0253 is not in the output.
+
+**What was accepted, in the past tense.** Use-after-free / double-free from missing panic safety in `LruCache::pop()`: if a
 stored key's `Drop` panics, `detach()` is skipped and the linked list keeps dangling
 pointers, which a later eviction dereferences. Both are UB reachable from safe Rust.
 Fixed in `lru >= 0.18.2`.
@@ -299,10 +316,13 @@ absent in `mainline 8.0.0`:
   `self.cached_iterative_queries.pop_lru()` (`src/rpc.rs:914`); `LruCache::pop()`
   does not appear. **(b)**
 
-Recorded as **accepted with justification** rather than fixed, because we cannot fix
-it. The justification is a fact about mainline's current usage, not a guarantee: a
-mainline release that changes either the key type or the pop call re-arms it, which
-is why §8 lists "a pinned crate moves" as a re-audit trigger.
+Recorded as **accepted with justification** rather than fixed, because we could not
+fix it: the justification was a fact about mainline's usage, not a guarantee, which
+is why §8 lists "a pinned crate moves" as a re-audit trigger. What actually ended it
+was neither an upgrade nor a re-audit — the dependency was removed for an unrelated
+reason, and the register kept the acceptance for months afterwards. **That is the
+failure this section is now an example of**, and it is why §8 gains "a crate leaves
+the build" as a trigger of its own.
 
 ### 3.4 `paste 1.0.15` — RUSTSEC-2024-0436, unmaintained
 
@@ -362,7 +382,17 @@ and `SPEC_CS.md` §7 forbids protocol randomness from any such source. Calling
 `rs_poker`'s deck or sampler anywhere in this project is a defect, and this is one of
 the things the §7 lint (`CRYPTOGRAPHY.md` §12 item 6, OQ-8) exists to catch.
 
-### 3.7 `mainline 8.0.0` — panics on IPv6
+### 3.7 `mainline 8.0.0` — panics on IPv6. **Historical: the crate is not in the build.**
+
+> **Corrected 2026-08-31.** `mainline` is not in `Cargo.lock`. Two claims below were
+> live instructions to a reader and are now false: the **hard constraint on
+> `src/net/dht.rs`** names a file that was deleted with the crate, and
+> **"discovery is IPv4-only"** was a property of this dependency, not of the client.
+> Discovery is a libp2p Kademlia provider record (`net::run::lobby_namespace`), which
+> carries whatever multiaddrs a node has and is not IPv4-only. Kept, in the past
+> tense, because §8's re-audit triggers are argued from it.
+
+**What the crate did, while it was in the build.**
 
 `KrpcSocket::new` reads the bound socket's local address and matches on it:
 
@@ -372,17 +402,18 @@ SocketAddr::V6(_) => unimplemented!("KrpcSocket does not support Ipv6"),
 
 `mainline-8.0.0/src/rpc/socket.rs:54`. **(b)** `unimplemented!` is a panic. If the
 client binds the DHT socket to an IPv6 address, the DHT thread dies — not with an
-error we can handle, with an unwind. **Binding the DHT socket must be IPv4-only, and
-that is a hard constraint on `src/net/dht.rs`, not a preference.**
+error we can handle, with an unwind. Binding the DHT socket had to be IPv4-only, and
+that was a hard constraint on the `net::dht` module rather than a preference. Both
+the module and the constraint are gone.
 
 Inbound IPv6 packets are handled differently and are not a panic: `src/rpc/socket.rs:207`
 matches `Ok((_, SocketAddr::V6(_)))` and only emits a trace. **(b)** So the failure
 mode is entirely on our side of the API — it is a bind-time constraint.
 
 The wider consequence, which `research/MAINLINE_DHT.md` §107–109 already states:
-BEP 32's IPv6 DHT is a separate routing table, so **discovery is IPv4-only**. On an
-IPv6-only network the client discovers nobody. That is a permanent limitation of this
-dependency, not a bug to be fixed downstream.
+BEP 32's IPv6 DHT is a separate routing table, so discovery **was** IPv4-only and on
+an IPv6-only network the client discovered nobody. That was a permanent limitation of
+this dependency; it left with it.
 
 `mainline` is also `=`-pinned because `NETWORK_STACK.md` §11.4 depends on internals
 (`RequestFilter`, adaptive server mode) that are not semver-stable in practice.
@@ -391,8 +422,37 @@ dependency, not a bug to be fixed downstream.
 
 ## 4. Open advisories — the complete `cargo audit` result
 
+**Re-run 2026-08-31 against `Cargo.lock`, 1 233 advisories loaded, 660 lockfile
+packages scanned. This is the whole output, not a selection. (a)** The count matches
+§1's `[[package]]` figure exactly, which is the cheapest check that the scanner saw
+the file this document describes.
+
+```
+Scanning Cargo.lock for vulnerabilities (660 crate dependencies)
+hickory-proto 0.25.2  RUSTSEC-2026-0118  Solution: No fixed upgrade is available!
+hickory-proto 0.25.2  RUSTSEC-2026-0119  Solution: Upgrade to >=0.26.1
+paste         1.0.15  RUSTSEC-2024-0436  Warning: unmaintained
+error: 2 vulnerabilities found!
+warning: 1 allowed warning found
+```
+
+**One row left the set and it is the one this pass was looking for.** `lru 0.16.4`
+/ RUSTSEC-2026-0253 is gone, because `lru` is gone: it arrived under `mainline`, and
+`c7e6317` took BitTorrent out of the binary. §3.3 had kept it as an **accepted**
+unsoundness ever since. The allowed-warning count moved with it, 2 to 1, and that is
+the number CI gates on.
+
+**The two `hickory-proto` vulnerabilities and the `paste` warning are unchanged** in
+ID, version and solution from the 2026-08-28 run, so §3.2's and §3.4's acceptances
+stand as written.
+
+> **The superseded 2026-08-28 run is kept below**, because §1's *"locked but never
+> compiled"* argument is made against its figures and because a register that
+> silently replaces a measurement teaches a reader to trust the next one without
+> checking. It scanned 612 packages where there are now 660.
+
 Run 2026-08-28 against `Cargo.lock`, 1 226 advisories loaded, 612 lockfile packages
-scanned. This is the whole output, not a selection. **(a)**
+scanned. This was the whole output, not a selection. **(a)**
 
 **Re-run 2026-08-28 at the close of the D-009…D-012 sweep, and the result is
 unchanged**: same four IDs, same versions, same solutions, same exit. Verbatim, the
@@ -409,16 +469,18 @@ warning: 2 allowed warnings found
 ```
 
 **`cargo audit` reads `Cargo.lock`, so it is feature-blind, and that has not changed
-either.** It scanned all 612 lockfile packages, not the 425 that are compiled. Two of
-the four rows below are only decidable by `cargo tree --edges normal -i` — see §1, and
-the "Compiled?" column exists because of it.
+either.** The current run scanned all 660 lockfile packages, not the 461 that are
+compiled. Two of the rows below are only decidable by `cargo tree --edges normal -i`
+— see §1, and the "Compiled?" column exists because of it. The `lru` row is struck
+through rather than deleted: it is the worked example of why the column is there,
+and of a register outliving the thing it registers.
 
 | ID | Crate | Version | Class | Fix available | Compiled? | Status |
 |---|---|---|---|---|---|---|
 | RUSTSEC-2026-0118 | `hickory-proto` | 0.25.2 | vulnerability — DoS | **none** | crate yes, **vulnerable module no** | accepted, §3.2 |
 | RUSTSEC-2026-0119 | `hickory-proto` | 0.25.2 | vulnerability — DoS | `>= 0.26.1`, blocked by `libp2p-dns` | **yes, reachable** | accepted, §3.2 |
 | RUSTSEC-2024-0436 | `paste` | 1.0.15 | warning — unmaintained | none, ever | build-time proc-macro only | accepted, §3.4 |
-| RUSTSEC-2026-0253 | `lru` | 0.16.4 | warning — unsound | `>= 0.18.2`, blocked by `mainline` | yes, preconditions absent | accepted, §3.3 |
+| ~~RUSTSEC-2026-0253~~ | ~~`lru`~~ | ~~0.16.4~~ | warning — unsound | — | **no — not in `Cargo.lock`** | **spent 2026-08-31, §3.3** |
 
 `cargo audit` exits non-zero: *"error: 2 vulnerabilities found! warning: 2 allowed
 warnings found"*. **A non-zero `cargo audit` is the current expected state of this
@@ -464,6 +526,23 @@ actually compiled, from `cargo tree --edges normal` — **(a)**.
 2026-08-28 RustSec database, and it is absent from §4's table. It does **not** mean
 audited, and it does not mean reviewed by us.
 
+> **Re-run 2026-08-31, and it does not hold: 7 of the 122 rows name a crate that is
+> not in `Cargo.lock`.** `serde_bencode` and `serde_bytes` in §5.7, and five of
+> §5.8's six. They left with `mainline` in `c7e6317`, and the register was not
+> told. The pass below is kept because its *method* is the right one, and because
+> deleting a verification claim that turned out false is how the next one gets
+> believed too easily - but read it as a record of a run, not as the state of this
+> document.
+>
+> The claim also disagreed with §1 before this correction: it asserts §1's
+> figures are **425 / 611 / 186** while §1's own table said 461 / 646 / 185, so
+> two statements of the same three numbers had already drifted apart inside one
+> file. Measured today: **461 / 659 / 198**. `tests/corpus_dependencies.rs` runs the
+> row check and the three counts on every `cargo test`, which is the difference
+> between a claim and a gate.
+>
+> **What follows is the 2026-08-28 run, unedited.**
+>
 > **Re-verified 2026-08-28, mechanically, against the lockfile and the registry
 > checkouts rather than against the earlier text of this document.** Every
 > `name`+`version` in every §5 table was matched against a `[[package]]` entry in
@@ -681,25 +760,36 @@ fuzzed; none of them has been fuzzed by us.
 | `idna` | 1.1.0 | IDNA in URL parsing | `github.com/servo/rust-url` | MIT OR Apache-2.0 | no open advisory; RUSTSEC-2024-0421 patched `>= 1.0.0` |
 | `url` | 2.5.8 | URL parsing for UPnP control endpoints | `github.com/servo/rust-url` | MIT OR Apache-2.0 | no open advisory |
 | `serde` | 1.0.229 | derive-based decoding across the tree | `github.com/serde-rs/serde` | MIT OR Apache-2.0 | no open advisory. **Not used for our signed envelope** — that is `minicbor`, because `serde` does not guarantee a canonical encoding |
-| `serde_bencode` | 0.2.4 | **bencode for every DHT packet** | `github.com/toby/serde-bencode` | MIT | no open advisory; small crate, unaudited, and the first thing an unauthenticated UDP packet touches |
-| `serde_bytes` | 0.11.19 | byte-string support under the above | `github.com/serde-rs/bytes` | MIT OR Apache-2.0 | no open advisory |
 | `bytes` | 1.12.1 | buffer type carrying all decoded frames | `github.com/tokio-rs/bytes` | MIT | no open advisory |
 
-### 5.8 Discovery — Mainline DHT (6)
+### 5.8 Discovery — Mainline DHT. **Removed from the build; kept as a record (0)**
 
-| Name | Version | Purpose | Repository | Licence | Security status |
-|---|---|---|---|---|---|
-| `mainline` | 8.0.0 | BitTorrent Mainline DHT client | `github.com/pubky/mainline` | MIT | no open advisory. **`unimplemented!()` panic on an IPv6 bind; discovery is IPv4-only** — §3.7. `=`-pinned because `NETWORK_STACK.md` §11.4 uses internals (`RequestFilter`, adaptive server mode) that are not semver-stable in practice. 8.0.0 is the newest of 43 published versions **(c)** |
-| `lru` | 0.16.4 | peer, value and query caches inside `mainline` | `github.com/jeromefroe/lru-rs.git` | MIT | **RUSTSEC-2026-0253, unsound.** Upgrade blocked by `mainline`'s `lru = "0.16.2"`; preconditions structurally absent — §3.3 |
-| `sha1_smol` | 1.0.1 | infohash computation | `github.com/mitsuhiko/sha1-smol` | BSD-3-Clause | no open advisory. SHA-1 here is BitTorrent's protocol-mandated infohash, **not** a security hash — no collision resistance is claimed or needed |
-| `crc` | 3.4.0 | CRC32C for BEP 42 secure node IDs | `github.com/mrhooray/crc-rs.git` | MIT OR Apache-2.0 | no open advisory |
-| `flume` | 0.12.0 | channels between the DHT thread and the client | `github.com/zesterer/flume` | `Apache-2.0/MIT` (deprecated SPDX form) | no open advisory |
-| `futures-lite` | 2.6.1 | async adapters for `mainline`'s async API | `github.com/smol-rs/futures-lite` | Apache-2.0 OR MIT | no open advisory |
+> **Corrected 2026-08-31.** Five of the six crates below are not in `Cargo.lock`:
+> `mainline`, `lru`, `sha1_smol`, `crc` and `flume`. `futures-lite` is still in the
+> lockfile but arrives by another road entirely — `async-io` under `if-watch`, which
+> `libp2p-mdns`, `libp2p-quic` and `libp2p-tcp` pull on non-Windows targets — and it
+> is **not in the host build** that §1 measures, so it is not re-registered here. `c7e6317` — *"Discovery is libp2p's now, and BitTorrent is
+> out of the binary"* — removed the group; this section, §3.3, §3.7, §4's table and
+> §5.7's two bencode rows all kept describing it as current, and §3.3 kept an
+> **accepted security advisory** alive for a crate that is not there.
+>
+> Discovery today is a libp2p Kademlia provider record. `net::run::lobby_namespace`
+> keys it on `sha2-256("p2p-poker/main-lobby/v1")` and `relay_namespace` on
+> `sha2-256("/libp2p/relay")`; the crates are in §5.5. The register's own infohash
+> constants outlived the crate in `src/protocol/constants.rs` too, guarded by two
+> compile-time assertions and a test that all passed while reaching nothing — they
+> are deleted in the same pass as this correction.
+>
+> **The rows are not restored here**, because a register lists what is compiled and
+> none of these are. What is kept is why they were here, since §8's re-audit triggers
+> and §3.3's reasoning are argued from them.
 
-`mainline 8.0.0` also links `ed25519-dalek 3.0.0` — the *same* crate as our
-application signatures (§5.2) — for BEP 44 mutable items. The crate is shared; the
-keys are not, and must not be. `dyn-clone 1.0.20` (MIT OR Apache-2.0) and
-`tracing 0.1.44` (MIT) arrive with it and are not security-critical.
+The group that was here held `mainline 8.0.0` (BitTorrent Mainline DHT client) with
+`lru` for its caches, `sha1_smol` for infohash computation, `crc` for BEP 42 secure
+node IDs, `flume` for the channel between the DHT thread and the client, and
+`futures-lite` for its async adapters. `mainline` also linked `ed25519-dalek 3.0.0`
+— the *same* crate as our application signatures (§5.2) — for BEP 44 mutable items;
+the crate was shared and the keys were not, and must not be.
 
 ### 5.9 UPnP / IGD — the LAN attack surface (2)
 
@@ -906,11 +996,12 @@ fires and the checklist in §8.2 runs.
    shows the tooling cannot see.
 2. **A new advisory lands against anything in the lockfile**, whether or not it is
    compiled, and whether `cargo audit` calls it a vulnerability or a warning.
-3. **A pinned crate moves.** `ziffle`, `mainline`, `rs_poker` and `libp2p-stream`
-   are the four whose pins carry reasoning; a new release of any of them, or of
-   `libp2p` or `lru` or `hickory-*`, is a trigger even if we do not take it. Some of
-   §3's justifications are facts about the *current* upstream code (mainline's key
-   type, hickory's feature gating) and a release invalidates them.
+3. **A pinned crate moves.** `ziffle`, `rs_poker` and `libp2p-stream` are the three
+   whose pins carry reasoning; a new release of any of them, or of `libp2p` or
+   `hickory-*`, is a trigger even if we do not take it. Some of §3's justifications
+   are facts about the *current* upstream code (hickory's feature gating) and a
+   release invalidates them. `mainline` and `lru` were on this list until 2026-08-31
+   and are not in the build; see §5.8.
 4. **Phase transition.** `SPEC_CS.md` §30's phase boundaries, each of which changes
    what the code does with the tree. Phase 7 (libp2p transport) and Phase 11
    (security audit) are the two that must not be crossed on a stale register.
@@ -918,7 +1009,16 @@ fires and the checklist in §8.2 runs.
    assumption breaking. Rendering a peer avatar is the canonical example.
 6. **Toolchain change.** A new stable rustc can change what resolves and what
    compiles; §3.6 is an existing example of a crate that a compiler version decides.
-7. **Twelve months since the last full pass**, whichever comes first.
+7. **A crate leaves the build.** The one this list did not have, added 2026-08-31
+   after it fired unnoticed. `c7e6317` removed `mainline`, and with it `lru` — and
+   §3.3 went on carrying `lru`'s unsoundness as **accepted with justification**,
+   §3.7 went on stating a hard constraint on a deleted module, §4's table went on
+   listing the advisory as compiled, and §5.8 went on registering six crates. Every
+   one of those reads as a live decision. A removal fires trigger 1 as well, which
+   is the point: **trigger 1 fired and nothing ran**, so this entry exists to name
+   the case where the checklist is cheapest and the stale text is most misleading.
+   The mechanical half is now `tests/corpus_dependencies.rs`.
+8. **Twelve months since the last full pass**, whichever comes first.
 
 ### 8.2 What a re-audit does
 

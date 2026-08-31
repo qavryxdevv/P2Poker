@@ -120,7 +120,7 @@ pub struct AppState {
     /// How many lines have **ever** been written to the log.
     ///
     /// Monotonic, and the only sound way to ask "what is new since I last
-    /// looked" once the log has reached its cap. See [`AppState::note`].
+    /// looked" once the log has reached its cap. See `AppState::note`.
     pub emitted: u64,
     /// The table the user has selected in the list.
     pub selected: Option<[u8; 32]>,
@@ -435,7 +435,7 @@ impl AppState {
                 // here. There is no goodbye message, because a client that is
                 // switched off does not send one.
                 self.players.retain(|_, (_, at)| {
-                    now_ms.saturating_sub(*at) < crate::net::lobbytalk::PRESENCE_TTL_MS
+                    now_ms.saturating_sub(*at) < crate::protocol::constants::PRESENCE_TTL_MS
                 });
                 let gone = self.lobby.expire(now_ms);
                 if gone > 0 {

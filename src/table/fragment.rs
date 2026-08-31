@@ -32,7 +32,7 @@
 //! keyed on a quantity an attacker chooses, which is the shape this project has
 //! already refused twice. Concretely:
 //!
-//! * the claimed total is checked against [`MAX_FRAGMENTS`] **before** anything
+//! * the claimed total is checked against [`MAX_FRAGMENTS`](crate::table::fragment::MAX_FRAGMENTS) **before** anything
 //!   is allocated;
 //! * the number of part-built messages held for one sender is bounded, and the
 //!   oldest is dropped rather than the newest refused;

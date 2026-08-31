@@ -55,7 +55,7 @@ pub struct DeckCtx([u8; 32]);
 impl DeckCtx {
     /// Build a context from an already length-prefixed, domain-separated hash.
     ///
-    /// Takes a [`Hash`] rather than bytes so the only way to make one is to
+    /// Takes a [`Hash`](type@Hash) rather than bytes so the only way to make one is to
     /// have hashed something properly. Simplifying the construction to a
     /// concatenation reintroduces a measured proof-transfer attack.
     pub const fn from_hash(h: Hash) -> Self {
@@ -385,7 +385,7 @@ pub fn structural_check(
 ///
 /// The two functions therefore accept and reject exactly the same decks, which
 /// is measured in
-/// [`the_initial_check_accepts_and_rejects_the_same_decks`](tests::the_initial_check_accepts_and_rejects_the_same_decks)
+/// `the_initial_check_accepts_and_rejects_the_same_decks`
 /// rather than argued. They can name a **different reason** for one input: a
 /// deck returned unchanged is `DeckUnchanged` to the full check and
 /// `IdentityCiphertext` to this one. Both are refusals and both are evidence;

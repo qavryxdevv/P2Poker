@@ -1,8 +1,8 @@
 //! The lobby: signed table advertisements, and what a receiver does with one.
 //!
 //! `PROTOCOL.md` §7. This is the half of discovery that answers **what tables
-//! are open**; [`super::dht`] answers *where to try*, and neither does the
-//! other's job.
+//! are open**; the Kademlia provider records in [`super::run`] answer *where to
+//! try*, and neither does the other's job.
 //!
 //! # The admission rules are the joiner's, and that is the point
 //!

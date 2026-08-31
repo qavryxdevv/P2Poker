@@ -23,7 +23,7 @@
 //! rebuilt.
 //!
 //! So the limits are always the volunteer ones, and **AutoNAT gates the announce
-//! under `RELAY_INFOHASH`** ([`super::dht::Swarm::Relay`]). A client behind NAT
+//! under the relay namespace** ([`super::run`]). A client behind NAT
 //! is then exactly as useless as a relay as it would have been with zero limits,
 //! and becomes useful the moment AutoNAT says it is reachable, with nothing to
 //! rebuild.
@@ -121,8 +121,8 @@ pub const JOIN_RPC_TIMEOUT_MS: u64 = 30_000;
 pub struct PokerBehaviour {
     /// The lobby and the table mesh.
     pub gossipsub: gossipsub::Behaviour,
-    /// Peer routing. **Not** the global lobby — that is Mainline, under
-    /// `LOBBY_INFOHASH`, and lives in [`super::dht`].
+    /// Peer routing. **Not** the global lobby — that is a provider record on
+    /// the public Kademlia below, and lives in [`super::run`].
     pub kademlia: kad::Behaviour<MemoryStore>,
     /// The **public** Kademlia, and the only reason it exists is relays.
     ///
@@ -237,7 +237,13 @@ pub const CONNECTION_CEILING: u32 = 320;
 /// Named rather than written twice: `identify` announces it, and it is what
 /// tells another poker client apart from the several hundred strangers this node
 /// shares a DHT with.
-pub const PROTOCOL_VERSION: &str = "/p2p-poker/1";
+///
+/// **It was written twice.** This was `pub const PROTOCOL_VERSION: &str` here
+/// and `IDENTIFY_PROTOCOL` in `protocol::constants`, holding the same string —
+/// and `PROTOCOL_VERSION` is also a `u16` in two other modules, so the name
+/// carried two types and three meanings. One definition, under the name that
+/// says what it is.
+pub use crate::protocol::constants::IDENTIFY_PROTOCOL;
 
 pub struct Topics {
     pub lobby: gossipsub::IdentTopic,
@@ -339,7 +345,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
             ipfs_kad.set_mode(None);
 
             let identify = identify::Behaviour::new(
-                identify::Config::new(PROTOCOL_VERSION.into(), key.public())
+                identify::Config::new(IDENTIFY_PROTOCOL.into(), key.public())
                     .with_agent_version(format!("p2p-poker/{}", env!("CARGO_PKG_VERSION")))
                     .with_push_listen_addr_updates(true),
             );

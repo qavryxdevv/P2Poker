@@ -1,6 +1,6 @@
 //! The node's event loop: listen, announce, discover, dial, gossip.
 //!
-//! This is where [`swarm`](super::swarm)'s behaviours, [`dht`](super::dht)'s
+//! This is where [`swarm`](super::swarm)'s behaviours, [`run`](super::run)'s
 //! global discovery and [`lobby`](super::lobby)'s admission rules are driven.
 //! It is transport plumbing and decides no poker rule.
 //!
@@ -115,7 +115,7 @@ pub enum NodeEvent {
     /// The whole record travels, not just the key.
     ///
     /// It used to be the key alone, and the consequence was quiet and total:
-    /// the interface keeps its own [`LobbyStore`](super::lobby::LobbyStore) and
+    /// the interface keeps its own [`super::lobby::LobbyStore`] and
     /// nothing ever put anything in it, so the table list was empty on every
     /// client no matter how many tables were being advertised. A key with no
     /// record is a row the list cannot draw.

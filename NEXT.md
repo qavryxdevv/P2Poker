@@ -2028,6 +2028,118 @@ loudly instead of passing.
 The half this does not settle is whether the section it lands in actually contains
 the thing. That needs a reader, and the three rows above are what a reader found.
 
+## The register said it had been checked, three days earlier, and it had not
+
+The reference sweep above settled *the address is wrong*. The next question in
+the same family is cheaper still and nobody had asked it: **which of the crates
+this project registers are actually in `Cargo.lock`?**
+
+Seven are not.
+
+`c7e6317` — *"Discovery is libp2p's now, and BitTorrent is out of the binary"* —
+removed `mainline` and everything under it. `DEPENDENCIES.md` was not told, and
+five of its sections went on describing the removed group as current:
+
+* **§3.3** carried `lru 0.16.4`'s RUSTSEC-2026-0253 unsoundness as **accepted
+  with justification**, arguing the upgrade was *"blocked by `mainline`"*.
+* **§3.7** stated a **hard constraint** binding `src/net/dht.rs` to IPv4 and
+  declared discovery *"permanently IPv4-only"*. That file was deleted with the
+  crate, and the limitation was the dependency's, not the client's.
+* **§4**'s advisory table listed the advisory with **Compiled? yes**.
+* **§5.8** registered six crates and **§5.7** two more (the bencode parsers that
+  decoded DHT packets).
+
+An accepted advisory is a decision a reader relies on. This one was about a
+crate that is not there.
+
+**What made it findable was the claim that it had been checked.** §5 carried a
+blockquote dated **2026-08-28**:
+
+> Every `name`+`version` in every §5 table was matched against a `[[package]]`
+> entry in `Cargo.lock` ... **All 122 rows matched; nothing had drifted.**
+
+Running exactly that: **7 of 122 do not match.** The same blockquote asserted
+§1's figures were 425 / 611 / 186 while §1's own table said 461 / 646 / 185 —
+two statements of the same three numbers, in one file, already apart. Measured
+today: **461 / 659 / 198**.
+
+That claim is mechanical, dated and specific, which is what makes it the hardest
+kind to disbelieve. `DECISIONS.md`'s `G6-R2-m` already says a claim that
+something was checked must be checked against the thing. This is the first time
+the claim itself was the finding.
+
+**It is fixed rather than filed, because `cargo audit` could be run.** The
+2026-08-31 run — 1 233 advisories, 660 lockfile packages — returns three
+findings, not four:
+
+```
+hickory-proto 0.25.2  RUSTSEC-2026-0118  Solution: No fixed upgrade is available!
+hickory-proto 0.25.2  RUSTSEC-2026-0119  Solution: Upgrade to >=0.26.1
+paste         1.0.15  RUSTSEC-2024-0436  Warning: unmaintained
+error: 2 vulnerabilities found!
+warning: 1 allowed warning found
+```
+
+`lru` is gone with `mainline`; the other three are unchanged; the allowed-warning
+count CI gates on moved from 2 to 1. §§1, 3.3, 3.7, 4, 5.7, 5.8 and 8.1 are
+corrected in the past tense rather than deleted, which is `PROTOCOL.md`'s own
+rule — *the tense is the point* — and §8.1 gains an eighth re-audit trigger:
+**a crate leaves the build**. Trigger 1, *`Cargo.lock` changes at all*, had
+already fired. Nothing ran. That is the argument for a gate over a rule.
+
+### The same removal, in the code
+
+Four public constants described a lobby that is somewhere else —
+`LOBBY_INFOHASH`, `RELAY_INFOHASH` and the two strings they were derived from —
+held up by two compile-time assertions and a test comparing them with each other.
+All three passed. None of them reached anything. Discovery is
+`net::run::lobby_namespace`, a Kademlia provider record keyed on
+`sha2-256("p2p-poker/main-lobby/v1")`.
+
+Four intra-doc links pointed at the deleted `net::dht`. **`cargo doc` reports
+that and nothing in this project ran it: 20 rustdoc warnings, now zero.** One of
+them was not a stale link at all — the doc comment for `toxsink` had been pasted
+onto `pub mod advert;` as well, so `advert`'s rendered page described the Tox
+sink, and because an outer doc comment resolves in the *parent's* scope it also
+moved `advert.rs`'s own links out of reach.
+
+### And one constant that had already drifted
+
+`PRESENCE_TTL_MS` was `120_000` in `protocol::constants`, next to a compile-time
+assertion, **read by nothing**; and `90_000` in `net::lobbytalk`, which is what
+the client sent and expired on. `PROTOCOL.md` §12 publishes the first pair.
+
+The second is the *advert* pair — `AD_TTL_MS` / `AD_REBROADCAST_MS` are exactly
+`90_000` / `30_000` — because `lobbytalk`'s comment said presence held *"the
+same relationship the table advertisements have with their own TTL"*. The
+relationship is 3×. What was copied was the values.
+
+**The failure is only visible against a conforming peer**, which is why two
+nodes of ours never showed it: a conforming client sends every `40_000`, and a
+client expiring at `90_000` drops it after two consecutive losses. That is
+precisely the property `lobbytalk`'s comment claimed to have. The assertion
+beside the register's pair was also weaker than the corpus — `2 *`, where
+`NETWORK_STACK.md` §10.3 says 3× — so it would have admitted a pair tolerating
+one loss.
+
+### Three gates, each proved by breaking it
+
+* `tests/corpus_dependencies.rs` — every §5 row against `Cargo.lock`, and §1's
+  count against the file.
+* `tests/corpus_constants.rs` — one definition per public constant, and 87
+  published values against the code.
+
+Each has a coverage floor, and each was run against an injected defect before
+being trusted: a fake register row, and a duplicate `MAX_SEATS`. A green test
+that has quietly stopped parsing is worth less than no test, because it also
+carries an assurance.
+
+Note which check found the real defect. The corpus-versus-code comparison — the
+obvious one — passes on all 87 and always has. What found `PRESENCE_TTL_MS` was
+asking whether the **name** was defined twice. The corpus's number was in the
+code, in a constant with the right name, guarded by a passing assertion. Nothing
+was missing. There was a second one, and the second one was the one that ran.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that

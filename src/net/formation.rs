@@ -2,7 +2,7 @@
 //!
 //! Every rule was written and tested in [`table::join`](crate::table::join) and
 //! [`table::formation`](crate::table::formation); every message got a wire form
-//! in [`joinwire`](super::joinwire). What was missing between them is the part
+//! in [`joinwire`]. What was missing between them is the part
 //! that decides **what to send next**, and that is here.
 //!
 //! # There is no libp2p in this file, and that is the point
@@ -755,7 +755,7 @@ impl Formation {
     ///
     /// One that does not fit the roster this client holds is **kept**, not
     /// refused: on a mesh the ratification and the roster it ratifies race, and
-    /// the loser is usually the roster. See [`Formation::early`].
+    /// the loser is usually the roster. See `Formation::early`.
     pub fn on_table_ready(&mut self, bytes: &[u8]) -> Result<Vec<Send>, Failed> {
         match self.take_ratification(bytes) {
             Ok(()) => Ok(vec![]),

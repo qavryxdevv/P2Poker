@@ -24,10 +24,10 @@
 //!    what they say.
 //! 3. **`verify_strict`**, never `verify` — for a reason narrower than the
 //!    folklore, and the narrower reason is the measured one. See
-//!    [`what_the_two_signature_checks_actually_do`](tests::what_the_two_signature_checks_actually_do).
+//!    `what_the_two_signature_checks_actually_do`.
 //! 4. **§7.2 rules 2 to 5**, which is [`lobby::admit`].
 //! 5. **§7.2 rules 6 and 7**, which need the advert already held and are
-//!    [`LobbyStore`]'s.
+//!    [`super::lobby::LobbyStore`]'s.
 //!
 //! # The table's identity is the key that signed it
 //!

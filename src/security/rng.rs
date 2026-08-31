@@ -26,7 +26,7 @@
 //! An absence we cannot guarantee is worthless as a security property. What we
 //! can guarantee is a **discipline**: our own code draws randomness only from
 //! [`SysRng`], the operating system's CSPRNG. That is enforceable, and
-//! [`tests::our_own_code_uses_no_generator_but_the_os_one`] enforces it by
+//! `tests::our_own_code_uses_no_generator_but_the_os_one` enforces it by
 //! scanning this crate's source on every test run — so the rule fails the build
 //! rather than living in a document nobody re-reads.
 //!

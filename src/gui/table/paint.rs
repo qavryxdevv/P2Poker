@@ -8,7 +8,7 @@
 //! # The look is the reference photograph's
 //!
 //! `assets/ggpoker-rush-and-cash-table.jpg`, whose colours were sampled into
-//! [`theme`](crate::gui::theme): felt darkest at the rim and brightest just off
+//! [`crate::gui::theme`]: felt darkest at the rim and brightest just off
 //! centre, a rail lit from below, and a four-colour deck whose cards are a solid
 //! suit colour with a white notch in one corner and a large white rank.
 //!

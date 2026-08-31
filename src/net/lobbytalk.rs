@@ -46,15 +46,10 @@ use super::lobby::RateLimiter;
 /// eight lines tall.
 pub const SAID_MAX: usize = 256;
 
-/// How long a player is still "in the lobby" after their last presence.
-///
-/// Three times the interval they are sent at, so two lost messages do not
-/// remove somebody who is sitting there. The same relationship the table
-/// advertisements have with their own TTL, for the same reason.
-pub const PRESENCE_TTL_MS: u64 = 90_000;
-
-/// How often to say it.
-pub const PRESENCE_EVERY_MS: u64 = 30_000;
+// **The presence TTL and heartbeat are `protocol::constants`'.** They were
+// defined here too, at `90_000` and `30_000`, and this module's pair is what the
+// client actually ran on while the documented pair sat next to a compile-time
+// assertion that nothing reached. See `constants::PRESENCE_TTL_MS`.
 
 /// What arrived, once it has been checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
