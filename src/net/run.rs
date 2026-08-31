@@ -462,6 +462,25 @@ pub async fn run(
     // A tournament that has once been full has started, and does not reopen.
     let mut tournament_started = false;
     let mut have_reservation = false;
+    // **Whether the reservation this client holds can carry a hand, and which
+    // poker peers are reachable only through it.**
+    //
+    // Measured across two networks and it is the finding of that run: every
+    // public relay found offered 131 072 bytes / 120 s, which `relay::adequate`
+    // correctly calls *not enough*, and the client said so — once, at
+    // reservation time, three thousand lines before the hand. When DCUtR then
+    // failed for the one peer that mattered, the hand reached the deal, the
+    // circuit hit its limit, publishing began to answer
+    // `NoPeersSubscribedToTopic`, and the hand died at its deadline reporting
+    // only *"the hand ran out of time"*.
+    //
+    // Both halves are needed. An inadequate reservation with every peer
+    // hole-punched carries nothing of the game and is irrelevant; a relayed
+    // peer on an unlimited reservation is fine. It is the conjunction that
+    // ends hands, so the conjunction is what the deadline reports.
+    let mut relay_inadequate = false;
+    let mut relayed_peers: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
     // Counted so that "no relay" is reported as a finding rather than as
     // impatience: three cycles is three minutes of looking.
     let mut relay_searches: u32 = 0;
@@ -611,15 +630,17 @@ pub async fn run(
                             bytes,
                             limit.as_ref().and_then(|l| l.duration()),
                         );
+                        let adequate = matches!(
+                            verdict,
+                            relay::Adequacy::Adequate | relay::Adequacy::Unlimited
+                        );
+                        relay_inadequate = !adequate;
                         let _ = events
                             .send(NodeEvent::Reserved {
                                 relay: relay_peer_id,
                                 bytes,
                                 seconds,
-                                adequate: matches!(
-                                    verdict,
-                                    relay::Adequacy::Adequate | relay::Adequacy::Unlimited
-                                ),
+                                adequate,
                             })
                             .await;
                     }
@@ -1158,11 +1179,13 @@ pub async fn run(
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Dcutr(ev)) => {
                         match ev.result {
                             Ok(_) => {
+                                relayed_peers.remove(&ev.remote_peer_id);
                                 let _ = events
                                     .send(NodeEvent::HolePunched(ev.remote_peer_id))
                                     .await;
                             }
                             Err(_) => {
+                                relayed_peers.insert(ev.remote_peer_id);
                                 let _ = events
                                     .send(NodeEvent::StillRelayed(ev.remote_peer_id))
                                     .await;
@@ -2186,10 +2209,27 @@ pub async fn run(
                 match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
                     Ok(sends) => {
                         publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said);
+                        // **And name the cause when the transport is the cause.**
+                        // A player reading "the hand ran out of time" looks for
+                        // a slow opponent. Across two networks the opponent was
+                        // not slow: the only path to it was a relay circuit
+                        // limited to 128 KB and two minutes, which is less than
+                        // one hand, and the hand stopped at the deal.
+                        let stranded: Vec<&libp2p::PeerId> =
+                            relayed_peers.intersection(&poker_peers).collect();
+                        let why = if relay_inadequate && !stranded.is_empty() {
+                            format!(
+                                ". {} of the poker peers here {} reachable only through a relay                                  whose reservation this client already reported as too small to                                  carry a hand - that is the likely cause, and it is not the                                  opponent being slow",
+                                stranded.len(),
+                                if stranded.len() == 1 { "is" } else { "are" }
+                            )
+                        } else {
+                            String::new()
+                        };
                         let _ = events
-                            .send(NodeEvent::Warning(
-                                "the hand ran out of time; every stack is restored".into(),
-                            ))
+                            .send(NodeEvent::Warning(format!(
+                                "the hand ran out of time; every stack is restored{why}"
+                            )))
                             .await;
                         // Straight on: an abort has nothing to look at, so
                         // D-020's hold has nothing to hold.

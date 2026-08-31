@@ -910,6 +910,73 @@ The step that remains is to make a failing argument say — the two `DeckCtx` fi
 input deck hash each side used — because the note as written says where the
 chain was and not what the proof was checked against.
 
+## The two-network run's real finding: a relayed hand dies at 128 KB
+
+The second run across the boundary is more interesting than the first, because
+it failed — and it failed in the one way only two networks can show.
+
+| | run 1, 120 s | run 2, 300 s |
+|---|---|---|
+| table formed | yes | yes |
+| hands agreed | 1, genesis `55f97eeb` | 1, genesis `1a2db2ab` |
+| direct connections at the far end | 8 | **0** |
+| hands the far end finished | 1 | **0** |
+
+In run 2 the far end reached `hand #1: the deck is shuffled and sealed` and
+then said nothing about that hand ever again. This end reached `your turn — 50
+to call`, then `not published: NoPeersSubscribedToTopic` five times, then `your
+clock ran out — Fold for you`, then `the hand ran out of time; every stack is
+restored`. It opened hand #2, waited for seat 1, and timed that one out too.
+
+**The cause was printed on line 20, three thousand lines earlier, at both
+ends:**
+
+```
+relay 12D3KooWJYusw…: 131072 bytes / 120 s, NOT enough to carry a hand
+```
+
+Every public relay either refused a reservation or granted the libp2p circuit
+relay v2 defaults — 128 KB of data and two minutes of circuit — and
+`relay::adequate` correctly compares that against what a hand costs and says
+no. In run 1 DCUtR hole-punched the far peer and the circuit stopped mattering.
+In run 2 it did not, the hand was carried over the circuit, and the circuit ran
+out somewhere around the deal: the deck messages are 9 KB per shuffler and
+`DEAL_PRIVATE` is ~2 KB heads-up, which is most of a 128 KB budget once the
+lobby traffic sharing that circuit is counted.
+
+**So the game across two networks depends on hole punching, not on the relay.**
+The relay finds the peer and carries the formation; it cannot carry the hand.
+That is a property of the public relays that exist, not of this protocol, and
+nothing in the client can raise their limits.
+
+### What was changed, and what deliberately was not
+
+Changed: **the deadline says so.** `run.rs` now tracks whether the reservation
+was judged inadequate and which poker peers DCUtR failed for, and when a hand
+dies at its deadline with both true it names the relay as the likely cause and
+says it is *"not the opponent being slow"*. The facts were all present before
+and each was said once, far apart, in a log where three thousand lines of DHT
+chatter separate them — a player reading `the hand ran out of time` had no
+route back to line 20.
+
+Also changed: `tools/two-network-ssh.ps1` reports direct connections at **both**
+ends, peers left on the relay, the count of too-small reservations and the count
+of `NoPeersSubscribedToTopic`. It reported direct connections at the far end
+only, which is the number the whole result turns on, and a run that says "a
+table formed" without saying how it was carried invites the wrong conclusion.
+
+Not changed, and these are decisions rather than omissions:
+
+* **No refusal to start a hand over a thin circuit.** It is tempting and it is
+  wrong: the reservation limits are what the relay *reported*, hole punching
+  can succeed at any moment, and a client that refuses to deal would turn a
+  hand that usually works into a table that never starts.
+* **No relay of our own.** A reachable peer already becomes a relay for the
+  others (`--port` exists for exactly that), so the answer already in the design
+  is *one player who can forward a port*, not a piece of infrastructure.
+* **Nothing about hole-punch success rate.** Two runs are two runs. What is
+  solid is the mechanism and the numbers above; the rate needs many more.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that
@@ -959,8 +1026,24 @@ turbulent point of a run, and neither has recurred in the five runs since.
   the three parts of the context that can vary, from **both** sides.
 * **A settlement mismatch.** Ruled out: this client's own timeout action follows
   the same rule the certificate does, so a self-fold and a certified check
-  cannot be two different hands. The refusal now prints both `final_stacks`
-  vectors and both pot counts.
+  cannot be two different hands.
+
+  **And the instrument had a hole exactly where it would have mattered.** It
+  printed two `final_stacks` vectors and two pot counts, which is two of the
+  six fields a receiver compares. A hand disagreeing only about `deltas`,
+  `busted` or `state_hash` printed two **identical** vectors under the word
+  "disagreement" - which reads as a broken instrument rather than as a
+  difference somewhere the instrument does not look, and `state_hash` is the
+  one field that can differ while all five others agree, because checkpoint 8
+  carries the board, the button, the transcript head and `signed_this_hand`
+  and the settlement repeats none of them. Two engines that agree about the
+  money and disagree about the hand look exactly like that.
+
+  `HandComplete::disagreement` now names the field and prints both sides, and
+  it **destructures `Self`**, so a seventh field is a compile error in the
+  report rather than a line that silently stops covering it. A test would only
+  have checked the fields somebody remembered to list, which is the same memory
+  that would have failed.
 
 ### Coverage that is missing rather than broken
 

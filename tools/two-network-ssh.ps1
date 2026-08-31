@@ -217,7 +217,23 @@ Write-Host "  there : peers $(Count $remoteText 'another poker client'), saw tab
 Write-Host ""
 Write-Host "  relay reservations here : $(Count $localText 'reservation')"
 Write-Host "  relay reservations there: $(Count $remoteText 'reservation')"
-Write-Host "  direct connections there: $(Count $remoteText 'is now a direct connection')"
+# **Both sides, and the reservation's verdict.** The first version counted direct
+# connections at the far end only, and that is the number this test turns on: a
+# run where the far peer never hole-punches plays no hand to the end, because
+# every public relay found so far offers 128 KB / 120 s and the client itself
+# calls that not enough to carry one. A run that reports "a table formed" and
+# nothing about how it was carried invites the wrong conclusion.
+Write-Host "  direct connections here  : $(Count $localText 'is now a direct connection')"
+Write-Host "  direct connections there : $(Count $remoteText 'is now a direct connection')"
+Write-Host "  peers left on the relay  : here $(Count $localText 'stays relayed'), there $(Count $remoteText 'stays relayed')"
+$thin = (Count $localText 'NOT enough to carry a hand') + (Count $remoteText 'NOT enough to carry a hand')
+if ($thin -gt 0) {
+    Write-Host "  relay reservations too small to carry a hand: $thin" -ForegroundColor Yellow
+}
+$stuck = (Count $localText 'NoPeersSubscribedToTopic') + (Count $remoteText 'NoPeersSubscribedToTopic')
+if ($stuck -gt 0) {
+    Write-Host "  publishes with nobody subscribed: $stuck  (a circuit that closed mid-hand looks like this)" -ForegroundColor Yellow
+}
 Write-Host ""
 
 if ((Count $remoteText 'the table is set') -gt 0) {

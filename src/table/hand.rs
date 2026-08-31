@@ -3226,18 +3226,30 @@ impl Hand {
         // here: a body that differs anywhere means two engines disagree about
         // the hand, which is a divergence and not a preference.
         if theirs != **mine {
-            // **And say what differs.** "Seat N holds a different settlement"
-            // named the peer and nothing else, so the one occurrence a day of
-            // running produced could not be told from any other: two engines
-            // disagreeing about a pot, about a winner, or about a fold nobody
-            // saw all read the same in the log.
-            let ours = mine.final_stacks.clone();
-            let theirs_stacks = theirs.final_stacks.clone();
-            let pots = (mine.pots.len(), theirs.pots.len());
-            self.settle_note = Some(format!(
-                "settlement disagreement with seat {seat}: mine {ours:?} theirs {theirs_stacks:?}, pots {} against {}",
-                pots.0, pots.1
-            ));
+            // **And say what differs — the field, not the body.** "Seat N holds
+            // a different settlement" named the peer and nothing else, so the
+            // one occurrence a day of running produced could not be told from
+            // any other. The first repair printed two `final_stacks` vectors
+            // and two pot counts, which covers two of the six fields: a hand
+            // that disagreed only about `deltas`, `busted` or `state_hash`
+            // printed two identical vectors under the word "disagreement",
+            // which reads as a broken instrument rather than as a difference
+            // somewhere the instrument does not look.
+            let what = mine.disagreement(&theirs);
+            self.settle_note = Some(if what.is_empty() {
+                // Unreachable while `PartialEq` and `disagreement` enumerate the
+                // same fields, and reachable the moment a field is added to one
+                // and not the other. Said out loud, because a report that goes
+                // quiet is how that survives to a second occurrence.
+                format!(
+                    "settlement disagreement with seat {seat} in a field this report does not enumerate                      - HandComplete::disagreement is missing a field the derive compares"
+                )
+            } else {
+                format!(
+                    "settlement disagreement with seat {seat}: {}",
+                    what.join("; ")
+                )
+            });
             return Err(Failed::DeckDisagrees {
                 seat,
                 what: "settlement",

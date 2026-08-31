@@ -491,6 +491,87 @@ impl HandComplete {
     pub fn conserves_chips(&self) -> bool {
         self.deltas.iter().map(|d| i128::from(*d)).sum::<i128>() == 0
     }
+
+    /// Which fields two copies of this settlement disagree about, and what each
+    /// side holds there.
+    ///
+    /// # Why the report enumerates fields instead of printing two bodies
+    ///
+    /// A receiver compares the whole body, because every field is derived and a
+    /// difference anywhere means two engines disagree about the hand. But the
+    /// *report* was two `final_stacks` vectors and two pot counts, and four of
+    /// the six fields are neither: a hand that disagreed only about `deltas`,
+    /// `busted` or `state_hash` printed two **identical** vectors and two equal
+    /// counts under the words "settlement disagreement".
+    ///
+    /// That is worse than saying nothing. One of the two disagreements this
+    /// project has instrumented and cannot explain is a settlement mismatch seen
+    /// once, and a reader looking at two identical vectors concludes the
+    /// instrument is broken rather than that the difference is somewhere the
+    /// instrument does not look.
+    ///
+    /// # The empty case is a finding, not a gap
+    ///
+    /// The caller reaches this after `self != theirs`, so an empty result means
+    /// `PartialEq` and this function disagree — which happens exactly when a
+    /// field is added to the struct and not added here. The caller says so
+    /// rather than printing nothing, because a silent report is how this class
+    /// of defect survives a second time.
+    pub fn disagreement(&self, theirs: &Self) -> Vec<String> {
+        fn short(h: &[u8; 32]) -> String {
+            h[..4].iter().map(|b| format!("{b:02x}")).collect()
+        }
+        // **Destructured, so a seventh field is a compile error here.** The
+        // bindings are unused — every comparison below reads `self` and `theirs`
+        // directly — and that is the point: this pattern must name every field
+        // of the struct, so adding one without extending the report cannot
+        // build. A test could only have checked the fields somebody remembered
+        // to list, which is the same memory that would have failed.
+        let Self {
+            pots: _,
+            refunds: _,
+            deltas: _,
+            final_stacks: _,
+            busted: _,
+            state_hash: _,
+        } = self;
+
+        let mut out = Vec::new();
+        if self.pots != theirs.pots {
+            out.push(format!("pots {:?} against {:?}", self.pots, theirs.pots));
+        }
+        if self.refunds != theirs.refunds {
+            out.push(format!(
+                "refunds {:?} against {:?}",
+                self.refunds, theirs.refunds
+            ));
+        }
+        if self.deltas != theirs.deltas {
+            out.push(format!("deltas {:?} against {:?}", self.deltas, theirs.deltas));
+        }
+        if self.final_stacks != theirs.final_stacks {
+            out.push(format!(
+                "final stacks {:?} against {:?}",
+                self.final_stacks, theirs.final_stacks
+            ));
+        }
+        if self.busted != theirs.busted {
+            out.push(format!("busted {:?} against {:?}", self.busted, theirs.busted));
+        }
+        if self.state_hash != theirs.state_hash {
+            // The one field that is a hash of everything else, so it can differ
+            // while all five above agree: the checkpoint-8 state carries the
+            // board, the button, the transcript head and `signed_this_hand`,
+            // none of which the settlement repeats. Alone in the list, it means
+            // the two engines agree about the money and disagree about the hand.
+            out.push(format!(
+                "checkpoint-8 state hash {} against {}",
+                short(&self.state_hash),
+                short(&theirs.state_hash)
+            ));
+        }
+        out
+    }
 }
 
 /// `HAND_ABORT 0x0802`: the other way a hand can end.
@@ -825,6 +906,84 @@ mod tests {
         assert_eq!(minicbor::decode::<ActionAmount>(&bytes).unwrap(), raise);
         assert_eq!(raise.head().seat, 3);
         assert_eq!(raise.head().action_index, 8);
+    }
+
+    /// The settlement report must name the field that differs, including the
+    /// three fields the first version of it could not see.
+    ///
+    /// The case that matters is `state_hash` alone: the money agrees, the pots
+    /// agree, the stacks agree, and the hand still disagrees — which is what
+    /// two engines that played different hands and settled the same way look
+    /// like. The old report printed two identical stack vectors there.
+    #[test]
+    fn a_settlement_disagreement_names_the_field() {
+        let mine = HandComplete {
+            pots: vec![PotAward {
+                size: 300,
+                eligible: vec![0, 1, 2],
+                winners: vec![1],
+                odd_chips: vec![],
+            }],
+            refunds: vec![Refund { seat: 2, amount: 50 }],
+            deltas: vec![-100, 200, -100],
+            final_stacks: vec![900, 1200, 900],
+            busted: vec![],
+            state_hash: [7u8; 32],
+        };
+
+        assert!(
+            mine.disagreement(&mine).is_empty(),
+            "a body must not disagree with itself"
+        );
+
+        // Only the checkpoint-8 hash differs. Every visible quantity matches.
+        let theirs = HandComplete {
+            state_hash: [9u8; 32],
+            ..mine.clone()
+        };
+        let what = mine.disagreement(&theirs);
+        assert_eq!(what.len(), 1, "one field differs, so one line: {what:?}");
+        assert!(
+            what[0].contains("state hash") && what[0].contains("07070707"),
+            "it must name the field and both values: {what:?}"
+        );
+
+        // And the three fields the old report could not see are each named.
+        for (label, other) in [
+            (
+                "deltas",
+                HandComplete {
+                    deltas: vec![-100, 100, 0],
+                    ..mine.clone()
+                },
+            ),
+            (
+                "busted",
+                HandComplete {
+                    busted: vec![2],
+                    ..mine.clone()
+                },
+            ),
+            (
+                "refunds",
+                HandComplete {
+                    refunds: vec![],
+                    ..mine.clone()
+                },
+            ),
+        ] {
+            let what = mine.disagreement(&other);
+            assert_eq!(what.len(), 1, "{label}: {what:?}");
+            assert!(what[0].starts_with(label), "{label}: {what:?}");
+        }
+
+        // Two at once are two lines, not the first one found.
+        let both = HandComplete {
+            busted: vec![0],
+            state_hash: [9u8; 32],
+            ..mine.clone()
+        };
+        assert_eq!(mine.disagreement(&both).len(), 2);
     }
 
     #[test]
