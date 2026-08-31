@@ -2810,6 +2810,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         .all_peers()
                         .filter(|(_, subscribed)| subscribed.contains(&&hash))
                         .count();
+                    // **Two different quantities, and the line used to read as
+                    // if they were one.** `mesh` counts peers GRAFTED into the
+                    // gossipsub mesh for this topic; `known` and `who` count and
+                    // name the peers SUBSCRIBED to it. The message was
+                    // `"{mesh} of {known} subscribed {who:?}"`, which reads as
+                    // *none of the eight are subscribed* and then lists eight
+                    // subscribers — the opposite of what it measures. A
+                    // nine-seat run on the libp2p path was read that way, as a
+                    // subscription failure, when what it says is that all eight
+                    // are subscribed and **none is grafted**: adverts then
+                    // arrive only by gossip pull, which is the "a table that
+                    // should form in seconds took minutes" symptom above.
+                    //
                     // Named, not counted. The founder reporting one subscriber
                     // while both joiners report two is the standing clue, and a
                     // count cannot say WHICH peer is missing.
@@ -2852,7 +2865,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if known > 0 || mesh > 0 || !connected.is_empty() {
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "lobby topic: {mesh} of {known} subscribed {who:?}; connected {connected:?}"
+                                "lobby topic: {mesh} of {known} subscribed peers grafted; subscribed {who:?}; connected {connected:?}"
                             )))
                             .await;
                     }

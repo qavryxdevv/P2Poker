@@ -215,7 +215,13 @@ foreach ($n in $nodes) {
 # genesis column says. This is the check that catches what the genesis one
 # cannot.
 $deaf = @($nodes | Where-Object { $_.Opens.Count -gt 0 -and $_.Overs -eq 0 })
-$never = @($nodes | Where-Object { $null -eq $_.Group })
+# **A build with no Tox has no group, and that is not a fault.** Every node
+# reporting `never` means this is the libp2p path (`--no-default-features`),
+# which is a curve worth measuring against D-019's. One node missing a group
+# while others have one is the fault.
+$onTox = @($nodes | Where-Object { $null -ne $_.Group }).Count -gt 0
+$never = if ($onTox) { @($nodes | Where-Object { $null -eq $_.Group }) } else { @() }
+if (-not $onTox) { Write-Host 'path   libp2p (no node reported a Tox group)' }
 $forked = @($nodes | Where-Object { $_.Opens.Count -gt 0 -and $_.Node -ne 'n0' } | Where-Object {
     $n = $_
     ($n.Opens | Where-Object {
@@ -254,6 +260,7 @@ if ($deaf.Count -gt 0) {
 # were deleted, and the question it could have answered (a friend connection
 # that had not come up, or an invitation refused?) went with them.
 $slow = @($nodes | Where-Object { $null -ne $_.Group -and $_.Group -gt $LateGroupSeconds })
+if (-not $onTox) { $slow = @() }
 if ($slow.Count -gt 0) {
     Write-Warning ("{0} seat(s) took longer than {1} s to enter the group: {2}" -f $slow.Count, $LateGroupSeconds, (($slow | ForEach-Object { '{0} at {1} s' -f $_.Node, $_.Group.ToString('F1', $inv) }) -join ', '))
     $KeepLogs = $true
