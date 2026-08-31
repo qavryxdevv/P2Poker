@@ -2397,6 +2397,92 @@ grafted means adverts arrive only by gossip pull, which is exactly the *"a table
 that should form in seconds took minutes"* symptom that comment records. The line
 now reads `0 of 8 subscribed peers grafted; subscribed […]; connected […]`.
 
+## The formation flake was `add_explicit_peer`, and a founder's own advert never left
+
+**Measured, three runs each side, six seats, one machine, shipping build:**
+
+| | time to hand 1 | s / hand |
+|---|---|---|
+| before | 33.2, 30.9, 31.0 s | 61.2, 9.9, 10.3 |
+| **after** | **7.2, 8.1, 7.0 s** | 9.5, 9.6, 10.6 |
+
+A table forms **four times faster**, three for three, and the
+`not published: NoPeersSubscribedToTopic` a founder logged seconds after hosting
+is gone. Steady-state play is unchanged, which is what should happen: the defect
+was in getting the advert out, not in the hand.
+
+### The mechanism, from the library's source
+
+Every peer found by mDNS was handed to `gossipsub.add_explicit_peer`. It was
+there to make delivery to a neighbour reliable. In `libp2p-gossipsub 0.49.5` it
+does the opposite, twice over:
+
+* **An explicit peer can never be grafted into the mesh.** The heartbeat's graft
+  filter is `!explicit_peers.contains(peer)` (`behaviour.rs:2224` and `:2317`).
+  On a LAN every peer arrives by mDNS, so **every peer was explicit and the mesh
+  could never fill** — measured as `0 of 5 subscribed peers grafted`, for a whole
+  run, with all five speaking gossipsub.
+* **And then `publish` reaches nobody.** With `flood_publish(false)`, which §11
+  sets deliberately, `publish` takes the mesh branch. `mesh_peers` is empty; the
+  top-up that would cover it filters on `!explicit_peers.contains(peer)`
+  **again** (`:670`); so `recipient_peers` comes out empty and the call returns
+  `NoPeersSubscribedToTopic` (`:783`).
+
+**The asymmetry is what hid it for so long.** `forward_msg` *does* include
+explicit peers (`:2740`), so everything this node relays for somebody else
+arrives normally. Only what it **originates** goes nowhere — and the one thing a
+founder originates that matters is its table advert. The table then formed only
+when a joiner happened to pull the advert by gossip, which is exactly the
+*"should have taken seconds, took minutes"* symptom recorded against this flake
+for months.
+
+An mDNS neighbour is an ordinary peer. The mesh is where it belongs.
+
+### The instrument that found it, and the one that nearly stopped it
+
+The line that pointed here read:
+
+```
+lobby topic: 0 of 8 subscribed ["xJQP24", … eight names …]; connected […]
+```
+
+`mesh` counts peers **grafted**; `known` and `who` count and name peers
+**subscribed**. The sentence collapsed the two, so it read as *none of the eight
+are subscribed* and then listed eight subscribers — and I read it that way first.
+It now says `0 of 8 subscribed peers grafted (N cannot be, wrong or unnegotiated
+protocol); subscribed […]; connected […]`.
+
+That `N` is the second half. `all_peers` does not filter on `PeerKind` while the
+mesh filler requires `kind.is_gossipsub()` (`behaviour.rs:3541`, `types.rs:166`),
+so *"subscribed but not grafted"* was two failures with one appearance. The
+counter separated them in one run: **`0 cannot be`** — every subscriber spoke
+gossipsub — which is what ruled out the protocol and left the explicit-peer list.
+
+It is compared as text because `PeerKind` is returned publicly by
+`peer_protocol()` and is **not** in the crate's `pub use` list (`lib.rs:119`), so
+its variants cannot be matched. The three names are listed as the *healthy* ones
+on purpose: a library that renames one makes the line shout about every peer
+rather than fall silent about a broken one.
+
+### What the fix exposed, and it is the next thing
+
+**A seat can still ratify and open hand 1 before it is in the Tox group**, and
+then it forks and never rejoins. Measured in one of the three fixed runs: `n2`
+opened hand 1 at **4.3 s** on its own genesis, entered the group at **15.1 s**,
+and finished **none** of the 4 hands it opened while the founder finished 22.
+
+**The fix widened that window rather than narrowing it.** Formation now completes
+in ~7 s where it took ~31, and Tox group entry is still 10–40 s on toxcore's own
+LAN discovery cadence. The founder opens hand 1 the moment the roster ratifies,
+which is now reliably *before* the group holds every seat.
+
+The gate is implementable — `peer_for` already answers *is this roster key in the
+group?* for each seat, so the founder can hold hand 1 until all of them are — and
+it is **not** a wire change: no message and no hash moves, the founder simply
+waits before emitting `HAND_INIT`. What it needs is a decision about the failure
+case, because a seat that never joins would otherwise hold the table for ever.
+Filed rather than written in a hurry.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that

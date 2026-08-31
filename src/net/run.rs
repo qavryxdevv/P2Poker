@@ -1650,7 +1650,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // a new lease — is offering a route this node does
                             // not have yet. It is only the *announcement* that
                             // is once per peer.
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                            // **Not `add_explicit_peer`, and that call was the
+                            // formation flake.** It was here to make delivery to
+                            // a neighbour reliable and did the exact opposite.
+                            //
+                            // An explicit peer is excluded from the mesh: the
+                            // heartbeat's graft filter is
+                            // `!explicit_peers.contains(peer)`
+                            // (`libp2p-gossipsub-0.49.5/src/behaviour.rs:2224`
+                            // and `:2317`). So on a LAN, where every peer
+                            // arrives by mDNS, **every peer was explicit and the
+                            // mesh could never fill** — measured as
+                            // `0 of 5 subscribed peers grafted`, for the whole
+                            // life of a run, with all five speaking gossipsub.
+                            //
+                            // With `flood_publish(false)`, which §11 sets
+                            // deliberately, `publish` then reaches nobody:
+                            // `mesh_peers` is empty, and the top-up that would
+                            // cover it filters on `!explicit_peers.contains`
+                            // **again** (`:670`), so `recipient_peers` comes out
+                            // empty and the call returns
+                            // `NoPeersSubscribedToTopic` (`:783`). That is the
+                            // `not published: NoPeersSubscribedToTopic` a
+                            // founder logs seconds after hosting.
+                            //
+                            // The asymmetry is what hid it: `forward_msg` **does**
+                            // include explicit peers (`:2740`), so everything
+                            // this node relays for somebody else arrives, and
+                            // only what it originates — its own table advert —
+                            // goes nowhere. The table then forms only when a
+                            // joiner pulls the advert by gossip, which is the
+                            // "should have taken seconds, took minutes" symptom.
+                            //
+                            // An mDNS neighbour is an ordinary peer. The mesh is
+                            // what it belongs in.
                             // **Every** address is dialled, and only the
                             // announcement is once per peer.
                             //
@@ -2837,6 +2870,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // reporting both connected — measured, five runs. A count
                     // cannot say WHICH peer is connected and not subscribed,
                     // and that is the whole question.
+                    // **Which protocol gossipsub thinks each subscriber
+                    // speaks, because that decides whether it can be grafted at
+                    // all.** `all_peers` — which `known` and `who` are built
+                    // from — does not filter on `PeerKind`, while
+                    // `get_random_peers_dynamic`, which is what the heartbeat
+                    // fills the mesh from, requires `p.kind.is_gossipsub()`
+                    // (`libp2p-gossipsub-0.49.5/src/behaviour.rs:3541` and
+                    // `types.rs:166`). A peer whose protocol is not yet
+                    // negotiated, or is Floodsub, or is NotSupported, therefore
+                    // counts as subscribed here and is invisible to the mesh.
+                    //
+                    // That is two different failures with one appearance, which
+                    // is the shape this project keeps paying for. Non-zero means
+                    // the protocol; zero means backoff or score.
+                    //
+                    // **Compared as text, because `PeerKind` is not exported.**
+                    // `peer_protocol()` returns `&PeerKind` publicly and the
+                    // type is absent from the crate's `pub use` list
+                    // (`lib.rs:119`), so the variants cannot be matched. The
+                    // three names below are `types.rs:126–137`. The polarity is
+                    // deliberate: they are the **healthy** kinds, so a library
+                    // that renames one makes this line shout about every peer
+                    // rather than fall silent about a broken one.
+                    const GRAFTABLE: [&str; 3] = ["Gossipsubv1_2", "Gossipsubv1_1", "Gossipsub"];
+                    let subscribed: std::collections::HashSet<libp2p::PeerId> = g
+                        .all_peers()
+                        .filter(|(_, subs)| subs.contains(&&hash))
+                        .map(|(p, _)| *p)
+                        .collect();
+                    let not_gossipsub = g
+                        .peer_protocol()
+                        .filter(|(p, _)| subscribed.contains(p))
+                        .filter(|(_, kind)| !GRAFTABLE.contains(&format!("{kind:?}").as_str()))
+                        .count();
                     let connected: Vec<String> = poker_peers
                         .iter()
                         .map(|p| p.to_string().chars().rev().take(6).collect::<String>())
@@ -2865,7 +2932,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if known > 0 || mesh > 0 || !connected.is_empty() {
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "lobby topic: {mesh} of {known} subscribed peers grafted; subscribed {who:?}; connected {connected:?}"
+                                "lobby topic: {mesh} of {known} subscribed peers grafted ({not_gossipsub} cannot be, wrong or unnegotiated protocol); subscribed {who:?}; connected {connected:?}"
                             )))
                             .await;
                     }
