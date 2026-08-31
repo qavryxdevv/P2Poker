@@ -418,6 +418,10 @@ pub async fn run(
     // saw, and `ticks` counts five-second ticks since that position moved. A
     // table that is advancing re-sends almost nothing; a stuck one still gets
     // its first repeat after five seconds.
+    // How many times the table's topic has been said again while forming.
+    // Bounded, because the primitive is not free: a peer that has still not
+    // heard after this many tries has a problem re-announcing will not fix.
+    let mut table_announces: u32 = 0;
     let mut resend_at: u64 = u64::MAX;
     let mut resend_ticks: u32 = 0;
 
@@ -1069,6 +1073,7 @@ pub async fn run(
                                         // is exactly what sits in that queue.
                                         tox_sink.clear();
                             tox_group_said = false;
+                            table_announces = 0;
                                         if let Some(t) = table_topic.take() {
                                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                                         }
@@ -1110,6 +1115,7 @@ pub async fn run(
                         // is exactly what sits in that queue.
                         tox_sink.clear();
                             tox_group_said = false;
+                            table_announces = 0;
                         if let Some(t) = table_topic.take() {
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
@@ -1457,20 +1463,27 @@ pub async fn run(
                             // the ordinary exchange worked — which is most of
                             // the time — there is nothing to repair and this
                             // does nothing.
-                            let lobby_hash = topics.lobby.hash();
-                            let already = swarm
-                                .behaviour()
-                                .gossipsub
-                                .all_peers()
-                                .any(|(p, subscribed)| {
-                                    *p == peer_id && subscribed.contains(&&lobby_hash)
-                                });
-                            if !already {
-                                for t in [&topics.lobby, &topics.lobby_chat] {
-                                    let g = &mut swarm.behaviour_mut().gossipsub;
-                                    let _ = g.unsubscribe(t);
-                                    let _ = g.subscribe(t);
-                                }
+                            // **Every topic this client holds, and the
+                            // table's is one of them.** It checked the lobby
+                            // hash alone, so a peer subscribed to the lobby and
+                            // not to the table read as "already fine" and
+                            // nothing was re-announced — and the table's topic
+                            // is the one `TABLE_READY` travels on.
+                            //
+                            // Measured: a founder connected to both joiners,
+                            // seated both over the join RPC (which is
+                            // request-response and unaffected), and never
+                            // received either ratification. `lobby topic: 0 of
+                            // 2 subscribed` was in its own log, twice, next to
+                            // two direct connections. The other two formed the
+                            // table without it and played seventeen hands as
+                            // seats [1, 2].
+                            if !peer_has_our_topics(&swarm, &peer_id, &topics, table_topic.as_ref())
+                            {
+                                let mut which: Vec<&gossipsub::IdentTopic> =
+                                    vec![&topics.lobby, &topics.lobby_chat];
+                                which.extend(table_topic.as_ref());
+                                announce_topics(&mut swarm, &which);
                             }
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: false })
@@ -2055,6 +2068,7 @@ pub async fn run(
                                         // the table rides the mesh.
                                         tox_sink.clear();
                             tox_group_said = false;
+                            table_announces = 0;
                                         let _ = events
                                             .send(NodeEvent::Warning(
                                                 "the Tox group did not come up; this table stays on the mesh"
@@ -2329,6 +2343,7 @@ pub async fn run(
                         // is exactly what sits in that queue.
                         tox_sink.clear();
                             tox_group_said = false;
+                            table_announces = 0;
                         if let Some(t) = table_topic.take() {
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
@@ -2400,6 +2415,37 @@ pub async fn run(
                             refused + sent
                         )))
                         .await;
+                }
+
+                // **While a table is forming, keep saying what we subscribe
+                // to.** The per-peer check above fires once, when a peer
+                // arrives; a subscription lost after that is a subscription
+                // nothing repairs, and the window that matters is exactly the
+                // few seconds between seating and ratifying. A formed table
+                // that is playing does not need it and does not do it.
+                // **The table's topic only, and only a few times.** The
+                // first version said all three every five seconds for as long
+                // as a table was forming, and that churn cost more than it
+                // bought: every re-announce prunes this client from every
+                // peer's lobby mesh, and adverts started coming back
+                // `RateLimited` — at the founder, against its own.
+                //
+                // The lobby is not what is missing during formation. The
+                // table's topic is, and re-announcing that one disturbs only
+                // the seats already at the table.
+                if let (Some(t), true, true) =
+                    (table_topic.as_ref(), table.is_some(), hand.is_none())
+                {
+                    let hash = t.hash();
+                    let missing = poker_peers.iter().any(|p| {
+                        !swarm.behaviour().gossipsub.all_peers().any(|(q, subs)| {
+                            q == p && subs.contains(&&hash)
+                        })
+                    });
+                    if missing && table_announces < MAX_TABLE_ANNOUNCES {
+                        table_announces += 1;
+                        announce_topics(&mut swarm, &[t]);
+                    }
                 }
 
                 let Some(h) = hand.as_ref() else { continue };
@@ -3337,6 +3383,58 @@ async fn begin_hand(
 /// the transport. Neither GossipSub nor a Tox group keeps history, and a peer
 /// that joined after a publish never sees it — measured on both, and on the Tox
 /// side it killed a hand with neither end reporting anything wrong.
+/// Is this peer known to subscribe to every topic this client holds?
+///
+/// GossipSub delivers to grafted mesh peers, and a peer it does not know is
+/// subscribed is a peer it will not graft. The answer is what it *knows*, which
+/// is a claim that arrives in a subscription message and can be missed.
+fn peer_has_our_topics(
+    swarm: &libp2p::Swarm<super::swarm::PokerBehaviour>,
+    peer: &libp2p::PeerId,
+    topics: &super::swarm::Topics,
+    table: Option<&gossipsub::IdentTopic>,
+) -> bool {
+    let mut want = vec![topics.lobby.hash(), topics.lobby_chat.hash()];
+    if let Some(t) = table {
+        want.push(t.hash());
+    }
+    swarm
+        .behaviour()
+        .gossipsub
+        .all_peers()
+        .any(|(p, subscribed)| p == peer && want.iter().all(|h| subscribed.contains(&h)))
+}
+
+/// Say again what this client subscribes to, for the topics named.
+///
+/// There is no per-peer "send my subscriptions" call, so this is the primitive
+/// that exists: dropping and retaking a topic re-announces it to everyone
+/// connected.
+///
+/// **It is expensive and the list is explicit for that reason.** Peers that
+/// receive the `UNSUBSCRIBE` prune this client from their mesh for that topic
+/// and re-graft on a later heartbeat — so re-announcing the lobby churns every
+/// peer's view of it. Measured, and it was a regression of mine: re-announcing
+/// all three topics every five seconds while a table formed pushed the lobby
+/// hard enough that adverts came back `RateLimited`, including at the founder
+/// against its own. Say again only what is actually missing.
+fn announce_topics(
+    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    which: &[&gossipsub::IdentTopic],
+) {
+    for t in which {
+        let g = &mut swarm.behaviour_mut().gossipsub;
+        let _ = g.unsubscribe(*t);
+        let _ = g.subscribe(*t);
+    }
+}
+
+/// How many times a forming table says its topic again before giving up.
+///
+/// Three, at five seconds apart. A peer that has not heard by then is not going
+/// to, and the churn of saying it again costs every seat already there.
+const MAX_TABLE_ANNOUNCES: u32 = 3;
+
 /// How many stages back a re-send reaches.
 ///
 /// A peer one stage behind is the ordinary case — the mesh does not order two

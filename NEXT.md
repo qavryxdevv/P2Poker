@@ -1436,6 +1436,68 @@ moving off GossipSub is to leave that loop behind.
 
 
 
+
+### The table's own topic was never re-announced, and a seat can still miss a ratification
+
+A three-seat run went 0 hands at the founder and 17 at the other two, playing as
+seats `[1, 2]`. The founder had connected to both, seated both, and joined the
+Tox group; what it never got was either `TABLE_READY`. Its own log carried the
+tell, twice:
+
+```
+lobby topic: 0 of 2 subscribed ["QiQTLr", "cHbDFq"]; connected ["cHbDFq", "QiQTLr"]
+```
+
+Connected to two peers and knowing neither of them to be subscribed to anything.
+
+**One real gap, now closed.** `run.rs` re-announces its subscriptions when a
+poker peer appears — and it re-announced **only the lobby topics**, guarded by a
+check on the *lobby* hash alone. A peer subscribed to the lobby and not to the
+table therefore read as "already fine", and the table's topic is the one
+`TABLE_READY` travels on. The check now covers every topic this client holds and
+the re-announce includes the table's, plus up to three retries at five seconds
+while a table is forming.
+
+**And a regression of mine, caught by the next batch.** The first version of
+that retry said *all three* topics every five seconds for as long as a table was
+forming. Every re-announce prunes this client from every peer's mesh for that
+topic, so the lobby churned hard enough that adverts came back `RateLimited` —
+at the founder, against its own advertisement — and the table never formed at
+all. The retry now says the **table's topic only**, which disturbs the seats
+already at the table and nobody else, and it is bounded at three.
+
+Batches of three-seat runs, `--autoplay`, sixty seconds each:
+
+| | clean |
+|---|---|
+| before | (the failure above, one in five) |
+| all three topics every tick | 5 of 6, and `RateLimited` in the failure |
+| the table's topic, three times | **7 of 8, no `RateLimited` anywhere** |
+
+**What is left is not closed and should not be read as closed.** The one failure
+in eight was a *joiner* this time, not the founder: `3 seated` three times, in
+the Tox group, and then `NO TABLE` — with `0 of 2 subscribed` in its log again.
+So the residual is not about which seat it is; it is that a client on this host
+sometimes never learns its peers' subscriptions at all. The existing note about
+one process's multicast being dead for a run points the same way, and both say
+the same thing: it is at least partly the environment, and a client cannot make
+a peer tell it something.
+
+### The counters earned their keep in the first batch
+
+From the same run, at the founder:
+
+```
+the table's transport is behind: 1 message(s) queued, 84 fragment(s) refused of 84 offered
+the table's transport is behind: 0 message(s) queued, 211 fragment(s) refused of 214 offered
+```
+
+**Every fragment of hand 1 refused**, because the founder opens hand 1 the
+moment the roster ratifies and the joiners are not in the Tox group yet — the
+founder learns a peer has joined after the peer does. The re-send loop covers it
+and three fragments eventually went, but it is why the first hand of a table
+takes longest, and without the counters it was invisible.
+
 ### How long a hand takes, and it was not the network
 
 Six seats looked slow — one hand in three hundred seconds, then a stall after
