@@ -2093,6 +2093,36 @@ the implementation and not preferences:
   depending on somebody having configured their router by hand.
 * **Only game data.** Human chat stays on ordinary group messages; the protocol
   rides custom lossless packets.
+
+### The UPnP/NAT-PMP requirement cannot be met by configuring toxcore
+
+**Found 2026-08-31, on the first day of implementation, and recorded here rather
+than worked around quietly, because it contradicts a requirement stated above in
+the owner's own words.**
+
+`c-toxcore` has **no UPnP and no NAT-PMP**. The whole vendored tree at `v0.2.23`
+— every `.c`, every `.h`, every CMake file — contains one occurrence of either
+word, and it is a sentence in `docs/TCP_Network.txt` observing that they *can
+help*. There is no `tox_options_set_*` for it, no build flag, and nothing to
+compile in. The requirement is not switched off in this build; it is absent from
+the library.
+
+**Why the goal behind it is still met.** The requirement's reason is stated
+above and is sound: *"a player behind a router that would have opened a port for
+them, and did not because a checkbox was off, is a player who cannot host"*.
+Tox's answer to that is UDP hole punching plus TCP relays, and the property
+D-019 was bought for survives it — a Tox TCP relay carries a session with **no
+per-circuit byte cap**, which is the entire difference from a libp2p circuit's
+128 KiB. `hole_punching_enabled` and `local_discovery_enabled` are set
+explicitly in `Tox::new` rather than left to defaults, so a future change of
+default cannot move this client's behaviour silently.
+
+**What is still owed, if port mapping is wanted rather than hole punching.** It
+belongs to this client and not to toxcore: map a port with the IGD machinery
+already in the tree for libp2p — `libp2p`'s `upnp` feature is a dependency
+today — and then pin Tox to it with `tox_options_set_start_port` and
+`set_end_port`. That is a separate piece of work, it is not done, and it is not
+pretended to be.
 * The group is a **closed** one: the founder invites, removes anybody no longer
   seated, and the `chat_id` reaches players through the lobby advertisement
   rather than through Tox's own group discovery — which is what makes this

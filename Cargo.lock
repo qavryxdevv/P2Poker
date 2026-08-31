@@ -4036,6 +4036,7 @@ dependencies = [
  "ark-std",
  "async-trait",
  "blake3",
+ "cc",
  "chacha20poly1305 0.11.0",
  "crab_nat",
  "curve25519-dalek 5.0.0",

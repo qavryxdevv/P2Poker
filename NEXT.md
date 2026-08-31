@@ -979,7 +979,10 @@ Not changed, and these are decisions rather than omissions:
   hand that usually works into a table that never starts.
 * **No relay of our own.** A reachable peer already becomes a relay for the
   others (`--port` exists for exactly that), so the answer already in the design
-  is *one player who can forward a port*, not a piece of infrastructure.
+  is *one player who can forward a port*, not a piece of infrastructure - and
+  the owner's answer to *that* is D-019, because a client whose playability
+  rests on somebody having forwarded a port is a client most people cannot use.
+  See the Tox section below: the work has started.
 * **Nothing about hole-punch success rate.** Two runs are two runs. What is
   solid is the mechanism and the numbers above; the rate needs many more.
 
@@ -1130,6 +1133,106 @@ are wire decisions.
   attacker is written down where the constant is: one CBOR decode of up to
   `HAND_ABORT_CAP` instead of `FRAME_CAP`, for bytes libp2p has already read and
   buffered, retaining nothing — every `open` still uses its own type's cap.
+
+## D-019 has started: c-toxcore compiles and links here
+
+The relay finding above is what D-019 exists to answer, and the owner confirmed
+the direction on 2026-08-31. The first step is done and it is the one that could
+have failed: **`c-toxcore` builds and links on this machine**, and a Tox instance
+comes up.
+
+| | |
+|---|---|
+| `c-toxcore` | `v0.2.23`, pinned at `d9ca3c57` |
+| `third_party/cmp` | pinned at `52bfcfa1` |
+| `libsodium` | `1.0.20-RELEASE`, pinned at `9511c982` |
+| built archive | 6.75 MB, 58 core sources |
+| tests | an instance starts with a distinct identity; a bootstrap address is accepted; the loop turns |
+
+Behind `--features tox`, which is **not** in `default`. The feature flag is the
+line where the licence changes: `c-toxcore` is GPL-3.0 and linking it makes this
+whole client GPL-3.0. D-019 takes that decision and calls it a one-way door;
+what this adds is that the door is visible in the build rather than implicit.
+
+### Three things the build did not need, and one it did
+
+`c-toxcore`'s own CMake build cannot be used on MSVC without **pkg-config**
+(`find_package(PkgConfig REQUIRED)` fails outright when it is absent), a
+**libsodium CMake package config**, and in practice **vcpkg**. None of the three
+is on this machine and none of them should become a requirement for building a
+poker client. `build.rs` compiles the sixty C files with the `cc` crate instead,
+reading the file list out of the vendored `CMakeLists.txt` — parsed, not
+transcribed, so a version bump cannot leave the two out of step, and only the
+first `set(toxcore_SOURCES` block, because the second is `toxav` and this client
+carries no audio or video.
+
+What it did need is **pthreads**, which MSVC does not have.
+`tools/msvc-shim/pthread.h` is 150 lines and supplies exactly the fifteen calls
+`grep -rho "pthread_[a-z_]*"` finds in the tree — recursive mutexes and
+reader-writer locks, nothing else. Two decisions in it are worth reading:
+`pthread_mutex_t` is a `CRITICAL_SECTION` because toxcore asks for
+`PTHREAD_MUTEX_RECURSIVE` explicitly and an `SRWLOCK` deadlocks on the second
+take; and `pthread_rwlock_t` is *also* a `CRITICAL_SECTION`, exclusive in both
+directions, because POSIX has one `pthread_rwlock_unlock` for both modes and
+Win32 has two — recording the mode in the lock is wrong the moment two readers
+hold it, which is precisely the case a reader-writer lock exists for. An
+exclusive lock is always correct and only less parallel, and these guard short
+list operations rather than I/O.
+
+Nothing in the shim is stubbed to a no-op. A future toxcore that uses threads or
+condition variables fails to compile here rather than linking against something
+that does not do what its name says.
+
+### The finding: c-toxcore has no UPnP and no NAT-PMP
+
+D-019's requirements say, in the owner's own words, that the Tox instance
+*"opens its own port, through NAT-PMP and UPnP, and both are on without anybody
+choosing them … not an option, not a setting, not a build flag somebody has to
+remember"*.
+
+**`c-toxcore` has neither.** The whole vendored tree — every `.c`, every `.h`,
+every CMake file — contains **one** occurrence of either word, and it is a
+sentence in `docs/TCP_Network.txt` observing that they *can help*. There is no
+`tox_options_set_*` for it, no build flag, and nothing to compile in. The
+requirement cannot be met by configuring toxcore, because toxcore does not do
+it.
+
+What Tox does instead is UDP hole punching plus TCP relays — and that is the
+answer to the problem the requirement was written for, since a Tox TCP relay
+carries a session with **no per-circuit byte cap**, which is the whole reason
+for D-019. `hole_punching_enabled` and `local_discovery_enabled` are both set
+explicitly in `Tox::new` rather than left to the default, so the setting is
+visible in the code.
+
+If genuine port mapping is still wanted — and the owner's reason for asking is
+sound, since a player whose router would have opened a port and did not is a
+player who cannot host — it belongs to **this client** and not to toxcore: map a
+port with the IGD machinery already in the tree for libp2p (`libp2p`'s `upnp`
+feature is in `Cargo.toml` today), then pin Tox to it with
+`tox_options_set_start_port` / `set_end_port`. That is a separate piece of work
+and is not pretended to.
+
+### What is next, in order
+
+1. **The NGC group itself**: `tox_group_new` at the founder,
+   `tox_group_invite_friend`, `tox_group_send_custom_packet` with `lossless`
+   set. All three are in `v0.2.23`'s header.
+2. **`chat_id` in the table advertisement**, so a joiner has something to be
+   invited to.
+3. **A `TableTransport` implementation over it**, behind the seam
+   `src/table/transport.rs` was written for — the protocol does not change, and
+   `FromTable::claimed` stays advisory, because a chat id travels in a public
+   advertisement and "it arrived over the table's group" is worth nothing as a
+   claim about authorship.
+4. **The measurement across two networks**, which is the only thing that
+   settles whether D-019 was right. `tools/two-network-ssh.ps1` already runs
+   both ends and compares genesis hashes; it needs a Tox-side count next to the
+   relay counts it prints now.
+
+The vendored trees are **fetched at pinned commits by `tools/build-tox.ps1`,
+not committed** — 12.7 MB for a transport whose whole point is a measurement
+that has not been taken. `vendor/ziffle` is committed, so this is the exception;
+the script carries the argument and says what would change the answer.
 
 ## Still open
 

@@ -18,3 +18,12 @@ Thumbs.db
 desktop.ini
 /vendor/**/target/
 /profile/
+
+# The vendored C for D-019's Tox transport, fetched at pinned commits by
+# tools/build-tox.ps1 rather than committed. 12.7 MB for a transport whose
+# whole point - a measurement across two networks - has not been taken yet;
+# the script carries the argument and the hashes, and says what would change
+# the answer. `vendor/ziffle` IS committed, so this is the exception and not
+# the rule.
+/vendor/c-toxcore/
+/vendor/libsodium/

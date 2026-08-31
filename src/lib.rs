@@ -21,3 +21,8 @@ pub mod protocol;
 pub mod security;
 pub mod storage;
 pub mod table;
+
+/// The table's transport under D-019. **`--features tox` makes this client
+/// GPL-3.0**, which is why it is not compiled by default; see `src/tox/mod.rs`.
+#[cfg(feature = "tox")]
+pub mod tox;

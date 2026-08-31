@@ -153,3 +153,27 @@ strip = "debuginfo"
 # Only to put the icon inside the executable on Windows. See build.rs.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# Compiling the vendored c-toxcore. Only under `--features tox`, but cargo
+# resolves build-dependencies unconditionally, so it is declared here rather
+# than made optional: `cc` is small, has no transitive tree worth the name, and
+# an optional build-dependency would buy nothing but a longer manifest.
+[build-dependencies]
+cc = "1"
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
+#
+# **`tox` changes this project's licence.** `c-toxcore` is GPL-3.0, not LGPL,
+# and linking it makes the whole client GPL-3.0 - D-019 takes that decision
+# deliberately and calls it a one-way door. It is a feature rather than an
+# unconditional dependency so that the line where the licence changes is a line
+# somebody can see, and so that the tree still builds for anyone without a C
+# toolchain.
+#
+# It is NOT in `default`. Turning it on also requires `tools/build-tox.ps1` to
+# have built libsodium once.
+[features]
+default = []
+tox = []
