@@ -312,6 +312,16 @@ pub fn admit(ad: &TableAd, now_unix_ms: u64) -> Result<(), AdRejected> {
             "expires_at is more than the lifetime cap ahead of local time",
         ));
     }
+    // **And the other end, which was open.** Only the future was bounded, so an
+    // advert that had already expired was admitted — anybody who had ever seen
+    // one could re-inject it and put a dead table back into every lobby it
+    // reached, with no key and no signature of their own. `expire` drops it on
+    // the next sweep using this exact comparison, so admitting it was taking in
+    // something already known to be rubbish. Same predicate, one moment
+    // earlier, and the clock is the same local view in both places (D-012).
+    if ad.expires_at_unix_ms <= now_unix_ms {
+        return Err(AdRejected::Timing("expires_at has already passed"));
+    }
     if ad.timestamp_unix_ms > now_unix_ms.saturating_add(MAX_CLOCK_SKEW_MS) {
         return Err(AdRejected::Timing("timestamp is too far in the future"));
     }
@@ -1601,6 +1611,35 @@ mod tests {
         assert_eq!(store.expire(NOW + AD_TTL_MS - 1), 0);
         assert_eq!(store.expire(NOW + AD_TTL_MS), 1, "no re-broadcast heard");
         assert!(store.is_empty());
+    }
+
+    /// **An advert that has already expired is not admitted in the first
+    /// place**, and this is the other half of the sweep below.
+    ///
+    /// Only the future was bounded: `expires_at` had to be after `timestamp`
+    /// and within the lifetime cap ahead of local time, and nothing said it had
+    /// to be ahead of local time at all. So anybody who had ever seen an advert
+    /// could re-inject it after it lapsed and put a dead table back into every
+    /// lobby it reached — no key, no signature of their own, and the table's own
+    /// signature still verifying, because the bytes are genuine.
+    ///
+    /// **To make this fail:** remove the `expires_at_unix_ms <= now_unix_ms`
+    /// arm from `admit`.
+    #[test]
+    fn an_advert_that_has_already_expired_is_refused_rather_than_swept_later() {
+        let mut ad = legal_custom();
+        ad.timestamp_unix_ms = NOW - 200_000;
+        ad.expires_at_unix_ms = NOW - 100_000;
+        assert_eq!(
+            admit(&ad, NOW),
+            Err(AdRejected::Timing("expires_at has already passed")),
+            "a lapsed advert was taken in, to be dropped by the next sweep"
+        );
+
+        // And one that is still alive by a second is still admitted, so this is
+        // a bound and not a narrowing.
+        ad.expires_at_unix_ms = NOW + 1_000;
+        assert_eq!(admit(&ad, NOW), Ok(()));
     }
 
     #[test]
