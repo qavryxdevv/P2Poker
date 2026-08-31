@@ -115,7 +115,7 @@ impl Table {
                             }
                         }
                         // Its own copy coming back, or a stage it has left.
-                        Err(Failed::NotYet) => self.hands[to].hold(bytes.clone()),
+                        Err(Failed::NotYet) => { let _ = self.hands[to].hold(bytes.clone()); }
                         Err(e) => self.refusals.push((to, e.to_string())),
                     }
                 }
@@ -255,7 +255,7 @@ impl Live {
                                 queue.push(b);
                             }
                         }
-                        Err(Failed::NotYet) => self.hands[to].hold(bytes.clone()),
+                        Err(Failed::NotYet) => { let _ = self.hands[to].hold(bytes.clone()); }
                         Err(_) => {}
                     }
                 }
@@ -634,7 +634,7 @@ fn diverged(cut: usize) -> Option<(Vec<Hand>, Vec<SigningKey>)> {
                             queue.push((to, b));
                         }
                     }
-                    Err(Failed::NotYet) => hands[to].hold(bytes.clone()),
+                    Err(Failed::NotYet) => { let _ = hands[to].hold(bytes.clone()); }
                     Err(_) => {}
                 }
             }
@@ -802,7 +802,7 @@ fn a_settlement_that_arrives_after_an_abort_replaces_its_terminal() {
                             queue.push(b);
                         }
                     }
-                    Err(Failed::NotYet) => t.hands[to].hold(bytes.clone()),
+                    Err(Failed::NotYet) => { let _ = t.hands[to].hold(bytes.clone()); }
                     Err(_) => {}
                 }
             }

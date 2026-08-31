@@ -548,3 +548,35 @@ impl Table {
         self.seen_ready.extend(readies);
     }
 }
+
+
+/// **Nothing is held, and nothing is forwarded, that this client cannot
+/// verify.**
+///
+/// `Hand::on_event` routes on `chained::peek`, which checks no signature and no
+/// key — so `Failed::NotYet` is reachable by unsigned junk with a matching type
+/// byte and a sequence one ahead. The node answered that by storing the bytes
+/// and telling GossipSub to **Accept**, which forwards a forgery in this
+/// client's own name and evicts a genuine early event from a queue of
+/// sixty-four. It needs no key, no seat and no table membership, which made it
+/// the cheapest attack in the set.
+///
+/// **To make this fail:** take the `open_in_hand` check out of `Hand::hold`, or
+/// have it return `Holding::Kept` unconditionally.
+#[test]
+fn unsigned_junk_is_neither_held_nor_forwarded() {
+    use p2p_poker::table::hand::Holding;
+
+    let (mut h, _) = Hand::open(opening3(0), &key(10), NOW, 30_000).expect("the hand opens");
+    assert_eq!(h.held(), 0);
+
+    let mut refused = 0usize;
+    for n in 0..80u8 {
+        let junk = vec![n; 64 + usize::from(n)];
+        if h.hold(junk) != Holding::Kept {
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 80, "junk was kept");
+    assert_eq!(h.held(), 0, "the queue took bytes it could not verify");
+}

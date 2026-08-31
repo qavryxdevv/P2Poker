@@ -390,6 +390,19 @@ pub struct CertFact {
     pub kind: u16,
 }
 
+/// What became of an event offered for holding.
+///
+/// The three answers exist because they need three different things said to
+/// the mesh: a kept event was worth forwarding, an event of another hand is
+/// somebody else's business and costs its sender nothing, and a malformed one
+/// is the sender's fault and must not be forwarded in this client's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holding {
+    Kept,
+    AnotherHand,
+    Malformed,
+}
+
 /// A settlement being collected while this client is in `Phase::Aborted`.
 ///
 /// The aborted peer never computed a settlement of its own, so it cannot
@@ -4568,13 +4581,49 @@ impl Hand {
     }
 
     /// Hold an event that belongs to a stage this client has not reached.
-    pub fn hold(&mut self, bytes: Vec<u8>) {
+    pub fn hold(&mut self, bytes: Vec<u8>) -> Holding {
+        // **Verified before it is kept, and this is the cheapest attack in the
+        // set without it.** `on_event` routes on `peek`, which checks no
+        // signature and no key, so `Failed::NotYet` is reachable by unsigned
+        // junk — a matching type byte and a sequence one ahead is the whole
+        // recipe. The node answered that by storing the bytes and telling
+        // GossipSub to **Accept**, which forwards a forgery in this client's
+        // own name and evicts a genuine early event from a queue of sixty-four.
+        // Measured by the review that found it: seventy-one frames, seventy-one
+        // `NotYet`, zero signature checks, the queue full.
+        //
+        // Opening the event proves the signature and that it belongs to this
+        // table and this hand, and relaxes only the position — which is the
+        // one thing that was ever in question about a held event.
+        let Ok((kind, hand_id, _)) = chained::peek(&bytes, FRAME_CAP) else {
+            return Holding::Malformed;
+        };
+        if hand_id != self.open.hand_id {
+            // A hand this client is not playing. Not a fault — a peer that ran
+            // ahead is doing nothing wrong — but holding it is pointless:
+            // `replay_early` re-runs the same guard, `early` does not survive
+            // into the next hand, and the bytes would sit here until they
+            // pushed something useful out.
+            return Holding::AnotherHand;
+        }
+        if chained::open_in_hand(
+            &bytes,
+            FRAME_CAP,
+            kind,
+            &self.open.table_id,
+            self.open.hand_id,
+        )
+        .is_err()
+        {
+            return Holding::Malformed;
+        }
         // Bounded: this is fed from the network, and everything fed from the
         // network is bounded where it is consumed.
         if self.early.len() >= 64 {
             self.early.pop_front();
         }
         self.early.push_back(bytes);
+        Holding::Kept
     }
 
     /// Judge everything that was held, now that the stage may have moved.
@@ -4614,7 +4663,11 @@ impl Hand {
                     }
                     // Still ahead of this client. Held again, and the hold is
                     // still bounded - `hold` drops the oldest at 64.
-                    Err(Failed::NotYet) => self.hold(bytes),
+                    // It was verified on the way in, so re-holding it cannot
+                    // fail for any reason worth acting on.
+                    Err(Failed::NotYet) => {
+                        let _ = self.hold(bytes);
+                    }
                     Err(e) => failures.push(e),
                 }
             }

@@ -68,6 +68,7 @@ use super::portmap;
 use super::relay;
 use super::lobby::{LobbyStore, RateLimiter, TableAd, TableKind};
 use super::node::{worth_parsing, Events, NodeCommand, NodeEvent, NodeState, REBROADCAST};
+use crate::table::hand::Holding;
 use super::swarm::{CONNECTION_CEILING, MAX_CONNECTIONS, MIN_CONNECTIONS};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
 use super::joinwire::DISPLAY_NAME_MAX;
@@ -997,25 +998,34 @@ pub async fn run(
                                             .send(NodeEvent::Warning(format!("{n} | HELD")))
                                             .await;
                                     }
-                                    h.hold(message.data.clone());
-                                    // **Reported before leaving, or this
-                                    // node forwards nothing.** Every arm of
-                                    // this branch returns to the top of the
-                                    // loop, and with `validate_messages()` set
-                                    // an unreported message is never passed on
-                                    // — so a peer that hears an event only
-                                    // through this one never hears it at all.
-                                    // That is how two survivors of a dropped
-                                    // peer end up a stage apart with no way
-                                    // back: the missing bytes exist, at a
-                                    // neighbour that would not relay them.
+                                    // **What is said to the mesh depends on
+                                    // what was kept.** Accepting an event this
+                                    // client could not verify forwards it in
+                                    // this client's own name, and `NotYet` is
+                                    // reachable before any signature is
+                                    // checked — so unsigned junk used to be
+                                    // both relayed and stored, sixty-four at a
+                                    // time, evicting the genuine early events
+                                    // the queue exists for.
+                                    let verdict = match h.hold(message.data.clone()) {
+                                        Holding::Kept => gossipsub::MessageAcceptance::Accept,
+                                        // Somebody else's hand: nothing is
+                                        // known to be wrong with it and this
+                                        // client simply cannot judge it.
+                                        Holding::AnotherHand => {
+                                            gossipsub::MessageAcceptance::Ignore
+                                        }
+                                        Holding::Malformed => {
+                                            gossipsub::MessageAcceptance::Reject
+                                        }
+                                    };
                                     let _ = swarm
                                         .behaviour_mut()
                                         .gossipsub
                                         .report_message_validation_result(
                                             &message_id,
                                             &propagation_source,
-                                            gossipsub::MessageAcceptance::Accept,
+                                            verdict,
                                         );
                                     continue;
                                 }
@@ -2242,6 +2252,16 @@ pub async fn run(
                 deck_reported = None;
                 cards_reported = false;
                 turn_reported = None;
+                // **And the re-send buffer, which nothing cleared here.** The
+                // five-second loop re-broadcasts this client's own events
+                // because GossipSub keeps no history and a peer grafted after
+                // a publish never sees it. That reason expires with the hand:
+                // every stored event names hand k, and after the boundary each
+                // re-send is an event of a hand nobody is playing — refused by
+                // every peer, and before the hold queue was made to verify,
+                // stored by every peer. The four other `said.clear()` sites are
+                // all leaving the table; this one is the ordinary case.
+                said.clear();
                 match next {
                     Some(opening) => {
                         begin_hand(
