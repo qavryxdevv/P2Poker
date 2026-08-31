@@ -1427,8 +1427,8 @@ endpoint outside this building.
    What is owed to `PROTOCOL.md`: the three field indices and the sentence that
    they are excluded from §3.1's digest. The decision is D-019's and is made;
    the numbering is the document's to record.
-4. ~~A `TableTransport` implementation over it~~ **done, and the whole stack is
-   proven end to end.** `tox::table` owns the instance on a dedicated thread -
+4. ~~A `TableTransport` implementation over it~~ **done, the whole stack is
+   proven end to end, and both directions of the group check are measured.** `tox::table` owns the instance on a dedicated thread -
    `tox_iterate` wants a steady loop on one thread, which is the same
    arrangement `ChannelTransport` has with the swarm and for the same reason -
    and the client reaches it through channels. Fragmentation lives in the
@@ -1453,6 +1453,24 @@ endpoint outside this building.
    message; and the driver sends one message at a time while its fragments are
    being accepted, because pushing the next onto a refusal would interleave two
    half-sent ones.
+
+   **The `chat_id` comparison is implemented and measured in both directions**,
+   which closes a gap between what was written down and what ran: the field was
+   documented as the thing a joiner checks and for one commit nothing checked
+   it. Tox will not say which group an invitation is for until it is accepted,
+   so the driver accepts, reads the id back, and **leaves at once** on a
+   mismatch. Measured: the right id carries 9 000 bytes in 12.8 s; a wrong one
+   is left, nothing arrives in sixty seconds, and the driver's own `chat_id()`
+   stays `None`. The founder's id comes out through a `watch` channel, because
+   the group does not exist when `spawn` returns and `TableAd::on_tox` needs it.
+
+   **And the Tox identity is persisted**, in a third profile file beside the
+   network identity and the player key — three identities, three secrets, for
+   §20's reason. A Tox key that changed on every start would take the table with
+   it: both ends add each other from keys carried in the advert and the join
+   request, a friendship is two-sided, and a founder that restarted would come
+   back as a stranger every seated player is waiting for and none of them can
+   reach.
 5. ~~The measurement across two networks~~ **done, and it passed** - see
    above. `tools/two-network-tox.ps1` runs both ends and reports it.
 6. ~~The node list has to update itself~~ **done**: `tox::nodes`, seven tests.

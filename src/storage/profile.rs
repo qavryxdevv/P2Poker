@@ -139,6 +139,63 @@ pub fn load_or_create_app_key(dir: &Path) -> io::Result<ed25519_dalek::SigningKe
     Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
 }
 
+/// The Tox secret key, in a **third** file (D-019).
+///
+/// Three identities, three files, for the reason §20 gives for the first two: a
+/// `PeerId` says which socket you are talking to, an application key says who is
+/// playing, and this says where a table's traffic reaches you. One file holding
+/// two of them would make them one secret, and a client that had to rotate one
+/// would be rotating the other.
+pub fn tox_key_path(dir: &Path) -> PathBuf {
+    dir.join("tox.key")
+}
+
+/// Load the Tox secret key, creating one on first run.
+///
+/// # Why it has to persist
+///
+/// A Tox identity that changed on every start would take the table with it.
+/// The founder's Tox key is in the advertisement and the joiner's is in the
+/// `JOIN_REQUEST`; both ends add each other from those, and a friendship is
+/// two-sided. A founder that restarted would come back as a stranger to every
+/// seated player — they would still hold the old key, add it, and wait for a
+/// friend that no longer exists — and the table would sit there looking
+/// reachable and be unreachable.
+///
+/// It is also what makes the advert's `founder_tox_key` and `tox_chat_id`
+/// stable enough to be worth publishing. They are outside `table_params_hash`
+/// precisely so that a founder *can* come back on a new group; that is the
+/// escape hatch, not the ordinary path.
+///
+/// The same shape as the other two: 32 raw bytes, nothing to parse, and an
+/// existing file that is not one is never overwritten. `tox_options_set_savedata_type`
+/// with `TOX_SAVEDATA_TYPE_SECRET_KEY` takes exactly these bytes.
+pub fn load_or_create_tox_key(dir: &Path) -> io::Result<[u8; 32]> {
+    let path = tox_key_path(dir);
+
+    if let Ok(bytes) = fs::read(&path) {
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exists and is not a 32-byte key; move it aside rather than \
+                 letting this overwrite it",
+                path.display()
+            ),
+        ));
+    }
+
+    fs::create_dir_all(dir)?;
+    let key = crate::security::rng::secret_32()
+        .map_err(|e| io::Error::other(format!("no operating system randomness: {e}")))?;
+    fs::write(&path, key)?;
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +204,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("p2p-poker-test-{name}"));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// The Tox key survives a restart, or a founder comes back as a stranger to
+    /// its own table.
+    ///
+    /// Both ends add each other from keys carried in the advertisement and the
+    /// join request, and a Tox friendship is two-sided — so a founder with a new
+    /// key is a founder every seated player is waiting for and none of them can
+    /// reach.
+    #[test]
+    fn the_tox_key_survives_a_restart() {
+        let dir = scratch("tox-key");
+        let first = load_or_create_tox_key(&dir).unwrap();
+        let again = load_or_create_tox_key(&dir).unwrap();
+        assert_eq!(first, again);
+        assert_ne!(first, [0u8; 32], "and it is not thirty-two zero bytes");
+    }
+
+    /// Three identities, three files, and no two of them are the same secret.
+    #[test]
+    fn the_three_identities_are_three_secrets() {
+        let dir = scratch("three-keys");
+        let app = load_or_create_app_key(&dir).unwrap().to_bytes();
+        let tox = load_or_create_tox_key(&dir).unwrap();
+        let net = load_or_create_identity(&dir).unwrap();
+        assert_ne!(app, tox, "the player and the Tox key are not one secret");
+        assert_ne!(
+            tox_key_path(&dir),
+            app_key_path(&dir),
+            "and they are not one file"
+        );
+        assert_ne!(tox_key_path(&dir), identity_path(&dir));
+        // The network identity is a different type, so it is compared through
+        // what it produces rather than through its bytes.
+        assert_ne!(net.public().to_peer_id().to_bytes()[..32], tox[..]);
+    }
+
+    /// A file that is not a key is never overwritten. Silently replacing one
+    /// would be silently changing who this client is.
+    #[test]
+    fn a_tox_key_file_that_is_not_a_key_is_refused() {
+        let dir = scratch("tox-key-bad");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(tox_key_path(&dir), b"not a key").unwrap();
+        assert!(load_or_create_tox_key(&dir).is_err());
+        assert_eq!(
+            fs::read(tox_key_path(&dir)).unwrap(),
+            b"not a key",
+            "and it is still there"
+        );
     }
 
     /// The player's own key survives a restart too, or rejoining your own table

@@ -48,6 +48,21 @@ pub enum Role {
         /// The founder's **Tox** public key, from the table's advertisement.
         /// An invitation from any other friend is refused.
         founder: [u8; 32],
+        /// The `chat_id` the advertisement named, if it named one.
+        ///
+        /// **An invitation says nothing about which group it is for.** Without
+        /// this the founder could invite a player into a group nobody
+        /// advertised, and every other client would be watching a different
+        /// one — a table whose traffic nobody else can see, which is the shape
+        /// a founder colluding with one player would want. So the group is
+        /// joined, its id read back, and compared; a mismatch is left again at
+        /// once.
+        ///
+        /// `None` when the advertisement named none, which is an advert from a
+        /// build with no Tox. There is then nothing to compare against and
+        /// nothing to be invited to, so an invitation is refused outright
+        /// rather than accepted on trust.
+        chat_id: Option<[u8; 32]>,
     },
 }
 
@@ -90,12 +105,44 @@ pub struct ToxTable {
     out: tokio::sync::mpsc::Sender<Vec<u8>>,
     inbox: tokio::sync::mpsc::Receiver<FromTable>,
     control: sync_mpsc::Sender<Command>,
+    /// The group's `chat_id`, once there is a group.
+    ///
+    /// The founder **needs** this: `TableAd::on_tox` puts it in the
+    /// advertisement, and until it is there nobody can check that the group
+    /// they were invited into is the one the table named. It is a `watch`
+    /// rather than a return value because the group does not exist when
+    /// `spawn` returns — the driver creates it on its own thread — and a
+    /// constructor that blocked until it did would block the client's startup
+    /// on a socket.
+    chat: tokio::sync::watch::Receiver<Option<[u8; 32]>>,
     /// Kept so a caller can wait for the thread to finish on shutdown, and so
     /// that dropping the handle does not orphan it silently.
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ToxTable {
+    /// The group's `chat_id`, or `None` while there is not one yet.
+    pub fn chat_id(&self) -> Option<[u8; 32]> {
+        *self.chat.borrow()
+    }
+
+    /// Wait until there is a group, and give back its `chat_id`.
+    ///
+    /// `None` if the driver stopped without ever having one — a founder whose
+    /// `tox_group_new` failed, or a joiner that was never invited. A caller
+    /// that treated that as "wait for ever" would hang a table on a group that
+    /// is not coming.
+    pub async fn wait_for_chat_id(&mut self) -> Option<[u8; 32]> {
+        loop {
+            if let Some(id) = *self.chat.borrow_and_update() {
+                return Some(id);
+            }
+            if self.chat.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+
     /// Tell the driver something the roster decided.
     ///
     /// Best effort: a driver that has already stopped answers nothing, which is
@@ -177,16 +224,18 @@ pub fn spawn(tox: Tox, setup: Setup) -> ToxTable {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<FromTable>(256);
     let (ctl_tx, ctl_rx) = sync_mpsc::channel::<Command>();
+    let (chat_tx, chat_rx) = tokio::sync::watch::channel::<Option<[u8; 32]>>(None);
 
     let thread = std::thread::Builder::new()
         .name("tox-table".into())
-        .spawn(move || run(tox, setup, out_rx, in_tx, ctl_rx))
+        .spawn(move || run(tox, setup, out_rx, in_tx, ctl_rx, chat_tx))
         .expect("a thread for the table's transport");
 
     ToxTable {
         out: out_tx,
         inbox: in_rx,
         control: ctl_tx,
+        chat: chat_rx,
         thread: Some(thread),
     }
 }
@@ -198,6 +247,7 @@ fn run(
     mut out: tokio::sync::mpsc::Receiver<Vec<u8>>,
     inbox: tokio::sync::mpsc::Sender<FromTable>,
     control: sync_mpsc::Receiver<Command>,
+    chat: tokio::sync::watch::Sender<Option<[u8; 32]>>,
 ) {
     // Tox friend number -> that friend's public key, so an invitation can be
     // matched against the roster rather than accepted from whoever sends one.
@@ -213,6 +263,10 @@ fn run(
         Role::Host => tox.new_group(&setup.group_name, &setup.self_name).ok(),
         Role::Joiner { .. } => None,
     };
+    // Said as soon as there is something to say. The founder's advertisement
+    // cannot name the group until this arrives, and nothing else can check the
+    // group it was invited into until the advertisement names it.
+    announce(&tox, group, &chat);
 
     let mut invited: Vec<u32> = Vec::new();
     let mut reassembler: Reassembler<u32> = Reassembler::new(fragment::TOX_PACKET);
@@ -281,12 +335,35 @@ fn run(
                     // invitation is an offer; this client joins the table it
                     // decided to join, and a friend that is on the roster but
                     // is not the founder has no business inviting anybody.
-                    let from_founder = match (&setup.role, friends.get(&friend)) {
-                        (Role::Joiner { founder }, Some(key)) => key == founder,
-                        _ => false,
+                    let expected = match (&setup.role, friends.get(&friend)) {
+                        (Role::Joiner { founder, chat_id }, Some(key)) if key == founder => {
+                            *chat_id
+                        }
+                        _ => None,
                     };
-                    if from_founder && group.is_none() {
-                        group = tox.accept_invite(friend, &invite, &setup.self_name).ok();
+                    // Refused outright when the advertisement named no group:
+                    // there is nothing to compare against, and an invitation
+                    // accepted on trust is the whole thing the id is published
+                    // to prevent.
+                    if let (Some(want), None) = (expected, group) {
+                        if let Ok(joined) = tox.accept_invite(friend, &invite, &setup.self_name) {
+                            // **Read back and compared.** Accepting is the only
+                            // way to learn which group the invitation was for;
+                            // Tox does not say beforehand. So the check is
+                            // after, and a mismatch leaves at once — the table
+                            // then ends at its own deadline, which is the right
+                            // outcome for a founder that pointed somewhere
+                            // nobody advertised.
+                            match tox.chat_id(joined) {
+                                Ok(id) if id == want => {
+                                    group = Some(joined);
+                                    announce(&tox, group, &chat);
+                                }
+                                _ => {
+                                    let _ = tox.leave(joined);
+                                }
+                            }
+                        }
                     }
                 }
                 Event::GroupPacket { peer, data, .. } => {
@@ -368,6 +445,22 @@ fn run(
     }
 }
 
+/// Publish the group's id to anybody waiting for it, once and only once.
+fn announce(
+    tox: &Tox,
+    group: Option<u32>,
+    chat: &tokio::sync::watch::Sender<Option<[u8; 32]>>,
+) {
+    if chat.borrow().is_some() {
+        return;
+    }
+    if let Some(id) = group.and_then(|g| tox.chat_id(g).ok()) {
+        // A closed channel means every waiter has gone, which is ordinary at
+        // shutdown and is not worth reporting.
+        let _ = chat.send(Some(id));
+    }
+}
+
 /// Which group peer holds this Tox public key, if any.
 fn peer_for(tox: &Tox, group: u32, key: &[u8; 32]) -> Option<u32> {
     // Peer ids are small and dense, and a table is at most ten seats. Scanning
@@ -430,10 +523,23 @@ mod tests {
                 roster: vec![join_key],
             },
         );
+
+        // **The advertisement's job, done by hand.** In the client the chat id
+        // goes into `TableAd::on_tox` and reaches the joiner through the lobby;
+        // here it goes straight across, because what is under test is the Tox
+        // side and not the lobby.
+        let chat_id = tokio::time::timeout(Duration::from_secs(10), host.wait_for_chat_id())
+            .await
+            .expect("the group is created locally and at once")
+            .expect("and it has an id");
+
         let mut join = spawn(
             join_tox,
             Setup {
-                role: Role::Joiner { founder: host_key },
+                role: Role::Joiner {
+                    founder: host_key,
+                    chat_id: Some(chat_id),
+                },
                 group_name: "TwoNet".into(),
                 self_name: "player".into(),
                 roster: vec![host_key],
@@ -467,6 +573,86 @@ mod tests {
             got.as_deref(),
             Some(message.as_slice()),
             "nine kilobytes arrived whole, in the order it was cut"
+        );
+    }
+
+    /// **An invitation into a group the advertisement did not name is left.**
+    ///
+    /// The reason `tox_chat_id` is published at all. An invitation says nothing
+    /// about which group it is for, so without the comparison a founder could
+    /// put the table on a group nobody advertised — and every other client
+    /// would be watching a different one, which is what a founder colluding
+    /// with one player would arrange.
+    ///
+    /// The joiner here is told to expect a chat id that is not the host's. It
+    /// accepts the invitation, because accepting is the only way Tox lets it
+    /// learn which group the invitation was for, reads the id back, and leaves.
+    /// Nothing then arrives, and `chat_id()` stays `None` — the driver never
+    /// took the group as its own.
+    #[tokio::test]
+    #[ignore = "needs a network and tens of seconds"]
+    async fn an_invitation_to_the_wrong_group_is_left() {
+        let mut host_tox = Tox::new().expect("a host instance");
+        let mut join_tox = Tox::new().expect("a joining instance");
+        let host_key: [u8; 32] = host_tox.address()[..32].try_into().unwrap();
+        let join_key: [u8; 32] = join_tox.address()[..32].try_into().unwrap();
+        for t in [&mut host_tox, &mut join_tox] {
+            for n in crate::tox::nodes::bundled() {
+                let _ = t.bootstrap(&n.host, n.udp_port, &n.key);
+                for p in &n.tcp_ports {
+                    let _ = t.add_tcp_relay(&n.host, *p, &n.key);
+                }
+            }
+        }
+
+        let mut host = spawn(
+            host_tox,
+            Setup {
+                role: Role::Host,
+                group_name: "TwoNet".into(),
+                self_name: "host".into(),
+                roster: vec![join_key],
+            },
+        );
+        let real = tokio::time::timeout(Duration::from_secs(10), host.wait_for_chat_id())
+            .await
+            .expect("the group exists at once")
+            .expect("and has an id");
+
+        // Every byte flipped: a chat id that is certainly not this group's, and
+        // certainly not a value anybody could have arrived at by accident.
+        let mut wrong = real;
+        for b in &mut wrong {
+            *b ^= 0xff;
+        }
+
+        let mut join = spawn(
+            join_tox,
+            Setup {
+                role: Role::Joiner {
+                    founder: host_key,
+                    chat_id: Some(wrong),
+                },
+                group_name: "TwoNet".into(),
+                self_name: "player".into(),
+                roster: vec![host_key],
+            },
+        );
+
+        let message = vec![0xA5u8; 4_000];
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            let _ = host.broadcast(&message).await;
+            if let Ok(got) =
+                tokio::time::timeout(Duration::from_millis(250), join.next()).await
+            {
+                panic!("a message arrived over a group nobody advertised: {got:?}");
+            }
+        }
+        assert_eq!(
+            join.chat_id(),
+            None,
+            "the joiner never took the group as its own"
         );
     }
 
