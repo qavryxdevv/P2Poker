@@ -48,7 +48,13 @@ param(
     # hole punch asks the router to hairpin a packet back to itself. See the
     # D-019 notes in NEXT.md; a relay is a third party with an address of its
     # own, so nothing has to hairpin.
-    [switch] $TcpOnly
+    [switch] $TcpOnly,
+    # Play real hands instead of pushing packets: runs `tox_hand`, which is
+    # the hand driver on the Tox transport and nothing else. It is the
+    # measurement D-019 is actually for - `tox_link` proves the group carries
+    # bytes, this proves it carries the game.
+    [switch] $Hand,
+    [int]    $Hands = 3
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,9 +66,13 @@ function Warn($msg) { Write-Host "WARN  $msg" -ForegroundColor Yellow }
 
 $hostPart = ($Target -split '@')[-1]
 
-if (-not (Test-Path $Binary)) {
-    Fail "no probe at $Binary. Run tools/build-tox.ps1 once, then: cargo build --release --features tox --example tox_link"
+if ($Hand) {
+    $Binary = Join-Path (Split-Path -Parent $PSScriptRoot) 'target\release\examples\tox_hand.exe'
 }
+if (-not (Test-Path $Binary)) {
+    Fail "no probe at $Binary. Run tools/build-tox.ps1 once, then: cargo build --release --features tox --examples"
+}
+$probeName = [IO.Path]::GetFileName($Binary)
 
 Step "checking the far end is up before spending two minutes on SSH"
 $probe = Test-NetConnection -ComputerName $hostPart -Port 22 -WarningAction SilentlyContinue
@@ -97,7 +107,7 @@ $remoteDir = 'C:\p2p-poker-test'
 
 Step "copying the probe over"
 & ssh @ssh "md $remoteDir" 2>$null | Out-Null
-& scp -i $privKey -o StrictHostKeyChecking=accept-new $Binary "${Target}:$remoteDir/tox_link.exe"
+& scp -i $privKey -o StrictHostKeyChecking=accept-new $Binary "${Target}:$remoteDir/$probeName"
 if ($LASTEXITCODE -ne 0) { Fail "scp failed" }
 
 $localLog  = Join-Path $env:TEMP 'twonettox-local.log'
@@ -128,17 +138,44 @@ Note "join $joinKey"
 
 Step "starting the host end"
 Remove-Item $localLog -ErrorAction SilentlyContinue
+$common = @('--seed', $hostSeed, '--peer', $joinKey, '--host', '--for', "$Seconds")
+if ($TcpOnly) { $common += '--tcp-only' }
+if ($Hand)    { $common += @('--hands', "$Hands") }
+# The peer's *signing* seed, which `tox_hand` needs and a lobby would
+# otherwise have agreed. It travels in the environment rather than on the
+# command line because it is a secret, even a disposable one.
+$env:TOX_HAND_PEER_SEED = $joinSeed
 $here = Start-Process -FilePath $Binary -PassThru -NoNewWindow `
     -RedirectStandardOutput $localLog `
-    -ArgumentList (@('--seed', $hostSeed, '--peer', $joinKey, '--host', '--for', "$Seconds") +
-                   $(if ($TcpOnly) { @('--tcp-only') } else { @() }))
+    -ArgumentList $common
+
+# `tox_hand`'s joiner needs the chat id the advertisement would have carried.
+# The host prints it; this waits for it rather than sleeping, because a sleep
+# long enough to be safe is a sleep wasted on every run.
+$chat = $null
+if ($Hand) {
+    for ($i = 0; $i -lt 150; $i++) {
+        Start-Sleep -Milliseconds 200
+        if (Test-Path $localLog) {
+            $m = Select-String -Path $localLog -Pattern '^chat id ([0-9A-F]{64})' | Select-Object -First 1
+            if ($m) { $chat = $m.Matches[0].Groups[1].Value; break }
+        }
+    }
+    if (-not $chat) {
+        Stop-Process -Id $here.Id -ErrorAction SilentlyContinue
+        Fail "the host end never printed a chat id. Its log is $localLog"
+    }
+    Note "chat id $chat"
+}
 
 Step "running both ends for $Seconds s"
 $far = Start-Job -ScriptBlock {
     param($ssh, $cmd, $out)
     & ssh @ssh $cmd 2>&1 | Set-Content -Path $out
-} -ArgumentList (,$ssh), ("cd $remoteDir && tox_link.exe --seed $joinSeed --peer $hostKey --for $Seconds" +
-    $(if ($TcpOnly) { ' --tcp-only' } else { '' })), $remoteLog
+} -ArgumentList (,$ssh), (
+    "set TOX_HAND_PEER_SEED=$hostSeed && cd $remoteDir && $probeName --seed $joinSeed --peer $hostKey --for $Seconds" +
+    $(if ($TcpOnly) { ' --tcp-only' } else { '' }) +
+    $(if ($Hand) { " --hands $Hands --chat $chat" } else { '' })), $remoteLog
 
 Wait-Process -Id $here.Id -Timeout ($Seconds + 60) -ErrorAction SilentlyContinue
 Receive-Job $far -Wait -AutoRemoveJob | Out-Null
@@ -152,9 +189,13 @@ function Line($text, $pattern) {
 }
 
 Write-Host ""
-Write-Host "  here : $(Line $hereText 'RESULT self')"
-Write-Host "  there: $(Line $thereText 'RESULT self')"
-Write-Host ""
+# Only in link mode: `tox_hand` counts hands, not packets, and printing two
+# blank lines where its counters would be reads as two ends that said nothing.
+if (-not $Hand) {
+    Write-Host "  here : $(Line $hereText 'RESULT self')"
+    Write-Host "  there: $(Line $thereText 'RESULT self')"
+    Write-Host ""
+}
 foreach ($p in 'friend up after', 'joined the group after', 'FIRST PACKET') {
     $h = Line $hereText $p
     $t = Line $thereText $p
@@ -162,6 +203,22 @@ foreach ($p in 'friend up after', 'joined the group after', 'FIRST PACKET') {
     if ($t) { Write-Host "  there: $t" }
 }
 Write-Host ""
+
+if ($Hand) {
+    foreach ($p in 'HAND \d+ DONE', 'RESULT hands') {
+        foreach ($l in ($hereText  | Select-String -Pattern $p)) { Write-Host "  here : $($l.Line)" }
+        foreach ($l in ($thereText | Select-String -Pattern $p)) { Write-Host "  there: $($l.Line)" }
+    }
+    Write-Host ""
+    $played = ($hereText | Select-String -Pattern 'HAND \d+ DONE').Count
+    if ($played -gt 0) {
+        Write-Host "RESULT  $played hand(s) of poker played across the boundary over Tox" -ForegroundColor Green
+    } else {
+        Write-Host "RESULT  no hand completed - the logs above say how far it got" -ForegroundColor Yellow
+    }
+    Note "logs: $localLog and $remoteLog"
+    return
+}
 
 $crossed = ($thereText | Select-String -Pattern 'the group carried traffic').Count +
            ($hereText  | Select-String -Pattern 'the group carried traffic').Count

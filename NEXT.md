@@ -1366,6 +1366,67 @@ and the result stands anyway. What it does not prove remains what it did not
 prove for libp2p: NAT traversal between two different NATs, which needs an
 endpoint outside this building.
 
+
+### Measured: hands of poker played across the boundary, over Tox
+
+`tools/two-network-tox.ps1 -Hand`, the same two machines, 200 s:
+
+```
+here : HAND 1 DONE after 35.3s   there: HAND 1 DONE after 33.8s
+here : HAND 2 DONE after 52.2s   there: HAND 2 DONE after 49.9s
+                                 there: HAND 3 DONE after 61.3s
+RESULT  2 hand(s) of poker played across the boundary over Tox
+```
+
+That is `HAND_INIT`, the deck chain, `DECK_COMMIT`, `DEAL_PRIVATE`, four streets
+of betting, the showdown and `HAND_COMPLETE` — the real protocol, verified at
+both ends — over a private Tox group, with every message over 1 365 bytes
+fragmented and put back together. About **seventeen seconds a hand** after the
+first, which carries the connection setup. Locally the same probe plays a hand
+in the same time, so the boundary costs nothing measurable once the two are
+connected.
+
+The near end shows two hands where the far end shows three: `tox_hand` exits
+when **it** has played its count, and the seat that finishes first leaves before
+the other has the last message. That is the probe, not the protocol — in a
+client neither end leaves at the end of a hand.
+
+`examples/tox_hand.rs` is the hand driver on the Tox transport and nothing else:
+no lobby, no join RPC, no ratification. Both ends are handed the same `Opening`,
+which is what the formation would have agreed, because what is under test is
+whether the transport carries a hand and not whether two clients can agree to
+start one.
+
+### Two defects it found, and the second is the one worth keeping
+
+**1. Leaving threw away what had not been sent.** `Command::Leave` broke the
+driver's loop, and what is still queued when a client stops is the *last* message
+it produced — the `HAND_COMPLETE` that ends the hand. Measured: a hand played to
+the river, the seat that finished first left, and the other sat at the settlement
+stage until its deadline waiting for a message that had been built, queued and
+discarded. The driver now flushes before leaving, bounded at thirty turns so that
+leaving cannot become waiting.
+
+**2. A Tox group keeps no history either, and that is not a GossipSub quirk.**
+
+`run.rs` re-broadcasts everything this client has said every five seconds,
+because GossipSub keeps no history and a peer grafted after a publish never sees
+it. The obvious reading is that this is a workaround for GossipSub. It is not: a
+Tox group has the same property, and the first version of this probe proved it
+the hard way.
+
+The joiner published its `HAND_INIT` while the group was still empty — the
+founder learns a peer has joined after the peer does — so it went to nobody. The
+joiner then heard the founder's `HAND_INIT`, counted stage 0 complete against
+its own copy, and stopped re-sending. The founder held one event it could not
+place and waited out the hand. **Both ends were healthy, neither reported an
+error, and the hand was dead.**
+
+So the re-send buffer is a property of any transport without history, not of
+libp2p, and D-019 does not remove the need for it — it changes which transport
+lacks the history. Worth stating plainly, because the natural thing to do while
+moving off GossipSub is to leave that loop behind.
+
 ### What is next, in order
 
 1. ~~The fragmentation layer~~ **done**: `table::fragment`, eleven tests, and

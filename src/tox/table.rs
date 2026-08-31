@@ -305,6 +305,26 @@ fn run(
             }
         }
         if stop {
+            // **Flushed before leaving, not dropped.** Breaking here discarded
+            // whatever was still in `pending`, and what is still in `pending`
+            // when a client stops is the *last* message it produced - the
+            // `HAND_COMPLETE` that ends the hand. Measured: a hand played to the
+            // river over Tox, the seat that finished first left, and the other
+            // sat at the settlement stage until its deadline waiting for a
+            // message that had been built, queued and thrown away.
+            //
+            // Bounded, because leaving must not become waiting: a fixed number
+            // of turns, and then it goes whatever is left.
+            for _ in 0..FLUSH_TURNS {
+                if pending.is_empty() {
+                    break;
+                }
+                tox.iterate();
+                if let Some(g) = group {
+                    flush(&mut tox, g, &mut pending, &mut next_id);
+                }
+                std::thread::sleep(tox.interval().min(MAX_TICK));
+            }
             break;
         }
 
@@ -401,31 +421,7 @@ fn run(
             pending.push(message);
         }
         if let Some(g) = group {
-            // One message at a time, and only while its fragments are being
-            // accepted. `tox_group_send_custom_packet` refuses when the group
-            // has no peers or its send queue is full, and pushing the next
-            // message on top of a refusal would interleave two half-sent ones.
-            while let Some(message) = pending.first() {
-                let id = next_id;
-                let Ok(parts) = fragment::split(message, id, fragment::TOX_PACKET) else {
-                    // Longer than the protocol builds. Dropped rather than
-                    // retried for ever, because it will not get shorter.
-                    pending.remove(0);
-                    continue;
-                };
-                let mut sent_all = true;
-                for part in &parts {
-                    if tox.send(g, part).is_err() {
-                        sent_all = false;
-                        break;
-                    }
-                }
-                if !sent_all {
-                    break;
-                }
-                next_id = next_id.wrapping_add(1);
-                pending.remove(0);
-            }
+            flush(&mut tox, g, &mut pending, &mut next_id);
         }
 
         if last_sweep.elapsed() >= SWEEP_EVERY {
@@ -442,6 +438,43 @@ fn run(
         // instance is dropped. Leaving without it is leaving silently, and the
         // other seats then wait out a deadline for somebody who has gone.
         tox.iterate();
+    }
+}
+
+/// How many turns a leaving driver spends trying to send what it still holds.
+///
+/// Leaving must not become waiting, so it is a fixed number rather than a wait
+/// for an empty queue: at `MAX_TICK` this is at most a second and a half.
+const FLUSH_TURNS: usize = 30;
+
+/// Send what is queued, one message at a time.
+///
+/// **One at a time, and only while its fragments are being accepted.**
+/// `tox_group_send_custom_packet` refuses when the group has no peers or its
+/// send queue is full, and pushing the next message on top of a refusal would
+/// interleave two half-sent ones — the reassembler at the far end would then be
+/// holding two part-built messages from one sender, which it bounds, and the
+/// older of them would be the one dropped.
+fn flush(tox: &mut Tox, group: u32, pending: &mut Vec<Vec<u8>>, next_id: &mut u32) {
+    while let Some(message) = pending.first() {
+        let Ok(parts) = fragment::split(message, *next_id, fragment::TOX_PACKET) else {
+            // Longer than the protocol builds. Dropped rather than retried for
+            // ever, because it will not get shorter.
+            pending.remove(0);
+            continue;
+        };
+        let mut sent_all = true;
+        for part in &parts {
+            if tox.send(group, part).is_err() {
+                sent_all = false;
+                break;
+            }
+        }
+        if !sent_all {
+            return;
+        }
+        *next_id = next_id.wrapping_add(1);
+        pending.remove(0);
     }
 }
 
