@@ -506,6 +506,17 @@ impl Formation {
         self.ratified.keys().copied().collect()
     }
 
+    /// How many ratifications are waiting for a roster they fit.
+    ///
+    /// `on_table_ready` has three outcomes and only two of them are visible: a
+    /// refusal is reported by the caller and an acceptance moves `ratifiers`,
+    /// while **held** returns `Ok(vec![])` and looks exactly like nothing having
+    /// arrived. With `ratifiers` alone, a client stuck at `ratified 1/4` cannot
+    /// be told apart from one nobody is talking to.
+    pub fn held(&self) -> usize {
+        self.early.len()
+    }
+
     /// The founder's answer to a join request.
     ///
     /// `connection_peer_id` is what the **transport** authenticated, not what

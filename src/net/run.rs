@@ -1912,11 +1912,36 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // to them at all. Say it again.
                         if let (Some(f), Some(mine)) = (table.as_ref(), table_topic.as_ref()) {
                             if t == mine.hash() {
+                                // **Said out loud, because the silent version of
+                                // this could not be told from not firing at
+                                // all.** A rejoining client sat at `ratified
+                                // 1/4, 0 held` for a whole run — nothing
+                                // refused, nothing waiting, and no way from
+                                // either side's log to say whether the repeat
+                                // went out, went out into an empty mesh, or was
+                                // never triggered.
+                                let mut sent = 0usize;
+                                let mut failed: Option<String> = None;
                                 for bytes in f.say_again() {
-                                    let _ = swarm
+                                    match swarm
                                         .behaviour_mut()
                                         .gossipsub
-                                        .publish(mine.clone(), bytes);
+                                        .publish(mine.clone(), bytes)
+                                    {
+                                        Ok(_) => sent += 1,
+                                        Err(e) => failed = Some(format!("{e:?}")),
+                                    }
+                                }
+                                if sent > 0 || failed.is_some() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "{peer_id} joined this table's topic: said {sent} message(s) again{}",
+                                            match &failed {
+                                                Some(e) => format!(", and {e}"),
+                                                None => String::new(),
+                                            }
+                                        )))
+                                        .await;
                                 }
                             }
                         }
@@ -3152,12 +3177,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let (seen, want) = tox_sink.group_seen();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "seats on the line: {}; tox self {}, group {seen}/{want}, tox friends up {up}, invites {sent} sent {refused} refused",
+                                "seats on the line: {}; tox self {}, group {seen}/{want}, tox friends up {up}, invites {sent} sent {refused} refused{}",
                                 line.join(", "),
                                 match tox_sink.tox_connection() {
                                     0 => "offline",
                                     1 => "tcp",
                                     _ => "udp",
+                                },
+                                // **Only while the table has not settled.** A
+                                // ratification count is the difference between
+                                // "they never arrive" and "they arrive and are
+                                // refused", and it is the number missing from
+                                // every line this client printed while it sat at
+                                // a table it could not start a hand at. Once
+                                // there is a session it is answered and saying
+                                // it every thirty seconds is noise.
+                                if f.session().is_none() {
+                                    format!(
+                                        ", ratified {}/{}, {} held",
+                                        f.ratifiers().len(),
+                                        f.roster().len(),
+                                        f.held()
+                                    )
+                                } else {
+                                    String::new()
                                 }
                             )))
                             .await;
