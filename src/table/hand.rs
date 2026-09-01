@@ -7218,7 +7218,7 @@ mod tests {
         o.required = vec![0, 1];
         o.readmitted = vec![2];
         let (mut present, _) = Hand::open(o.clone(), &key(10), NOW, 30_000).unwrap();
-        let (mut absent, _) = Hand::open(o.clone(), &key(10), NOW, 30_000).unwrap();
+        let (absent, _) = Hand::open(o.clone(), &key(10), NOW, 30_000).unwrap();
 
         // The returning seat opens the same hand and says its one piece.
         let mut two = opening3(2);
