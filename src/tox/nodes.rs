@@ -142,7 +142,18 @@ pub fn parse(json: &str) -> Vec<Node> {
         let Some(host) = n.get("ipv4").and_then(|v| v.as_str()) else {
             continue;
         };
-        if host.is_empty() || host.len() > MAX_HOST || host == "-" {
+        // **`"NONE"` as well as `"-"`.** `nodes.tox.chat` writes a literal
+        // `"NONE"` in `ipv4` for a node it knows only by IPv6, and one such
+        // node in the live list carries `status_udp` and `status_tcp` true and
+        // two real TCP ports — so it passed this filter and was added as a
+        // relay whose host is the four characters `NONE`. That is a DNS lookup
+        // that cannot succeed and two relay slots spent on nothing, on every
+        // start.
+        //
+        // Skipped rather than repaired from `ipv6`: that field holds a hostname
+        // as often as an address in this document, and guessing which is which
+        // is how a parser starts trusting a stranger's formatting.
+        if host.is_empty() || host.len() > MAX_HOST || host == "-" || host == "NONE" {
             continue;
         }
         let Some(port) = n.get("port").and_then(|v| v.as_u64()) else {
@@ -274,6 +285,26 @@ pub fn refresh(profile: &Path) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `nodes.tox.chat` writes a literal `"NONE"` where it knows a node only by
+    /// IPv6, and such a node can still carry `status_udp`, `status_tcp` and real
+    /// TCP ports — one in the live list does. Without this it was added as a
+    /// relay whose host is the four characters `NONE`: a DNS lookup that cannot
+    /// succeed and two relay slots spent on nothing, on every start.
+    #[test]
+    fn a_node_known_only_by_ipv6_is_skipped_rather_than_dialled_as_none() {
+        let doc = r#"{"nodes":[
+            {"ipv4":"NONE","ipv6":"tox1.mooo.com","port":33445,
+             "public_key":"7E5668E0EE09E19F320AD47902419331FFEE147BB3606769CFBE921A2A2FD34C",
+             "status_udp":true,"status_tcp":true,"tcp_ports":[3389,33445]},
+            {"ipv4":"9.9.9.9","port":33445,
+             "public_key":"7E5668E0EE09E19F320AD47902419331FFEE147BB3606769CFBE921A2A2FD34C",
+             "status_udp":true,"status_tcp":true,"tcp_ports":[443]}
+        ]}"#;
+        let got = parse(doc);
+        assert_eq!(got.len(), 1, "the NONE node is not a node");
+        assert_eq!(got[0].host, "9.9.9.9");
+    }
 
     #[test]
     fn the_bundled_list_is_usable() {
