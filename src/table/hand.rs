@@ -7297,6 +7297,141 @@ mod tests {
     /// in the state hash, so two peers cannot disagree about how much anybody
     /// has left. That is the whole reason it is counted in hands: an allowance
     /// in seconds is an allowance measured on a clock nobody shares, and one
+    /// **The seat that is seated and not dealt in must be able to follow, and
+    /// today it cannot.** This is `S1-S`, and D-013's promise rests on it.
+    ///
+    /// §3.2's box: *"A seat outside `P(k)` keeps everything except its vote."*
+    /// §4.4: *"A seat outside `dealt_in` keeps its stack, pays its blinds and
+    /// antes as dead money, takes no cards, and is not a party to the
+    /// cryptography."* It is still a **required emitter** of `HAND_INIT`, of
+    /// `HAND_COMPLETE` and of every checkpoint — so it has to follow the whole
+    /// hand it holds no cards in, and §4.6 makes that possible by construction:
+    /// *"every peer has all `m` tokens for those indices and opens the cards."*
+    ///
+    /// And it has to, or §4.9's readmission set is unreachable by the only seat
+    /// it exists for: `A` is written by *a checkpoint-8 `STATE_HASH` that
+    /// agrees*, and a seat that cannot reach its own settlement has no such
+    /// value to sign.
+    ///
+    /// **What this test pins, and what it costs to leave open:** seat 2 is on
+    /// the roster with chips and is outside `dealt_in`. Seats 0 and 1 must
+    /// finish the hand; seat 2 must accuse nobody; and seat 2 must reach its own
+    /// boundary checkpoint. Today `begin_deck` seeds this client's own deck key
+    /// unconditionally (`keys: vec![own]`, with no `dealt_in` test), so the
+    /// observer's aggregate key is a sum over `|dealt_in| + 1` keys while every
+    /// dealt-in seat's is a sum over `|dealt_in|`, and the first shuffle proof
+    /// it checks cannot verify.
+    ///
+    /// **Ignored rather than deleted or weakened.** It is the specification the
+    /// fix has to satisfy, it runs on demand with `--ignored`, and an assertion
+    /// softened to today's behaviour would be a test that stops asking.
+    #[test]
+    #[ignore = "S1-S: an observer seat cannot follow a hand it is not dealt into"]
+    fn a_seat_that_is_not_dealt_in_still_follows_the_hand_and_accuses_nobody() {
+        // Seat 2 is on the roster and outside `P(k)`, so it is not dealt in.
+        let observer: SeatIdx = 2;
+        let mut hands: Vec<Hand> = Vec::new();
+        let keys = [key(10), key(11), key(12)];
+        let mut pending: Vec<Vec<u8>> = Vec::new();
+        for seat in 0..3u8 {
+            let mut o = opening3(seat);
+            o.required = vec![0, 1];
+            let (h, sends) = Hand::open(o, &keys[usize::from(seat)], NOW, 30_000)
+                .expect("every seat on the roster opens the hand, dealt in or not");
+            assert_eq!(
+                h.init().dealt_in,
+                vec![0, 1],
+                "seat {seat} agrees who is dealt in"
+            );
+            for Send::Broadcast(b) in sends {
+                pending.push(b);
+            }
+            hands.push(h);
+        }
+
+        // A broadcast bus: everything anybody says reaches everybody else.
+        let mut accusations = 0usize;
+        let mut aborts = 0usize;
+        for _ in 0..512 {
+            if pending.is_empty() {
+                let Some(turn) = (0..2u8).find_map(|s| hands[usize::from(s)].turn()) else {
+                    break;
+                };
+                let seat = turn.seat;
+                let h = &mut hands[usize::from(seat)];
+                let turn = h.turn().expect("that hand agrees it is to act");
+                let action = if turn.legal.can_check {
+                    Action::Check
+                } else {
+                    Action::Call
+                };
+                let out = h
+                    .act(action, &keys[usize::from(seat)], NOW)
+                    .expect("a legal action");
+                for Send::Broadcast(b) in out {
+                    pending.push(b);
+                }
+                continue;
+            }
+            let batch: Vec<Vec<u8>> = std::mem::take(&mut pending);
+            for bytes in batch {
+                for seat in 0..3u8 {
+                    let h = &mut hands[usize::from(seat)];
+                    if let Ok(out) = h.on_event(&bytes, &keys[usize::from(seat)], NOW) {
+                        for Send::Broadcast(b) in out {
+                            // An abort with an empty `attributed` is the
+                            // anonymous deadline abort and names nobody; one
+                            // that carries a key is the accusation. Counting
+                            // both as one would repeat the mistake `S1-S` was
+                            // corrected for once already.
+                            if let Ok((kind, _, _)) =
+                                crate::net::chained::peek(&b, HAND_ABORT_CAP)
+                            {
+                                if kind == EventType::HandAbort {
+                                    aborts += 1;
+                                    if let Ok(o) = crate::net::chained::open_in_hand(
+                                        &b,
+                                        HAND_ABORT_CAP,
+                                        EventType::HandAbort,
+                                        &[1u8; 32],
+                                        1,
+                                    ) {
+                                        if let Ok(body) = crate::net::chained::payload::<
+                                            crate::table::handwire::HandAbort,
+                                        >(&o, HAND_ABORT_CAP)
+                                        {
+                                            if !body.attributed.is_empty() {
+                                                accusations += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            pending.push(b);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            accusations, 0,
+            "nobody was named: an observer that cannot verify a shuffle must not \
+             conclude that the shuffler cheated ({aborts} abort(s) in all)"
+        );
+        for seat in [0u8, 1] {
+            assert!(
+                hands[usize::from(seat)].checkpoint8().is_some(),
+                "seat {seat} played the hand and reached its settlement"
+            );
+        }
+        assert!(
+            hands[usize::from(observer)].checkpoint8().is_some(),
+            "and the observer reached the same boundary, which is the only way \
+             back in that section 4.9 gives it"
+        );
+    }
+
     /// that decides `dealt_in` would fork the chain.
     #[test]
     fn the_bank_is_spent_by_absence_and_earned_by_presence() {
