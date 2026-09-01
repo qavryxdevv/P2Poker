@@ -71,6 +71,30 @@ pub struct TableSink {
     /// a second instance. See its own note for what the second call used to do.
     #[cfg(feature = "tox")]
     mine: Option<[u8; 32]>,
+    /// How far this client got in reaching the Tox network at all.
+    reach: Reach,
+}
+
+/// What bootstrapping actually achieved, rather than that it was attempted.
+///
+/// **Every one of these calls was `let _ =`.** The relay list is the whole of
+/// what makes a NATed or UDP-blocked player able to play — the owner's point,
+/// and the reason `attohttpc` and `serde_json` are in this tree at all — and
+/// nothing recorded whether a single relay was ever added. A run that failed
+/// looked exactly like a run where the network was fine and something else was
+/// wrong.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reach {
+    /// Nodes in the list this client loaded.
+    pub nodes: usize,
+    /// Of those, how many `tox_bootstrap` accepted (the DHT, over UDP).
+    pub booted: usize,
+    /// How many `tox_add_tcp_relay` accepted, across every advertised port.
+    /// **This is the fallback**, and a zero here with UDP blocked is a client
+    /// that cannot reach anybody.
+    pub relays: usize,
+    /// Whether the list was re-fetched from the network on this start.
+    pub refreshed: bool,
 }
 
 impl Default for TableSink {
@@ -80,6 +104,11 @@ impl Default for TableSink {
 }
 
 impl TableSink {
+    /// How far this client got in reaching the Tox network.
+    pub fn reach(&self) -> Reach {
+        self.reach
+    }
+
     /// No Tox table. The node publishes to its GossipSub mesh as before.
     pub const fn none() -> Self {
         Self {
@@ -87,6 +116,12 @@ impl TableSink {
             inner: None,
             #[cfg(feature = "tox")]
             mine: None,
+                    reach: Reach {
+                nodes: 0,
+                booted: 0,
+                relays: 0,
+                refreshed: false,
+            },
         }
     }
 
@@ -170,15 +205,39 @@ impl TableSink {
             // waits for UDP to fail - measured, two machines behind one router
             // reach the DHT in nine seconds and never reach each other without
             // them, because the hole punch asks the router to hairpin.
-            if crate::tox::nodes::stale(profile, 0) {
-                let _ = crate::tox::nodes::refresh(profile);
-            }
+            // **Counted, because every one of these was `let _ =` and the
+            // relay fallback therefore had no instrument at all.** When a whole
+            // evening of runs died with `tox self tcp, tox friends up 0, invites
+            // 0 sent`, nothing anywhere could say whether zero relays had been
+            // added or all of them had and the friendships failed anyway — and
+            // those are different faults with different fixes. A mechanism whose
+            // outcome is invisible is a mechanism that fails silently, which is
+            // the same defect this client has now been bitten by four times.
+            let refreshed = if crate::tox::nodes::stale(profile, 0) {
+                crate::tox::nodes::refresh(profile).is_ok()
+            } else {
+                false
+            };
+            let mut nodes = 0usize;
+            let mut booted = 0usize;
+            let mut relays = 0usize;
             for n in crate::tox::nodes::load(profile) {
-                let _ = tox.bootstrap(&n.host, n.udp_port, &n.key);
+                nodes += 1;
+                if tox.bootstrap(&n.host, n.udp_port, &n.key).is_ok() {
+                    booted += 1;
+                }
                 for port in &n.tcp_ports {
-                    let _ = tox.add_tcp_relay(&n.host, *port, &n.key);
+                    if tox.add_tcp_relay(&n.host, *port, &n.key).is_ok() {
+                        relays += 1;
+                    }
                 }
             }
+            self.reach = Reach {
+                nodes,
+                booted,
+                relays,
+                refreshed,
+            };
 
             let role = match role {
                 Role::Host => table::Role::Host,

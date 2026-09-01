@@ -467,6 +467,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // A latch, and terminal — see `note_a_hand_ahead`.
     let mut adrift: Option<(u64, u64)> = None;
     let mut adrift_said = false;
+    // Said once: this client is on a TCP relay and the group is not filling.
+    let mut udp_warned = false;
     let mut readmitted: Vec<u8> = Vec::new();
     let mut hand_one_held_since: Option<std::time::Instant> = None;
     // How many seats the group held when it last grew, and when that was. The
@@ -3448,6 +3450,48 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     )
                                 } else {
                                     String::new()
+                                }
+                            )))
+                            .await;
+                    }
+
+                    // **When the group will not fill, say how far this client
+                    // reached at all.**
+                    //
+                    // The owner's rule is that a TCP relay is a **fallback that
+                    // must work**, not a fault to report — it is why the node
+                    // list is refreshed over HTTPS and why every node is added
+                    // to toxcore's relay list as well as its DHT. So the useful
+                    // sentence is not *"UDP is blocked, check your firewall"*,
+                    // which tells a player to fix what the client is supposed to
+                    // survive. It is **which half of the fallback failed**.
+                    //
+                    // Every one of those calls was `let _ =`, so when an evening
+                    // of runs died with `tox self tcp, tox friends up 0, invites
+                    // 0 sent`, nothing could say whether zero relays had been
+                    // added or all of them had and the friendships failed
+                    // anyway. Those are different faults. `S1-U`.
+                    if !udp_warned && {
+                        let (seen, want) = tox_sink.group_seen();
+                        want > 0 && seen < want
+                    } {
+                        udp_warned = true;
+                        let r = tox_sink.reach();
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "the table's group is not filling. Tox is {}; of {} known nodes, {} bootstrapped and {} TCP relays were accepted{}. Game traffic rides that group, so nothing can be dealt until it fills.",
+                                match tox_sink.tox_connection() {
+                                    0 => "offline",
+                                    1 => "reachable only through a TCP relay",
+                                    _ => "on UDP",
+                                },
+                                r.nodes,
+                                r.booted,
+                                r.relays,
+                                if r.refreshed {
+                                    ", from a list refreshed on this start"
+                                } else {
+                                    ", from the stored list"
                                 }
                             )))
                             .await;
