@@ -202,6 +202,31 @@ pub struct Opening {
     pub genesis: Hash,
     /// The required emitter set: for hand 1, the signers of `TABLE_READY`.
     pub required: Vec<SeatIdx>,
+    /// §4.9's readmission set `A`, and it widens the **accepted** emitter set
+    /// of stage 0 alone.
+    ///
+    /// **This is the door back for a seat that missed a hand**, and until it
+    /// existed there was none. A seat outside `P(k)` is not dealt into `k+1`
+    /// (§4.4, `dealt_in ⊆ R(HAND_INIT, k+1) = P(k)`), and it cannot enter
+    /// `P(k+1)` without signing a chained event of hand `k+1`, which it cannot
+    /// do while it is not dealt in. Measured: a client that reconnected,
+    /// rejoined the table's group and never played another hand — `S1-O`.
+    ///
+    /// A seat gets in here by **signing**: a checkpoint-8 `STATE_HASH` of a
+    /// completed hand that **agrees** with this receiver's own value, or a
+    /// `PLAYER_SIT_IN` in that hand's boundary window. Signing requires being
+    /// alive, which is the entire test — no certificate, no vote, no quorum,
+    /// no third party.
+    ///
+    /// **Accepted and not required, which is `P2`'s disposition.** The write is
+    /// reachable by replay, so a read that enlarged a *required* set would let
+    /// one stale agreeing copy stall stage 0 to the hand deadline once per hand
+    /// for every hand `§5.3` retains. Widening the accepted set costs a map
+    /// lookup and completes nothing on its own. A seat readmitted this way is
+    /// **not** dealt in at `k+1`; it is counted into `P(k+1)` by its own
+    /// `HAND_INIT`, and is required and dealable at `k+2` — one hand later,
+    /// which is what D-013's promise costs when the news arrives late.
+    pub readmitted: Vec<SeatIdx>,
     /// Seat, public key and starting stack, ascending by seat.
     pub seats: Vec<(SeatIdx, [u8; 32], u64)>,
     pub max_players: u8,
@@ -279,6 +304,9 @@ impl Opening {
             roster_hash: f.roster().hash_at_zero(),
             genesis: f.genesis_one()?,
             required: f.ratifiers(),
+            // Hand one has no readmission set: nobody has missed a hand yet,
+            // and `A` is written only by a stale event of a **completed** hand.
+            readmitted: Vec::new(),
             seats: f
                 .roster()
                 .seats()
@@ -1096,7 +1124,20 @@ impl Hand {
         )
         .map_err(Failed::Wire)?;
 
-        let mut stage = Collective::closed(0, EventType::HandInit.code(), &o.required)
+        // **Required is `P(k-1)`; accepted is `P(k-1) ∪ A`.** The distinction is
+        // §4.9's and `Collective` has carried it from the start: `hear` counts a
+        // required seat and admits an accepted one without counting it towards
+        // completion. `closed` — the constructor every other stage uses — is
+        // exactly `new(required, required)`, which is right everywhere the
+        // readmission set is empty and wrong at this one stage.
+        let mut accepted: Vec<SeatIdx> = o.required.clone();
+        for seat in &o.readmitted {
+            if !accepted.contains(seat) {
+                accepted.push(*seat);
+            }
+        }
+        accepted.sort_unstable();
+        let mut stage = Collective::new(0, EventType::HandInit.code(), &o.required, &accepted)
             .ok_or(Failed::NotInThisStage)?;
         let own_hash = chained::open(&bytes, FRAME_CAP, EventType::HandInit, &slot)
             .map_err(Failed::Wire)?
@@ -5853,6 +5894,13 @@ impl Hand {
             roster_hash,
             genesis,
             required,
+            // **Filled by the caller, because the set outlives this hand.**
+            // `A` is written by a stale checkpoint-8 `STATE_HASH` or
+            // `PLAYER_SIT_IN` of a **completed** hand, which arrives at the
+            // node loop after this hand has stopped holding anything, and is
+            // read and cleared at exactly one place: the next hand init. A
+            // `Hand` cannot hold it, because the hand it belongs to is over.
+            readmitted: Vec::new(),
             seats,
             max_players: self.open.max_players,
             small_blind: self.open.small_blind,
@@ -6307,6 +6355,7 @@ mod tests {
             roster_hash: [3; 32],
             genesis: [4; 32],
             required: vec![0, 1],
+            readmitted: Vec::new(),
             seats: vec![
                 (0, key(10).verifying_key().to_bytes(), 10_000),
                 (1, key(11).verifying_key().to_bytes(), 10_000),
@@ -6344,6 +6393,7 @@ mod tests {
             roster_hash: [3; 32],
             genesis: [4; 32],
             required: vec![0, 1, 2],
+            readmitted: Vec::new(),
             seats: vec![
                 (0, key(10).verifying_key().to_bytes(), 10_000),
                 (1, key(11).verifying_key().to_bytes(), 10_000),
@@ -6779,6 +6829,50 @@ mod tests {
         } else {
             assert_eq!(stacks, vec![10_000, 10_000], "a tie splits it back");
         }
+    }
+
+    /// A readmitted seat is **accepted** at stage 0 and never **required**.
+    ///
+    /// **This is the door `S1-O` found missing**, and both halves of it matter.
+    ///
+    /// *Accepted*: without it a seat outside `P(k)` cannot send a `HAND_INIT`
+    /// this receiver will look at, so it cannot be counted into `P(k+1)`, so it
+    /// is never dealt in again. Measured: a client that reconnected, rejoined
+    /// the table's group, and played nothing for the rest of a run.
+    ///
+    /// *Never required*: the write to `A` is reachable by replay — §4.0 step
+    /// 10a is skipped for the stale events that write it — so if `A` enlarged
+    /// the **required** set, one replayed and perfectly agreeing checkpoint-8
+    /// `STATE_HASH` would stall stage 0 to the full hand deadline, once per
+    /// hand, for every hand §5.3 retains a record of. No key and no forgery
+    /// needed. That is `P2`, and it is why the widening is of the accepted set
+    /// alone.
+    #[test]
+    fn a_readmitted_seat_is_accepted_at_stage_zero_and_never_required() {
+        let mut o = opening3(0);
+        // Seat 2 missed the last hand: it is outside `P(k)` and so outside the
+        // required set, and the readmission set is what lets it be heard.
+        o.required = vec![0, 1];
+        o.readmitted = vec![2];
+        let (mut h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
+
+        // A stage that needs seats 0 and 1 is complete on those two alone, and
+        // seat 2 arriving does not change that — it was never counted towards
+        // completion.
+        let mut with_two = opening3(2);
+        with_two.required = vec![0, 1];
+        with_two.readmitted = vec![2];
+        let (_, from_two) = Hand::open(with_two, &key(12), NOW, 30_000).unwrap();
+        let Send::Broadcast(bytes) = &from_two[0];
+        let accepted = h.on_event(bytes, &key(10), NOW);
+        assert!(
+            accepted.is_ok(),
+            "a readmitted seat's HAND_INIT is admitted: {accepted:?}"
+        );
+        assert!(
+            h.participants().contains(&2),
+            "and it is counted into P(k+1), which is what makes it dealable at k+2"
+        );
     }
 
     /// Both peers reach the same boundary checkpoint, and it sits where §4.9

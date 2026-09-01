@@ -145,6 +145,7 @@ async fn main() {
         roster_hash: [0x33; 32],
         genesis,
         required: vec![0, 1],
+        readmitted: Vec::new(),
         seats: vec![
             (0, sk0.verifying_key().to_bytes(), 10_000),
             (1, sk1.verifying_key().to_bytes(), 10_000),

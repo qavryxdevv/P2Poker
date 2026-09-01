@@ -37,6 +37,7 @@ fn opening3_with_bank(my_seat: u8, time_bank_ms: u32) -> Opening {
         roster_hash: [3; 32],
         genesis: [4; 32],
         required: vec![0, 1, 2],
+        readmitted: Vec::new(),
         seats: vec![
             (0, key(10).verifying_key().to_bytes(), 10_000),
             (1, key(11).verifying_key().to_bytes(), 10_000),
