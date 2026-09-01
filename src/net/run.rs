@@ -437,6 +437,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // Whether this node has said that its checkpoints agree. Said once; see the
     // `Took::Agreed` arm of `checkpoint_event`.
     let mut checkpoint_said = false;
+    // **§6.3 step 1's freeze, and it is a latch.** `Some((k, sequence))` while
+    // this peer has observed two distinct `state_hash` values at one checkpoint.
+    // While it is set this client accepts no hand event and emits none: no card
+    // opens, no action is applied, no chips move. §6.3: *"silently continuing is
+    // what §15 forbids"*.
+    //
+    // **Released by exactly one thing** — a reconciliation stage that completes
+    // over `R(c) ∪ W` with every value in it agreeing. Not a timer; not the
+    // abort of the hand it froze in; not `TERMINAL(k)`; not a later hand's
+    // checkpoint; not the table closing. The corpus lists those exclusions
+    // because the previous revision left the release to be inferred and the
+    // inference was wrong.
+    let mut frozen: Option<(u64, u64)> = None;
+    // Every occupied seat, which is the accepted set of a checkpoint stage and
+    // of a reconciliation round. Refreshed where a boundary is opened.
+    let mut roster_seats: Vec<u8> = Vec::new();
+    // Said once: why the table has stopped. Cleared when the freeze is.
+    let mut frozen_said = false;
+    // Said once: why no reconciliation round could be opened. Its causes are
+    // permanent ones only — a stage that has not closed yet is retried in
+    // silence, because it is the ordinary case and not a fault.
+    let mut no_round_said = false;
     let mut readmitted: Vec<u8> = Vec::new();
     let mut hand_one_held_since: Option<std::time::Instant> = None;
     // How many seats the group held when it last grew, and when that was. The
@@ -1382,10 +1404,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &mut readmitted,
                                     &app_key,
                                     &mut checkpoint_said,
+                                    &mut frozen,
+                                    &roster_seats,
+                                    &mut no_round_said,
                                     &events,
                                 )
                                 .await
                                 {
+                                    // **§6.3 step 1: no hand event is accepted
+                                    // while frozen.** Ignored rather than
+                                    // rejected — the sender is not at fault and
+                                    // its message is not invalid; this receiver
+                                    // has stopped, which is a different thing
+                                    // and must not cost anybody peer score.
+                                    None if frozen.is_some() => {
+                                        Some(gossipsub::MessageAcceptance::Ignore)
+                                    }
                                     None => hand_event!(h, &message.data),
                                     Some(out) => {
                                         if !out.is_empty() {
@@ -1396,6 +1430,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 &mut readmitted,
                                                 &app_key,
                                                 &mut checkpoint_said,
+                                                &mut frozen,
+                                                &roster_seats,
+                                                &mut no_round_said,
                                                 &events,
                                                 table_topic.as_ref(),
                                                 &mut swarm,
@@ -2681,13 +2718,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         &mut readmitted,
                         &app_key,
                         &mut checkpoint_said,
+                        &mut frozen,
+                        &roster_seats,
+                        &mut no_round_said,
                         &events,
                     )
                     .await
                     {
-                        // Not a checkpoint event: the hand's own.
+                        // Not a checkpoint event: the hand's own, and it is
+                        // not applied while §6.3 step 1's freeze is latched.
                         None => {
-                            let _ = hand_event!(h, &item.bytes);
+                            if frozen.is_none() {
+                                let _ = hand_event!(h, &item.bytes);
+                            }
                         }
                         // Taken, and this peer's own `STATE_ACK` is due.
                         Some(out) if !out.is_empty() => {
@@ -2698,6 +2741,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 &mut readmitted,
                                 &app_key,
                                 &mut checkpoint_said,
+                                &mut frozen,
+                                &roster_seats,
+                                &mut no_round_said,
                                 &events,
                                 table_topic.as_ref(),
                                 &mut swarm,
@@ -3068,6 +3114,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }, if next_hand_at.is_some() => {
                 next_hand_at = None;
+                // **No further hand while frozen.** §6.3's freeze stops emission
+                // as well as acceptance, and a peer that dealt on would be
+                // building hand `k+1` on a state it has been told is contested.
+                // The checkpoint below is not reached either, which is right:
+                // there is nothing to checkpoint if no hand ran.
+                // Reset where the latch is read, not where it is cleared:
+                // `checkpoint_event` releases the freeze and has no business
+                // knowing what this loop has said out loud.
+                if frozen.is_none() {
+                    frozen_said = false;
+                }
+                if let Some((k, _)) = frozen {
+                    if !frozen_said {
+                        frozen_said = true;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "no further hand is dealt: this peer is frozen at hand {k}'s checkpoint and section 6.3 releases that by a reconciliation round alone"
+                            )))
+                            .await;
+                    }
+                    continue;
+                }
                 // **Said when the roster moves, and only then.** Reported at
                 // the derivation rather than at the end of the hand, because a
                 // late certificate is banked in between and the earlier version
@@ -3094,10 +3162,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // is §4.9's `L3`: a copy from outside `P(k)` is compared
                         // rather than rejected, and that copy agreeing is what
                         // writes the readmission set.
-                        let roster: Vec<u8> = table
+                        // Refreshed here, once a hand, because this is the one
+                        // place that already needs it and a reconciliation round
+                        // — the only other reader — can only open after a
+                        // checkpoint this site opened.
+                        roster_seats = table
                             .as_ref()
                             .map(|f| f.roster().seats().iter().map(|e| e.seat).collect())
                             .unwrap_or_default();
+                        let roster = roster_seats.clone();
                         if boundaries
                             .open(
                                 h.hand_id(),
@@ -3119,6 +3192,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         match h.state_hash_event(&app_key, super::node::now_unix_ms()) {
                             Ok(Some(bytes)) => {
+                                // Kept whole, because §6.3 step 2's dispute
+                                // carries it as evidence: the complete signed
+                                // bytes, so a peer whose own copies all agreed
+                                // can **verify** a second value at this
+                                // checkpoint rather than believe an accusation.
+                                boundaries.remember_own_event(h.hand_id(), &bytes);
                                 // **Published and heard.** A stage counts its
                                 // own seat like every other, and neither
                                 // GossipSub nor the Tox group delivers a message
@@ -3141,6 +3220,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &mut readmitted,
                                     &app_key,
                                     &mut checkpoint_said,
+                                    &mut frozen,
+                                    &roster_seats,
+                                    &mut no_round_said,
                                     &events,
                                     table_topic.as_ref(),
                                     &mut swarm,
@@ -4324,6 +4406,9 @@ async fn publish_and_hear(
     readmitted: &mut Vec<u8>,
     app_key: &ed25519_dalek::SigningKey,
     checkpoint_said: &mut bool,
+    frozen: &mut Option<(u64, u64)>,
+    roster: &[u8],
+    no_round_said: &mut bool,
     events: &Events,
     topic: Option<&gossipsub::IdentTopic>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
@@ -4347,6 +4432,9 @@ async fn publish_and_hear(
             readmitted,
             app_key,
             checkpoint_said,
+            frozen,
+            roster,
+            no_round_said,
             events,
         )
         .await
@@ -4358,6 +4446,103 @@ async fn publish_and_hear(
     }
 }
 
+/// §6.3 step 2, the moment this peer freezes: **declare, with the evidence**.
+///
+/// The dispute carries this peer's own `STATE_HASH` event whole, so a recipient
+/// whose own copies all agreed can verify a second value at that checkpoint
+/// rather than believe anybody — and §6.3 makes that load-bearing, because such
+/// a recipient otherwise takes no part in the procedure and the reconciliation
+/// stage's floor of two seats is then unreachable at a table where only two saw
+/// the mismatch.
+///
+/// Step 3 is **not** here, and the first version of this had it here and was
+/// wrong. See `try_to_reconcile`.
+async fn dispute_answer(
+    hand_id: u64,
+    at_sequence: u64,
+    boundaries: &crate::table::boundary::Boundaries,
+    app_key: &ed25519_dalek::SigningKey,
+    h: &crate::table::hand::Hand,
+) -> Vec<u8> {
+    let Some(own) = boundaries.own_event(hand_id).map(|b| b.to_vec()) else {
+        // A peer that never published its own copy has no evidence to carry,
+        // and a dispute without evidence is the accusation §6.3 deliberately
+        // does not send.
+        return Vec::new();
+    };
+    crate::table::dispute::publish_state_divergence(
+        h.table_id(),
+        hand_id,
+        at_sequence,
+        own,
+        app_key,
+        super::node::now_unix_ms(),
+    )
+    .unwrap_or_default()
+}
+
+/// §6.3 step 3: open the reconciliation round when it **can** be opened, and put
+/// this peer's re-derived value in it.
+///
+/// **Tried on every checkpoint event while frozen, and not once at the freeze.**
+/// The round chains from the checkpoint's `stage_hash`, which exists only when
+/// the stage has closed — and the copy that contradicts is usually not the last
+/// one to arrive, so at the moment of the freeze there is nothing to chain from.
+/// Measured: opened once at the freeze, the round never opened on any node of a
+/// run, and the single `None` returned then reported the wrong cause as well.
+///
+/// Returns this peer's own round `STATE_HASH` to publish, or empty.
+async fn try_to_reconcile(
+    hand_id: u64,
+    boundaries: &mut crate::table::boundary::Boundaries,
+    roster: &[u8],
+    app_key: &ed25519_dalek::SigningKey,
+    said: &mut bool,
+    events: &Events,
+) -> Vec<u8> {
+    use crate::table::boundary::NoRound;
+
+    if boundaries.has_round(hand_id, 1) {
+        return Vec::new();
+    }
+    match boundaries.open_round(hand_id, 1, roster) {
+        Ok(()) => {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "reconciliation round 1 for hand {hand_id} is open over R(c) union W; it is waiting for {:?} and needs one seat other than this to agree",
+                    boundaries.round_waiting_for(hand_id, 1)
+                )))
+                .await;
+            boundaries
+                .get(hand_id)
+                .and_then(|b| b.round_hash_event(1, app_key, super::node::now_unix_ms()))
+                .unwrap_or_default()
+        }
+        // Not permanent: the stage closes when the last member of `P(k)` is
+        // heard, and this is tried again on the next checkpoint event.
+        Err(NoRound::StageNotClosed) => Vec::new(),
+        Err(e) => {
+            if !*said {
+                *said = true;
+                let _ = events
+                    .send(NodeEvent::Warning(format!(
+                        "no reconciliation round can open for hand {hand_id}: {}",
+                        match e {
+                            NoRound::BelowFloor =>
+                                "R(c) union W is under section 4.9's floor of two, so this freeze is released by nothing",
+                            NoRound::NoSuchBoundary =>
+                                "this peer no longer holds that boundary",
+                            _ => "the round is outside the band section 4.9 reserves",
+                        }
+                    )))
+                    .await;
+            }
+            Vec::new()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn checkpoint_event(
     bytes: &[u8],
     h: &crate::table::hand::Hand,
@@ -4365,9 +4550,12 @@ async fn checkpoint_event(
     readmitted: &mut Vec<u8>,
     app_key: &ed25519_dalek::SigningKey,
     checkpoint_said: &mut bool,
+    frozen: &mut Option<(u64, u64)>,
+    roster: &[u8],
+    no_round_said: &mut bool,
     events: &Events,
 ) -> Option<Vec<u8>> {
-    use crate::table::boundary::Took;
+    use crate::table::boundary::{RoundTook, Took};
     use crate::table::checkwire;
     use crate::protocol::messages::EventType;
 
@@ -4384,12 +4572,6 @@ async fn checkpoint_event(
         return None;
     }
     let (round, half) = checkwire::round_of(sequence)?;
-    // Rounds 1 to 7 are §6.3's re-derivations and are not built. Refusing them
-    // here rather than treating them as round 0 is the difference between "not
-    // implemented" and "implemented wrongly".
-    if round != 0 {
-        return Some(Vec::new());
-    }
     let expected = match half {
         checkwire::Kind::Hash => EventType::StateHash,
         checkwire::Kind::Ack => EventType::StateAck,
@@ -4413,6 +4595,40 @@ async fn checkpoint_event(
     let Some(seat) = h.seat_of_key(&opened.sender) else {
         return Some(Vec::new());
     };
+
+    // §6.3 step 3's re-derivation, in the round's own stage. Its `STATE_ACK`
+    // half is not built: §6.3 reads the outcome off the **hash** stage — one
+    // value resolves, two fault, *"and the engine needs no other signal"*.
+    if round != 0 {
+        if half != checkwire::Kind::Hash {
+            return Some(Vec::new());
+        }
+        let Ok(body) = crate::net::chained::payload::<checkwire::StateHash>(&opened, 512) else {
+            return Some(Vec::new());
+        };
+        match boundaries.on_round_hash(hand_id, round, seat, opened.event_hash, body.state_hash) {
+            RoundTook::Resolved => {
+                // The only thing that releases the freeze, and it took at least
+                // one seat other than this one signing the same re-derived
+                // value — which is the whole of what the floor `|R| >= 2` buys.
+                *frozen = None;
+                let _ = events
+                    .send(NodeEvent::Warning(format!(
+                        "the divergence at hand {hand_id} reconciled in round {round}: one value across R(c) union W, and the freeze is released"
+                    )))
+                    .await;
+            }
+            RoundTook::Unresolved => {
+                let _ = events
+                    .send(NodeEvent::Warning(format!(
+                        "the divergence at hand {hand_id} did NOT reconcile in round {round}: two values, section 6.3 case (c), and this table deals no further hand"
+                    )))
+                    .await;
+            }
+            _ => {}
+        }
+        return Some(Vec::new());
+    }
 
     let took = match half {
         checkwire::Kind::Hash => {
@@ -4454,16 +4670,27 @@ async fn checkpoint_event(
         Took::Diverged {
             solitary_contradicted,
         } => {
+            let already = frozen.is_some();
+            // **The latch.** Set on the first observation and not moved by a
+            // second: §6.3 freezes on *"two distinct `state_hash` values at one
+            // checkpoint"*, and a third value is more of the same evidence
+            // rather than a new event to freeze at.
+            if !already {
+                *frozen = Some((hand_id, sequence));
+            }
             let _ = events
                 .send(NodeEvent::Warning(format!(
-                    "seat {seat} holds a different end-of-hand state for hand {hand_id}: this is a divergence, section 6.3 is not built{}",
+                    "seat {seat} holds a different end-of-hand state for hand {hand_id}: FROZEN at section 6.3 step 1 — no hand event is accepted or emitted from here{}",
                     if solitary_contradicted {
-                        " (and this peer is alone in P(k), which is N1's second half)"
+                        ", and this peer is alone in P(k), which is N1's second half"
                     } else {
                         ""
                     }
                 )))
                 .await;
+            if !already {
+                return Some(dispute_answer(hand_id, sequence, boundaries, app_key, h).await);
+            }
         }
         Took::Equivocation { .. } => {
             let _ = events
@@ -4489,6 +4716,15 @@ async fn checkpoint_event(
             }
         }
         Took::Counted | Took::Again | Took::Uninvited => {}
+    }
+    // **§6.3 step 3, tried here rather than at the freeze.** The round chains
+    // from the checkpoint's `stage_hash` and the contradicting copy is usually
+    // not the last to arrive, so at the freeze there is nothing to chain from.
+    if matches!(*frozen, Some((k, _)) if k == hand_id) {
+        let out = try_to_reconcile(hand_id, boundaries, roster, app_key, no_round_said, events).await;
+        if !out.is_empty() {
+            return Some(out);
+        }
     }
     Some(Vec::new())
 }

@@ -78,6 +78,14 @@ pub struct Boundary {
     participants: Vec<SeatIdx>,
     /// This peer's own `state_hash`, repeated in its acknowledgement.
     own: Hash,
+    /// This peer's own `STATE_HASH` **event**, kept whole.
+    ///
+    /// §6.3 step 2's dispute carries it as evidence — the complete signed bytes,
+    /// not the value — because a receiver whose own copies all agreed must be
+    /// able to **verify** a second value at that checkpoint rather than take
+    /// this peer's word for it. Without the bytes there is nothing to carry and
+    /// the dispute degenerates into an accusation.
+    own_event: Option<Vec<u8>>,
     hash_stage: Collective,
     ack_stage: Collective,
     /// `W`, section 4.9's **contradiction set**: the seats whose checkpoint
@@ -135,6 +143,47 @@ impl Boundary {
     /// acknowledgement are different faults with different causes.
     pub fn acks_waiting_for(&self) -> Vec<SeatIdx> {
         self.ack_stage.waiting_for()
+    }
+
+    /// This peer's own re-derived `STATE_HASH` for reconciliation round `r`.
+    ///
+    /// §6.3 step 3: *"each peer then publishes a fresh `STATE_HASH` for the
+    /// disputed checkpoint at a new `sequence`, chained from that checkpoint's
+    /// `stage_hash`, in the reconciliation stage §4.9 defines"*.
+    ///
+    /// **The value is this peer's own, re-derived.** With no transcript exchange
+    /// built (`S1-Q`) there is nothing new to derive it from, so it is the same
+    /// value — which is honest: a round that carries two values says the
+    /// divergence is a fork this peer cannot fill, and that is exactly what a
+    /// peer with nothing to reconcile from should be saying.
+    pub fn round_hash_event(
+        &self,
+        round: u16,
+        key: &ed25519_dalek::SigningKey,
+        now_ms: u64,
+    ) -> Option<Vec<u8>> {
+        let checkpoint_hash = self.checkpoint_hash()?;
+        let body = checkwire::StateHash {
+            checkpoint: checkwire::BOUNDARY_CHECKPOINT,
+            state_hash: self.own,
+            transcript_head: self.terminal,
+        };
+        let slot = crate::net::chained::Slot {
+            table_id: self.table_id,
+            hand_id: self.hand_id,
+            sequence: checkwire::hash_sequence(round)?,
+            previous_event_hash: checkpoint_hash,
+        };
+        crate::net::chained::seal(
+            EventType::StateHash,
+            &slot,
+            &body,
+            key,
+            now_ms,
+            0,
+            STATE_ACK_CAP,
+        )
+        .ok()
     }
 
     /// This peer's own `STATE_ACK`, once the `STATE_HASH` stage has completed.
@@ -196,6 +245,28 @@ struct Round {
     /// **unresolved** when it completes carrying two, *"and the engine needs no
     /// other signal"*.
     values: Vec<Hash>,
+}
+
+/// Why a reconciliation round did not open.
+///
+/// **Three causes, and they are not interchangeable.** A single `None` here said
+/// *"below the floor"* for a stage that had simply not closed yet, on every node
+/// of a measured run — a diagnostic that names the wrong cause is worse than
+/// none, because it sends the reader somewhere there is nothing to find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRound {
+    /// Round 0 is the checkpoint itself, and above 7 the band has no room.
+    NotARound,
+    /// No such boundary is held.
+    NoSuchBoundary,
+    /// §6.3 chains the round from *"that checkpoint's `stage_hash`"*, and a
+    /// stage that has not completed has none. **Not permanent**: the stage
+    /// completes when the last member of `P(k)` is heard, which may be after
+    /// the copy that contradicted.
+    StageNotClosed,
+    /// §4.9's floor: `|R(c) ∪ W| >= 2`. A stage whose purpose is to detect a
+    /// fork may not have a set the forked peer can satisfy alone.
+    BelowFloor,
 }
 
 /// What a reconciliation round did.
@@ -326,6 +397,7 @@ impl Boundaries {
                 terminal,
                 participants: participants.to_vec(),
                 own: own_state_hash,
+                own_event: None,
                 contradicted: Vec::new(),
                 rounds: BTreeMap::new(),
                 hash_stage,
@@ -472,6 +544,38 @@ impl Boundaries {
         Took::Counted
     }
 
+    /// Keep this peer's own `STATE_HASH` event, for §6.3 step 2's evidence.
+    pub fn remember_own_event(&mut self, hand_id: u64, bytes: &[u8]) {
+        if let Some(b) = self.open.get_mut(&hand_id) {
+            b.own_event = Some(bytes.to_vec());
+        }
+    }
+
+    /// This peer's own `STATE_HASH` event for hand `k`, if it published one.
+    pub fn own_event(&self, hand_id: u64) -> Option<&[u8]> {
+        self.open.get(&hand_id).and_then(|b| b.own_event.as_deref())
+    }
+
+    /// Record a seat into `W` without a `STATE_HASH` of its own having arrived.
+    ///
+    /// §6.3 step 2: a peer whose own copies all agreed *"did not observe the
+    /// divergence and would otherwise take no part in the procedure"*. A dispute
+    /// puts a second, independently verified value in front of it, and the
+    /// evidence's signer joins `W` exactly as a directly-observed contradiction
+    /// would. That is what makes the reconciliation stage's floor of two
+    /// reachable at a table where only two seats saw the mismatch.
+    pub fn contradiction_from_a_dispute(&mut self, hand_id: u64, seat: SeatIdx) -> bool {
+        let Some(b) = self.open.get_mut(&hand_id) else {
+            return false;
+        };
+        if b.contradicted.contains(&seat) {
+            return false;
+        }
+        b.contradicted.push(seat);
+        b.contradicted.sort_unstable();
+        true
+    }
+
     /// `W`, this peer's contradiction set for hand `k`.
     pub fn contradicted(&self, hand_id: u64) -> Vec<SeatIdx> {
         self.open
@@ -495,13 +599,18 @@ impl Boundaries {
     /// when the checkpoint's own stage has not completed — §6.3 chains the round
     /// from *"that checkpoint's `stage_hash`"*, and a stage that has not closed
     /// has none.
-    pub fn open_round(&mut self, hand_id: u64, round: u16, roster: &[SeatIdx]) -> Option<()> {
+    pub fn open_round(
+        &mut self,
+        hand_id: u64,
+        round: u16,
+        roster: &[SeatIdx],
+    ) -> Result<(), NoRound> {
         if round == 0 {
-            return None;
+            return Err(NoRound::NotARound);
         }
-        let sequence = checkwire::hash_sequence(round)?;
-        let b = self.open.get_mut(&hand_id)?;
-        b.hash_stage.hash()?;
+        let sequence = checkwire::hash_sequence(round).ok_or(NoRound::NotARound)?;
+        let b = self.open.get_mut(&hand_id).ok_or(NoRound::NoSuchBoundary)?;
+        b.hash_stage.hash().ok_or(NoRound::StageNotClosed)?;
         let mut required = b.participants.clone();
         for seat in &b.contradicted {
             if !required.contains(seat) {
@@ -510,9 +619,10 @@ impl Boundaries {
         }
         required.sort_unstable();
         if required.len() < 2 {
-            return None;
+            return Err(NoRound::BelowFloor);
         }
-        let stage = Collective::new(sequence, EventType::StateHash.code(), &required, roster)?;
+        let stage = Collective::new(sequence, EventType::StateHash.code(), &required, roster)
+            .ok_or(NoRound::NoSuchBoundary)?;
         b.rounds.insert(
             round,
             Round {
@@ -520,7 +630,15 @@ impl Boundaries {
                 values: Vec::new(),
             },
         );
-        Some(())
+        Ok(())
+    }
+
+    /// Whether round `r` of hand `k` has been opened here.
+    pub fn has_round(&self, hand_id: u64, round: u16) -> bool {
+        self.open
+            .get(&hand_id)
+            .map(|b| b.rounds.contains_key(&round))
+            .unwrap_or(false)
     }
 
     /// Which seats a reconciliation round is still waiting for.
@@ -792,7 +910,7 @@ mod tests {
         );
         assert_eq!(
             b.open_round(4, 1, &[0, 1]),
-            None,
+            Err(NoRound::BelowFloor),
             "P(k) is this seat alone and nobody has contradicted: the floor refuses the round"
         );
 
@@ -801,7 +919,7 @@ mod tests {
         assert_eq!(b.contradicted(4), vec![1], "W is what the contradiction wrote");
         assert_eq!(
             b.open_round(4, 1, &[0, 1]),
-            Some(()),
+            Ok(()),
             "R(c) union W is two seats now, and the floor is met"
         );
         assert_eq!(b.round_waiting_for(4, 1), vec![0, 1]);
@@ -851,9 +969,17 @@ mod tests {
         b.on_state_hash(4, 0, ev(0), STATE);
         b.on_state_hash(4, 1, ev(1), STATE);
 
-        assert_eq!(b.open_round(4, 0, &[0, 1]), None, "round 0 is the checkpoint");
-        assert_eq!(b.open_round(4, 7, &[0, 1]), Some(()), "seven is the last");
-        assert_eq!(b.open_round(4, 8, &[0, 1]), None, "and eight is outside the band");
+        assert_eq!(
+            b.open_round(4, 0, &[0, 1]),
+            Err(NoRound::NotARound),
+            "round 0 is the checkpoint"
+        );
+        assert_eq!(b.open_round(4, 7, &[0, 1]), Ok(()), "seven is the last");
+        assert_eq!(
+            b.open_round(4, 8, &[0, 1]),
+            Err(NoRound::NotARound),
+            "and eight is outside the band"
+        );
         assert_eq!(checkwire::hash_sequence(7), Some(8206));
         assert_eq!(checkwire::ack_sequence(7), Some(8207));
     }
@@ -872,7 +998,7 @@ mod tests {
         assert!(!b.get(4).expect("held").hash_stage_complete());
         assert_eq!(
             b.open_round(4, 1, &[0, 1, 2]),
-            None,
+            Err(NoRound::StageNotClosed),
             "seat 2 has not spoken, so the checkpoint has no stage_hash to chain from"
         );
     }
