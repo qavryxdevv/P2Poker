@@ -7193,6 +7193,70 @@ mod tests {
     /// `STATE_HASH` would stall stage 0 to the full hand deadline, once per
     /// hand, for every hand §5.3 retains a record of. No key and no forgery
     /// needed. That is `P2`, and it is why the widening is of the accepted set
+    /// **The oscillation, re-measured against today's `grace`** — the rules
+    /// question `NEXT.md` files as *"it is consistent and it may be wrong"*.
+    ///
+    /// `next_hand` derives `R(k+1)` by filtering `R(k)`, so the roster is
+    /// monotone and a seat that misses a hand never returns. That rule was
+    /// adopted because the alternative — deriving `R(k+1)` from `P(k)` — was
+    /// measured oscillating: a seat certified absent *"came back every other
+    /// hand and was certified out again, for ever"*.
+    ///
+    /// The whole alternative reduces to one question, which is what this
+    /// measures: **does an accepted bystander's `HAND_INIT` put its seat into
+    /// `P(k)`?** If it does, a seat that is present again re-enters `R` and
+    /// D-013 is kept; if a seat that stays away also re-enters, the oscillation
+    /// is real and the monotone rule is right.
+    ///
+    /// Both halves are measured here, and they differ — which is the answer.
+    #[test]
+    fn a_returning_seat_enters_p_of_k_and_an_absent_one_does_not() {
+        // Hand two: seat 2 missed hand one, so it is outside the required set
+        // and inside the readmission set §4.9 writes.
+        let mut o = opening3(0);
+        o.hand_id = 2;
+        o.required = vec![0, 1];
+        o.readmitted = vec![2];
+        let (mut present, _) = Hand::open(o.clone(), &key(10), NOW, 30_000).unwrap();
+        let (mut absent, _) = Hand::open(o.clone(), &key(10), NOW, 30_000).unwrap();
+
+        // The returning seat opens the same hand and says its one piece.
+        let mut two = opening3(2);
+        two.hand_id = 2;
+        two.required = vec![0, 1];
+        two.readmitted = vec![2];
+        let (_, from_two) = Hand::open(two, &key(12), NOW, 30_000).unwrap();
+        let Send::Broadcast(bytes) = &from_two[0];
+        present
+            .on_event(bytes, &key(10), NOW)
+            .expect("§4.9 admits a readmitted seat's HAND_INIT");
+
+        // **The returning seat is in `P(k)`.** So under the alternative rule —
+        // `R(k+1) = P(k)` — it is required again at hand three, which is
+        // exactly D-013's "one silent seat costs exactly one hand".
+        assert!(
+            present.participants().contains(&2),
+            "a readmitted seat that speaks joins P(k): {:?}",
+            present.participants()
+        );
+
+        // **And a seat that stays away does not.** Nothing was delivered to
+        // `absent` from seat 2, and `P(k)` does not hold it — so the
+        // alternative rule would NOT make an absent seat required again, and
+        // the oscillation the monotone rule was adopted against needs a seat
+        // that is heard from to occur at all.
+        assert!(
+            !absent.participants().contains(&2),
+            "an absent seat is not in P(k) however long it stays away: {:?}",
+            absent.participants()
+        );
+
+        // The two differ, and that difference is the whole of the answer: `P(k)`
+        // separates "came back" from "still gone", which is what the monotone
+        // rule gives up in order to be safe.
+        assert_ne!(present.participants(), absent.participants());
+    }
+
     /// alone.
     #[test]
     fn a_readmitted_seat_is_accepted_at_stage_zero_and_never_required() {
