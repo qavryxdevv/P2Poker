@@ -14,6 +14,7 @@ pub mod formation;
 /// (`PROTOCOL.md` §4.9).
 pub mod boundary;
 pub mod checkwire;
+pub mod dispute;
 /// Carrying a message over a transport whose packets are smaller than it
 /// (D-019: every Tox channel caps at about 1372 bytes).
 pub mod fragment;
