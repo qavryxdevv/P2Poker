@@ -614,7 +614,30 @@ impl Formation {
                 };
                 let reply =
                     joinwire::publish_join_reject(request_hash, reason, 0, &f.key, now_ms)?;
-                Ok(vec![Send::Reply(reply)])
+
+                // **A join request from a seat that is already seated is proof
+                // that its roster is stale, so answer with the roster as well.**
+                //
+                // Measured at nine seats: three joiners stopped at *4 seated*
+                // while the founder and four others reached nine, because the
+                // `PLAYER_LIST` that carried seats five to nine never reached
+                // them. `PLAYER_LIST` is broadcast when the roster **changes**
+                // and there is no request for it, so a peer that misses the
+                // last one misses it for ever — and its only recovery is to ask
+                // to join again, every thirty seconds, and be told *already
+                // seated*. Correct, and useless: the table never ratified and
+                // the run ended with `NO TABLE` on every node.
+                //
+                // The repeat is `said.list`, the exact bytes already signed and
+                // published, so nothing new is created and `list_serial` does
+                // not move. A peer that already has it discards a duplicate.
+                let mut out = vec![Send::Reply(reply)];
+                if matches!(reason, RejectReason::AlreadySeated) {
+                    if let Some(list) = self.said.list.clone() {
+                        out.push(Send::Broadcast(list));
+                    }
+                }
+                Ok(out)
             }
         }
     }
@@ -1365,8 +1388,19 @@ mod tests {
             .founder
             .on_join_request(&second, &peer(2), NOW)
             .expect("a refusal is still an answer");
-        assert_eq!(out.len(), 1, "a refusal changes no roster");
-        assert_eq!(t.founder.roster().len(), 2);
+        // **A refusal changes no roster, and it repeats one.** The roster
+        // assertion below is the one that carries the rule; the send count used
+        // to stand in for it and stopped being able to when the repeat was
+        // added. A join request from a seat that is already seated is proof
+        // that its roster is stale - measured at nine seats, three joiners
+        // stuck at four seated for a whole run - so the answer carries the
+        // list as well as the refusal.
+        assert_eq!(t.founder.roster().len(), 2, "a refusal changes no roster");
+        assert_eq!(out.len(), 2, "the refusal, and the roster the asker is missing");
+        assert!(
+            matches!(&out[1], Send::Broadcast(b) if joinwire::receive_player_list(b).is_ok()),
+            "the second send is the player list, re-published as it stands"
+        );
         match &out[0] {
             Send::Reply(bytes) => {
                 let (_, reason, _, _) = joinwire::receive_join_reject(bytes).unwrap();

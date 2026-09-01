@@ -2581,6 +2581,55 @@ roster update.
 costs nothing while nothing counts it, and a key comparison that never matches
 costs nothing while the only caller is a kick nobody watches.
 
+## A stale roster had no way back, and nine seats could not form because of it
+
+Re-measuring the seat curve with formation fixed and the gate in, nine and ten
+seats came back **`NO TABLE`**. The logs said why, and it was not the gate — the
+gate holds `HAND_INIT` *after* ratification, and ratification never happened.
+
+```
+n0 max 9 seated    n3 max 4 seated    n6 max 9 seated
+n1 max 9 seated    n4 max 4 seated    n7 max 9 seated
+n2 max 9 seated    n5 max 4 seated    n8 max 0 seated
+```
+
+**Three joiners stopped at four seated while the founder and four others reached
+nine.** The `PLAYER_LIST` carrying seats five to nine never reached them.
+
+`PLAYER_LIST` is broadcast when the roster **changes**, and there is no request
+for it. So a peer that misses the last one misses it for ever, and its only
+recovery is the one it already tried: ask to join again, every thirty seconds,
+and be told **"already seated"** — which is true, and useless. Eleven times in
+that run.
+
+**The fix is one line of reasoning: a join request from a seat that is already
+seated is proof that its roster is stale, so answer with the roster as well as
+the refusal.** What is repeated is `said.list`, the exact bytes the founder
+already signed and published, so nothing new is created and `list_serial` does
+not move; a peer that already has it discards a duplicate.
+
+**Measured, nine seats:** `NO TABLE`, three joiners stuck at four seated →
+**every seat at nine, every seat in the group by 20.6 s, 22 hands, 12.0 s/hand.**
+
+The test that guarded this asserted `out.len() == 1` under the words *"a refusal
+changes no roster"*. The roster assertion beside it is what carries that rule;
+the send count was standing in for it and stopped being able to. It now asserts
+both — the roster is unchanged, and the second send is the list.
+
+### Ten seats still does not form, and it is not the roster
+
+Six of ten never entered the Tox group, and the founder reports **zero
+invitations refused** — so `invite_pending` had nobody to invite: the Tox
+**friend connections** never came up. n3 reached *10 seated* and sat waiting for
+an invitation for the whole run.
+
+That is toxcore's friend discovery, and ten toxcore instances on one machine all
+broadcasting on the same LAN discovery cadence is a plausible cause that has
+nothing to do with the protocol. **Recorded as unexplained rather than filed as a
+defect**, because the honest reading of one run on one box is that the harness
+may be the limit rather than the client. Nine seats plays; ten needs a second
+machine before anything is claimed about it.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that
