@@ -80,6 +80,20 @@ param(
     # It stops on its own `--for`, so `Drop` runs and the client exits the way a
     # player closing the window does rather than the way a crash does.
     [ValidateRange(0, 3600)][int]$LeaverSeconds = 0,
+    # **A seat that drops mid-tournament and comes back**, which is the case
+    # D-022 exists for and which nothing had ever exercised.
+    #
+    # `-DropAt` is when n1's client stops; `-DropFor` is how long it stays down
+    # before starting again **with the same profile** — the same application
+    # key, the same peer identity, the same seat. That is a client that crashed
+    # or a link that went, not a player who left.
+    #
+    # D-022 gives every seat `GRACE_HANDS = 2`: back inside two hands and it is
+    # dealt in again; longer and the allowance is spent and the blinds eat the
+    # stack while it sits out. At roughly ten seconds a hand, a twenty-second
+    # outage is the boundary.
+    [ValidateRange(0, 3600)][int]$DropAt = 0,
+    [ValidateRange(0, 600)][int]$DropFor = 20,
     # A seat slower than this to enter the Tox group keeps the logs, however
     # well the rest of the run went. Sixty seconds is far outside the ordinary
     # spread, which has been 10-25 s in every run measured.
@@ -138,6 +152,10 @@ for ($i = 0; $i -lt $Seats; $i++) {
     if ($mine -lt 30) { $mine = 30 }
     $leaving = ($LeaverSeconds -gt 0 -and $i -eq 1)
     if ($leaving) { $mine = $LeaverSeconds }
+    # The dropper stops at `-DropAt` and is started again below. Its own `--for`
+    # is cut to the outage's start; the second half gets the rest of the run.
+    $dropping = ($DropAt -gt 0 -and $i -eq 1 -and -not $leaving)
+    if ($dropping) { $mine = $DropAt }
     $nodeArgs = @('--headless', '--autoplay', '--for', "$mine", '--profile', $profileDir)
     if ($i -eq 0) {
         $nodeArgs += @('--host', $table, '--seats', "$Seats")
@@ -194,6 +212,27 @@ if ($LeaverSeconds -gt 0) {
     $jobs += $replacement
 }
 
+if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
+    Write-Host "==> n1 drops at $DropAt s and returns $DropFor s later, same profile"
+    $return = Start-Job -ArgumentList $Exe, $work, $table, $Seconds, $DropAt, $DropFor -ScriptBlock {
+        param($exe, $work, $table, $seconds, $dropAt, $dropFor)
+        Start-Sleep -Seconds ($dropAt + $dropFor)
+        # **The same profile, deliberately.** It carries the identity and the
+        # application key, so this is the seat coming back rather than a new
+        # player taking one.
+        $p = Join-Path $work 'n1'
+        $log = Join-Path $work 'n1-again.log'
+        $start = Get-Date
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+        $left = $seconds - $dropAt - $dropFor
+        if ($left -lt 30) { $left = 30 }
+        & $exe --headless --autoplay --for "$left" --profile $p --join $table 2>&1 |
+            ForEach-Object { ((((Get-Date) - $start).TotalSeconds).ToString('F1', $inv)).PadLeft(7) + '  ' + $_ } |
+            Out-File -FilePath $log -Encoding utf8
+    }
+    $jobs += $return
+}
+
 Write-Host "$Seats nodes started; waiting up to $($Seconds + 60) s"
 $null = Wait-Job -Job $jobs -Timeout ($Seconds + 60)
 
@@ -219,6 +258,7 @@ $inv = [System.Globalization.CultureInfo]::InvariantCulture
 $logs = @()
 for ($i = 0; $i -lt $Seats; $i++) { $logs += @{ Name = "n$i"; Path = (Join-Path $work "n$i.log") } }
 if ($LeaverSeconds -gt 0) { $logs += @{ Name = 'nR'; Path = (Join-Path $work 'nR.log') } }
+if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) { $logs += @{ Name = 'n1-again'; Path = (Join-Path $work 'n1-again.log') } }
 
 $nodes = @()
 foreach ($entry in $logs) {

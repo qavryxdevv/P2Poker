@@ -561,6 +561,40 @@ impl Tox {
     /// silently.
     const PEER_SCAN: u32 = 64;
 
+    /// Forget a friend, so the next `add_friend` searches for it afresh.
+    ///
+    /// **This exists for one case: a peer whose client restarted.** toxcore
+    /// keeps trying the address it last knew, and its own constants say for how
+    /// long — `FRIEND_CONNECTION_TIMEOUT` is `FRIEND_PING_INTERVAL * 4`, thirty-
+    /// two seconds (`friend_connection.h:34,37`), and the DHT entry behind it
+    /// only goes bad at `FRIEND_DHT_TIMEOUT = BAD_NODE_TIMEOUT`, which is
+    /// `PING_INTERVAL + 1 * (PING_INTERVAL + PING_ROUNDTRIP)` = **122 seconds**
+    /// (`DHT.h:52-57`, `friend_connection.h:40`). So a restarted peer is
+    /// invisible for something over two and a half minutes before the search
+    /// even begins again.
+    ///
+    /// Measured: a client back after twenty seconds, and the founder reporting
+    /// `tox friends up 2` of three for the rest of a five-minute run while it
+    /// sent fifteen invitations to the two it could still reach. D-022 gives
+    /// that seat two hands — about twenty seconds — to come back, so waiting
+    /// out toxcore is not an option.
+    ///
+    /// Deleting drops the cached address with the friendship, and adding the
+    /// same key again starts a fresh search.
+    pub fn forget_friend(&mut self, friend: u32) -> Result<(), Failed> {
+        let mut err: c_int = 0;
+        // SAFETY: `friend` is a friend number this instance issued.
+        let ok = unsafe { sys::tox_friend_delete(self.ptr, friend, &mut err) };
+        if ok && err == 0 {
+            Ok(())
+        } else {
+            Err(Failed::Api {
+                call: "tox_friend_delete",
+                error: err,
+            })
+        }
+    }
+
     /// How many other peers this client can see in the group.
     ///
     /// **A count, not a set, and that distinction is forced by the API.**

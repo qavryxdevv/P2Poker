@@ -2919,6 +2919,79 @@ datagram that did not make it. Treating the second as evidence would cost
 somebody their seat for a moment of packet loss, which is why `SEAT_SILENCE_MS`
 is six intervals of the first rather than one of the second.
 
+## A seat that drops and comes back cannot rejoin — four fixes, still open
+
+The owner's premise: the internet is unreliable in principle. So the case after
+*a player who leaves* is *a player whose client dies and starts again*, which is
+what D-022's allowance exists for — `GRACE_HANDS = 2`, about twenty seconds at
+this table's pace. `table-run.ps1 -DropAt -DropFor` restarts a node **with the
+same profile**, so the same identity comes back to the same seat.
+
+**The table survives it well.** Across every run: the seat drops, the others
+carry on, and 22 to 30 hands finish with every remaining seat agreeing. D-022's
+*not dealt in* path works.
+
+**The returning client never gets back in.** Seven runs, and not once.
+
+### Four things were wrong, all four are fixed, and none of them was the cause
+
+Each was found by measuring, each is a real defect, and each is committed here.
+
+**1. A closed table stops being advertised.** The comment was *"a full tournament
+under way has nobody to attract — a lobby listing it is a lobby listing a door
+that does not open"*, which is true of strangers and false of the one person who
+needs it. The advert expires at `AD_TTL_MS`, so a client restarting ninety
+seconds later could not find the table **at all** — `NO TABLE` for its whole
+life. Fixed, and it demonstrably helped: the returning client now finds the
+table in seven seconds and asks to join.
+
+**2. `TableSink::start` was not idempotent.** It built a new `Tox` instance and
+replaced the running one — thread, friendships, group membership — every time it
+was called. The joiner path calls it on every `JoinTable`, and a headless client
+asks every thirty seconds while it is not seated. So the returning client tore
+down and rebuilt its own Tox identity on a timer, for ever.
+
+**3. `invited` is a record of what the founder did, not of who is there.** A peer
+that restarts has left the group and needs inviting again; `invite_pending`
+skipped it permanently. Now the founder re-offers while the group is short, and
+on the one signal that means *this peer has restarted* — a seat asking to join a
+table it already sits at. A peer that already holds a group ignores a second
+invitation, so the offer is free.
+
+**4. toxcore keeps trying the address the peer had before.** Its own constants:
+`FRIEND_CONNECTION_TIMEOUT = FRIEND_PING_INTERVAL * 4` = **32 s**, and the DHT
+entry behind it only goes bad at `FRIEND_DHT_TIMEOUT = BAD_NODE_TIMEOUT` =
+`60 + 1 * (60 + 2)` = **122 s** (`friend_connection.h:34,37,40`, `DHT.h:52-57`).
+So the search for a restarted peer does not even begin for over two and a half
+minutes, against D-022's twenty. `Tox::forget_friend` now deletes and re-adds the
+friendship on `Rejoined`, which throws the stale address away.
+
+### What the counters say, and it is still not enough
+
+The instrument that should have existed from the start — three numbers, because
+*zero refusals* is ambiguous between *everything went* and *nothing was tried*:
+
+```
+seats on the line: 1 0ms, 2 0ms, 3 0ms; group 2/3, tox friends up 2, invites 15 sent 0 refused
+```
+
+Seat 1 answers **libp2p** pings at 0 ms, so the peer is there and reachable. The
+group holds two of three. **The founder's Tox friend connection to it never comes
+up**, so `invite_pending` — which sends only to a connected friend — has nowhere
+to send, and the fifteen invitations went to the two it could already reach.
+
+That is where it stands. Four causes removed, the symptom unchanged, and the
+remaining question is precise: **why does a Tox friendship to a restarted peer
+not re-establish, when both sides hold the same keys, the peer is up, and the
+stale address has been deliberately discarded?**
+
+**Not guessed at further.** Five hypotheses have been tested against this run and
+four of them were right about something and wrong about the outcome; a sixth
+written without new evidence would be the same mistake again. What is owed is a
+Tox-level trace — `tox_self_get_connection_status` and the friend's own status on
+both sides through the outage — which is an instrument this client does not have
+yet and which is the next thing to build.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that

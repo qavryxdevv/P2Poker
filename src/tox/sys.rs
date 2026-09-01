@@ -241,6 +241,10 @@ extern "C" {
         error: *mut c_int,
     ) -> bool;
     /// `tox.h:3840`
+    /// `tox.h:989`. Forget a friend, which discards toxcore's cached idea of
+    /// where it is. See `Tox::forget_friend`.
+    pub fn tox_friend_delete(tox: *mut Tox, friend_number: u32, error: *mut c_int) -> bool;
+
     /// `tox.h:3698`. This client's own peer id inside the group, so a scan that
     /// counts members can leave itself out of the count.
     pub fn tox_group_self_get_peer_id(

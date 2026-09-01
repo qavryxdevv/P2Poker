@@ -1054,6 +1054,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // client is a founder of something.
                                     continue;
                                 };
+                                // **A seat asking to join a table it already
+                                // sits at has restarted**, and this is the only
+                                // signal that says so. A client that is playing
+                                // does not ask; one that asks has lost
+                                // everything it held, its place in the table's
+                                // Tox group among it — and nothing else notices,
+                                // because `invited` records what the founder did
+                                // rather than who is there, toxcore's friend
+                                // connection outlives a short outage so no
+                                // down-edge clears it, and a dead peer still
+                                // resolves in the group's peer list so the group
+                                // does not read as short.
+                                //
+                                // Read **before** the request is answered,
+                                // because answering it is what changes the
+                                // roster in every other case.
+                                let returning = f
+                                    .roster()
+                                    .seats()
+                                    .iter()
+                                    .find(|e| e.peer_id == authenticated)
+                                    .and_then(|e| e.tox_key);
+                                if let Some(k) = returning {
+                                    tox_sink.tell(super::toxsink::Seat::Back(k));
+                                }
                                 match f.on_join_request(&request, &authenticated, now) {
                                     Ok(sends) => {
                                         // The channel is consumed by the one
@@ -2995,9 +3020,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                     if !line.is_empty() {
+                        let (sent, refused, up) = tox_sink.invite_counts();
+                        let (seen, want) = tox_sink.group_seen();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "seats on the line: {}",
+                                "seats on the line: {}; group {seen}/{want}, tox friends up {up}, invites {sent} sent {refused} refused",
                                 line.join(", ")
                             )))
                             .await;
@@ -3241,13 +3268,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // was refused with "the advertisement has expired", which is the
                 // defect the first two-instance run found and which no unit test
                 // could have, because it needs thirty seconds to appear.
-                // Not a table that has closed. A full tournament under way has
-                // nobody to attract - it is a closed group now - and a lobby
-                // listing it is a lobby listing a door that does not open.
-                if let Some(f) = table
-                    .as_mut()
-                    .filter(|f| f.is_founder())
-                    .filter(|_| !table_closed)
+                // **A closed table is advertised too, and the sentence that
+                // used to stand here is why it was not.** It read: *a full
+                // tournament under way has nobody to attract — it is a closed
+                // group now — and a lobby listing it is a lobby listing a door
+                // that does not open.* True of strangers, and false of the one
+                // person who needs it most.
+                //
+                // The advert is **how a seat that was disconnected finds its way
+                // back**. Stop it and the advert expires at `AD_TTL_MS`, and a
+                // player whose client restarts ninety seconds later has no way
+                // to find the table at all: no advert, no address, nothing.
+                // Measured, twice — a client back after twenty seconds ran out
+                // its whole remaining life reporting `NO TABLE` while the table
+                // played thirty hands without it. D-022 gives that seat two
+                // hands of allowance and the transport gave it no way to spend
+                // them.
+                //
+                // Nothing is loosened by advertising it: a stranger's
+                // `JOIN_REQUEST` is refused as *the table is full* by §7.2 as it
+                // always was, and the advert carries `players` and
+                // `max_players`, so a lobby that does not want to show full
+                // tables has the numbers to filter on. `dht_effort` still
+                // narrows for a closed table — what is kept is the mesh
+                // re-broadcast, which is what a returning seat hears.
+                if let Some(f) = table.as_mut().filter(|f| f.is_founder())
                 {
                     match f.readvertise(now, AD_TTL_MS) {
                         Ok(bytes) => {

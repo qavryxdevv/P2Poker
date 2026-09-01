@@ -53,6 +53,9 @@ pub enum Seat {
     Took([u8; 32]),
     /// It no longer does: remove it from the group, where this client may.
     Left([u8; 32]),
+    /// It is back after a restart and needs the group offered again. See
+    /// `tox::table::Command::Rejoined` for why nothing else notices.
+    Back([u8; 32]),
 }
 
 /// The table's game transport, when there is one.
@@ -62,6 +65,12 @@ pub enum Seat {
 pub struct TableSink {
     #[cfg(feature = "tox")]
     inner: Option<crate::tox::table::ToxTable>,
+    /// This client's own Tox public key, once an instance is running.
+    ///
+    /// Kept so [`start`](Self::start) can answer a second call without building
+    /// a second instance. See its own note for what the second call used to do.
+    #[cfg(feature = "tox")]
+    mine: Option<[u8; 32]>,
 }
 
 impl Default for TableSink {
@@ -76,6 +85,8 @@ impl TableSink {
         Self {
             #[cfg(feature = "tox")]
             inner: None,
+            #[cfg(feature = "tox")]
+            mine: None,
         }
     }
 
@@ -107,6 +118,28 @@ impl TableSink {
     /// other from keys carried in the advertisement and the join request and a
     /// Tox friendship is two-sided.
     #[allow(unused_variables)]
+    /// Start the table's Tox driver, or keep the one already running.
+    ///
+    /// # The second call used to throw the first away
+    ///
+    /// This built a new `Tox` instance every time and replaced `inner`,
+    /// dropping the running driver — its thread, its friendships and its place
+    /// in the group — and starting over from a fresh DHT bootstrap.
+    ///
+    /// **The joiner path calls it on every `JoinTable`**, and a headless client
+    /// asks to join every thirty seconds for as long as it is not seated. So a
+    /// client that restarted and was answered *already seated* tore down and
+    /// rebuilt its own Tox identity every half minute for ever, and was never in
+    /// one place long enough for the founder to find it.
+    ///
+    /// That is what four earlier fixes were aimed at and missed. The founder's
+    /// counters said `tox friends up 2` of three for a whole five-minute run
+    /// while it sent fifteen invitations to the two it could reach; the peer it
+    /// could not reach was resetting itself on a timer.
+    ///
+    /// A second call now returns the running instance's key. Changing tables
+    /// goes through [`clear`](Self::clear) first, which is what `LeaveTable`
+    /// already does.
     pub fn start(
         &mut self,
         profile: &Path,
@@ -118,6 +151,10 @@ impl TableSink {
         #[cfg(feature = "tox")]
         {
             use crate::tox::{table, Tox};
+
+            if self.inner.is_some() {
+                return Ok(self.mine);
+            }
 
             let secret = crate::storage::profile::load_or_create_tox_key(profile)
                 .map_err(|e| format!("no tox identity: {e}"))?;
@@ -156,6 +193,7 @@ impl TableSink {
                     roster,
                 },
             ));
+            self.mine = Some(mine);
             Ok(Some(mine))
         }
         #[cfg(not(feature = "tox"))]
@@ -276,6 +314,31 @@ impl TableSink {
         }
     }
 
+    /// Invitations sent, invitations refused, and friends the driver believes
+    /// are connected.
+    ///
+    /// **Three numbers because zero refusals is ambiguous**: every invitation
+    /// went, or none was attempted, and a peer that never rejoins looks the
+    /// same under both.
+    pub fn invite_counts(&self) -> (u64, u64, u64) {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => (
+                    t.trouble().invites_sent.load(Ordering::Relaxed),
+                    t.trouble().invites_refused.load(Ordering::Relaxed),
+                    t.trouble().friends_up.load(Ordering::Relaxed),
+                ),
+                None => (0, 0, 0),
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            (0, 0, 0)
+        }
+    }
+
     /// Invitations into the table's group that toxcore refused.
     ///
     /// **Separate from `trouble`, because it is a different condition with a
@@ -310,6 +373,7 @@ impl TableSink {
                 t.tell(match seat {
                     Seat::Took(k) => Command::Seated(k),
                     Seat::Left(k) => Command::Unseated(k),
+                    Seat::Back(k) => Command::Rejoined(k),
                 });
             }
         }
@@ -323,6 +387,9 @@ impl TableSink {
             // thread, which flushes whatever it still holds — the last message
             // of a hand is exactly what is in that queue.
             self.inner = None;
+            // And the key goes with it, so a later `start` builds afresh rather
+            // than answering with the key of an instance that has stopped.
+            self.mine = None;
         }
     }
 

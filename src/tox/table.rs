@@ -95,6 +95,27 @@ pub enum Command {
     /// and pretending otherwise would put a second membership answer beside
     /// the roster's.
     Unseated([u8; 32]),
+    /// **This seat is here again and needs the group offered to it afresh.**
+    ///
+    /// A client that restarts has left the group, and nothing the founder can
+    /// see says so. `invited` records what this client *did*, not who is
+    /// there, so `invite_pending` skips a peer it once invited for ever. The
+    /// friend connection is no help either: toxcore's outlives an outage far
+    /// longer than the ones that matter, so no down-edge fires to clear the
+    /// entry — measured, a client back after **twenty seconds** sat at
+    /// *waiting to be invited* for the rest of the run while the table
+    /// finished thirty hands without it.
+    ///
+    /// Counting the group's members is no help either, and that was the first
+    /// attempt: `tox_group_peer_get_public_key` still resolves for a peer whose
+    /// client has died, so `peer_count` returns the whole roster and the group
+    /// does not look short.
+    ///
+    /// **The signal that does work is the peer asking to join a table it
+    /// already has a seat at.** A seat that is playing does not ask; one that
+    /// asks has restarted and lost everything it held, the group among it.
+    /// `net::run` sends this from the `AlreadySeated` path and nowhere else.
+    Rejoined([u8; 32]),
     /// Leave the group and stop.
     Leave,
 }
@@ -144,6 +165,17 @@ pub struct Trouble {
     /// peer cannot see the others yet*. Two numbers do.
     pub in_group: AtomicU64,
     pub want_in_group: AtomicU64,
+    /// Invitations toxcore **accepted** from the founder.
+    ///
+    /// Beside `invites_refused` because zero refusals means one of two very
+    /// different things — every invitation went, or none was attempted — and a
+    /// reconnection that never completes looks identical under both. Three
+    /// fixes were made against that ambiguity before this counter existed.
+    pub invites_sent: AtomicU64,
+    /// The friends the founder currently believes are connected, so an
+    /// invitation has somewhere to go. `invite_pending` sends to these and to
+    /// no others.
+    pub friends_up: AtomicU64,
     /// Invitations the founder tried to send and toxcore refused.
     ///
     /// **Here because a seat arriving late is two different failures that look
@@ -290,6 +322,24 @@ const MAX_TICK: Duration = Duration::from_millis(50);
 /// How often stalled reassemblies are swept.
 const SWEEP_EVERY: Duration = Duration::from_secs(5);
 
+/// How often the founder offers the group again to seats that are not in it.
+///
+/// **Because `invited` is a record of what this client did, not of who is
+/// there.** A peer whose client restarts has left the group and needs a fresh
+/// invitation; the founder's `invited` still names it, so `invite_pending`
+/// skips it for ever. The down-edge that would clear the entry never comes
+/// either, because toxcore's friend connection outlives an outage far longer
+/// than the ones that matter — measured, a client back after **twenty seconds**
+/// waited out the rest of a run at *waiting to be invited* and played nothing,
+/// while the table finished thirty hands without it.
+///
+/// So while the group is **short**, the record is dropped and everybody
+/// connected is offered it again. It costs nothing when the group is whole,
+/// because then nothing is short and nothing is sent; and a peer that is
+/// already in a group ignores a second invitation, since the joiner accepts
+/// only when it holds none.
+const REINVITE_EVERY: Duration = Duration::from_secs(30);
+
 /// Start the driver on its own thread.
 ///
 /// `tox` is moved onto that thread and stays there. The returned handle is the
@@ -382,6 +432,7 @@ fn run(
     let mut reassembler: Reassembler<u32> = Reassembler::new(fragment::TOX_PACKET);
     let mut next_id: u32 = 0;
     let mut last_sweep = Instant::now();
+    let mut last_reinvite = Instant::now();
     let mut pending: Vec<Vec<u8>> = Vec::new();
 
     loop {
@@ -415,6 +466,38 @@ fn run(
                         }
                     }
                 }
+                Command::Rejoined(key) if key != me => {
+                    if matches!(setup.role, Role::Host) {
+                        if let Some(n) = friends.iter().find(|(_, k)| **k == key).map(|(n, _)| *n) {
+                            invited.retain(|f| *f != n);
+                            // **And if the friendship is down, start it over.**
+                            // Forgetting that the peer was invited is not enough
+                            // on its own: `invite_pending` sends only to a
+                            // connected friend, and toxcore will keep trying the
+                            // address the peer had before it restarted for
+                            // something over two and a half minutes — see
+                            // `Tox::forget_friend` for the constants. Measured,
+                            // the founder sat at `tox friends up 2` of three for
+                            // a whole five-minute run.
+                            //
+                            // Only while it is down. A connected friend is
+                            // reachable and deleting it would throw away a
+                            // working connection to solve a problem it does not
+                            // have.
+                            if !connected.contains(&n) {
+                                let _ = tox.forget_friend(n);
+                                friends.remove(&n);
+                                connected.remove(&n);
+                                invited.retain(|f| *f != n);
+                                if let Ok(fresh) = tox.add_friend(&key) {
+                                    friends.insert(fresh, key);
+                                }
+                            }
+                        }
+                        invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
+                    }
+                }
+                Command::Rejoined(_) => {}
                 Command::Leave => stop = true,
             }
         }
@@ -547,6 +630,24 @@ fn run(
             if matches!(setup.role, Role::Host) {
                 invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
             }
+            // **Offer the group again to whoever is not in it.** See
+            // `REINVITE_EVERY`: `invited` says what this client has done, and
+            // a peer that restarted needs asking again even though it does.
+            // Only while the group is short, so a whole table sends nothing.
+            if matches!(setup.role, Role::Host)
+                && last_reinvite.elapsed() >= REINVITE_EVERY
+            {
+                let short = match group {
+                    Some(g) => tox.peer_count(g) < roster.len(),
+                    None => false,
+                };
+                if short {
+                    invited.clear();
+                    invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
+                }
+                last_reinvite = Instant::now();
+            }
+
             // And whether the group now holds every other seat. `roster` is
             // this client's excepted (see `Setup::roster`), so the answer is a
             // straight comparison. At most ten keys and a scan each, once every
@@ -569,6 +670,7 @@ fn run(
                 Some(g) => tox.peer_count(g),
                 None => 0,
             };
+            trouble.friends_up.store(connected.len() as u64, Ordering::Relaxed);
             trouble.in_group.store(seen as u64, Ordering::Relaxed);
             trouble.want_in_group.store(roster.len() as u64, Ordering::Relaxed);
             trouble
@@ -618,6 +720,7 @@ fn invite_pending(
     let Some(g) = group else { return };
     for friend in pending_invites(connected, friends, invited) {
         if tox.invite(g, friend).is_ok() {
+            trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
             invited.push(friend);
         } else {
             // Counted rather than logged: a refusal here is ordinary while the
