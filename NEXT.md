@@ -3030,13 +3030,55 @@ It now keeps the table and the group and waits for the roster that is on its way
 where seven runs before it never did, and it holds a table with all three
 friendships up. The warning is gone.
 
-### What is left, and it is a different question
+### The transport is fixed, and the protocol has no door
 
-The returning client is in a group **with nobody else in it**: its own report goes
-`group 1/3` then `group 0/3` while `tox friends up 3`. It rejoined *a* group and
-is alone there. Whether that is a stale group, a fragmented one, or a second one
-of its own is the next thing to find out, and the instrument to do it with now
-exists.
+**The group heals.** A clean run, both sides, every thirty seconds:
+
+```
+founder     30 s  group 3/3   …  120 s  group 2/3   …  150 s  group 3/3  (and on)
+returning   60 s  group 3/3, tox friends up 3       (and on)
+```
+
+The dip is the outage and it closes within thirty seconds of the return. The
+earlier `group 0/3` reading was from before the `AlreadySeated` fix. Reconnection
+at the transport layer works.
+
+**The returning seat still plays nothing, and now the reason is exact.** The
+founder's one roster derivation says it:
+
+```
+128.2  the table changes: required [0,1,2,3] -> [0,2,3].
+       certified [1]  strikes [0,1,0,0]  grace [2,2,2,2]  by_certificate=true
+```
+
+Not D-022's allowance — grace is untouched at 2 for everybody. The seat was
+**certified out** for not acting, which is correct, and it is then outside
+`P(k)`. §4.4: `dealt_in ⊆ R(HAND_INIT, k+1) = P(k)`. So it is not dealt into the
+next hand; and it cannot get into `P(k+1)` without signing a chained event of
+hand `k+1`, which it cannot do while it is not dealt in.
+
+**The corpus knows this and names two ways out.** §4.9's readmission set `A` is
+written by a seat *signing a chained event*: either a `0x0804 PLAYER_SIT_IN` in
+chain `k`'s boundary window, **or a checkpoint-8 `STATE_HASH` of chain `k` that
+agrees with this receiver's own value**. Either makes its sender an accepted
+emitter of the next hand init, and D-013's promise is that one silent hand costs
+one hand.
+
+**Neither exists in this client.** `PLAYER_SIT_IN`, `PLAYER_SIT_OUT` and
+`PLAYER_LEAVE` appear only in `messages.rs` as event-type constants — nothing
+emits or admits them; `BOUNDARY_SEQUENCE_BASE` is referenced by nothing but its
+own compile-time assertions; and checkpoint-8 `STATE_HASH` is the feature whose
+wire bodies were written earlier today and whose stage does not run yet.
+
+So the finding is not about Tox at all: **a seat that misses one hand can never
+be dealt in again, because both doors the specification provides are unbuilt.**
+The transport work above got the player back into the room. There is no door from
+the room to the table.
+
+**And it reframes what `STATE_HASH` is for.** It has been carried as divergence
+detection — §6.1's *"the only way a silent divergence is ever caught"* — and it is
+equally **the mechanism by which a disconnected player rejoins the game**. That is
+a much stronger reason to finish it than the one it was queued under.
 
 The founder meanwhile handled the seat correctly: `required [0,1,2,3] -> [0,2,3]`,
 `certified [1]`, `strikes [0,1,0,0]`, grace untouched at 2 for everybody. A seat
