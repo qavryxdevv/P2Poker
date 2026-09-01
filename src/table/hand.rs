@@ -322,6 +322,14 @@ pub const HAND_INIT_CAP: usize = 512;
 /// that a peer cannot make this client hold much by sending nonsense.
 const FRAME_CAP: usize = 16_384;
 
+/// The frame cap for a `STATE_HASH`.
+///
+/// Three fields — a `u16` and two thirty-two-byte hashes — so this is generous
+/// by an order of magnitude and is a bound rather than a size. Every cap in
+/// this file is one: `SPEC_CS.md` §17 wants a limit on everything that arrives
+/// from the network, and a body this small still arrives from the network.
+const STATE_HASH_CAP: usize = 512;
+
 /// The cap for [`chained::peek`], which runs **before** the type is known.
 ///
 /// `peek` cannot use a per-type cap, because reading the type is what it is
@@ -950,6 +958,19 @@ pub struct Hand {
     /// outside every required set from the following hand, which is how one
     /// silent seat costs exactly one hand rather than the table.
     signed: Vec<bool>,
+    /// The boundary checkpoint's value for this hand, once the hand has one.
+    ///
+    /// `(state_hash, TERMINAL(k))` — §6.1's hash of the settled state, and the
+    /// stage hash the checkpoint chains from.
+    ///
+    /// **Kept because the hand is about to stop holding it.** The settlement
+    /// computes `state_hash` for `HAND_COMPLETE`'s body and the `Step` that
+    /// carries it is replaced by `Step::Ended` a moment later; §4.9 needs the
+    /// value **after** that, and §4.9 needs it to outlive the hand entirely —
+    /// a checkpoint-8 `STATE_HASH` of hand `k` is admissible until
+    /// `TERMINAL(k+1)` is fixed. This is the hand's half of that; the record
+    /// that outlives it is `protocol::checkpoint`'s.
+    checkpoint8: Option<(Hash, Hash)>,
     /// The body this client derived. Everybody else's is compared against it.
     mine: HandInit,
     /// The slot of the stage now open.
@@ -1090,6 +1111,7 @@ impl Hand {
         Ok((
             Hand {
                 signed,
+            checkpoint8: None,
                 tally: None,
                 certs: BTreeMap::new(),
                 banked: BTreeSet::new(),
@@ -3454,8 +3476,88 @@ impl Hand {
                 *slot = *end;
             }
         }
+        // **Held before the step that computed it goes.** `mine.state_hash` is
+        // §6.1's hash of the settled state and `parent` is `TERMINAL(k)`; the
+        // next line drops the `Step` that carries the first, and the slot moves
+        // past the second on the following hand. See the field's own note.
+        self.checkpoint8 = Some((mine.state_hash, parent));
         play.step = Step::Ended;
         Ok(Vec::new())
+    }
+
+    /// The boundary checkpoint's value and the stage it chains from, once the
+    /// hand has settled. `None` before that, and on the aborted path, which
+    /// §6.2 row 8 also places a checkpoint on and which is not built yet.
+    pub fn checkpoint8(&self) -> Option<(Hash, Hash)> {
+        self.checkpoint8
+    }
+
+    /// This client's copy of the boundary checkpoint's `STATE_HASH` (§4.9).
+    ///
+    /// **Why the hand emits this at all, and it is not only about divergence.**
+    /// §6.1 calls the state hash *"the only way a silent divergence is ever
+    /// caught"*, which is what this stage is usually queued under. It is also
+    /// the door back: §4.9's readmission set `A` is written by a seat signing
+    /// *a checkpoint-8 `STATE_HASH` of chain `k` that agrees*, and without it a
+    /// seat that misses one hand is outside `P(k)`, is therefore not dealt into
+    /// `k+1` (§4.4), and cannot sign its way back in. Measured — a client that
+    /// reconnected, rejoined the group and never played again. That is `S1-O`.
+    ///
+    /// `None` until the hand has settled: there is nothing to hash before then.
+    ///
+    /// The slot is **named, not walked** — `sequence = BOUNDARY_CHECKPOINT_BASE`
+    /// with `previous_event_hash = TERMINAL(k)`, which is §4.9's rule and eight
+    /// thousand stages above anything the hand itself reached.
+    pub fn state_hash_event(
+        &self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, Failed> {
+        let Some((state_hash, terminal)) = self.checkpoint8 else {
+            return Ok(None);
+        };
+        let Some(sequence) = crate::table::checkwire::hash_sequence(0) else {
+            return Ok(None);
+        };
+        let body = crate::table::checkwire::StateHash {
+            checkpoint: crate::table::checkwire::BOUNDARY_CHECKPOINT,
+            state_hash,
+            transcript_head: terminal,
+        };
+        let slot = self.slot.at(sequence, terminal);
+        let bytes = chained::seal(
+            EventType::StateHash,
+            &slot,
+            &body,
+            key,
+            now_ms,
+            // **The checkpoint arms no deadline.** Every other stage's number
+            // says how long the next one may take; this one has no next stage
+            // yet — its `STATE_ACK` follows when the hash stage completes — and
+            // §4.9 accepts a copy of it until `TERMINAL(k+1)` is fixed, which
+            // is a window the hand cannot name because it belongs to the hand
+            // after. A deadline here would be a promise about somebody else's
+            // clock.
+            0,
+            STATE_HASH_CAP,
+        )
+        .map_err(Failed::Wire)?;
+        Ok(Some(bytes))
+    }
+
+    /// `P(k)` as seat indices: the seats this client accepted a chained event
+    /// from during this hand.
+    ///
+    /// The required emitter set of the boundary checkpoint's `STATE_HASH`
+    /// stage (§4.9: *"at checkpoint 8 it is `P(k)`"*), and the set §4.4 draws
+    /// the next hand's `dealt_in` from.
+    pub fn participants(&self) -> Vec<SeatIdx> {
+        self.signed
+            .iter()
+            .enumerate()
+            .filter(|(_, signed)| **signed)
+            .filter_map(|(seat, _)| u8::try_from(seat).ok())
+            .collect()
     }
 
     /// Give up on this hand: nobody produced what the stage needed in time.
@@ -6677,6 +6779,88 @@ mod tests {
         } else {
             assert_eq!(stacks, vec![10_000, 10_000], "a tie splits it back");
         }
+    }
+
+    /// Both peers reach the same boundary checkpoint, and it sits where §4.9
+    /// puts it.
+    ///
+    /// **This is the property everything downstream of the checkpoint rests
+    /// on.** §6.1 calls the state hash *"the only way a silent divergence is
+    /// ever caught"*, and a comparison is worth nothing unless two honest peers
+    /// that played the same hand produce the same value. So the value is
+    /// compared, and so is the slot: `sequence = BOUNDARY_CHECKPOINT_BASE` with
+    /// `previous_event_hash = TERMINAL(k)`, which is §4.9's rule and not the
+    /// next stage after the hand.
+    ///
+    /// The stage does not run yet — nothing collects these or completes it.
+    /// What is pinned here is the value and its address, which is what the
+    /// stage will carry.
+    #[test]
+    fn both_peers_reach_the_same_boundary_checkpoint() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+        queue.push((1, deliver(&mut b, &a_deck, &key(11))));
+        queue.push((0, deliver(&mut a, &b_deck, &key(10))));
+
+        let keys = [key(10), key(11)];
+        for _ in 0..256 {
+            if let Some((from, sends)) = queue.pop() {
+                if sends.is_empty() {
+                    continue;
+                }
+                let to = 1 - from;
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let out = deliver(hand, &sends, &keys[usize::from(to)]);
+                queue.push((to, out));
+                continue;
+            }
+            if a.over() && b.over() {
+                break;
+            }
+            let Some(turn) = a.turn().or_else(|| b.turn()) else {
+                break;
+            };
+            let seat = turn.seat;
+            let hand: &mut Hand = if seat == 0 { &mut a } else { &mut b };
+            let action = if hand.turn().expect("that hand agrees").legal.can_check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            let out = hand.act(action, &keys[usize::from(seat)], NOW).unwrap();
+            queue.push((seat, out));
+        }
+
+        let (a_state, a_terminal) = a.checkpoint8().expect("a settled hand has a checkpoint");
+        let (b_state, b_terminal) = b.checkpoint8().expect("and so does the other peer");
+        assert_eq!(
+            a_state, b_state,
+            "two peers that played the same hand hash the same state, or the              checkpoint compares nothing"
+        );
+        assert_eq!(
+            a_terminal, b_terminal,
+            "and chain it from the same TERMINAL(k)"
+        );
+
+        // `P(k)`: both peers heard both seats.
+        assert_eq!(a.participants(), vec![0, 1]);
+        assert_eq!(b.participants(), vec![0, 1]);
+
+        // The address, which is §4.9's and not the hand's own next stage.
+        let bytes = a
+            .state_hash_event(&key(10), NOW)
+            .expect("the event seals")
+            .expect("and there is one to seal");
+        let (_, _, sequence) =
+            crate::net::chained::peek(&bytes, STATE_HASH_CAP).expect("it is a chained event");
+        assert_eq!(
+            sequence,
+            crate::protocol::constants::BOUNDARY_CHECKPOINT_BASE,
+            "the checkpoint is named, not walked to"
+        );
     }
 
     /// Hand two follows hand one, and both peers derive the same opening.

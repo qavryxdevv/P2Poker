@@ -61,6 +61,24 @@ impl Slot {
         }
     }
 
+    /// A **named** stage of the same chain, rather than the next one.
+    ///
+    /// `then` walks forward by one, which is every ordinary stage. The
+    /// boundary checkpoint does not walk: §4.9 puts its `STATE_HASH` at
+    /// `sequence = BOUNDARY_CHECKPOINT_BASE` and its `STATE_ACK` at `+ 1`,
+    /// eight thousand stages above whatever the hand reached, with
+    /// `previous_event_hash = TERMINAL(k)` — *"equivalently, §3.2's rule
+    /// extended a second time: `stage_hash(BOUNDARY_CHECKPOINT_BASE - 1) :=
+    /// TERMINAL(k)`"*. Reaching it by repeated `then` would be counting to
+    /// 8 192.
+    pub fn at(self, sequence: u64, parent: Hash) -> Slot {
+        Slot {
+            sequence,
+            previous_event_hash: parent,
+            ..self
+        }
+    }
+
     /// The next stage of the same chain, after an event whose hash is `parent`.
     pub fn then(self, parent: Hash) -> Slot {
         Slot {
