@@ -339,6 +339,28 @@ impl TableSink {
         }
     }
 
+    /// This client's own connection to the Tox network: `0` none, `1` TCP,
+    /// `2` UDP, and `0` in a build without the feature.
+    ///
+    /// **The first question to ask of a peer nobody can reach.** A client whose
+    /// own Tox never reaches the network is unreachable for a reason that has
+    /// nothing to do with friendships or invitations, and from the outside the
+    /// two look the same.
+    pub fn tox_connection(&self) -> u64 {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().self_connection.load(Ordering::Relaxed),
+                None => 0,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            0
+        }
+    }
+
     /// Invitations into the table's group that toxcore refused.
     ///
     /// **Separate from `trouble`, because it is a different condition with a

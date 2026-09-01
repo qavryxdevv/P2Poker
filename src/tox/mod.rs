@@ -391,6 +391,28 @@ impl Tox {
         unsafe { sys::tox_self_get_connection_status(self.ptr) }
     }
 
+    /// What toxcore thinks of one friendship: `0` none, `1` TCP, `2` UDP.
+    ///
+    /// **The number `S1-N` needed and did not have.** The driver tracked
+    /// friendships from `FriendConnection` events alone, which says what has
+    /// *changed* and never what *is* — so a connection that came up before the
+    /// driver was listening, or one whose event was missed, was invisible.
+    /// Asked directly, this cannot disagree with toxcore, because it is
+    /// toxcore's own answer.
+    ///
+    /// `-1` when the friend number is not one this instance issued.
+    pub fn friend_connection(&self, friend: u32) -> i32 {
+        let mut err: c_int = 0;
+        // SAFETY: the pointer is valid for the lifetime of `self`; an unknown
+        // friend number is reported through `err` rather than by misbehaving.
+        let n = unsafe { sys::tox_friend_get_connection_status(self.ptr, friend, &mut err) };
+        if err == 0 {
+            n
+        } else {
+            -1
+        }
+    }
+
     /// How long toxcore wants before the next [`iterate`](Tox::iterate).
     pub fn interval(&self) -> std::time::Duration {
         // SAFETY: the pointer is valid for the lifetime of `self`.

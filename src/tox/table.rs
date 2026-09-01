@@ -176,6 +176,14 @@ pub struct Trouble {
     /// invitation has somewhere to go. `invite_pending` sends to these and to
     /// no others.
     pub friends_up: AtomicU64,
+    /// This instance's own connection to the Tox network: `0` none, `1` TCP,
+    /// `2` UDP.
+    ///
+    /// **The first question to ask of a peer that cannot be reached**, and
+    /// `S1-N` spent five hypotheses without it: a client whose own Tox never
+    /// reaches the network cannot be found by anybody, and that looks from the
+    /// outside exactly like a friendship that will not form.
+    pub self_connection: AtomicU64,
     /// Invitations the founder tried to send and toxcore refused.
     ///
     /// **Here because a seat arriving late is two different failures that look
@@ -670,6 +678,22 @@ fn run(
                 Some(g) => tox.peer_count(g),
                 None => 0,
             };
+            // **Asked of toxcore rather than remembered.** `connected` is
+            // built from `FriendConnection` events, which say what has changed
+            // and never what is; a connection whose event was missed is
+            // invisible to it for ever. Reconciled here every sweep, so the set
+            // the invitations are sent to cannot drift from the one toxcore
+            // would deliver them over.
+            for (n, _) in friends.iter() {
+                if tox.friend_connection(*n) > 0 {
+                    connected.insert(*n);
+                } else {
+                    connected.remove(n);
+                }
+            }
+            trouble
+                .self_connection
+                .store(tox.connection().max(0) as u64, Ordering::Relaxed);
             trouble.friends_up.store(connected.len() as u64, Ordering::Relaxed);
             trouble.in_group.store(seen as u64, Ordering::Relaxed);
             trouble.want_in_group.store(roster.len() as u64, Ordering::Relaxed);

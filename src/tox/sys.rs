@@ -241,6 +241,15 @@ extern "C" {
         error: *mut c_int,
     ) -> bool;
     /// `tox.h:3840`
+    /// `tox.h:1283`. What toxcore thinks of one friendship: `0` none, `1` TCP,
+    /// `2` UDP. The one number that says whether an invitation has anywhere to
+    /// go, and it was not asked for until `S1-N`.
+    pub fn tox_friend_get_connection_status(
+        tox: *const Tox,
+        friend_number: u32,
+        error: *mut c_int,
+    ) -> c_int;
+
     /// `tox.h:989`. Forget a friend, which discards toxcore's cached idea of
     /// where it is. See `Tox::forget_friend`.
     pub fn tox_friend_delete(tox: *mut Tox, friend_number: u32, error: *mut c_int) -> bool;

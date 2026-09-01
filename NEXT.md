@@ -2985,12 +2985,69 @@ remaining question is precise: **why does a Tox friendship to a restarted peer
 not re-establish, when both sides hold the same keys, the peer is up, and the
 stale address has been deliberately discarded?**
 
-**Not guessed at further.** Five hypotheses have been tested against this run and
-four of them were right about something and wrong about the outcome; a sixth
-written without new evidence would be the same mistake again. What is owed is a
-Tox-level trace — `tox_self_get_connection_status` and the friend's own status on
-both sides through the outage — which is an instrument this client does not have
-yet and which is the next thing to build.
+**Not guessed at further.** Five hypotheses were tested against this run and four
+of them were right about something and wrong about the outcome; a sixth written
+without new evidence would be the same mistake again. What was owed was a
+Tox-level trace, and building it is what found the cause.
+
+### The instrument, and what it said
+
+Two numbers the client had never asked for. `tox_friend_get_connection_status`
+is toxcore's own answer about one friendship — the driver had been tracking
+friendships from `FriendConnection` **events**, which say what has *changed* and
+never what *is*, so a connection whose event was missed was invisible for ever;
+the sweep now reconciles against toxcore every five seconds. And
+`tox_self_get_connection_status` says whether this instance is on the network at
+all, which is the first thing to ask of a peer nobody can reach and the last
+thing five hypotheses had checked.
+
+The line became:
+
+```
+seats on the line: 1 58ms, 2 0ms, 3 0ms; tox self udp, group 1/3, tox friends up 2, invites 21 sent 0 refused
+```
+
+**And the returning client printed nothing at all.** No line, because the line is
+printed only while there is a table — and it had none.
+
+### The cause: `AlreadySeated` was treated as a refusal like any other
+
+```rust
+Err(Failed::Refused { reason, .. }) => {
+    table = None;
+    tox_sink.clear();
+```
+
+Every other reason means *you are not at this table*. `AlreadySeated` means **you
+already are** — the founder is holding the seat and, since `S1-J`, answering with
+the roster. Treating them alike made the returning client throw away its
+Formation and **destroy its own Tox driver** on every attempt: ask, be told the
+seat is yours, discard everything, wait thirty seconds, repeat. For ever.
+
+It now keeps the table and the group and waits for the roster that is on its way.
+
+**Measured, two runs:** `n1-again` **enters the Tox group** — 25.1 s and 20.2 s —
+where seven runs before it never did, and it holds a table with all three
+friendships up. The warning is gone.
+
+### What is left, and it is a different question
+
+The returning client is in a group **with nobody else in it**: its own report goes
+`group 1/3` then `group 0/3` while `tox friends up 3`. It rejoined *a* group and
+is alone there. Whether that is a stale group, a fragmented one, or a second one
+of its own is the next thing to find out, and the instrument to do it with now
+exists.
+
+The founder meanwhile handled the seat correctly: `required [0,1,2,3] -> [0,2,3]`,
+`certified [1]`, `strikes [0,1,0,0]`, grace untouched at 2 for everybody. A seat
+that went silent mid-hand was certified out, which is what should happen.
+
+**And one number is worth stating even so.** D-022's allowance is two hands, about
+eighteen seconds at this table's pace. Rejoining the group takes **20 to 25
+seconds** on its own. So a dropped seat spends its whole allowance on the way
+back however quickly its owner restarts, and whether the allowance is
+denominated in the right unit for a transport that takes this long to readmit
+anybody is a question for D-022 rather than for this code.
 
 ## Still open
 

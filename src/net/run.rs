@@ -1183,6 +1183,47 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         report_roster(&events, f).await;
                                 seat_on_tox(f, &tox_sink);
                                     }
+                                    // **`AlreadySeated` is not a refusal like the
+                                    // others, and treating it like one is what
+                                    // stopped a disconnected player ever coming
+                                    // back.**
+                                    //
+                                    // Every other reason means *you are not at
+                                    // this table*. This one means *you are
+                                    // already at it* — the founder is holding
+                                    // the seat and, since `S1-J`, answering with
+                                    // the roster. Throwing the table away and
+                                    // clearing the sink discards the Formation
+                                    // and **destroys the Tox driver**, so the
+                                    // client asks again thirty seconds later,
+                                    // gets the same answer, and destroys it
+                                    // again. Measured across seven runs: the
+                                    // returning peer never entered the group,
+                                    // never held a table, and the founder sat at
+                                    // `tox friends up 2` of three while it sent
+                                    // twenty-one invitations to the two it could
+                                    // reach.
+                                    //
+                                    // Four other defects were found and fixed
+                                    // looking for this one. Each was real; none
+                                    // was the cause. What found it was asking
+                                    // the returning client what it held, and
+                                    // getting no answer at all.
+                                    //
+                                    // So: keep the table, keep the group, and
+                                    // wait for the roster that is on its way.
+                                    Err(Failed::Refused { reason, .. })
+                                        if reason
+                                            == crate::table::join::RejectReason::AlreadySeated
+                                                .code() =>
+                                    {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(
+                                                "this table already holds a seat for us; waiting for its roster"
+                                                    .into(),
+                                            ))
+                                            .await;
+                                    }
                                     Err(Failed::Refused { reason, .. }) => {
                                         table = None;
                                         // The Tox group goes with the table. Dropping the handle
@@ -3024,8 +3065,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let (seen, want) = tox_sink.group_seen();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "seats on the line: {}; group {seen}/{want}, tox friends up {up}, invites {sent} sent {refused} refused",
-                                line.join(", ")
+                                "seats on the line: {}; tox self {}, group {seen}/{want}, tox friends up {up}, invites {sent} sent {refused} refused",
+                                line.join(", "),
+                                match tox_sink.tox_connection() {
+                                    0 => "offline",
+                                    1 => "tcp",
+                                    _ => "udp",
+                                }
                             )))
                             .await;
                     }
