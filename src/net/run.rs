@@ -422,20 +422,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // `GROUP_WAIT_MS`, after which it deals anyway — which is what this client
     // did before the gate existed. See `hand_one_may_open`.
     // **The boundary checkpoint's retained values, and the readmission set they
-    // write** (§4.9). `checkpoints` is this peer's own checkpoint-8 state hash
-    // per completed hand; `readmitted` is `A`, read and cleared at the next hand
-    // init and nowhere else.
+    // write** (§4.9). `boundaries` holds each retained hand's checkpoint — its
+    // two stages and the comparison — and `readmitted` is `A`, read and cleared
+    // at the next hand init and nowhere else.
     //
     // Held here rather than in `Hand`, because both outlive the hand they are
     // about: §4.9 admits a checkpoint-8 `STATE_HASH` of hand `k` until
     // `TERMINAL(k+1)` is fixed, and by then hand `k+1` is live.
-    // The retained value is `(state_hash, P(k))`. `P(k)` is kept **with** it
-    // because the readmission set is for a seat that would otherwise be shut
-    // out, and whether a seat would be is a question about the hand the
-    // checkpoint is of — which, by the time one arrives, is not the live hand
-    // and cannot be asked of it.
-    let mut checkpoints: std::collections::HashMap<u64, ([u8; 32], Vec<u8>)> =
-        std::collections::HashMap::new();
+    let mut boundaries = crate::table::boundary::Boundaries::new();
+    // Which hand's `HAND_INIT` stage has already moved the previous hand's
+    // checkpoint down. T47 fires once per hand and `dealt()` stays true after
+    // it, so without this the transition would run on every later event.
+    let mut crossed_for: Option<u64> = None;
+    // Whether this node has said that its checkpoints agree. Said once; see the
+    // `Took::Agreed` arm of `checkpoint_event`.
+    let mut checkpoint_said = false;
     let mut readmitted: Vec<u8> = Vec::new();
     let mut hand_one_held_since: Option<std::time::Instant> = None;
     // How many seats the group held when it last grew, and when that was. The
@@ -1372,19 +1373,39 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // is accepted for the mesh either way: it verified,
                             // and it is worth forwarding whether or not it
                             // agreed.
+                            cross_boundary_at_t47(h, &mut boundaries, &mut crossed_for);
                             let verdict: Option<gossipsub::MessageAcceptance> =
-                                if checkpoint_event(
+                                match checkpoint_event(
                                     &message.data,
                                     h,
-                                    &checkpoints,
+                                    &mut boundaries,
                                     &mut readmitted,
+                                    &app_key,
+                                    &mut checkpoint_said,
                                     &events,
                                 )
                                 .await
                                 {
-                                    Some(gossipsub::MessageAcceptance::Accept)
-                                } else {
-                                    hand_event!(h, &message.data)
+                                    None => hand_event!(h, &message.data),
+                                    Some(out) => {
+                                        if !out.is_empty() {
+                                            publish_and_hear(
+                                                out,
+                                                h,
+                                                &mut boundaries,
+                                                &mut readmitted,
+                                                &app_key,
+                                                &mut checkpoint_said,
+                                                &events,
+                                                table_topic.as_ref(),
+                                                &mut swarm,
+                                                &mut said,
+                                                &tox_sink,
+                                            )
+                                            .await;
+                                        }
+                                        Some(gossipsub::MessageAcceptance::Accept)
+                                    }
                                 };
                             // The single exit. A hand event never leaves this
                             // branch without the mesh being told what became of
@@ -2652,10 +2673,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // branch contributes nothing to the `select!`.
             Some(item) = tox_sink.next() => {
                 if let Some(h) = hand.as_mut() {
-                    if !checkpoint_event(&item.bytes, h, &checkpoints, &mut readmitted, &events)
-                        .await
+                    cross_boundary_at_t47(h, &mut boundaries, &mut crossed_for);
+                    match checkpoint_event(
+                        &item.bytes,
+                        h,
+                        &mut boundaries,
+                        &mut readmitted,
+                        &app_key,
+                        &mut checkpoint_said,
+                        &events,
+                    )
+                    .await
                     {
-                        let _ = hand_event!(h, &item.bytes);
+                        // Not a checkpoint event: the hand's own.
+                        None => {
+                            let _ = hand_event!(h, &item.bytes);
+                        }
+                        // Taken, and this peer's own `STATE_ACK` is due.
+                        Some(out) if !out.is_empty() => {
+                            publish_and_hear(
+                                out,
+                                h,
+                                &mut boundaries,
+                                &mut readmitted,
+                                &app_key,
+                                &mut checkpoint_said,
+                                &events,
+                                table_topic.as_ref(),
+                                &mut swarm,
+                                &mut said,
+                                &tox_sink,
+                            )
+                            .await;
+                        }
+                        Some(_) => {}
                     }
                 }
             }
@@ -3031,17 +3082,72 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // door back for a seat that missed this hand: §4.9's
                 // readmission set is written by exactly this event agreeing.
                 if let Some(h) = hand.as_ref() {
-                    if let Some((state, _)) = h.checkpoint8() {
-                        checkpoints.insert(h.hand_id(), (state, h.participants()));
+                    if let Some((state, terminal)) = h.checkpoint8() {
+                        // The stage, opened at the moment `TERMINAL(k)` is
+                        // fixed. `P(k)` is a **snapshot** taken here and not a
+                        // set read later: a checkpoint-8 `STATE_HASH` is itself
+                        // a chain-`k` event and adds its sender to `P(k)`, so a
+                        // set read after the stage opened would grow with its
+                        // own contributions and never complete (§4.9).
+                        //
+                        // The accepted set is every occupied roster seat, which
+                        // is §4.9's `L3`: a copy from outside `P(k)` is compared
+                        // rather than rejected, and that copy agreeing is what
+                        // writes the readmission set.
+                        let roster: Vec<u8> = table
+                            .as_ref()
+                            .map(|f| f.roster().seats().iter().map(|e| e.seat).collect())
+                            .unwrap_or_default();
+                        if boundaries
+                            .open(
+                                h.hand_id(),
+                                h.table_id(),
+                                terminal,
+                                state,
+                                &h.participants(),
+                                &roster,
+                            )
+                            .is_none()
+                        {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "the boundary checkpoint of hand {} would not open: P(k) {:?} is not inside the roster {roster:?}",
+                                    h.hand_id(),
+                                    h.participants()
+                                )))
+                                .await;
+                        }
                         match h.state_hash_event(&app_key, super::node::now_unix_ms()) {
                             Ok(Some(bytes)) => {
-                                publish_hand(
-                                    vec![crate::table::hand::Send::Broadcast(bytes)],
+                                // **Published and heard.** A stage counts its
+                                // own seat like every other, and neither
+                                // GossipSub nor the Tox group delivers a message
+                                // back to the peer that sent it — so a copy that
+                                // is only published is a copy this peer's own
+                                // stage never hears. Measured before this: every
+                                // node's checkpoint waiting for exactly one
+                                // seat, its own, for every hand of a run.
+                                //
+                                // Through `checkpoint_event`, which is the one
+                                // admission path — a second one here would be a
+                                // second set of rules for the same event — and
+                                // it answers with this peer's `STATE_ACK` when
+                                // the hash stage closes on this very copy, which
+                                // then needs publishing and hearing in its turn.
+                                publish_and_hear(
+                                    bytes,
+                                    h,
+                                    &mut boundaries,
+                                    &mut readmitted,
+                                    &app_key,
+                                    &mut checkpoint_said,
+                                    &events,
                                     table_topic.as_ref(),
                                     &mut swarm,
                                     &mut said,
                                     &tox_sink,
-                                );
+                                )
+                                .await;
                             }
                             Ok(None) => {}
                             Err(e) => {
@@ -3198,6 +3304,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         f.ratifiers().len(),
                                         f.roster().len(),
                                         f.held()
+                                    )
+                                } else if let Some(b) = boundaries.newest() {
+                                    // Where the boundary checkpoint has got to.
+                                    // A stage that never closes is silent, and
+                                    // so is one that closes and agrees.
+                                    format!(
+                                        ", checkpoint hand {} waiting for {:?}{}",
+                                        b.hand_id(),
+                                        b.waiting_for(),
+                                        if b.ack_stage_complete() {
+                                            ", agreed".to_string()
+                                        } else if b.hash_stage_complete() {
+                                            format!(
+                                                ", hashes in, acks waiting for {:?}",
+                                                b.acks_waiting_for()
+                                            )
+                                        } else {
+                                            String::new()
+                                        }
                                     )
                                 } else {
                                     String::new()
@@ -4115,72 +4240,223 @@ fn short_hash(h: &[u8; 32]) -> String {
 /// A **disagreeing** value is a divergence and §6.3 is what answers it. That is
 /// not built, so it is said out loud and nothing else: saying nothing would be
 /// the silent divergence §6.1 exists to prevent.
+/// T47: hand `k+1`'s `HAND_INIT` stage has completed, so hand `k`'s checkpoint
+/// moves down to the boundary slot.
+///
+/// **Moved, not dropped** — §4.9 keeps admitting `STATE_ACK` copies into it,
+/// which is `N6`: *"the checkpoint-8 `STATE_ACK` stage is not closed by that
+/// window"*. What the window bounds is the admission of a `STATE_HASH`, because
+/// that is the only checkpoint-8 event that can grow `P(k)`, and hand `k`'s
+/// record is released by `TERMINAL(k+1)` opening the next one.
+///
+/// `Hand::dealt` is T47's condition in the player's words: stage 0 complete,
+/// every required seat heard and agreed. It stays true for the rest of the hand,
+/// so the caller's `crossed_for` is what makes this happen once.
+fn cross_boundary_at_t47(
+    h: &crate::table::hand::Hand,
+    boundaries: &mut crate::table::boundary::Boundaries,
+    crossed_for: &mut Option<u64>,
+) {
+    if !h.dealt() || *crossed_for == Some(h.hand_id()) {
+        return;
+    }
+    *crossed_for = Some(h.hand_id());
+    boundaries.cross_boundary();
+}
+
+/// Put a checkpoint event on the table **and hear it here**, and the same for
+/// whatever it makes due.
+///
+/// **A stage counts its own seat like every other, and the wire never gives a
+/// message back to the peer that sent it** — neither GossipSub nor the Tox group
+/// does. So a copy that is only published is a copy this peer's own stage never
+/// hears, and the stage waits for its own seat for ever. Measured twice, once
+/// per stage: every node's `STATE_HASH` stage *"waiting for [0]"* on the node
+/// that is seat 0, and then, after the first half was fixed, every node's
+/// `STATE_ACK` stage waiting for exactly the same seat.
+///
+/// Hearing goes through `checkpoint_event` rather than through a second
+/// admission written here, because two admission paths for one event are two
+/// sets of rules that can come to differ — and it is what makes this compose:
+/// the `STATE_HASH` that completes the stage answers with this peer's
+/// `STATE_ACK`, which needs publishing and hearing in its turn.
+///
+/// The loop is bounded rather than trusted to be two long.
+#[allow(clippy::too_many_arguments)]
+async fn publish_and_hear(
+    first: Vec<u8>,
+    h: &crate::table::hand::Hand,
+    boundaries: &mut crate::table::boundary::Boundaries,
+    readmitted: &mut Vec<u8>,
+    app_key: &ed25519_dalek::SigningKey,
+    checkpoint_said: &mut bool,
+    events: &Events,
+    topic: Option<&gossipsub::IdentTopic>,
+    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    said: &mut Vec<Vec<u8>>,
+    tox: &super::toxsink::TableSink,
+) {
+    let mut out = Some(first);
+    for _ in 0..2 {
+        let Some(bytes) = out.take() else { break };
+        publish_hand(
+            vec![crate::table::hand::Send::Broadcast(bytes.clone())],
+            topic,
+            swarm,
+            said,
+            tox,
+        );
+        if let Some(next) = checkpoint_event(
+            &bytes,
+            h,
+            boundaries,
+            readmitted,
+            app_key,
+            checkpoint_said,
+            events,
+        )
+        .await
+        {
+            if !next.is_empty() {
+                out = Some(next);
+            }
+        }
+    }
+}
+
 async fn checkpoint_event(
     bytes: &[u8],
     h: &crate::table::hand::Hand,
-    checkpoints: &std::collections::HashMap<u64, ([u8; 32], Vec<u8>)>,
+    boundaries: &mut crate::table::boundary::Boundaries,
     readmitted: &mut Vec<u8>,
+    app_key: &ed25519_dalek::SigningKey,
+    checkpoint_said: &mut bool,
     events: &Events,
-) -> bool {
+) -> Option<Vec<u8>> {
+    use crate::table::boundary::Took;
     use crate::table::checkwire;
+    use crate::protocol::messages::EventType;
 
-    let Ok((kind, hand_id, sequence)) =
-        crate::net::chained::peek(bytes, TABLE_FRAME_PEEK)
-    else {
-        return false;
+    let Ok((kind, hand_id, sequence)) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK) else {
+        return None;
     };
-    if kind != crate::protocol::messages::EventType::StateHash {
-        return false;
+    if kind != EventType::StateHash && kind != EventType::StateAck {
+        return None;
     }
-    // Only for a hand this receiver has finished. One that is live belongs to
-    // the hand, which owns its own stages.
-    let Some((mine, played)) = checkpoints.get(&hand_id) else {
-        return false;
+    // Only for a boundary this receiver still holds. §4.9's window, and the
+    // store is what decides how long it is open — a hand that is live belongs
+    // to the hand, which owns its own stages.
+    if !boundaries.holds(hand_id) {
+        return None;
+    }
+    let (round, half) = checkwire::round_of(sequence)?;
+    // Rounds 1 to 7 are §6.3's re-derivations and are not built. Refusing them
+    // here rather than treating them as round 0 is the difference between "not
+    // implemented" and "implemented wrongly".
+    if round != 0 {
+        return Some(Vec::new());
+    }
+    let expected = match half {
+        checkwire::Kind::Hash => EventType::StateHash,
+        checkwire::Kind::Ack => EventType::StateAck,
     };
-    if checkwire::round_of(sequence).map(|(_, k)| k) != Some(checkwire::Kind::Hash) {
-        return false;
+    if kind != expected {
+        // A `STATE_ACK` at the hash stage's sequence, or the reverse. §5.2.1's
+        // slot key contains `event_type`, so this is not a slot either of them
+        // owns.
+        return Some(Vec::new());
     }
 
     let Ok(opened) = crate::net::chained::open_in_hand(
         bytes,
         TABLE_FRAME_PEEK,
-        crate::protocol::messages::EventType::StateHash,
+        kind,
         &h.table_id(),
         hand_id,
     ) else {
-        return true;
-    };
-    let Ok(body) = crate::net::chained::payload::<checkwire::StateHash>(&opened, 512) else {
-        return true;
+        return Some(Vec::new());
     };
     let Some(seat) = h.seat_of_key(&opened.sender) else {
-        return true;
+        return Some(Vec::new());
     };
 
-    if body.state_hash == *mine {
-        // **Only a seat that would otherwise be shut out.** `A` widens the
-        // accepted emitter set, and a seat already in `P(k)` is already in it —
-        // adding it changes nothing and says something false in the log.
-        //
-        // `P(k)` is the retained one, of the hand this checkpoint is **of**.
-        // Asking the live hand instead reads `signed` on a hand that has barely
-        // started, which is empty or nearly so, and every seat passes a filter
-        // like that. Measured: with the live hand's set, seats 2 and 3 were
-        // announced as readmitted after all thirty-seven hands of a run in
-        // which neither ever missed one.
-        let in_p = played.contains(&seat);
-        if !in_p && !readmitted.contains(&seat) {
-            readmitted.push(seat);
-            readmitted.sort_unstable();
+    let took = match half {
+        checkwire::Kind::Hash => {
+            let Ok(body) = crate::net::chained::payload::<checkwire::StateHash>(&opened, 512)
+            else {
+                return Some(Vec::new());
+            };
+            boundaries.on_state_hash(hand_id, seat, opened.event_hash, body.state_hash)
         }
-    } else {
-        let _ = events
-            .send(NodeEvent::Warning(format!(
-                "seat {seat} holds a different end-of-hand state for hand {hand_id}: this is a divergence and section 6.3 is not built"
-            )))
-            .await;
+        checkwire::Kind::Ack => {
+            let Ok(body) = crate::net::chained::payload::<checkwire::StateAck>(&opened, 512) else {
+                return Some(Vec::new());
+            };
+            boundaries.on_state_ack(hand_id, seat, opened.event_hash, body.checkpoint_hash)
+        }
+    };
+
+    match took {
+        // §4.9's readmission set, written by exactly this: a copy from a seat
+        // **outside** `P(k)` whose value agrees. A seat already in `P(k)` is
+        // already in the next hand's required set and adding it would change
+        // nothing and say something false in the log.
+        Took::Bystander => {
+            if !readmitted.contains(&seat) {
+                readmitted.push(seat);
+                readmitted.sort_unstable();
+            }
+        }
+        // The stage closed and every value in it agreed. One copy per seat, and
+        // `Boundaries` returns this once.
+        Took::AckIsDue => {
+            if let Some(out) = boundaries
+                .get(hand_id)
+                .and_then(|b| b.state_ack_event(app_key, super::node::now_unix_ms()))
+            {
+                return Some(out);
+            }
+        }
+        Took::Diverged {
+            solitary_contradicted,
+        } => {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "seat {seat} holds a different end-of-hand state for hand {hand_id}: this is a divergence, section 6.3 is not built{}",
+                    if solitary_contradicted {
+                        " (and this peer is alone in P(k), which is N1's second half)"
+                    } else {
+                        ""
+                    }
+                )))
+                .await;
+        }
+        Took::Equivocation { .. } => {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "seat {seat} put two different events in one checkpoint stage of hand {hand_id}"
+                )))
+                .await;
+        }
+        // **Said once per node.** A checkpoint that agrees is the ordinary case
+        // and a line per hand would be noise; but a stage that never ran is
+        // also silent, and the two must not look the same in a log. So the
+        // first one that closes says so, and after that only a divergence
+        // speaks.
+        Took::Agreed => {
+            if !*checkpoint_said {
+                *checkpoint_said = true;
+                let _ = events
+                    .send(NodeEvent::Warning(format!(
+                        "the boundary checkpoint of hand {hand_id} agreed across P(k) = {:?}; checkpoints run from here and only a disagreement will say so",
+                        boundaries.get(hand_id).map(|b| b.participants().to_vec()).unwrap_or_default()
+                    )))
+                    .await;
+            }
+        }
+        Took::Counted | Took::Again | Took::Uninvited => {}
     }
-    true
+    Some(Vec::new())
 }
 
 /// The first hand's opening, once the roster has ratified.

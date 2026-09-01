@@ -67,11 +67,17 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone)]
 pub struct Boundary {
     hand_id: u64,
+    /// The table, so the acknowledgement can be sealed after the `Hand` that
+    /// produced the checkpoint is gone. It is: §4.9 keeps this stage open past
+    /// `HAND_INIT(k+1)`, and by then hand `k` has been dropped.
+    table_id: Hash,
     /// `TERMINAL(k)`, which is what the `STATE_HASH` event chains from.
     terminal: Hash,
     /// `P(k)`, snapshot at `TERMINAL(k)`. The required set of both stages, and
     /// the set §4.4 draws hand `k+1`'s `dealt_in` from.
     participants: Vec<SeatIdx>,
+    /// This peer's own `state_hash`, repeated in its acknowledgement.
+    own: Hash,
     hash_stage: Collective,
     ack_stage: Collective,
     /// Whether this peer has published its own `STATE_ACK` for this checkpoint.
@@ -110,7 +116,65 @@ impl Boundary {
     pub fn waiting_for(&self) -> Vec<SeatIdx> {
         self.hash_stage.waiting_for()
     }
+
+    /// Which seats of `P(k)` have not acknowledged yet.
+    ///
+    /// The two stages fail differently and a single *"not complete"* cannot say
+    /// which: nobody's hash arriving and everybody's hash arriving with nobody's
+    /// acknowledgement are different faults with different causes.
+    pub fn acks_waiting_for(&self) -> Vec<SeatIdx> {
+        self.ack_stage.waiting_for()
+    }
+
+    /// This peer's own `STATE_ACK`, once the `STATE_HASH` stage has completed.
+    ///
+    /// `None` before that, because `checkpoint_hash` is the `stage_hash` of a
+    /// stage that has not closed and there is nothing to acknowledge.
+    ///
+    /// **It chains from the stage it acknowledges**, not from `TERMINAL(k)`: the
+    /// `STATE_HASH` stage is the previous stage of this chain and its
+    /// `stage_hash` is exactly what §5.2.1 makes a parent. So `checkpoint_hash`
+    /// appears twice, once as the parent and once in the body — §4.9 asks for
+    /// it in the body so that an acknowledgement says **what** it acknowledges
+    /// rather than only that it does, and a bare ack of a stage is an ack of
+    /// whatever the reader thinks that stage said.
+    ///
+    /// **It arms no deadline**, for the reason the `STATE_HASH` does not: its
+    /// window runs to `TERMINAL(k+1)`, which belongs to the hand after and is a
+    /// promise about somebody else's clock.
+    pub fn state_ack_event(
+        &self,
+        key: &ed25519_dalek::SigningKey,
+        now_ms: u64,
+    ) -> Option<Vec<u8>> {
+        let checkpoint_hash = self.checkpoint_hash()?;
+        let body = checkwire::StateAck {
+            checkpoint: checkwire::BOUNDARY_CHECKPOINT,
+            agreed_state_hash: self.own,
+            checkpoint_hash,
+        };
+        let slot = crate::net::chained::Slot {
+            table_id: self.table_id,
+            hand_id: self.hand_id,
+            sequence: checkwire::ack_sequence(0)?,
+            previous_event_hash: checkpoint_hash,
+        };
+        crate::net::chained::seal(
+            EventType::StateAck,
+            &slot,
+            &body,
+            key,
+            now_ms,
+            0,
+            STATE_ACK_CAP,
+        )
+        .ok()
+    }
 }
+
+/// How much of a `STATE_ACK` body this client will decode. §9.3's cap for the
+/// checkpoint bodies, which are three small fixed fields.
+pub const STATE_ACK_CAP: usize = 512;
 
 /// What accepting one checkpoint-8 event did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +186,15 @@ pub enum Took {
     AckIsDue,
     /// Counted, and nothing further is due.
     Counted,
+    /// The `STATE_ACK` stage completed: every member of `P(k)` acknowledged the
+    /// same `checkpoint_hash`, and [`Boundaries::agreed`] now answers.
+    ///
+    /// **Distinguished from `Counted` so that a caller can say it happened.**
+    /// A checkpoint that agrees produces no divergence warning, and a checkpoint
+    /// stage that never ran produces no divergence warning either — the two are
+    /// identical in a log that only reports faults, and one of them is the
+    /// mechanism §6.1 calls the only way a silent divergence is ever caught.
+    Agreed,
     /// From a seat outside `P(k)` and inside the roster: compared and retained,
     /// not counted. §4.9's `L3`, and the copy that writes §4.9's readmission
     /// set when it agrees.
@@ -171,6 +244,7 @@ impl Boundaries {
     pub fn open(
         &mut self,
         hand_id: u64,
+        table_id: Hash,
         terminal: Hash,
         own_state_hash: Hash,
         participants: &[SeatIdx],
@@ -202,8 +276,10 @@ impl Boundaries {
             hand_id,
             Boundary {
                 hand_id,
+                table_id,
                 terminal,
                 participants: participants.to_vec(),
+                own: own_state_hash,
                 hash_stage,
                 ack_stage,
                 ack_sent: false,
@@ -249,6 +325,15 @@ impl Boundaries {
     /// Whether hand `k`'s boundary is one this peer still admits events for.
     pub fn holds(&self, hand_id: u64) -> bool {
         self.open.contains_key(&hand_id)
+    }
+
+    /// The newest boundary held, for saying where the checkpoint has got to.
+    ///
+    /// *"Waiting for seat 4"* is a sentence somebody can act on; a stage that
+    /// silently never closes is not, and a checkpoint that agrees and a
+    /// checkpoint that never ran are the same silence.
+    pub fn newest(&self) -> Option<&Boundary> {
+        self.open.values().next_back()
     }
 
     /// The `checkpoint_hash` every member of `P(k)` acknowledged, once the
@@ -355,8 +440,10 @@ impl Boundaries {
             seat,
             checkpoint_hash,
         }) {
-            StateAckOutcome::Recorded { .. } => Took::Counted,
-            StateAckOutcome::NotApplicable => Took::Counted,
+            StateAckOutcome::Recorded {
+                stage_complete: true,
+            } => Took::Agreed,
+            StateAckOutcome::Recorded { .. } | StateAckOutcome::NotApplicable => Took::Counted,
         }
     }
 }
@@ -365,6 +452,7 @@ impl Boundaries {
 mod tests {
     use super::*;
 
+    const TABLE: Hash = [3u8; 32];
     const TERMINAL: Hash = [7u8; 32];
     const STATE: Hash = [9u8; 32];
 
@@ -378,7 +466,7 @@ mod tests {
     fn the_two_stages_sit_where_the_specification_puts_them() {
         let mut b = Boundaries::new();
         let c = b
-            .open(4, TERMINAL, STATE, &[0, 1, 2], &[0, 1, 2, 3])
+            .open(4, TABLE, TERMINAL, STATE, &[0, 1, 2], &[0, 1, 2, 3])
             .expect("P(k) is inside the roster");
         assert_eq!(c.hand_id(), 4);
         assert_eq!(c.terminal(), TERMINAL);
@@ -395,7 +483,7 @@ mod tests {
     #[test]
     fn a_seat_outside_the_required_set_is_compared_and_does_not_count() {
         let mut b = Boundaries::new();
-        b.open(4, TERMINAL, STATE, &[0, 1], &[0, 1, 2, 3])
+        b.open(4, TABLE, TERMINAL, STATE, &[0, 1], &[0, 1, 2, 3])
             .expect("opens");
 
         assert_eq!(
@@ -422,7 +510,7 @@ mod tests {
     #[test]
     fn the_acknowledgement_is_due_once_and_only_on_a_complete_unanimous_stage() {
         let mut b = Boundaries::new();
-        b.open(4, TERMINAL, STATE, &[0, 1], &[0, 1, 2])
+        b.open(4, TABLE, TERMINAL, STATE, &[0, 1], &[0, 1, 2])
             .expect("opens");
 
         assert_eq!(b.on_state_hash(4, 0, ev(0), STATE), Took::Counted);
@@ -442,7 +530,7 @@ mod tests {
     #[test]
     fn a_differing_value_is_a_divergence_and_no_acknowledgement_follows() {
         let mut b = Boundaries::new();
-        b.open(4, TERMINAL, STATE, &[0, 1], &[0, 1]).expect("opens");
+        b.open(4, TABLE, TERMINAL, STATE, &[0, 1], &[0, 1]).expect("opens");
 
         assert_eq!(b.on_state_hash(4, 0, ev(0), STATE), Took::Counted);
         assert!(matches!(
@@ -460,19 +548,70 @@ mod tests {
     #[test]
     fn the_agreed_value_appears_when_the_acknowledgement_stage_completes() {
         let mut b = Boundaries::new();
-        b.open(4, TERMINAL, STATE, &[0, 1], &[0, 1]).expect("opens");
+        b.open(4, TABLE, TERMINAL, STATE, &[0, 1], &[0, 1]).expect("opens");
         b.on_state_hash(4, 0, ev(0), STATE);
         b.on_state_hash(4, 1, ev(1), STATE);
         let cp = b.get(4).expect("held").checkpoint_hash().expect("complete");
 
-        b.on_state_ack(4, 0, ev(10), cp);
+        assert_eq!(b.on_state_ack(4, 0, ev(10), cp), Took::Counted);
         assert!(b.agreed(4).is_none(), "one ack is not the stage");
-        b.on_state_ack(4, 1, ev(11), cp);
+        assert_eq!(
+            b.on_state_ack(4, 1, ev(11), cp),
+            Took::Agreed,
+            "the stage completed, and the caller is told so it can say it happened"
+        );
         assert_eq!(
             b.agreed(4),
             Some(cp),
             "and the value is the stage hash the acks named"
         );
+    }
+
+    /// The acknowledgement is at the specification's address and chains from
+    /// the stage it acknowledges.
+    ///
+    /// Both halves matter and neither is implied by the other: an ack at the
+    /// wrong `sequence` is a stage violation at §4.0 step 12, and one chaining
+    /// from `TERMINAL(k)` rather than from the `STATE_HASH` stage would be a
+    /// second event in that stage's slot rather than the stage after it.
+    #[test]
+    fn the_acknowledgement_is_at_the_next_sequence_and_chains_from_the_hash_stage() {
+        let mut b = Boundaries::new();
+        b.open(4, TABLE, TERMINAL, STATE, &[0, 1], &[0, 1])
+            .expect("opens");
+        let key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        assert!(
+            b.get(4).expect("held").state_ack_event(&key, 1).is_none(),
+            "nothing to acknowledge before the stage it acknowledges has closed"
+        );
+
+        b.on_state_hash(4, 0, ev(0), STATE);
+        b.on_state_hash(4, 1, ev(1), STATE);
+        let held = b.get(4).expect("held");
+        let cp = held.checkpoint_hash().expect("the stage closed");
+        let bytes = held.state_ack_event(&key, 1).expect("and now there is one");
+
+        let opened = crate::net::chained::open_in_hand(
+            &bytes,
+            512,
+            EventType::StateAck,
+            &TABLE,
+            4,
+        )
+        .expect("it is a well-formed chained STATE_ACK of hand 4");
+        assert_eq!(opened.envelope.sequence, 8193);
+        assert_eq!(
+            opened.envelope.previous_event_hash, cp,
+            "the parent is the stage_hash of the STATE_HASH stage"
+        );
+        let body: checkwire::StateAck =
+            crate::net::chained::payload(&opened, 512).expect("the body decodes");
+        assert_eq!(body.checkpoint, checkwire::BOUNDARY_CHECKPOINT);
+        assert_eq!(
+            body.checkpoint_hash, cp,
+            "and it says what it acknowledges rather than only that it does"
+        );
+        assert_eq!(body.agreed_state_hash, STATE);
     }
 
     /// §4.9's lifetime, driven the way the store implements it: hand `k`'s
@@ -485,7 +624,7 @@ mod tests {
     #[test]
     fn a_boundary_lives_exactly_as_long_as_the_record_it_compares_against() {
         let mut b = Boundaries::new();
-        b.open(1, TERMINAL, STATE, &[0], &[0]).expect("opens");
+        b.open(1, TABLE, TERMINAL, STATE, &[0], &[0]).expect("opens");
         assert!(b.holds(1));
 
         // Hand 2's HAND_INIT completes: hand 1's moves down, still admitting
@@ -494,7 +633,7 @@ mod tests {
         assert!(b.holds(1), "moved, not dropped");
 
         // TERMINAL(2): hand 2's checkpoint opens and hand 1's window is over.
-        b.open(2, TERMINAL, STATE, &[0], &[0]).expect("opens");
+        b.open(2, TABLE, TERMINAL, STATE, &[0], &[0]).expect("opens");
         assert!(
             !b.holds(1) && b.holds(2),
             "one retention rule, and it is the store's"
@@ -509,8 +648,8 @@ mod tests {
     #[test]
     fn a_boundary_the_store_has_released_is_not_held_here_either() {
         let mut b = Boundaries::new();
-        b.open(1, TERMINAL, STATE, &[0], &[0]).expect("opens");
-        b.open(2, TERMINAL, STATE, &[0], &[0]).expect("opens");
+        b.open(1, TABLE, TERMINAL, STATE, &[0], &[0]).expect("opens");
+        b.open(2, TABLE, TERMINAL, STATE, &[0], &[0]).expect("opens");
         assert!(!b.holds(1) && b.holds(2));
     }
 }
