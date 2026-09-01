@@ -46,6 +46,18 @@ param(
     [ValidateRange(30, 3600)][int]$Seconds = 300,
     [string]$Exe,
     [switch]$KeepLogs,
+    # **How long the joiners take to arrive, in seconds, spread evenly.**
+    #
+    # Zero starts them within a second of each other, which is the easy case and
+    # not the real one: players arrive irregularly and a tournament table has to
+    # stay open until it fills. Everything measured before this parameter
+    # existed measured the easy case, and a table that forms when six clients
+    # start at once has not been shown to form when the sixth arrives ten
+    # minutes after the first.
+    #
+    # `-Seconds` must cover the stagger and still leave time to play; a
+    # combination that cannot is refused rather than run.
+    [ValidateRange(0, 3600)][int]$StaggerSeconds = 0,
     # A seat slower than this to enter the Tox group keeps the logs, however
     # well the rest of the run went. Sixty seconds is far outside the ordinary
     # spread, which has been 10-25 s in every run measured.
@@ -76,6 +88,12 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 Write-Host "table  $table"
 Write-Host "seats  $Seats"
 Write-Host "for    $Seconds s"
+if ($StaggerSeconds -gt 0) {
+    if ($StaggerSeconds -ge $Seconds - 60) {
+        throw "a stagger of $StaggerSeconds s leaves nothing of a $Seconds s run to play in"
+    }
+    Write-Host ("join   over {0} s, one every {1:F1} s" -f $StaggerSeconds, ($StaggerSeconds / [Math]::Max(1, $Seats - 1)))
+}
 Write-Host "work   $work"
 Write-Host ''
 
@@ -83,13 +101,20 @@ Write-Host ''
 # Every node is a job that timestamps each line as it arrives. `Start-Process
 # -RedirectStandardOutput` would be shorter and would lose the timing, which is
 # the half of the measurement that says WHERE a hand's time goes.
+$t0 = Get-Date
 $jobs = @()
 for ($i = 0; $i -lt $Seats; $i++) {
     $profileDir = Join-Path $work "n$i"
     New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
     $log = Join-Path $work "n$i.log"
 
-    $nodeArgs = @('--headless', '--autoplay', '--for', "$Seconds", '--profile', $profileDir)
+    # **Every node stops at the same wall-clock moment, not after the same
+    # duration.** A joiner started two hundred seconds late and given
+    # `--for $Seconds` would outlive the founder by two hundred seconds and
+    # spend the last of them as the only seat at the table.
+    $mine = $Seconds - [int]([Math]::Round(((Get-Date) - $t0).TotalSeconds))
+    if ($mine -lt 30) { $mine = 30 }
+    $nodeArgs = @('--headless', '--autoplay', '--for', "$mine", '--profile', $profileDir)
     if ($i -eq 0) {
         $nodeArgs += @('--host', $table, '--seats', "$Seats")
     } else {
@@ -112,7 +137,15 @@ for ($i = 0; $i -lt $Seats; $i++) {
     # The founder needs to be advertising before a joiner looks for its name.
     # Joiners are staggered so ten of them do not all dial in one instant, which
     # is a thundering herd this measurement is not about.
-    if ($i -eq 0) { Start-Sleep -Seconds 3 } else { Start-Sleep -Milliseconds 400 }
+    # The founder first and then a gap, so it is advertising before anybody
+    # looks. After that, either a token stagger or the real one.
+    if ($i -eq 0) {
+        Start-Sleep -Seconds 3
+    } elseif ($StaggerSeconds -gt 0) {
+        Start-Sleep -Seconds ([Math]::Round($StaggerSeconds / [Math]::Max(1, $Seats - 1)))
+    } else {
+        Start-Sleep -Milliseconds 400
+    }
 }
 
 Write-Host "$Seats nodes started; waiting up to $($Seconds + 60) s"

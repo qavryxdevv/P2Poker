@@ -2693,6 +2693,45 @@ seats that finished a hand      : 10 of 10
 Every seat played, where the run before it had one that opened four hands and
 finished none.
 
+## Players arriving irregularly, which is the case everything else measured around
+
+Every seat-count figure in this file was taken with all N clients started within
+a second of each other. That is the easy case for formation and it is not the
+real one: **players arrive irregularly, and a tournament table has to stay open
+until it fills.** A table that forms when six clients start at once has not been
+shown to form when the sixth arrives ten minutes after the first.
+
+`table-run.ps1 -StaggerSeconds` spreads the joiners. Six seats, one player a
+minute over five minutes, ten-minute run:
+
+| | |
+|---|---|
+| last player started | ~243 s |
+| **first hand opened** | **245.1 s** |
+| every seat in the group | yes, 10–25 s after its own start |
+| played | 14 hands, 13 finished, every seat |
+
+**The table stayed open for four minutes and dealt two seconds after the last
+player sat down.** Nothing expires it while it waits: the founder re-advertises
+every `AD_REBROADCAST_MS = 30_000` for as long as `table_is_closed` is false, and
+that is *full and ratified* — for a tournament it latches on full, so an SNG that
+never fills is advertised for ever, which is what an SNG that never fills should
+be. `MAX_AD_LIFETIME_MS` bounds how far ahead one advert may claim to be valid,
+not how long a table may live.
+
+**Two things the stagger made the harness get right.** Each node is given
+`--for` counted to a **common wall-clock end**, not the same duration: a joiner
+started four minutes late and given the full run would have outlived the founder
+by four minutes and spent them as the only seat at the table. And the script
+refuses a stagger that leaves under a minute to play in, rather than reporting a
+table that never got to deal.
+
+**One number is worse and is not explained.** Steady state came out at 23.8 s a
+hand against 9.5–10.6 s in the simultaneous six-seat runs. It is one run against
+three, and a simultaneous LAN run has come in at 20.7 s before now, so this may
+be ordinary spread rather than a cost of arriving late. Not claimed either way
+until it is repeated.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that
