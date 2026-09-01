@@ -547,18 +547,63 @@ impl Formation {
         self.early.len()
     }
 
-    /// The founder's answer to a join request.
-    ///
     /// `connection_peer_id` is what the **transport** authenticated, not what
     /// the request claims: the whole of `U17` rests on those being compared.
+    ///
+    /// The founder's answer to a join request.
+    ///
+    /// `started` is whether this table has dealt a hand. **A stranger may not
+    /// join one that has** — `STATE_MACHINE.md` §9.4: *"A seat may not be added
+    /// after `Seating`, in either mode, in this version (P8)"*, and §3.1: *"No
+    /// seat is added to the vector, removed from it, or reordered within it for
+    /// the life of the table."* Nothing enforced it, and accepting one does
+    /// `serial += 1; ratified.clear(); session = None` — **un-ratifying a table
+    /// in the middle of a tournament** and giving its roster a row that
+    /// `roster_hash(k)` does not contain. `S1-T`.
+    ///
+    /// The only barrier before this was `TableFull`, which never fires on a
+    /// table that started at `min_players_to_start` below `max_players` — this
+    /// client's own default.
+    ///
+    /// **A seat that is already on the roster is not a stranger and is not
+    /// refused here.** It is answered as it was before, with `AlreadySeated`
+    /// and a freshly signed roster (`S1-J`); that path exists for a peer that
+    /// lost its list and gating it here would undo the fix without saying so.
     pub fn on_join_request(
         &mut self,
         bytes: &[u8],
         connection_peer_id: &[u8],
+        started: bool,
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
         let f = self.founder.as_ref().ok_or(Failed::NotTheFounder)?;
         let (req, sender, request_hash) = joinwire::receive_join_request(bytes)?;
+
+        let seated = self
+            .roster
+            .seats()
+            .iter()
+            .any(|e| e.app_public_key == sender || e.peer_id == connection_peer_id);
+        if started && !seated {
+            // **`AdvertExpired`, and the choice is worth stating.** The refusal
+            // vocabulary has no word for *the table has started*: `RejectReason`
+            // is `TableFull`, `SeatTaken`, `BadPassword`, `BuyinOutOfRange`,
+            // `AdvertExpired`, `Banned`, `CapabilityMismatch`, `AlreadySeated`.
+            // This is the nearest true one — §7.3 withdraws a table's advert
+            // when it starts (`reason = 1`), so an advert that still names this
+            // table as joinable is one that should no longer exist — and it
+            // tells the asker not to retry under it, which is the behaviour
+            // that matters. A dedicated code point is a wire decision and is
+            // the owner's.
+            let reply = joinwire::publish_join_reject(
+                request_hash,
+                RejectReason::AdvertExpired,
+                0,
+                &f.key,
+                now_ms,
+            )?;
+            return Ok(vec![Send::Reply(reply)]);
+        }
 
         // The copy **this joiner** heard, which is very unlikely to be the
         // newest one. Every field but the hash is identical across
@@ -1171,7 +1216,7 @@ mod tests {
 
             let out = t
                 .founder
-                .on_join_request(&request, &peer(n), NOW)
+                .on_join_request(&request, &peer(n), false, NOW)
                 .expect("the founder seats an honest joiner");
 
             // The reply first, then the list to everybody — including the
@@ -1307,7 +1352,7 @@ mod tests {
 
         let out = t
             .founder
-            .on_join_request(&request, &peer(2), NOW + 61_000)
+            .on_join_request(&request, &peer(2), false, NOW + 61_000)
             .expect("a request naming an older copy is still honest");
         let Send::Reply(reply) = &out[0] else {
             panic!("an acceptance is a reply")
@@ -1350,7 +1395,7 @@ mod tests {
         let stale = NOW + crate::protocol::constants::MAX_AD_LIFETIME_MS + 1_000;
         t.founder.readvertise(stale, 90_000).unwrap();
 
-        let out = t.founder.on_join_request(&request, &peer(2), stale).unwrap();
+        let out = t.founder.on_join_request(&request, &peer(2), false, stale).unwrap();
         let Send::Reply(reply) = &out[0] else {
             panic!("a refusal is a reply")
         };
@@ -1405,7 +1450,7 @@ mod tests {
 
         let mut list = None;
         let mut ready = None;
-        for send in t.founder.on_join_request(&request, &peer(2), NOW).unwrap() {
+        for send in t.founder.on_join_request(&request, &peer(2), false, NOW).unwrap() {
             match send {
                 Send::Reply(b) => j.on_join_answer(&b, NOW).unwrap(),
                 Send::Broadcast(b) => {
@@ -1495,7 +1540,7 @@ mod tests {
             None,
         )
         .unwrap();
-        for s in t.founder.on_join_request(&request, &peer(2), NOW).unwrap() {
+        for s in t.founder.on_join_request(&request, &peer(2), false, NOW).unwrap() {
             match s {
                 Send::Reply(b) => {
                     j.on_join_answer(&b, NOW).unwrap();
@@ -1529,6 +1574,111 @@ mod tests {
     /// The four things that have to be true, and each of them was false:
     /// the seat leaves the roster, the serial moves so every prior ratification
     /// is void, a fresh list says so, and somebody else can take the number.
+    /// `S1-T`: a stranger cannot join a table that has dealt a hand, and a seat
+    /// that is already on it still can be answered.
+    ///
+    /// `STATE_MACHINE.md` §9.4 forbids adding a seat after `Seating` and
+    /// §3.1 fixes the roster for the life of the table, and **nothing enforced
+    /// either**. The only barrier was `TableFull`, which never fires on a table
+    /// that started at `min_players_to_start` below `max_players` — the shape
+    /// this client's own founder path creates by default. Accepting a late join
+    /// runs `serial += 1; ratified.clear(); session = None`, so a tournament in
+    /// progress loses its ratification and its session identity.
+    ///
+    /// **Both halves are asserted**, because refusing everybody would have been
+    /// the easy version and would have silently undone `S1-J`: a seat already on
+    /// the roster is answered with `AlreadySeated` and a fresh list, exactly as
+    /// before.
+    #[test]
+    fn a_stranger_cannot_join_a_table_that_has_started_and_a_seat_still_can() {
+        let (mut t, _, a, hash) = found(6, 2);
+        let table_id = t.founder.table_id();
+
+        // A seat takes its place while the table is still forming.
+        let (_, early) = Formation::join(
+            key(2),
+            a.clone(),
+            hash,
+            table_id,
+            peer(2),
+            "early".into(),
+            1_000,
+            None,
+            None,
+            [2u8; 32],
+            NOW,
+            None,
+        )
+        .unwrap();
+        t.founder
+            .on_join_request(&early, &peer(2), false, NOW)
+            .expect("a forming table seats it");
+        let seated = t.founder.roster().len();
+        let serial = t.founder.serial();
+
+        // The table deals. A stranger asks anyway — its advert is stale but it
+        // is well formed, which is exactly the case that had no barrier.
+        let (_, stranger) = Formation::join(
+            key(7),
+            a.clone(),
+            hash,
+            table_id,
+            peer(7),
+            "stranger".into(),
+            1_000,
+            None,
+            None,
+            [7u8; 32],
+            NOW + 1,
+            None,
+        )
+        .unwrap();
+        let out = t
+            .founder
+            .on_join_request(&stranger, &peer(7), true, NOW + 1)
+            .expect("it is answered rather than dropped");
+        assert!(
+            out.iter().all(|s| matches!(s, Send::Reply(_))),
+            "a refusal is a reply and nothing else; a broadcast here would be a roster change"
+        );
+        assert_eq!(
+            t.founder.roster().len(),
+            seated,
+            "the roster did not move"
+        );
+        assert_eq!(
+            t.founder.serial(),
+            serial,
+            "and neither did the serial, so nothing was un-ratified"
+        );
+
+        // The seat that is already there is not a stranger, and `S1-J`'s answer
+        // still reaches it.
+        let (_, again) = Formation::join(
+            key(2),
+            a.clone(),
+            hash,
+            table_id,
+            peer(2),
+            "early".into(),
+            1_000,
+            None,
+            None,
+            [2u8; 32],
+            NOW + 2,
+            None,
+        )
+        .unwrap();
+        let out = t
+            .founder
+            .on_join_request(&again, &peer(2), true, NOW + 2)
+            .expect("a seated peer is answered");
+        assert!(
+            out.iter().any(|s| matches!(s, Send::Broadcast(b) if joinwire::receive_player_list(b).is_ok())),
+            "with a freshly signed roster, which is what S1-J exists for"
+        );
+    }
+
     /// `S1-P`: the repeat has to be **new bytes**, or GossipSub will not carry
     /// it.
     ///
@@ -1561,7 +1711,7 @@ mod tests {
         .unwrap();
         let out = t
             .founder
-            .on_join_request(&req, &peer(2), NOW)
+            .on_join_request(&req, &peer(2), false, NOW)
             .expect("the seat is given");
         for send in &out {
             match send {
@@ -1624,7 +1774,7 @@ mod tests {
         )
         .unwrap();
         t.founder
-            .on_join_request(&req, &peer(2), NOW)
+            .on_join_request(&req, &peer(2), false, NOW)
             .expect("the seat is given");
         let took = t.founder.roster().len();
         let serial_before = t.founder.serial();
@@ -1671,7 +1821,7 @@ mod tests {
         )
         .unwrap();
         t.founder
-            .on_join_request(&replacement, &peer(7), NOW + 2)
+            .on_join_request(&replacement, &peer(7), false, NOW + 2)
             .expect("the freed seat is given to the next player");
         assert_eq!(t.founder.roster().len(), took, "the table is full again");
         assert!(
@@ -1742,7 +1892,7 @@ mod tests {
         )
         .unwrap();
         t.founder
-            .on_join_request(&first, &peer(2), NOW)
+            .on_join_request(&first, &peer(2), false, NOW)
             .expect("the first seat is given");
 
         // A second application key, from the same node.
@@ -1763,7 +1913,7 @@ mod tests {
         .unwrap();
         let out = t
             .founder
-            .on_join_request(&second, &peer(2), NOW)
+            .on_join_request(&second, &peer(2), false, NOW)
             .expect("a refusal is still an answer");
         // **A refusal changes no roster, and it repeats one.** The roster
         // assertion below is the one that carries the rule; the send count used
@@ -1790,7 +1940,7 @@ mod tests {
         let much_later = NOW + crate::protocol::constants::LIST_MAX_AGE_MS * 2;
         let out = t
             .founder
-            .on_join_request(&second, &peer(2), much_later)
+            .on_join_request(&second, &peer(2), false, much_later)
             .expect("a refusal is still an answer");
         let list = match &out[1] {
             Send::Broadcast(b) => b.clone(),
@@ -1835,7 +1985,7 @@ mod tests {
 
         // The same bytes, arriving on a connection belonging to somebody else.
         assert_eq!(
-            t.founder.on_join_request(&request, &peer(7), NOW),
+            t.founder.on_join_request(&request, &peer(7), false, NOW),
             Err(Failed::Join(JoinRefused::PeerIdIsNotTheConnection))
         );
         assert_eq!(t.founder.roster().len(), 1);
@@ -1863,7 +2013,7 @@ mod tests {
             None,
         )
         .unwrap();
-        t.founder.on_join_request(&first, &peer(2), NOW).unwrap();
+        t.founder.on_join_request(&first, &peer(2), false, NOW).unwrap();
 
         let (mut third, request) = Formation::join(
             key(3),
@@ -1880,7 +2030,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let out = t.founder.on_join_request(&request, &peer(3), NOW).unwrap();
+        let out = t.founder.on_join_request(&request, &peer(3), false, NOW).unwrap();
         let Send::Reply(bytes) = &out[0] else {
             panic!("a refusal is a reply")
         };
@@ -1959,7 +2109,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let out = f.on_join_request(&wrong, &peer(2), NOW).unwrap();
+        let out = f.on_join_request(&wrong, &peer(2), false, NOW).unwrap();
         let Send::Reply(bytes) = &out[0] else {
             panic!()
         };
@@ -1983,7 +2133,7 @@ mod tests {
             None,
         )
         .unwrap();
-        f.on_join_request(&right, &peer(2), NOW).unwrap();
+        f.on_join_request(&right, &peer(2), false, NOW).unwrap();
         assert_eq!(f.roster().len(), 2);
     }
 
@@ -2010,7 +2160,7 @@ mod tests {
             None,
         )
         .unwrap();
-        t.founder.on_join_request(&first, &peer(2), NOW).unwrap();
+        t.founder.on_join_request(&first, &peer(2), false, NOW).unwrap();
         let after_first = t.founder.serial();
 
         let (_, second) = Formation::join(
@@ -2028,7 +2178,7 @@ mod tests {
             None,
         )
         .unwrap();
-        t.founder.on_join_request(&second, &peer(3), NOW).unwrap();
+        t.founder.on_join_request(&second, &peer(3), false, NOW).unwrap();
 
         assert!(
             t.founder.serial() > after_first,

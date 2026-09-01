@@ -210,7 +210,7 @@ async fn run() -> ([u8; 32], [u8; 32]) {
                     // What the transport authenticated, which is what §4.3
                     // compares the request's own claim against.
                     let out = founder
-                        .on_join_request(&request, &peer.to_bytes(), NOW)
+                        .on_join_request(&request, &peer.to_bytes(), false, NOW)
                         .expect("an honest request is seated");
                     let mut channel = Some(channel);
                     for send in out {
@@ -340,7 +340,7 @@ async fn the_two_seats_are_the_ones_the_founder_assigned() {
     .unwrap();
 
     for send in founder
-        .on_join_request(&request, &[2u8; 38], NOW)
+        .on_join_request(&request, &[2u8; 38], false, NOW)
         .unwrap()
     {
         match send {

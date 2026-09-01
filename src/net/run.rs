@@ -1136,7 +1136,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(k) = returning {
                                     tox_sink.tell(super::toxsink::Seat::Back(k));
                                 }
-                                match f.on_join_request(&request, &authenticated, now) {
+                                match f.on_join_request(&request, &authenticated, ever_dealt, now) {
                                     Ok(sends) => {
                                         // The channel is consumed by the one
                                         // reply and the rest of the sends go to
@@ -3742,14 +3742,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // hands of allowance and the transport gave it no way to spend
                 // them.
                 //
-                // Nothing is loosened by advertising it: a stranger's
-                // `JOIN_REQUEST` is refused as *the table is full* by §7.2 as it
-                // always was, and the advert carries `players` and
-                // `max_players`, so a lobby that does not want to show full
-                // tables has the numbers to filter on. `dht_effort` still
-                // narrows for a closed table — what is kept is the mesh
-                // re-broadcast, which is what a returning seat hears.
-                if let Some(f) = table.as_mut().filter(|f| f.is_founder())
+                // **That reason is gone and so is the advertising, once a hand
+                // has been dealt.** The owner has ruled the restarting client
+                // out of scope — *“ten peer má smůlu”* — and a client whose link
+                // merely dropped never lost its table and never looks in the
+                // lobby for it. What the advert did keep open was a door for
+                // strangers: `S1-T`, where the paragraph above was wrong on its
+                // own terms. *“A stranger's `JOIN_REQUEST` is refused as the
+                // table is full”* is false for any table that started at
+                // `min_players_to_start` below `max_players` — this client's own
+                // default — and accepting one un-ratifies a table in the middle
+                // of a tournament. §7.3 withdraws a table's advert when it
+                // starts, `reason = 1`, and this is that withdrawal by omission.
+                if let Some(f) = table
+                    .as_mut()
+                    .filter(|f| f.is_founder() && !ever_dealt)
                 {
                     match f.readvertise(now, AD_TTL_MS) {
                         Ok(bytes) => {

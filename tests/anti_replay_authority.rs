@@ -509,7 +509,7 @@ impl Table {
 
         let out = self
             .founder
-            .on_join_request(&request, &[seed; 38], NOW)
+            .on_join_request(&request, &[seed; 38], false, NOW)
             .unwrap();
         let (mut accept, mut list, mut founder_ready) = (None, None, None);
         for s in out {
