@@ -92,6 +92,16 @@ param(
     # dealt in again; longer and the allowance is spent and the blinds eat the
     # stack while it sits out. At roughly ten seconds a hand, a twenty-second
     # outage is the boundary.
+    # `-DivergeAt <hand>` makes n1 compute a WRONG boundary-checkpoint value for
+    # that hand, so that section 6.3's answer to a divergence can be measured
+    # rather than reasoned about. It needs a binary built with
+    # `--features divergence-harness`; without it the environment variable is
+    # not read and the run is an ordinary one.
+    [ValidateRange(0, 100000)][int]$DivergeAt = 0,
+    # Which node tells the lie. Its own log is where the OTHER nodes' complaints
+    # are not: a peer that diverges does not know it, which is the whole reason
+    # everybody else compares.
+    [ValidateRange(0, 32)][int]$DivergeNode = 1,
     [ValidateRange(0, 3600)][int]$DropAt = 0,
     [ValidateRange(0, 600)][int]$DropFor = 20,
     # A seat slower than this to enter the Tox group keeps the logs, however
@@ -163,8 +173,10 @@ for ($i = 0; $i -lt $Seats; $i++) {
         $nodeArgs += @('--join', $table)
     }
 
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log -ScriptBlock {
-        param($exe, $nodeArgs, $log)
+    $diverge = if ($DivergeAt -gt 0 -and $i -eq $DivergeNode) { $DivergeAt } else { 0 }
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge)
+        if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
         $start = Get-Date
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
         & $exe @nodeArgs 2>&1 | ForEach-Object {
@@ -212,6 +224,10 @@ if ($LeaverSeconds -gt 0) {
     $jobs += $replacement
 }
 
+if ($DivergeAt -gt 0) {
+    Write-Host "==> n$DivergeNode will hold a wrong end-of-hand state for hand $DivergeAt"
+    Write-Host "    (needs a binary built with --features divergence-harness)"
+}
 if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
     Write-Host "==> n1 drops at $DropAt s and returns $DropFor s later, same profile"
     $return = Start-Job -ArgumentList $Exe, $work, $table, $Seconds, $DropAt, $DropFor -ScriptBlock {

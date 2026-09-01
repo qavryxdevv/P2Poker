@@ -360,6 +360,38 @@ impl Opening {
     }
 }
 
+/// Return the state hash, or a **wrong** one, if this build and this run were
+/// both asked for a divergence.
+///
+/// `P2P_POKER_DIVERGE_AT_HAND=<k>` makes this peer's checkpoint-8 value for hand
+/// `k` differ from everybody else's by one bit. That is the only fault §6.3
+/// exists to answer and the only one an honest run never produces, so without a
+/// way to cause it deliberately the freeze and the reconciliation rounds would
+/// first execute in front of a player.
+///
+/// **Two locks, and the outer one is a compile-time absence.** A build without
+/// `--features divergence-harness` contains no path to a wrong hash — this
+/// function is the identity and the environment variable is not read. That is
+/// what makes it safe to have at all.
+#[cfg(feature = "divergence-harness")]
+fn diverge_if_asked(state_hash: Hash, hand_id: u64) -> Hash {
+    let Ok(at) = std::env::var("P2P_POKER_DIVERGE_AT_HAND") else {
+        return state_hash;
+    };
+    if at.trim().parse::<u64>() != Ok(hand_id) {
+        return state_hash;
+    }
+    let mut wrong = state_hash;
+    wrong[0] ^= 1;
+    wrong
+}
+
+/// The identity, in every build that did not ask for the harness.
+#[cfg(not(feature = "divergence-harness"))]
+fn diverge_if_asked(state_hash: Hash, _hand_id: u64) -> Hash {
+    state_hash
+}
+
 /// How much of an event body this client will decode.
 ///
 /// `PROTOCOL.md` §9.3's cap for `HAND_INIT`. Nested: the frame holds an
@@ -3545,7 +3577,7 @@ impl Hand {
         // §6.1's hash of the settled state and `parent` is `TERMINAL(k)`; the
         // next line drops the `Step` that carries the first, and the slot moves
         // past the second on the following hand. See the field's own note.
-        self.checkpoint8 = Some((mine.state_hash, parent));
+        self.checkpoint8 = Some((diverge_if_asked(mine.state_hash, self.open.hand_id), parent));
         play.step = Step::Ended;
         Ok(Vec::new())
     }
