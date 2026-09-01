@@ -334,6 +334,30 @@ impl Opening {
             button: None,
         })
     }
+
+    /// Why `from_formation` would decline, or `None` if it would not.
+    ///
+    /// `from_formation` has four `?`s and no voice. It is the **only** road into
+    /// a hand — every peer derives its own opening rather than taking one from
+    /// somebody's `HAND_INIT` — so a silent `None` is a client that sits at a
+    /// table for ever, holding a roster, with no line in its log saying what it
+    /// is missing. Measured: a rejoining client did exactly that for 275 s.
+    ///
+    /// Kept beside the constructor and not inside it, so that the constructor
+    /// stays an expression and the two cannot drift: each arm names the field
+    /// whose `?` it stands for.
+    pub fn why_not_from_formation(f: &crate::net::formation::Formation) -> Option<&'static str> {
+        if f.session().is_none() {
+            return Some("the table has no session id: its roster has not ratified here");
+        }
+        if f.genesis_one().is_none() {
+            return Some("the table has no genesis: its roster has not ratified here");
+        }
+        if f.my_seat().is_none() {
+            return Some("this client holds no seat in the roster it has");
+        }
+        None
+    }
 }
 
 /// How much of an event body this client will decode.
@@ -3584,6 +3608,26 @@ impl Hand {
         )
         .map_err(Failed::Wire)?;
         Ok(Some(bytes))
+    }
+
+    /// The table this hand belongs to.
+    pub fn table_id(&self) -> Hash {
+        self.open.table_id
+    }
+
+    /// Which seat holds an application key, if any.
+    ///
+    /// `seat_of` answers the same question and refuses with `NotAtThisTable`,
+    /// which is right inside a stage. This one is for a caller **outside** any
+    /// stage — a checkpoint-8 `STATE_HASH` of a finished hand — where a key
+    /// that is not on the roster is a message to ignore rather than a fault to
+    /// report.
+    pub fn seat_of_key(&self, key: &[u8; 32]) -> Option<SeatIdx> {
+        self.open
+            .seats
+            .iter()
+            .find(|(_, k, _)| k == key)
+            .map(|(seat, _, _)| *seat)
     }
 
     /// `P(k)` as seat indices: the seats this client accepted a chained event

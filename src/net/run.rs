@@ -442,6 +442,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // wait is on progress rather than on a deadline; see `hand_one_may_open`.
     let mut hand_one_progress: (u64, std::time::Instant) = (0, std::time::Instant::now());
     let mut hand_one_forced_said = false;
+    // Said once per node: the reason hand one cannot be built from the roster
+    // this client holds. See `say_why_no_hand_one`.
+    let mut why_no_hand_one_said = false;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
     // Empty unless this table's game traffic rides a Tox group (D-019), and
     // empty for ever in a build without `--features tox`. The lobby, the join
@@ -1159,6 +1162,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 )
                                                 .await
                                             {
+                                                say_why_no_hand_one(f, &mut why_no_hand_one_said, &events).await;
                                                 if let Some(o) = opening_for_hand_one(f) {
                                                     ever_dealt = true;
                                                     begin_hand(
@@ -1442,6 +1446,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         )
                                         .await
                                     {
+                                        say_why_no_hand_one(f, &mut why_no_hand_one_said, &events).await;
                                         if let Some(o) = opening_for_hand_one(f) {
                                             ever_dealt = true;
                                             begin_hand(
@@ -2721,6 +2726,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await
                         {
+                            say_why_no_hand_one(f, &mut why_no_hand_one_said, &events).await;
                             if let Some(o) = opening_for_hand_one(f) {
                                 ever_dealt = true;
                                 begin_hand(
@@ -4143,6 +4149,21 @@ fn opening_for_hand_one(f: &Formation) -> Option<crate::table::hand::Opening> {
     crate::table::hand::Opening::from_formation(f, 1)
 }
 
+/// Say once, per node, why hand one cannot be opened from this formation.
+///
+/// Once, because the three roads in are retried on every table message and a
+/// reason repeated every thirty seconds is a reason nobody reads.
+async fn say_why_no_hand_one(f: &Formation, said: &mut bool, events: &Events) {
+    if *said {
+        return;
+    }
+    if let Some(why) = crate::table::hand::Opening::why_not_from_formation(f) {
+        *said = true;
+        let _ = events
+            .send(NodeEvent::Warning(format!("no hand can start here: {why}")))
+            .await;
+    }
+}
 
 /// How long a seated peer may answer nothing before the founder gives its seat
 /// back, and **only before the first hand**.
