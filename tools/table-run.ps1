@@ -144,6 +144,25 @@ $table = "run$stamp-$Seats"
 $work = Join-Path $env:TEMP "p2p-table-run\$table"
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
+# **One shared Tox node list for every run on this machine.**
+#
+# Each node gets a fresh profile, finds no `tox-nodes.json`, and fetches
+# `https://nodes.tox.chat/json` on start. Measured on 2026-09-01: 88 run
+# directories and 432 of those files in one evening - 432 requests to one public
+# endpoint from one address, which is a load nobody should put on a volunteer
+# service and is a variable in every measurement taken afterwards. That evening's
+# runs did fail, repeatedly and inexplicably, with `tox self tcp, tox friends up
+# 0` and no group; the cause was never proven, and this removes the most likely
+# candidate from the next attempt.
+#
+# The client refreshes at most daily and merges the cache with its compiled-in
+# list, so seeding a profile from a shared copy is exactly what a second run on
+# the same day would have done for itself.
+$shared = Join-Path $env:TEMP (Join-Path "p2p-table-run" "tox-nodes.json")
+$seed = (Test-Path $shared) -and
+        ((Get-Date) - (Get-Item $shared).LastWriteTime).TotalHours -lt 24
+if ($seed) { Write-Host "nodes  seeded from the shared cache, no fetch needed" }
+
 Write-Host "table  $table"
 Write-Host "seats  $Seats"
 Write-Host "for    $Seconds s"
@@ -165,6 +184,7 @@ $jobs = @()
 for ($i = 0; $i -lt $Seats; $i++) {
     $profileDir = Join-Path $work "n$i"
     New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+    if ($seed) { Copy-Item $shared (Join-Path $profileDir 'tox-nodes.json') -Force }
     $log = Join-Path $work "n$i.log"
 
     # **Every node stops at the same wall-clock moment, not after the same
@@ -443,6 +463,16 @@ if ($opens.Count -ge 3) {
     Write-Host "not enough hands for a steady-state figure (need 3 opens, got $($opens.Count))."
     Write-Host "Logs are in $work"
     $KeepLogs = $true
+}
+
+# Keep whatever the founder fetched, so the next run on this machine seeds from
+# it instead of asking `nodes.tox.chat` again. Outside the `KeepLogs` branch on
+# purpose: a run whose logs are thrown away still fetched a list, and throwing
+# that away too is what made 432 requests out of one evening.
+$fetched = Join-Path $work (Join-Path 'n0' 'tox-nodes.json')
+if ((Test-Path $fetched) -and (-not $seed)) {
+    Copy-Item $fetched $shared -Force
+    Write-Host "nodes  cached for the next run"
 }
 
 # A stalled run is the one whose logs are wanted.
