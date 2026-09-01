@@ -2681,6 +2681,18 @@ deals, which is what the client did before any of this existed.
 On one LAN nothing changes: the group completes and the gate passes on the count,
 with no fallback fired.
 
+**Confirmed across the boundary with the progress gate in.** The same ten-seat
+split, run again: group entry 27–85 s, and
+
+```
+seats that saw the whole roster : 10 of 10
+seats that entered the group    : 10 of 10
+seats that finished a hand      : 10 of 10
+```
+
+Every seat played, where the run before it had one that opened four hands and
+finished none.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that
