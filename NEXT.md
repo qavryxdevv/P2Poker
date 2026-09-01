@@ -2726,11 +2726,26 @@ by four minutes and spent them as the only seat at the table. And the script
 refuses a stagger that leaves under a minute to play in, rather than reporting a
 table that never got to deal.
 
-**One number is worse and is not explained.** Steady state came out at 23.8 s a
-hand against 9.5–10.6 s in the simultaneous six-seat runs. It is one run against
-three, and a simultaneous LAN run has come in at 20.7 s before now, so this may
-be ordinary spread rather than a cost of arriving late. Not claimed either way
-until it is repeated.
+### The long wait, which is the one a tournament actually does
+
+Six players, **one every three minutes**, twenty-minute run:
+
+| | |
+|---|---|
+| last player started | 723 s |
+| **first hand opened** | **727.4 s** |
+| played | **46 hands, 45 finished, every seat** |
+| steady state | **10.0 s a hand**, over 44 intervals |
+
+**The table stayed open for twelve minutes and dealt four seconds after the last
+player sat down**, and then played exactly as fast as a table whose six clients
+all started at once.
+
+That also settles a number the five-minute run left hanging. It had come out at
+23.8 s a hand against 9.5–10.6 s simultaneous, which looked like a cost of
+arriving late. It was not: twelve intervals is a small sample, this run has
+forty-four, and it lands at 10.0 s. **Arriving late costs the table nothing once
+it is full.**
 
 ### And thinking about the long wait found a defect in the fix from an hour ago
 
