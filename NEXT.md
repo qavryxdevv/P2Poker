@@ -2820,12 +2820,66 @@ already tracks who is connected; it covers the crash as well as the clean exit,
 which (a) does not; and it costs nothing that is at stake, because no chips have
 moved and no card has been dealt.
 
-(b) is the smaller change and the one that covers both cases. What it needs is a
-duration and agreement that a pre-start seat may be taken back at all —
-**D-010's *no automated forfeiture and no automated eviction* and D-014's tier-1
-rule are stated broadly enough to be read against it**, and reading them narrowly
-because this case is cheap is exactly the move those decisions exist to stop. So
-it is filed as `S1-M` rather than written.
+(b) is the smaller change and the one that covers both cases.
+
+### The owner chose (b), and added the part that makes it sound
+
+*"Transport over the internet is unreliable in principle — dropped connections,
+lost packets — so every peer must be **pinged** to check it is on the line."*
+
+That is the half I had left implicit and it matters more than the policy does. A
+connection being up is **not** evidence that anybody is behind it: a half-open
+TCP or a NAT mapping that has expired leaves a socket that looks perfectly well
+and answers nothing. Liveness has to be asked for.
+
+**And the client was already asking and throwing the answers away.**
+`ping::Behaviour` has been in the swarm from the beginning and `run.rs` matched
+its events with nothing — every peer pinged four times a minute, every reply
+discarded.
+
+So: `alive` records when each peer last **answered**, `ConnectionEstablished`
+seeds it (the first ping is fifteen seconds away and a seat that joins must not
+look silent because nothing has asked it yet), and the housekeeping sweep frees
+a seat whose peer has answered nothing for `SEAT_SILENCE_MS`.
+
+**Ninety seconds, and it is derived rather than chosen.** `ping::Config`'s
+defaults in `libp2p-ping-0.47.0` are a fifteen-second interval and a
+twenty-second timeout (`handler.rs:65-66`), so ninety seconds is **six
+intervals**: a seat is given back only by a peer that has missed every one of
+them. The internet drops packets, and a rule that took a seat away for one lost
+datagram would be worse than the problem it solves.
+
+`!ever_dealt` is the whole of what keeps this out of D-010's and D-014's way,
+and it is checked in the node loop because `Formation` cannot see it — which is
+why the method is called `release_seat_before_the_first_hand` and says so in its
+own name.
+
+### Measured, and this is the trace
+
+Six seats filling one a minute, the **first** joiner leaving at 93 s, a
+replacement following:
+
+```
+  1.0   1 seated
+  4.1   2 seated   <- the leaver joins
+ 64.4   3 seated
+124.6   4 seated
+180.1   3 seated   <- seat 1 has answered nothing for 90 s and the seat is free again
+184.8   4 seated   <- the replacement takes it
+249.2   5 seated
+450.2   6 seated
+```
+
+The table then dealt and played **13 hands, all 13 finished by every remaining
+seat and by the replacement**. Before the fix the same shape gave 5 hands
+opened, 2 finished, and three seats that played nothing.
+
+**The first attempt at this measured the wrong thing**, and the harness now says
+so: the leaver was the *last* joiner, so the table filled in ten seconds and
+dealt at thirty, and the departure at ninety was an ordinary mid-tournament one
+that D-022 already handles. A seat given up *before the table fills* needs the
+leaver to be an early one. (That mid-tournament case is in good health, for what
+it is worth: 36 hands opened, 35 finished by the five that stayed.)
 
 ## Still open
 

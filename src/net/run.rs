@@ -53,8 +53,8 @@
 use std::time::Duration;
 
 use libp2p::{
-    futures::StreamExt as SwarmStreamExt, gossipsub, identity, request_response, swarm::SwarmEvent,
-    Multiaddr, PeerId,
+    futures::StreamExt as SwarmStreamExt, gossipsub, identity, ping, request_response,
+    swarm::SwarmEvent, Multiaddr, PeerId,
 };
 use tokio::sync::mpsc;
 
@@ -439,6 +439,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut tox_group_said = false;
     // The last refusal count reported, so a steady state says nothing and a
     // rising one says it every five seconds.
+    // When each peer last **answered**, not when it last connected. See the
+    // `Ping` arm and `SEAT_SILENCE_MS`.
+    let mut alive: std::collections::HashMap<PeerId, std::time::Instant> =
+        std::collections::HashMap::new();
     let mut tox_refused_said: u64 = 0;
     let mut tox_invites_said: u64 = 0;
     // **How the re-send loop backs off.** `at` is the chain position it last
@@ -916,7 +920,32 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         state_peers += 1;
+                        // A connection that has just been made is evidence the
+                        // peer is there, and it is the only evidence available
+                        // until the first ping fifteen seconds later. Without
+                        // it a seat that joins and is swept a moment afterwards
+                        // looks silent because nothing has asked it yet.
+                        alive.insert(peer_id, std::time::Instant::now());
                         let _ = events.send(NodeEvent::PeerConnected(peer_id)).await;
+                    }
+
+                    // **The answer to a ping, which this loop used to throw
+                    // away.** `ping::Behaviour` has been in the swarm from the
+                    // start and its events were matched by nothing, so the
+                    // client asked every peer whether it was there fifteen
+                    // times a minute and never looked at a single reply.
+                    //
+                    // A connection being up is not evidence that anybody is
+                    // behind it: a half-open TCP or a NAT mapping that expired
+                    // leaves a socket that looks perfectly well and answers
+                    // nothing. Liveness has to be **asked for**, and this is the
+                    // asking.
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Ping(ping::Event {
+                        peer,
+                        result: Ok(_),
+                        ..
+                    })) => {
+                        alive.insert(peer, std::time::Instant::now());
                     }
                     SwarmEvent::ConnectionClosed {
                         peer_id,
@@ -2900,6 +2929,111 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             _ = housekeeping.tick() => {
                 let now = super::node::now_unix_ms();
                 state.tick(now);
+
+                // **Give back the seat of anybody who has stopped answering,
+                // and only before the first hand.**
+                //
+                // A player who sits down at a tournament and leaves before it
+                // fills is ordinary. Nothing used to notice: `LeaveTable` clears
+                // local state and tells the founder nothing, there is no message
+                // that could tell it — `PLAYER_LEAVE` is a boundary-window event
+                // of a chain that does not exist yet — and D-022's *held for two
+                // hands* is counted in hands, of which there are none. So the
+                // seat was held for ever and the replacement was refused with
+                // *the table is full*, measured twice in one run.
+                //
+                // **Liveness is asked for rather than assumed.** `alive` is the
+                // last time each peer answered a **ping**; a connection being up
+                // is not evidence that anybody is behind it. `SEAT_SILENCE_MS`
+                // is six ping intervals, so a seat is given back only by a peer
+                // that has missed every one of them.
+                //
+                // `!ever_dealt` is the whole of what makes this not an eviction,
+                // and it is checked here because `Formation` cannot see it.
+                if !ever_dealt {
+                    if let Some(f) = table.as_mut().filter(|f| f.is_founder()) {
+                        let silent: Vec<(u8, Vec<u8>)> = f
+                            .roster()
+                            .seats()
+                            .iter()
+                            .filter(|e| Some(e.seat) != f.my_seat())
+                            .filter(|e| {
+                                match PeerId::from_bytes(&e.peer_id) {
+                                    // Answered, and recently enough.
+                                    Ok(p) => alive
+                                        .get(&p)
+                                        .map(|at| {
+                                            at.elapsed()
+                                                >= std::time::Duration::from_millis(SEAT_SILENCE_MS)
+                                        })
+                                        // Seated and never once heard from. It
+                                        // reached the join RPC over a connection,
+                                        // so `ConnectionEstablished` recorded it;
+                                        // no entry at all means that connection
+                                        // and this client's memory of it are both
+                                        // gone.
+                                        .unwrap_or(true),
+                                    // A `peer_id` that will not parse cannot be
+                                    // pinged and cannot be judged. Left alone:
+                                    // §4.3 admitted it, and refusing to seat it
+                                    // is that check's business rather than this
+                                    // one's.
+                                    Err(_) => false,
+                                }
+                            })
+                            .map(|e| (e.seat, e.peer_id.clone()))
+                            .collect();
+
+                        for (seat, peer) in silent {
+                            match f.release_seat_before_the_first_hand(&peer, now) {
+                                Ok(sends) if !sends.is_empty() => {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "seat {seat} has answered nothing for {} s and the seat is free again",
+                                            SEAT_SILENCE_MS / 1000
+                                        )))
+                                        .await;
+                                    // Only broadcasts come out of a release:
+                                    // there is nobody to reply to, because
+                                    // nothing asked. A `Reply` here would be a
+                                    // response to a request that does not
+                                    // exist, so it is dropped and said rather
+                                    // than sent nowhere quietly.
+                                    for s in sends {
+                                        match s {
+                                            Send::Broadcast(bytes) => {
+                                                if let Some(tt) = &table_topic {
+                                                    let _ = swarm
+                                                        .behaviour_mut()
+                                                        .gossipsub
+                                                        .publish(tt.clone(), bytes);
+                                                }
+                                            }
+                                            Send::Reply(_) => {
+                                                let _ = events
+                                                    .send(NodeEvent::Warning(
+                                                        "releasing a seat produced a reply, which has no request to answer"
+                                                            .into(),
+                                                    ))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    seat_on_tox(f, &tox_sink);
+                                    report_roster(&events, f).await;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "could not free seat {seat}: {e:?}"
+                                        )))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
                 // **Who this client can actually reach on the lobby topic.**
                 // A publish that returns `Ok` says only that it went somewhere.
                 // Measured on three clients on one machine, all discovered by
@@ -3672,6 +3806,22 @@ fn short_hash(h: &[u8; 32]) -> String {
 fn opening_for_hand_one(f: &Formation) -> Option<crate::table::hand::Opening> {
     crate::table::hand::Opening::from_formation(f, 1)
 }
+
+/// How long a seated peer may answer nothing before the founder gives its seat
+/// back, and **only before the first hand**.
+///
+/// **Derived from the ping cadence, not chosen.** `ping::Config`'s defaults in
+/// `libp2p-ping-0.47.0` are a fifteen-second interval and a twenty-second
+/// timeout (`handler.rs:65-66`), so a peer that is there answers roughly four
+/// times a minute. Ninety seconds is six intervals: a peer has to miss every
+/// one of them, which no ordinary loss does — the internet drops packets and
+/// closes connections, and a rule that took a seat away for one lost datagram
+/// would be worse than the problem.
+///
+/// It is also short enough that a table is not held for long by somebody who
+/// has gone, which is the whole point: until this existed a tournament that
+/// lost one player before it started could not be completed by anybody.
+const SEAT_SILENCE_MS: u64 = 90_000;
 
 /// How long hand 1 waits after the group **stops filling**.
 ///

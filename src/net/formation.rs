@@ -664,6 +664,93 @@ impl Formation {
         }
     }
 
+    /// Give a seat back, **before the first hand and never after it**.
+    ///
+    /// # Why this exists, and why it is not eviction
+    ///
+    /// A player who sits down at a tournament table and leaves before it fills
+    /// is ordinary, and until this existed nothing in the client ever removed a
+    /// seat from a formation roster — not a clean leave, not a disconnect, not
+    /// time. Measured: six seats, one leaving cleanly at 90 s, the replacement
+    /// told *“the table is full”* at 95 s and again at 106 s, and the founder
+    /// then dealing hand 1 to all six including the one that had gone. A
+    /// tournament that lost a player before it started could not be completed
+    /// by anybody. That is `S1-M`.
+    ///
+    /// **It is not D-010's forfeiture nor D-014's unseating**, and the
+    /// difference is not a matter of degree: those govern a seat with chips
+    /// behind it in a hand that is being played. Here no card has been dealt,
+    /// no chip has moved, `session` is `None` or about to be, and the seat's
+    /// buy-in is a number in an advert. Giving it back costs its owner a place
+    /// in a queue, and they take it again by joining again.
+    ///
+    /// **The caller must hold the hand-has-not-started condition**, because
+    /// this type cannot see it: `Formation` knows the roster and the session,
+    /// not whether `HAND_INIT` has gone out. `net::run` gates on `ever_dealt`
+    /// and this name says so, so a second caller has to read the sentence
+    /// before it can get it wrong.
+    ///
+    /// The founder's own seat is never released: a table whose founder gave its
+    /// own seat away is a table with an advert and nobody behind it.
+    ///
+    /// Returns an empty vector when there is no such seat, which is the
+    /// ordinary case — a peer goes quiet, is released once, and the sweep that
+    /// found it runs again a minute later.
+    pub fn release_seat_before_the_first_hand(
+        &mut self,
+        peer_id: &[u8],
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let f = self.founder.as_ref().ok_or(Failed::NotTheFounder)?;
+        let key = f.key.clone();
+
+        let Some(going) = self
+            .roster
+            .seats()
+            .iter()
+            .find(|e| e.peer_id == peer_id)
+            .map(|e| e.seat)
+        else {
+            return Ok(Vec::new());
+        };
+        if Some(going) == self.my_seat {
+            return Ok(Vec::new());
+        }
+
+        let seats: Vec<SeatEntry> = self
+            .roster
+            .seats()
+            .iter()
+            .filter(|e| e.seat != going)
+            .cloned()
+            .collect();
+        // `Roster::form` requires the seats sorted and unique and says nothing
+        // about contiguity, so the hole this leaves is a seat number that is
+        // free — which is exactly what the join path looks for.
+        self.roster = Roster::form(seats, &self.under.ad, false)
+            .map_err(|e| Failed::List(ListRefused::Roster(e)))?;
+
+        // The roster changed, so every previous ratification named a serial that
+        // no longer describes this table. The same four lines the accept path
+        // runs, for the same reason.
+        self.serial += 1;
+        self.ratified.clear();
+        self.sent_ready = false;
+        self.session = None;
+
+        let list = PlayerList {
+            roster: self.roster.seats().to_vec(),
+            table_params_hash: self.under.params,
+            list_serial: self.serial,
+        };
+        let list_bytes = joinwire::publish_player_list(&list, &key, now_ms)?;
+        self.said.list = Some(list_bytes.clone());
+
+        let mut out = vec![Send::Broadcast(list_bytes)];
+        out.extend(self.adopt(&list, now_ms)?);
+        Ok(out)
+    }
+
     /// The joiner's handling of whatever came back.
     ///
     /// One entry point for both answers because the joiner does not get to
@@ -1366,6 +1453,135 @@ mod tests {
     /// One node may not hold two seats at one table — `U17`, checked against
     /// what the transport authenticated rather than against what the request
     /// claims.
+    /// A seat given back before the first hand is free for somebody else.
+    ///
+    /// **`S1-M`, and it is the owner's case.** A player sits down at a
+    /// tournament table and leaves before it fills. Measured before this
+    /// existed: six seats, one leaving cleanly at 90 s, the replacement told
+    /// *"the table is full"* at 95 s and again at 106 s, and the founder then
+    /// dealing hand 1 to all six including the one that had gone.
+    ///
+    /// The four things that have to be true, and each of them was false:
+    /// the seat leaves the roster, the serial moves so every prior ratification
+    /// is void, a fresh list says so, and somebody else can take the number.
+    #[test]
+    fn a_seat_given_back_before_the_first_hand_can_be_taken_by_somebody_else() {
+        let (mut t, _, a, hash) = found(6, 2);
+        let table_id = t.founder.table_id();
+
+        let (_, req) = Formation::join(
+            key(2),
+            a.clone(),
+            hash,
+            table_id,
+            peer(2),
+            "leaver".into(),
+            1_000,
+            None,
+            None,
+            [2u8; 32],
+            NOW,
+            None,
+        )
+        .unwrap();
+        t.founder
+            .on_join_request(&req, &peer(2), NOW)
+            .expect("the seat is given");
+        let took = t.founder.roster().len();
+        let serial_before = t.founder.serial();
+        let seat = t
+            .founder
+            .roster()
+            .seats()
+            .iter()
+            .find(|e| e.peer_id == peer(2))
+            .map(|e| e.seat)
+            .expect("the leaver is seated");
+
+        let out = t
+            .founder
+            .release_seat_before_the_first_hand(&peer(2), NOW + 1)
+            .expect("the founder may give a seat back");
+
+        assert_eq!(t.founder.roster().len(), took - 1, "the seat left the roster");
+        assert!(
+            t.founder.serial() > serial_before,
+            "the serial moves, so every ratification naming the old one is void"
+        );
+        assert!(
+            out.iter().any(|s| matches!(s, Send::Broadcast(b) if joinwire::receive_player_list(b).is_ok())),
+            "and a fresh list says so"
+        );
+
+        // The number is free, and the point of freeing it is that somebody
+        // else can have it.
+        let (_, replacement) = Formation::join(
+            key(7),
+            a,
+            hash,
+            table_id,
+            peer(7),
+            "replacement".into(),
+            1_000,
+            // The seat the leaver gave back, asked for by number.
+            Some(seat),
+            None,
+            [7u8; 32],
+            NOW + 2,
+            None,
+        )
+        .unwrap();
+        t.founder
+            .on_join_request(&replacement, &peer(7), NOW + 2)
+            .expect("the freed seat is given to the next player");
+        assert_eq!(t.founder.roster().len(), took, "the table is full again");
+        assert!(
+            t.founder
+                .roster()
+                .seats()
+                .iter()
+                .any(|e| e.peer_id == peer(7) && e.seat == seat),
+            "and the replacement has the number the leaver gave back"
+        );
+    }
+
+    /// The founder never gives away its own seat, and an unknown peer is a no-op.
+    ///
+    /// A table whose founder released its own seat is a table with an advert and
+    /// nobody behind it. The second half matters as much: the sweep that calls
+    /// this runs every thirty seconds and will name a peer it has already
+    /// released, so a second call has to be silent rather than an error.
+    #[test]
+    fn the_founder_keeps_its_own_seat_and_an_unknown_peer_changes_nothing() {
+        let (mut t, _, _, _) = found(6, 2);
+        let mine = t.founder.roster().len();
+        let serial = t.founder.serial();
+
+        let own = t
+            .founder
+            .roster()
+            .seats()
+            .iter()
+            .find(|e| Some(e.seat) == t.founder.my_seat())
+            .map(|e| e.peer_id.clone())
+            .expect("the founder has a seat");
+
+        let out = t
+            .founder
+            .release_seat_before_the_first_hand(&own, NOW + 1)
+            .expect("asking is not an error");
+        assert!(out.is_empty(), "the founder does not give away its own seat");
+        assert_eq!(t.founder.roster().len(), mine);
+        assert_eq!(t.founder.serial(), serial, "and nothing moved");
+
+        let out = t
+            .founder
+            .release_seat_before_the_first_hand(&peer(200), NOW + 2)
+            .expect("asking about a stranger is not an error");
+        assert!(out.is_empty(), "a peer that holds no seat frees none");
+        assert_eq!(t.founder.serial(), serial);
+    }
+
     #[test]
     fn one_node_cannot_take_two_seats() {
         let (mut t, _, a, hash) = found(6, 2);

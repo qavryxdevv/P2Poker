@@ -67,9 +67,18 @@ param(
     # again — the serial moving twice, every prior ratification cleared twice,
     # and the freed seat taken by somebody new.
     #
-    # Zero is off. The leaver is the last of `-Seats` to start, and it stops on
-    # its own `--for` so `Drop` runs and the table is told, which is a player
-    # closing the client rather than one that crashed.
+    # Zero is off.
+    #
+    # **The leaver is the FIRST joiner, not the last, and that is the whole
+    # point.** The case is a seat given up *before the table fills*, and a
+    # leaver that arrives last has by definition filled it: the first attempt at
+    # this put the leaver at the end, the table filled in ten seconds, dealt at
+    # thirty, and the departure at ninety was an ordinary mid-tournament one
+    # that D-022 already handles. Use `-StaggerSeconds` with this so the table
+    # is still filling when the seat is given back.
+    #
+    # It stops on its own `--for`, so `Drop` runs and the client exits the way a
+    # player closing the window does rather than the way a crash does.
     [ValidateRange(0, 3600)][int]$LeaverSeconds = 0,
     # A seat slower than this to enter the Tox group keeps the logs, however
     # well the rest of the run went. Sixty seconds is far outside the ordinary
@@ -127,7 +136,7 @@ for ($i = 0; $i -lt $Seats; $i++) {
     # spend the last of them as the only seat at the table.
     $mine = $Seconds - [int]([Math]::Round(((Get-Date) - $t0).TotalSeconds))
     if ($mine -lt 30) { $mine = 30 }
-    $leaving = ($LeaverSeconds -gt 0 -and $i -eq $Seats - 1)
+    $leaving = ($LeaverSeconds -gt 0 -and $i -eq 1)
     if ($leaving) { $mine = $LeaverSeconds }
     $nodeArgs = @('--headless', '--autoplay', '--for', "$mine", '--profile', $profileDir)
     if ($i -eq 0) {
@@ -167,7 +176,7 @@ if ($LeaverSeconds -gt 0) {
     # The replacement, started once the leaver has gone. It is given the rest of
     # the run, and the table is one seat short in between - which is the state
     # the whole exercise is about.
-    Write-Host "==> n$($Seats - 1) leaves at $LeaverSeconds s; a replacement follows"
+    Write-Host "==> n1 leaves at $LeaverSeconds s; a replacement follows"
     $replacement = Start-Job -ArgumentList $Exe, $work, $table, $Seats, $Seconds, $LeaverSeconds -ScriptBlock {
         param($exe, $work, $table, $seats, $seconds, $leaverSeconds)
         Start-Sleep -Seconds ($leaverSeconds + 5)
