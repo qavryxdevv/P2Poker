@@ -2630,6 +2630,57 @@ defect**, because the honest reading of one run on one box is that the harness
 may be the limit rather than the client. Nine seats plays; ten needs a second
 machine before anything is claimed about it.
 
+## Ten seats is not a protocol limit: it is ten toxcore instances on one box
+
+Ten seats had failed here and, run again on a second machine over SSH, failed
+there the same way — two seats never entering the Tox group, two more taking 71
+and 84 seconds. So it was not this machine. That left two candidates: ten seats,
+or ten toxcore instances sharing one host.
+
+`tools/table-run-split.ps1` separates them. Five seats here and five on the far
+machine is **five instances per host**, well inside what both play at six, seven,
+eight and nine, so a ten-seat table that still failed would be a ten-seat
+problem.
+
+**It does not fail.**
+
+| node | saw the roster | in the group | opened | finished |
+|---|---|---|---|---|
+| here-n0 … n4 | 10 | 1.1 – 155.6 s | 5 | 4 |
+| far-n0 … n4 | 10 | 73.0 – 246.1 s | 5 | 4 (one 0) |
+
+**Ten of ten saw the whole roster, ten of ten entered the group, nine of ten
+finished hands.** Ten seats plays. What could not carry it was one machine
+running ten toxcore instances, each with its own DHT presence and its own LAN
+discovery on the same wire.
+
+Discovery here is the **public DHT lobby** for every seat — `--no-mdns` on both
+sides, because two subnets cannot find each other by multicast and letting the
+local five find themselves in a second while the far five come the long way is
+not one table under test, it is two halves. The first attempt without it had the
+far seat reach the lobby, find thirty-four players in it, and never see our
+table.
+
+### And it found the next thing: the gate was calibrated on the wrong network
+
+`S1-H`'s gate held hand 1 for `GROUP_WAIT_MS = 60_000`, a number taken from LAN
+group entry at 10–40 s. Across the boundary the same quantity is not the same
+size at all: **70, 73, 107, 143, 148, 155 and 246 seconds**, with a **91-second
+gap** between the last two. Sixty covers none of it, so the gate expired every
+time and `far-n1` — in the group at 246 s — was dealt into a hand it could not
+hear and finished none of the four it opened. Exactly what `S1-H` says happens.
+
+**A fixed deadline is wrong for one of the two cases, so the wait is no longer on
+the clock.** It is on **progress**: while seats are still arriving the table
+keeps waiting, and it gives up only once nothing new has joined for
+`GROUP_STALL_MS = 120_000` — longer than the widest gap measured — with
+`GROUP_WAIT_MAX_MS = 300_000` as a ceiling so a group that gains one member every
+ninety seconds and never completes cannot hold a table for ever. Past either, it
+deals, which is what the client did before any of this existed.
+
+On one LAN nothing changes: the group completes and the gate passes on the count,
+with no fallback fired.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that

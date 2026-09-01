@@ -422,6 +422,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // `GROUP_WAIT_MS`, after which it deals anyway — which is what this client
     // did before the gate existed. See `hand_one_may_open`.
     let mut hand_one_held_since: Option<std::time::Instant> = None;
+    // How many seats the group held when it last grew, and when that was. The
+    // wait is on progress rather than on a deadline; see `hand_one_may_open`.
+    let mut hand_one_progress: (u64, std::time::Instant) = (0, std::time::Instant::now());
     let mut hand_one_forced_said = false;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
     // Empty unless this table's game traffic rides a Tox group (D-019), and
@@ -1053,6 +1056,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 && hand_one_may_open(
                                                     &tox_sink,
                                                     &mut hand_one_held_since,
+                                                    &mut hand_one_progress,
                                                     &mut hand_one_forced_said,
                                                     &events,
                                                 )
@@ -1275,6 +1279,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         && hand_one_may_open(
                                             &tox_sink,
                                             &mut hand_one_held_since,
+                                            &mut hand_one_progress,
                                             &mut hand_one_forced_said,
                                             &events,
                                         )
@@ -2549,6 +2554,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if hand_one_may_open(
                             &tox_sink,
                             &mut hand_one_held_since,
+                            &mut hand_one_progress,
                             &mut hand_one_forced_said,
                             &events,
                         )
@@ -3667,13 +3673,31 @@ fn opening_for_hand_one(f: &Formation) -> Option<crate::table::hand::Opening> {
     crate::table::hand::Opening::from_formation(f, 1)
 }
 
-/// How long hand 1 waits for the Tox group to hold every seat.
+/// How long hand 1 waits after the group **stops filling**.
 ///
-/// Group entry runs on toxcore's LAN discovery cadence — `LAN_DISCOVERY_INTERVAL`
-/// is ten seconds (`vendor/c-toxcore/toxcore/LAN_discovery.h:23`) — and has been
-/// measured at 10 to 40 s, once at 125 s. Sixty covers the ordinary spread with
-/// room, and the table is not held longer than a player would wait.
-const GROUP_WAIT_MS: u64 = 60_000;
+/// **A fixed deadline is wrong for one of the two cases, which is why this one
+/// is not fixed.** On one LAN, group entry runs on toxcore's own cadence —
+/// `LAN_DISCOVERY_INTERVAL` is ten seconds
+/// (`vendor/c-toxcore/toxcore/LAN_discovery.h:23`) — and lands at 10 to 40 s.
+/// Across two machines on different subnets it is a different quantity
+/// altogether: measured on a ten-seat table split five and five, seats entered
+/// at **70, 73, 107, 143, 148, 155 and 246 seconds**, with a 91-second gap
+/// between the last two. A sixty-second deadline covers none of that, and the
+/// seat that arrived at 246 s was dealt into a hand it could not hear and
+/// finished none of the four it opened.
+///
+/// So the wait is on **progress**, not on the clock: while seats are still
+/// arriving the table keeps waiting, and it gives up only once nothing new has
+/// joined for this long. Two minutes is longer than the widest gap measured.
+const GROUP_STALL_MS: u64 = 120_000;
+
+/// The wait's absolute ceiling, whatever the group is doing.
+///
+/// A table cannot be held for ever by a group that gains one member every
+/// ninety seconds and never completes. Past this it deals — **which is exactly
+/// what the client did before any of this existed**, so the worst case is the
+/// old behaviour and nothing new can go wrong at the end of the wait.
+const GROUP_WAIT_MAX_MS: u64 = 300_000;
 
 /// May hand 1 open yet?
 ///
@@ -3693,14 +3717,25 @@ const GROUP_WAIT_MS: u64 = 60_000;
 async fn hand_one_may_open(
     tox: &super::toxsink::TableSink,
     held_since: &mut Option<std::time::Instant>,
+    progress: &mut (u64, std::time::Instant),
     said: &mut bool,
     events: &Events,
 ) -> bool {
     if tox.group_is_complete() {
         return true;
     }
-    let since = held_since.get_or_insert_with(std::time::Instant::now);
-    if since.elapsed() >= std::time::Duration::from_millis(GROUP_WAIT_MS) {
+    let now = std::time::Instant::now();
+    let since = *held_since.get_or_insert(now);
+
+    // Still filling? Then keep waiting, however long it has already been.
+    let (seen, _) = tox.group_seen();
+    if seen > progress.0 {
+        *progress = (seen, now);
+    }
+
+    let stalled = now.duration_since(progress.1) >= std::time::Duration::from_millis(GROUP_STALL_MS);
+    let too_long = now.duration_since(since) >= std::time::Duration::from_millis(GROUP_WAIT_MAX_MS);
+    if stalled || too_long {
         // Said once, because it means the first hand is being dealt into a group
         // that does not hold everybody and somebody is about to sit through a
         // hand they cannot see.
@@ -3709,9 +3744,9 @@ async fn hand_one_may_open(
             let _ = events
                 .send(NodeEvent::Warning({
                     let (seen, want) = tox.group_seen();
+                    let why = if too_long { "the wait's ceiling" } else { "no new seat for two minutes" };
                     format!(
-                        "the table's group held {seen} of {want} other seats after {} s; dealing anyway",
-                        GROUP_WAIT_MS / 1000
+                        "the table's group held {seen} of {want} other seats and stopped filling ({why}); dealing anyway"
                     )
                 }))
                 .await;

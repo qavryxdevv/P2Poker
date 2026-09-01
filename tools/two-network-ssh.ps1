@@ -250,10 +250,20 @@ Note "logs: $localLog and $remoteLogLocal"
 
 # The genesis hashes are the only thing that says the two really played the same
 # hand rather than two hands with the same name.
-$hereG  = ($localText  | Select-String -Pattern 'opens at genesis (\S+)' -AllMatches).Matches |
-          ForEach-Object { $_.Groups[1].Value }
-$thereG = ($remoteText | Select-String -Pattern 'opens at genesis (\S+)' -AllMatches).Matches |
-          ForEach-Object { $_.Groups[1].Value }
+#
+# **Wrapped in `@()` because a run where one end opened no hand made this throw
+# and turned a successful test into exit 1.** `Select-String` with no match
+# yields nothing, `.Matches` on nothing is `$null`, and `ForEach-Object` over
+# `$null.Groups` is *Cannot index into a null array*. Measured: a run that
+# reported `RESULT a table formed across the boundary` and then failed here,
+# which reads as a failed test to anybody who checks the exit code.
+function Get-Genesis($text) {
+    $m = @($text | Select-String -Pattern 'opens at genesis (\S+)' -AllMatches)
+    if (-not $m) { return @() }
+    @($m.Matches | ForEach-Object { $_.Groups[1].Value })
+}
+$hereG  = Get-Genesis $localText
+$thereG = Get-Genesis $remoteText
 $shared = @($hereG | Where-Object { $thereG -contains $_ })
 Note "hands here $($hereG.Count), there $($thereG.Count), at the same genesis $($shared.Count)"
 if ($shared.Count -gt 0) {
