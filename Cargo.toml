@@ -196,18 +196,21 @@ cc = "1"
 default = ["tox"]
 tox = ["dep:attohttpc", "dep:serde_json"]
 
-# **A way to make one peer disagree, so that the code which answers disagreement
+# **A way to make faults happen on purpose, so that the code which answers them
 # can be measured rather than reasoned about.**
 #
-# §6.3's freeze and its reconciliation rounds are the client's whole answer to a
-# divergence, and nothing in an honest run ever produces one — measured: the
-# boundary checkpoint agrees across `P(k)` on every hand of every run. Code that
-# cannot be made to run is code whose first execution is in front of a player.
+# Two faults so far. A **divergence**: §6.3's freeze and its reconciliation
+# rounds are the client's whole answer to one, and nothing in an honest run ever
+# produces one — the boundary checkpoint agrees across `P(k)` on every hand of
+# every run. And a **link outage**: a seated player on an unreliable connection
+# loses the line for a few seconds and gets it back, which is the ordinary real
+# failure and the one the time bank and the re-send exist for. Code that cannot
+# be made to run is code whose first execution is in front of a player.
 #
-# Off by default and **never in a release build**: the perturbation is behind
+# Off by default and **never in a release build**: every perturbation is behind
 # this feature *and* behind an environment variable, so a binary built without it
-# contains no path to a wrong state hash at all.
-divergence-harness = []
+# contains no path to any of them.
+fault-harness = []
 
 # --- only under `--features tox` -------------------------------------------
 #

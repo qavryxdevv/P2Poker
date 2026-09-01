@@ -1395,6 +1395,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // is accepted for the mesh either way: it verified,
                             // and it is worth forwarding whether or not it
                             // agreed.
+                            if link_is_down() {
+                                continue;
+                            }
                             cross_boundary_at_t47(h, &mut boundaries, &mut crossed_for);
                             let verdict: Option<gossipsub::MessageAcceptance> =
                                 match checkpoint_event(
@@ -1460,6 +1463,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
+                        // Nothing arrives while the link is down.
+                        if link_is_down() {
+                            continue;
+                        }
                         let Some(f) = table.as_mut() else { continue };
                         let now = super::node::now_unix_ms();
                         let result = if joinwire::receive_player_list(&message.data).is_ok() {
@@ -2709,6 +2716,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // future that never resolves when there is no Tox table, so this
             // branch contributes nothing to the `select!`.
             Some(item) = tox_sink.next() => {
+                // Nothing arrives while the link is down.
+                if link_is_down() {
+                    continue;
+                }
                 if let Some(h) = hand.as_mut() {
                     cross_boundary_at_t47(h, &mut boundaries, &mut crossed_for);
                     match checkpoint_event(
@@ -4307,6 +4318,61 @@ const RESEND_STAGES: u64 = 3;
 /// a decoder with no bound, and `HAND_ABORT` is the largest thing it builds.
 const TABLE_FRAME_PEEK: usize = crate::protocol::constants::HAND_ABORT_MAX;
 
+/// **A link that is down on purpose**, for the one failure that is ordinary and
+/// that nothing here had ever been made to face: a seated player on an
+/// unreliable connection loses the line for a few seconds and gets it back.
+///
+/// `P2P_POKER_LINK_DOWN_AT=<s>` and `P2P_POKER_LINK_DOWN_FOR=<s>` drop every
+/// table message this client would send and every one it would receive, for that
+/// window, measured from the first call — which is the node loop starting.
+///
+/// **What it simulates, exactly, and the limit is the point of it.** The
+/// application's messages stop in both directions while the process, the `Hand`,
+/// the `Opening`, the chain position, the keys and the transport all survive —
+/// which is what a brief outage does to a client and is emphatically *not* what
+/// killing the process does. libp2p's own pings keep answering, deliberately:
+/// that separates **did the hand recover** from **did the transport reconnect**,
+/// and the second question already has an instrument (`-DropAt`) while the first
+/// has never had one.
+///
+/// No argument, so no caller has to thread a clock through six signatures to ask
+/// it. Two locks, and the outer one is a compile-time absence: without
+/// `--features fault-harness` this is the constant `false` and the environment
+/// is never read.
+#[cfg(feature = "fault-harness")]
+fn link_is_down() -> bool {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static WINDOW: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    let window = WINDOW.get_or_init(|| {
+        let at = std::env::var("P2P_POKER_LINK_DOWN_AT")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        let dur = std::env::var("P2P_POKER_LINK_DOWN_FOR")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some((at, dur))
+    });
+    match window {
+        Some((at, dur)) => {
+            let s = start.elapsed().as_secs();
+            s >= *at && s < at.saturating_add(*dur)
+        }
+        None => false,
+    }
+}
+
+/// The constant `false`, in every build that did not ask for the harness.
+#[cfg(not(feature = "fault-harness"))]
+fn link_is_down() -> bool {
+    false
+}
+
 fn publish_hand(
     sends: Vec<crate::table::hand::Send>,
     topic: Option<&gossipsub::IdentTopic>,
@@ -4314,7 +4380,18 @@ fn publish_hand(
     said: &mut Vec<Vec<u8>>,
     tox: &super::toxsink::TableSink,
 ) {
+    let down = link_is_down();
     for crate::table::hand::Send::Broadcast(out) in sends {
+        if down {
+            // Nothing leaves. It is still put in `said`, because `said` is the
+            // re-send buffer and a message that could not go out is exactly what
+            // it exists to send later.
+            if said.len() >= 64 {
+                said.remove(0);
+            }
+            said.push(out);
+            continue;
+        }
         if tox.is_on_tox() {
             // A refusal here is a full channel, not a lost table: the driver is
             // behind, and the five-second re-send is what covers it.

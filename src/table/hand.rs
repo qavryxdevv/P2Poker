@@ -370,10 +370,10 @@ impl Opening {
 /// first execute in front of a player.
 ///
 /// **Two locks, and the outer one is a compile-time absence.** A build without
-/// `--features divergence-harness` contains no path to a wrong hash — this
+/// `--features fault-harness` contains no path to a wrong hash — this
 /// function is the identity and the environment variable is not read. That is
 /// what makes it safe to have at all.
-#[cfg(feature = "divergence-harness")]
+#[cfg(feature = "fault-harness")]
 fn diverge_if_asked(state_hash: Hash, hand_id: u64) -> Hash {
     let Ok(at) = std::env::var("P2P_POKER_DIVERGE_AT_HAND") else {
         return state_hash;
@@ -387,7 +387,7 @@ fn diverge_if_asked(state_hash: Hash, hand_id: u64) -> Hash {
 }
 
 /// The identity, in every build that did not ask for the harness.
-#[cfg(not(feature = "divergence-harness"))]
+#[cfg(not(feature = "fault-harness"))]
 fn diverge_if_asked(state_hash: Hash, _hand_id: u64) -> Hash {
     state_hash
 }
