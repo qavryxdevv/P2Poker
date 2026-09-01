@@ -95,13 +95,26 @@ param(
     # `-DivergeAt <hand>` makes n1 compute a WRONG boundary-checkpoint value for
     # that hand, so that section 6.3's answer to a divergence can be measured
     # rather than reasoned about. It needs a binary built with
-    # `--features divergence-harness`; without it the environment variable is
+    # `--features fault-harness`; without it the environment variable is
     # not read and the run is an ordinary one.
     [ValidateRange(0, 100000)][int]$DivergeAt = 0,
     # Which node tells the lie. Its own log is where the OTHER nodes' complaints
     # are not: a peer that diverges does not know it, which is the whole reason
     # everybody else compares.
     [ValidateRange(0, 32)][int]$DivergeNode = 1,
+    # `-LinkDownAt <s> -LinkDownFor <s>` takes one node's LINE away without
+    # killing it. The process, its Hand, its chain position and its keys all
+    # survive; only the table messages stop, in both directions.
+    #
+    # This is a different test from `-DropAt`, which kills the process, and the
+    # difference is the whole question: after a brief outage a client needs only
+    # the messages it missed, while after a restart it has lost the state as
+    # well. A test where both fail at once cannot say which one you fixed.
+    #
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateRange(0, 100000)][int]$LinkDownAt = 0,
+    [ValidateRange(0, 3600)][int]$LinkDownFor = 15,
+    [ValidateRange(0, 32)][int]$LinkDownNode = 1,
     [ValidateRange(0, 3600)][int]$DropAt = 0,
     [ValidateRange(0, 600)][int]$DropFor = 20,
     # A seat slower than this to enter the Tox group keeps the logs, however
@@ -174,9 +187,14 @@ for ($i = 0; $i -lt $Seats; $i++) {
     }
 
     $diverge = if ($DivergeAt -gt 0 -and $i -eq $DivergeNode) { $DivergeAt } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge)
+    $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor)
         if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
+        if ($downAt -gt 0) {
+            $env:P2P_POKER_LINK_DOWN_AT = "$downAt"
+            $env:P2P_POKER_LINK_DOWN_FOR = "$downFor"
+        }
         $start = Get-Date
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
         & $exe @nodeArgs 2>&1 | ForEach-Object {
@@ -226,7 +244,11 @@ if ($LeaverSeconds -gt 0) {
 
 if ($DivergeAt -gt 0) {
     Write-Host "==> n$DivergeNode will hold a wrong end-of-hand state for hand $DivergeAt"
-    Write-Host "    (needs a binary built with --features divergence-harness)"
+    Write-Host "    (needs a binary built with --features fault-harness)"
+}
+if ($LinkDownAt -gt 0) {
+    Write-Host "==> n$LinkDownNode loses its LINE at $LinkDownAt s for $LinkDownFor s; the process lives on"
+    Write-Host "    (needs a binary built with --features fault-harness)"
 }
 if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
     Write-Host "==> n1 drops at $DropAt s and returns $DropFor s later, same profile"
