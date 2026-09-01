@@ -1922,7 +1922,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // never triggered.
                                 let mut sent = 0usize;
                                 let mut failed: Option<String> = None;
-                                for bytes in f.say_again() {
+                                for bytes in f.say_again(super::node::now_unix_ms()) {
                                     match swarm
                                         .behaviour_mut()
                                         .gossipsub

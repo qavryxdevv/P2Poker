@@ -383,10 +383,40 @@ impl Formation {
     ///
     /// The list first and the ratification second, because a ratification names
     /// the serial of a list its receiver may not have yet.
-    pub fn say_again(&self) -> Vec<Vec<u8>> {
+    /// **The list is signed again, not repeated.** `S1-P`: `publish` hashes the
+    /// message content for its id and holds it in a duplicate cache for 120
+    /// seconds, so republished bytes are refused **on this side** for exactly
+    /// the window a peer arriving late needs them in — and after that window the
+    /// receiver refuses them instead, `on_player_list` dropping a list older
+    /// than `LIST_MAX_AGE_MS`. Measured before this: `said 0 message(s) again,
+    /// and Duplicate`, on every node of a run, thirty-two times.
+    ///
+    /// Only a founder can do it — a `PLAYER_LIST` is signed under the table key
+    /// — and only for the list. **A ratification must arrive verbatim**:
+    /// `emitted_at_unix_ms` is inside the body `event_hash` covers, `session_id`
+    /// is computed over those hashes, and a re-signed `TABLE_READY` would give
+    /// its receiver a different session identity from everybody else and make
+    /// `take_ratification` report an honest seat as `RatifiedTwice`. So the
+    /// ratification is still repeated as-is, still refused inside the window,
+    /// and what carries it instead is the wire decision `S1-P` leaves open.
+    pub fn say_again(&self, now_ms: u64) -> Vec<Vec<u8>> {
         let mut out = Vec::with_capacity(2);
-        if let Some(l) = &self.said.list {
-            out.push(l.clone());
+        match (&self.founder, self.serial > 0) {
+            (Some(f), true) => {
+                let list = PlayerList {
+                    roster: self.roster.seats().to_vec(),
+                    table_params_hash: self.under.params,
+                    list_serial: self.serial,
+                };
+                if let Ok(bytes) = joinwire::publish_player_list(&list, &f.key, now_ms) {
+                    out.push(bytes);
+                }
+            }
+            _ => {
+                if let Some(l) = &self.said.list {
+                    out.push(l.clone());
+                }
+            }
         }
         if let Some(r) = &self.said.ready {
             out.push(r.clone());
@@ -1475,6 +1505,80 @@ mod tests {
     /// The four things that have to be true, and each of them was false:
     /// the seat leaves the roster, the serial moves so every prior ratification
     /// is void, a fresh list says so, and somebody else can take the number.
+    /// `S1-P`: the repeat has to be **new bytes**, or GossipSub will not carry
+    /// it.
+    ///
+    /// `publish` takes its message id from the content and holds it for 120
+    /// seconds, so a byte-identical repeat is refused on the sender's side for
+    /// the whole window a late-arriving peer needs it in. Measured before the
+    /// fix, on every node of a run: `said 0 message(s) again, and Duplicate`.
+    ///
+    /// The assertion is on the **bytes**, not on the content: it is the bytes
+    /// GossipSub hashes, and a version of this that compared the decoded rosters
+    /// would pass while the mechanism stayed dead.
+    #[test]
+    fn a_founder_signs_the_roster_again_rather_than_repeating_it() {
+        let (mut t, _, a, hash) = found(6, 2);
+        let table_id = t.founder.table_id();
+        let (mut joiner, req) = Formation::join(
+            key(2),
+            a.clone(),
+            hash,
+            table_id,
+            peer(2),
+            "joiner".into(),
+            1_000,
+            None,
+            None,
+            [2u8; 32],
+            NOW,
+            None,
+        )
+        .unwrap();
+        let out = t
+            .founder
+            .on_join_request(&req, &peer(2), NOW)
+            .expect("the seat is given");
+        for send in &out {
+            match send {
+                Send::Reply(b) => {
+                    let _ = joiner.on_join_answer(b, NOW);
+                }
+                Send::Broadcast(b) => {
+                    let _ = joiner.on_player_list(b, NOW);
+                }
+            }
+        }
+
+        let first = t.founder.say_again(NOW + 1);
+        let again = t.founder.say_again(NOW + 2);
+        let list_one = first.first().expect("a founder says the roster");
+        let list_two = again.first().expect("and says it again");
+        assert!(
+            joinwire::receive_player_list(list_one).is_ok()
+                && joinwire::receive_player_list(list_two).is_ok(),
+            "both are lists"
+        );
+        assert_ne!(
+            list_one, list_two,
+            "signed again at the moment of saying, so GossipSub sees a message it has not carried"
+        );
+
+        // And a seat that is not the founder cannot do this: a `PLAYER_LIST` is
+        // signed under the table key. Its repeat is the stored bytes, which is
+        // why `S1-P` stays open for the ratification half.
+        let joiner_says = joiner.say_again(NOW + 3);
+        assert!(
+            !joiner_says.is_empty(),
+            "the joiner has something to repeat: it took the roster and ratified it"
+        );
+        assert_eq!(
+            joiner.say_again(NOW + 4),
+            joiner_says,
+            "a seat with no table key repeats what it has, byte for byte"
+        );
+    }
+
     #[test]
     fn a_seat_given_back_before_the_first_hand_can_be_taken_by_somebody_else() {
         let (mut t, _, a, hash) = found(6, 2);
