@@ -183,7 +183,17 @@ pub fn open(
 ///   vote's own signed envelope — a binding the voter itself signed, which is
 ///   stronger than anything the receiver's own cursor could offer.
 ///
-/// No third caller may be added without a clause of its own.
+/// * A **stale checkpoint-8 `STATE_HASH`** of a hand this receiver has already
+///   completed (§4.9, §4.0 step 10b). It names a chain position this receiver
+///   has left — that is the whole of what makes it stale — so the positional
+///   check is the one thing it must not face, and it is not applied: step 10b
+///   says such an event *"is not dropped for arriving late"*. What it does is
+///   add its sender to the readmission set when its value **agrees**, and
+///   nothing else: it is not applied, enters no `stage_hash` and completes no
+///   stage. The comparison is against this receiver's own retained value, so a
+///   forged one is refused by the comparison and a replayed one is idempotent.
+///
+/// No fourth caller may be added without a clause of its own.
 pub fn open_in_hand(
     bytes: &[u8],
     cap: usize,

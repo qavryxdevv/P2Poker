@@ -421,6 +421,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // **Hand 1 waits for the Tox group to hold every seat**, bounded by
     // `GROUP_WAIT_MS`, after which it deals anyway — which is what this client
     // did before the gate existed. See `hand_one_may_open`.
+    // **The boundary checkpoint's retained values, and the readmission set they
+    // write** (§4.9). `checkpoints` is this peer's own checkpoint-8 state hash
+    // per completed hand; `readmitted` is `A`, read and cleared at the next hand
+    // init and nowhere else.
+    //
+    // Held here rather than in `Hand`, because both outlive the hand they are
+    // about: §4.9 admits a checkpoint-8 `STATE_HASH` of hand `k` until
+    // `TERMINAL(k+1)` is fixed, and by then hand `k+1` is live.
+    // The retained value is `(state_hash, P(k))`. `P(k)` is kept **with** it
+    // because the readmission set is for a seat that would otherwise be shut
+    // out, and whether a seat would be is a question about the hand the
+    // checkpoint is of — which, by the time one arrives, is not the live hand
+    // and cannot be asked of it.
+    let mut checkpoints: std::collections::HashMap<u64, ([u8; 32], Vec<u8>)> =
+        std::collections::HashMap::new();
+    let mut readmitted: Vec<u8> = Vec::new();
     let mut hand_one_held_since: Option<std::time::Instant> = None;
     // How many seats the group held when it last grew, and when that was. The
     // wait is on progress rather than on a deadline; see `hand_one_may_open`.
@@ -1345,8 +1361,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // defined above the loop and this is one of its two call
                             // sites; the other is the Tox group's. See there for why it
                             // is a macro, and for what the verdict is.
+                            // **A checkpoint-8 `STATE_HASH` of a hand this
+                            // client has finished is taken here and not by the
+                            // hand**, which owns only its own stages and would
+                            // refuse it for naming a position it has left. It
+                            // is accepted for the mesh either way: it verified,
+                            // and it is worth forwarding whether or not it
+                            // agreed.
                             let verdict: Option<gossipsub::MessageAcceptance> =
-                                hand_event!(h, &message.data);
+                                if checkpoint_event(
+                                    &message.data,
+                                    h,
+                                    &checkpoints,
+                                    &mut readmitted,
+                                    &events,
+                                )
+                                .await
+                                {
+                                    Some(gossipsub::MessageAcceptance::Accept)
+                                } else {
+                                    hand_event!(h, &message.data)
+                                };
                             // The single exit. A hand event never leaves this
                             // branch without the mesh being told what became of
                             // it.
@@ -2587,7 +2622,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // branch contributes nothing to the `select!`.
             Some(item) = tox_sink.next() => {
                 if let Some(h) = hand.as_mut() {
-                    let _ = hand_event!(h, &item.bytes);
+                    if !checkpoint_event(&item.bytes, h, &checkpoints, &mut readmitted, &events)
+                        .await
+                    {
+                        let _ = hand_event!(h, &item.bytes);
+                    }
                 }
             }
 
@@ -2955,6 +2994,36 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // required sets, allowances and strike counts after every hand
                 // are two lines a player has to read past to find out what
                 // happened to theirs.
+                // **This peer's own checkpoint-8 `STATE_HASH`, published once
+                // the hand it is about has settled** (§4.9, §6.2 row 8). It is
+                // the value every other seat compares against, and it is the
+                // door back for a seat that missed this hand: §4.9's
+                // readmission set is written by exactly this event agreeing.
+                if let Some(h) = hand.as_ref() {
+                    if let Some((state, _)) = h.checkpoint8() {
+                        checkpoints.insert(h.hand_id(), (state, h.participants()));
+                        match h.state_hash_event(&app_key, super::node::now_unix_ms()) {
+                            Ok(Some(bytes)) => {
+                                publish_hand(
+                                    vec![crate::table::hand::Send::Broadcast(bytes)],
+                                    table_topic.as_ref(),
+                                    &mut swarm,
+                                    &mut said,
+                                    &tox_sink,
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "the boundary checkpoint would not seal: {e}"
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
                 let next = hand.as_ref().and_then(|h| h.next_hand());
                 if let (Some(h), Some(o)) = (hand.as_ref(), next.as_ref()) {
                     if o.required != h.required_now() {
@@ -2992,7 +3061,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     said.clear();
                 }
                 match next {
-                    Some(opening) => {
+                    Some(mut opening) => {
+                        // **Read here and cleared here, which is the whole of
+                        // `A`'s life** (§4.9). A set read anywhere else is a set
+                        // two peers can come to disagree about.
+                        opening.readmitted = std::mem::take(&mut readmitted);
+                        if !opening.readmitted.is_empty() {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "seat(s) {:?} are heard again at this hand, and dealt in at the next",
+                                    opening.readmitted
+                                )))
+                                .await;
+                        }
                         begin_hand(
                             opening,
                             &app_key,
@@ -3963,6 +4044,96 @@ fn short_hash(h: &[u8; 32]) -> String {
     h[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A checkpoint-8 `STATE_HASH` of a hand this receiver has **completed**, and
+/// what it is worth (§4.9, §4.0 step 10b).
+///
+/// Returns whether the event was one — a `false` means the caller should pass
+/// the bytes on to the hand as usual.
+///
+/// **It is not applied, chains nothing and completes no stage.** Step 10b:
+/// such an event *"is not dropped for arriving late"*, and the one thing it
+/// does is add its sender to the readmission set `A` **when its value agrees
+/// with this receiver's own retained value**. That is `S1-O`'s door: a seat
+/// outside `P(k)` is not dealt into `k+1` (§4.4) and cannot sign its way back
+/// in, and this is how it signs.
+///
+/// **Agreement is the whole of the check, and it is enough.** A forged value is
+/// refused by the comparison; a replayed one is idempotent, because entering a
+/// set twice is entering it once. The signature, the table and the hand are all
+/// verified by `open_in_hand`, which relaxes only the positional check — and
+/// the position is exactly what makes this event stale.
+///
+/// A **disagreeing** value is a divergence and §6.3 is what answers it. That is
+/// not built, so it is said out loud and nothing else: saying nothing would be
+/// the silent divergence §6.1 exists to prevent.
+async fn checkpoint_event(
+    bytes: &[u8],
+    h: &crate::table::hand::Hand,
+    checkpoints: &std::collections::HashMap<u64, ([u8; 32], Vec<u8>)>,
+    readmitted: &mut Vec<u8>,
+    events: &Events,
+) -> bool {
+    use crate::table::checkwire;
+
+    let Ok((kind, hand_id, sequence)) =
+        crate::net::chained::peek(bytes, TABLE_FRAME_PEEK)
+    else {
+        return false;
+    };
+    if kind != crate::protocol::messages::EventType::StateHash {
+        return false;
+    }
+    // Only for a hand this receiver has finished. One that is live belongs to
+    // the hand, which owns its own stages.
+    let Some((mine, played)) = checkpoints.get(&hand_id) else {
+        return false;
+    };
+    if checkwire::round_of(sequence).map(|(_, k)| k) != Some(checkwire::Kind::Hash) {
+        return false;
+    }
+
+    let Ok(opened) = crate::net::chained::open_in_hand(
+        bytes,
+        TABLE_FRAME_PEEK,
+        crate::protocol::messages::EventType::StateHash,
+        &h.table_id(),
+        hand_id,
+    ) else {
+        return true;
+    };
+    let Ok(body) = crate::net::chained::payload::<checkwire::StateHash>(&opened, 512) else {
+        return true;
+    };
+    let Some(seat) = h.seat_of_key(&opened.sender) else {
+        return true;
+    };
+
+    if body.state_hash == *mine {
+        // **Only a seat that would otherwise be shut out.** `A` widens the
+        // accepted emitter set, and a seat already in `P(k)` is already in it —
+        // adding it changes nothing and says something false in the log.
+        //
+        // `P(k)` is the retained one, of the hand this checkpoint is **of**.
+        // Asking the live hand instead reads `signed` on a hand that has barely
+        // started, which is empty or nearly so, and every seat passes a filter
+        // like that. Measured: with the live hand's set, seats 2 and 3 were
+        // announced as readmitted after all thirty-seven hands of a run in
+        // which neither ever missed one.
+        let in_p = played.contains(&seat);
+        if !in_p && !readmitted.contains(&seat) {
+            readmitted.push(seat);
+            readmitted.sort_unstable();
+        }
+    } else {
+        let _ = events
+            .send(NodeEvent::Warning(format!(
+                "seat {seat} holds a different end-of-hand state for hand {hand_id}: this is a divergence and section 6.3 is not built"
+            )))
+            .await;
+    }
+    true
+}
+
 /// The first hand's opening, once the roster has ratified.
 ///
 /// A named function rather than the expression inline, because both roads into
@@ -3971,6 +4142,7 @@ fn short_hash(h: &[u8; 32]) -> String {
 fn opening_for_hand_one(f: &Formation) -> Option<crate::table::hand::Opening> {
     crate::table::hand::Opening::from_formation(f, 1)
 }
+
 
 /// How long a seated peer may answer nothing before the founder gives its seat
 /// back, and **only before the first hand**.
