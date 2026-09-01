@@ -469,6 +469,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut adrift_said = false;
     // Said once: this client is on a TCP relay and the group is not filling.
     let mut udp_warned = false;
+    // How many §6.3 disputes this client has verified. Reported with the freeze,
+    // because "none arrived" and "several arrived and agreed with me" are
+    // different states and were the same silence.
+    let mut disputes_seen = 0usize;
     let mut readmitted: Vec<u8> = Vec::new();
     let mut hand_one_held_since: Option<std::time::Instant> = None;
     // How many seats the group held when it last grew, and when that was. The
@@ -1431,6 +1435,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 )
                                 .await
                                 {
+                                    // A dispute is unchained and out of stage,
+                                    // so the hand would refuse it; it is taken
+                                    // here instead. Before the freeze test,
+                                    // because a dispute is one of the things
+                                    // that may **cause** the freeze.
+                                    None if dispute_event(
+                                        &message.data,
+                                        h,
+                                        &mut boundaries,
+                                        &mut frozen,
+                                        &mut disputes_seen,
+                                        &events,
+                                    )
+                                    .await =>
+                                    {
+                                        Some(gossipsub::MessageAcceptance::Accept)
+                                    }
                                     // **§6.3 step 1: no hand event is accepted
                                     // while frozen.** Ignored rather than
                                     // rejected — the sender is not at fault and
@@ -2753,10 +2774,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await
                     {
-                        // Not a checkpoint event: the hand's own, and it is
-                        // not applied while §6.3 step 1's freeze is latched.
+                        // Not a checkpoint event: a dispute, or the hand's
+                        // own — and the hand's own is not applied while §6.3
+                        // step 1's freeze is latched.
                         None => {
-                            if frozen.is_none() {
+                            if !dispute_event(
+                                &item.bytes,
+                                h,
+                                &mut boundaries,
+                                &mut frozen,
+                                &mut disputes_seen,
+                                &events,
+                            )
+                            .await
+                                && frozen.is_none()
+                            {
                                 let _ = hand_event!(h, &item.bytes);
                             }
                         }
@@ -3172,7 +3204,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         frozen_said = true;
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "no further hand is dealt: this peer is frozen at hand {k}'s checkpoint and section 6.3 releases that by a reconciliation round alone"
+                                "no further hand is dealt: this peer is frozen at hand {k}'s checkpoint and section 6.3 releases that by a reconciliation round alone. {disputes_seen} dispute(s) verified from other seats; W is {:?}",
+                                boundaries.contradicted(k)
                             )))
                             .await;
                     }
@@ -4657,6 +4690,103 @@ async fn publish_and_hear(
     }
 }
 
+/// §6.3 step 2, on the receiving side: a dispute is a **carrier**, and what
+/// carries weight is what it contains.
+///
+/// **This is the half that makes the procedure reachable.** §6.3: *"a recipient
+/// whose own copies all agreed did not observe the divergence and would
+/// otherwise take no part in the procedure; the dispute is what puts a second,
+/// independently verifying value at that checkpoint in front of it."* Without
+/// it, a table where only two seats saw the mismatch can never satisfy §4.9's
+/// floor of two on the reconciliation round, and the freeze is released by
+/// nothing. This client emitted disputes and admitted none.
+///
+/// **The evidence is compared, never applied.** It occupies no slot, enters no
+/// `stage_hash` and completes no stage — a `DISPUTE` is unchained and *"nothing
+/// carried inside one ever becomes a chained event by being carried"*. So it
+/// does not go through `checkpoint_event`, which would enter it into the stage.
+///
+/// **And it is an observation, not an instruction.** §6.3 calls the embedded
+/// `STATE_HASH` *"an observation for step 1's purposes"*, and step 1's trigger
+/// is observing **two distinct** values at one checkpoint. A dispute carrying a
+/// value equal to this peer's own is therefore one value, not two, and changes
+/// nothing — which is also what stops a dispute being a way to freeze a table
+/// somebody else is playing.
+///
+/// Returns whether the bytes were a dispute at all.
+async fn dispute_event(
+    bytes: &[u8],
+    h: &crate::table::hand::Hand,
+    boundaries: &mut crate::table::boundary::Boundaries,
+    frozen: &mut Option<(u64, u64)>,
+    seen: &mut usize,
+    events: &Events,
+) -> bool {
+    use crate::table::dispute;
+
+    let table_id = h.table_id();
+    let Ok((body, sender)) = dispute::receive(bytes, &table_id) else {
+        return false;
+    };
+    // **Counted before anything else is decided.** A dispute that arrives and
+    // adds nothing — because this peer had already seen the divergence
+    // directly, which is the ordinary case at a small table — is silent, and
+    // was indistinguishable from a dispute that never arrived. Measured: four
+    // disputes went out and not one line said any had been read.
+    *seen += 1;
+    // `kind = 3` is D-014's cheat evidence and is not answered here; `kind = 2`
+    // never reaches this point, `receive` having refused it.
+    if body.kind != dispute::KIND_STATE_DIVERGENCE {
+        return true;
+    }
+    let hand_id = body.hand_id;
+    let Some(mine) = boundaries.own_value(hand_id) else {
+        // A hand whose boundary this peer no longer holds. Verified and
+        // relayed, and nothing to compare it against.
+        return true;
+    };
+    let Some(evidence) = body.evidence.first() else {
+        return true;
+    };
+    // Opened against the hand it names, exactly as a checkpoint-8 copy is, and
+    // by the same function — the signature and the table do all the work, and
+    // the position is what makes it stale rather than wrong.
+    let Ok(opened) = crate::net::chained::open_in_hand(
+        evidence,
+        TABLE_FRAME_PEEK,
+        crate::protocol::messages::EventType::StateHash,
+        &table_id,
+        hand_id,
+    ) else {
+        return true;
+    };
+    let Ok(carried) =
+        crate::net::chained::payload::<crate::table::checkwire::StateHash>(&opened, 512)
+    else {
+        return true;
+    };
+    if carried.state_hash == mine {
+        return true;
+    }
+    // Two distinct values at one checkpoint, one of them this peer's own.
+    let Some(seat) = h.seat_of_key(&opened.sender) else {
+        return true;
+    };
+    let fresh = boundaries.contradiction_from_a_dispute(hand_id, seat);
+    if frozen.is_none() {
+        *frozen = Some((hand_id, opened.envelope.sequence));
+    }
+    if fresh {
+        let _ = events
+            .send(NodeEvent::Warning(format!(
+                "a dispute from {} carries seat {seat}'s end-of-hand state for hand {hand_id}, and it differs from this client's own: FROZEN at section 6.3 step 1, and seat {seat} joins the contradiction set",
+                short_hash(&sender)
+            )))
+            .await;
+    }
+    true
+}
+
 /// §6.3 step 2, the moment this peer freezes: **declare, with the evidence**.
 ///
 /// The dispute carries this peer's own `STATE_HASH` event whole, so a recipient
@@ -4674,22 +4804,48 @@ async fn dispute_answer(
     boundaries: &crate::table::boundary::Boundaries,
     app_key: &ed25519_dalek::SigningKey,
     h: &crate::table::hand::Hand,
+    events: &Events,
 ) -> Vec<u8> {
     let Some(own) = boundaries.own_event(hand_id).map(|b| b.to_vec()) else {
         // A peer that never published its own copy has no evidence to carry,
         // and a dispute without evidence is the accusation §6.3 deliberately
         // does not send.
+        let _ = events
+            .send(NodeEvent::Warning(format!(
+                "no dispute is sent for hand {hand_id}: this client never published its own checkpoint copy, so it has no evidence to carry"
+            )))
+            .await;
         return Vec::new();
     };
-    crate::table::dispute::publish_state_divergence(
+    match crate::table::dispute::publish_state_divergence(
         h.table_id(),
         hand_id,
         at_sequence,
         own,
         app_key,
         super::node::now_unix_ms(),
-    )
-    .unwrap_or_default()
+    ) {
+        Some(bytes) => {
+            // **Said, because a dispute that is not sent and a dispute that is
+            // sent and not heard look the same from here.** §6.3 step 2 is what
+            // makes the reconciliation floor reachable at a table where only
+            // two seats saw the mismatch, so whether it left is worth one line.
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "section 6.3 step 2: a dispute for hand {hand_id} goes out, carrying this client's own checkpoint copy as evidence"
+                )))
+                .await;
+            bytes
+        }
+        None => {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "the dispute for hand {hand_id} would not seal, so section 6.3 step 2 did not happen here"
+                )))
+                .await;
+            Vec::new()
+        }
+    }
 }
 
 /// §6.3 step 3: open the reconciliation round when it **can** be opened, and put
@@ -4900,7 +5056,9 @@ async fn checkpoint_event(
                 )))
                 .await;
             if !already {
-                return Some(dispute_answer(hand_id, sequence, boundaries, app_key, h).await);
+                return Some(
+                    dispute_answer(hand_id, sequence, boundaries, app_key, h, events).await,
+                );
             }
         }
         Took::Equivocation { .. } => {

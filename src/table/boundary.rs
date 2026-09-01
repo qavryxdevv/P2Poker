@@ -576,6 +576,20 @@ impl Boundaries {
         true
     }
 
+    /// This peer's own end-of-hand value for hand `k`, for comparing against a
+    /// value that arrives inside something else.
+    ///
+    /// §6.3 step 2's dispute carries another peer's `STATE_HASH` as evidence,
+    /// and that copy must be **compared without being applied**: it occupies no
+    /// slot, enters no `stage_hash` and completes no stage, because *"a
+    /// `DISPUTE` is unchained and nothing carried inside one ever becomes a
+    /// chained event by being carried"*. So it cannot go through
+    /// [`on_state_hash`](Self::on_state_hash), which would enter it, and the
+    /// caller needs the value to compare against instead.
+    pub fn own_value(&self, hand_id: u64) -> Option<Hash> {
+        self.open.get(&hand_id).map(|b| b.own)
+    }
+
     /// `W`, this peer's contradiction set for hand `k`.
     pub fn contradicted(&self, hand_id: u64) -> Vec<SeatIdx> {
         self.open
