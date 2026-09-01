@@ -2510,6 +2510,77 @@ which is precisely the peer that is one or two stages behind. What was wrong was
 the sentence, and a reader who believed it would either mis-measure the bandwidth
 or "correct" the code and delete a working safety net.
 
+## Hand 1 now waits for the group, and getting there found two more defects
+
+`S1-H` was *a seat can ratify and open hand 1 before it is in the Tox group, and
+then it hears nothing and cannot be caught up*. The gate is written: the founder
+and every joiner hold `HAND_INIT` until the group holds every other seat, bounded
+by `GROUP_WAIT_MS = 60_000`, after which they deal anyway — **which is exactly
+what the client did before the gate existed**, so the worst case is unchanged.
+
+**Measured, three runs, six seats:** every node reports the gate passing on the
+count rather than the fallback, hand 1 opens at 20–36 s — right after the last
+seat enters the group — and across all three runs there are **no deaf seats and
+no forced gates**. Before it, one run in three had a seat that opened hands and
+finished none.
+
+Time to hand 1 is now bounded by toxcore's group entry (10–40 s) rather than by
+gossipsub. That is the honest trade and it is the right one: a table that starts
+in seven seconds without one of its players is not faster, it is broken.
+
+### The first defect: the founder's kick has never worked
+
+The gate was written on `peer_for`, which scans a group's peer ids for one whose
+public key equals a roster key. **That comparison can never be true.**
+`tox.h:3823` says `tox_group_peer_get_public_key` returns the peer's **group**
+public key — *"permanently tied to a particular peer … the only way to reliably
+identify the same peer across client restarts"* — which is a per-group identity,
+not the long-term friend key the roster holds and `tox_friend_add_norequest` uses.
+
+So the gate never saw a complete group: **six seats all in by 20.7 s and hand 1
+held to the 60-second fallback, three runs out of three.**
+
+And the same call is what `Command::Unseated` uses to kick. **D-019's kick has
+therefore never once happened** — `peer_for` returns `None`, `tox.kick` is never
+reached, and a player removed from the roster stays in the group. Filed as
+`S1-I`, because fixing it needs a mapping the API does not give away: the only
+in-band signal is the peer id on an inbound packet, which `tox::table`
+deliberately discards as *"not evidence about"* a signing key. That reasoning is
+right about evidence and is the wrong tool for an operational mapping.
+
+The gate itself does not need the mapping. `Tox::peer_count` counts peer ids that
+resolve, leaves out this client's own via `tox_group_self_get_peer_id`, and
+compares against the roster length — sound because the group is PRIVATE and the
+founder is its sole admin, so the only way in is an invitation to a roster key.
+There is no `tox_group_peer_count` in this toxcore: the NGC API has none and the
+one in `tox.h` belongs to the old conference API.
+
+### The second: every client had itself on its own roster
+
+With the count in place the founder's gate passed and **every joiner still ran to
+the fallback**. The numbers said why, once the warning carried them:
+
+```
+n0  the table's group held 4 of 5 other seats after 60 s
+n1  the table's group held 4 of 6 other seats after 60 s
+n2  the table's group held 4 of 6 other seats after 60 s
+```
+
+**Five for the founder and six for every joiner, at a six-seat table.**
+`Setup::roster` is documented *"this client's excepted"* and the caller does not
+keep to it: `net::run::seat_on_tox` tells the driver about every seat the
+formation holds, its own included. A joiner was therefore waiting for a sixth
+other seat that is itself, and could never stop waiting.
+
+Guarded in the driver rather than at the caller, because the driver is the one
+place that owns the list and a second caller would make the same mistake. It also
+means the client had been trying to add **itself** as a Tox friend on every
+roster update.
+
+**None of this was visible until the gate made it matter.** A roster one too long
+costs nothing while nothing counts it, and a key comparison that never matches
+costs nothing while the only caller is a kick nobody watches.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that

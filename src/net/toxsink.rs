@@ -234,6 +234,48 @@ impl TableSink {
         }
     }
 
+    /// Whether the table's Tox group holds every other seat on the roster.
+    ///
+    /// **`true` when this build has no Tox, and that is the point.** The gate
+    /// this answers is *"may hand 1 open?"*, and on a build where the hand does
+    /// not ride a group there is nothing to wait for. A gate that answered
+    /// `false` there would stop a table that has no reason to be stopped.
+    pub fn group_is_complete(&self) -> bool {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().complete.load(Ordering::Relaxed),
+                None => true,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            true
+        }
+    }
+
+    /// What the driver last counted in the group, and what it wanted.
+    ///
+    /// `(0, 0)` on a build with no Tox, where there is no group to count.
+    pub fn group_seen(&self) -> (u64, u64) {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => (
+                    t.trouble().in_group.load(Ordering::Relaxed),
+                    t.trouble().want_in_group.load(Ordering::Relaxed),
+                ),
+                None => (0, 0),
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            (0, 0)
+        }
+    }
+
     /// Invitations into the table's group that toxcore refused.
     ///
     /// **Separate from `trouble`, because it is a different condition with a

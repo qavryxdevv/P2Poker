@@ -553,6 +553,37 @@ impl Tox {
     }
 
     /// A peer's public key, for matching a group member against the roster.
+    /// How far a peer-id scan goes.
+    ///
+    /// Peer ids are small and dense and a table is at most ten seats, so this
+    /// is generous. It is a constant rather than a literal because two places
+    /// scan and a scan that stopped short in one of them would under-count
+    /// silently.
+    const PEER_SCAN: u32 = 64;
+
+    /// How many other peers this client can see in the group.
+    ///
+    /// **A count, not a set, and that distinction is forced by the API.**
+    /// `tox_group_peer_get_public_key` returns the peer's **group** public key
+    /// (`tox.h:3823`), which is a per-group identity and is *not* the friend
+    /// key a roster holds — so a scan cannot say *which* seat it is looking at,
+    /// only that somebody is there. This version of toxcore has no
+    /// `tox_group_peer_count`; the NGC API offers none, and the one in `tox.h`
+    /// belongs to the old conference API.
+    ///
+    /// So this scans peer ids and counts the ones that resolve, leaving out
+    /// this client's own. Ten seats at most and a scan is cheap; it is called
+    /// once every five seconds.
+    pub fn peer_count(&self, group: u32) -> usize {
+        let mut err: c_int = 0;
+        // SAFETY: `group` is a live group number; the error out-pointer is valid.
+        let me = unsafe { sys::tox_group_self_get_peer_id(self.ptr, group, &mut err) };
+        let me = if err == 0 { Some(me) } else { None };
+        (0..Self::PEER_SCAN)
+            .filter(|p| Some(*p) != me && self.peer_key(group, *p).is_ok())
+            .count()
+    }
+
     pub fn peer_key(&self, group: u32, peer: u32) -> Result<[u8; 32], Failed> {
         let mut out = [0u8; 32];
         let mut err: c_int = 0;

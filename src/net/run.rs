@@ -418,6 +418,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // one again, on a table that has already played it, with stacks from the
     // roster rather than from the chain.
     let mut ever_dealt = false;
+    // **Hand 1 waits for the Tox group to hold every seat**, bounded by
+    // `GROUP_WAIT_MS`, after which it deals anyway — which is what this client
+    // did before the gate existed. See `hand_one_may_open`.
+    let mut hand_one_held_since: Option<std::time::Instant> = None;
+    let mut hand_one_forced_said = false;
     let mut table_topic: Option<gossipsub::IdentTopic> = None;
     // Empty unless this table's game traffic rides a Tox group (D-019), and
     // empty for ever in a build without `--features tox`. The lobby, the join
@@ -1044,7 +1049,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // what a three-seat run showed:
                                             // the table formed and one seat's
                                             // HAND_INIT never came.
-                                            if !ever_dealt {
+                                            if !ever_dealt
+                                                && hand_one_may_open(
+                                                    &tox_sink,
+                                                    &mut hand_one_held_since,
+                                                    &mut hand_one_forced_said,
+                                                    &events,
+                                                )
+                                                .await
+                                            {
                                                 if let Some(o) = opening_for_hand_one(f) {
                                                     ever_dealt = true;
                                                     begin_hand(
@@ -1258,7 +1271,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // idempotent, because this one fires again
                                     // on every later table message.
                                     // See the note at the other road in.
-                                    if !ever_dealt {
+                                    if !ever_dealt
+                                        && hand_one_may_open(
+                                            &tox_sink,
+                                            &mut hand_one_held_since,
+                                            &mut hand_one_forced_said,
+                                            &events,
+                                        )
+                                        .await
+                                    {
                                         if let Some(o) = opening_for_hand_one(f) {
                                             ever_dealt = true;
                                             begin_hand(
@@ -2516,6 +2537,41 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // **The third road into hand 1, and the gate needs it.** The
+                // other two fire on a table message, and a table whose roster
+                // has ratified may send none at all while it waits for the Tox
+                // group to fill. Without this the wait could only end when
+                // something else happened to arrive, which on a quiet table is
+                // never. Idempotent for the same reason the other two are:
+                // `ever_dealt`.
+                if !ever_dealt {
+                    if let Some(f) = table.as_ref() {
+                        if hand_one_may_open(
+                            &tox_sink,
+                            &mut hand_one_held_since,
+                            &mut hand_one_forced_said,
+                            &events,
+                        )
+                        .await
+                        {
+                            if let Some(o) = opening_for_hand_one(f) {
+                                ever_dealt = true;
+                                begin_hand(
+                                    o,
+                                    &app_key,
+                                    &mut hand,
+                                    &mut said,
+                                    &mut swarm,
+                                    table_topic.as_ref(),
+                                    &events,
+                                    &tox_sink,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+
                 let Some(h) = hand.as_ref() else { continue };
                 // A hand that is over is a hand nobody is waiting on.
                 if h.over() || said.is_empty() {
@@ -3609,6 +3665,60 @@ fn short_hash(h: &[u8; 32]) -> String {
 /// expression that can come to differ at two sites.
 fn opening_for_hand_one(f: &Formation) -> Option<crate::table::hand::Opening> {
     crate::table::hand::Opening::from_formation(f, 1)
+}
+
+/// How long hand 1 waits for the Tox group to hold every seat.
+///
+/// Group entry runs on toxcore's LAN discovery cadence — `LAN_DISCOVERY_INTERVAL`
+/// is ten seconds (`vendor/c-toxcore/toxcore/LAN_discovery.h:23`) — and has been
+/// measured at 10 to 40 s, once at 125 s. Sixty covers the ordinary spread with
+/// room, and the table is not held longer than a player would wait.
+const GROUP_WAIT_MS: u64 = 60_000;
+
+/// May hand 1 open yet?
+///
+/// **Waiting is the whole of it; there is no new rule here.** Formation is now
+/// about four times faster than it was (`S1-G`) while Tox group entry is
+/// unchanged, so a seat reliably ratifies before the group holds everybody — and
+/// a hand opened then reaches nobody, cannot be caught up, and ends at its own
+/// deadline. Measured: a seat in the group from 15.1 s that received not one
+/// fragment before 66.2 s while the founder played to hand 22.
+///
+/// After `GROUP_WAIT_MS` this returns `true` regardless, which is **exactly what
+/// the client did before this gate existed**. So the worst case is unchanged and
+/// the ordinary case is a table whose first hand everybody can hear.
+///
+/// `held_since` is `None` until the first refusal, so the clock starts when there
+/// is something to wait for rather than when the process did.
+async fn hand_one_may_open(
+    tox: &super::toxsink::TableSink,
+    held_since: &mut Option<std::time::Instant>,
+    said: &mut bool,
+    events: &Events,
+) -> bool {
+    if tox.group_is_complete() {
+        return true;
+    }
+    let since = held_since.get_or_insert_with(std::time::Instant::now);
+    if since.elapsed() >= std::time::Duration::from_millis(GROUP_WAIT_MS) {
+        // Said once, because it means the first hand is being dealt into a group
+        // that does not hold everybody and somebody is about to sit through a
+        // hand they cannot see.
+        if !*said {
+            *said = true;
+            let _ = events
+                .send(NodeEvent::Warning({
+                    let (seen, want) = tox.group_seen();
+                    format!(
+                        "the table's group held {seen} of {want} other seats after {} s; dealing anyway",
+                        GROUP_WAIT_MS / 1000
+                    )
+                }))
+                .await;
+        }
+        return true;
+    }
+    false
 }
 
 /// Tell the interface where the hand is, when it has moved.

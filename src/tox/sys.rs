@@ -241,6 +241,14 @@ extern "C" {
         error: *mut c_int,
     ) -> bool;
     /// `tox.h:3840`
+    /// `tox.h:3698`. This client's own peer id inside the group, so a scan that
+    /// counts members can leave itself out of the count.
+    pub fn tox_group_self_get_peer_id(
+        tox: *const Tox,
+        group_number: u32,
+        error: *mut c_int,
+    ) -> u32;
+
     pub fn tox_group_peer_get_public_key(
         tox: *const Tox,
         group_number: u32,

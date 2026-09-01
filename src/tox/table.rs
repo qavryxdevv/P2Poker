@@ -30,7 +30,7 @@
 //! reason a chat id travelling in a public advertisement costs nothing.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as sync_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -119,6 +119,31 @@ pub struct Trouble {
     pub waiting: AtomicU64,
     /// Fragments handed to toxcore and accepted.
     pub sent: AtomicU64,
+    /// Whether every other seat on the roster is in the group right now.
+    ///
+    /// **Here because a table whose group is not complete deals a hand nobody
+    /// receives.** The hand rides the group (D-019) and the roster ratifies on
+    /// libp2p, which is now much the faster of the two: formation completes in
+    /// about seven seconds and group entry runs on toxcore's LAN discovery
+    /// cadence, ten to forty. So a seat can ratify, open hand 1, and be alone
+    /// with it - measured once, a seat that entered the group at 15.1 s and
+    /// received not one fragment before its own clock ran out at 66.2 s, while
+    /// the founder played on to hand 22. Nothing catches such a peer up: the
+    /// re-send window is the last three stages of the hand in progress.
+    ///
+    /// Written by the driver's sweep, read by the node loop, and **false until
+    /// the sweep has run at least once**, so a caller that gates on it waits
+    /// rather than races.
+    pub complete: AtomicBool,
+    /// What the last sweep counted in the group, and what it wanted.
+    ///
+    /// **Reported because `complete` alone cannot say why it is false.** The
+    /// founder's gate began working the moment it counted instead of matching
+    /// keys, and every joiner still ran to the sixty-second fallback — and
+    /// nothing in a log distinguished *the group really is short* from *this
+    /// peer cannot see the others yet*. Two numbers do.
+    pub in_group: AtomicU64,
+    pub want_in_group: AtomicU64,
     /// Invitations the founder tried to send and toxcore refused.
     ///
     /// **Here because a seat arriving late is two different failures that look
@@ -311,7 +336,20 @@ fn run(
     // Tox friend number -> that friend's public key, so an invitation can be
     // matched against the roster rather than accepted from whoever sends one.
     let mut friends: HashMap<u32, [u8; 32]> = HashMap::new();
-    let mut roster: Vec<[u8; 32]> = setup.roster.clone();
+    // **This client's own key, so it can never be added to its own roster.**
+    // `Setup::roster` says *this client's excepted*, and the caller does not
+    // keep to it: `net::run::seat_on_tox` tells the driver about **every** seat
+    // the formation holds, its own included, and `Command::Seated` then pushed
+    // it here. The count that comes out is one too many, so the group-complete
+    // gate waits for a seat that is this client and can never arrive - measured,
+    // every joiner at a six-seat table reporting *held 4 of 6 other seats* and
+    // running to the sixty-second fallback, while the founder, whose own key was
+    // not in the list, reported *4 of 5*.
+    //
+    // Guarded here rather than at the caller because this is the one place that
+    // owns the list, and a second caller would make the same mistake.
+    let me: [u8; 32] = tox.address()[..32].try_into().unwrap_or([0u8; 32]);
+    let mut roster: Vec<[u8; 32]> = setup.roster.iter().copied().filter(|k| *k != me).collect();
     for key in &roster {
         if let Ok(n) = tox.add_friend(key) {
             friends.insert(n, *key);
@@ -351,6 +389,10 @@ fn run(
         let mut stop = false;
         while let Ok(cmd) = control.try_recv() {
             match cmd {
+                Command::Seated(key) if key == me => {
+                    // This client. Not a friend of itself and not a peer of
+                    // itself; see `me` above for what happened when it was.
+                }
                 Command::Seated(key) => {
                     if !roster.contains(&key) {
                         roster.push(key);
@@ -505,6 +547,33 @@ fn run(
             if matches!(setup.role, Role::Host) {
                 invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
             }
+            // And whether the group now holds every other seat. `roster` is
+            // this client's excepted (see `Setup::roster`), so the answer is a
+            // straight comparison. At most ten keys and a scan each, once every
+            // five seconds.
+            //
+            // **Counted, not matched, and the API forces that.**
+            // `tox_group_peer_get_public_key` gives a peer's *group* public key
+            // (`tox.h:3823`) — a per-group identity, not the friend key the
+            // roster holds — so no scan can say *which* seat a group member is.
+            // The first version of this compared the two key spaces, always
+            // found nothing, and made the gate above it time out every single
+            // time: measured, six seats all in the group by 20.7 s and hand 1
+            // held until the 60-second fallback fired.
+            //
+            // A count answers the only question the gate asks. It cannot tell a
+            // stranger from a seat, which is sound here because the group is
+            // PRIVATE and the founder is the sole admin: the only way in is an
+            // invitation the founder sent to a roster key.
+            let seen = match group {
+                Some(g) => tox.peer_count(g),
+                None => 0,
+            };
+            trouble.in_group.store(seen as u64, Ordering::Relaxed);
+            trouble.want_in_group.store(roster.len() as u64, Ordering::Relaxed);
+            trouble
+                .complete
+                .store(group.is_some() && seen >= roster.len(), Ordering::Relaxed);
             last_sweep = Instant::now();
         }
 
@@ -654,7 +723,7 @@ fn peer_for(tox: &Tox, group: u32, key: &[u8; 32]) -> Option<u32> {
     // Peer ids are small and dense, and a table is at most ten seats. Scanning
     // is cheaper than keeping a map in step with joins and parts, and a map
     // that drifted would remove the wrong player.
-    (0..64u32).find(|p| tox.peer_key(group, *p).as_ref() == Ok(key))
+    (0..Tox::PEER_SCAN).find(|p| tox.peer_key(group, *p).as_ref() == Ok(key))
 }
 
 /// Milliseconds for the reassembler's timers.
