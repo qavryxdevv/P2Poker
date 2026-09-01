@@ -2773,6 +2773,60 @@ bytes were never more than ninety seconds old. Only the *long* wait reaches the
 defect, and the only reason it was found is that the case was thought about
 rather than only measured.
 
+## A player who leaves before the tournament starts keeps the seat for ever
+
+Suggested by the owner as an ordinary case, and it is: somebody sits down at a
+tournament table, waits, and leaves before it fills. Every run before this one
+measured a roster that only ever grows.
+
+Six seats, one leaving cleanly at 90 s, a replacement joining at 95 s:
+
+```
+the founder says no: the table is full     (replacement, 95.5 s)
+the founder says no: the table is full     (replacement, 106.2 s)
+6 seated                                   (founder, 112.6 s)
+hand #1 opens ... with seats [0,1,2,3,4,5] (founder, 150.3 s)
+```
+
+The leaver's process had exited at 90.1 s. **The founder still counted its seat
+at 112 s, refused the replacement twice, and then dealt hand 1 to all six
+including the one that had gone.** Three of the remaining five received no
+`HAND_INIT` at all; two hands of five finished.
+
+**Nothing in this client ever removes a seat from a formation roster.** Not a
+clean leave, not a disconnect, not time. `NodeCommand::LeaveTable` is documented
+*"Formation only; leaving a table that has started is a `PLAYER_LEAVE` and is
+not this"* — and it clears **local** state only: the sink, the subscription,
+`table = None`. It tells the founder nothing.
+
+**And there is no message it could send.** `PLAYER_LEAVE` (`0x0805`) is a
+boundary-window event of chain `k`, and before hand 1 there is no chain to carry
+it. The join RPC is `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST`,
+`TABLE_READY` — there is no cancel.
+
+**D-022 does not reach it either.** *A disconnected player is held for two hands*
+is counted in hands, and before the first hand there are none, so a seat held by
+a peer that crashed is held for ever by the same arithmetic.
+
+### Two routes, and the choice is a rule
+
+**(a) A message.** Let a seat release itself during formation — `PLAYER_LEAVE`
+on the setup chain, or a new join-RPC type. That is a wire decision and not an
+implementation's to make.
+
+**(b) A policy.** The founder frees a seat whose peer has been unreachable for
+some time **before the first hand**. It needs no new message, because the founder
+already tracks who is connected; it covers the crash as well as the clean exit,
+which (a) does not; and it costs nothing that is at stake, because no chips have
+moved and no card has been dealt.
+
+(b) is the smaller change and the one that covers both cases. What it needs is a
+duration and agreement that a pre-start seat may be taken back at all —
+**D-010's *no automated forfeiture and no automated eviction* and D-014's tier-1
+rule are stated broadly enough to be read against it**, and reading them narrowly
+because this case is cheap is exactly the move those decisions exist to stop. So
+it is filed as `S1-M` rather than written.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that

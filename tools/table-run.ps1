@@ -58,6 +58,19 @@ param(
     # `-Seconds` must cover the stagger and still leave time to play; a
     # combination that cannot is refused rather than run.
     [ValidateRange(0, 3600)][int]$StaggerSeconds = 0,
+    # **One seat sits down, waits this long, and leaves before the table is
+    # full.** A replacement then joins for the seat it freed.
+    #
+    # A player who takes a seat at a tournament and then leaves before it starts
+    # is ordinary, and no run before this one covered it: they all measure a
+    # roster that only ever grows. This exercises one that shrinks and grows
+    # again — the serial moving twice, every prior ratification cleared twice,
+    # and the freed seat taken by somebody new.
+    #
+    # Zero is off. The leaver is the last of `-Seats` to start, and it stops on
+    # its own `--for` so `Drop` runs and the table is told, which is a player
+    # closing the client rather than one that crashed.
+    [ValidateRange(0, 3600)][int]$LeaverSeconds = 0,
     # A seat slower than this to enter the Tox group keeps the logs, however
     # well the rest of the run went. Sixty seconds is far outside the ordinary
     # spread, which has been 10-25 s in every run measured.
@@ -114,6 +127,8 @@ for ($i = 0; $i -lt $Seats; $i++) {
     # spend the last of them as the only seat at the table.
     $mine = $Seconds - [int]([Math]::Round(((Get-Date) - $t0).TotalSeconds))
     if ($mine -lt 30) { $mine = 30 }
+    $leaving = ($LeaverSeconds -gt 0 -and $i -eq $Seats - 1)
+    if ($leaving) { $mine = $LeaverSeconds }
     $nodeArgs = @('--headless', '--autoplay', '--for', "$mine", '--profile', $profileDir)
     if ($i -eq 0) {
         $nodeArgs += @('--host', $table, '--seats', "$Seats")
@@ -148,6 +163,28 @@ for ($i = 0; $i -lt $Seats; $i++) {
     }
 }
 
+if ($LeaverSeconds -gt 0) {
+    # The replacement, started once the leaver has gone. It is given the rest of
+    # the run, and the table is one seat short in between - which is the state
+    # the whole exercise is about.
+    Write-Host "==> n$($Seats - 1) leaves at $LeaverSeconds s; a replacement follows"
+    $replacement = Start-Job -ArgumentList $Exe, $work, $table, $Seats, $Seconds, $LeaverSeconds -ScriptBlock {
+        param($exe, $work, $table, $seats, $seconds, $leaverSeconds)
+        Start-Sleep -Seconds ($leaverSeconds + 5)
+        $p = Join-Path $work 'nR'
+        New-Item -ItemType Directory -Force -Path $p | Out-Null
+        $log = Join-Path $work 'nR.log'
+        $start = Get-Date
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+        $left = $seconds - $leaverSeconds - 5
+        if ($left -lt 30) { $left = 30 }
+        & $exe --headless --autoplay --for "$left" --profile $p --join $table 2>&1 |
+            ForEach-Object { ((((Get-Date) - $start).TotalSeconds).ToString('F1', $inv)).PadLeft(7) + '  ' + $_ } |
+            Out-File -FilePath $log -Encoding utf8
+    }
+    $jobs += $replacement
+}
+
 Write-Host "$Seats nodes started; waiting up to $($Seconds + 60) s"
 $null = Wait-Job -Job $jobs -Timeout ($Seconds + 60)
 
@@ -170,11 +207,15 @@ $jobs | Remove-Job -Force
 # So the scripted pass condition every test in this project reads back cannot
 # tell a seat that played from one that did not, and this table is what says so.
 $inv = [System.Globalization.CultureInfo]::InvariantCulture
+$logs = @()
+for ($i = 0; $i -lt $Seats; $i++) { $logs += @{ Name = "n$i"; Path = (Join-Path $work "n$i.log") } }
+if ($LeaverSeconds -gt 0) { $logs += @{ Name = 'nR'; Path = (Join-Path $work 'nR.log') } }
+
 $nodes = @()
-for ($i = 0; $i -lt $Seats; $i++) {
-    $log = Join-Path $work "n$i.log"
+foreach ($entry in $logs) {
+    $log = $entry.Path
     if (-not (Test-Path $log)) {
-        $nodes += [pscustomobject]@{ Node = "n$i"; Group = $null; Opens = @(); Overs = 0; Formed = $false }
+        $nodes += [pscustomobject]@{ Node = $entry.Name; Group = $null; Opens = @(); Overs = 0; Formed = $false }
         continue
     }
     $lines = Get-Content $log
@@ -197,7 +238,7 @@ for ($i = 0; $i -lt $Seats; $i++) {
         if ($l -match 'hand #\d+ is over') { $overs++ }
         if ($l -match 'TABLE FORMED session=(\w+) seats=(\d+)') { $formed = $true }
     }
-    $nodes += [pscustomobject]@{ Node = "n$i"; Group = $group; Opens = $opens; Overs = $overs; Formed = $formed }
+    $nodes += [pscustomobject]@{ Node = $entry.Name; Group = $group; Opens = $opens; Overs = $overs; Formed = $formed }
 }
 
 $founder = $nodes[0]
