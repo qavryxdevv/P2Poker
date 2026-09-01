@@ -2881,6 +2881,44 @@ that D-022 already handles. A seat given up *before the table fills* needs the
 leaver to be an early one. (That mid-tournament case is in good health, for what
 it is worth: 36 hands opened, 35 finished by the five that stayed.)
 
+## Who is on the line, said out loud — and the number is not what it looks like
+
+Freeing a silent seat acts on liveness. It does not **show** it, and the owner's
+requirement was the wider one: *every peer must be pinged to check it is on the
+line*. A player watching a stalled stage otherwise has no way to tell a seat
+that is thinking from one that has gone.
+
+So the housekeeping tick says, once per tick while there is a table:
+
+```
+seats on the line: 1 60ms, 2 342ms, 3 68ms
+```
+
+Each seat, and how long its last **answered** ping took. A seat with nothing
+recent reads `silent 45s`; one connected but not yet pinged reads `connected`,
+because the first ping is fifteen seconds behind the connection and a sentinel
+duration would be indistinguishable from the sub-millisecond answers a local
+peer gives.
+
+**And the number is not network distance, which is why it is worth having.**
+That line was measured between four clients on **one machine**, where the wire
+is free. None of 60, 342 or 68 milliseconds is transit. It is how long each
+peer's own loop took to get round to replying — and on a table doing
+elliptic-curve work between hands, that is the quantity that actually decides
+whether a seat answers promptly. A seat at 342 ms on localhost is a seat whose
+client is busy, which is exactly what a reader wants to know and is invisible in
+every other line this client prints.
+
+It is reported and not acted on. Nothing in the protocol reads it, and the seat
+rule deliberately reads *silence* rather than latency: a slow peer is playing, a
+silent one is not.
+
+**A failed ping is not counted as silence either.** Silence is *nothing has come
+back lately*, which an unreliable link produces on its own; a failed ping is one
+datagram that did not make it. Treating the second as evidence would cost
+somebody their seat for a moment of packet loss, which is why `SEAT_SILENCE_MS`
+is six intervals of the first rather than one of the second.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that

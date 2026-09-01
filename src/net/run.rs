@@ -439,10 +439,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut tox_group_said = false;
     // The last refusal count reported, so a steady state says nothing and a
     // rising one says it every five seconds.
-    // When each peer last **answered**, not when it last connected. See the
-    // `Ping` arm and `SEAT_SILENCE_MS`.
-    let mut alive: std::collections::HashMap<PeerId, std::time::Instant> =
-        std::collections::HashMap::new();
+    // When each peer last **answered**, and how long the round trip took. See
+    // the `Ping` arm and `SEAT_SILENCE_MS`.
+    //
+    // The round trip is kept because it is the only thing that says how long a
+    // seat takes to answer, and **that is not the same as how far away it is**.
+    // Measured between four clients on one machine, where the wire is free:
+    // `1 60ms, 2 342ms, 3 68ms`. None of that is network. It is how long each
+    // peer's own loop took to get round to replying, which on a table doing
+    // elliptic-curve work between hands is the quantity that actually decides
+    // whether a seat answers promptly.
+    //
+    // Reported rather than acted on — nothing in the protocol reads it — and a
+    // number nobody can see is a number nobody can use.
+    //
+    // `None` is *connected and not yet pinged*: the first ping is fifteen
+    // seconds after the connection, and a sentinel duration would be
+    // indistinguishable from the sub-millisecond answers a local peer gives.
+    let mut alive: std::collections::HashMap<
+        PeerId,
+        (std::time::Instant, Option<std::time::Duration>),
+    > = std::collections::HashMap::new();
     let mut tox_refused_said: u64 = 0;
     let mut tox_invites_said: u64 = 0;
     // **How the re-send loop backs off.** `at` is the chain position it last
@@ -925,7 +942,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // until the first ping fifteen seconds later. Without
                         // it a seat that joins and is swept a moment afterwards
                         // looks silent because nothing has asked it yet.
-                        alive.insert(peer_id, std::time::Instant::now());
+                        alive
+                            .entry(peer_id)
+                            .or_insert((std::time::Instant::now(), None));
                         let _ = events.send(NodeEvent::PeerConnected(peer_id)).await;
                     }
 
@@ -940,12 +959,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // leaves a socket that looks perfectly well and answers
                     // nothing. Liveness has to be **asked for**, and this is the
                     // asking.
+                    // **Only a success is matched, and a failure is
+                    // deliberately not the opposite of one.** Silence is
+                    // *nothing has come back lately*, which an unreliable link
+                    // produces on its own; a failed ping is one datagram that
+                    // did not make it. Treating the second as evidence that a
+                    // player has gone would cost somebody their seat for a
+                    // moment of packet loss, which is why `SEAT_SILENCE_MS` is
+                    // six intervals of the first rather than one of the second.
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Ping(ping::Event {
                         peer,
-                        result: Ok(_),
+                        result: Ok(rtt),
                         ..
                     })) => {
-                        alive.insert(peer, std::time::Instant::now());
+                        alive.insert(peer, (std::time::Instant::now(), Some(rtt)));
                     }
                     SwarmEvent::ConnectionClosed {
                         peer_id,
@@ -2930,6 +2957,53 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let now = super::node::now_unix_ms();
                 state.tick(now);
 
+                // **Who is actually on the line**, said once per housekeeping
+                // tick while there is a table.
+                //
+                // The owner's requirement, and it is not only about freeing
+                // seats: *every peer must be pinged to check it is on the
+                // line*. Acting on liveness and never showing it leaves a
+                // player watching a stalled stage with no way to tell a seat
+                // that is thinking from one that is gone — and this client has
+                // been pinging four times a minute since the beginning and
+                // discarding every reply.
+                if let Some(f) = table.as_ref() {
+                    let mut line: Vec<String> = Vec::new();
+                    for e in f.roster().seats() {
+                        if Some(e.seat) == f.my_seat() {
+                            continue;
+                        }
+                        let Ok(p) = PeerId::from_bytes(&e.peer_id) else {
+                            line.push(format!("{} ?", e.seat));
+                            continue;
+                        };
+                        line.push(match alive.get(&p) {
+                            Some((at, Some(rtt)))
+                                if at.elapsed() < std::time::Duration::from_secs(30) =>
+                            {
+                                format!("{} {}ms", e.seat, rtt.as_millis())
+                            }
+                            Some((at, None))
+                                if at.elapsed() < std::time::Duration::from_secs(30) =>
+                            {
+                                format!("{} connected", e.seat)
+                            }
+                            Some((at, _)) => {
+                                format!("{} silent {}s", e.seat, at.elapsed().as_secs())
+                            }
+                            None => format!("{} never", e.seat),
+                        });
+                    }
+                    if !line.is_empty() {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "seats on the line: {}",
+                                line.join(", ")
+                            )))
+                            .await;
+                    }
+                }
+
                 // **Give back the seat of anybody who has stopped answering,
                 // and only before the first hand.**
                 //
@@ -2962,7 +3036,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // Answered, and recently enough.
                                     Ok(p) => alive
                                         .get(&p)
-                                        .map(|at| {
+                                        .map(|(at, _)| {
                                             at.elapsed()
                                                 >= std::time::Duration::from_millis(SEAT_SILENCE_MS)
                                         })
