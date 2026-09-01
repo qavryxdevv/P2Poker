@@ -3330,6 +3330,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             )))
                             .await;
                     }
+
+                    // **Everything this seat has to say, said again, while the
+                    // table has not settled.**
+                    //
+                    // A ratification is published once, into a mesh the last
+                    // joiner may not be grafted into yet, and **nothing ever
+                    // sends it again**: `say_again` fires on `Subscribed`, which
+                    // for a peer that is already subscribed never fires a second
+                    // time. So one lost `TABLE_READY` costs its receiver the
+                    // whole tournament — it holds a full roster, cannot compute
+                    // a `session_id` without every ratification, and
+                    // `Opening::from_formation` then returns `None` for ever.
+                    //
+                    // Measured: a seat reporting `ratified 3/4, 0 held` for a
+                    // whole run — nothing refused, nothing waiting, one
+                    // ratification simply never delivered — while the other
+                    // three played fifteen hands without it.
+                    //
+                    // Inside `duplicate_cache_time` (120 s) a seat's repeat is
+                    // still refused as a duplicate and only the founder's
+                    // re-signed roster goes out; after it, the repeat is carried.
+                    // That makes the gap two minutes rather than for ever, which
+                    // is the whole of what this can do without the wire decision
+                    // `S1-P` leaves open.
+                    if f.session().is_none() {
+                        if let Some(topic) = table_topic.as_ref() {
+                            for bytes in f.say_again(super::node::now_unix_ms()) {
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .publish(topic.clone(), bytes);
+                            }
+                        }
+                    }
                 }
 
                 // **Give back the seat of anybody who has stopped answering,
