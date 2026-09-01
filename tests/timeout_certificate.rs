@@ -38,6 +38,9 @@ fn opening3_with_bank(my_seat: u8, time_bank_ms: u32) -> Opening {
         genesis: [4; 32],
         required: vec![0, 1, 2],
         readmitted: Vec::new(),
+        every_n_hands: 11,
+        first_small_blind: 50,
+        small_blind_cap: 50_000,
         seats: vec![
             (0, key(10).verifying_key().to_bytes(), 10_000),
             (1, key(11).verifying_key().to_bytes(), 10_000),

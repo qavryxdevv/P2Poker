@@ -1239,6 +1239,30 @@ mod tests {
                 "a seat computed a different session identity"
             );
         }
+        // **The table's blind schedule reaches the hand**, so that hand `k+1`
+        // can derive its own level instead of copying hand `k`'s.
+        //
+        // This is the wiring that was missing, and its absence is why
+        // `RATED_SNG_POKERTH_V1`'s doubling never happened in play: the formula
+        // in `poker::tournament` was right and tested, `Opening.level` was set
+        // to 1 at formation and copied forward for ever, and nothing in between
+        // carried the three parameters the boundary needed to compute anything.
+        // A unit that is right and unreachable tests green.
+        //
+        // All three are parts of `table_params_hash`, so they are the table's
+        // and signed — which is what makes every peer's answer the same answer.
+        let o = crate::table::hand::Opening::from_formation(&t.founder, 1)
+            .expect("a ratified table can open hand one");
+        assert_eq!(o.every_n_hands, a.blind_schedule.every_n_hands);
+        assert_eq!(o.first_small_blind, a.blind_schedule.first_small_blind);
+        assert_eq!(o.small_blind_cap, a.blind_schedule.small_blind_cap);
+        assert_eq!(
+            o.small_blind, o.first_small_blind,
+            "§7.2 rule 2 forces small_blind == first_small_blind, so hand one is level one"
+        );
+        assert_eq!(o.big_blind, 2 * o.small_blind);
+        assert_eq!(o.level, 1);
+
     }
 
     /// A joiner names the copy of the advertisement **it** heard, and a founder

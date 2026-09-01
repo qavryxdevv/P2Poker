@@ -233,6 +233,18 @@ pub struct Opening {
     pub small_blind: u64,
     pub big_blind: u64,
     pub level: u16,
+    /// The blind schedule, carried so that hand `k+1` can **derive** its level
+    /// and its blinds instead of copying hand `k`'s.
+    ///
+    /// `PROTOCOL.md` §7.2 `BlindSchedule`, and all three are parts of
+    /// `table_params_hash` (§3.1) — so they are the table's, signed, and not a
+    /// client's setting. Without them in the `Opening` nothing at the hand
+    /// boundary could compute the next level, which is why the blinds stood
+    /// still: `level` was set to 1 at formation and copied forward for ever,
+    /// and `RATED_SNG_POKERTH_V1`'s doubling never happened in play.
+    pub every_n_hands: u16,
+    pub first_small_blind: u64,
+    pub small_blind_cap: u64,
     pub my_seat: SeatIdx,
     /// How long a peer has to answer a cryptographic step, from the table's own
     /// parameters. Carried on the envelope of every stage this hand emits.
@@ -317,8 +329,13 @@ impl Opening {
             small_blind: ad.small_blind,
             big_blind: ad.big_blind,
             // Level 1: the blind schedule advances from `HAND_COMPLETE`, and no
-            // hand has completed.
+            // hand has completed. §7.2 rule 2 also forces
+            // `small_blind == blind_schedule.first_small_blind`, so hand one's
+            // blinds and level one's are the same numbers by construction.
             level: 1,
+            every_n_hands: ad.blind_schedule.every_n_hands,
+            first_small_blind: ad.blind_schedule.first_small_blind,
+            small_blind_cap: ad.blind_schedule.small_blind_cap,
             my_seat: f.my_seat()?,
             crypto_step_timeout_ms: ad.crypto_step_timeout_ms,
             action_timeout_ms: ad.action_timeout_ms,
@@ -5987,6 +6004,13 @@ impl Hand {
             &required,
         );
 
+        let next_hand_id = self.open.hand_id + 1;
+        let next_small_blind = crate::poker::tournament::small_blind_at(
+            u32::try_from(next_hand_id).unwrap_or(u32::MAX),
+            u32::from(self.open.every_n_hands),
+            self.open.first_small_blind,
+            self.open.small_blind_cap,
+        );
         Some(Opening {
             table_id: self.open.table_id,
             hand_id,
@@ -6003,9 +6027,23 @@ impl Hand {
             readmitted: Vec::new(),
             seats,
             max_players: self.open.max_players,
-            small_blind: self.open.small_blind,
-            big_blind: self.open.big_blind,
-            level: self.open.level,
+            // **Derived, not copied**, which is the whole of the fix. §7.2:
+            // `small_blind(h) = min(first_small_blind · 2^(⌊(h-1)/every_n⌋),
+            // small_blind_cap)`, and §7.2 rule 2 forces
+            // `big_blind == 2 × small_blind` on every advert, so the big blind
+            // is that and nothing else. Every peer computes it from the same
+            // signed parameters and the same hand number, so it is agreement by
+            // construction rather than by message.
+            small_blind: next_small_blind,
+            big_blind: next_small_blind.saturating_mul(2),
+            level: u16::try_from(crate::poker::tournament::blind_level(
+                u32::try_from(next_hand_id).unwrap_or(u32::MAX),
+                u32::from(self.open.every_n_hands),
+            ))
+            .unwrap_or(u16::MAX),
+            every_n_hands: self.open.every_n_hands,
+            first_small_blind: self.open.first_small_blind,
+            small_blind_cap: self.open.small_blind_cap,
             my_seat: self.open.my_seat,
             crypto_step_timeout_ms: self.open.crypto_step_timeout_ms,
             action_timeout_ms: self.open.action_timeout_ms,
@@ -6456,6 +6494,11 @@ mod tests {
             genesis: [4; 32],
             required: vec![0, 1],
             readmitted: Vec::new(),
+            // The rated preset's schedule, so a test hand doubles
+            // where a real one does.
+            every_n_hands: 11,
+            first_small_blind: 50,
+            small_blind_cap: 50_000,
             seats: vec![
                 (0, key(10).verifying_key().to_bytes(), 10_000),
                 (1, key(11).verifying_key().to_bytes(), 10_000),
@@ -6494,6 +6537,11 @@ mod tests {
             genesis: [4; 32],
             required: vec![0, 1, 2],
             readmitted: Vec::new(),
+            // The rated preset's schedule, so a test hand doubles
+            // where a real one does.
+            every_n_hands: 11,
+            first_small_blind: 50,
+            small_blind_cap: 50_000,
             seats: vec![
                 (0, key(10).verifying_key().to_bytes(), 10_000),
                 (1, key(11).verifying_key().to_bytes(), 10_000),

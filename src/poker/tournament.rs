@@ -207,6 +207,47 @@ pub const HEADS_UP_CUSTOM_2P: Preset = Preset {
     join_deadline_sec: 120,
 };
 
+/// The blind level hand `h` belongs to, counting from 1.
+///
+/// `PROTOCOL.md` §7.2: `BlindSchedule.mode = 1` is `DOUBLE_EVERY_N_HANDS` and
+/// `small_blind(h) = min(first_small_blind · 2^(⌊(h-1)/every_n_hands⌋),
+/// small_blind_cap)`. This is the exponent.
+///
+/// Hands are numbered from 1. PokerTH raises when
+/// `lastHandBlindsRaised + raiseEvery <= currentHandID`, with
+/// `lastHandBlindsRaised` starting at 1, so the first raise lands on hand
+/// `every_n_hands + 1` and each level is exactly that long
+/// (`src/engine/game.cpp:286-291`, `:51-52`).
+///
+/// `every_n_hands == 0` cannot divide, and an advert may carry it: the wire
+/// format gives the field no lower bound (`G8-C3`). It is read as **never
+/// raise** so a malformed advert that reached the engine cannot panic every
+/// peer at once — the real defence is `Preset::validate` and `lobby`'s advert
+/// check, which refuse it before a seat is taken.
+///
+/// **Free, and both readers call it**, so a table's blinds and a preset's
+/// cannot come to disagree — which is `G7-S3`'s lesson in a function.
+pub const fn blind_level(hand: u32, every_n_hands: u32) -> u32 {
+    if hand == 0 || every_n_hands == 0 {
+        return 1;
+    }
+    1 + (hand - 1) / every_n_hands
+}
+
+/// The small blind for hand `h`, doubling each level and then clamped.
+pub fn small_blind_at(hand: u32, every_n_hands: u32, first: Chips, cap: Chips) -> Chips {
+    let doublings = blind_level(hand, every_n_hands) - 1;
+    // Beyond 63 doublings the shift would overflow, and the cap has long since
+    // bitten anyway. A tournament never gets there, but a malformed hand number
+    // off the network could.
+    let scaled = if doublings >= Chips::BITS {
+        Chips::MAX
+    } else {
+        first.saturating_mul(1u64 << doublings)
+    };
+    scaled.min(cap)
+}
+
 impl Preset {
     /// Half of all the chips the tournament started with.
     ///
@@ -231,24 +272,17 @@ impl Preset {
     /// every peer at once — but the real defence is [`Preset::validate`],
     /// which refuses such an advert before a seat is ever taken.
     pub const fn level(&self, hand: u32) -> u32 {
-        if hand == 0 || self.raise_every_hands == 0 {
-            return 1;
-        }
-        1 + (hand - 1) / self.raise_every_hands
+        blind_level(hand, self.raise_every_hands)
     }
 
     /// The small blind for a hand, doubling each level and then clamped.
     pub fn small_blind(&self, hand: u32) -> Chips {
-        let doublings = self.level(hand) - 1;
-        // Beyond 63 doublings the shift would overflow, and the cap has long
-        // since bitten anyway. A tournament never gets there, but a malformed
-        // hand number off the network could.
-        let scaled = if doublings >= Chips::BITS {
-            Chips::MAX
-        } else {
-            self.first_small_blind.saturating_mul(1u64 << doublings)
-        };
-        scaled.min(self.small_blind_cap)
+        small_blind_at(
+            hand,
+            self.raise_every_hands,
+            self.first_small_blind,
+            self.small_blind_cap,
+        )
     }
 
     /// The big blind is twice the small blind
@@ -381,6 +415,68 @@ impl Preset {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §7.2's formula, walked across the rated preset's own numbers.
+    ///
+    /// `small_blind(h) = min(first_small_blind · 2^(⌊(h-1)/every_n_hands⌋),
+    /// small_blind_cap)` with `every_n_hands = 11`, `first = 50`, `cap = 50 000`.
+    /// The boundaries are what a reader checks against the corpus: hand 11 is
+    /// still level 1 and hand 12 is level 2, because PokerTH raises when
+    /// `lastHandBlindsRaised + raiseEvery <= currentHandID` from a base of 1.
+    ///
+    /// **The formula was already tested here and the blinds still stood still
+    /// in play**, which is the point worth keeping: `the_first_raise_lands_on_
+    /// hand_twelve` and `the_blind_schedule_matches_the_derived_table` both
+    /// passed while `Hand` never called any of it. A unit that is right and
+    /// unreachable tests green. This walks the whole ladder rather than its
+    /// ends, and `three_clients_form_one_table` in `formation.rs` is the one
+    /// that pins the wiring, on a table that has actually ratified.
+    #[test]
+    fn the_rated_schedule_doubles_every_eleven_hands_and_then_stops_at_the_cap() {
+        let p = RATED_SNG_POKERTH_V1;
+        assert_eq!(p.raise_every_hands, 11);
+
+        // The first level, and its last hand.
+        assert_eq!(p.level(1), 1);
+        assert_eq!(p.level(11), 1);
+        assert_eq!(p.small_blind(1), 50);
+        assert_eq!(p.small_blind(11), 50, "hand eleven is still level one");
+
+        // The first raise, on hand twelve.
+        assert_eq!(p.level(12), 2);
+        assert_eq!(p.small_blind(12), 100, "and the first doubling lands here");
+
+        // Every level of a ten-player tournament, against the arithmetic.
+        for (hand, level, sb) in [
+            (12u32, 2u32, 100u64),
+            (23, 3, 200),
+            (34, 4, 400),
+            (45, 5, 800),
+            (56, 6, 1_600),
+            (67, 7, 3_200),
+            (78, 8, 6_400),
+            (89, 9, 12_800),
+            (100, 10, 25_600),
+        ] {
+            assert_eq!(p.level(hand), level, "level at hand {hand}");
+            assert_eq!(p.small_blind(hand), sb, "small blind at hand {hand}");
+        }
+
+        // The cap bites, and having bitten it does not move again.
+        assert_eq!(p.small_blind(111), 50_000);
+        assert_eq!(p.small_blind(1_000), 50_000);
+        assert_eq!(
+            p.small_blind(u32::MAX),
+            50_000,
+            "a hand number off the network cannot overflow the shift"
+        );
+
+        // `every_n_hands = 0` reaches the engine only from a malformed advert,
+        // and is read as never raising rather than dividing by zero at every
+        // peer at once (`G8-C3`).
+        assert_eq!(blind_level(500, 0), 1);
+        assert_eq!(small_blind_at(500, 0, 50, 50_000), 50);
+    }
 
     #[test]
     fn the_rated_preset_matches_pokerth_constant_for_constant() {

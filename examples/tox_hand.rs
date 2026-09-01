@@ -146,6 +146,9 @@ async fn main() {
         genesis,
         required: vec![0, 1],
         readmitted: Vec::new(),
+        every_n_hands: 11,
+        first_small_blind: 50,
+        small_blind_cap: 50_000,
         seats: vec![
             (0, sk0.verifying_key().to_bytes(), 10_000),
             (1, sk1.verifying_key().to_bytes(), 10_000),
