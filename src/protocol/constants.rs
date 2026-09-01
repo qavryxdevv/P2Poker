@@ -60,6 +60,14 @@ pub const BOUNDARY_SEQUENCE_BASE: u64 = 4_096;
 /// The boundary checkpoint's own sequence base (§4.9).
 pub const BOUNDARY_CHECKPOINT_BASE: u64 = 8_192;
 
+/// How many reconciliation rounds the checkpoint band has room for.
+///
+/// `PROTOCOL.md` §4.9: round `r` takes `BOUNDARY_CHECKPOINT_BASE + 2r` for its
+/// `STATE_HASH` and `+ 2r + 1` for its `STATE_ACK`, with **`1 <= r <= 7`** — so
+/// the band is the sixteen values `8 192 … 8 207` and a checkpoint-8 event
+/// outside it is a stage violation at §4.0 step 12.
+pub const MAX_RECONCILIATION_ROUNDS: u16 = 7;
+
 /// How many past hands a receiver keeps a record of, for the stale-event test.
 pub const MAX_RETAINED_HAND_RECORDS: usize = 4_096;
 
@@ -436,6 +444,14 @@ const _: () = assert!(PRESENCE_HEARTBEAT_MS * 3 <= PRESENCE_TTL_MS);
 /// checkpoint, with room for every seat.
 const _: () = assert!(BOUNDARY_SEQUENCE_BASE > MAX_STAGES_PER_HAND);
 const _: () = assert!(BOUNDARY_CHECKPOINT_BASE > BOUNDARY_SEQUENCE_BASE + MAX_SEATS as u64);
+/// The checkpoint band ends above every ordinary stage and above the boundary
+/// window, which is the constraint §4.9 argues the base from: a reconciliation
+/// round extends **upwards**, so a base low enough for the band to reach the
+/// window would let a disputed checkpoint collide with a seat's `PLAYER_SIT_IN`.
+const _: () = assert!(
+    BOUNDARY_CHECKPOINT_BASE > BOUNDARY_SEQUENCE_BASE + MAX_SEATS as u64
+        && BOUNDARY_CHECKPOINT_BASE > MAX_STAGES_PER_HAND
+);
 
 /// The rated deadline is inside the range every advert must satisfy.
 const _: () = assert!(RATED_HAND_DEADLINE_MS <= HAND_DEADLINE_CAP_MS);
