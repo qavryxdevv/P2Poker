@@ -4233,10 +4233,13 @@ async fn begin_hand(
             // log, as silence. This is the one line that tells them apart.
             let _ = events
                 .send(NodeEvent::Warning(format!(
-                    "hand #{} opens at genesis {} with seats {:?}",
+                    "hand #{} opens at genesis {} with seats {:?}, level {} blinds {}/{}",
                     h.hand_id(),
                     short_hash(&h.genesis()),
-                    h.required()
+                    h.required(),
+                    h.level(),
+                    h.small_blind(),
+                    h.big_blind()
                 )))
                 .await;
             let _ = events

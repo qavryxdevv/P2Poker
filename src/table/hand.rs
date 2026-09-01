@@ -3673,6 +3673,21 @@ impl Hand {
         Ok(Some(bytes))
     }
 
+    /// The blind level this hand is played at, and the two blinds themselves.
+    ///
+    /// Said out loud when a hand opens, because a player has to be able to see
+    /// the blinds go up — and because the escalation stood still for the whole
+    /// life of this client without anything in a log being wrong.
+    pub fn level(&self) -> u16 {
+        self.open.level
+    }
+    pub fn small_blind(&self) -> Chips {
+        self.open.small_blind
+    }
+    pub fn big_blind(&self) -> Chips {
+        self.open.big_blind
+    }
+
     /// The table this hand belongs to.
     pub fn table_id(&self) -> Hash {
         self.open.table_id
