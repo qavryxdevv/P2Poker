@@ -628,13 +628,35 @@ impl Formation {
                 // seated*. Correct, and useless: the table never ratified and
                 // the run ended with `NO TABLE` on every node.
                 //
-                // The repeat is `said.list`, the exact bytes already signed and
-                // published, so nothing new is created and `list_serial` does
-                // not move. A peer that already has it discards a duplicate.
+                // **Signed again rather than repeated, and the first version of
+                // this got that wrong.** It re-broadcast `said.list` — the exact
+                // bytes published when the roster last changed — and
+                // `on_player_list` refuses a list older than `LIST_MAX_AGE_MS`,
+                // ninety seconds. So the repeat helped only while the roster had
+                // changed within the last minute and a half, and was discarded
+                // by every receiver otherwise.
+                //
+                // That is precisely the case it exists for. Players arrive
+                // irregularly and a tournament table stays open until it fills;
+                // a seat that joined and then waited a quarter of an hour is
+                // asking about a roster whose last change is long past ninety
+                // seconds ago, and the stale bytes would be refused by the very
+                // peer that needs them.
+                //
+                // The content and the `list_serial` are unchanged — this is the
+                // same list, said again, which §14's table permits in terms:
+                // `PLAYER_LIST` is `chain_scope = 0`, **"any number, any time"**,
+                // and outside the equivocation predicate.
                 let mut out = vec![Send::Reply(reply)];
-                if matches!(reason, RejectReason::AlreadySeated) {
-                    if let Some(list) = self.said.list.clone() {
-                        out.push(Send::Broadcast(list));
+                if matches!(reason, RejectReason::AlreadySeated) && self.serial > 0 {
+                    let list = PlayerList {
+                        roster: self.roster.seats().to_vec(),
+                        table_params_hash: self.under.params,
+                        list_serial: self.serial,
+                    };
+                    if let Ok(bytes) = joinwire::publish_player_list(&list, &f.key, now_ms) {
+                        self.said.list = Some(bytes.clone());
+                        out.push(Send::Broadcast(bytes));
                     }
                 }
                 Ok(out)
@@ -1400,6 +1422,29 @@ mod tests {
         assert!(
             matches!(&out[1], Send::Broadcast(b) if joinwire::receive_player_list(b).is_ok()),
             "the second send is the player list, re-published as it stands"
+        );
+
+        // **And it is signed again, not repeated.** `on_player_list` refuses a
+        // list older than `LIST_MAX_AGE_MS`, so re-broadcasting the bytes from
+        // when the roster last changed helps only for the first ninety seconds
+        // and is discarded after that — which is exactly the case this exists
+        // for, a seat that joined and then waited while the table filled.
+        //
+        // Asked at `NOW + LIST_MAX_AGE_MS * 2`: the answer must still be
+        // admissible at that moment, which the stored bytes could not be.
+        let much_later = NOW + crate::protocol::constants::LIST_MAX_AGE_MS * 2;
+        let out = t
+            .founder
+            .on_join_request(&second, &peer(2), much_later)
+            .expect("a refusal is still an answer");
+        let list = match &out[1] {
+            Send::Broadcast(b) => b.clone(),
+            _ => panic!("the second send is the list"),
+        };
+        let (_, _, emitted) = joinwire::receive_player_list_at(&list).expect("a readable list");
+        assert_eq!(
+            emitted, much_later,
+            "the list is signed at the moment it is asked for, not at the moment the roster changed"
         );
         match &out[0] {
             Send::Reply(bytes) => {

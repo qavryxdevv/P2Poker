@@ -2732,6 +2732,32 @@ three, and a simultaneous LAN run has come in at 20.7 s before now, so this may
 be ordinary spread rather than a cost of arriving late. Not claimed either way
 until it is repeated.
 
+### And thinking about the long wait found a defect in the fix from an hour ago
+
+`S1-J` answers a join request from an already-seated peer with the roster,
+because such a request is proof the asker's roster is stale. It repeated
+`said.list` — **the exact bytes published when the roster last changed** — and
+`on_player_list` refuses a list older than `LIST_MAX_AGE_MS`, ninety seconds.
+
+So the repeat worked only while the roster had changed within the last minute
+and a half, and was discarded by every receiver after that. **Which is precisely
+the case it exists for**: a seat that joined and then waited a quarter of an
+hour while the table filled is asking about a roster whose last change is long
+past ninety seconds ago, and would have been sent bytes the receiver throws away.
+
+It is now signed again at the moment it is asked for. The content and the
+`list_serial` do not change — this is the same list, said again, which
+`PROTOCOL.md` §14's table permits in terms: `PLAYER_LIST` is `chain_scope = 0`,
+**"any number, any time"**, and outside the equivocation predicate. The test asks
+at `LIST_MAX_AGE_MS * 2` and requires the answer to be admissible then, which the
+stored bytes could not be.
+
+**The staggered run that would have caught it did not, and that is worth
+saying:** at one player a minute the roster changes every minute, so the stored
+bytes were never more than ninety seconds old. Only the *long* wait reaches the
+defect, and the only reason it was found is that the case was thought about
+rather than only measured.
+
 ## Still open
 
 Checked against the tree on the day this was written, and three entries that
