@@ -551,7 +551,21 @@ pub struct CertFact {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Holding {
     Kept,
-    AnotherHand,
+    /// Verified, and of a hand this client is not playing.
+    ///
+    /// **The two values are carried because they are evidence.** A signed,
+    /// well-formed chained event of *this table* naming a hand this client has
+    /// not reached is another seat's signature on the proposition that the
+    /// table has moved past it. One such seat could be mistaken; several
+    /// agreeing cannot all be, and that is what tells a client that fell far
+    /// enough behind that it is dealing a game of its own.
+    ///
+    /// `seat` is `None` when the sender holds no seat in this hand's roster,
+    /// which is not evidence of anything and is counted as nothing.
+    AnotherHand {
+        hand_id: u64,
+        seat: Option<SeatIdx>,
+    },
     Malformed,
 }
 
@@ -5524,15 +5538,25 @@ impl Hand {
         // table identity and the signature doing all the work — that is what a
         // relay decision may rest on, and a `hand_id` this client is not
         // playing is not a fault in the sender.
-        if chained::open_in_hand(&bytes, FRAME_CAP, kind, &self.open.table_id, hand_id).is_err() {
+        let Ok(opened) =
+            chained::open_in_hand(&bytes, FRAME_CAP, kind, &self.open.table_id, hand_id)
+        else {
             return Holding::Malformed;
-        }
+        };
         if hand_id != self.open.hand_id {
             // A hand this client is not playing. Worth relaying and not worth
             // holding: `replay_early` re-runs the same guard, `early` does not
             // survive into the next hand, and the bytes would sit here until
             // they pushed something useful out.
-            return Holding::AnotherHand;
+            //
+            // **Who signed it is carried out with it.** The signature and the
+            // table have just been checked, so this is a roster seat's own
+            // word that the table is somewhere this client is not — which is
+            // the only evidence a client on a private branch can ever get.
+            return Holding::AnotherHand {
+                hand_id,
+                seat: self.seat_of_key(&opened.sender),
+            };
         }
         // Bounded: this is fed from the network, and everything fed from the
         // network is bounded where it is consumed.

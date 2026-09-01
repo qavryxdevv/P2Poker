@@ -459,6 +459,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // permanent ones only — a stage that has not closed yet is retried in
     // silence, because it is the ordinary case and not a fault.
     let mut no_round_said = false;
+    // **Which roster seats have signed an event of a hand this client has not
+    // reached, and the furthest each named.** Evidence that the table is
+    // somewhere this client is not.
+    let mut ahead: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
+    // Set once that evidence is conclusive: `(the table's hand, this client's)`.
+    // A latch, and terminal — see `note_a_hand_ahead`.
+    let mut adrift: Option<(u64, u64)> = None;
+    let mut adrift_said = false;
     let mut readmitted: Vec<u8> = Vec::new();
     let mut hand_one_held_since: Option<std::time::Instant> = None;
     // How many seats the group held when it last grew, and when that was. The
@@ -879,7 +887,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // hand behind is exactly the
                                     // intermediary a peer one hand ahead
                                     // needs — it is simply not kept.
-                                    Holding::AnotherHand => {
+                                    Holding::AnotherHand { hand_id, seat } => {
+                                        note_a_hand_ahead(
+                                            $h,
+                                            hand_id,
+                                            seat,
+                                            &mut ahead,
+                                            &mut adrift,
+                                        );
                                         gossipsub::MessageAcceptance::Accept
                                     }
                                     Holding::Malformed => {
@@ -3136,6 +3151,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 if frozen.is_none() {
                     frozen_said = false;
                 }
+                // **This client is on a branch nobody shares.** It cannot
+                // catch up and it must not deal on: a private tournament is
+                // worse than no tournament, because it looks like one.
+                if let Some((theirs, mine)) = adrift {
+                    if !adrift_said {
+                        adrift_said = true;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "this client is out: the table is at hand {theirs} and this client reached only {mine}, so it has been dealing a hand nobody else has. No further hand is dealt here."
+                            )))
+                            .await;
+                    }
+                    continue;
+                }
                 if let Some((k, _)) = frozen {
                     if !frozen_said {
                         frozen_said = true;
@@ -4433,6 +4462,57 @@ fn short_hash(h: &[u8; 32]) -> String {
 /// A **disagreeing** value is a divergence and §6.3 is what answers it. That is
 /// not built, so it is said out loud and nothing else: saying nothing would be
 /// the silent divergence §6.1 exists to prevent.
+/// Notice that the table has gone on without this client, and latch it.
+///
+/// **The failure this exists for, measured.** A seat whose link was down for 75
+/// seconds is certified out by the others, comes back with a perfectly healthy
+/// transport — `group 3/3`, every seat answering pings — and then **deals a game
+/// of its own**: `hand #5 opens at genesis c41cdc63` while the table is on hand
+/// #10, three of its six hands on a genesis nobody else has, every one of them
+/// timing out. The table is fine and plays on. The client is not, and nothing
+/// told it so.
+///
+/// The owner's rule is that a peer this far gone is out — *“ten peer má smůlu a
+/// bude muset být ostatními vyhozen ze hry”* — and the table already does its
+/// half by certifying the seat away. This is the other half: **the client takes
+/// itself out** instead of dealing a private tournament for the rest of the run.
+///
+/// **Two seats, because one is not evidence.** Each `Holding::AnotherHand`
+/// carries a signature this hand has already verified against this table, so a
+/// roster seat naming a hand this client has not reached is that seat's own word
+/// that it is elsewhere. One seat could be mistaken or hostile; two independent
+/// ones cannot both be, and it is the same floor §4.9 puts on a reconciliation
+/// round for the same reason.
+///
+/// **Terminal, deliberately.** Nothing here can catch up: the openings of the
+/// hands in between were derived from settlements this client never saw, and no
+/// message carries one (`S1-Q`, closed by scope). Latching is therefore honest
+/// where a retry would not be.
+fn note_a_hand_ahead(
+    h: &crate::table::hand::Hand,
+    hand_id: u64,
+    seat: Option<u8>,
+    ahead: &mut std::collections::HashMap<u8, u64>,
+    adrift: &mut Option<(u64, u64)>,
+) {
+    // A hand *behind* this client is an ordinary late delivery, and a seat with
+    // no place in the roster is not evidence of anything.
+    let Some(seat) = seat else { return };
+    let mine = h.hand_id();
+    if hand_id <= mine {
+        return;
+    }
+    let furthest = ahead.entry(seat).or_insert(hand_id);
+    *furthest = (*furthest).max(hand_id);
+    if adrift.is_some() {
+        return;
+    }
+    let saying: Vec<u64> = ahead.values().copied().filter(|k| *k > mine).collect();
+    if saying.len() >= 2 {
+        *adrift = Some((saying.iter().copied().max().unwrap_or(hand_id), mine));
+    }
+}
+
 /// T47: hand `k+1`'s `HAND_INIT` stage has completed, so hand `k`'s checkpoint
 /// moves down to the boundary slot.
 ///
