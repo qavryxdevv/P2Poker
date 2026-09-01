@@ -799,7 +799,14 @@ pub struct Play {
     actions: u32,
 
     /// This client's own two, opened when `DEAL_PRIVATE` completed.
-    cards: [Card; 2],
+    ///
+    /// **`None` for a seat that is not dealt in.** §4.4: it *"takes no cards,
+    /// and is not a party to the cryptography"* — and it still plays out the
+    /// hand as a follower, because it is a required emitter of `HAND_COMPLETE`
+    /// and of the boundary checkpoint that §4.9 lets it back in with. An array
+    /// here made that seat's `Play` unbuildable, so the hand stopped dead at
+    /// `read_my_cards` and left the phase `Between` for ever.
+    cards: Option<[Card; 2]>,
 
     /// What each seat showed, by seat.
     ///
@@ -1226,16 +1233,42 @@ impl Hand {
         accepted.sort_unstable();
         let mut stage = Collective::new(0, EventType::HandInit.code(), &o.required, &accepted)
             .ok_or(Failed::NotInThisStage)?;
-        let own_hash = chained::open(&bytes, FRAME_CAP, EventType::HandInit, &slot)
-            .map_err(Failed::Wire)?
-            .event_hash;
-        stage.hear(o.my_seat, own_hash);
+        // **Only a member of `R(HAND_INIT, k) = P(k-1)` emits one, and only a
+        // seat that emitted one counts itself into `P(k)`.**
+        //
+        // §4.10: a seat outside `P(k-1)` *"may legally emit exactly one chained
+        // event"*, and `HAND_INIT` is not it — *"every other chained type from
+        // a seat outside `P(k-1)` … is a divergence under §4.0 step 12a"*. Such
+        // a seat still opens the hand and follows it, which is what §4.9's
+        // readmission route needs of it, and says nothing while it does.
+        //
+        // **The `signed` bool is the half that bites.** It is
+        // `signed_this_hand`, §6.1 hashes it into `PublicTableState`, and the
+        // settlement carries that hash — so a seat that marked itself into its
+        // own `P(k)` for an event no receiver accepted derived a settlement
+        // that differed from everybody's by one bit, and every arriving copy
+        // came back `DeckDisagrees { what: "settlement" }`. Measured, and it
+        // turned §4.9's readmission route into a §6.3 divergence.
+        // **The ACCEPTED set, not the required one**, and the difference is
+        // §4.9's whole readmission route. A seat in `A` is admitted at this
+        // stage without counting towards its completion, and emitting here is
+        // exactly how it earns its way into `P(k)` and is required again at
+        // `k+2`. Gating on `required` instead shut that door on the seat it was
+        // built for — caught by
+        // `a_readmitted_seat_is_accepted_at_stage_zero_and_never_required`.
+        let a_member = accepted.contains(&o.my_seat);
+        let mut signed = vec![false; usize::from(o.max_players)];
+        if a_member {
+            let own_hash = chained::open(&bytes, FRAME_CAP, EventType::HandInit, &slot)
+                .map_err(Failed::Wire)?
+                .event_hash;
+            stage.hear(o.my_seat, own_hash);
+            if let Some(slot) = signed.get_mut(usize::from(o.my_seat)) {
+                *slot = true;
+            }
+        }
 
         let opened_at_ms = now_ms;
-        let mut signed = vec![false; usize::from(o.max_players)];
-        if let Some(slot) = signed.get_mut(usize::from(o.my_seat)) {
-            *slot = true;
-        }
         Ok((
             Hand {
                 signed,
@@ -1266,7 +1299,12 @@ impl Hand {
                 params: DeckParams::new(),
                 early: VecDeque::new(),
             },
-            vec![Send::Broadcast(bytes)],
+            // Nothing goes out from a seat that is in no `R` of this hand.
+            if a_member {
+                vec![Send::Broadcast(bytes)]
+            } else {
+                Vec::new()
+            },
         ))
     }
 
@@ -1495,8 +1533,33 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         self.slot = self.slot.then(parent);
 
+        // **Whether this client is a party to the deck at all.**
+        //
+        // §4.4: *"A seat outside `dealt_in` keeps its stack, pays its blinds
+        // and antes as dead money, takes no cards, and is not a party to the
+        // cryptography."* And the aggregate key is derived the same way by
+        // everybody — *"every peer derives `apk = Σ pk_i` over the **`dealt_in`**
+        // seats in ascending seat order"* — so a seat that adds its own key to
+        // its own sum computes an `apk` over `|dealt_in| + 1` keys that no other
+        // peer will ever match.
+        //
+        // Unguarded, that is not a quiet disagreement: the first `SHUFFLE_PROOF`
+        // fails to verify against the wrong `apk`, and the hand turns that into
+        // `abort_bad_shuffle` — **a §4.10 cause-2 abort naming an honest
+        // shuffler**. Reproduced by
+        // `a_seat_that_is_not_dealt_in_still_follows_the_hand_and_accuses_nobody`.
+        //
+        // The seat still follows the hand: it is a required emitter of
+        // `HAND_INIT`, of `HAND_COMPLETE` and of every checkpoint, and §4.9's
+        // readmission set is written by a checkpoint copy it can only produce by
+        // having followed. So this is a guard on **emitting and self-seeding**,
+        // never on listening.
+        let a_party = self.mine.dealt_in.contains(&self.open.my_seat);
+
         let me = self.open.seats[self.seat_index()].1;
         let ctx = self.deck_ctx(&me);
+        // The key is generated either way: `Phase::Deck` needs a `HandSecret`,
+        // and a secret nothing is encrypted to is inert.
         let (secret, wire_key, proof) = self.params.keygen(&ctx);
         let body = DeckInit {
             key: wire_key.encode(),
@@ -1531,19 +1594,34 @@ impl Hand {
             why: "this client's own proof did not verify",
         })?;
         let own_hash = self.opened(&bytes, EventType::DeckInit)?.event_hash;
-        stage.hear(self.open.my_seat, own_hash);
-
         let mut by_seat = vec![None; usize::from(self.open.max_players)];
-        if let Some(slot) = by_seat.get_mut(usize::from(self.open.my_seat)) {
-            *slot = Some(own);
+        if a_party {
+            stage.hear(self.open.my_seat, own_hash);
+            if let Some(slot) = by_seat.get_mut(usize::from(self.open.my_seat)) {
+                *slot = Some(own);
+            }
         }
         self.phase = Phase::Deck {
             stage,
             by_seat,
-            keys: vec![own],
+            // **Empty for a seat that is not dealt in**, so that `apk` is the
+            // sum over `dealt_in` and nothing else — which is what every other
+            // peer computes for this hand.
+            keys: if a_party { vec![own] } else { Vec::new() },
             secret,
         };
-        Ok(vec![Send::Broadcast(bytes)])
+        // **Nothing is emitted by a seat that is not a party.** §4.4 gives
+        // `DECK_INIT` the emitter set `dealt_in`, and the stage every receiver
+        // built is `Collective::closed` over exactly that — so an out-of-set
+        // copy comes back `Heard::Uninvited`, which `on_event` turns into
+        // `Failed::NotYet` and the node then holds in a bounded queue that the
+        // five-second re-send churns. It is refused everywhere it lands, and
+        // sending it costs the sender the only thing that could still go wrong.
+        Ok(if a_party {
+            vec![Send::Broadcast(bytes)]
+        } else {
+            Vec::new()
+        })
     }
 
     fn on_deck_init(
@@ -2100,6 +2178,35 @@ impl Hand {
         };
 
         let me = self.open.my_seat;
+
+        // **A seat that is not dealt in follows this stage and contributes
+        // nothing to it.** §4.4: it *"takes no cards, and is not a party to the
+        // cryptography"*, so it holds no hole-card indices and no deck key —
+        // and the two lookups below are exactly where that used to stop the
+        // hand dead with `NotInThisStage`, at the `DEAL_PRIVATE` stage, while
+        // every dealt-in seat walked on. Measured: the observer stuck at
+        // sequence 7 while the others reached 21.
+        //
+        // It still needs the stage, because §4.6 gives it *"all `m` tokens for
+        // those indices"* and it must reach the settlement to produce the
+        // checkpoint §4.9 lets it back in with.
+        if !self.mine.dealt_in.contains(&me) {
+            let stage = Collective::closed(
+                self.slot.sequence,
+                EventType::DealPrivate.code(),
+                &self.mine.dealt_in,
+            )
+            .ok_or(Failed::NotInThisStage)?;
+            let dealing = Dealing::new(table.map.clone(), self.mine.dealt_in.clone());
+            self.phase = Phase::Dealing {
+                deal,
+                table,
+                stage,
+                dealing: Box::new(dealing),
+            };
+            return Ok(Vec::new());
+        }
+
         let mine_indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
         let my_key = deal.key_of(me).ok_or(Failed::NotInThisStage)?;
         let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
@@ -2286,18 +2393,28 @@ impl Hand {
         };
 
         let me = self.open.my_seat;
-        let indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
-        let mut cards = Vec::with_capacity(2);
-        for index in indices {
-            let card = dealing
-                .open(&deal.as_ref(&table), index)
-                .map_err(|_| Failed::BadToken {
-                    seat: me,
-                    why: "the stage completed without every share for a card",
-                })?;
-            cards.push(card);
-        }
-        let cards: [Card; 2] = cards.try_into().map_err(|_| Failed::NotInThisStage)?;
+        // **A seat that is not dealt in reads no cards and plays on anyway.**
+        // §4.4 gives it no hole-card indices at all, so this used to end the
+        // hand for it with `NotInThisStage` — and because the phase is taken
+        // out with `mem::replace` above, the failure left it in `Between` for
+        // ever, one stage short of the settlement §4.9 needs it to reach.
+        let cards: Option<[Card; 2]> = if self.mine.dealt_in.contains(&me) {
+            let indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
+            let mut cards = Vec::with_capacity(2);
+            for index in indices {
+                let card =
+                    dealing
+                        .open(&deal.as_ref(&table), index)
+                        .map_err(|_| Failed::BadToken {
+                            seat: me,
+                            why: "the stage completed without every share for a card",
+                        })?;
+                cards.push(card);
+            }
+            Some(cards.try_into().map_err(|_| Failed::NotInThisStage)?)
+        } else {
+            None
+        };
 
         let n = usize::from(self.open.max_players);
         let mut dealt = vec![false; n];
@@ -2690,6 +2807,31 @@ impl Hand {
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
         let me = self.open.my_seat;
+
+        // **A seat that is not dealt in opens the board with everybody else and
+        // contributes no share to it.** §4.6: *"every peer has all `m` tokens
+        // for those indices and opens the cards"* — the shares come from the
+        // dealt-in seats and the board is public, which is what lets a follower
+        // hold the same `PublicTableState` and therefore the same checkpoint.
+        //
+        // It holds no deck key, so `keys_by_seat(me)` is `None`, and this was
+        // the last of the three `NotInThisStage` walls between such a seat and
+        // its own settlement.
+        if !self.mine.dealt_in.contains(&me) {
+            let stage = Collective::closed(
+                self.slot.sequence,
+                EventType::BoardReveal.code(),
+                &self.mine.dealt_in,
+            )
+            .ok_or(Failed::NotInThisStage)?;
+            let Phase::Playing { play, .. } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            play.dealing.advance(RevealStage::Betting(street));
+            play.step = Step::Opening { street, stage };
+            return Ok(Vec::new());
+        }
+
         let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
         let my_key = *self
             .keys_by_seat(me)
@@ -3014,7 +3156,13 @@ impl Hand {
             // nothing to compare against and showing is the safe answer.
             return Ok(true);
         };
-        let mine = evaluate_holdem(play.cards, &board);
+        // A seat with no cards has nothing to show and nothing to compare; it
+        // is `folded` from the start of the hand and never reaches a showdown
+        // decision about its own hand.
+        let Some(my_cards) = play.cards else {
+            return Ok(false);
+        };
+        let mine = evaluate_holdem(my_cards, &board);
         let best_shown = play
             .shown
             .iter()
@@ -3069,7 +3217,11 @@ impl Hand {
             // Its own hand goes on the table here, because nothing else will
             // put it there: every other seat learns it from the message below,
             // and this client is not a receiver of its own messages.
-            let cards = play.cards;
+            let Some(cards) = play.cards else {
+                // Only a seat that was dealt cards reaches a showdown, and this
+                // is the one place that would otherwise have to invent two.
+                return Err(Failed::NotInThisStage);
+            };
             if let Some(slot) = play.shown.get_mut(usize::from(me)) {
                 *slot = Some(cards);
             }
@@ -3309,6 +3461,38 @@ impl Hand {
     /// derivation would leave the chain with no terminal stage if a seat went
     /// quiet between the last reveal and this one.
     fn begin_settlement(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        // **Two different sets, and conflating them is what made this stage the
+        // last wall.** `dealt_in` decides who is a party to the CRYPTOGRAPHY;
+        // `required` decides who is a member of a STAGE. A dead-money seat is
+        // in `required` and outside `dealt_in` — it emits `HAND_COMPLETE` like
+        // everybody else, computed from public state, holding no cards. A seat
+        // outside `required` altogether is in no `R` of this hand (§4.10: it
+        // *"may legally emit exactly one chained event"*, and this is not it),
+        // so it completes the stage by hearing the others and emits nothing.
+        //
+        // Unguarded it did both wrong: it sealed a `HAND_COMPLETE` no receiver
+        // accepts, and `stage.hear` answered `Uninvited` for its own copy, so
+        // the stage could never complete here and the settlement — and with it
+        // the boundary checkpoint §4.9 readmits on — was unreachable.
+        if !self.open.required.contains(&self.open.my_seat) {
+            // It still DERIVES the settlement — from pots, stacks and a board
+            // that are public by construction — because `on_hand_complete`
+            // compares every arriving copy against its own and that comparison
+            // is the whole of how a follower knows it is still in step. What it
+            // does not do is seal one or count itself into the stage.
+            let mine = Box::new(self.settlement()?);
+            let stage = Collective::closed(
+                self.slot.sequence,
+                EventType::HandComplete.code(),
+                &self.open.required,
+            )
+            .ok_or(Failed::NotInThisStage)?;
+            let Phase::Playing { play, .. } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            play.step = Step::Settling { stage, mine };
+            return Ok(Vec::new());
+        }
         let mine = Box::new(self.settlement()?);
         let bytes = self.say(
             EventType::HandComplete,
@@ -5687,7 +5871,7 @@ impl Hand {
     /// show. §22 is kept by there being no card rather than by a check.
     pub fn cards(&self) -> Option<[Card; 2]> {
         match &self.phase {
-            Phase::Playing { play, .. } => Some(play.cards),
+            Phase::Playing { play, .. } => play.cards,
             _ => None,
         }
     }
@@ -7322,11 +7506,11 @@ mod tests {
     /// dealt-in seat's is a sum over `|dealt_in|`, and the first shuffle proof
     /// it checks cannot verify.
     ///
-    /// **Ignored rather than deleted or weakened.** It is the specification the
-    /// fix has to satisfy, it runs on demand with `--ignored`, and an assertion
-    /// softened to today's behaviour would be a test that stops asking.
+    /// **It was written `#[ignore]`d, as the specification the fix had to
+    /// satisfy, and it failed on the accusation.** Four guards later it passes,
+    /// and it is the thing that told each of them apart: the observer stopped at
+    /// sequence 7, then 8, then 10, then 20, each number naming the next wall.
     #[test]
-    #[ignore = "S1-S: an observer seat cannot follow a hand it is not dealt into"]
     fn a_seat_that_is_not_dealt_in_still_follows_the_hand_and_accuses_nobody() {
         // Seat 2 is on the roster and outside `P(k)`, so it is not dealt in.
         let observer: SeatIdx = 2;
@@ -7352,6 +7536,7 @@ mod tests {
         // A broadcast bus: everything anybody says reaches everybody else.
         let mut accusations = 0usize;
         let mut aborts = 0usize;
+        let mut last_refusal: Option<(u64, String)> = None;
         for _ in 0..512 {
             if pending.is_empty() {
                 let Some(turn) = (0..2u8).find_map(|s| hands[usize::from(s)].turn()) else {
@@ -7377,7 +7562,14 @@ mod tests {
             for bytes in batch {
                 for seat in 0..3u8 {
                     let h = &mut hands[usize::from(seat)];
-                    if let Ok(out) = h.on_event(&bytes, &keys[usize::from(seat)], NOW) {
+                    let at = h.slot().sequence;
+                    let answer = h.on_event(&bytes, &keys[usize::from(seat)], NOW);
+                    if seat == observer {
+                        if let Err(e) = &answer {
+                            last_refusal = Some((at, format!("{e:?}")));
+                        }
+                    }
+                    if let Ok(out) = answer {
                         for Send::Broadcast(b) in out {
                             // An abort with an empty `attributed` is the
                             // anonymous deadline abort and names nobody; one
@@ -7425,9 +7617,16 @@ mod tests {
                 "seat {seat} played the hand and reached its settlement"
             );
         }
+        let stopped = (
+            hands[usize::from(observer)].slot().sequence,
+            hands[usize::from(observer)].dealt(),
+            hands[usize::from(observer)].deck_ready(),
+            hands[usize::from(observer)].betting_over(),
+            hands[0].slot().sequence,
+        );
         assert!(
             hands[usize::from(observer)].checkpoint8().is_some(),
-            "and the observer reached the same boundary, which is the only way \
+            "the observer stopped at {stopped:?} (sequence, dealt, deck_ready, betting_over, seat 0's sequence), last refusal {last_refusal:?} \
              back in that section 4.9 gives it"
         );
     }
