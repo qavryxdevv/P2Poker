@@ -116,6 +116,38 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// The one TCP port worth offering for a node, in preference order.
+///
+/// **Only the first port of a node is ever dialled**, and this is toxcore's
+/// doing rather than a choice: `add_tcp_relay_global` deduplicates by the
+/// relay's DHT public key and not by address, so a second
+/// `tox_add_tcp_relay(host, other_port, same_key)` returns -1 and is discarded
+/// — silently, because `tox_add_tcp_relay` answers `true` whenever the hostname
+/// resolved (`TCP_connection.c:1359`, `find_tcp_connection_relay` at `:647`).
+/// Measured: 45 calls from 21 nodes, of which 24 did nothing at all.
+///
+/// And the choice is not recoverable. A relay that fails to complete its
+/// handshake inside `TCP_CONNECTION_TIMEOUT` = 10 s is **wiped and never
+/// retried** — `kill_tcp_relay_connection` at `TCP_connection.c:1679`, because
+/// its status is `TCP_CONN_VALID` rather than `TCP_CONN_CONNECTED` — so a node
+/// whose first port is blocked is lost for the whole run even though it
+/// advertises three others.
+///
+/// So the port is picked rather than stumbled into: **443 first**, because a
+/// network that filters anything usually leaves HTTPS alone; then 3389, which
+/// is commonly open for RDP; then whatever the node offers. The Tox default of
+/// 33445 is the most likely to be blocked and is therefore last among the
+/// named ones.
+pub fn best_tcp_port(ports: &[u16]) -> Option<u16> {
+    const PREFERRED: [u16; 3] = [443, 3389, 33445];
+    for want in PREFERRED {
+        if ports.contains(&want) {
+            return Some(want);
+        }
+    }
+    ports.first().copied()
+}
+
 /// Read `nodes.tox.chat`'s document into nodes, refusing anything unbounded.
 ///
 /// Only nodes reporting **both** UDP and TCP up are taken. A node with neither
@@ -291,6 +323,17 @@ mod tests {
     /// TCP ports — one in the live list does. Without this it was added as a
     /// relay whose host is the four characters `NONE`: a DNS lookup that cannot
     /// succeed and two relay slots spent on nothing, on every start.
+    /// The port is picked, because only the first one offered is ever dialled
+    /// and a node whose first port fails is wiped for the whole run.
+    #[test]
+    fn the_offered_port_prefers_the_one_a_firewall_is_least_likely_to_block() {
+        assert_eq!(best_tcp_port(&[33445, 3389, 443]), Some(443));
+        assert_eq!(best_tcp_port(&[33445, 3389]), Some(3389));
+        assert_eq!(best_tcp_port(&[33445]), Some(33445));
+        assert_eq!(best_tcp_port(&[8080, 9001]), Some(8080), "an unknown port is still a port");
+        assert_eq!(best_tcp_port(&[]), None);
+    }
+
     #[test]
     fn a_node_known_only_by_ipv6_is_skipped_rather_than_dialled_as_none() {
         let doc = r#"{"nodes":[

@@ -208,6 +208,18 @@ impl std::fmt::Display for Failed {
     }
 }
 
+/// Whether LAN discovery is on. Always `true` outside the fault harness.
+#[cfg(feature = "fault-harness")]
+fn local_discovery() -> bool {
+    std::env::var("P2P_POKER_NO_LAN_DISCOVERY").is_err()
+}
+
+/// The product default, in every build that did not ask for the harness.
+#[cfg(not(feature = "fault-harness"))]
+fn local_discovery() -> bool {
+    true
+}
+
 impl Tox {
     /// A new instance, with the network settings D-019 asks for.
     ///
@@ -291,7 +303,18 @@ impl Tox {
             // Two clients on one wire find each other without the DHT. It is
             // also the one discovery path that keeps working when the internet
             // does not.
-            sys::tox_options_set_local_discovery_enabled(opts, true);
+            //
+            // **Switchable under the fault harness, and only there.** toxcore's
+            // `onion_client.c` decides whether it is *"UDP connected"* with
+            // `dht_isconnected`, which counts LAN peers — so several processes
+            // on one machine can LAN-discover each other, take the UDP path for
+            // their onion, and never touch a relay, while
+            // `tox_self_get_connection_status` still answers TCP. That is a
+            // candidate cause of a whole evening of runs where four co-located
+            // processes reported `tox self tcp, tox friends up 0` with 45 relays
+            // accepted and general UDP working. A default cannot be tested by
+            // reading it; this makes the experiment one environment variable.
+            sys::tox_options_set_local_discovery_enabled(opts, local_discovery());
 
             if let Some(key) = secret {
                 sys::tox_options_set_savedata_type(opts, sys::TOX_SAVEDATA_TYPE_SECRET_KEY);

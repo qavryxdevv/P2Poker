@@ -89,9 +89,14 @@ pub struct Reach {
     pub nodes: usize,
     /// Of those, how many `tox_bootstrap` accepted (the DHT, over UDP).
     pub booted: usize,
-    /// How many `tox_add_tcp_relay` accepted, across every advertised port.
-    /// **This is the fallback**, and a zero here with UDP blocked is a client
-    /// that cannot reach anybody.
+    /// How many relays were **offered**, one per node.
+    ///
+    /// Not how many connected: `tox_add_tcp_relay` answers `true` whenever the
+    /// hostname resolved (`tox.c:1186`), so this is a DNS-success count and it
+    /// says so here rather than wearing a name that promises more. What
+    /// toxcore then does with them is its own — it keeps
+    /// `RECOMMENDED_FRIEND_TCP_CONNECTIONS` = 3, chosen by whichever finishes
+    /// its handshake first, and there is no API to influence that.
     pub relays: usize,
     /// Whether the list was re-fetched from the network on this start.
     pub refreshed: bool,
@@ -226,8 +231,13 @@ impl TableSink {
                 if tox.bootstrap(&n.host, n.udp_port, &n.key).is_ok() {
                     booted += 1;
                 }
-                for port in &n.tcp_ports {
-                    if tox.add_tcp_relay(&n.host, *port, &n.key).is_ok() {
+                // **One port, chosen.** toxcore dedups by the relay's public
+                // key, so every port after the first is a silent no-op — 24 of
+                // 45 calls, measured — and a node whose first port does not
+                // complete its handshake in ten seconds is wiped and never
+                // retried on the others. See `nodes::best_tcp_port`.
+                if let Some(port) = crate::tox::nodes::best_tcp_port(&n.tcp_ports) {
+                    if tox.add_tcp_relay(&n.host, port, &n.key).is_ok() {
                         relays += 1;
                     }
                 }
