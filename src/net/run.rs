@@ -473,6 +473,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // because "none arrived" and "several arrived and agreed with me" are
     // different states and were the same silence.
     let mut disputes_seen = 0usize;
+    // Group keys this client has already paired with an application key. One
+    // pairing per peer per run; see `signer_of`.
+    let mut taught: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut readmitted: Vec<u8> = Vec::new();
     let mut hand_one_held_since: Option<std::time::Instant> = None;
     // How many seats the group held when it last grew, and when that was. The
@@ -2754,6 +2757,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // future that never resolves when there is no Tox table, so this
             // branch contributes nothing to the `select!`.
             Some(item) = tox_sink.next() => {
+                // **Learn who this group peer is, once, from a signature.**
+                // The driver reports a sender by its group key and cannot get
+                // further; the roster is keyed by application key. Pairing them
+                // here — where the event is opened anyway — is what makes
+                // D-019's removal able to find its target at all (`S1-I`), and
+                // it costs one open per peer per run.
+                if let (Some(gk), Some(h)) = (item.claimed, hand.as_ref()) {
+                    if !taught.contains(&gk) {
+                        if let Some(app) = signer_of(&item.bytes, h) {
+                            taught.insert(gk);
+                            tox_sink.tell(super::toxsink::Seat::KnownAs {
+                                group_key: gk,
+                                app_key: app,
+                            });
+                        }
+                    }
+                }
                 // Nothing arrives while the link is down.
                 if link_is_down() {
                     continue;
@@ -3587,7 +3607,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // and it is checked here because `Formation` cannot see it.
                 if !ever_dealt {
                     if let Some(f) = table.as_mut().filter(|f| f.is_founder()) {
-                        let silent: Vec<(u8, Vec<u8>)> = f
+                        let silent: Vec<(u8, Vec<u8>, Option<[u8; 32]>)> = f
                             .roster()
                             .seats()
                             .iter()
@@ -3616,10 +3636,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     Err(_) => false,
                                 }
                             })
-                            .map(|e| (e.seat, e.peer_id.clone()))
+                            // The Tox key travels with the seat, because it is
+                            // read from the roster **before** the release takes
+                            // the entry out of it. D-019's kick needs it and it
+                            // is gone a line later.
+                            .map(|e| (e.seat, e.peer_id.clone(), e.tox_key))
                             .collect();
 
-                        for (seat, peer) in silent {
+                        for (seat, peer, tox_key) in silent {
                             match f.release_seat_before_the_first_hand(&peer, now) {
                                 Ok(sends) if !sends.is_empty() => {
                                     let _ = events
@@ -3628,6 +3652,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             SEAT_SILENCE_MS / 1000
                                         )))
                                         .await;
+                                    // **D-019: out of the roster is out of the
+                                    // group.** `Seat::Left` was constructed
+                                    // NOWHERE — only its match arm existed — so
+                                    // `Command::Unseated` was never sent and
+                                    // the kick was dead twice over: nothing
+                                    // asked for it, and `peer_for` could not
+                                    // have answered if anything had (`S1-I`).
+                                    //
+                                    // It is asked for here, at the one place a
+                                    // seat leaves a roster. Whether the driver
+                                    // can find the peer is a second question:
+                                    // the group-key pairing is learned from
+                                    // signed hand traffic, and before hand one
+                                    // there is none — so a seat released during
+                                    // formation is removed from the roster,
+                                    // which is the authority, and left in the
+                                    // group until it is rebuilt. Said here
+                                    // rather than discovered later.
+                                    if let Some(k) = tox_key {
+                                        tox_sink.tell(super::toxsink::Seat::Left(k));
+                                    }
                                     // Only broadcasts come out of a release:
                                     // there is nobody to reply to, because
                                     // nothing asked. A `Reply` here would be a
@@ -4688,6 +4733,21 @@ async fn publish_and_hear(
             }
         }
     }
+}
+
+/// Which application key signed this table message, if it is one and it verifies.
+///
+/// **Used to bridge two key spaces, and it does it with a signature rather than
+/// a guess.** The Tox driver knows a sender by its *group* key; the roster knows
+/// a seat by its application key; `tox.h` maps neither to the other. Opening the
+/// event answers it, and answers it with the only evidence that counts — which
+/// is why the pairing is learned here, where the signature is checked, and not
+/// in the driver, where nothing could check it. `S1-I`.
+fn signer_of(bytes: &[u8], h: &crate::table::hand::Hand) -> Option<[u8; 32]> {
+    let (kind, hand_id, _) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK).ok()?;
+    crate::net::chained::open_in_hand(bytes, TABLE_FRAME_PEEK, kind, &h.table_id(), hand_id)
+        .ok()
+        .map(|o| o.sender)
 }
 
 /// §6.3 step 2, on the receiving side: a dispute is a **carrier**, and what

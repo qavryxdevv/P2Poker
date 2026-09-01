@@ -95,6 +95,12 @@ pub enum Command {
     /// and pretending otherwise would put a second membership answer beside
     /// the roster's.
     Unseated([u8; 32]),
+    /// A group peer's own key, and the application key that was verified to
+    /// have signed a message from it. See `peer_for`.
+    KnownAs {
+        group_key: [u8; 32],
+        app_key: [u8; 32],
+    },
     /// **This seat is here again and needs the group offered to it afresh.**
     ///
     /// A client that restarts has left the group, and nothing the founder can
@@ -408,6 +414,12 @@ fn run(
     // owns the list, and a second caller would make the same mistake.
     let me: [u8; 32] = tox.address()[..32].try_into().unwrap_or([0u8; 32]);
     let mut roster: Vec<[u8; 32]> = setup.roster.iter().copied().filter(|k| *k != me).collect();
+    // A group peer's own key, against the application key verified to have
+    // signed a message from it. The only authenticated bridge between the two
+    // key spaces `S1-I` found this client comparing across. Bounded by the
+    // group, which is private and at most `MAX_SEATS`.
+    let mut known_as: std::collections::HashMap<[u8; 32], [u8; 32]> =
+        std::collections::HashMap::new();
     for key in &roster {
         if let Ok(n) = tox.add_friend(key) {
             friends.insert(n, *key);
@@ -460,6 +472,15 @@ fn run(
                         friends.insert(n, key);
                     }
                 }
+                // What signed traffic has taught this client about who is who
+                // in the group: a peer's **group** key, paired with the
+                // **application** key whose signature the node loop verified on
+                // a message from it. The only authenticated bridge between the
+                // two key spaces, and it needs no new message because every
+                // hand event already carries one.
+                Command::KnownAs { group_key, app_key } => {
+                    known_as.insert(group_key, app_key);
+                }
                 Command::Unseated(key) => {
                     roster.retain(|k| *k != key);
                     // Removed from the group where this client is the admin.
@@ -468,7 +489,7 @@ fn run(
                     // beside the roster's.
                     if matches!(setup.role, Role::Host) {
                         if let Some(g) = group {
-                            if let Some(peer) = peer_for(&tox, g, &key) {
+                            if let Some(peer) = peer_for(&tox, g, &key, &known_as) {
                                 let _ = tox.kick(g, peer);
                             }
                         }
@@ -592,18 +613,34 @@ fn run(
                         }
                     }
                 }
-                Event::GroupPacket { peer, data, .. } => {
+                Event::GroupPacket { group: g, peer, data } => {
                     // Reassembled here, so nothing above this module ever sees
                     // a fragment. A refusal costs this sender its part-built
                     // message and nothing else — see `table::fragment` for what
                     // each one means.
                     match reassembler.accept(&peer, &data, millis()) {
                         Ok(Some(message)) => {
-                            // `claimed` is None on purpose. A group peer id
-                            // resolves to a Tox key, which is not a player's
-                            // signing key and is not evidence about one.
+                            // **The sender's GROUP key, and it is advisory —
+                            // which is what `FromTable::claimed` has always
+                            // promised.** It is not a player's signing key and
+                            // is not evidence about one; the signature inside
+                            // the message is the only thing that says who
+                            // spoke.
+                            //
+                            // It was `None`, and discarding it cost D-019's
+                            // kick: `peer_for` compared a peer's group key
+                            // against the roster's **friend** key, which
+                            // `tox.h:3823` says are different things — a group
+                            // key is *"permanently tied to a particular peer"*
+                            // per group, while the roster holds the long-term
+                            // key `tox_friend_add_norequest` uses. The
+                            // comparison could never be true, so no player was
+                            // ever removed from a group. Carried out here, the
+                            // node loop can pair it with the application key
+                            // that signed the message and learn the mapping
+                            // from **verified** traffic instead. `S1-I`.
                             let item = FromTable {
-                                claimed: None,
+                                claimed: tox.peer_key(g, peer).ok(),
                                 bytes: message,
                             };
                             if inbox.try_send(item).is_err() {
@@ -846,11 +883,36 @@ fn announce(
 }
 
 /// Which group peer holds this Tox public key, if any.
-fn peer_for(tox: &Tox, group: u32, key: &[u8; 32]) -> Option<u32> {
-    // Peer ids are small and dense, and a table is at most ten seats. Scanning
-    // is cheaper than keeping a map in step with joins and parts, and a map
-    // that drifted would remove the wrong player.
-    (0..Tox::PEER_SCAN).find(|p| tox.peer_key(group, *p).as_ref() == Ok(key))
+/// Which group peer is the seat holding this **application** key.
+///
+/// **Two key spaces, and comparing across them was `S1-I`.** This used to test
+/// `tox_group_peer_get_public_key` against the roster's key directly, and
+/// `tox.h:3823` says that value is the peer's *group* public key — *"permanently
+/// tied to a particular peer … the only way to reliably identify the same peer
+/// across client restarts"* — a per-group identity, not the long-term friend key
+/// the roster holds. The test could never be true, so `tox.kick` was never
+/// reached and D-019's removal never once happened.
+///
+/// The bridge is `known_as`, built from **verified** traffic: the node loop
+/// checks a message's signature, learns which application key signed it, and
+/// pairs that with the group key the transport reported. Nothing here is
+/// trusted — a wrong pairing can only fail to find a peer, and the roster
+/// remains the only authority on who is seated.
+///
+/// Peer ids are small and dense and a table is at most ten seats, so scanning
+/// beats keeping a second map in step with joins and parts.
+fn peer_for(
+    tox: &Tox,
+    group: u32,
+    app_key: &[u8; 32],
+    known_as: &std::collections::HashMap<[u8; 32], [u8; 32]>,
+) -> Option<u32> {
+    (0..Tox::PEER_SCAN).find(|p| {
+        tox.peer_key(group, *p)
+            .ok()
+            .and_then(|g| known_as.get(&g))
+            .is_some_and(|a| a == app_key)
+    })
 }
 
 /// Milliseconds for the reassembler's timers.

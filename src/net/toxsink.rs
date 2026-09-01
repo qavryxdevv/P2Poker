@@ -56,6 +56,17 @@ pub enum Seat {
     /// It is back after a restart and needs the group offered again. See
     /// `tox::table::Command::Rejoined` for why nothing else notices.
     Back([u8; 32]),
+    /// A group peer's own key, and the **application** key that was verified to
+    /// have signed a message from it.
+    ///
+    /// The bridge between two key spaces the driver cannot cross on its own: a
+    /// group key identifies a peer inside one group, the roster holds a
+    /// long-term key, and `tox.h` offers nothing that maps one to the other.
+    /// The signature does, and every hand event carries one. `S1-I`.
+    KnownAs {
+        group_key: [u8; 32],
+        app_key: [u8; 32],
+    },
 }
 
 /// The table's game transport, when there is one.
@@ -465,6 +476,13 @@ impl TableSink {
                     Seat::Took(k) => Command::Seated(k),
                     Seat::Left(k) => Command::Unseated(k),
                     Seat::Back(k) => Command::Rejoined(k),
+                    Seat::KnownAs {
+                        group_key,
+                        app_key,
+                    } => Command::KnownAs {
+                        group_key,
+                        app_key,
+                    },
                 });
             }
         }
