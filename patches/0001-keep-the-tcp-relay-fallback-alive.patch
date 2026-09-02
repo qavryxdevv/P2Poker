@@ -1,8 +1,8 @@
 diff --git a/toxcore/onion_client.c b/toxcore/onion_client.c
-index 041a0d8..f7ee4e5 100644
+index 041a0d8..6899d41 100644
 --- a/toxcore/onion_client.c
 +++ b/toxcore/onion_client.c
-@@ -2166,7 +2166,31 @@ void do_onion_client(Onion_Client *onion_c)
+@@ -2166,7 +2166,49 @@ void do_onion_client(Onion_Client *onion_c)
      onion_c->udp_connected = dht_non_lan_connected(onion_c->dht);
  
      if (mono_time_is_timeout(onion_c->mono_time, onion_c->first_run, ONION_CONNECTION_SECONDS * 2)) {
@@ -25,6 +25,24 @@ index 041a0d8..f7ee4e5 100644
 +         * Measured across two subnets before this change: the joiner logged that
 +         * error at 72.5 s and again after each of three re-invitations, and the
 +         * group stayed at 0 seen / 0 confirmed for the whole run.
++         *
++         * THERE ARE TWO TCP_Connections INSTANCES AND THEY ARE EASY TO CONFUSE.
++         * This one is net_crypto's, and it is the one the invite confirmation
++         * is built from: handle_gc_invite_accepted_packet fills its relay list
++         * from nc_get_tcp_c(m->net_crypto) at group_chats.c:8012. Every chat
++         * ALSO has its own separate instance -- chat->tcp_conn, created in
++         * init_gc_tcp_connection -- and set_tcp_onion_status is never called on
++         * that one (this is its only call site in the tree). The chat instance
++         * is what the DHT announce reads (Messenger.c:2458) and what the
++         * per-peer relay sharing reads (group_chats.c:2035), and it is seeded
++         * only by copying main's CONNECTED relays at the moment the chat is
++         * created (group_chats.c:7249), behind a refill gate that latches once
++         * main's connected count stops changing (:7061).
++         *
++         * So this patch fixes the confirmation DIRECTLY, and reaches the chat
++         * instance only through that single copy -- which is why the founder
++         * must not create its group before its transport is up. The Rust side
++         * waits for exactly that: HOST_SEED_WAIT in src/tox/table.rs.
 +         *
 +         * `true` costs NUM_ONION_TCP_CONNECTIONS = 3 idle TCP relay connections
 +         * for the life of the process, which is what every other Tox client
