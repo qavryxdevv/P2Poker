@@ -3684,7 +3684,7 @@ impl Hand {
             ledger_in: self.mine.stacks.iter().sum(),
             ledger_out: 0,
             transcript_head: self.slot.previous_event_hash,
-            signed_this_hand: self.signed.clone(),
+            signed_this_hand: self.heard_from_flags().to_vec(),
         };
         view.state_hash()
             .map_err(|_| Failed::Wire(WireError::Unencodable("the end-of-hand state")))
@@ -3930,7 +3930,8 @@ impl Hand {
     /// This comment used to end: *"changing `participants` would move
     /// `state_hash`, which is a §6.1 wire change"*. **It would not.**
     /// [`state_hash`](Self::state_hash) fills `signed_this_hand` from
-    /// `self.signed` directly; `participants()` has no caller inside it, and
+    /// [`heard_from_flags`](Self::heard_from_flags); `participants()` has no
+    /// caller inside it, and
     /// outside this file it is read only by `run.rs` to build §4.9's required
     /// emitter set. Changing it moves `P(k)` and leaves §6.1 field 28
     /// byte-identical. The `S1-V` row inherited the same false sentence and both
@@ -3953,23 +3954,64 @@ impl Hand {
     /// So what remains is only whether `R(k+1)` should be derived from
     /// certification or from having been heard, and that is `Q-10` — *"nothing
     /// ratifies the stalled stage, and no construction can"*. This method's
-    /// value is unchanged: **one named place with both definitions written next
-    /// to each other**, instead of a closure in one derivation and a field read
-    /// in three others.
+    /// value is unchanged in kind and sharper in shape: **both definitions
+    /// are named functions written next to each other**, and all four readers
+    /// go through one of them, where before there was a closure in one
+    /// derivation and three separate reads of the raw field in the others.
+    /// That does not answer `Q-10` and is not meant to; it makes answering it
+    /// an edit to one call site rather than a search.
+    /// Was this seat **heard from** during hand `k`?
+    ///
+    /// The other half of `S1-V`'s pair, and the one §4.9 asks for: `P(k)` is
+    /// *the seats this client accepted a chained event from*, which is exactly
+    /// this flag. [`participants`](Self::participants) is this predicate as a
+    /// seat list and [`heard_from_flags`](Self::heard_from_flags) is the same
+    /// thing in the shape §6.1 field 28 wants; all three are one fact.
+    ///
+    /// **It is deliberately not the same question as
+    /// [`took_part`](Self::took_part)**, which sits directly below so the
+    /// difference is read rather than reconstructed. This one is an
+    /// observation — what *this* client heard — and `took_part` is an
+    /// agreement — what every peer holds a certificate about. They diverge at
+    /// a seat certified absent whose events were nonetheless heard, or the
+    /// reverse, and which of them `R(k+1)` should be derived from is `Q-10`.
+    ///
+    /// Routing all four readers through these two names does not answer
+    /// `Q-10`, and is not meant to. It makes the divergence a visible choice
+    /// between two documented functions instead of a structural accident
+    /// between a closure and three copies of a field read — so that when
+    /// `Q-10` is answered, the edit is one call site rather than a search.
+    ///
+    /// An out-of-range seat is not heard from. That is the same answer the
+    /// three separate field reads gave, kept deliberately: a seat index past
+    /// `max_players` cannot have signed anything.
+    pub fn heard_from(&self, seat: SeatIdx) -> bool {
+        self.signed.get(usize::from(seat)).copied().unwrap_or(false)
+    }
+
+    /// [`heard_from`](Self::heard_from) for every seat, in seat order.
+    ///
+    /// §6.1 hashes `signed_this_hand` as a flag per seat rather than as a list,
+    /// so [`state_hash`](Self::state_hash) needs this shape. It is the stored
+    /// vector and it is the wire's own ordering, which is why this returns it
+    /// rather than rebuilding it: a rebuild that disagreed with the field by
+    /// one element would move field 28 and be found at a boundary checkpoint,
+    /// not here.
+    pub fn heard_from_flags(&self) -> &[bool] {
+        &self.signed
+    }
+
     pub fn took_part(&self, seat: SeatIdx) -> bool {
         if self.open.required.len() >= 3 {
             !self.certified.contains(&seat)
         } else {
-            self.signed.get(usize::from(seat)).copied().unwrap_or(false)
+            self.heard_from(seat)
         }
     }
 
     pub fn participants(&self) -> Vec<SeatIdx> {
-        self.signed
-            .iter()
-            .enumerate()
-            .filter(|(_, signed)| **signed)
-            .filter_map(|(seat, _)| u8::try_from(seat).ok())
+        (0..self.open.max_players)
+            .filter(|seat| self.heard_from(*seat))
             .collect()
     }
 
@@ -5678,7 +5720,7 @@ impl Hand {
             })
             .collect();
         let signed: Vec<SeatIdx> = (0..self.open.max_players)
-            .filter(|s| self.signed.get(usize::from(*s)).copied().unwrap_or(false))
+            .filter(|s| self.heard_from(*s))
             .collect();
         format!(
             "roster from: required {:?} certified {:?} strikes {:?} grace {:?} signed {signed:?} stacked {stacked:?} by_certificate={}",
