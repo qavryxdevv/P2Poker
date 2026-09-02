@@ -218,6 +218,17 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     `$p = "$FarDir\split-n`$i"
     if (Test-Path `$p) { Remove-Item -Recurse -Force `$p }
     New-Item -ItemType Directory -Force -Path `$p | Out-Null
+    # A stable identity per far seat, for the reason given at the local seats
+    # above: an empty profile mints a peer id that haunts the lobby key for 48 h.
+    `$seatKeys = Join-Path `$env:LOCALAPPDATA 'p2p-poker-test-seats'
+    `$seed = Join-Path `$seatKeys "far-n`$i.key"
+    if (-not (Test-Path `$seed)) {
+        New-Item -ItemType Directory -Force -Path `$seatKeys | Out-Null
+        `$b = New-Object byte[] 32
+        [System.Security.Cryptography.RandomNumberGenerator]::Fill(`$b)
+        [System.IO.File]::WriteAllBytes(`$seed, `$b)
+    }
+    Copy-Item `$seed (Join-Path `$p 'identity.key') -Force
     `$log = "$FarDir\split-n`$i.log"
     `$jobs += Start-Job -ArgumentList `$p, `$log, `$i -ScriptBlock {
         param(`$p, `$log, `$seat)
@@ -251,6 +262,35 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     for ($i = 0; $i -lt $Here; $i++) {
         $profileDir = Join-Path $work "n$i"
         New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+        # **A stable identity per seat, because a fresh one is a permanent
+        # ghost.** An empty profile makes `load_or_create_identity`
+        # (`src/storage/profile.rs:55`) mint a new 32-byte Ed25519 seed, and that
+        # brand-new peer id announces itself on the public lobby key. Kademlia
+        # has no unprovide and `stop_providing` is local only, so the record
+        # outlives the process by the storing node's TTL -- 48 h. One seat-start
+        # was one permanent ghost.
+        #
+        # Measured before this existed: 1020 identities of ours on the lobby key,
+        # of which a run saw 598 and could reach none. See `DECISIONS.md` S1-AI.
+        # Reusing one seed per seat index turns that into 4-20 recurring ids and
+        # lets the graveyard drain itself inside two days.
+        #
+        # The file is 32 raw bytes with no header, which is exactly what the
+        # client reads; a file it cannot parse is refused rather than
+        # overwritten, so a damaged seed fails loudly.
+        #
+        # Cost: two runs can no longer be told apart by peer id -- use the seat
+        # names -- and two concurrent runs on this machine would collide on a
+        # seat index. This harness starts one table at a time.
+        $seatKeys = Join-Path $env:LOCALAPPDATA 'p2p-poker-test-seats'
+        $seed = Join-Path $seatKeys "here-n$i.key"
+        if (-not (Test-Path $seed)) {
+            New-Item -ItemType Directory -Force -Path $seatKeys | Out-Null
+            $b = New-Object byte[] 32
+            [System.Security.Cryptography.RandomNumberGenerator]::Fill($b)
+            [System.IO.File]::WriteAllBytes($seed, $b)
+        }
+        Copy-Item $seed (Join-Path $profileDir 'identity.key') -Force
         $log = Join-Path $work "n$i.log"
         $nodeArgs = @('--headless', '--autoplay', '--for', "$Seconds", '--profile', $profileDir)
         if ($NoMdns) { $nodeArgs += '--no-mdns' }
