@@ -3898,6 +3898,43 @@ impl Hand {
     /// The required emitter set of the boundary checkpoint's `STATE_HASH`
     /// stage (§4.9: *"at checkpoint 8 it is `P(k)`"*), and the set §4.4 draws
     /// the next hand's `dealt_in` from.
+    /// Whether this seat took part in this hand, for the purpose of deriving
+    /// the **next** one.
+    ///
+    /// Where a certificate is possible — three seats or more, D-023's floor —
+    /// absence means **certified** absence and nothing else, because a
+    /// certificate is an artefact every peer holds and agrees about by
+    /// construction. Heads-up there can be no certificate at all and this falls
+    /// back to observation, which is safe for the only reason it is ever safe:
+    /// with one other peer there is nobody to disagree with.
+    ///
+    /// # This is not the same question `participants` answers, and that is `S1-V`
+    ///
+    /// [`participants`](Self::participants) returns the raw `signed` set — who
+    /// was **heard from** — and it is what §6.1 hashes as `signed_this_hand` and
+    /// what §4.9 makes the boundary checkpoint's required set. This method is
+    /// what `R(k+1)` and the whole `grace`/`present_run` fold read.
+    ///
+    /// So the quantity every peer **compares** at the checkpoint and the
+    /// quantity every peer **acts on** at the next hand are different
+    /// quantities, and they differ exactly at a seat that was certified absent
+    /// while its events were nonetheless heard, or the reverse.
+    ///
+    /// **Which one is right is `Q-10`'s question**, which the corpus asks of
+    /// itself and leaves open — *"nothing ratifies the stalled stage, and no
+    /// construction can"*. It is not settled here and neither reader is changed:
+    /// changing `participants` would move `state_hash`, which is a §6.1 wire
+    /// change. What this method does is make the disagreement **one named place
+    /// with both definitions written next to each other**, instead of a closure
+    /// in one derivation and a field read in three others.
+    pub fn took_part(&self, seat: SeatIdx) -> bool {
+        if self.open.required.len() >= 3 {
+            !self.certified.contains(&seat)
+        } else {
+            self.signed.get(usize::from(seat)).copied().unwrap_or(false)
+        }
+    }
+
     pub fn participants(&self) -> Vec<SeatIdx> {
         self.signed
             .iter()
@@ -6102,13 +6139,11 @@ impl Hand {
         // nothing else. Heads-up there can be no certificate at all, and this
         // falls back to observation, which is safe for the only reason it is
         // ever safe: with one other peer there is nobody to disagree with.
+        // The same test `took_part` applies, kept here because the two
+        // branches below differ in more than the predicate.
         let by_certificate = self.open.required.len() >= 3;
         let took_part = |me: &Self, seat: usize| -> bool {
-            if by_certificate {
-                !me.certified.contains(&(seat as SeatIdx))
-            } else {
-                me.signed.get(seat).copied().unwrap_or(false)
-            }
+            me.took_part(seat as SeatIdx)
         };
         for seat in 0..n {
             if !alive.get(seat).copied().unwrap_or(false) {
