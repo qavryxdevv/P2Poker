@@ -447,6 +447,30 @@ if ($slow.Count -gt 0) {
     $KeepLogs = $true
 }
 
+# **The shapes this summary cannot see, from the script that can.**
+#
+# Everything above counts hands. Three failures measured on 2026-09-02 do not
+# show up in a hand count at all: a seat that never entered the group opens
+# nothing and contributes a quiet zero; a seat whose stage stalled leaves the
+# others waiting while its own line says it is present; and a seat one
+# ratification short of a full set (`S1-P`) never computes a session, never
+# opens a hand, and is invisible from every side. The last of those sat at
+# `ratified 1/10` for six and a half minutes of a ten-seat run whose summary
+# looked healthy, and the logs were deleted.
+#
+# So the classifier runs before the cleanup decision and its verdict keeps the
+# logs. It is a separate script because it must also be usable on runs already
+# on disk, including ones from before it existed.
+$classifier = Join-Path $PSScriptRoot 'classify-run.ps1'
+if (Test-Path $classifier) {
+    $verdict = & powershell -NoProfile -File $classifier -Dir $work 2>&1 | Out-String
+    if ($verdict -notmatch 'verdict: clean') {
+        Write-Host ''
+        Write-Host ($verdict.Trim())
+        $KeepLogs = $true
+    }
+}
+
 # Seconds per hand from consecutive opens, first interval dropped. See the note
 # in the header: hand 1 measures formation.
 if ($opens.Count -ge 3) {
