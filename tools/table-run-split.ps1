@@ -142,9 +142,32 @@ $ssh = @('-i', $privKey,
          '-o', "BindAddress=$bind",
          '-o', 'StrictHostKeyChecking=accept-new',
          '-o', 'UserKnownHostsFile=NUL',
+         # `UserKnownHostsFile=NUL` means the host key is re-added on every call,
+         # so `ssh` prints *Permanently added ... to the list of known hosts* to
+         # stderr every time. Under `$ErrorActionPreference = 'Stop'` PowerShell
+         # turns a native command's stderr into a terminating NativeCommandError,
+         # so that warning alone killed a run. Silenced at the source; real
+         # errors still print.
+         '-o', 'LogLevel=ERROR',
          '-o', 'BatchMode=yes')
 
 try {
+    # **Stop any seat left running on the far end before copying over it.**
+    #
+    # The far seats are started detached, so ending the run here ends the `ssh`
+    # and not them. They keep `p2p-poker.exe` open, and the next run's copy
+    # fails with `dest open "C:/p2ptest/p2p-poker.exe": Failure` — which reads
+    # like a permissions or path problem on a directory that is perfectly fine.
+    #
+    # Measured, and it had already cost two runs by the time it was seen: five
+    # seats from the previous day were still running, holding the previous
+    # day's binary, and because the script copy had failed too the far end was
+    # obediently running *yesterday's* `far.ps1` — five seats for a two-seat
+    # table, against a binary without any of the day's fixes in it.
+    Write-Host '==> stopping any seat left running on the far end'
+    & ssh @ssh $Target 'powershell -NoProfile -Command "Get-Process p2p-poker -ErrorAction SilentlyContinue | Stop-Process -Force"' 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 800
+
     Write-Host '==> copying the binary to the far end'
     & ssh @ssh $Target "if not exist $FarDir mkdir $FarDir" | Out-Null
     # **A copy that fails must stop the run.** It used to be piped to
