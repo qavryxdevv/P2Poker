@@ -37,7 +37,8 @@ use minicbor::{Decode, Encode};
 
 use crate::poker::state::Hash;
 use crate::protocol::constants::{
-    JOIN_REQ_MAX, JOIN_RESP_MAX, MAX_SEATS, TABLE_AD_SIGNED_MAX,
+    JOIN_ACCEPT_MAX, JOIN_REJECT_MAX, JOIN_REQUEST_MAX, JOIN_REQ_MAX, JOIN_RESP_MAX,
+    MAX_SEATS, PLAYER_LIST_MAX, TABLE_AD_SIGNED_MAX, TABLE_READY_MAX,
 };
 use crate::protocol::messages::{EventBody, EventType, SignedEvent, PROTOCOL_VERSION};
 use crate::protocol::serialization::{from_canonical, to_canonical};
@@ -302,7 +303,7 @@ fn seal_ready(
 ) -> Result<Vec<u8>, WireError> {
     let payload_bytes =
         to_canonical(payload).map_err(|_| WireError::Unencodable("the payload"))?;
-    if payload_bytes.len() > JOIN_RESP_MAX {
+    if payload_bytes.len() > TABLE_READY_MAX {
         return Err(WireError::TooLong("the payload is over its cap"));
     }
     let envelope = EventBody {
@@ -427,7 +428,7 @@ pub fn publish_join_request(
 /// cannot compute later because the bytes are gone by then.
 pub fn receive_join_request(bytes: &[u8]) -> Result<(JoinRequest, [u8; 32], Hash), WireError> {
     let o = open(bytes, JOIN_REQ_MAX, EventType::JoinRequest)?;
-    let b: JoinRequestBody = payload_of(&o, JOIN_REQ_MAX)?;
+    let b: JoinRequestBody = payload_of(&o, JOIN_REQUEST_MAX)?;
 
     if b.peer_id.len() > PEER_ID_MAX {
         return Err(WireError::TooLong("peer_id"));
@@ -493,7 +494,7 @@ pub fn publish_join_accept(
 /// module's: the rules live next door and this returns what they need.
 pub fn receive_join_accept(bytes: &[u8]) -> Result<(JoinAccept, [u8; 32]), WireError> {
     let o = open(bytes, JOIN_RESP_MAX, EventType::JoinAccept)?;
-    let b: JoinAcceptBody = payload_of(&o, JOIN_RESP_MAX)?;
+    let b: JoinAcceptBody = payload_of(&o, JOIN_ACCEPT_MAX)?;
     if b.advert_event.len() > TABLE_AD_SIGNED_MAX {
         return Err(WireError::TooLong("advert_event"));
     }
@@ -543,7 +544,7 @@ pub fn publish_join_reject(
 /// anything and the reason is returned as the number it is.
 pub fn receive_join_reject(bytes: &[u8]) -> Result<(Hash, u16, u32, [u8; 32]), WireError> {
     let o = open(bytes, JOIN_RESP_MAX, EventType::JoinReject)?;
-    let b: JoinRejectBody = payload_of(&o, JOIN_RESP_MAX)?;
+    let b: JoinRejectBody = payload_of(&o, JOIN_REJECT_MAX)?;
     Ok((b.request_hash, b.reason, b.retry_after_ms, o.sender))
 }
 
@@ -588,7 +589,7 @@ pub fn receive_player_list_at(
     bytes: &[u8],
 ) -> Result<(PlayerList, [u8; 32], u64), WireError> {
     let o = open(bytes, JOIN_RESP_MAX, EventType::PlayerList)?;
-    let b: PlayerListBody = payload_of(&o, JOIN_RESP_MAX)?;
+    let b: PlayerListBody = payload_of(&o, PLAYER_LIST_MAX)?;
     Ok((
         PlayerList {
             roster: roster_in(b.roster)?,
@@ -665,7 +666,7 @@ pub fn receive_table_ready(
         ));
     }
 
-    let b: TableReadyBody = payload_of(&o, JOIN_RESP_MAX)?;
+    let b: TableReadyBody = payload_of(&o, TABLE_READY_MAX)?;
     if b.capability_set.len() > MAX_CAPABILITIES {
         return Err(WireError::TooLong("capability_set"));
     }
@@ -688,6 +689,11 @@ pub fn receive_table_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The family caps, which the production paths no longer use: §9.3 gives
+    // every message its own and `S1-W` is that the shared ones enforced none of
+    // them. Kept here because these tests decode arbitrary bytes and want a
+    // ceiling that is not the one under test.
+
     use crate::protocol::messages::ZERO32;
     use crate::security::rng::secret_32;
 
@@ -1033,7 +1039,7 @@ mod tests {
             list_serial: 1,
         };
         let wire =
-            seal_unchained(EventType::PlayerList, &body, &table, NOW, JOIN_RESP_MAX).unwrap();
+            seal_unchained(EventType::PlayerList, &body, &table, NOW, PLAYER_LIST_MAX).unwrap();
         assert_eq!(receive_player_list(&wire), Err(WireError::TooLong("roster")));
 
         let mut e = entry(0);
@@ -1044,7 +1050,7 @@ mod tests {
             list_serial: 1,
         };
         let wire =
-            seal_unchained(EventType::PlayerList, &body, &table, NOW, JOIN_RESP_MAX).unwrap();
+            seal_unchained(EventType::PlayerList, &body, &table, NOW, PLAYER_LIST_MAX).unwrap();
         assert_eq!(
             receive_player_list(&wire),
             Err(WireError::TooLong("peer_id"))
@@ -1065,7 +1071,7 @@ mod tests {
             list_serial: 1,
         };
         let wire =
-            seal_unchained(EventType::PlayerList, &body, &table, NOW, JOIN_RESP_MAX).unwrap();
+            seal_unchained(EventType::PlayerList, &body, &table, NOW, PLAYER_LIST_MAX).unwrap();
         assert!(receive_player_list(&wire).is_err());
     }
 

@@ -276,3 +276,32 @@ fn stated_value(line: &str, name: &str) -> Option<u128> {
     }
     None
 }
+
+
+/// §9.3 gives every message its own payload cap, and until `S1-W` the code
+/// enforced one shared number for the whole join family.
+///
+/// `JOIN_REQUEST` is published at 512 and was checked at 4 096; `JOIN_ACCEPT`
+/// at 8 192, `JOIN_REJECT` at 128, `PLAYER_LIST` at 2 048 and `TABLE_READY` at
+/// 1 024 were all checked at 16 384. Four published bounds enforced by nothing,
+/// and a client built to §9.3 would have refused messages this one considers
+/// legal.
+///
+/// **The caps are on the payload and not on the frame**, which is the mistake
+/// worth pinning: applied to the whole signed event, `JOIN_REJECT`'s 128 is
+/// smaller than the envelope alone — 32 bytes of table id, 32 of sender key, 32
+/// of parent hash and 64 of signature — so every message of that type failed to
+/// decode. The published number is the payload's.
+#[test]
+fn the_join_family_enforces_section_9_3s_own_caps() {
+    use p2p_poker::protocol::constants::*;
+    for (name, code, published) in [
+        ("JOIN_REQUEST", JOIN_REQUEST_MAX, 512usize),
+        ("JOIN_ACCEPT", JOIN_ACCEPT_MAX, 8_192),
+        ("JOIN_REJECT", JOIN_REJECT_MAX, 128),
+        ("PLAYER_LIST", PLAYER_LIST_MAX, 2_048),
+        ("TABLE_READY", TABLE_READY_MAX, 1_024),
+    ] {
+        assert_eq!(code, published, "{name}'s cap is §9.3's");
+    }
+}
