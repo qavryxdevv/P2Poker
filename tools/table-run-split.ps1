@@ -164,8 +164,11 @@ try {
     # day's binary, and because the script copy had failed too the far end was
     # obediently running *yesterday's* `far.ps1` — five seats for a two-seat
     # table, against a binary without any of the day's fixes in it.
+    # No pipe in the remote command: the far end's login shell is `cmd.exe`,
+    # which splits on `|` before PowerShell ever sees it and answers
+    # *'Stop-Process' is not recognized as an internal or external command*.
     Write-Host '==> stopping any seat left running on the far end'
-    & ssh @ssh $Target 'powershell -NoProfile -Command "Get-Process p2p-poker -ErrorAction SilentlyContinue | Stop-Process -Force"' 2>&1 | Out-Null
+    & ssh @ssh $Target 'powershell -NoProfile -Command "Stop-Process -Name p2p-poker -Force -ErrorAction SilentlyContinue"' 2>&1 | Out-Null
     Start-Sleep -Milliseconds 800
 
     Write-Host '==> copying the binary to the far end'
