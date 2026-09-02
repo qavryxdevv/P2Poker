@@ -527,6 +527,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut adrift_said = false;
     // Said once: this client is on a TCP relay and the group is not filling.
     let mut udp_warned = false;
+    // **A checkpoint copy that arrived before this client opened its own
+    // boundary, held rather than dropped.**
+    //
+    // Peers finish a hand milliseconds apart and open their boundaries in that
+    // order, so a faster seat's `STATE_HASH` routinely reaches a slower one
+    // before there is a boundary to put it in. `checkpoint_event` answered that
+    // with `return None` and the copy was gone — and the sender does not repeat
+    // it on demand, because nothing tells it to. The slower seat then waits for
+    // a value that was delivered and discarded, which reads from every side as
+    // a message that never arrived.
+    //
+    // Bounded on both axes: two hands, and one copy per seat per hand. A hold
+    // queue that grows is a way to be attacked, and a copy older than two hands
+    // belongs to a boundary the store has already released anyway.
+    let mut early_checkpoints: std::collections::HashMap<u64, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
     // **The number nobody has: how many private addresses the real Amino DHT
     // hands this client.** `S1-AC`'s filter counts what it refuses, so the
     // figure arrives as a byproduct of the defence instead of needing a second
@@ -1499,6 +1515,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &mut frozen,
                                     &roster_seats,
                                     &mut no_round_said,
+                                    &mut early_checkpoints,
                                     &profile_dir,
                                     &events,
                                 )
@@ -1543,6 +1560,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 &mut frozen,
                                                 &roster_seats,
                                                 &mut no_round_said,
+                                                &mut early_checkpoints,
                                                 &profile_dir,
                                                 &events,
                                                 table_topic.as_ref(),
@@ -2932,6 +2950,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         &mut frozen,
                         &roster_seats,
                         &mut no_round_said,
+                        &mut early_checkpoints,
                         &profile_dir,
                         &events,
                     )
@@ -2967,6 +2986,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 &mut frozen,
                                 &roster_seats,
                                 &mut no_round_said,
+                                &mut early_checkpoints,
                                 &profile_dir,
                                 &events,
                                 table_topic.as_ref(),
@@ -3425,6 +3445,65 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 )))
                                 .await;
                         }
+                        // **The copies that arrived before this boundary
+                        // existed, admitted now.**
+                        //
+                        // Held rather than dropped by `checkpoint_event`; see
+                        // `early_checkpoints`. They go through the same one
+                        // admission path as everything else — a second set of
+                        // rules for the same event is how two paths come to
+                        // disagree — and they go through it **before** this
+                        // client publishes its own, so a stage that is already
+                        // complete on arrival closes here instead of waiting
+                        // for a repeat that nothing was going to send.
+                        //
+                        // Taken out of the map first, because the call needs
+                        // `&mut` on it.
+                        let waiting = early_checkpoints.remove(&h.hand_id()).unwrap_or_default();
+                        // Anything older than the boundary now opening is for a
+                        // hand the store has released. Dropped here rather than
+                        // left to grow.
+                        early_checkpoints.retain(|k, _| *k > h.hand_id());
+                        for held in waiting {
+                            if let Some(next) = checkpoint_event(
+                                &held,
+                                h,
+                                &mut boundaries,
+                                &mut readmitted,
+                                &app_key,
+                                &mut checkpoint_said,
+                                &mut frozen,
+                                &roster_seats,
+                                &mut no_round_said,
+                                &mut early_checkpoints,
+                                &profile_dir,
+                                &events,
+                            )
+                            .await
+                            {
+                                if !next.is_empty() {
+                                    publish_and_hear(
+                                        next,
+                                        h,
+                                        &mut boundaries,
+                                        &mut readmitted,
+                                        &app_key,
+                                        &mut checkpoint_said,
+                                        &mut frozen,
+                                        &roster_seats,
+                                        &mut no_round_said,
+                                        &mut early_checkpoints,
+                                        &profile_dir,
+                                        &events,
+                                        table_topic.as_ref(),
+                                        &mut swarm,
+                                        &mut said,
+                                        &tox_sink,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                         match h.state_hash_event(&app_key, super::node::now_unix_ms()) {
                             Ok(Some(bytes)) => {
                                 // Kept whole, because §6.3 step 2's dispute
@@ -3458,6 +3537,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &mut frozen,
                                     &roster_seats,
                                     &mut no_round_said,
+                                    &mut early_checkpoints,
                                     &profile_dir,
                                     &events,
                                     table_topic.as_ref(),
@@ -3543,11 +3623,33 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // Everything else is an event of a hand nobody is playing —
                 // refused by every peer, and, before the hold queue was made to
                 // verify, stored by every peer.
-                if let Some(last) = said.pop() {
-                    said.clear();
-                    said.push(last);
-                } else {
-                    said.clear();
+                //
+                // **And it kept the wrong one.** `said.pop()` keeps whatever
+                // was pushed last, and by the time this runs the checkpoint
+                // block above has already published — so the entry that
+                // survived was a `STATE_HASH` or a `STATE_ACK` and **the
+                // terminal was dropped**, which is the one thing the paragraph
+                // above says must not be. Both are repairs and both are needed:
+                // the terminal frees a peer stuck on hand `k`, and the
+                // checkpoint hash is what §4.9's readmission set is written by.
+                // So this retains by **kind** rather than by position.
+                {
+                    use crate::protocol::messages::EventType;
+                    let mut terminal: Option<Vec<u8>> = None;
+                    let mut checkpoint: Vec<Vec<u8>> = Vec::new();
+                    for b in said.drain(..) {
+                        match crate::net::chained::peek(&b, TABLE_FRAME_PEEK) {
+                            Ok((EventType::HandComplete | EventType::HandAbort, _, _)) => {
+                                terminal = Some(b)
+                            }
+                            Ok((EventType::StateHash | EventType::StateAck, _, _)) => {
+                                checkpoint.push(b)
+                            }
+                            _ => {}
+                        }
+                    }
+                    said.extend(terminal);
+                    said.extend(checkpoint);
                 }
                 match next {
                     Some(mut opening) => {
@@ -4953,6 +5055,7 @@ async fn publish_and_hear(
     frozen: &mut Option<(u64, u64)>,
     roster: &[u8],
     no_round_said: &mut bool,
+    early: &mut std::collections::HashMap<u64, Vec<Vec<u8>>>,
     profile: &std::path::Path,
     events: &Events,
     topic: Option<&gossipsub::IdentTopic>,
@@ -4980,6 +5083,7 @@ async fn publish_and_hear(
             frozen,
             roster,
             no_round_said,
+            early,
             profile,
             events,
         )
@@ -5356,6 +5460,7 @@ async fn checkpoint_event(
     frozen: &mut Option<(u64, u64)>,
     roster: &[u8],
     no_round_said: &mut bool,
+    early: &mut std::collections::HashMap<u64, Vec<Vec<u8>>>,
     profile: &std::path::Path,
     events: &Events,
 ) -> Option<Vec<u8>> {
@@ -5372,7 +5477,25 @@ async fn checkpoint_event(
     // Only for a boundary this receiver still holds. §4.9's window, and the
     // store is what decides how long it is open — a hand that is live belongs
     // to the hand, which owns its own stages.
+    //
+    // **A copy for a boundary that is not open *yet* is held, not dropped.**
+    // The two cases are opposite and this branch used to treat them alike: a
+    // hand id **below** the window is a copy for a boundary the store has
+    // released, and there is nothing to do with it; a hand id **at or above**
+    // the live hand is a peer that finished before this one, and its copy is
+    // exactly what the stage about to open will need. See `early_checkpoints`.
     if !boundaries.holds(hand_id) {
+        if hand_id >= h.hand_id() {
+            let slot = early.entry(hand_id).or_default();
+            // One copy per seat per hand, and two hands' worth in all: a hold
+            // queue that grows is a way to be attacked.
+            if slot.len() < usize::from(crate::protocol::constants::MAX_SEATS) && early.len() <= 2 {
+                let slot = early.entry(hand_id).or_default();
+                if !slot.iter().any(|b| b == bytes) {
+                    slot.push(bytes.to_vec());
+                }
+            }
+        }
         return None;
     }
     let (round, half) = checkwire::round_of(sequence)?;
