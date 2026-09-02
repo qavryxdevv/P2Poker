@@ -75,6 +75,29 @@ mod tox {
             .include(sodium.join("src/libsodium/include"))
             .warnings(false);
 
+        // **The library's own diagnostics, at DEBUG, in the harness build only.**
+        //
+        // `logger.h` defaults `MIN_LOGGER_LEVEL` to `LOGGER_LEVEL_INFO`, and
+        // `LOGGER_WRITE` compiles a call out entirely when its level is below
+        // that — so every `LOGGER_DEBUG` in the group code is gone before a
+        // callback could ever see it. Measured: with
+        // `tox_options_set_log_callback` registered, a four-seat run in which a
+        // seat's join was deliberately starved produced **zero** lines from any
+        // node in ninety seconds.
+        //
+        // That silence was itself worth having — it excludes the four invite
+        // branches that log at `WARNING` and `ERROR`, leaving the two that
+        // return with no diagnostic at all, of which the unconfirmed-peer reap
+        // is one. Lowering the threshold is what turns "one of two" into
+        // "this one". `S1-AA` shape (i).
+        //
+        // **Only under `fault-harness`.** At `DEBUG` the whole library is loud —
+        // thousands of lines about the DHT — and a release build has no use for
+        // any of it. `LOGGER_LEVEL_DEBUG` is 1 in `logger.h`'s enum.
+        if std::env::var("CARGO_FEATURE_FAULT_HARNESS").is_ok() {
+            cc.define("MIN_LOGGER_LEVEL", "1");
+        }
+
         if cfg!(target_env = "msvc") {
             // MSVC has no `/std:c99`; c11 is the nearest it offers and is a
             // superset for everything toxcore uses. Passing c99 produced
