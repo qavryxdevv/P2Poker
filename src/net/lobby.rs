@@ -795,6 +795,24 @@ impl LobbyStore {
 #[derive(Debug, Clone, Default)]
 pub struct RateLimiter {
     per_peer: BTreeMap<[u8; 32], Window>,
+    /// The same charge for the **chat** topic, in its own map.
+    ///
+    /// **`NETWORK_STACK.md` §6 promises this and the code did not do it.** The
+    /// document says chat is a separate topic *“so that chat volume can never
+    /// crowd out table discovery … and so its scoring and rate limits are
+    /// independent”*. They were one `BTreeMap`: `lobbytalk::receive` and
+    /// `advert::receive` were handed the same `RateLimiter` and both charged
+    /// `admit_peer`, so presence and chat spent the advert budget.
+    ///
+    /// That matters more than it looks, because the charge is against the
+    /// **forwarding neighbour** and not the author — `run.rs` says so in terms:
+    /// *“a peer relaying somebody else's advert is the ordinary case”*. On a
+    /// gossip mesh that makes it a throughput ceiling for the whole topic
+    /// rather than a fairness rule, and presence is unconditional at one every
+    /// forty seconds while an advert is only sent by a founder of a table that
+    /// has not yet dealt. So the traffic that would have been squeezed out
+    /// first is exactly table discovery.
+    per_peer_talk: BTreeMap<[u8; 32], Window>,
     per_table: BTreeMap<[u8; 32], Window>,
 }
 
@@ -838,6 +856,27 @@ impl RateLimiter {
             .admit(now_ms, MAX_ADS_PER_PEER_PER_MIN)
     }
 
+    /// Whether a **chat-topic** message from this peer may be processed.
+    ///
+    /// The same cap as [`admit_peer`](Self::admit_peer) and deliberately the
+    /// same number: this change is about the budgets being **separate**, which
+    /// is what the corpus promises, and not about what either budget is worth.
+    /// Moving a threshold and un-sharing a map in one edit would leave neither
+    /// measured.
+    ///
+    /// **`MAX_PRESENCE_PER_PEER_PER_MIN` is still unused, and that is on
+    /// purpose.** It is 4, which is a sane per-*author* rate against a
+    /// heartbeat of one per forty seconds — and this charge is per *forwarding
+    /// neighbour*, which relays for its whole mesh. Wiring the constant in here
+    /// would drop almost all presence. It is left declared and unread until
+    /// something charges the author, which nothing does yet.
+    pub fn admit_peer_talk(&mut self, peer: [u8; 32], now_ms: u64) -> bool {
+        self.per_peer_talk
+            .entry(peer)
+            .or_default()
+            .admit(now_ms, MAX_ADS_PER_PEER_PER_MIN)
+    }
+
     /// Whether this **table key** may advertise again.
     ///
     /// **Charged only after the signature verifies**, and the first version got
@@ -863,11 +902,23 @@ impl RateLimiter {
     pub fn sweep(&mut self, now_ms: u64) {
         let stale = |w: &Window| now_ms.saturating_sub(w.started_ms) >= 120_000;
         self.per_peer.retain(|_, w| !stale(w));
+        // Swept with the others. A map added to this struct and forgotten here
+        // is an unbounded one, and this one is keyed by every neighbour that
+        // ever relayed a chat message.
+        self.per_peer_talk.retain(|_, w| !stale(w));
         self.per_table.retain(|_, w| !stale(w));
     }
 
+    /// Windows held, as `(peers, tables)`.
+    ///
+    /// The peer figure is the **larger** of the two peer maps rather than their
+    /// sum, because this is a memory watch and the two are keyed by the same
+    /// neighbours: summing would report a doubling that has not happened.
     pub fn tracked(&self) -> (usize, usize) {
-        (self.per_peer.len(), self.per_table.len())
+        (
+            self.per_peer.len().max(self.per_peer_talk.len()),
+            self.per_table.len(),
+        )
     }
 }
 
@@ -876,6 +927,57 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_700_000_000_000;
+
+    /// `NETWORK_STACK.md` §6 promises chat cannot crowd out table discovery.
+    ///
+    /// It said chat is a separate topic *“so that chat volume can never crowd
+    /// out table discovery … and so its scoring and rate limits are
+    /// independent”*, and until 2026-09-02 the two paths charged **one**
+    /// `BTreeMap` through `admit_peer`. Both charge the *forwarding neighbour*
+    /// — `run.rs`: *“a peer relaying somebody else's advert is the ordinary
+    /// case”* — so on a gossip mesh a chatty neighbour spent the budget this
+    /// client needed to hear about tables, and presence is unconditional while
+    /// an advert is not.
+    ///
+    /// A promise a document makes and the code does not keep is the class this
+    /// register calls a defect, so it is a test rather than a comment.
+    #[test]
+    fn chat_volume_cannot_crowd_out_table_discovery() {
+        let mut limits = RateLimiter::new();
+        let peer = [7u8; 32];
+
+        for i in 0..MAX_ADS_PER_PEER_PER_MIN {
+            assert!(
+                limits.admit_peer_talk(peer, NOW),
+                "chat message {i} should be admitted"
+            );
+        }
+        assert!(
+            !limits.admit_peer_talk(peer, NOW),
+            "the chat bucket must fill at its cap"
+        );
+
+        for i in 0..MAX_ADS_PER_PEER_PER_MIN {
+            assert!(
+                limits.admit_peer(peer, NOW),
+                "advert {i} must not have paid for that chat"
+            );
+        }
+    }
+
+    /// The second map is swept like the first, or it grows without bound.
+    #[test]
+    fn the_chat_bucket_is_swept_too() {
+        let mut limits = RateLimiter::new();
+        for i in 0..100u32 {
+            let mut peer = [0u8; 32];
+            peer[..4].copy_from_slice(&i.to_be_bytes());
+            assert!(limits.admit_peer_talk(peer, NOW));
+        }
+        assert_eq!(limits.tracked().0, 100);
+        limits.sweep(NOW + 120_000);
+        assert_eq!(limits.tracked(), (0, 0));
+    }
 
     /// One named change to an otherwise legal advert.
     type Mutation = (&'static str, Box<dyn Fn(&mut TableAd)>);

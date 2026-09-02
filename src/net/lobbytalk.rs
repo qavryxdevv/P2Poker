@@ -182,7 +182,7 @@ pub fn receive(
     if bytes.len() > LOBBY_MSG_MAX {
         return Err(NotHeard::TooLong("the message is over the topic's cap"));
     }
-    if !limits.admit_peer(from_peer, now_ms) {
+    if !limits.admit_peer_talk(from_peer, now_ms) {
         return Err(NotHeard::TooMuch);
     }
 
