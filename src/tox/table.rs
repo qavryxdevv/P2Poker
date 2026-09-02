@@ -40,6 +40,26 @@ use crate::table::transport::{FromTable, PlayerId, TableTransport, TransportErro
 use crate::tox::{Event, Tox};
 
 /// How this client stands to the table's group.
+/// How long a joiner waits for its own join to finish before giving it up.
+///
+/// **Comfortably past toxcore's own reaper, and deliberately so.**
+/// `GC_UNCONFIRMED_PEER_TIMEOUT` is twelve seconds, and the handshake has about
+/// four attempts inside it at `GC_SEND_HANDSHAKE_INTERVAL` = 3 s. Twenty-five
+/// seconds is long enough that a slow handshake is never interrupted and short
+/// enough that a seat is not lost for a whole tournament — measured group entry
+/// on one machine is 10-40 s, but that is entry *finishing*, which is exactly
+/// what `self_join` reports and what this waits for.
+const JOIN_GRACE: Duration = Duration::from_secs(25);
+
+/// How many times a joiner will do that before it stops.
+///
+/// **A client that leaves and rejoins for ever is worse than one that sits
+/// still**: it burns the founder's invitations and looks, from every other
+/// seat, like a peer flapping. Three attempts is seventy-five seconds of
+/// trying; past that the failure is not transient and the count on the status
+/// line is the useful thing.
+const MAX_REJOINS: u32 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
     /// The founder. Creates the group, invites every seat, removes anybody the
@@ -198,6 +218,17 @@ pub struct Trouble {
     /// was attempted and refused. Measured at six seats, group entry landed at
     /// 15, 35, 40, 40 and 40 seconds, and nothing said which of the two it was.
     pub invites_refused: AtomicU64,
+    /// **How many times this client gave a stalled join up and started again.**
+    ///
+    /// Zero on a healthy run. A number here is `S1-AA` shape (i) happening and
+    /// being survived, which is the difference between a seat that recovers and
+    /// one that sits at `group 0/N` for the rest of the tournament.
+    pub rejoins: AtomicU64,
+    /// Joins toxcore itself abandoned, with `tox_group_join_fail`.
+    ///
+    /// Distinct from [`rejoins`](Self::rejoins): this is the library saying so,
+    /// that is this client noticing silence.
+    pub join_fails: AtomicU64,
 }
 
 /// The handle the rest of the client holds.
@@ -451,6 +482,32 @@ fn run(
     let mut connected: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut reassembler: Reassembler<u32> = Reassembler::new(fragment::TOX_PACKET);
     let mut next_id: u32 = 0;
+    // **When this client accepted an invitation, and whether the join ever
+    // finished.** `S1-AA` shape (i).
+    //
+    // `tox_group_join_invite` hands back a group number nine steps before the
+    // joiner is a confirmed peer, and `confirmed = true` is set in exactly one
+    // place in `group_chats.c`. If the handshake does not complete within
+    // `GC_UNCONFIRMED_PEER_TIMEOUT` — twelve seconds, refreshed only by lossy
+    // packets and lossless *fragments*, never by a handshake — the inviter's
+    // address-less entry is reaped, silently: no `peer_exit`, no timeout-list
+    // entry, no log this client could ever see.
+    //
+    // **And there is no way back.** `do_timed_out_reconn` only ever considers
+    // peers that were once confirmed; a fresh invitation over the friend link
+    // is refused inside `Messenger.c` because a chat with that id already
+    // exists; and `gc_rejoin_group` has nobody left to handshake with. (An
+    // earlier draft of this comment said the joiner's chat is private and so
+    // never announced. It is not: `gc_accept_invite` creates it `GI_PUBLIC`.
+    // The dead end is the reap and the id gate, not the privacy state.)
+    // The seat sits at `group 0/N` for the rest of the run with every
+    // friendship up and nothing wrong that it can name. Seven runs in 134.
+    //
+    // `tox_group_leave` destroys the chat, which is the one lever that clears
+    // that gate — and the driver already owns it.
+    let mut accepted_at: Option<Instant> = None;
+    let mut self_joined = false;
+    let mut rejoins = 0u32;
     let mut last_sweep = Instant::now();
     let mut last_reinvite = Instant::now();
     let mut pending: Vec<Vec<u8>> = Vec::new();
@@ -604,6 +661,8 @@ fn run(
                             match tox.chat_id(joined) {
                                 Ok(id) if id == want => {
                                     group = Some(joined);
+                                    accepted_at = Some(Instant::now());
+                                    self_joined = false;
                                     announce(&tox, group, &chat);
                                 }
                                 _ => {
@@ -611,6 +670,27 @@ fn run(
                                 }
                             }
                         }
+                    }
+                }
+                Event::GroupSelfJoin { group: g } => {
+                    // **The join actually finished.** Until this fires, holding
+                    // a group number means nothing: this client can neither
+                    // send to anybody nor be sent to.
+                    if group == Some(g) {
+                        self_joined = true;
+                        accepted_at = None;
+                    }
+                }
+                Event::GroupJoinFail { group: g, reason } => {
+                    // toxcore gave up on its own. Leave, so the chat id stops
+                    // blocking the next invitation, and let the sweep retry.
+                    if group == Some(g) {
+                        let _ = tox.leave(g);
+                        group = None;
+                        accepted_at = None;
+                        self_joined = false;
+                        trouble.join_fails.fetch_add(1, Ordering::Relaxed);
+                        let _ = reason;
                     }
                 }
                 Event::GroupPacket { group: g, peer, data } => {
@@ -737,6 +817,31 @@ fn run(
             trouble
                 .complete
                 .store(group.is_some() && seen >= roster.len(), Ordering::Relaxed);
+
+            // **A join that never finished, given up and started again.**
+            //
+            // Twelve seconds is toxcore's own reaper; this waits `JOIN_GRACE`,
+            // comfortably past it, so a slow but working handshake is never
+            // interrupted. Past that the chat is destroyed — which is the only
+            // action that lets the founder's next invitation through — and the
+            // sweep's ordinary re-invite does the rest.
+            //
+            // Bounded, because a client that leaves and rejoins for ever is
+            // worse than one that sits still: after `MAX_REJOINS` it stops and
+            // the count is on the status line, which turns an invisible failure
+            // into a number.
+            if !self_joined && group.is_some() && matches!(setup.role, Role::Joiner { .. }) {
+                if let Some(since) = accepted_at {
+                    if since.elapsed() >= JOIN_GRACE && rejoins < MAX_REJOINS {
+                        if let Some(g) = group.take() {
+                            let _ = tox.leave(g);
+                        }
+                        accepted_at = None;
+                        rejoins += 1;
+                        trouble.rejoins.store(rejoins as u64, Ordering::Relaxed);
+                    }
+                }
+            }
             last_sweep = Instant::now();
         }
 

@@ -419,6 +419,33 @@ impl TableSink {
         }
     }
 
+    /// **Stalled joins this client gave up and started again, and joins
+    /// toxcore itself abandoned.**
+    ///
+    /// Zero on a healthy run, and the two are different things: the first is
+    /// this client noticing that `self_join` never fired, the second is the
+    /// library saying so. `S1-AA` shape (i) — a seat that holds a group number
+    /// nine steps short of being in the group, whose inviter entry is reaped
+    /// after twelve seconds with no callback and no log, and for which
+    /// libtoxcore has no path back.
+    pub fn join_trouble(&self) -> (u64, u64) {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => (
+                    t.trouble().rejoins.load(Ordering::Relaxed),
+                    t.trouble().join_fails.load(Ordering::Relaxed),
+                ),
+                None => (0, 0),
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            (0, 0)
+        }
+    }
+
     /// This client's own connection to the Tox network: `0` none, `1` TCP,
     /// `2` UDP, and `0` in a build without the feature.
     ///

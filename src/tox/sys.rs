@@ -274,7 +274,20 @@ extern "C" {
     pub fn tox_callback_group_invite(tox: *mut Tox, callback: tox_group_invite_cb);
     /// `tox.h:4617`
     pub fn tox_callback_group_custom_packet(tox: *mut Tox, callback: tox_group_custom_packet_cb);
+    /// `tox.h:4885`
+    pub fn tox_callback_group_self_join(tox: *mut Tox, callback: tox_group_self_join_cb);
+    /// `tox.h:4925`
+    pub fn tox_callback_group_join_fail(tox: *mut Tox, callback: tox_group_join_fail_cb);
 }
+
+/// `tox.h:4877`. Fires **once**, when this client's own join completes.
+pub type tox_group_self_join_cb =
+    Option<unsafe extern "C" fn(tox: *mut Tox, group_number: u32, user_data: *mut c_void)>;
+
+/// `tox.h:4918`. Fires when a join attempt is abandoned, with a reason.
+pub type tox_group_join_fail_cb = Option<
+    unsafe extern "C" fn(tox: *mut Tox, group_number: u32, fail_type: c_int, user_data: *mut c_void),
+>;
 
 /// `tox.h:4780`
 pub type tox_group_invite_cb = Option<

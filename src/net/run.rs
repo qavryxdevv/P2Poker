@@ -3632,10 +3632,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if !line.is_empty() {
                         let (sent, refused, up) = tox_sink.invite_counts();
+                        let (rejoins, join_fails) = tox_sink.join_trouble();
                         let (seen, want) = tox_sink.group_seen();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "seats on the line: {}; tox self {}, group {seen}/{want}, tox friends up {up}, invites {sent} sent {refused} refused{}{}",
+                                "seats on the line: {}; tox self {}, group {seen}/{want}, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}",
                                 line.join(", "),
                                 match tox_sink.tox_connection() {
                                     0 => "offline",
@@ -3692,6 +3693,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     } else {
                                         String::new()
                                     }
+                                },
+                                // **Said only when it is not zero.** A healthy
+                                // run never prints this, so its presence is the
+                                // whole message: `S1-AA` shape (i) happened and
+                                // was survived rather than sat through.
+                                if rejoins > 0 || join_fails > 0 {
+                                    format!(
+                                        ", group join restarted {rejoins} time(s), {join_fails} abandoned by toxcore"
+                                    )
+                                } else {
+                                    String::new()
                                 }
                             )))
                             .await;

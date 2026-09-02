@@ -257,6 +257,15 @@ fn main() {
                     }
                 }
                 Event::FriendRequestIgnored => println!("a friend request, ignored"),
+                // The two that say whether a join actually finished. This probe
+                // exists to time a link, and until they existed it could report a
+                // group number as a join.
+                Event::GroupSelfJoin { group } => {
+                    println!("joined group {group} after {:.1}s", began.elapsed().as_secs_f32())
+                }
+                Event::GroupJoinFail { group, reason } => {
+                    println!("group {group} join failed, reason {reason}")
+                }
             }
         }
 

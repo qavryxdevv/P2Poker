@@ -66,6 +66,35 @@ pub enum Event {
     /// because a request from a stranger is a stranger. Reported so that a
     /// flood of them is visible rather than silent.
     FriendRequestIgnored,
+    /// **This client's own join into a group completed.**
+    ///
+    /// The one signal in the whole API that separates *holding a group number*
+    /// from *being in the group*, and nothing registered it.
+    ///
+    /// `tox_group_join_invite` returns a group number nine steps before the
+    /// joiner is a confirmed peer: the chat is created at `CS_CONNECTING` with
+    /// an address-less entry for the inviter, and `confirmed = true` is set in
+    /// exactly one place in `group_chats.c`, after a handshake, an invite
+    /// request, a sync request and a peer-info response. `self_join` fires at
+    /// the sync response, which is the first point at which anything this
+    /// client sends can reach anybody.
+    ///
+    /// The inviter's entry is reaped after twelve seconds if the handshake has
+    /// not finished — silently, with no `peer_exit` and no log this client
+    /// could see — and after that a fresh invitation is refused inside
+    /// `Messenger.c` because a chat with that id already exists. Destroying the
+    /// chat is the only way back, which is what
+    /// [`table`](crate::tox::table)'s recovery does.
+    ///
+    /// Without it, `group 0/3` and `group 3/3` are the only numbers available
+    /// and neither says whether the join finished — and `peer_count` counts
+    /// **unconfirmed** peers, so even a full count is not proof.
+    GroupSelfJoin { group: u32 },
+    /// A join attempt was abandoned, with toxcore's own reason code.
+    ///
+    /// `TOX_GROUP_JOIN_FAIL_PEER_LIMIT` = 0, `..._PASSWORD` = 1,
+    /// `..._UNKNOWN` = 2.
+    GroupJoinFail { group: u32, reason: i32 },
 }
 
 /// Where the C callbacks put what they are given, for the length of one
@@ -115,6 +144,31 @@ unsafe extern "C" fn on_group_packet(
         group,
         peer,
         data: bytes,
+    });
+}
+
+/// This client's own join finished. See [`Event::GroupSelfJoin`].
+unsafe extern "C" fn on_group_self_join(
+    _tox: *mut sys::Tox,
+    group: u32,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    s.events.push(Event::GroupSelfJoin { group });
+}
+
+/// A join was abandoned. Carries toxcore's reason rather than a boolean,
+/// because *peer limit* and *unknown* want different answers from a caller.
+unsafe extern "C" fn on_group_join_fail(
+    _tox: *mut sys::Tox,
+    group: u32,
+    reason: c_int,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    s.events.push(Event::GroupJoinFail {
+        group,
+        reason,
     });
 }
 
@@ -337,6 +391,29 @@ impl Tox {
             // error, which is the quietest way this could fail.
             sys::tox_callback_group_custom_packet(ptr, Some(on_group_packet));
             sys::tox_callback_group_invite(ptr, Some(on_group_invite));
+            // **The two that were missing, and the reason a seat could sit at
+            // `group 0/3` for a whole run with nothing to say about it.**
+            //
+            // # Registering `self_join` is not free, and it was checked
+            //
+            // `group_chats.c` sets `chat->time_connected` **inside** the block
+            // guarded by `c->self_join != nullptr`, so registering the callback
+            // changes library state that has been zero for the whole life of
+            // this client. That is a behaviour change wearing an instrument's
+            // clothes, and it is exactly the shape of thing this project has
+            // been bitten by.
+            //
+            // It is safe here, and the reason is narrow: `time_connected` has
+            // exactly two readers in the vendored tree and both are about group
+            // **topics** — whether to send a peer the topic on sync, and the
+            // topic-reversion window. **This client uses no topics at all**; the
+            // game rides custom packets. So the field starts being set and
+            // nothing in this build reads it.
+            //
+            // (The founder's side already sets it directly when its own group
+            // reaches `CS_CONNECTED`, so only the joiner's was ever zero.)
+            sys::tox_callback_group_self_join(ptr, Some(on_group_self_join));
+            sys::tox_callback_group_join_fail(ptr, Some(on_group_join_fail));
             sys::tox_callback_friend_connection_status(ptr, Some(on_friend_connection));
             sys::tox_callback_friend_request(ptr, Some(on_friend_request));
 
