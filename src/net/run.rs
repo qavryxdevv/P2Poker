@@ -3734,7 +3734,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if !line.is_empty() {
                         let (sent, refused, up) = tox_sink.invite_counts();
-                        let (rejoins, join_fails, confirmed) = tox_sink.join_trouble();
+                        let (rejoins, join_fails, confirmed, founder_link) = tox_sink.join_trouble();
                         let (seen, want) = tox_sink.group_seen();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
@@ -3802,7 +3802,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // was survived rather than sat through.
                                 if rejoins > 0 || join_fails > 0 {
                                     format!(
-                                        ", group join restarted {rejoins} time(s), {join_fails} abandoned by toxcore"
+                                        ", group join restarted {rejoins} time(s), {join_fails} abandoned by toxcore, founder link {}",
+                                        match founder_link {
+                                            0 => "down",
+                                            1 => "over a TCP relay",
+                                            2 => "direct over UDP",
+                                            _ => "n/a (this client is the founder)",
+                                        }
                                     )
                                 } else {
                                     String::new()

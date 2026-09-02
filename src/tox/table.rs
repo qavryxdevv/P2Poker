@@ -287,6 +287,19 @@ pub struct Trouble {
     /// makes the difference visible: `seen > confirmed` is the library's skip
     /// happening, and the two agreeing rules it out.
     pub confirmed_peers: AtomicU64,
+    /// **How this joiner reaches the founder: `0` not at all, `1` over a TCP
+    /// relay, `2` directly over UDP.** `3` on a founder, which has no founder
+    /// of its own.
+    ///
+    /// The number `S1-AA` shape (i) turned out to need. `handle_gc_invite_
+    /// confirmed_packet` accepts a join only if the confirmation carried a TCP
+    /// relay **or** the inviter's `IP:port` could be copied off the friend
+    /// connection, and returns `-5` with *"Got invalid connection info from
+    /// peer"* when it has neither. Which of the two failed is not something the
+    /// client could see, and the retry was blind to it: it re-entered as soon
+    /// as *any* friendship was up, which says nothing about whether the
+    /// founder's link carries an address.
+    pub founder_link: AtomicU64,
     pub rejoins: AtomicU64,
     /// Joins toxcore itself abandoned, with `tox_group_join_fail`.
     ///
@@ -907,6 +920,17 @@ fn run(
             trouble
                 .confirmed_peers
                 .store(confirmed.len() as u64, Ordering::Relaxed);
+            trouble.founder_link.store(
+                match &setup.role {
+                    Role::Host => 3,
+                    Role::Joiner { founder, .. } => friends
+                        .iter()
+                        .find(|(_, k)| *k == founder)
+                        .map(|(n, _)| tox.friend_connection(*n).max(0) as u64)
+                        .unwrap_or(0),
+                },
+                Ordering::Relaxed,
+            );
             trouble.want_in_group.store(roster.len() as u64, Ordering::Relaxed);
             trouble
                 .complete
