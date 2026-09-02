@@ -49,22 +49,22 @@ const LIVE: &[&str] = &[
 /// documentation decision — for two of them the cited content is not in the
 /// cited document at all, so there is no number to correct it to.
 const KNOWN: &[(&str, &str)] = &[
-    // Cited by CRYPTOGRAPHY.md, PROTOCOL.md and STATE_MACHINE.md, all three,
-    // as the authority for "no two-network test has been run". NETWORK_STACK
-    // §12 exists and has no subsections at all. The claim is also now false:
-    // two-network runs are measured in NEXT.md.
-    ("NETWORK_STACK.md", "12.12"),
-    // PROTOCOL.md §2.8 deleted its BLAKE3 rationale under D-011 rule 1 and
-    // points here for it. CRYPTOGRAPHY §3 is "Constructions considered and
-    // rejected" and has no subsections; the content is spread over §1's summary
-    // table, §9's library table and OQ-6.
-    ("CRYPTOGRAPHY.md", "3.2"),
-    // THREAT_MODEL.md X4 says the canonical encoding and the gate that enforces
-    // it are "PROTOCOL.md §2.8's and CRYPTOGRAPHY.md §4.7's". CRYPTOGRAPHY §4
-    // is "The group, and why" - the elliptic curve - and the document mentions
-    // the encoding three times in passing. The gate is PROTOCOL.md's and
-    // NETWORK_STACK.md's; this half of the citation has no home.
-    ("CRYPTOGRAPHY.md", "4.7"),
+    // **Empty, and that is the point of keeping it.** It held three references
+    // that pointed at sections nobody had written, listed rather than fixed
+    // because each needed an editorial decision. All three are made:
+    //
+    //   `NETWORK_STACK.md` §12.12 - three decision rows meant §12, which
+    //   exists; and the two prose citers claimed "no two-network test has been
+    //   run", which `NEXT.md` had already disproved. Renumbered where it was a
+    //   number and rewritten where it was a claim.
+    //
+    //   `CRYPTOGRAPHY.md` §3.2 - `PROTOCOL.md` §2.8 sent its BLAKE3 rationale
+    //   there under D-011 rule 1. The content is in §1's summary table, §9's
+    //   library table and OQ-6, so the citations point there.
+    //
+    //   `CRYPTOGRAPHY.md` §4.7 - `THREAT_MODEL.md` X4 named it as the home of
+    //   the canonicality gate. `research/CRYPTO_LIBS.md` §4.7 is titled *The
+    //   canonicality gate*; the number was right and the document was a slip.
 ];
 
 fn docs_dir() -> PathBuf {

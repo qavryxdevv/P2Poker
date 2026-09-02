@@ -4727,7 +4727,7 @@ which is `G7-S5` — and is not playable by the MVP.** It pins `seats` and `min_
 both at `MAX_SEATS`, while `SPEC_CS.md` §32 requires two-player heads-up
 as the first supported mode and §1.3 scopes the MVP at `nlhe/2-6`. The MVP ships `CUSTOM` tables;
 `RATED_SNG_POKERTH_V1` becomes playable when `nlhe/7-10` lands. The Phase 8 acceptance test
-therefore uses a **`CUSTOM` two-seat table** (`NETWORK_STACK.md` §12.12, D-003/D-004), and a reader
+therefore uses a **`CUSTOM` two-seat table** (`NETWORK_STACK.md` §12, D-003/D-004), and a reader
 who takes the preset as the MVP's acceptance configuration will build the wrong test.
 `PROTOCOL.md` §13 carries the same statement under its preset block, and since this pass §9.1
 carries no values of its own for it to disagree with.

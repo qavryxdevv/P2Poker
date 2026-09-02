@@ -1399,7 +1399,7 @@ attrition, so each unmeasured row names the phase that will measure it.
 | private deal | measured, within the 1.39–4.34 ms per-card reveal |
 | board reveal | measured, 1.39–4.34 ms per card |
 | **signature verification** | **not measured** — Phase 4, one `verify_strict` per event, and the per-hand event count from `PROTOCOL.md` §3 |
-| **network latency** | **not measured** — Phase 8, two-network test; `NETWORK_STACK.md` §12.12 confirms none has been run |
+| **network latency** | **not measured** — Phase 8. Two-network runs have since been made (`NEXT.md`, *“The two-network run's real finding”*) and did not produce a latency figure: what they found was that a relayed hand dies at 128 KB. The §12.12 this cell used to cite as confirming *none has been run* was never written, and the claim it carried is false either way |
 | **hand startup latency** | **estimated only** — ~340 ms heads-up, ~1.1 s six-handed at an assumed 100 ms RTT, and not yet revised for the collective `HAND_INIT` of §2.9. Phase 8 measures it. |
 
 These are three measurement obligations, not open questions: nothing about the design

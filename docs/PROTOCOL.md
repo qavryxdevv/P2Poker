@@ -693,8 +693,9 @@ construction" is a claim to be tested, not asserted.
 ### 2.8 Hashes and domain separation
 
 All protocol hashes are BLAKE3 1.8.7. **Why BLAKE3, what else is in the tree and
-what is unaudited about it are constructions, and `CRYPTOGRAPHY.md` §3.2 owns
-them** (D-011 rule 1). The four-reason list and the audit limitation that stood
+what is unaudited about it are constructions, and `CRYPTOGRAPHY.md` owns
+them** (D-011 rule 1) — §1's summary table, §9's library table and `OQ-6`, which
+is where the content actually is; the §3.2 this used to name was never written. The four-reason list and the audit limitation that stood
 here were a copy of that section and are deleted; nothing in this document
 depends on them. One consequence is wire-visible and is therefore stated here: if
 the mental-poker proof system mandates a specific hash for Fiat–Shamir, that
@@ -2843,10 +2844,13 @@ one node is ~195 ms heads-up and ~420 ms six-handed; those are measurements.
 
 **Hand start-up latency is an estimate, not a measurement.** Roughly
 `n × (100 ms + one-way latency)`: **an estimated ~340 ms heads-up and ~1.1 s
-six-handed, at an assumed 100 ms RTT.** No two-network test has been run
-(`NETWORK_STACK.md` §12.12), the figure is one of `SPEC_CS.md` §33's seven
-profiling targets, and `CRYPTOGRAPHY.md` §6.5 holds the target table and names
-Phase 8 as where it is measured. The estimate must also be revised upward for
+six-handed, at an assumed 100 ms RTT.** **Two-network runs have since been made and this
+sentence used to deny it** — `NEXT.md`'s *“The two-network run's real finding”*
+carries them, and what they found was not a latency figure but that a relayed
+hand dies at 128 KB, so the estimate above still stands unmeasured while the
+claim that nothing had been tried does not. The figure is one of `SPEC_CS.md`
+§33's seven profiling targets, and `CRYPTOGRAPHY.md` §6.5 holds the target table
+and names Phase 8 as where it is measured. The estimate must also be revised upward for
 C-5: making `HAND_INIT` collective replaces one message with `n` and adds one
 collective round trip to hand start-up. [MENTAL §5.1, §5.4]
 
@@ -8240,7 +8244,7 @@ hole it was filed about.
 corrected (D-011 rule 1).** §11's three-part restatement of `THREAT_MODEL.md`'s
 classification, replaced by a routing table from an attack to the mechanism in
 *this* document; §2.8's BLAKE3 rationale and audit limitation, which are
-`CRYPTOGRAPHY.md` §3.2's; §1.4's libp2p behaviour column and its GossipSub and
+`CRYPTOGRAPHY.md` §1, §9 and `OQ-6`'s; §1.4's libp2p behaviour column and its GossipSub and
 `libp2p-stream` notes, and §1.5's connectivity floor, and §9.5's
 `connection_limits` table, all `NETWORK_STACK.md`'s; §4.10's absent-seat paragraph
 and §8.4's join-timeout transition paragraph and §6.3/§6.4's two `Diverged`-phase
