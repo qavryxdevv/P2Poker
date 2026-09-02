@@ -84,6 +84,19 @@ pub struct TableSink {
     mine: Option<[u8; 32]>,
     /// How far this client got in reaching the Tox network at all.
     reach: Reach,
+    /// Whether this table **asked** for a Tox carrier, whatever came of it.
+    ///
+    /// **`inner.is_none()` cannot tell the two apart and the difference is the
+    /// whole hand.** A table with no Tox key in its advert never wanted one; a
+    /// table whose `start` failed — no identity, no instance, a profile
+    /// directory that would not open — wanted one and has none. The second
+    /// client cannot send a hand at all, because D-019's second amendment left
+    /// the hand no other channel, and it must therefore not open one.
+    ///
+    /// Set before the fallible steps in [`start`](Self::start) and cleared by
+    /// [`clear`](Self::clear), so it says *this table's traffic belongs on a
+    /// group* rather than *a group exists*.
+    wants_tox: bool,
 }
 
 /// What bootstrapping actually achieved, rather than that it was attempted.
@@ -132,6 +145,7 @@ impl TableSink {
             inner: None,
             #[cfg(feature = "tox")]
             mine: None,
+            wants_tox: false,
                     reach: Reach {
                 nodes: 0,
                 booted: 0,
@@ -146,6 +160,14 @@ impl TableSink {
     /// The one question `run.rs` asks, and it is what decides where
     /// `publish_hand` sends. In a build without the feature it is always false
     /// and the compiler removes the branch.
+    /// Whether this table asked for a Tox carrier, whether or not it got one.
+    ///
+    /// The pair with [`is_on_tox`](Self::is_on_tox): `wants_tox && !is_on_tox()`
+    /// is a client that owes its table a channel it does not have.
+    pub fn wants_tox(&self) -> bool {
+        self.wants_tox
+    }
+
     pub fn is_on_tox(&self) -> bool {
         #[cfg(feature = "tox")]
         {
@@ -201,6 +223,9 @@ impl TableSink {
     ) -> Result<Option<[u8; 32]>, String> {
         #[cfg(feature = "tox")]
         {
+            // Said before anything that can fail: the claim is that this table's
+            // traffic belongs on a group, not that one was built.
+            self.wants_tox = true;
             use crate::tox::{table, Tox};
 
             if self.inner.is_some() {
@@ -364,7 +389,14 @@ impl TableSink {
             use std::sync::atomic::Ordering;
             match self.inner.as_ref() {
                 Some(t) => t.trouble().complete.load(Ordering::Relaxed),
-                None => true,
+                // **`true` here is only honest when the table never wanted a
+                // group.** The comment above justifies exactly one state — a
+                // build with no Tox — and this arm is reached in a build that
+                // has it, by a table whose `start` failed after its advert had
+                // already named a group. That client is not on a group the hand
+                // rides, and answering *complete* let it open a hand it could
+                // not send anywhere.
+                None => !self.wants_tox,
             }
         }
         #[cfg(not(feature = "tox"))]
@@ -525,6 +557,7 @@ impl TableSink {
             // thread, which flushes whatever it still holds — the last message
             // of a hand is exactly what is in that queue.
             self.inner = None;
+            self.wants_tox = false;
             // And the key goes with it, so a later `start` builds afresh rather
             // than answering with the key of an instance that has stopped.
             self.mine = None;

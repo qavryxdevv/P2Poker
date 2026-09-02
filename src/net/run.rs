@@ -604,7 +604,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut hand_one_held_since: Option<std::time::Instant> = None;
     // How many seats the group held when it last grew, and when that was. The
     // wait is on progress rather than on a deadline; see `hand_one_may_open`.
-    let mut hand_one_progress: (u64, std::time::Instant) = (0, std::time::Instant::now());
+    // **`None` until a table exists, because a clock started at process launch
+    // measures the wrong thing.** This used to be `(0, Instant::now())` at
+    // start-up, so `GROUP_STALL_MS` had already elapsed for any client that had
+    // been running two minutes before its table formed — which is the ordinary
+    // case, not an exotic one — and the stall arm dealt hand 1 the instant the
+    // roster ratified. Anchored on first use instead, exactly as `held_since`
+    // is.
+    let mut hand_one_progress: Option<(u64, std::time::Instant)> = None;
     let mut hand_one_forced_said = false;
     // Said once per node: the reason hand one cannot be built from the roster
     // this client holds. See `say_why_no_hand_one`.
@@ -6024,10 +6031,26 @@ const GROUP_WAIT_MAX_MS: u64 = 300_000;
 async fn hand_one_may_open(
     tox: &super::toxsink::TableSink,
     held_since: &mut Option<std::time::Instant>,
-    progress: &mut (u64, std::time::Instant),
+    progress: &mut Option<(u64, std::time::Instant)>,
     said: &mut bool,
     events: &Events,
 ) -> bool {
+    // **A table that owes itself a Tox carrier and has none opens nothing.**
+    // `publish_hand` has no second channel by instruction (D-019's second
+    // amendment), so such a client would deal into `said` and wait for events
+    // it has no way to receive.
+    if tox.wants_tox() && !tox.is_on_tox() {
+        if !*said {
+            *said = true;
+            let _ = events
+                .send(NodeEvent::Warning(
+                    "this table's hand rides a Tox group and this client is not on one, so no hand is opened here"
+                        .into(),
+                ))
+                .await;
+        }
+        return false;
+    }
     if tox.group_is_complete() {
         return true;
     }
@@ -6035,9 +6058,12 @@ async fn hand_one_may_open(
     let since = *held_since.get_or_insert(now);
 
     // Still filling? Then keep waiting, however long it has already been.
-    if tox.group_seen().0 > progress.0 {
-        *progress = (tox.group_seen().0, now);
+    // Anchored on the first call for this table rather than at process start.
+    let anchored = *progress.get_or_insert((tox.group_seen().0, now));
+    if tox.group_seen().0 > anchored.0 {
+        *progress = Some((tox.group_seen().0, now));
     }
+    let anchored = progress.unwrap_or(anchored);
 
     // **A group that never started is not a group that stopped filling, and
     // both of the rules below could not tell them apart.**
@@ -6064,8 +6090,25 @@ async fn hand_one_may_open(
     //
     // `want > 0` guards the no-Tox build, where `group_seen` answers `(0, 0)`
     // because there is no group to count.
+    // **The floor tests the transport, not the driver's count.**
+    //
+    // `want` and `complete` are stored only inside the driver's sweep, once
+    // every `SWEEP_EVERY` = 5 s, while the node loop calls `seat_on_tox` and
+    // this function in the **same iteration** — so at the instant a table
+    // ratifies, `want` is still the 0 it started at. `want > 0` was therefore
+    // false exactly when the floor was needed, and the stall arm below dealt
+    // anyway on any founder whose process had been up longer than
+    // `GROUP_STALL_MS`.
+    //
+    // That is how `S1-AK`'s defect survived its own fix: making `complete`
+    // honest about an empty roster moved the hole into the floor rather than
+    // shutting it, and the run that appeared to prove the fix only did so
+    // because the process was 45 seconds old.
+    //
+    // `is_on_tox()` is `inner.is_some()`, set synchronously in `start` and read
+    // without asking the driver anything, so it cannot lag.
     let (seen, want) = tox.group_seen();
-    if want > 0 && seen == 0 {
+    if tox.is_on_tox() && seen == 0 {
         if !*said {
             *said = true;
             let _ = events
@@ -6077,7 +6120,7 @@ async fn hand_one_may_open(
         return false;
     }
 
-    let stalled = now.duration_since(progress.1) >= std::time::Duration::from_millis(GROUP_STALL_MS);
+    let stalled = now.duration_since(anchored.1) >= std::time::Duration::from_millis(GROUP_STALL_MS);
     let too_long = now.duration_since(since) >= std::time::Duration::from_millis(GROUP_WAIT_MAX_MS);
     if stalled || too_long {
         // Said once, because it means the first hand is being dealt into a group
