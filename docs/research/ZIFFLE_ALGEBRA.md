@@ -53,7 +53,7 @@ in two places, consistently:
 | `a_i = π(i) ∈ {1..N}` | `pi[i] = Scalar::new(perm[i] + 1)` | 1117 |
 | `b_i = x^{π(i)}` | `xpi[i] = x.pow([perm[i] + 1])` | 1125 |
 | `C^x` target `∏_{i=1}^N C_i^{x^i}` | `xs[i] = x_base.pow([i + 1])`, `i ∈ 0..N-1` | 816 |
-| `∏_{i=1}^N (y·i + x^i − z)` | `(1..=N).map(|i| y·Scalar::new(i) + x_base.pow([i]) − z)` | 1018–1023 |
+| `∏_{i=1}^N (y·i + x^i − z)` | `(1..=N).map(\|i\| y·Scalar::new(i) + x_base.pow([i]) − z)` | 1018–1023 |
 
 The shift is applied to `pi`, to `xpi`, and to the verifier's public product together,
 so the three agree. The comment at 1124 states the reason (avoid `x^0 = 1`) and is

@@ -423,7 +423,7 @@ readmission set `A`, and neither is applied, chains anything, or enters a
 | `PrefixOutcome` at the wire | `A ∪= {X}` | `A ∪= {X}` |
 | Engine event | `Readmitted{X}` → **T67**: `readmit ∪= {X}` and nothing else | identical |
 | §5.3 step 4 reads `readmit`? | **no** — `dealt_in[s] := status == Active ∧ s ∈ signed_this_hand` | **no** |
-| §5.3 step 8 reads `readmit`? | **no** — `|signed_this_hand| == 1` | **no** |
+| §5.3 step 8 reads `readmit`? | **no** — `\|signed_this_hand\| == 1` | **no** |
 
 **Hand by hand, both routes, ten hands:**
 

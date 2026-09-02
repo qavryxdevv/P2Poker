@@ -307,3 +307,151 @@ fn the_allow_list_holds_only_live_defects() {
         );
     }
 }
+
+/// Split a line on **unescaped** pipes.
+///
+/// GFM honours `\|` and nothing else — a pipe inside a code span is still a
+/// column separator — so this is the split a renderer actually performs.
+fn split_cells(line: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            cur.push(c);
+            if let Some(n) = chars.next() {
+                cur.push(n);
+            }
+            continue;
+        }
+        if c == '|' {
+            cells.push(std::mem::take(&mut cur));
+            continue;
+        }
+        cur.push(c);
+    }
+    cells.push(cur);
+    cells
+}
+
+/// How many columns a table line declares.
+///
+/// `None` for a line that is not a table row at all. The leading pipe is
+/// required and the trailing one is optional, which is what GFM allows.
+fn columns(line: &str) -> Option<usize> {
+    let t = line.trim_end();
+    if !t.starts_with('|') {
+        return None;
+    }
+    let cells = split_cells(t);
+    // `| a | b |` splits to ["", " a ", " b ", ""]; the empty head is the
+    // leading pipe and the empty tail the optional trailing one.
+    let mut n = cells.len() - 1;
+    if cells.last().is_some_and(|c| c.trim().is_empty()) {
+        n -= 1;
+    }
+    Some(n)
+}
+
+fn is_separator(line: &str) -> bool {
+    let t = line.trim();
+    if !t.starts_with('|') {
+        return false;
+    }
+    let cells = split_cells(t);
+    let inner: Vec<&String> = cells
+        .get(1..cells.len().saturating_sub(1))
+        .unwrap_or(&[])
+        .iter()
+        .collect();
+    !inner.is_empty()
+        && inner.iter().all(|c| {
+            let c = c.trim();
+            !c.is_empty() && c.contains('-') && c.chars().all(|ch| ch == '-' || ch == ':')
+        })
+}
+
+/// Every row of every table must have exactly the columns its header declares.
+///
+/// # Why this is a test
+///
+/// GFM **ignores** cells past the header's count. A row that grows an extra
+/// cell does not render wide — it renders with its last cell **deleted**, in
+/// silence, in every viewer, while the file on disk still contains the text.
+///
+/// That is not hypothetical here. `DECISIONS.md`'s findings register is updated
+/// by appending the new verdict as a new final cell, and fifteen rows had
+/// acquired a fourth column that way — so for each of them the cell being
+/// dropped was **the newest verdict**, and the register rendered the superseded
+/// one instead. Found only because a stray pipe in one row was traced back.
+///
+/// The related trap is set-cardinality notation: `|P(k)|` and
+/// `|signed_this_hand| == 1` are column separators to GFM even inside a code
+/// span, and must be written `\|`. Twenty-two rows across ten documents were
+/// splitting themselves that way.
+///
+/// Both failures are invisible in the source and obvious to this test, which is
+/// exactly the shape that earns a test rather than a sweep.
+#[test]
+fn every_table_row_has_the_columns_its_header_declares() {
+    let docs = read_all();
+    let mut wrong: Vec<String> = Vec::new();
+
+    for (name, text) in &docs {
+        if !LIVE.contains(&name.as_str()) {
+            continue;
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let mut in_fence = false;
+        let mut i = 0;
+        while i < lines.len() {
+            let trimmed = lines[i].trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_fence = !in_fence;
+                i += 1;
+                continue;
+            }
+            if in_fence {
+                i += 1;
+                continue;
+            }
+            let header = columns(lines[i]);
+            if let Some(want) = header {
+                if i + 1 < lines.len() && is_separator(lines[i + 1]) {
+                    let mut j = i + 2;
+                    while j < lines.len() && lines[j].starts_with('|') {
+                        if let Some(got) = columns(lines[j]) {
+                            if got != want {
+                                let id = split_cells(lines[j])
+                                    .get(1)
+                                    .map(|c| c.trim().to_string())
+                                    .unwrap_or_default();
+                                let id: String = id.chars().take(40).collect();
+                                wrong.push(format!(
+                                    "{name}:{} row [{id}] has {got} cells, its header declares {want}",
+                                    j + 1
+                                ));
+                            }
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} table row(s) do not have their header's column count. GFM does not \
+         render these wide - it DELETES the cells past the header's count, in \
+         silence. Where the register is updated by appending a new final cell, \
+         the deleted cell is the newest verdict and the file reads as if the \
+         superseded one still stood. Merge the extra cells back into the body, \
+         and write set-cardinality pipes as \\| so they stop splitting rows:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}

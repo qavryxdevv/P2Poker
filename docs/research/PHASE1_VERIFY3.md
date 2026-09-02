@@ -363,7 +363,7 @@ read. **No survivor.** The sweep pattern was `|V| < 2`, `|V| >= 2`, `|V| ≥ 2`,
 | `PROTOCOL.md` §4.8 `TIMEOUT_CERT` (l. 1849–1853) | "A certificate with `\|V\| < 2` is **inert** … §8.3's boxed below-the-floor rule is canonical for that and this line restates nothing beyond the pointer" | none |
 | `PROTOCOL.md` §8.5 (l. 3284) | "**Where `\|V\| < 2` it proves only that one peer said so, which is why §8.3 gives it no effect of any kind**" | none |
 | `STATE_MACHINE.md` §8.4 rule 6 (l. 1693) | rejected, both kinds, bit-identical state | none |
-| `STATE_MACHINE.md` T8, T12, T16, T22, T27, T34, T41, T44 | every guard carries `∧ |V| ≥ 2` | none below the floor |
+| `STATE_MACHINE.md` T8, T12, T16, T22, T27, T34, T41, T44 | every guard carries `∧ \|V\| ≥ 2` | none below the floor |
 | `STATE_MACHINE.md` unanimity table (l. 1720) | "0 or 1 \| … \| **no effect at all** (rule 6)" | none |
 | `STATE_MACHINE.md` I29(b) (l. 2276) | "never accepted, of either `kind` … no `AbortRecord`, no `FaultRecord`, no entry in `certified_subjects` and no stack change at all" | none |
 | `STATE_MACHINE.md` §8.5 (l. 1876), §8.6 (l. 1939), §8.7 (l. 2046), §9.5 (l. 2190), §12 (l. 2366) | all five restate inertness and route to T57 | none |

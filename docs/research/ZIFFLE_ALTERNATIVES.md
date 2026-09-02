@@ -29,7 +29,7 @@ gone**, and I verified that by building it.
 | --- | --- | --- |
 | unpublished git dep on a stale org via SSH, needs a patched manifest | Gone — one repo, HTTPS, `rev`-pinnable | built a probe with `cards-protocol = { git = "https://github.com/paritytech/mental-poker", rev = "e05744b4…" }`; clean build, ran |
 | arkworks 0.3.0 → two incompatible arkworks trees | Gone — arkworks **0.5.0**, same as `ziffle` | `Cargo.toml` `[workspace.dependencies]`; adding it to the project's real lock adds **6 packages**, no arkworks split |
-| ~6600 lines to review | Still large: 5143 (`proofs`) + 2621 (`protocol`) | `find -name '*.rs' | xargs wc -l` |
+| ~6600 lines to review | Still large: 5143 (`proofs`) + 2621 (`protocol`) | `find -name '*.rs' \| xargs wc -l` |
 
 And on the same curve as `ziffle` (secp256k1, arkworks 0.5.0) it is **faster and
 smaller on every axis**, measured on this machine in this session:

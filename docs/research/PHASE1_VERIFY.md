@@ -870,7 +870,7 @@ time" — true at `n >= 3`, and it points at §8, so it does not mislead), and
 | 1 | the equivocation predicate | `PROTOCOL.md` §5.2 ↔ `THREAT_MODEL.md` G7 | **identical**, quoted as a block; `NETWORK_STACK.md` §7.4 and §11.5 defer to it and say what their own rule is *not* |
 | 2 | the `ctx` construction | `PROTOCOL.md` §4.5 ↔ `CRYPTOGRAPHY.md` §6.4 | **identical**, with an explicit ownership sentence and a tie-break rule |
 | 3 | the deck-index map | `PROTOCOL.md` §4.5 ↔ `CRYPTOGRAPHY.md` §2.4 ↔ `STATE_MACHINE.md` §7.8 | **identical**, same symbol `m`, same `2m+5 … 51` unused range |
-| 4 | the timeout-certificate rules | `PROTOCOL.md` §8.3/§8.4 ↔ `STATE_MACHINE.md` §8.4 ↔ `THREAT_MODEL.md` X10/A13 | agree on `V`, on the `n = 2` rules, on the collective stage and on the race statement. **Both carry N3's `|V|` hole identically**, which is at least consistent |
+| 4 | the timeout-certificate rules | `PROTOCOL.md` §8.3/§8.4 ↔ `STATE_MACHINE.md` §8.4 ↔ `THREAT_MODEL.md` X10/A13 | agree on `V`, on the `n = 2` rules, on the collective stage and on the race statement. **Both carry N3's `\|V\|` hole identically**, which is at least consistent |
 | 5 | the relay byte budget | `CRYPTOGRAPHY.md` §6.5 ↔ `PROTOCOL.md` §9.3 ↔ `THREAT_MODEL.md` §3.5/X20/OQ12 ↔ `NETWORK_STACK.md` §9.5 **↔ `NETWORK_STACK.md` §16.1** | **contradiction — N1.** Four documents say ~14 hands per direction; one section of the fifth says ~7 hands bidirectional and is right |
 
 Three further pairs checked and clean: the ledger identity (`STATE_MACHINE.md` §10 /

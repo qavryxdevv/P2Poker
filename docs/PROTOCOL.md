@@ -820,7 +820,7 @@ in seven passes asked what removes a seat from an `R`.
 | `SHOWDOWN_REVEAL` / `SHOWDOWN_MUCK` | the required-to-show set | unchanged — a function of the betting sequence and the rules, every input chained |
 | `TIMEOUT_CERT` | `V(subject)`, inductive over completed certificates | unchanged — clean, and clean because D-008 already fixed the version that was not |
 | `STATE_HASH`, `STATE_ACK` | "all present seats" | **changed** — `P(k-1)`, `P(0)` at checkpoint 1, and **`P(k)` at checkpoint 8** (§4.9). Checkpoint 8's is the one `R` in the document that is not `P(k-1)` or a subset of it, and it is the one stage whose *accepted* set is wider than its *required* set: an out-of-set `STATE_HASH` there is compared rather than rejected, which is `L3`'s disposition and is what stops two peers whose `P` has forked from never colliding |
-| the **reconciliation round** of §6.3 step 3 | the re-derived checkpoint's own set | **changed in this pass — `N1`** — `R(c) ∪ W`, where `W` is this receiver's contradiction set. **The one required emitter set in this document with a per-receiver component**, and the paragraph below is why it is admissible; it is also the one with a **floor**, `|R| >= 2`, which is the point of it |
+| the **reconciliation round** of §6.3 step 3 | the re-derived checkpoint's own set | **changed in this pass — `N1`** — `R(c) ∪ W`, where `W` is this receiver's contradiction set. **The one required emitter set in this document with a per-receiver component**, and the paragraph below is why it is admissible; it is also the one with a **floor**, `\|R\| >= 2`, which is the point of it |
 | `HAND_INIT`, when §4.9's readmission set is non-empty | — | **unchanged, and that is `P2`'s disposition** — `R` stays `P(m)`. The set `A` — the senders of a stale `PLAYER_SIT_IN`, or of a stale checkpoint-8 `STATE_HASH` that agreed — widens this stage's **accepted** emitter set to `P(m) ∪ A` and never its required one. `N5` put the union in `R`, where a replayed agreeing copy re-enlarged it once per hand for 4 096 hands and stalled stage 0 each time; a required set is now enlarged only by a seat's own accepted copy of a **chain-`m+1`** event, which no replay can forge (§4.9, §4.4) |
 | `HAND_ABORT` | none — witness-independent terminal | unchanged |
 
@@ -7110,7 +7110,7 @@ reading the body.
 | `JOIN_ACCEPT` | 8 192 | ~1 800 |
 | `JOIN_REJECT` | 128 | ~45 |
 | `PLAYER_LIST` | 2 048 | ~1 200 |
-| `TABLE_READY` | 1 536 | ~200 |[^ready-cap]
+| `TABLE_READY` | 1 536 | ~200[^ready-cap] |
 | `RNG_COMMIT` | 64 | 34 |
 | `RNG_REVEAL` | 128 | 68 |
 | `HAND_INIT` | 512 | ~140 |
