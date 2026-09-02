@@ -953,97 +953,113 @@ which may read them as hints and never as state (§1.2 prohibitions 3 and 8).
 
 ---
 
-## 3. `LOBBY_INFOHASH`
+## 3. The lobby rendezvous
+
+> **Rewritten 2026-09-02 to the mechanism the client runs.** §§3.1–3.4 specified
+> a 20-byte BitTorrent infohash and a Mainline announce; `c7e6317` replaced that
+> with a libp2p Kademlia **provider record** and deleted both infohashes from the
+> build. §3.5 below is **not** rewritten and is still Mainline's — see its own
+> note. The rest of this document's Mainline sections are listed in the warning
+> at the head of the file.
 
 ### 3.1 Requirement
 
-`SPEC_CS.md` §3: every installation ships the same fixed 20-byte infohash; the
-client must not create a new lobby on each start. It must therefore be a compiled-in
-constant. It must also be *verifiable* — anyone auditing the client should be able
-to recompute it from first principles rather than trust a magic number.
+`SPEC_CS.md` §3: every installation shares **one fixed rendezvous**, and the
+client must not create a new lobby on each start — so it is a compiled-in
+constant. It must also be **verifiable**: anyone auditing the client should be
+able to recompute it from first principles rather than trust a magic number.
+
+**That requirement is mechanism-independent, and only the thing that discharges
+it moved.** What follows is a different construction of the same fixed, shared,
+recomputable meeting place.
 
 ### 3.2 Derivation
 
-```
-LOBBY_INFOHASH = first 20 bytes of SHA-256( ASCII("p2p-poker/mainline-lobby/v1") )
-RELAY_INFOHASH = first 20 bytes of SHA-256( ASCII("p2p-poker/mainline-relay/v1") )
-```
-
-The input is the exact ASCII byte string, with **no** trailing newline, **no** NUL
-terminator and no length prefix. The output is the first (most significant) 20
-bytes of the 32-byte digest, in digest order.
-
-| Constant | Derivation string | Value (hex, 20 bytes) |
-|---|---|---|
-| `LOBBY_INFOHASH` | `p2p-poker/mainline-lobby/v1` | `fd7c0d69433e32e425db3ca2b7d7718928739f01` |
-| `RELAY_INFOHASH` | `p2p-poker/mainline-relay/v1` | `9c18d8c80f69de3aa079b2ef519bc4bbb67e1cc1` |
-
-**On D-011 rule 1 and this one table.** Both values are also pinned in
-`PROTOCOL.md` §13, which is the normative home for two-sided constants, and
-everywhere else in the corpus they appear by name only. This is the one place a
-value is written twice, and it is deliberate: these two constants are **derived,
-not chosen**, so the pair cannot drift silently the way a hand-picked number can
-— one shell command below settles any disagreement, and a copy that disagrees is
-a copy that fails its own audit. The derivation, the truncation rule and the
-reasoning are this document's, because discovery is what this document owns; the
-pinned constant is `PROTOCOL.md` §13's. If the two ever differ, recompute:
-whichever value the derivation string produces is right, and the other is a typo.
-
-Reproduce with any tool:
+Two namespaces, and the key each becomes:
 
 ```
-$ printf '%s' 'p2p-poker/mainline-lobby/v1' | sha256sum | cut -c1-40
-fd7c0d69433e32e425db3ca2b7d7718928739f01
-$ printf '%s' 'p2p-poker/mainline-relay/v1' | sha256sum | cut -c1-40
-9c18d8c80f69de3aa079b2ef519bc4bbb67e1cc1
+lobby namespace = ASCII("p2p-poker/main-lobby/v1")
+relay namespace = ASCII("/libp2p/relay")          -- go-libp2p's own
+
+key(ns) = 0x12 || 0x20 || SHA-256(ns)             -- 34 bytes
 ```
 
-> Verification: [COMPILED+RUN] `probe-netstack` computes both digests with `sha2`,
-> truncates to 20 bytes, builds `mainline::Id` from them, and asserts equality
-> against the pinned hex constants parsed by `Id::from_str`. Program output:
-> `LOBBY_INFOHASH = fd7c0d69433e32e425db3ca2b7d7718928739f01`,
-> `RELAY_INFOHASH = 9c18d8c80f69de3aa079b2ef519bc4bbb67e1cc1`.
-> Independently reproduced with `sha256sum` and with `openssl dgst -sha256`.
-> [SOURCE] `mainline-8.0.0/src/common/id.rs:31` (`Id::from_bytes`), `:165`
-> (`From<[u8;20]>`), `:183` (`FromStr`, hex).
+`0x12 0x20` is the multihash prefix for sha2-256 and a 32-byte digest, so the
+key is exactly the multihash of `CIDv1(raw, sha2-256(ns))`. That mapping is
+go-libp2p's routing discovery: it turns a namespace into that CID and
+go-libp2p-kad-dht keys the provider record on the CID's multihash, so a client
+written against either implementation lands on the same key.
+
+The published values, and `the_lobby_rendezvous_key_is_the_published_one` pins
+them:
+
+```
+lobby  12207e342925602a7c6558d6ac574207bcc56f7989e17ad52b7694f2c964d772c4b6
+relay  1220245eebd20d2cd4c81b5d4ac27c73746279f436d62f3ef52c452a369e6ef7b610
+```
+
+Every client calls `start_providing(key)` for the lobby key and `get_providers`
+on it; a client that also serves as a relay provides the relay key as well. That
+is the whole of the lobby: a place all clients agree on, where each finds the
+others' addresses, after which table advertisements travel over GossipSub exactly
+as §6 describes.
+
+**The derivation is in `src/net/run.rs`'s `namespace`, computed rather than
+pasted**, and the test above writes the expected bytes out rather than
+recomputing them — a test that recomputes the thing it checks passes whatever the
+code does. This is the one constant on which two independent implementations find
+each other or do not, and until that test existed a change to the namespace
+string, the hash or the prefix would have moved the lobby in silence while every
+client kept working perfectly alone.
 
 ### 3.3 Why this construction
 
-* **Not SHA-1.** A BitTorrent infohash is conventionally SHA-1 because it hashes a
-  torrent `info` dictionary. We are not hashing a torrent; we need an arbitrary
-  20-byte label. SHA-1 is collision-broken and using it here would invite the
-  reader to think a security property is being claimed. Truncated SHA-256 makes it
-  obvious that the value is a *namespace label*, not a commitment.
-* **20 bytes is forced** by BEP 5 and by `mainline::Id` (`ID_SIZE = 20` [SOURCE]).
-  Truncation is the only way to get 20 bytes out of SHA-256, and truncation of a
-  hash function output is standard practice for a label.
-* **Non-arbitrary and auditable.** A reviewer recomputes it in one shell command.
-  Nobody has to trust that the constant was not chosen to sit next to something.
-* **Version separation is free.** `v1` in the string means a future incompatible
-  protocol version derives a different infohash and the two populations do not see
-  each other at the DHT level at all. That is cheaper and more reliable than
-  filtering incompatible peers after connecting.
-* **Distinct relay namespace.** `RELAY_INFOHASH ≠ LOBBY_INFOHASH` so that looking
-  for a relay does not enumerate players and vice versa
-  (`NAT_AND_DISCOVERY.md` §3.4).
+**A BitTorrent announcement can say one thing — `IP:port` — and a player behind
+a NAT does not have one worth saying.** What such a player has is a circuit
+address through a relay: a multiaddr, which does not fit in four bytes and a
+port. A provider record carries whatever addresses the node has, so **one
+mechanism serves the reachable player and the unreachable one**, and that is the
+difference between a lobby most people can be seen in and a lobby only a minority
+can.
+
+It also removes a dependency and a divergence: the client already runs a libp2p
+Kademlia for peer routing, so the lobby rides a table it maintains anyway rather
+than a second DHT with its own crate, its own bootstrap set and its own failure
+modes.
+
+The namespace strings are versioned (`/v1`) so that a future incompatible lobby
+is a different key rather than a mixed one.
 
 ### 3.4 Distribution and integrity
 
-* Both constants, and both derivation strings, are two-sided and are therefore
-  defined in **`PROTOCOL.md` §13** together with the protocol names, topic names
-  and size caps; §14 of this document no longer restates them. They are `const`,
-  compiled in.
-* A release build has **no** way to override them. A `--testnet <string>` flag may
-  derive a *different* pair from a different derivation string for integration
-  testing; when it is active the GUI must display a prominent, permanent "TESTNET"
-  banner, because a client on a different infohash is invisible to everyone else
-  and that must never be mistaken for "nobody is online".
-* A unit test recomputes both constants from their derivation strings and asserts
-  equality with the pinned hex. This is exactly the assertion the probe already
-  runs, and it means a typo in the constant fails the build rather than silently
-  splitting the network.
+**A provider record is a hint and not a credential**, exactly as §4.1 says of the
+address list it produces. What a provider record asserts is that some peer
+claimed to provide this key; it is not evidence about a table, a roster, or a
+player. Everything that matters is checked afterwards and elsewhere:
 
-### 3.5 What a fixed public infohash costs — and it must be told to the user
+* the **peer id** is bound to the connection by libp2p's own handshake, so an
+  address that answers is the peer it claims to be or the dial fails;
+* a **table** is a signed `LOBBY_TABLE_AD` under the table key (§6, `PROTOCOL.md`
+  §7.2), which the DHT never sees and cannot forge;
+* a **seat** is the roster's, ratified under §4.3, and no discovery answer
+  changes it.
+
+So a hostile provider record costs a dial and nothing else. Its cost in
+**privacy** is a different question and is §3.5's.
+
+### 3.5 What a fixed public rendezvous costs — and it must be told to the user
+
+> **NOT REWRITTEN, and it is the half of §3 that needs more than transcription.**
+> Everything below is derived from a **Mainline** announce — BEP 5's token, LRU
+> eviction, and a measured `~45 minutes` before an un-refreshed announce was
+> gone. The client no longer does any of that. The **obligation** stands
+> unchanged, because `SPEC_CS.md` §3 requires these limits to be documented and
+> forbids answering them with a central server; what has to be re-derived is the
+> **content**: Kademlia's provider-record lifetime, its republish interval, what
+> a provider learns about who is looking, and what a fixed public key therefore
+> discloses. That needs measurement against `libp2p-kad`'s real bounds and a
+> decision about what the user is told, which is why it is left standing and
+> marked rather than quietly re-pointed. `S1-E`.
 
 `SPEC_CS.md` §3 explicitly requires documenting these limits, and forbids
 answering them with a central server.

@@ -5522,6 +5522,41 @@ fn reachable(addr: &libp2p::Multiaddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// **The rendezvous key, pinned to its bytes.** `NETWORK_STACK.md` §3.2.
+    ///
+    /// This is the one constant on which two independent implementations find
+    /// each other or do not. `namespace` says it is *"derived here rather than
+    /// pasted, so the derivation is visible and testable"* — it was visible and
+    /// nothing tested it, so a change to the namespace string, the hash, or the
+    /// multihash prefix would have moved the whole lobby somewhere else in
+    /// silence, and every client would have kept working perfectly alone.
+    ///
+    /// The value is written out rather than recomputed by the test, because a
+    /// test that recomputes the thing it checks passes whatever the code does.
+    #[test]
+    fn the_lobby_rendezvous_key_is_the_published_one() {
+        assert_eq!(
+            hex(lobby_namespace().to_vec().as_slice()),
+            "12207e342925602a7c6558d6ac574207bcc56f7989e17ad52b7694f2c964d772c4b6",
+            "sha2-256 of \"p2p-poker/main-lobby/v1\" under the 0x12 0x20 multihash prefix"
+        );
+        assert_eq!(
+            hex(relay_namespace().to_vec().as_slice()),
+            "1220245eebd20d2cd4c81b5d4ac27c73746279f436d62f3ef52c452a369e6ef7b610",
+            "and the relay namespace is go-libp2p's own \"/libp2p/relay\""
+        );
+        // The shape, so a wrong prefix fails for the reason it is wrong rather
+        // than as an opaque byte mismatch.
+        let k = lobby_namespace().to_vec();
+        assert_eq!(k.len(), 34, "a multihash: two bytes of prefix and a digest");
+        assert_eq!(k[0], 0x12, "sha2-256");
+        assert_eq!(k[1], 0x20, "thirty-two bytes of it");
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
     use super::*;
 
     /// A table name is bounded in **bytes**, because that is what goes on the
