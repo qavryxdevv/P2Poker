@@ -3925,13 +3925,37 @@ impl Hand {
     /// quantities, and they differ exactly at a seat that was certified absent
     /// while its events were nonetheless heard, or the reverse.
     ///
-    /// **Which one is right is `Q-10`'s question**, which the corpus asks of
-    /// itself and leaves open — *"nothing ratifies the stalled stage, and no
-    /// construction can"*. It is not settled here and neither reader is changed:
-    /// changing `participants` would move `state_hash`, which is a §6.1 wire
-    /// change. What this method does is make the disagreement **one named place
-    /// with both definitions written next to each other**, instead of a closure
-    /// in one derivation and a field read in three others.
+    /// # The reason given for leaving it open was false, and it was checked
+    ///
+    /// This comment used to end: *"changing `participants` would move
+    /// `state_hash`, which is a §6.1 wire change"*. **It would not.**
+    /// [`state_hash`](Self::state_hash) fills `signed_this_hand` from
+    /// `self.signed` directly; `participants()` has no caller inside it, and
+    /// outside this file it is read only by `run.rs` to build §4.9's required
+    /// emitter set. Changing it moves `P(k)` and leaves §6.1 field 28
+    /// byte-identical. The `S1-V` row inherited the same false sentence and both
+    /// are corrected.
+    ///
+    /// **And a §6.1 change would not be a cost even if it were one.**
+    /// `PROTOCOL.md` §10.2: `PROTOCOL_MAJOR = 1` has not shipped and no peer is
+    /// emitting the struct, so an edit today is a revision of version 1's
+    /// definition rather than a break — free now, and forbidden after release.
+    ///
+    /// # What is actually open, which is narrower
+    ///
+    /// With the false blocker gone, the two predicates stop looking like two
+    /// answers to one question. §4.9 defines `P(k)` as *the seats this client
+    /// accepted a chained event from*, which is `signed` — so `participants()`
+    /// is literally what the specification asks for and is not a candidate for
+    /// change. `took_part` answers a different question: whether a seat was a
+    /// party to hand `k` for the purpose of deriving hand `k+1`.
+    ///
+    /// So what remains is only whether `R(k+1)` should be derived from
+    /// certification or from having been heard, and that is `Q-10` — *"nothing
+    /// ratifies the stalled stage, and no construction can"*. This method's
+    /// value is unchanged: **one named place with both definitions written next
+    /// to each other**, instead of a closure in one derivation and a field read
+    /// in three others.
     pub fn took_part(&self, seat: SeatIdx) -> bool {
         if self.open.required.len() >= 3 {
             !self.certified.contains(&seat)

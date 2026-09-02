@@ -2089,6 +2089,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let mut sent = 0usize;
                                 let mut failed: Option<String> = None;
                                 for bytes in f.say_again(super::node::now_unix_ms()) {
+                                    // **And over the table's Tox group, where
+                                    // no duplicate cache applies.** `S1-P`: a
+                                    // seat's own ratification must arrive
+                                    // verbatim or not at all, so it cannot be
+                                    // re-signed, so GossipSub refuses the repeat
+                                    // for `duplicate_cache_time` = 120 s — which
+                                    // is exactly the window a seat that missed
+                                    // the single publish needs it in. The Tox
+                                    // group has no content-addressed cache and
+                                    // carries the same bytes.
+                                    tox_sink.try_broadcast(&bytes);
                                     match swarm
                                         .behaviour_mut()
                                         .gossipsub
@@ -2837,6 +2848,70 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // Nothing arrives while the link is down.
                 if link_is_down() {
                     continue;
+                }
+                // **Formation traffic over the group, before there is a hand.**
+                //
+                // `S1-P`. Everything below this block is gated on a live `Hand`,
+                // so until 2026-09-02 every Tox byte that arrived during
+                // formation was discarded — and formation is exactly where the
+                // GossipSub duplicate cache makes a repeat impossible. A seat's
+                // `TABLE_READY` must arrive **verbatim** (`emitted_at_unix_ms`
+                // is inside `EventBody`, so a re-signature is a different
+                // `event_hash`, a different `session_id`, and `RatifiedTwice`
+                // against an honest seat), and a verbatim repeat is what
+                // `publish` refuses for two minutes.
+                //
+                // The group exists throughout: D-019 creates it **before** the
+                // advert is signed, because the advert names it. So this is not
+                // a new transport for the message — it is the transport the
+                // table already has, carrying a message that had no second
+                // chance on the other one.
+                //
+                // **What it does not fix**, stated because the row would
+                // otherwise read as closed: `say_again` repeats only this
+                // client's *own* ratification, and `Formation::ratified` stores
+                // hashes rather than bytes, so no peer can repair a third
+                // party's missing copy. A seat that never enters the group at
+                // all is `S1-AA` shape (i) and is untouched by this.
+                if hand.is_none() {
+                    if let Some(f) = table.as_mut() {
+                        let now = super::node::now_unix_ms();
+                        let took = if joinwire::receive_player_list(&item.bytes).is_ok() {
+                            f.on_player_list(&item.bytes, now)
+                        } else {
+                            f.on_table_ready(&item.bytes)
+                        };
+                        // A refusal here is not reported. The group carries hand
+                        // traffic too, and during formation a peer may already
+                        // be sending it; feeding that to the formation handler
+                        // produces a refusal that means nothing.
+                        if let Ok(sends) = took {
+                            for send in sends {
+                                if let super::formation::Send::Broadcast(bytes) = send {
+                                    if !tox_sink.try_broadcast(&bytes) {
+                                        if let Some(t) = &table_topic {
+                                            let _ = swarm
+                                                .behaviour_mut()
+                                                .gossipsub
+                                                .publish(t.clone(), bytes);
+                                        }
+                                    }
+                                }
+                            }
+                            report_roster(&events, f).await;
+                            seat_on_tox(f, &tox_sink);
+                            if let Some(session) = f.session() {
+                                // `TableReal` is idempotent and is emitted from
+                                // more than one place already; see `begin_hand`.
+                                let _ = events
+                                    .send(NodeEvent::TableReal {
+                                        key: f.table_id(),
+                                        session,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
                 }
                 if let Some(h) = hand.as_mut() {
                     cross_boundary_at_t47(h, &mut boundaries, &mut crossed_for);
@@ -3649,6 +3724,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if !ever_dealt {
                         if let Some(topic) = table_topic.as_ref() {
                             for bytes in f.say_again(super::node::now_unix_ms()) {
+                                // The same second path as the `Subscribed`
+                                // repeat above, for the same reason (`S1-P`).
+                                tox_sink.try_broadcast(&bytes);
                                 let _ = swarm
                                     .behaviour_mut()
                                     .gossipsub
