@@ -131,7 +131,15 @@ $bind = $probe.SourceAddress.IPAddress
 # `UserKnownHostsFile=NUL` because otherwise `ssh` tries to write the file and
 # fails with *the system cannot find the path specified*, which also reads as a
 # routing failure. The far end is on a private network and is pinned by the key.
-$ssh = @('-b', $bind, '-i', $privKey,
+#
+# **`-o BindAddress=` and not `-b`, because this list is handed to `scp` too.**
+# `ssh` takes `-b`; `scp` does not — its `-b` is `sftp`'s batch-file option and
+# it exits with *unknown option -- b* before doing anything. That killed every
+# copy in a run while the local founder started normally and played alone, so
+# the report looked like a far machine that never joined rather than a harness
+# that never sent it the binary. Both programs accept the `-o` form.
+$ssh = @('-i', $privKey,
+         '-o', "BindAddress=$bind",
          '-o', 'StrictHostKeyChecking=accept-new',
          '-o', 'UserKnownHostsFile=NUL',
          '-o', 'BatchMode=yes')
@@ -139,7 +147,14 @@ $ssh = @('-b', $bind, '-i', $privKey,
 try {
     Write-Host '==> copying the binary to the far end'
     & ssh @ssh $Target "if not exist $FarDir mkdir $FarDir" | Out-Null
+    # **A copy that fails must stop the run.** It used to be piped to
+    # `Out-Null` and its exit code ignored, so a broken `scp` invocation left
+    # the far end with no binary while the local founder started normally and
+    # played by itself. The report then read as *the far machine never joined*,
+    # which is a protocol conclusion, drawn from a harness fault. One run was
+    # spent on it.
     & scp @ssh $Exe "$($Target):$($FarDir -replace '\\','/')/p2p-poker.exe" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "could not copy the binary to $Target (scp exited $LASTEXITCODE). The far seats would have had nothing to run." }
 
     # --- the far seats, started first so they are looking before the table is
     #     hosted. They join by name, and a name they have not heard of yet is
@@ -171,6 +186,7 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     $farFile = Join-Path $work 'far.ps1'
     Set-Content -Path $farFile -Value $farScript -Encoding UTF8
     & scp @ssh $farFile "$($Target):$($FarDir -replace '\\','/')/far.ps1" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "could not copy the far-end script to $Target (scp exited $LASTEXITCODE)." }
 
     $far = Start-Job -ArgumentList $ssh, $Target, $FarDir -ScriptBlock {
         param($ssh, $Target, $FarDir)
@@ -208,6 +224,7 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     Write-Host '==> collecting the far logs'
     for ($i = 0; $i -lt $There; $i++) {
         & scp @ssh "$($Target):$($FarDir -replace '\\','/')/split-n$i.log" (Join-Path $work "far-n$i.log") 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Warning "far seat $i left no log to collect (scp exited $LASTEXITCODE); its column below is empty because nothing was read, not because nothing happened" }
     }
 
     # --- read it back -------------------------------------------------------
