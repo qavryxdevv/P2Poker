@@ -2303,6 +2303,21 @@ peer confirmed, so the sentence was false on its face. It is now conditioned on
 the table **not** being on Tox — a diagnosis that can be right for the wrong
 reason is worse than none, and this one cost a reading.
 
+**Measured across two networks, and it is the best result this project has
+had.** `split222801-2`, 420 s, one seat here and one at `172.16.0.20`, the same
+binary at both ends by SHA-256: **42 hands opened and 42 finished on both
+nodes**, with `opened` equal to `finished` for the first time — every hand that
+started also completed. Group entry fell to **5.5 s and 21.6 s**, against 76.6 s
+and 81.6 s in the two runs before this change. The founder logged *"this table's
+traffic rides a Tox group, `1aa7112b`"*, the group read
+`1 seen/1 confirmed/1 wanted` throughout, and the relay sentence appears **zero**
+times in either log.
+
+For the record, the three cross-network runs either side of the change, same two
+machines and the same wire: 35 opened / 34 finished, 35 / 34, and now 42 / 42.
+One run apiece is not a proof, and what the sequence shows is the same numbers
+moving the same way on the configuration the change was aimed at.
+
 ## D-020 — the showdown is held on screen before the next hand
 
 Decided 2026-08-30, on the owner's instruction: **at a showdown the cards of
