@@ -91,12 +91,24 @@ Write-Host ''
 # read, removed in the `finally`.
 $privKey = Join-Path $env:TEMP ('split-' + [IO.Path]::GetFileName($KeyPath))
 Copy-Item -Path $KeyPath -Destination $privKey -Force
-$acl = Get-Acl $privKey
-$acl.SetAccessRuleProtection($true, $false)
-$acl.Access | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
+
+# **`icacls`, not `Set-Acl`, and that is not a style preference.** `Set-Acl`
+# writes back the whole security descriptor it was handed by `Get-Acl` --
+# including the audit portion -- so Windows demands `SeSecurityPrivilege` for
+# it, which an ordinary shell does not hold. It fails with *the process does not
+# have the SeSecurityPrivilege required for this operation*, which reads like a
+# key problem and is not one; the run dies before a single node starts.
+# `icacls` sets only the DACL and needs no such privilege.
+#
+# `/inheritance:r` drops the inherited rules that make the file group- and
+# world-readable, which is the whole reason for the copy: Windows OpenSSH
+# refuses a key anyone else can read and reports it as
+# `Permission denied (publickey)`.
 $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')))
-Set-Acl -Path $privKey -AclObject $acl
+& icacls "$privKey" /inheritance:r /grant:r "${me}:(F)" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "could not lock the permissions on the key copy at $privKey (icacls exited $LASTEXITCODE). ssh will refuse a key other accounts can read."
+}
 
 # **`ssh` must be told which interface to leave by, and finding that out took a
 # session.** A machine with a Hyper-V switch and a handful of `169.254.*`
