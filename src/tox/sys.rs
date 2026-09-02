@@ -30,6 +30,27 @@ pub struct Tox {
     _private: [u8; 0],
 }
 
+/// `tox_options.h:90`. The library's own log line, which is discarded unless
+/// this is set.
+///
+/// **Every `LOGGER_WARNING` and `LOGGER_ERROR` in the vendored tree is a no-op
+/// without it** (`logger.c`), and the group invite path has six distinct
+/// failure branches — four that log and two that return with no diagnostic at
+/// all. None of them could reach an operator, which is why `S1-AA` shape (i)
+/// looks from outside like a healthy transport that simply will not admit a
+/// peer.
+pub type tox_log_cb = Option<
+    unsafe extern "C" fn(
+        tox: *mut Tox,
+        level: c_int,
+        file: *const c_char,
+        line: u32,
+        func: *const c_char,
+        message: *const c_char,
+        user_data: *mut c_void,
+    ),
+>;
+
 /// Opaque, from `tox_options_new`.
 #[repr(C)]
 pub struct Tox_Options {
@@ -56,6 +77,8 @@ extern "C" {
     pub fn tox_options_new(error: *mut c_int) -> *mut Tox_Options;
     /// `tox_options.h:460`
     pub fn tox_options_free(options: *mut Tox_Options);
+    /// `tox_options.h:377`
+    pub fn tox_options_set_log_callback(options: *mut Tox_Options, callback: tox_log_cb);
     /// `tox_options.h:319`
     pub fn tox_options_set_ipv6_enabled(options: *mut Tox_Options, enabled: bool);
     /// `tox_options.h:323`

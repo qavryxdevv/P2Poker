@@ -161,6 +161,36 @@ unsafe extern "C" fn on_group_packet(
     });
 }
 
+/// toxcore's own log line, forwarded to stderr in a harness build.
+///
+/// Filtered to the group code, because the whole library at `DEBUG` buries the
+/// six lines that matter under thousands about the DHT. A `NULL` field is
+/// printed as `?` rather than skipped: which one is missing is itself a fact
+/// about where the library gave up.
+#[cfg(feature = "fault-harness")]
+unsafe extern "C" fn on_tox_log(
+    _tox: *mut sys::Tox,
+    level: c_int,
+    file: *const std::ffi::c_char,
+    line: u32,
+    func: *const std::ffi::c_char,
+    message: *const std::ffi::c_char,
+    _user_data: *mut c_void,
+) {
+    let s = |p: *const std::ffi::c_char| -> String {
+        if p.is_null() {
+            "?".to_owned()
+        } else {
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    };
+    let file = s(file);
+    if !file.contains("group") {
+        return;
+    }
+    eprintln!("toxcore[{level}] {file}:{line} {} — {}", s(func), s(message));
+}
+
 /// A peer became confirmed. See [`Event::GroupPeerJoin`].
 unsafe extern "C" fn on_group_peer_join(
     _tox: *mut sys::Tox,
@@ -398,6 +428,22 @@ impl Tox {
             // depends on a default is a client that changes behaviour when the
             // vendored tree moves.
             sys::tox_options_set_hole_punching_enabled(opts, true);
+            // **The library's own diagnostics, in the harness build only.**
+            //
+            // Every `LOGGER_WARNING` and `LOGGER_ERROR` in the vendored tree is
+            // a no-op while no callback is set, and the group invite path has
+            // six distinct failure branches — four that log and two that return
+            // silently. So `S1-AA` shape (i) looks from outside like a healthy
+            // transport that will not admit a peer, and two measured attempts at
+            // a leave-and-rejoin recovery did not cure it with nothing to say
+            // why.
+            //
+            // **Not in a release build.** These lines are noisy, they name
+            // files and functions inside a vendored C library, and a player has
+            // no use for them. `--features fault-harness` is the same gate the
+            // divergence and stall knobs use.
+            #[cfg(feature = "fault-harness")]
+            sys::tox_options_set_log_callback(opts, Some(on_tox_log));
             // Two clients on one wire find each other without the DHT. It is
             // also the one discovery path that keeps working when the internet
             // does not.
