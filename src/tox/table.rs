@@ -462,6 +462,36 @@ const SWEEP_EVERY: Duration = Duration::from_secs(5);
 /// only when it holds none.
 const REINVITE_EVERY: Duration = Duration::from_secs(30);
 
+/// How long the founder waits for its own transport before creating the group.
+///
+/// **This is the group's one guaranteed chance to be given TCP relays, and it
+/// was being spent on an empty list.**
+///
+/// `init_gc_tcp_connection` gives the chat a `TCP_Connections` instance of its
+/// own — a *different* instance from the one `tox_add_tcp_relay` feeds — and
+/// seeds it by copying whatever the main instance has **connected** at that
+/// instant (`group_chats.c:7271`, `add_tcp_relays_to_chat`). Every refill after
+/// that is gated on the main instance's connected count *changing*
+/// (`group_chats.c:7061`); that count settles at
+/// `RECOMMENDED_FRIEND_TCP_CONNECTIONS` = 3 and then stops changing, so the
+/// gate latches and the seeding never runs again.
+///
+/// The founder used to call `new_group` microseconds after `toxsink` offered
+/// the relay list, before a single relay had finished its handshake, so the
+/// copy took **zero** relays and the founder's DHT announce carried none
+/// (`Messenger.c:2457` reads the *chat's* instance, not the main one). That is
+/// the condition `S1-AA` traced the failed cross-network join to: a joiner that
+/// reaches the founder over a relay needs relays in the invite confirmation,
+/// and the founder had none to put there.
+///
+/// **Waiting on `connection()` rather than on a fixed delay** because the
+/// quantity that matters is whether anything is connected, and that is what the
+/// status answers. Bounded, and the bound is generous because cross-network
+/// bring-up was measured at well over a minute — but a founder whose network
+/// never comes up must still start rather than hang, so after the budget the
+/// group is created anyway and the table fails the way it did before.
+const HOST_SEED_WAIT: Duration = Duration::from_secs(20);
+
 /// Start the driver on its own thread.
 ///
 /// `tox` is moved onto that thread and stays there. The returned handle is the
@@ -531,6 +561,24 @@ fn run(
     for key in &roster {
         if let Ok(n) = tox.add_friend(key) {
             friends.insert(n, *key);
+        }
+    }
+
+    // **Whatever toxcore reported while the founder was waiting below.**
+    //
+    // The wait has to call `iterate`, because `connection()` never moves
+    // without it — and `iterate` is also the only place events are delivered.
+    // Dropping them would lose a friend's up-edge, and the comment on
+    // `connected` above says what that costs: an invitation is sent from a
+    // condition now precisely because a missed edge left a seated player
+    // outside the group until the network hiccupped. So they are kept and
+    // handed to the first turn of the main loop.
+    let mut early: Vec<Event> = Vec::new();
+    if matches!(setup.role, Role::Host) {
+        let waiting_since = Instant::now();
+        while tox.connection() == 0 && waiting_since.elapsed() < HOST_SEED_WAIT {
+            early.extend(tox.iterate());
+            std::thread::sleep(tox.interval().min(MAX_TICK));
         }
     }
 
@@ -693,7 +741,11 @@ fn run(
         }
 
         // --- one turn of toxcore's own loop --------------------------------
-        for e in tox.iterate() {
+        // `early` carries whatever arrived while the founder was waiting for
+        // its transport, and is empty from the second turn on.
+        let mut turn = std::mem::take(&mut early);
+        turn.extend(tox.iterate());
+        for e in turn {
             match e {
                 Event::FriendConnection { friend, status } if status != 0 => {
                     // Up. The founder invites every seat the roster names, once
