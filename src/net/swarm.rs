@@ -344,9 +344,29 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
             // starts answering queries is one that can actually be reached.
             ipfs_kad.set_mode(None);
 
+            // **`identify` sent this machine's LAN topology to every stranger on
+            // the public DHT**, and `NETWORK_STACK.md` §3.5 now says so.
+            //
+            // `hide_listen_addrs` defaults to false, so the message carries
+            // `listen_addresses ∪ external_addresses`. The external half is
+            // filtered — `run::reachable` gates what AutoNAT may add, which is
+            // §5.6's publish filter doing its job — but the listen half is the
+            // raw bound set. Measured here on 2026-09-02 that was
+            // `/ip4/192.168.1.20`, `/ip4/172.27.224.1` (a Hyper-V "Default
+            // Switch"), and two `fdc9:…` IPv6 ULAs. A peer on the Amino DHT that
+            // never sees the lobby key still learned the player's home subnet
+            // and which hypervisor they run.
+            //
+            // Hiding it costs a delay, not a capability. A genuinely public host
+            // is advertised the moment AutoNAT confirms its address — the same
+            // address, by the path that filters it — and the LAN case is served
+            // by mDNS (§9.8), which does not go through `identify` at all. What
+            // stops being advertised is precisely the set `reachable` would have
+            // refused anyway.
             let identify = identify::Behaviour::new(
                 identify::Config::new(IDENTIFY_PROTOCOL.into(), key.public())
                     .with_agent_version(format!("p2p-poker/{}", env!("CARGO_PKG_VERSION")))
+                    .with_hide_listen_addrs(true)
                     .with_push_listen_addr_updates(true),
             );
 

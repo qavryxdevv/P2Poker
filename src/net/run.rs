@@ -171,12 +171,48 @@ fn namespace(ns: &[u8]) -> libp2p::kad::RecordKey {
 /// The same number is used for UDP and TCP. They are different sockets and do
 /// not collide, and one number is one line in a router's configuration instead
 /// of two.
+///
+/// # IPv6, and why it was missing
+///
+/// **This client bound `/ip4/0.0.0.0` and nothing else, on both transports, for
+/// its whole life.** `NETWORK_STACK.md` §5.8 said discovery was IPv4-only and
+/// gave the reason: the `mainline` crate's socket did
+/// `unimplemented!("KrpcSocket does not support Ipv6")`. That crate was deleted
+/// in `c7e6317` and the reason went with it — libp2p's QUIC and TCP transports
+/// are both dual-stack — but the four IPv4 literals stayed, so the conclusion
+/// survived its own premise. A player on an IPv6-only network could not be
+/// reached by anybody, and neither could a player whose ISP gives out CGNAT on
+/// v4 and a routable address on v6, which is the common case this is worth
+/// most to.
+///
+/// **An IPv6 listener that fails is not an error.** A machine with no IPv6 at
+/// all is ordinary — the machine this was written on is one — so the `/ip6/`
+/// addresses are attempted and reported, never fatal. That is why this returns
+/// two lists rather than one: the caller must be able to tell "could not bind,
+/// carry on" from "could not bind, stop".
 fn listen_addrs(port: u16) -> Vec<Multiaddr> {
     vec![
         format!("/ip4/0.0.0.0/udp/{port}/quic-v1")
             .parse()
             .expect("a literal"),
         format!("/ip4/0.0.0.0/tcp/{port}")
+            .parse()
+            .expect("a literal"),
+    ]
+}
+
+/// The same two transports on IPv6, on the same port number.
+///
+/// `::` is the v6 wildcard. Whether it also accepts v4 traffic depends on the
+/// host's `IPV6_V6ONLY` default and is not relied on here: the v4 listeners of
+/// [`listen_addrs`] are bound in their own right, so a dual-stack socket would
+/// merely be a duplicate and a v6-only socket loses nothing.
+fn listen_addrs_v6(port: u16) -> Vec<Multiaddr> {
+    vec![
+        format!("/ip6/::/udp/{port}/quic-v1")
+            .parse()
+            .expect("a literal"),
+        format!("/ip6/::/tcp/{port}")
             .parse()
             .expect("a literal"),
     ]
@@ -269,6 +305,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
 
     for addr in listen_addrs(port) {
         swarm.listen_on(addr)?;
+    }
+    // IPv6 beside IPv4, and a failure here is reported rather than fatal: a host
+    // with no IPv6 stack is ordinary and must still be able to play.
+    let mut v6 = 0usize;
+    for addr in listen_addrs_v6(port) {
+        match swarm.listen_on(addr.clone()) {
+            Ok(_) => v6 += 1,
+            Err(e) => {
+                let _ = events
+                    .send(NodeEvent::Warning(format!(
+                        "no IPv6 listener on {addr}: {e}. This client is reachable over IPv4 only, which is what every build before this one was"
+                    )))
+                    .await;
+            }
+        }
+    }
+    if v6 > 0 {
+        let _ = events
+            .send(NodeEvent::Warning(format!(
+                "listening on IPv6 as well as IPv4 ({v6} of 2 transports)"
+            )))
+            .await;
     }
 
     // Reach for the public network at once, rather than after the first
@@ -5401,9 +5459,46 @@ async fn hand_one_may_open(
     let since = *held_since.get_or_insert(now);
 
     // Still filling? Then keep waiting, however long it has already been.
-    let (seen, _) = tox.group_seen();
-    if seen > progress.0 {
-        *progress = (seen, now);
+    if tox.group_seen().0 > progress.0 {
+        *progress = (tox.group_seen().0, now);
+    }
+
+    // **A group that never started is not a group that stopped filling, and
+    // both of the rules below could not tell them apart.**
+    //
+    // `progress` begins at `(0, now)`. If `seen` stays at zero it never moves,
+    // so `stalled` becomes true at two minutes for a client that has not seen a
+    // single other peer — and `too_long` does the same at five. Both then say
+    // *"dealing anyway"*, and dealing to nobody is not a degraded table, it is
+    // hands that no one will ever answer.
+    //
+    // Measured 2026-09-02, a four-seat run: `n3` sat at `group 0/3` for the
+    // whole run with all three Tox friendships up and every seat 0 ms away on
+    // the line, announced *"held 0 of 3 other seats and stopped filling …
+    // dealing anyway"* at 135 s, and opened one hand that finished never. The
+    // harness's own verdict was **"4 seat(s) opened hands and finished none —
+    // they heard nobody"**.
+    //
+    // So the ceiling is not the last word: with no other seat in the group there
+    // is nothing to deal *to*, and the honest move is to keep waiting and say
+    // why. This cannot hold the **table** up — the other seats deal without this
+    // one and §8.3's timeout certifies it out, which is exactly what happened to
+    // a lagging seat in the run before this one. It holds up only this client's
+    // production of hands nobody can hear.
+    //
+    // `want > 0` guards the no-Tox build, where `group_seen` answers `(0, 0)`
+    // because there is no group to count.
+    let (seen, want) = tox.group_seen();
+    if want > 0 && seen == 0 {
+        if !*said {
+            *said = true;
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "not one of {want} other seats is in the table's group, so no hand is opened here: a hand dealt now would reach nobody. This client is isolated and the other seats will certify it out"
+                )))
+                .await;
+        }
+        return false;
     }
 
     let stalled = now.duration_since(progress.1) >= std::time::Duration::from_millis(GROUP_STALL_MS);
@@ -5660,7 +5755,27 @@ fn reachable(addr: &libp2p::Multiaddr) -> bool {
                 && !ip.is_broadcast()
                 && !ip.is_documentation()
         }
-        Protocol::Ip6(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+        // **IPv6's private ranges, spelled out because `std` will not do it on
+        // stable.** `Ipv6Addr::is_unique_local` and `is_unicast_link_local` are
+        // both unstable, and the v6 arm here used to test only loopback and
+        // `::`, so `fc00::/7` — the exact counterpart of `10/8` and
+        // `192.168/16` — read as *"the rest of the internet could dial this"*.
+        //
+        // That was harmless while the client bound no IPv6 socket at all. It
+        // stopped being harmless in the same commit that added one: this
+        // machine's own v6 addresses are `fdc9:6d69:…`, a ULA, and without
+        // these two masks a LAN-only address would be offered as a relay
+        // endpoint and, if anything ever confirmed it, published in a provider
+        // record for strangers to fail to dial.
+        Protocol::Ip6(ip) => {
+            let first = ip.segments()[0];
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && (first & 0xfe00) != 0xfc00  // fc00::/7, unique local
+                && (first & 0xffc0) != 0xfe80  // fe80::/10, link-local unicast
+                && ip.segments()[..2] != [0x2001, 0x0db8] // 2001:db8::/32, documentation
+        }
         _ => false,
     })
 }
@@ -5809,6 +5924,60 @@ mod tests {
         let shown: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
         assert!(shown.contains(&"/ip4/0.0.0.0/udp/4242/quic-v1".to_owned()), "{shown:?}");
         assert!(shown.contains(&"/ip4/0.0.0.0/tcp/4242".to_owned()), "{shown:?}");
+    }
+
+    /// A LAN address is not an address the rest of the internet can dial, and
+    /// that is as true in IPv6 as in IPv4.
+    ///
+    /// The v6 arm of `reachable` tested loopback and `::` and nothing else,
+    /// which was survivable only for as long as the client never bound a v6
+    /// socket. It binds two now, and the addresses it gets on an ordinary home
+    /// network are `fc00::/7` unique-local ones.
+    #[test]
+    fn a_private_ipv6_address_is_not_reachable_from_outside() {
+        let yes = |s: &str| reachable(&s.parse::<Multiaddr>().expect("a literal"));
+        // Real addresses this machine was measured to bind, 2026-09-02.
+        assert!(!yes("/ip6/fdc9:6d69:ed51:0:2081:e457:503:2311/tcp/33774"), "a ULA is a LAN address");
+        assert!(!yes("/ip6/fe80::1/tcp/1"), "link-local");
+        assert!(!yes("/ip6/::1/tcp/1"), "loopback");
+        assert!(!yes("/ip6/::/tcp/1"), "the wildcard bind is not an address");
+        assert!(!yes("/ip6/2001:db8::1/tcp/1"), "the documentation range");
+        assert!(!yes("/ip6/ff02::1/tcp/1"), "multicast");
+        // And a real one still passes, or the client could never be reached
+        // over IPv6 at all — which was the state this whole change is fixing.
+        assert!(yes("/ip6/2606:4700:4700::1111/udp/443/quic-v1"), "a global unicast address");
+
+        // The v4 arm, unchanged, restated so a future edit cannot quietly
+        // loosen one family while tightening the other.
+        assert!(!yes("/ip4/192.168.1.20/tcp/1"));
+        assert!(!yes("/ip4/127.0.0.1/tcp/1"));
+        // Not `203.0.113.4`: that is TEST-NET-3, and `reachable` refuses the
+        // documentation ranges deliberately. `peerbook`'s own filter does not,
+        // which is why its tests use it as a good address — two filters, two
+        // jobs, and this one is stricter.
+        assert!(yes("/ip4/1.1.1.1/tcp/1"));
+    }
+
+    /// **And IPv6, on the same port, on both transports.**
+    ///
+    /// `NETWORK_STACK.md` §5.8 called discovery IPv4-only and named the reason:
+    /// the `mainline` crate could not do IPv6. That crate is gone and the four
+    /// IPv4 literals stayed, so the client kept the limitation after losing the
+    /// cause. A player on an IPv6-only network was unreachable by anybody, and
+    /// nothing in the tree said so out loud — which is why this is a test and
+    /// not a comment.
+    #[test]
+    fn ipv6_is_listened_on_too_and_on_the_same_port() {
+        let shown: Vec<String> = listen_addrs_v6(4242).iter().map(|a| a.to_string()).collect();
+        assert!(shown.contains(&"/ip6/::/udp/4242/quic-v1".to_owned()), "{shown:?}");
+        assert!(shown.contains(&"/ip6/::/tcp/4242".to_owned()), "{shown:?}");
+
+        // The same number as IPv4's, because a router rule names a number and
+        // two numbers would be two rules for no reason.
+        for a in listen_addrs(4242).iter().chain(listen_addrs_v6(4242).iter()) {
+            let s = a.to_string();
+            assert!(s.contains("/4242"), "{s} is not on the port that was asked for");
+        }
     }
 
 }
