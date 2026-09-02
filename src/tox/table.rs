@@ -961,9 +961,37 @@ fn run(
                 Ordering::Relaxed,
             );
             trouble.want_in_group.store(roster.len() as u64, Ordering::Relaxed);
-            trouble
-                .complete
-                .store(group.is_some() && seen >= roster.len(), Ordering::Relaxed);
+            // **An empty roster is not a complete group, and saying it was
+            // cost a table.**
+            //
+            // `seen >= roster.len()` is vacuously true at `roster.len() == 0`,
+            // and the roster reaches this thread by `Command::Seated`, one turn
+            // behind the node loop that sets it. So in the gap between a seat
+            // being admitted and this driver being told about it, an **empty**
+            // group answered *complete*.
+            //
+            // `hand_one_may_open` asks this first and returns `true` on it
+            // without consulting anything else, so the floor added by `S1-AA` —
+            // never deal while the group holds nobody — was short-circuited by
+            // the very condition it exists to catch.
+            //
+            // Measured, `split001316-2`: the founder seated the second player at
+            // 19.1 s and opened hand 1 at **19.2 s**, into a group the joiner did
+            // not enter until **51.6 s**. Both sides opened at the same genesis,
+            // so formation was correct; the opening simply went to nobody, the
+            // founder timed out at 51.0 s, and the joiner opened its own hand 1
+            // at 56.6 s waiting for a seat that had already given up.
+            //
+            // **It was invisible until today.** Hand traffic used to go to the
+            // per-table GossipSub topic as well, where the joiner had been
+            // connected since 16.5 s, so libp2p delivered what Tox could not and
+            // the defect never showed. D-019's second amendment took that
+            // fallback away — the owner's instruction, and the capacity argument
+            // behind it — and this surfaced on the first run afterwards.
+            trouble.complete.store(
+                group.is_some() && !roster.is_empty() && seen >= roster.len(),
+                Ordering::Relaxed,
+            );
 
             // **A join that never finished, given up and started again.**
             //
