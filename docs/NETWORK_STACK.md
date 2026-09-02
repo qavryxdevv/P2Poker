@@ -2023,7 +2023,12 @@ safety margin.
 * Chosen from peers that have completed `identify` and advertise `/p2p-poker/1`.
 * Prefer peers in **distinct IPv4 /24 prefixes** and, where known, discovered from
   **different DHT responders** — a cheap and partial defence against being handed
-  four Sybils by one flooder.
+  four Sybils by one flooder. **Neither half is implemented, and the first can no
+  longer be implemented here as written**: this client never sees a provider's
+  addresses, so it has no prefix to compare (§4.5). The second still could be —
+  `FoundProviders` is emitted once per responding node, so multiplicity is
+  observable — but nothing records it. `S1-AC` covers the same gap on the dial
+  path.
 * Ask all K concurrently. 15 s timeout each.
 * If fewer than 2 respond, retry once with a fresh set, then continue on live
   gossip alone and show "lobby syncing" in the GUI. Never block the UI.
@@ -2297,6 +2302,20 @@ This does **not** contradict D-004 layer 1: blind *mutual dialling* needs no rel
 at all, because the DHT delivers both addresses to both peers symmetrically. Layer
 1 is not DCUtR; it is two clients dialling each other at the same time. DCUtR is
 layer 2, and layer 2 needs a relay.
+
+> **The symmetry has a precondition it did not have under Mainline, and it makes
+> this finding worse rather than better.** A Mainline announce published an
+> `IP:port` whether or not that address worked, so a NATed peer could always put
+> *something* in the DHT and layer 1 always had two addresses to work with. A
+> provider record publishes `external_addresses`, and `start_providing` is gated
+> on holding one — so a NATed peer is not in the lobby at all until a relay has
+> given it a circuit address.
+>
+> So the relay is now on the critical path for layer 1 as well, by a completely
+> different route from the one this section found: not because dialling needs it,
+> but because *appearing* does. §9.7 layer 0 and §2 state it; it is recorded here
+> because a reader who takes this paragraph at face value would conclude that
+> layer 1 survives a relay-less world, and it no longer does.
 
 ### 9.2 AutoNAT: v2 only
 
