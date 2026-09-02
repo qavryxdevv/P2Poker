@@ -122,6 +122,21 @@ const PUBLIC_ENTRY: &[&str] = &["/dnsaddr/bootstrap.libp2p.io"];
 /// Those are dated records of what was believed then and are left alone.
 const DIALS_PER_ANSWER: usize = 8;
 
+/// How long before a lobby provider that did not answer a dial is tried again.
+///
+/// **The number this replaces was infinity, and that cost a table.** A peer was
+/// recorded as dialled *before* the dial was issued and the outcome was never
+/// read, so one failed attempt refused it for the life of the process — and the
+/// first dial between two clients behind routers routinely fails, before either
+/// has a relay reservation or a hole punched.
+///
+/// One minute matches `discover_timer`, so a provider is tried at most once per
+/// discovery cycle however many answers name it. That keeps what the original
+/// set was for — a record for a client that is long gone costs one dial a
+/// minute, not one per answer — and gives a live peer that was unreachable at
+/// 22.8 s a chance at 82.8 s rather than at never.
+const REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The namespace relay hosts advertise themselves under, as a DHT key.
 ///
 /// Derived, not copied: go-libp2p's routing discovery turns a namespace string
@@ -647,10 +662,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut poker_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
 
-    // Lobby providers already tried, so a record for a client that is long gone
-    // is dialled once rather than every minute for ever.
-    let mut dialled_lobby: std::collections::HashSet<libp2p::PeerId> =
-        std::collections::HashSet::new();
+    // When each lobby provider was last dialled, so a record for a client that
+    // is long gone is not dialled every minute for ever.
+    //
+    // **A map and not a set, because the set remembered an *attempt* and a
+    // first dial to a NATed peer routinely fails.** Both ends of a table are
+    // usually behind a router, and the first dial goes out before either has a
+    // relay reservation or a hole punched; it fails, and until 2026-09-02 that
+    // peer was refused for the life of the process.
+    //
+    // Measured, `split231719-2`: the joiner was offered the founder at 22.8 s
+    // **in an answer containing one provider** — so the per-answer budget was
+    // certainly not the reason — dialled it, and did not reach it. The founder
+    // was offered again at 31.1, 38.4, 200.1 and 327.3 s and skipped every time
+    // by `contains`. Contact came at **386.1 s**, and it came the other way:
+    // the founder dialled in. The table then formed one second after the run's
+    // own deadline, and no hand finished.
+    //
+    // `REDIAL_AFTER` keeps the whole of the protection the set was written for
+    // — a dead record still costs at most one dial per interval — while letting
+    // a live peer that was not reachable at 22.8 s be reached at 82.8 s. A peer
+    // already connected costs nothing to re-dial:
+    // `PeerCondition::DisconnectedAndNotDialing` makes it a no-op.
+    let mut dialled_lobby: std::collections::HashMap<libp2p::PeerId, std::time::Instant> =
+        std::collections::HashMap::new();
 
     // How many discovery cycles in a row this client has been comfortably under
     // its connection budget. Three, and the budget comes down a step.
@@ -2072,14 +2107,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     if peer == me {
                                         continue;
                                     }
-                                    if dialled_lobby.contains(&peer) {
+                                    // Recently tried, so not again yet. Not
+                                    // *ever* again: see `REDIAL_AFTER`.
+                                    if dialled_lobby
+                                        .get(&peer)
+                                        .is_some_and(|at| at.elapsed() < REDIAL_AFTER)
+                                    {
                                         continue;
                                     }
                                     if fresh >= DIALS_PER_ANSWER {
                                         continue;
                                     }
                                     fresh += 1;
-                                    dialled_lobby.insert(peer);
+                                    dialled_lobby.insert(peer, std::time::Instant::now());
                                     // **Bounded, but never at the cost of the
                                     // one peer that matters.** This used to
                                     // `clear()`, which on a lobby larger than
@@ -2094,7 +2134,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // this is a guard for a public lobby, not a
                                     // fix for an observed fault.
                                     if dialled_lobby.len() > 512 {
-                                        dialled_lobby.retain(|p| swarm.is_connected(p));
+                                        dialled_lobby.retain(|p, _| swarm.is_connected(p));
                                     }
                                 }
                                 // By peer id: the addresses came with the query
