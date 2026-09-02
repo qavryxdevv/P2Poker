@@ -2008,6 +2008,27 @@ that already exists.
 (review N4) is answered by D-009 rule 1 — the slot key must include every field
 that legitimately varies — and is no longer open.
 
+### What is waiting on the project owner, as of 2026-09-02
+
+**Every other `S1` row is either closed or is work that can proceed without a
+decision. These five cannot**, and they are gathered here because a decision
+spread across five long table rows is a decision nobody can see the shape of.
+The rows themselves stay normative; this is an index, not a second owner
+(D-011 rule 1).
+
+| # | The decision | Why it is not an implementation's | Cost of getting it wrong |
+|---|---|---|---|
+| 1 | **`seed → button`, and `seed → seat permutation` in the same breath** (`S1-B`, `S1-AD`) | It decides `HAND_INIT n(1)`, which every peer recomputes as validation, so a rule chosen in one implementation is a wire value invented. §4.4 says the rule is `STATE_MACHINE.md`'s, §7.9 says the constructions are §4.4's and that the engine computes neither — a citation cycle with nothing at the centre. | Until it exists the initial button is grindable by whoever ratifies last, at **11 hashes worst case at six seats and 22 at ten** — microseconds. Worth about one hand of position plus ~1 % of a stack at the first blind boundary, so it is open rather than urgent. `S1-AD` must be answered with it: §4.3 lets a joiner name its seat and §4.4 says the seed decides the seating, and the two collide the moment the beacon exists. |
+| 2 | **Write D-019's four Tox fields into §4.3 and §7.2** (`S1-AE`) | It is a wire definition. By §10.2's own rule, *any* change to a payload struct's field set is a major-version change; `grep -ci tox` over all five specification documents returns **zero, five times**. | A conforming second implementation **cannot complete formation** with this client: the fields sit in `JOIN_REQUEST`, `JOIN_ACCEPT`, `PLAYER_LIST` and `LOBBY_TABLE_AD`, and §10.2 says there is no ignore-unknown-trailing-fields behaviour *and there cannot be one*. **Free before release; a major bump after.** |
+| 3 | **Correct `NETWORK_STACK.md` §1.4 and §8 for D-019** (`S1-A`) | D-019 already decides it — a numbered decision beats a specification — but saying *where the traffic actually is* means ratifying the same invented values as row 2, plus `table::fragment`'s 8-byte header and the per-table GossipSub topic string. | The documents route groups 3–8 to a table mesh that has no implementation and should not get one: it would be `n(n-1)/2` circuits — 45 at ten seats — each under the 128 KiB relay cap D-019 exists to escape. |
+| 4 | **The three passages quoting `SPEC_CS.md` verbatim** (`S1-E`, at §1.2, §2 and §9.1) | `SPEC_CS.md` §1 and §3 mandate Mainline and outrank `NETWORK_STACK.md`. Correcting them in place would put the document in front of its own authority; amending `SPEC_CS.md` is the owner's. | The rest of `NETWORK_STACK.md` is now current and these three are not, so the file contradicts itself where a reader is most likely to trust it. |
+| 5 | **`Q-10`: does a peer's own emission count into its own participation record?** (`S1-R`, `S1-V`, and `S1-O`'s last sentence) | The corpus asks it of itself and says no construction can close it — agreeing who contributed to the stage that stalled needs a collective step at exactly the point collectivity failed. | It is the last thing between `R(k+1)` and a definition. `S1-V`'s stated blocker turned out to be false — `state_hash` reads `signed` directly, so changing `participants()` moves `P(k)` and leaves §6.1 byte-identical — so what is left really is only this. |
+
+**Rows 1 and 2 are the two that a second implementation trips over**, and they
+are of different kinds: row 2 makes two clients **meet and fail**, which is
+worse than row 1's silent unfairness and cheaper to fix. Row 2 is also the only
+one of the five whose cost rises on a date rather than on a decision.
+
 ---
 
 ## D-019 — A Tox group carries the table; libp2p keeps the lobby
