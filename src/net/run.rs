@@ -527,6 +527,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut adrift_said = false;
     // Said once: this client is on a TCP relay and the group is not filling.
     let mut udp_warned = false;
+    // **The number nobody has: how many private addresses the real Amino DHT
+    // hands this client.** `S1-AC`'s filter counts what it refuses, so the
+    // figure arrives as a byproduct of the defence instead of needing a second
+    // measurement pass. Taken once, as a shared handle, so the status line can
+    // read it without borrowing the swarm.
+    let bogons = swarm.behaviour().ipfs_kad.dropped();
+    let mut bogons_said = 0u64;
     // How many §6.3 disputes this client has verified. Reported with the freeze,
     // because "none arrived" and "several arrived and agreed with me" are
     // different states and were the same silence.
@@ -3334,27 +3341,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // **No further hand while frozen.** §6.3's freeze stops emission
                 // as well as acceptance, and a peer that dealt on would be
                 // building hand `k+1` on a state it has been told is contested.
-                // The checkpoint below is not reached either, which is right:
-                // there is nothing to checkpoint if no hand ran.
+                //
+                // **The checkpoint below is not reached either, and for the
+                // frozen peer that stays right — but the reason given here used
+                // to be wrong and it was the same reason that broke the adrift
+                // path.** *"There is nothing to checkpoint if no hand ran"* is
+                // about hand `k+1`; the block below publishes hand **`k`'s**
+                // hash, and that hand did run. What makes withholding it correct
+                // *here* is narrower: a peer freezes because a value at that
+                // checkpoint was already compared and disagreed, so its own copy
+                // is out — and §6.3 step 2's dispute carries the complete signed
+                // bytes as evidence in any case. The adrift latch had no such
+                // argument and was moved below the checkpoint.
                 // Reset where the latch is read, not where it is cleared:
                 // `checkpoint_event` releases the freeze and has no business
                 // knowing what this loop has said out loud.
                 if frozen.is_none() {
                     frozen_said = false;
-                }
-                // **This client is on a branch nobody shares.** It cannot
-                // catch up and it must not deal on: a private tournament is
-                // worse than no tournament, because it looks like one.
-                if let Some((theirs, mine)) = adrift {
-                    if !adrift_said {
-                        adrift_said = true;
-                        let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "this client is out: the table is at hand {theirs} and this client reached only {mine}, so it has been dealing a hand nobody else has. No further hand is dealt here."
-                            )))
-                            .await;
-                    }
-                    continue;
                 }
                 if let Some((k, _)) = frozen {
                     if !frozen_said {
@@ -3474,6 +3477,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                }
+
+                // **This client is on a branch nobody shares.** It cannot
+                // catch up and it must not deal on: a private tournament is
+                // worse than no tournament, because it looks like one.
+                //
+                // # This test used to sit ABOVE the checkpoint, and that
+                // # stranded every other seat at the table
+                //
+                // The block above publishes this peer's own checkpoint-8
+                // `STATE_HASH` and says in its own words that it is *"the value
+                // every other seat compares against, and … the door back for a
+                // seat that missed this hand"*. The latch `continue`d before
+                // reaching it, so a seat that fell behind **withheld the one
+                // value the others needed to close hand `k`'s stage** — and
+                // they sat at `checkpoint hand k waiting for [s]` for the rest
+                // of the run. Measured across 134 runs: eight showed exactly
+                // that, and it was read as a Tox delivery failure for a day
+                // because the seat was in the group and 0 ms away.
+                //
+                // The hash is about a hand that has **already settled**.
+                // Withholding it helps nobody and blocks everybody, and the
+                // seat is going to stop dealing either way — which is all the
+                // latch was ever for.
+                if let Some((theirs, mine)) = adrift {
+                    if !adrift_said {
+                        adrift_said = true;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "this client is out: the table is at hand {theirs} and this client reached only {mine}, so it has been dealing a hand nobody else has. No further hand is dealt here — but hand {mine}'s checkpoint has gone out, so the others are not held up by this."
+                            )))
+                            .await;
+                    }
+                    continue;
                 }
 
                 let next = hand.as_ref().and_then(|h| h.next_hand());
@@ -3598,7 +3635,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let (seen, want) = tox_sink.group_seen();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "seats on the line: {}; tox self {}, group {seen}/{want}, tox friends up {up}, invites {sent} sent {refused} refused{}",
+                                "seats on the line: {}; tox self {}, group {seen}/{want}, tox friends up {up}, invites {sent} sent {refused} refused{}{}",
                                 line.join(", "),
                                 match tox_sink.tox_connection() {
                                     0 => "offline",
@@ -3641,6 +3678,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     )
                                 } else {
                                     String::new()
+                                },
+                                // **Said only when it changes.** A count that
+                                // repeats every thirty seconds is a number
+                                // nobody reads; one that appears when it moves
+                                // is the measurement (`S1-AC`).
+                                {
+                                    let now = bogons.load(std::sync::atomic::Ordering::Relaxed);
+                                    if now > bogons_said {
+                                        let since = now - bogons_said;
+                                        bogons_said = now;
+                                        format!(", {since} private address(es) from the DHT refused ({now} this run)")
+                                    } else {
+                                        String::new()
+                                    }
                                 }
                             )))
                             .await;

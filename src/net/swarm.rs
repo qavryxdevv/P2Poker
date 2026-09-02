@@ -116,6 +116,205 @@ pub const RELAY_MAX_CIRCUITS_PER_PEER: usize = 4;
 /// left looking at a button that appears to have done nothing.
 pub const JOIN_RPC_TIMEOUT_MS: u64 = 30_000;
 
+
+// ---------------------------------------------------------------------------
+// The bogon filter (`S1-AC`)
+// ---------------------------------------------------------------------------
+
+/// Whether an address is one this client will let a **DHT record** send it to.
+///
+/// `NETWORK_STACK.md` §4.5 rule 2 says to drop RFC 1918, RFC 6598, loopback,
+/// link-local, multicast, broadcast and the reserved ranges from DHT-derived
+/// candidates, and gives the reason in its own words: *"a record in the public
+/// DHT claiming a private address is either pollution or an attempt to make us
+/// scan our own LAN."*
+///
+/// # This is not [`super::run::reachable`], and the difference matters
+///
+/// `reachable` asks *"could the rest of the internet dial this"* and answers
+/// **no** for `/dns4/example.com/tcp/4001`, which has no IP component at all.
+/// That is right where it is used — deciding what may be published as an
+/// external address — and wrong here: a name is not a bogon, and dropping one
+/// would cut the `/dnsaddr/bootstrap.libp2p.io` shape out of the routing table.
+///
+/// So this refuses an address only when it **carries an IP and that IP is
+/// somebody's own network**. Anything it cannot judge, it keeps: a filter that
+/// guesses is worse than one that admits what it does not know.
+fn not_a_bogon(addr: &libp2p::Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    !addr.iter().any(|p| match p {
+        Protocol::Ip4(ip) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_multicast()
+                // RFC 6598, carrier-grade NAT: 100.64.0.0/10. Not `is_private`.
+                || (ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+        }
+        Protocol::Ip6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (first & 0xfe00) == 0xfc00 // fc00::/7, unique local
+                || (first & 0xffc0) == 0xfe80 // fe80::/10, link-local
+                || ip.segments()[..2] == [0x2001, 0x0db8] // documentation
+        }
+        _ => false,
+    })
+}
+
+/// A `NetworkBehaviour` that refuses to hand the swarm a private address.
+///
+/// # Why a wrapper, and why only around Kademlia
+///
+/// `NETWORK_STACK.md` §4.5's filter had somewhere to live under the old
+/// Mainline discovery, where a candidate was a `SocketAddrV4` that application
+/// code parsed. Under `libp2p-kad` the addresses never reach application code:
+/// they ride inside the DHT messages, go into the routing table, and
+/// `run.rs` dials with `DialOpts::peer_id(peer)`. The provider handler sees a
+/// `HashSet<PeerId>` and nothing else. `S1-AC`.
+///
+/// **libp2p records the provenance the finding said the swarm does not.**
+/// `DialOpts::peer_id(p).build()` sets `extend_addresses_through_behaviour:
+/// true` and every address-carrying builder sets it `false` — including
+/// `From<Multiaddr>`, which is what `swarm.dial(addr)` uses. `Swarm::dial`
+/// appends what the behaviour returns **only** when that flag is true. So a
+/// filter here touches the DHT path and is **structurally unable** to reach the
+/// mDNS path, where a LAN peer is dialled on the `192.168.x` address this
+/// project deliberately supports (§9.8, and §4.5's own warning that this filter
+/// and §5.6's publish filter must never be merged).
+///
+/// # It counts what it drops, because that number does not exist
+///
+/// Nobody knows how many bogons the real Amino DHT hands this client. A filter
+/// that counts produces the figure as a byproduct instead of requiring a second
+/// measurement pass.
+pub struct Bogonless<B> {
+    inner: B,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<B> Bogonless<B> {
+    pub fn new(inner: B) -> Self {
+        Self {
+            inner,
+            dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// A handle to the count, so the status line can read it without borrowing
+    /// the swarm.
+    pub fn dropped(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.dropped)
+    }
+}
+
+/// So every existing `swarm.behaviour_mut().ipfs_kad.get_providers(..)` call
+/// site keeps working unchanged. The wrapper adds one method to the behaviour
+/// trait's surface and nothing to the crate's.
+impl<B> std::ops::Deref for Bogonless<B> {
+    type Target = B;
+    fn deref(&self) -> &B {
+        &self.inner
+    }
+}
+
+impl<B> std::ops::DerefMut for Bogonless<B> {
+    fn deref_mut(&mut self) -> &mut B {
+        &mut self.inner
+    }
+}
+
+impl<B: libp2p::swarm::NetworkBehaviour> libp2p::swarm::NetworkBehaviour for Bogonless<B> {
+    type ConnectionHandler = B::ConnectionHandler;
+    type ToSwarm = B::ToSwarm;
+
+    fn handle_pending_inbound_connection(
+        &mut self,
+        id: libp2p::swarm::ConnectionId,
+        local: &libp2p::Multiaddr,
+        remote: &libp2p::Multiaddr,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        self.inner.handle_pending_inbound_connection(id, local, remote)
+    }
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        id: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        local: &libp2p::Multiaddr,
+        remote: &libp2p::Multiaddr,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.inner
+            .handle_established_inbound_connection(id, peer, local, remote)
+    }
+
+    /// **The one method that is not a delegation.**
+    fn handle_pending_outbound_connection(
+        &mut self,
+        id: libp2p::swarm::ConnectionId,
+        maybe_peer: Option<PeerId>,
+        addresses: &[libp2p::Multiaddr],
+        role: libp2p::core::Endpoint,
+    ) -> Result<Vec<libp2p::Multiaddr>, libp2p::swarm::ConnectionDenied> {
+        let offered = self
+            .inner
+            .handle_pending_outbound_connection(id, maybe_peer, addresses, role)?;
+        let before = offered.len();
+        let kept: Vec<libp2p::Multiaddr> =
+            offered.into_iter().filter(not_a_bogon_ref).collect();
+        let dropped = before - kept.len();
+        if dropped > 0 {
+            self.dropped
+                .fetch_add(dropped as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(kept)
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        id: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        addr: &libp2p::Multiaddr,
+        role: libp2p::core::Endpoint,
+        port_use: libp2p::core::transport::PortUse,
+    ) -> Result<libp2p::swarm::THandler<Self>, libp2p::swarm::ConnectionDenied> {
+        self.inner
+            .handle_established_outbound_connection(id, peer, addr, role, port_use)
+    }
+
+    fn on_swarm_event(&mut self, event: libp2p::swarm::FromSwarm) {
+        self.inner.on_swarm_event(event)
+    }
+
+    fn on_connection_handler_event(
+        &mut self,
+        peer: PeerId,
+        id: libp2p::swarm::ConnectionId,
+        event: libp2p::swarm::THandlerOutEvent<Self>,
+    ) {
+        self.inner.on_connection_handler_event(peer, id, event)
+    }
+
+    fn poll(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
+    {
+        self.inner.poll(cx)
+    }
+}
+
+/// `filter` wants `&Multiaddr`; the predicate takes one too. A named function
+/// rather than a closure so the borrow reads the same at both call sites.
+fn not_a_bogon_ref(a: &libp2p::Multiaddr) -> bool {
+    not_a_bogon(a)
+}
+
 /// The behaviours this node runs.
 #[derive(NetworkBehaviour)]
 pub struct PokerBehaviour {
@@ -141,7 +340,7 @@ pub struct PokerBehaviour {
     /// people's routing queries is a service to a network this client is only
     /// visiting, and it would be paid for with the bandwidth of somebody trying
     /// to play poker.
-    pub ipfs_kad: kad::Behaviour<MemoryStore>,
+    pub ipfs_kad: Bogonless<kad::Behaviour<MemoryStore>>,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,
     /// Asks other peers whether this client is reachable, which is what decides
@@ -373,7 +572,7 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
             Ok(PokerBehaviour {
                 gossipsub,
                 kademlia,
-                ipfs_kad,
+                ipfs_kad: Bogonless::new(ipfs_kad),
                 identify,
                 ping: ping::Behaviour::new(ping::Config::new()),
                 // AutoNAT's constructor names the concrete OS generator type
@@ -518,6 +717,89 @@ pub fn relay_config(role: RelayRole) -> relay::Config {
 
 #[cfg(test)]
 mod tests {
+    /// **The bogon filter accepts everything it cannot judge, and refuses only
+    /// an address that carries somebody's own network.** `S1-AC`.
+    ///
+    /// The table is the test. A predicate like this fails by being one range
+    /// too wide — cutting the routing table down — or one range too narrow,
+    /// which is the attack `NETWORK_STACK.md` §4.5 names: *"an attempt to make
+    /// us scan our own LAN."*
+    #[test]
+    fn a_dht_record_cannot_send_this_client_to_a_private_address() {
+        use super::not_a_bogon;
+        let a = |s: &str| s.parse::<libp2p::Multiaddr>().expect("a literal");
+
+        // Refused: somebody's own network, in both families.
+        for bad in [
+            "/ip4/192.168.1.20/tcp/4001",
+            "/ip4/10.0.0.5/udp/4001/quic-v1",
+            "/ip4/172.16.0.20/tcp/22",
+            "/ip4/127.0.0.1/tcp/4001",
+            "/ip4/169.254.1.1/tcp/4001",
+            "/ip4/0.0.0.0/tcp/4001",
+            "/ip4/255.255.255.255/tcp/4001",
+            "/ip4/203.0.113.4/tcp/4001",     // TEST-NET-3, documentation
+            "/ip4/224.0.0.1/tcp/4001",       // multicast
+            "/ip4/100.64.0.1/tcp/4001",      // RFC 6598, carrier-grade NAT
+            "/ip4/100.127.255.255/tcp/4001", // the top of that /10
+            "/ip6/::1/tcp/4001",
+            "/ip6/fdc9:6d69:ed51:0:2081:e457:503:2311/tcp/4001", // a real ULA from this machine
+            "/ip6/fe80::1/tcp/4001",
+            "/ip6/2001:db8::1/tcp/4001",
+            "/ip6/ff02::1/tcp/4001",
+        ] {
+            assert!(!not_a_bogon(&a(bad)), "{bad} should have been refused");
+        }
+
+        // Kept: a real address, in both families.
+        for good in [
+            "/ip4/1.1.1.1/tcp/4001",
+            "/ip4/104.131.131.82/udp/4001/quic-v1",
+            "/ip4/100.63.255.255/tcp/4001", // just below RFC 6598
+            "/ip4/100.128.0.1/tcp/4001",    // just above it
+            "/ip6/2606:4700:4700::1111/udp/443/quic-v1",
+        ] {
+            assert!(not_a_bogon(&a(good)), "{good} should have been kept");
+        }
+
+        // **Kept because it cannot be judged, which is the whole design.**
+        // `run::reachable` answers *no* for these — rightly, where it is used —
+        // and using it here would have cut names and the bootstrap shape out of
+        // the routing table.
+        for unjudgeable in [
+            "/dns4/bootstrap.example.com/tcp/4001",
+            "/dnsaddr/bootstrap.libp2p.io",
+        ] {
+            assert!(
+                not_a_bogon(&a(unjudgeable)),
+                "{unjudgeable} has no IP to judge and must be kept"
+            );
+        }
+
+        // A relay circuit carries the relay's own address, so it is judged on
+        // that — and a circuit through a LAN relay is refused, which is right:
+        // a DHT record should not be sending anybody to a relay on our subnet.
+        assert!(not_a_bogon(&a(
+            "/ip4/147.75.87.27/tcp/4001/p2p/12D3KooWLZ18MNzm9xu7GZRQ16c6k3CZLN529CbUqrYaWNqyYko9/p2p-circuit"
+        )));
+        assert!(!not_a_bogon(&a(
+            "/ip4/192.168.1.5/tcp/4001/p2p/12D3KooWLZ18MNzm9xu7GZRQ16c6k3CZLN529CbUqrYaWNqyYko9/p2p-circuit"
+        )));
+    }
+
+    /// The counter starts at zero and the handle is shared, so a status line can
+    /// read it without borrowing the swarm.
+    #[test]
+    fn the_filter_counts_what_it_drops() {
+        use std::sync::atomic::Ordering;
+        let b = super::Bogonless::new(());
+        let handle = b.dropped();
+        assert_eq!(handle.load(Ordering::Relaxed), 0);
+        // Same allocation, not a copy: the point of handing out an Arc.
+        b.dropped().fetch_add(3, Ordering::Relaxed);
+        assert_eq!(handle.load(Ordering::Relaxed), 3);
+    }
+
     use super::*;
 
     fn keypair() -> identity::Keypair {
