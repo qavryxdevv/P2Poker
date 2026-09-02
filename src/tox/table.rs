@@ -46,11 +46,26 @@ use crate::tox::{Event, Tox};
 /// `P2P_POKER_STALL_JOIN=<seconds>` makes a joiner stop iterating toxcore for
 /// that long immediately after it accepts an invitation. The handshake needs
 /// four attempts at `GC_SEND_HANDSHAKE_INTERVAL` = 3 s inside
-/// `GC_UNCONFIRMED_PEER_TIMEOUT` = 12 s, so anything above twelve reproduces the
-/// failure exactly: the inviter's address-less entry is reaped, no `peer_exit`
-/// fires, no log is written, and libtoxcore has no path back — a fresh
-/// invitation is refused inside `Messenger.c` because a chat with that id
-/// already exists.
+/// `GC_UNCONFIRMED_PEER_TIMEOUT` = 12 s, so anything above twelve reaps the
+/// inviter's address-less entry: no `peer_exit` fires, no log is written, and
+/// libtoxcore has no path back, because a fresh invitation is refused inside
+/// `Messenger.c` when a chat with that id already exists.
+///
+/// # It is blunter than the failure it models, and the measurement said so
+///
+/// Not iterating stops **everything**, not only the handshake. Measured at 30 s
+/// on a four-seat table: the seat came back with `tox self udp` but only **one
+/// of three** friendships up, restarted its join three times to the
+/// `MAX_REJOINS` bound, and never got past `group 1 seen/0 confirmed/3`. The
+/// recovery ran, was counted, and stopped where it should — and it did not
+/// rescue the seat.
+///
+/// The measured `S1-AA` shape (i) is narrower than that: `tox friends up 3`,
+/// `tox self udp`, everything healthy except the group. **So this knob proves
+/// the recovery mechanism runs and does not prove it cures the real failure.**
+/// A shorter stall — thirteen to fifteen seconds — trips the twelve-second
+/// group reaper while the friend connections, which time out far later,
+/// survive. That is the closer model and it is what to reach for.
 ///
 /// **Why a knob and not a wait.** The failure appeared in seven runs of 134 and
 /// nothing makes it happen. `-DivergeAt` exists for the same reason and the row
@@ -558,6 +573,9 @@ fn run(
     let mut accepted_at: Option<Instant> = None;
     let mut self_joined = false;
     let mut rejoins = 0u32;
+    // Whether this client could be invited at the previous sweep. See the
+    // budget rule in the sweep below.
+    let mut was_reachable = false;
     let mut last_sweep = Instant::now();
     let mut last_reinvite = Instant::now();
     let mut pending: Vec<Vec<u8>> = Vec::new();
@@ -906,7 +924,34 @@ fn run(
             // worse than one that sits still: after `MAX_REJOINS` it stops and
             // the count is on the status line, which turns an invisible failure
             // into a number.
-            if !self_joined && group.is_some() && matches!(setup.role, Role::Joiner { .. }) {
+            //
+            // **The budget is per healthy period, not per run, and the first
+            // measured run is why.** `-StallJoin 30` on a four-seat table: the
+            // seat came back from the stall with its transport still recovering
+            // — one friendship of three — spent all three attempts on rejoins
+            // that could not work, and then sat at `group 0 seen/0 confirmed/3`
+            // with `tox friends up 3` and no attempts left. The budget had been
+            // eaten by the outage rather than by the fault it exists for.
+            //
+            // Two rules follow, and both are about not spending an attempt that
+            // cannot succeed. A rejoin needs the **founder** to be able to
+            // invite, which needs its friendship up; and when the friendships
+            // come back after having been down, the seat is in a new situation
+            // and the budget is fresh.
+            let can_be_invited = tox.connection() > 0 && !connected.is_empty();
+            if can_be_invited && !was_reachable {
+                // Back from an outage. Anything spent during it was spent on
+                // nothing.
+                rejoins = 0;
+                trouble.rejoins.store(0, Ordering::Relaxed);
+            }
+            was_reachable = can_be_invited;
+
+            if !self_joined
+                && group.is_some()
+                && can_be_invited
+                && matches!(setup.role, Role::Joiner { .. })
+            {
                 if let Some(since) = accepted_at {
                     if since.elapsed() >= JOIN_GRACE && rejoins < MAX_REJOINS {
                         if let Some(g) = group.take() {

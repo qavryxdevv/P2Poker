@@ -99,13 +99,37 @@ function Get-RunVerdict {
         # -- never entered the group, and never went on to play -----------------
         # The `group 0/N` line is normal for the first ten to twenty seconds of
         # every run.
-        if ($last -match 'group 0/([1-9])' -and -not $formed) {
-            $verdicts += 'ISOLATED'
-            $why += "never entered the Tox group and never dealt; last line says $($Matches[0])"
+        #
+        # **Two formats, because the archive is worth more than the tidier one.**
+        # The status line said `group N/M` until 2026-09-02 and now says
+        # `group N seen/C confirmed/M wanted` — the confirmed count was added
+        # because `peer_count` never checked toxcore's `confirmed` flag, so
+        # `N == M` was never proof that a broadcast would be delivered. There
+        # are 134 runs on disk in the old shape and they are the evidence base
+        # for four findings; a classifier that could only read the new one would
+        # silently score every one of them clean.
+        if ($last -match 'group 0 seen/' -or $last -match 'group 0/[1-9]') {
+            if (-not $formed) {
+                $verdicts += 'ISOLATED'
+                $why += "never entered the Tox group and never dealt; last line says $($Matches[0])"
+            }
         }
-        elseif ($last -match 'group (\d+)/(\d+)' -and [int]$Matches[1] -lt [int]$Matches[2] -and -not $formed) {
+        elseif (($last -match 'group (\d+) seen/\d+ confirmed/(\d+) wanted' -or
+                 $last -match 'group (\d+)/(\d+)') -and
+                [int]$Matches[1] -lt [int]$Matches[2] -and -not $formed) {
             $verdicts += 'PARTIAL-GROUP'
             $why += "group never filled and this node never dealt: $($Matches[0])"
+        }
+
+        # **Seen without confirmed is the library's own skip, and only the new
+        # format can show it.** `send_gc_lossless_packet_all_peers` skips a peer
+        # that is not confirmed and returns success anyway when there are none,
+        # so a table can look complete and reach nobody. Transient during a
+        # handshake; a finding when it is still true at the end of a run.
+        if ($last -match 'group (\d+) seen/(\d+) confirmed/' -and
+            [int]$Matches[1] -gt [int]$Matches[2] -and $formed) {
+            $verdicts += 'UNCONFIRMED-PEERS'
+            $why += "$($Matches[1]) peers seen but only $($Matches[2]) confirmed at the end of the run; the group send path skips the difference"
         }
 
         # -- S1-P: a ratification set that never completed ------------------------
@@ -158,6 +182,16 @@ function Get-RunVerdict {
         if ($opened -ge 2 -and $finished -eq 0) {
             $verdicts += 'HEARD-NOBODY'
             $why += "opened $opened hands and finished none - each was abandoned at its own deadline"
+        }
+
+        # -- a join this client gave up and started again ---------------------------
+        # Zero on a healthy run. A number is `S1-AA` shape (i) happening and
+        # being survived, which is the difference between a seat that recovers
+        # and one that sits at `group 0/N` for the rest of the tournament.
+        $rejoin = @($lines | Select-String 'group join restarted (\d+) time') | Select-Object -Last 1
+        if ($rejoin -and "$rejoin" -match 'restarted (\d+) time') {
+            $verdicts += 'REJOINED'
+            $why += "gave up a stalled group join and started again $($Matches[1]) time(s)"
         }
 
         # -- a seat the table left behind -------------------------------------------

@@ -3738,7 +3738,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let (seen, want) = tox_sink.group_seen();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "seats on the line: {}; tox self {}, group {seen}/{confirmed} confirmed/{want}, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}",
+                                "seats on the line: {}; tox self {}, group {seen} seen/{confirmed} confirmed/{want} wanted, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}",
                                 line.join(", "),
                                 match tox_sink.tox_connection() {
                                     0 => "offline",
