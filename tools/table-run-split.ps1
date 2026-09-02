@@ -48,7 +48,19 @@ param(
     # showed the cost: the far seat reached the lobby, found 34 players in it,
     # and never saw our table. With it off every seat finds every other by the
     # one road, which is what `two-network-ssh.ps1` proved carries a table.
-    [bool]$NoMdns = $true
+    [bool]$NoMdns = $true,
+    # `-Stall <seconds> -StallSeat <n>` starves one far seat's **group
+    # handshake** for that long, right after it accepts the invitation.
+    #
+    # `S1-AA` shape (i) on demand, and the far end is where it belongs: the
+    # failure turns on the founder having no TCP relays attached to the group
+    # connection and on `copy_friend_ip_port_to_gconn` finding no DHT `IP:port`,
+    # and a friendship that crosses subnets is TCP-relayed and has neither.
+    # Anything above `GC_UNCONFIRMED_PEER_TIMEOUT` = 12 s reproduces it.
+    #
+    # Needs binaries built with `--features fault-harness` at both ends.
+    [ValidateRange(0, 300)][int]$Stall = 0,
+    [ValidateRange(0, 8)][int]$StallSeat = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -86,7 +98,31 @@ $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')))
 Set-Acl -Path $privKey -AclObject $acl
 
-$ssh = @('-i', $privKey, '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=yes')
+# **`ssh` must be told which interface to leave by, and finding that out took a
+# session.** A machine with a Hyper-V switch and a handful of `169.254.*`
+# addresses lets `ssh` choose wrongly and report `Connection timed out` while a
+# raw TCP socket to the same port connects at once — which reads as *the far
+# machine is down* and is not. `Test-NetConnection` answers both questions: it
+# says whether port 22 is open, and it says which source address the OS would
+# use to reach it, which is exactly what `-b` wants. Detected rather than
+# configured, so this does not carry one machine's address as a constant.
+#
+# `PingSucceeded` is false either way because ICMP is blocked; read
+# `TcpTestSucceeded`.
+$targetHost = ($Target -split '@')[-1]
+$probe = Test-NetConnection -ComputerName $targetHost -Port 22 -WarningAction SilentlyContinue
+if (-not $probe.TcpTestSucceeded) {
+    throw "nothing is listening on $targetHost port 22. The far machine is off, or the key is on a drive that is not plugged in."
+}
+$bind = $probe.SourceAddress.IPAddress
+
+# `UserKnownHostsFile=NUL` because otherwise `ssh` tries to write the file and
+# fails with *the system cannot find the path specified*, which also reads as a
+# routing failure. The far end is on a private network and is pinned by the key.
+$ssh = @('-b', $bind, '-i', $privKey,
+         '-o', 'StrictHostKeyChecking=accept-new',
+         '-o', 'UserKnownHostsFile=NUL',
+         '-o', 'BatchMode=yes')
 
 try {
     Write-Host '==> copying the binary to the far end'
@@ -104,8 +140,9 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     if (Test-Path `$p) { Remove-Item -Recurse -Force `$p }
     New-Item -ItemType Directory -Force -Path `$p | Out-Null
     `$log = "$FarDir\split-n`$i.log"
-    `$jobs += Start-Job -ArgumentList `$p, `$log -ScriptBlock {
-        param(`$p, `$log)
+    `$jobs += Start-Job -ArgumentList `$p, `$log, `$i -ScriptBlock {
+        param(`$p, `$log, `$seat)
+        if ($Stall -gt 0 -and `$seat -eq $StallSeat) { `$env:P2P_POKER_STALL_JOIN = '$Stall' }
         `$start = Get-Date
         `$inv = [System.Globalization.CultureInfo]::InvariantCulture
         & "$FarDir\p2p-poker.exe" --headless $(if ($NoMdns) { '--no-mdns' }) --autoplay --for $Seconds --profile `$p --join $table 2>&1 |
@@ -123,10 +160,9 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     Set-Content -Path $farFile -Value $farScript -Encoding UTF8
     & scp @ssh $farFile "$($Target):$($FarDir -replace '\\','/')/far.ps1" | Out-Null
 
-    $far = Start-Job -ArgumentList $privKey, $Target, $FarDir -ScriptBlock {
-        param($privKey, $Target, $FarDir)
-        & ssh -i $privKey -o StrictHostKeyChecking=accept-new -o BatchMode=yes $Target `
-            "powershell -NoProfile -ExecutionPolicy Bypass -File $FarDir\far.ps1" 2>&1
+    $far = Start-Job -ArgumentList $ssh, $Target, $FarDir -ScriptBlock {
+        param($ssh, $Target, $FarDir)
+        & ssh @ssh $Target "powershell -NoProfile -ExecutionPolicy Bypass -File $FarDir\far.ps1" 2>&1
     }
 
     # --- the local seats, founder first ------------------------------------
