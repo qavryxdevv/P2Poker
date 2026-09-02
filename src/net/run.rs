@@ -801,13 +801,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         )))
                                         .await;
                                 }
-                                publish_hand(
-                                    sends,
-                                    table_topic.as_ref(),
-                                    &mut swarm,
-                                    &mut said,
-                                    &tox_sink,
-                                );
+                                publish_hand(sends, &mut swarm, &mut said, &tox_sink);
                                 // Outside `dealt()`: a certificate is
                                 // decided at cryptographic stages too, and
                                 // gating the report on cards being out
@@ -1312,7 +1306,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         &mut hand,
                                                                                             &mut said,
                                                         &mut swarm,
-                                                        table_topic.as_ref(),
                                                         &events,
                                                         &tox_sink,
                                                     )
@@ -1576,7 +1569,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 &mut early_checkpoints,
                                                 &profile_dir,
                                                 &events,
-                                                table_topic.as_ref(),
                                                 &mut swarm,
                                                 &mut said,
                                                 &tox_sink,
@@ -1659,7 +1651,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 &mut hand,
                                                                             &mut said,
                                                 &mut swarm,
-                                                table_topic.as_ref(),
                                                 &events,
                                                 &tox_sink,
                                             )
@@ -2845,13 +2836,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let now = super::node::now_unix_ms();
                         match h.act(action, &app_key, now) {
                             Ok(sends) => {
-                                publish_hand(
-                                    sends,
-                                    table_topic.as_ref(),
-                                    &mut swarm,
-                                    &mut said,
-                                    &tox_sink,
-                                );
+                                publish_hand(sends, &mut swarm, &mut said, &tox_sink);
                                 let report =
                                     report_hand(h, &events, &mut turn_reported).await;
                                 if let Some(end) = report.ended {
@@ -3057,7 +3042,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 &mut early_checkpoints,
                                 &profile_dir,
                                 &events,
-                                table_topic.as_ref(),
                                 &mut swarm,
                                 &mut said,
                                 &tox_sink,
@@ -3169,7 +3153,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &mut hand,
                                     &mut said,
                                     &mut swarm,
-                                    table_topic.as_ref(),
                                     &events,
                                     &tox_sink,
                                 )
@@ -3249,16 +3232,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .unwrap_or(true)
                         })
                         .collect();
+                    // **Tox or nothing.** This re-send used to fall back to the
+                    // per-table GossipSub topic when there was no Tox carrier,
+                    // which put hand bytes on a circuit relay reserved for
+                    // 131 072 bytes per 120 s — less than one hand, and the
+                    // client's own log already called it *“NOT enough to carry
+                    // a hand”*. The owner's instruction is that a hand never
+                    // travels on libp2p; the capacity is the reason.
                     if tox_sink.is_on_tox() {
                         for out in recent {
                             tox_sink.try_broadcast(out);
-                        }
-                    } else if let Some(t) = table_topic.as_ref() {
-                        for out in recent {
-                            let _ = swarm
-                                .behaviour_mut()
-                                .gossipsub
-                                .publish(t.clone(), (*out).clone());
                         }
                     }
                 }
@@ -3303,7 +3286,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(n) = h.take_cert_note() {
                             let _ = events.send(NodeEvent::Warning(n)).await;
                         }
-                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said, &tox_sink);
+                        publish_hand(sends, &mut swarm, &mut said, &tox_sink);
                     }
                     Ok(_) => {
                         if let Some(n) = h.take_cert_note() {
@@ -3324,16 +3307,39 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 act_by = None;
                 match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
                     Ok(sends) => {
-                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said, &tox_sink);
+                        publish_hand(sends, &mut swarm, &mut said, &tox_sink);
                         // **And name the cause when the transport is the cause.**
                         // A player reading "the hand ran out of time" looks for
                         // a slow opponent. Across two networks the opponent was
                         // not slow: the only path to it was a relay circuit
                         // limited to 128 KB and two minutes, which is less than
                         // one hand, and the hand stopped at the deal.
+                        //
+                        // **But only when the hand is actually on that relay.**
+                        // D-019 puts a formed table's game traffic on a Tox
+                        // group, and `publish_hand` honours it: Tox first, the
+                        // per-table GossipSub topic only when there is no Tox
+                        // carrier. So on a table that rides Tox this clause
+                        // named a libp2p relay for bytes that never touched
+                        // libp2p — and it was believed. Measured
+                        // `split215815-2`: both seats printed it, both were on
+                        // the Tox group with one peer confirmed, and the real
+                        // failure was that the joiner lost a table it had
+                        // already set (session `af7beef3` at 64.9 s) and formed
+                        // a second one (`d648ec85`) at 388.5 s, so the two
+                        // opened hand 1 at different genesis values and each
+                        // waited for a seat that was playing another table.
+                        // The relay sentence hid that for a whole reading.
+                        //
+                        // A diagnosis that can be right for the wrong reason is
+                        // worse than none, so it now asks whether this table is
+                        // on Tox before blaming the wire underneath it.
                         let stranded: Vec<&libp2p::PeerId> =
                             relayed_peers.intersection(&poker_peers).collect();
-                        let why = if relay_inadequate && !stranded.is_empty() {
+                        let why = if relay_inadequate
+                            && !stranded.is_empty()
+                            && !tox_sink.is_on_tox()
+                        {
                             format!(
                                 ". {} of the poker peers here {} reachable only through a relay                                  whose reservation this client already reported as too small to                                  carry a hand - that is the likely cause, and it is not the                                  opponent being slow",
                                 stranded.len(),
@@ -3393,7 +3399,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let now = super::node::now_unix_ms();
                 match h.act(action, &app_key, now) {
                     Ok(sends) => {
-                        publish_hand(sends, table_topic.as_ref(), &mut swarm, &mut said, &tox_sink);
+                        publish_hand(sends, &mut swarm, &mut said, &tox_sink);
                         let _ = events
                             .send(NodeEvent::Warning(if autoplay.is_some() {
                                 format!("autoplay: {action:?}")
@@ -3563,7 +3569,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         &mut early_checkpoints,
                                         &profile_dir,
                                         &events,
-                                        table_topic.as_ref(),
                                         &mut swarm,
                                         &mut said,
                                         &tox_sink,
@@ -3608,7 +3613,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &mut early_checkpoints,
                                     &profile_dir,
                                     &events,
-                                    table_topic.as_ref(),
                                     &mut swarm,
                                     &mut said,
                                     &tox_sink,
@@ -3739,7 +3743,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             &mut hand,
                                     &mut said,
                             &mut swarm,
-                            table_topic.as_ref(),
                             &events,
                             &tox_sink,
                         )
@@ -4726,7 +4729,9 @@ async fn begin_hand(
     hand: &mut Option<crate::table::hand::Hand>,
     said: &mut Vec<Vec<u8>>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
-    topic: Option<&gossipsub::IdentTopic>,
+    // No topic. A hand is Tox-only by instruction and by capacity, and the way
+    // that rule is kept is by not handing the swarm's topic to anything on the
+    // hand path -- see `publish_hand`.
     events: &Events,
     tox: &super::toxsink::TableSink,
 ) {
@@ -4744,7 +4749,7 @@ async fn begin_hand(
             // fact the one that goes missing: it is published the moment the
             // roster ratifies, which is before the last joiner has been
             // grafted into anybody's mesh for this topic.
-            publish_hand(sends, topic, swarm, said, tox);
+            publish_hand(sends, swarm, said, tox);
             // What this hand hangs off, said out loud. Two peers that opened
             // hand one from different views of the formation produce different
             // genesis values, and every message each sends is then "a different
@@ -4924,13 +4929,43 @@ fn link_is_down() -> bool {
     false
 }
 
+/// Send a hand's bytes, **over Tox and nowhere else**.
+///
+/// # The instruction, and the number behind it
+///
+/// D-019 puts a formed table's game traffic on a Tox group. The owner has since
+/// stated it as an absolute: *never libp2p for playing a hand* — because a
+/// libp2p circuit relay does not have the capacity for one, while the Tox
+/// network and its fallback TCP relays do.
+///
+/// That is not a preference, it is the measured reservation. The public relays
+/// this client obtains grant **131 072 bytes per 120 seconds**, and the client
+/// already says so out loud in its own log: *“NOT enough to carry a hand”*.
+///
+/// # Why the parameter is gone rather than the branch
+///
+/// This used to take the per-table GossipSub topic and fall back to it whenever
+/// there was no Tox carrier. Removing the argument is what makes the rule hold:
+/// a function that cannot reach the swarm cannot be made to publish to it by a
+/// later edit that looks harmless.
+///
+/// Formation traffic is untouched and still goes both ways — D-019 keeps the
+/// roster and the ratification on libp2p, and `S1-P` added a Tox carrier beside
+/// it rather than instead of it. This is about the hand.
+///
+/// # What happens when there is no Tox carrier
+///
+/// The bytes go into `said` and nothing leaves, exactly as when the link is
+/// down, and the caller is told. A hand that cannot be sent is a hand that
+/// stalls visibly; a hand pushed onto a channel that cannot carry it is one
+/// that fails at the deal and blames the opponent.
 fn publish_hand(
     sends: Vec<crate::table::hand::Send>,
-    topic: Option<&gossipsub::IdentTopic>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
     said: &mut Vec<Vec<u8>>,
     tox: &super::toxsink::TableSink,
 ) {
+    let _ = swarm;
     let down = link_is_down();
     for crate::table::hand::Send::Broadcast(out) in sends {
         if down {
@@ -4947,9 +4982,10 @@ fn publish_hand(
             // A refusal here is a full channel, not a lost table: the driver is
             // behind, and the five-second re-send is what covers it.
             tox.try_broadcast(&out);
-        } else if let Some(t) = topic {
-            let _ = swarm.behaviour_mut().gossipsub.publish(t.clone(), out.clone());
         }
+        // No `else`. There is no second channel for a hand, by instruction and
+        // by capacity. Without a Tox carrier the bytes wait in `said`, which is
+        // what `said` is for.
         if said.len() >= 64 {
             said.remove(0);
         }
@@ -5132,7 +5168,9 @@ async fn publish_and_hear(
     early: &mut std::collections::HashMap<u64, Vec<Vec<u8>>>,
     profile: &std::path::Path,
     events: &Events,
-    topic: Option<&gossipsub::IdentTopic>,
+    // No topic, for the reason given on `publish_hand`: the way a hand stays
+    // off libp2p is that nothing on the hand path is given the means to put it
+    // there.
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
     said: &mut Vec<Vec<u8>>,
     tox: &super::toxsink::TableSink,
@@ -5142,7 +5180,6 @@ async fn publish_and_hear(
         let Some(bytes) = out.take() else { break };
         publish_hand(
             vec![crate::table::hand::Send::Broadcast(bytes.clone())],
-            topic,
             swarm,
             said,
             tox,

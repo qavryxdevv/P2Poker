@@ -2263,6 +2263,45 @@ the same time.
 
 ---
 
+
+### Amendment, 2026-09-02 (second): a hand never travels on libp2p, and the reason is capacity
+
+**Instruction from the project owner, given directly and repeated:** *never libp2p
+for playing a hand — libp2p relays do not have the capacity for a hand, while the
+Tox network and its fallback TCP relays do.* Recorded as an absolute rather than a
+preference, because that is how it was given.
+
+**The number behind it is already in this client's own log.** The public circuit
+relays it obtains grant **131 072 bytes per 120 seconds**, and the client prints
+*"NOT enough to carry a hand"* when it takes one. A Tox group and its fallback TCP
+relays carry a hand; a libp2p circuit does not.
+
+**What changed in the code.** `publish_hand` used to fall back to the per-table
+GossipSub topic whenever there was no Tox carrier, and the hand re-send loop did
+the same. Both branches are gone. The guarantee is deliberately structural rather
+than conditional: `publish_hand`, `begin_hand` and `publish_and_hear` **no longer
+take a topic at all**, so a later edit cannot restore the fallback by accident. A
+function that cannot reach the swarm's topic cannot publish to it.
+
+**What did not change, and must not be read as changed.** Formation is untouched.
+The roster, the join and the ratification stay on libp2p exactly as D-019 says,
+with the Tox carrier of the first amendment beside them: `on_join_request`,
+`on_player_list`, `on_table_ready` and `say_again` all still publish to the table
+topic. This amendment is about the hand.
+
+**What happens when there is no Tox carrier.** The bytes wait in `said`, exactly
+as they do when the link is down, and nothing is sent. A hand that cannot be
+transmitted stalls visibly; a hand pushed onto a relay reserved for 128 KiB per
+two minutes fails at the deal and blames the opponent — which is what it did.
+
+**And one diagnostic was lying about precisely this.** The hand-timeout message
+named a libp2p relay as the likely cause whenever a poker peer was reachable only
+through one, without ever asking whether the table rode Tox. Measured in
+`split215815-2`: both seats printed it while both were on the Tox group with one
+peer confirmed, so the sentence was false on its face. It is now conditioned on
+the table **not** being on Tox — a diagnosis that can be right for the wrong
+reason is worse than none, and this one cost a reading.
+
 ## D-020 — the showdown is held on screen before the next hand
 
 Decided 2026-08-30, on the owner's instruction: **at a showdown the cards of
