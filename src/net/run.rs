@@ -3573,7 +3573,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // That makes the gap two minutes rather than for ever, which
                     // is the whole of what this can do without the wire decision
                     // `S1-P` leaves open.
-                    if f.session().is_none() {
+                    // **`!ever_dealt`, not `session().is_none()`.** A seat
+                    // whose own table has settled still holds a `TABLE_READY`
+                    // that a neighbour may be missing — and the gate that used
+                    // to stand here shut exactly when that seat became able to
+                    // help. Measured: `n1` sat at `ratified 3/4, 0 held` for a
+                    // whole run while three settled seats beside it held the
+                    // copy it lacked and said nothing (`S1-P`).
+                    //
+                    // It still ends: a table that has dealt has no formation
+                    // left to repair, and after that the repeat would be noise.
+                    if !ever_dealt {
                         if let Some(topic) = table_topic.as_ref() {
                             for bytes in f.say_again(super::node::now_unix_ms()) {
                                 let _ = swarm
