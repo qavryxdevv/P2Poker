@@ -2517,7 +2517,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         ) {
                             Ok(Some(mine)) => {
                                 match tox_sink
-                                    .chat_id_ready(std::time::Duration::from_secs(5))
+                                    // **Derived, not chosen.** The founder's
+                                    // driver holds the group back until its
+                                    // transport is up, because creating it is
+                                    // the group's one guaranteed chance to be
+                                    // given TCP relays. A fixed five seconds
+                                    // here was shorter than that wait and every
+                                    // founder fell back to the mesh, so the
+                                    // budget is read from the driver and this
+                                    // is the margin on top of it.
+                                    .chat_id_ready(
+                                        crate::tox::table::HOST_SEED_WAIT
+                                            + std::time::Duration::from_secs(5),
+                                    )
                                     .await
                                 {
                                     Some(chat) => {

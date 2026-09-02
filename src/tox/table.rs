@@ -486,11 +486,32 @@ const REINVITE_EVERY: Duration = Duration::from_secs(30);
 ///
 /// **Waiting on `connection()` rather than on a fixed delay** because the
 /// quantity that matters is whether anything is connected, and that is what the
-/// status answers. Bounded, and the bound is generous because cross-network
-/// bring-up was measured at well over a minute — but a founder whose network
-/// never comes up must still start rather than hang, so after the budget the
-/// group is created anyway and the table fails the way it did before.
-const HOST_SEED_WAIT: Duration = Duration::from_secs(20);
+/// status answers.
+///
+/// **The bound is small on purpose, and the reason is a regression this caused
+/// on its first measured run.** The founder's caller does not wait for ever:
+/// `net::run` advertises the table only once `chat_id_ready` has produced a
+/// chat id, and gives up on the Tox group and rides the mesh if it does not
+/// come. The first draft of this constant was twenty seconds against a caller
+/// that waited five, so every founder fell back to the mesh — the group was
+/// never created at all, which is worse than a group with no relays. The two
+/// numbers are therefore **one number**: this is `pub` and `net::run` derives
+/// its timeout from it, so they cannot drift apart again.
+///
+/// A founder whose network never comes up must still start rather than hang, so
+/// after the budget the group is created anyway and the table fails the way it
+/// did before.
+pub const HOST_SEED_WAIT: Duration = Duration::from_secs(6);
+
+/// How much longer the founder iterates after its transport comes up.
+///
+/// **`connection()` is not the question, it is only the cheapest proxy for it.**
+/// It turns non-zero as soon as the DHT answers over UDP, which can be before a
+/// single TCP relay has finished its handshake — and it is the relays this wait
+/// exists for. toxcore exposes no count of connected relays, so there is
+/// nothing better to test; what can be done is to not stop on the first good
+/// answer. Inside `HOST_SEED_WAIT`, so the total budget is unchanged.
+const HOST_SEED_SETTLE: Duration = Duration::from_secs(2);
 
 /// Start the driver on its own thread.
 ///
@@ -576,8 +597,15 @@ fn run(
     let mut early: Vec<Event> = Vec::new();
     if matches!(setup.role, Role::Host) {
         let waiting_since = Instant::now();
-        while tox.connection() == 0 && waiting_since.elapsed() < HOST_SEED_WAIT {
+        let mut up_at: Option<Instant> = None;
+        while waiting_since.elapsed() < HOST_SEED_WAIT {
             early.extend(tox.iterate());
+            if up_at.is_none() && tox.connection() != 0 {
+                up_at = Some(Instant::now());
+            }
+            if up_at.is_some_and(|t| t.elapsed() >= HOST_SEED_SETTLE) {
+                break;
+            }
             std::thread::sleep(tox.interval().min(MAX_TICK));
         }
     }
