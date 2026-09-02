@@ -2547,8 +2547,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         // can check, the sink is given up and
                                         // the table rides the mesh.
                                         tox_sink.clear();
-                            tox_group_said = false;
-                            table_announces = 0;
+                                        tox_group_said = false;
+                                        table_announces = 0;
                                         let _ = events
                                             .send(NodeEvent::Warning(
                                                 "the Tox group did not come up; this table stays on the mesh"
