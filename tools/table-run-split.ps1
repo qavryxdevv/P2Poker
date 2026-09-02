@@ -164,11 +164,20 @@ try {
     # day's binary, and because the script copy had failed too the far end was
     # obediently running *yesterday's* `far.ps1` — five seats for a two-seat
     # table, against a binary without any of the day's fixes in it.
-    # No pipe in the remote command: the far end's login shell is `cmd.exe`,
-    # which splits on `|` before PowerShell ever sees it and answers
-    # *'Stop-Process' is not recognized as an internal or external command*.
+    # **Remote PowerShell goes over as base64.** The far end's login shell is
+    # `cmd.exe`, and it parses the command line before PowerShell ever sees it:
+    # a `|` is split (which answered *'Stop-Process' is not recognized as an
+    # internal or external command*), and parentheses, `;`, `&` and quotes all
+    # have their own meanings. `-EncodedCommand` takes UTF-16 base64, which has
+    # none of those characters in it, so nothing has to survive two parsers.
+    function Invoke-Far {
+        param([string[]]$SshArgs, [string]$Where, [string]$Script)
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Script))
+        (& ssh @SshArgs $Where "powershell -NoProfile -EncodedCommand $enc" 2>&1) -join "`n"
+    }
+
     Write-Host '==> stopping any seat left running on the far end'
-    & ssh @ssh $Target 'powershell -NoProfile -Command "Stop-Process -Name p2p-poker -Force -ErrorAction SilentlyContinue"' 2>&1 | Out-Null
+    Invoke-Far $ssh $Target "Stop-Process -Name p2p-poker -Force -ErrorAction SilentlyContinue" | Out-Null
     Start-Sleep -Milliseconds 800
 
     Write-Host '==> copying the binary to the far end'
@@ -181,6 +190,23 @@ try {
     # spent on it.
     & scp @ssh $Exe "$($Target):$($FarDir -replace '\\','/')/p2p-poker.exe" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not copy the binary to $Target (scp exited $LASTEXITCODE). The far seats would have had nothing to run." }
+
+    # **Prove the far end has the bytes that were just built.** A successful
+    # `scp` exit code is not the same claim: the copy can be refused by a lock,
+    # land somewhere else, or -- as happened for a whole afternoon -- never run
+    # at all while the run reported success. Every cross-network measurement of
+    # 2026-09-02 was taken against a binary from the previous day because of
+    # that, and the reports read as *the far machine never joined*, which is a
+    # conclusion about the protocol drawn from a fault in the harness. See
+    # `DECISIONS.md` `S1-AG`.
+    #
+    # A hash is the only check that cannot be satisfied by a stale file.
+    $localHash = (Get-FileHash $Exe -Algorithm SHA256).Hash
+    $farHash = (Invoke-Far $ssh $Target "(Get-FileHash '$FarDir\p2p-poker.exe' -Algorithm SHA256).Hash").Trim()
+    if ($farHash -ne $localHash) {
+        throw "the far end is not running the binary that was just built. local $($localHash.Substring(0,16))..., far $(if ($farHash) { $farHash.Substring(0, [Math]::Min(16, $farHash.Length)) + '...' } else { '(nothing)' }). Every measurement from this run would have been about a different build."
+    }
+    Write-Host "    far binary verified, sha256 $($localHash.Substring(0,16))..." 
 
     # --- the far seats, started first so they are looking before the table is
     #     hosted. They join by name, and a name they have not heard of yet is
