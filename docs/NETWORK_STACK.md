@@ -959,7 +959,7 @@ reach a relay is invisible rather than merely unplayable.
 | 4 | **Bootstrap the DHT.** | ~3 of 35 cold starts failed on the first attempt [MEASURED]; `router.bittorrent.com` is dead from this network, confirmed twice ~50 min apart | retry with exponential backoff (2 s, 5 s, 15 s, 60 s, then every 5 min). A failed bootstrap is **normal**, never fatal. Merge the cached node list with the compiled defaults — do not overwrite the cache with a bad session's routing table. |
 | 5 | **`start_providing(lobby_namespace())`** (§3.2), **once**, at the moment a confirmed external address first exists — not on a timer. `libp2p-kad` owns the republish loop and runs it every 12 h, so a session shorter than that announces exactly once (§10.1). | announce error; or a walk that reached few storing nodes | there is no repair. The one walk happens seconds after the relay reservation, when the routing table is thinnest, and nothing widens it until the client restarts. This is a known weakness and it is stated rather than mitigated. |
 | 6 | **`get_providers(lobby_namespace())`** → `HashSet<PeerId>` per responding node, emitted as each answers. Repeated every **60 s**. | zero providers | not an error, and the client says so out loud — *"public lobby: nobody else yet"* — because an answer of nobody and a question never asked look identical in a log that only reports findings. |
-| 7 | **Dial the providers** (§4.3), by `PeerId`, at most `DIALS_PER_CYCLE = 8` fresh ones per cycle. Start on the first responder's answer — do not wait for the walk to finish. | most candidates fail | expected: a lobby key holds providers who left up to 48 h ago. |
+| 7 | **Dial the providers** (§4.3), by `PeerId`, at most `DIALS_PER_ANSWER = 8` fresh ones **per answer, not per cycle** — the counter is declared inside the `FoundProviders` arm and resets on every response, and one query draws one response per node that answers (707 of them in a measured 420-second run). This table said *per cycle* until 2026-09-02, and so did the constant's own name; both were wrong, and the effect was to make the crawl read sixty times slower than it is. Start on the first responder's answer — do not wait for the walk to finish. | most candidates fail | expected: a lobby key holds providers who left up to 48 h ago. |
 | 8 | **identify + AutoNAT v2 settle our external address.** Filter private/reserved addresses ourselves — AutoNAT v2 has no such guard and was measured confirming an RFC 1918 address as external [MEASURED]. `run::reachable` is that filter, and its IPv6 arm was blind to `fc00::/7` until 2026-09-02 (`S1-Y`). | no confirmation | stay in `Reachability::Unknown`; continue — but note that with no external address this client is **not in the lobby at all**, per the paragraph above. |
 | 9 | **Subscribe the GossipSub lobby topics** (§6). Can be done immediately after step 2; messages only flow once peers connect. | `SubscriptionError` | fatal configuration bug, not a runtime condition — fail loudly. |
 | 10 | **Snapshot request to several peers** (§7) over `request-response`. | fewer than 2 usable responses | retry once with a fresh peer set, then proceed on live gossip alone and show "lobby syncing". |
@@ -1166,7 +1166,7 @@ price §3.3 says is worth paying — but the user is the one paying it.
   closing the client changes nothing anyone else can see: the player's `PeerId`
   and addresses stay in the public lobby, findable, for as long as the storing
   nodes keep them. **Against Mainline's measured ~45 minutes that is roughly sixty
-  times longer.** `DIALS_PER_CYCLE = 8` exists precisely because of this: *"a
+  times longer.** `DIALS_PER_ANSWER = 8` exists precisely because of this: *"a
   lobby key outlives the clients in it"*.
 
 * **And while it is running it barely refreshes.** `AddProviderJob` waits a full
@@ -1382,7 +1382,7 @@ Two consequences follow, and the first is the reason the old §4.3 needed no
   the ordinary case, because a lobby key holds providers who left up to 48 hours
   ago (§10.1).
 
-At most `DIALS_PER_CYCLE = 8` **fresh** providers are dialled per cycle. A lobby
+At most `DIALS_PER_ANSWER = 8` **fresh** providers are dialled per DHT answer. A lobby
 key outlives the clients in it, so dialling every provider at once fills a finite
 connection budget with the dead and leaves none for the living — measured as a
 table that stopped forming at all. Whoever is not reached this cycle is reached
@@ -1491,7 +1491,7 @@ which is a case this project explicitly cares about.
 | **Stale entry** — the peer went offline, or announced a port nobody can reach | dial timeout | one timeout slot | expected and normal. Bounded budget (§11.2). No retry storm. |
 | **Wrong-port entry** — a NATed peer announced a port that is not its external port | dial timeout | as above | self-heals on that peer's next announce cycle. |
 | **Attacker announces a third party's `IP:port`** (reflection) | we send a QUIC Initial / TCP SYN to an innocent host | small packet, no amplification beyond one handshake attempt per address per cycle | bounded dial budget, per-IP dial rate limit, no retries, deduplicate. This is inherent to BEP 5 — every BitTorrent client on earth has the same property. We reduce our contribution; we cannot remove it. |
-| **Attacker floods the infohash with thousands of junk entries** (discovery DoS / eclipse attempt) | our candidate list is mostly junk, so real peers are found slowly or not at all | latency, wasted dials | (a) hard cap on candidates dialled per cycle; (b) prefer candidates returned by **more independent responding nodes** — `FoundProviders` is emitted once per responder, so multiplicity is observable and a single Sybil writer is visible as a low-multiplicity set. **Not implemented**: this client takes the first `DIALS_PER_CYCLE` fresh providers in iteration order and weighs nothing; (c) random sample from the remainder so a flooder cannot deterministically fill the sample; (d) keep a persistent list of peers that previously completed a poker handshake and dial those first. **None of this defeats a well-resourced flooder** — see §12. |
+| **Attacker floods the infohash with thousands of junk entries** (discovery DoS / eclipse attempt) | our candidate list is mostly junk, so real peers are found slowly or not at all | latency, wasted dials | (a) hard cap on candidates dialled per cycle; (b) prefer candidates returned by **more independent responding nodes** — `FoundProviders` is emitted once per responder, so multiplicity is observable and a single Sybil writer is visible as a low-multiplicity set. **Not implemented**: this client takes the first `DIALS_PER_ANSWER` fresh providers in iteration order and weighs nothing; (c) random sample from the remainder so a flooder cannot deterministically fill the sample; (d) keep a persistent list of peers that previously completed a poker handshake and dial those first. **None of this defeats a well-resourced flooder** — see §12. |
 | **Attacker announces its own address and completes the handshake** | it is now a connected libp2p peer with a proven `PeerId` | one connection slot | this is *allowed*. The DHT was never an authorisation. The peer can now gossip, and everything it says is subject to application signature verification and to the lobby validation of §6.4. It cannot forge another player's table ad, and it cannot join a table it is not admitted to. |
 
 ### 4.7 What the bridge establishes, and what it does not
@@ -2840,7 +2840,7 @@ announces *widen* the storing set: there are no repeated announces.
 lobby, by persistent `PeerId` and address, for up to 48 hours. That is not a
 defect to fix at this layer — `stop_providing` is local and would change nothing
 remotely — it is the reason the discovery loop dials at most
-`DIALS_PER_CYCLE = 8` fresh providers per cycle rather than everything an answer
+`DIALS_PER_ANSWER = 8` fresh providers per answer rather than everything an answer
 contains, and it is a disclosure, which §3.5 states.
 
 **The 45-minute figure and `OQ-1` are both obsolete, and their replacement is
@@ -2973,7 +2973,7 @@ built it" is the point, and a deleted row cannot say which it was.
 
 | Budget | Value | Where |
 |---|---|---|
-| Fresh providers dialled per discovery cycle | **8** | `run::DIALS_PER_CYCLE` |
+| Fresh providers dialled per DHT answer | **8** | `run::DIALS_PER_ANSWER` |
 | Discovery cycle | **60 s** | `run.rs`, and every cycle pays a full `α` = 3 Kademlia walk to completion (§11.4) |
 | Retries per provider within a session | **0**, and it is structural rather than a policy: `PeerCondition::DisconnectedAndNotDialing` refuses a second dial while the first is in flight, and a `dialled_lobby` set of 512 suppresses the rest | `run.rs` |
 | Whole-query timeout | **60 s** | `libp2p-kad` `QueryConfig::default`, re-set to the same value at `swarm.rs:316` |
@@ -2988,7 +2988,7 @@ built it" is the point, and a deleted row cannot say which it was.
   the dead, and a table stopped forming at all.
 * *"Concurrent dials from DHT hints ≤ 8"* — there is no concurrency cap. Eight
   dials are issued and the swarm runs them as it likes; the number coincides with
-  `DIALS_PER_CYCLE` by accident of both being 8, not by design.
+  `DIALS_PER_ANSWER` by accident of both being 8, not by design.
 * *"Per-address dial timeout 10 s"* — nothing sets a dial timeout. The 10 s above
   is Kademlia's per-peer query timeout and does not bound a dial.
 * *"Dials to the same `/24` per cycle ≤ 4"* — **no such rule exists**, and it was
@@ -3156,7 +3156,7 @@ restarts.
 `stop_providing`, and that call is local anyway (`behaviour.rs:1047-1054`) —
 remote copies run out their own 48 h clock. So the lobby key accumulates
 providers who left up to two days ago. That is not a defect to be fixed at this
-layer; it is the reason the discovery loop dials at most `DIALS_PER_CYCLE = 8`
+layer; it is the reason the discovery loop dials at most `DIALS_PER_ANSWER = 8`
 fresh providers per cycle rather than everything an answer contains.
 
 **Twenty nodes hold it, twenty providers each, and the twenty-first is dropped
@@ -3365,7 +3365,7 @@ network.
    adversary shows it. The mitigations in §4.6 and §7.2 raise the cost; they do not
    close it. The adversary still cannot forge a table ad or a hand.
 5. **Discovery-layer DoS / lobby-key pollution.** Anyone can provide the lobby
-   key with junk. We bound our own exposure — `DIALS_PER_CYCLE = 8` — and we
+   key with junk. We bound our own exposure — `DIALS_PER_ANSWER = 8` — and we
    cannot clean the DHT. Two things changed under Kademlia and they pull in
    opposite directions: a provider record must name the **announcer's own**
    authenticated `PeerId`, so a flooder must spend one identity per entry rather

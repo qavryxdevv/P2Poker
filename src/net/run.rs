@@ -102,12 +102,25 @@ use crate::protocol::constants::{
 ///   relay swarm has been asked and answered with nobody.
 const PUBLIC_ENTRY: &[&str] = &["/dnsaddr/bootstrap.libp2p.io"];
 
-/// How many players from the lobby to reach for in one discovery cycle.
+/// How many players from the lobby to reach for **per DHT answer**.
 ///
 /// The connection budget is finite and a lobby key outlives the clients in it,
 /// so dialling every provider at once fills the budget with the dead and leaves
-/// none for the living. Whoever is not reached this cycle is reached the next.
-const DIALS_PER_CYCLE: usize = 8;
+/// none for the living. Whoever is not reached in one answer is reached in the
+/// next.
+///
+/// **The old name said `CYCLE` and that was a lie about the code.** The counter
+/// is declared inside the `FoundProviders` arm, so it resets on **every
+/// response**, and one `get_providers` query draws one response per node that
+/// answers — 707 of them in a measured 420-second run, not 7. This comment and
+/// eight places in `NETWORK_STACK.md` all claimed a per-cycle budget the code
+/// has never implemented, which made the crawl read sixty times slower than it
+/// is. Renamed rather than re-explained: a name that needs a paragraph of
+/// correction will mislead the next reader too.
+///
+/// `DECISIONS.md` rows written before 2026-09-02 call it `DIALS_PER_CYCLE`.
+/// Those are dated records of what was believed then and are left alone.
+const DIALS_PER_ANSWER: usize = 8;
 
 /// The namespace relay hosts advertise themselves under, as a DHT key.
 ///
@@ -1998,7 +2011,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // whoever the budget skipped was marked as reached
                             // and `dialled_lobby` refused it for ever after.
                             // With 140 providers on the lobby key and
-                            // `DIALS_PER_CYCLE` = 8, that is 132 peers a cycle
+                            // `DIALS_PER_ANSWER` = 8, that is 132 peers an answer
                             // written off without one dial attempt.
                             //
                             // Measured, `split205429-2`: the founder found the
@@ -2017,19 +2030,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // budget stays unknown and the next cycle takes it,
                             // which is what the paragraph above always claimed.
                             let mut fresh = 0usize;
+                            let me = *swarm.local_peer_id();
                             for peer in providers {
                                 if lobby {
                                     let _ = events.send(NodeEvent::LobbyPeer(peer)).await;
+                                    // **This client provides the lobby key too,
+                                    // so it finds itself.** Fifteen times in one
+                                    // measured run, each spending a dial slot on
+                                    // a connection that cannot succeed.
+                                    if peer == me {
+                                        continue;
+                                    }
                                     if dialled_lobby.contains(&peer) {
                                         continue;
                                     }
-                                    if fresh >= DIALS_PER_CYCLE {
+                                    if fresh >= DIALS_PER_ANSWER {
                                         continue;
                                     }
                                     fresh += 1;
                                     dialled_lobby.insert(peer);
+                                    // **Bounded, but never at the cost of the
+                                    // one peer that matters.** This used to
+                                    // `clear()`, which on a lobby larger than
+                                    // the cap forgets the live peer along with
+                                    // the ghosts and restarts the whole crawl.
+                                    // Keeping the peers this client is connected
+                                    // to bounds the set just as well and cannot
+                                    // evict a mesh peer; the rest are ghosts, and
+                                    // a ghost re-dialled occasionally costs one
+                                    // slot and fails. Never fired in a measured
+                                    // run — peak 318 against a cap of 512 — so
+                                    // this is a guard for a public lobby, not a
+                                    // fix for an observed fault.
                                     if dialled_lobby.len() > 512 {
-                                        dialled_lobby.clear();
+                                        dialled_lobby.retain(|p| swarm.is_connected(p));
                                     }
                                 }
                                 // By peer id: the addresses came with the query
