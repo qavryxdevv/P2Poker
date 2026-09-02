@@ -1495,6 +1495,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         table = None;
                                         table_closed = false;
                         tournament_started = false;
+                        // **Per table, not per process.** Its own doc says
+                        // *whether this table has ever dealt a hand*, and it was
+                        // set true and never set back — so after one hand at one
+                        // table, the next table in the same process refused every
+                        // stranger (`on_join_request` reads it as `started`),
+                        // never opened hand 1, never re-said a ratification,
+                        // never released a silent seat and was never
+                        // re-advertised. Five mechanisms, all by not running.
+                        ever_dealt = false;
                         hand = None;
                         hand_reported = false;
                         deck_reported = None;
@@ -1531,6 +1540,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         table_closed = false;
                         tournament_started = false;
+                        // **Per table, not per process.** Its own doc says
+                        // *whether this table has ever dealt a hand*, and it was
+                        // set true and never set back — so after one hand at one
+                        // table, the next table in the same process refused every
+                        // stranger (`on_join_request` reads it as `started`),
+                        // never opened hand 1, never re-said a ratification,
+                        // never released a silent seat and was never
+                        // re-advertised. Five mechanisms, all by not running.
+                        ever_dealt = false;
                         hand = None;
                         hand_reported = false;
                         deck_reported = None;
@@ -2962,6 +2980,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             Err(e) => {
                                 table_closed = false;
                         tournament_started = false;
+                        // **Per table, not per process.** Its own doc says
+                        // *whether this table has ever dealt a hand*, and it was
+                        // set true and never set back — so after one hand at one
+                        // table, the next table in the same process refused every
+                        // stranger (`on_join_request` reads it as `started`),
+                        // never opened hand 1, never re-said a ratification,
+                        // never released a silent seat and was never
+                        // re-advertised. Five mechanisms, all by not running.
+                        ever_dealt = false;
                         hand = None;
                         hand_reported = false;
                         deck_reported = None;
@@ -3039,6 +3066,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         table = None;
                         table_closed = false;
                         tournament_started = false;
+                        // **Per table, not per process.** Its own doc says
+                        // *whether this table has ever dealt a hand*, and it was
+                        // set true and never set back — so after one hand at one
+                        // table, the next table in the same process refused every
+                        // stranger (`on_join_request` reads it as `started`),
+                        // never opened hand 1, never re-said a ratification,
+                        // never released a silent seat and was never
+                        // re-advertised. Five mechanisms, all by not running.
+                        ever_dealt = false;
                         hand = None;
                         hand_reported = false;
                         deck_reported = None;
