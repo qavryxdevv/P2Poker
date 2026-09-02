@@ -1420,30 +1420,48 @@ outbound operation"* is no longer true of the announce half.
 
 ### 4.5 Filtering candidates before dialling
 
-> **This filter has no counterpart in the client, and the reason is structural
-> rather than an oversight.** Under Mainline the candidate was a `SocketAddrV4`
-> that application code parsed, so a bogon check had somewhere to live. Under
-> Kademlia the addresses never pass through application code at all: they go
-> from the DHT message into `libp2p-kad`'s routing table, and `DialOpts::peer_id`
-> asks the swarm to use whatever is there. There is no point in the flow where
-> this list could be applied as written.
+> **Built 2026-09-02, and not where this section expected it.** For two days
+> this filter had no counterpart at all: under Mainline the candidate was a
+> `SocketAddrV4` that application code parsed, and under Kademlia the addresses
+> never pass through application code — they go from the DHT message into
+> `libp2p-kad`'s routing table, and `DialOpts::peer_id` asks the swarm to use
+> whatever is there. The provider handler sees a `HashSet<PeerId>` and nothing
+> else. So the attack rule 2 names — *"an attempt to make us scan our own LAN"*
+> — was live. `S1-AC`.
 >
-> **So the attack named in rule 2 is live.** A provider record may carry
-> `10.0.0.5` or `127.0.0.1`, and this client will dial it — *"an attempt to make
-> us scan our own LAN"*, in the old section's own words. What it costs is bounded
-> by `DIALS_PER_CYCLE` and by the fact that a dial is a connection attempt and
-> not a scan, but the cost is not zero and the specification says it should be
-> refused. Filed as `S1-AC`.
+> **libp2p records the provenance this section needed.**
+> `DialOpts::peer_id(p).build()` sets `extend_addresses_through_behaviour: true`
+> and every address-carrying builder sets it `false`, including
+> `From<Multiaddr>`, which is what `swarm.dial(addr)` uses; `Swarm::dial` appends
+> what a behaviour returns **only** when that flag is true. So a filter in
+> `NetworkBehaviour::handle_pending_outbound_connection` sees the DHT path and is
+> **structurally unable** to reach the mDNS path. `net::swarm::Bogonless<B>` is
+> that filter: it wraps each `kad::Behaviour`, delegates every other method, and
+> refuses what `not_a_bogon` refuses.
 >
-> Rules 1 and 3 **are** enforced, by a different mechanism than this section
+> **`not_a_bogon` is deliberately not `run::reachable`.** That one asks *"could
+> the rest of the internet dial this"* and answers **no** for
+> `/dnsaddr/bootstrap.libp2p.io`, which carries no IP — right where it is used,
+> and wrong here, because it would cut names and the bootstrap shape out of the
+> routing table. This refuses an address only when it **carries an IP and that IP
+> is somebody's own network**, and keeps anything it cannot judge. RFC 6598 is
+> spelled out because `Ipv4Addr::is_private` does not cover it; the IPv6 masks
+> are spelled out because `is_unique_local` is unstable.
+>
+> **It counts what it drops**, on the status line and only when the count moves,
+> so *how many private addresses the real Amino DHT hands this client* — a figure
+> nobody had — arrives as a byproduct of the defence.
+>
+> Rules 1 and 3 are enforced by a different mechanism than this section
 > describes: `PeerCondition::DisconnectedAndNotDialing` deduplicates, and libp2p
 > will not dial this node's own `PeerId`. Rule 4's port floor is gone with the
 > ports.
 >
-> The paragraph below the list is the part to keep, and it is why the fix is not
-> simply "drop private addresses": mDNS dials RFC 1918 addresses on the LAN
-> deliberately, and a filter that cannot tell a DHT-derived address from an
-> mDNS-derived one would break the two-players-behind-one-router case.
+> The paragraph below the list is the part that made the design necessary: mDNS
+> dials RFC 1918 addresses on the LAN deliberately, and a filter that could not
+> tell a DHT-derived address from an mDNS-derived one would break the
+> two-players-behind-one-router case. That is exactly what the provenance flag
+> buys.
 
 Applied to **DHT-derived** candidates only:
 
