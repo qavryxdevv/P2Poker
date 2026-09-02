@@ -428,7 +428,7 @@ impl TableSink {
     /// nine steps short of being in the group, whose inviter entry is reaped
     /// after twelve seconds with no callback and no log, and for which
     /// libtoxcore has no path back.
-    pub fn join_trouble(&self) -> (u64, u64) {
+    pub fn join_trouble(&self) -> (u64, u64, u64) {
         #[cfg(feature = "tox")]
         {
             use std::sync::atomic::Ordering;
@@ -436,13 +436,14 @@ impl TableSink {
                 Some(t) => (
                     t.trouble().rejoins.load(Ordering::Relaxed),
                     t.trouble().join_fails.load(Ordering::Relaxed),
+                    t.trouble().confirmed_peers.load(Ordering::Relaxed),
                 ),
-                None => (0, 0),
+                None => (0, 0, 0),
             }
         }
         #[cfg(not(feature = "tox"))]
         {
-            (0, 0)
+            (0, 0, 0)
         }
     }
 

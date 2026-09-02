@@ -95,6 +95,20 @@ pub enum Event {
     /// `TOX_GROUP_JOIN_FAIL_PEER_LIMIT` = 0, `..._PASSWORD` = 1,
     /// `..._UNKNOWN` = 2.
     GroupJoinFail { group: u32, reason: i32 },
+    /// **Another peer became confirmed in the group.**
+    ///
+    /// The flag this reports is the one
+    /// `send_gc_lossless_packet_all_peers` requires: it skips a peer that is
+    /// not confirmed and reports success anyway when there are none. So the set
+    /// of peers this event has fired for is exactly the set a broadcast reaches
+    /// — which `peer_count` is not, because it counts unconfirmed entries too.
+    ///
+    /// That gap is why `group N/N` was never proof that a message would be
+    /// delivered, and why every reading of the status line before this had to
+    /// hedge.
+    GroupPeerJoin { group: u32, peer: u32 },
+    /// A confirmed peer left, was kicked, or timed out.
+    GroupPeerExit { group: u32, peer: u32 },
 }
 
 /// Where the C callbacks put what they are given, for the length of one
@@ -145,6 +159,36 @@ unsafe extern "C" fn on_group_packet(
         peer,
         data: bytes,
     });
+}
+
+/// A peer became confirmed. See [`Event::GroupPeerJoin`].
+unsafe extern "C" fn on_group_peer_join(
+    _tox: *mut sys::Tox,
+    group: u32,
+    peer: u32,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    s.events.push(Event::GroupPeerJoin { group, peer });
+}
+
+/// A confirmed peer left. The name and part message are not read: a display
+/// name is not an identity here and a part message is a string a stranger
+/// chose.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn on_group_peer_exit(
+    _tox: *mut sys::Tox,
+    group: u32,
+    peer: u32,
+    _exit_type: c_int,
+    _name: *const u8,
+    _name_len: usize,
+    _part: *const u8,
+    _part_len: usize,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    s.events.push(Event::GroupPeerExit { group, peer });
 }
 
 /// This client's own join finished. See [`Event::GroupSelfJoin`].
@@ -414,6 +458,9 @@ impl Tox {
             // reaches `CS_CONNECTED`, so only the joiner's was ever zero.)
             sys::tox_callback_group_self_join(ptr, Some(on_group_self_join));
             sys::tox_callback_group_join_fail(ptr, Some(on_group_join_fail));
+            // **The confirmed-peer set, which `peer_count` is not.**
+            sys::tox_callback_group_peer_join(ptr, Some(on_group_peer_join));
+            sys::tox_callback_group_peer_exit(ptr, Some(on_group_peer_exit));
             sys::tox_callback_friend_connection_status(ptr, Some(on_friend_connection));
             sys::tox_callback_friend_request(ptr, Some(on_friend_request));
 

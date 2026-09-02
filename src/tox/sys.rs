@@ -278,7 +278,34 @@ extern "C" {
     pub fn tox_callback_group_self_join(tox: *mut Tox, callback: tox_group_self_join_cb);
     /// `tox.h:4925`
     pub fn tox_callback_group_join_fail(tox: *mut Tox, callback: tox_group_join_fail_cb);
+    /// `tox.h:4808`
+    pub fn tox_callback_group_peer_join(tox: *mut Tox, callback: tox_group_peer_join_cb);
+    /// `tox.h:4872`
+    pub fn tox_callback_group_peer_exit(tox: *mut Tox, callback: tox_group_peer_exit_cb);
 }
+
+/// `tox.h:4801`. Fires when another peer becomes **confirmed** — the same flag
+/// the group send path requires, so this callback set is exactly the set a
+/// broadcast will reach.
+pub type tox_group_peer_join_cb = Option<
+    unsafe extern "C" fn(tox: *mut Tox, group_number: u32, peer_id: u32, user_data: *mut c_void),
+>;
+
+/// `tox.h:4862`.
+#[allow(clippy::type_complexity)]
+pub type tox_group_peer_exit_cb = Option<
+    unsafe extern "C" fn(
+        tox: *mut Tox,
+        group_number: u32,
+        peer_id: u32,
+        exit_type: c_int,
+        name: *const u8,
+        name_length: usize,
+        part_message: *const u8,
+        part_message_length: usize,
+        user_data: *mut c_void,
+    ),
+>;
 
 /// `tox.h:4877`. Fires **once**, when this client's own join completes.
 pub type tox_group_self_join_cb =

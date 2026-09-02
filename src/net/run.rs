@@ -3734,11 +3734,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if !line.is_empty() {
                         let (sent, refused, up) = tox_sink.invite_counts();
-                        let (rejoins, join_fails) = tox_sink.join_trouble();
+                        let (rejoins, join_fails, confirmed) = tox_sink.join_trouble();
                         let (seen, want) = tox_sink.group_seen();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "seats on the line: {}; tox self {}, group {seen}/{want}, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}",
+                                "seats on the line: {}; tox self {}, group {seen}/{confirmed} confirmed/{want}, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}",
                                 line.join(", "),
                                 match tox_sink.tox_connection() {
                                     0 => "offline",
@@ -5485,15 +5485,16 @@ async fn checkpoint_event(
     // the live hand is a peer that finished before this one, and its copy is
     // exactly what the stage about to open will need. See `early_checkpoints`.
     if !boundaries.holds(hand_id) {
-        if hand_id >= h.hand_id() {
+        // One copy per seat per hand, and two hands' worth in all: a hold
+        // queue that grows is a way to be attacked. **The bound is checked
+        // before the entry is made**, or `or_default` would insert an empty
+        // slot for a third hand and the guard would then refuse to fill it.
+        if hand_id >= h.hand_id() && (early.contains_key(&hand_id) || early.len() < 2) {
             let slot = early.entry(hand_id).or_default();
-            // One copy per seat per hand, and two hands' worth in all: a hold
-            // queue that grows is a way to be attacked.
-            if slot.len() < usize::from(crate::protocol::constants::MAX_SEATS) && early.len() <= 2 {
-                let slot = early.entry(hand_id).or_default();
-                if !slot.iter().any(|b| b == bytes) {
-                    slot.push(bytes.to_vec());
-                }
+            if slot.len() < usize::from(crate::protocol::constants::MAX_SEATS)
+                && !slot.iter().any(|b| b == bytes)
+            {
+                slot.push(bytes.to_vec());
             }
         }
         return None;

@@ -223,6 +223,17 @@ pub struct Trouble {
     /// Zero on a healthy run. A number here is `S1-AA` shape (i) happening and
     /// being survived, which is the difference between a seat that recovers and
     /// one that sits at `group 0/N` for the rest of the tournament.
+    /// **Peers toxcore has confirmed in the group**, which is not the same as
+    /// the peers it counts.
+    ///
+    /// `peer_count` walks the peer list and does not check `confirmed`, while
+    /// the group send path skips exactly the peers that are not confirmed — and
+    /// reports success when there are none. So `in_group` could read `3/3`
+    /// while a broadcast reached nobody, and every reading of the status line
+    /// before this had to hedge about it. `seen` beside `confirmed` is what
+    /// makes the difference visible: `seen > confirmed` is the library's skip
+    /// happening, and the two agreeing rules it out.
+    pub confirmed_peers: AtomicU64,
     pub rejoins: AtomicU64,
     /// Joins toxcore itself abandoned, with `tox_group_join_fail`.
     ///
@@ -505,6 +516,7 @@ fn run(
     //
     // `tox_group_leave` destroys the chat, which is the one lever that clears
     // that gate — and the driver already owns it.
+    let mut confirmed: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut accepted_at: Option<Instant> = None;
     let mut self_joined = false;
     let mut rejoins = 0u32;
@@ -689,8 +701,19 @@ fn run(
                         group = None;
                         accepted_at = None;
                         self_joined = false;
+                        confirmed.clear();
                         trouble.join_fails.fetch_add(1, Ordering::Relaxed);
                         let _ = reason;
+                    }
+                }
+                Event::GroupPeerJoin { group: g, peer } => {
+                    if group == Some(g) {
+                        confirmed.insert(peer);
+                    }
+                }
+                Event::GroupPeerExit { group: g, peer } => {
+                    if group == Some(g) {
+                        confirmed.remove(&peer);
                     }
                 }
                 Event::GroupPacket { group: g, peer, data } => {
@@ -813,6 +836,9 @@ fn run(
                 .store(tox.connection().max(0) as u64, Ordering::Relaxed);
             trouble.friends_up.store(connected.len() as u64, Ordering::Relaxed);
             trouble.in_group.store(seen as u64, Ordering::Relaxed);
+            trouble
+                .confirmed_peers
+                .store(confirmed.len() as u64, Ordering::Relaxed);
             trouble.want_in_group.store(roster.len() as u64, Ordering::Relaxed);
             trouble
                 .complete
@@ -837,6 +863,7 @@ fn run(
                             let _ = tox.leave(g);
                         }
                         accepted_at = None;
+                        confirmed.clear();
                         rejoins += 1;
                         trouble.rejoins.store(rejoins as u64, Ordering::Relaxed);
                     }

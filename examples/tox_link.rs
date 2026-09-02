@@ -263,6 +263,13 @@ fn main() {
                 Event::GroupSelfJoin { group } => {
                     println!("joined group {group} after {:.1}s", began.elapsed().as_secs_f32())
                 }
+                // The confirmed set, which peer_count is not.
+                Event::GroupPeerJoin { group, peer } => {
+                    println!("group {group}: peer {peer} confirmed")
+                }
+                Event::GroupPeerExit { group, peer } => {
+                    println!("group {group}: peer {peer} left")
+                }
                 Event::GroupJoinFail { group, reason } => {
                     println!("group {group} join failed, reason {reason}")
                 }
