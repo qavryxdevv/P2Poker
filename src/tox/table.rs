@@ -40,7 +40,45 @@ use crate::table::transport::{FromTable, PlayerId, TableTransport, TransportErro
 use crate::tox::{Event, Tox};
 
 /// How this client stands to the table's group.
-/// How long a joiner waits for its own join to finish before giving it up.
+/// **Starve this joiner's group handshake, on purpose, so `S1-AA` shape (i) can
+/// be measured rather than waited for.**
+///
+/// `P2P_POKER_STALL_JOIN=<seconds>` makes a joiner stop iterating toxcore for
+/// that long immediately after it accepts an invitation. The handshake needs
+/// four attempts at `GC_SEND_HANDSHAKE_INTERVAL` = 3 s inside
+/// `GC_UNCONFIRMED_PEER_TIMEOUT` = 12 s, so anything above twelve reproduces the
+/// failure exactly: the inviter's address-less entry is reaped, no `peer_exit`
+/// fires, no log is written, and libtoxcore has no path back — a fresh
+/// invitation is refused inside `Messenger.c` because a chat with that id
+/// already exists.
+///
+/// **Why a knob and not a wait.** The failure appeared in seven runs of 134 and
+/// nothing makes it happen. `-DivergeAt` exists for the same reason and the row
+/// that added it says why: so §6.3's answer *“can be measured rather than
+/// reasoned about”*. A recovery nothing has ever triggered is a recovery nobody
+/// has tested.
+///
+/// Compiled out entirely without `--features fault-harness`, where this is the
+/// constant zero and the environment is never read.
+#[cfg(feature = "fault-harness")]
+fn stall_join_secs() -> u64 {
+    use std::sync::OnceLock;
+    static SECS: OnceLock<u64> = OnceLock::new();
+    *SECS.get_or_init(|| {
+        std::env::var("P2P_POKER_STALL_JOIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Zero, in every build that did not ask for the harness.
+#[cfg(not(feature = "fault-harness"))]
+fn stall_join_secs() -> u64 {
+    0
+}
+
+/// How long a joiner waits for its own join to finish before it gives it up.
 ///
 /// **Comfortably past toxcore's own reaper, and deliberately so.**
 /// `GC_UNCONFIRMED_PEER_TIMEOUT` is twelve seconds, and the handshake has about
@@ -676,6 +714,18 @@ fn run(
                                     accepted_at = Some(Instant::now());
                                     self_joined = false;
                                     announce(&tox, group, &chat);
+                                    // **The harness's stall, and nothing else
+                                    // in this loop knows about it.** Sleeping
+                                    // here starves the handshake past
+                                    // toxcore's twelve-second reaper without
+                                    // touching a single line of the code under
+                                    // test — the driver goes on believing it
+                                    // holds a group, which is exactly what the
+                                    // seven measured victims believed.
+                                    let stall = stall_join_secs();
+                                    if stall > 0 {
+                                        std::thread::sleep(Duration::from_secs(stall));
+                                    }
                                 }
                                 _ => {
                                     let _ = tox.leave(joined);

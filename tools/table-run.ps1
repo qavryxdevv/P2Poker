@@ -115,6 +115,29 @@ param(
     [ValidateRange(0, 100000)][int]$LinkDownAt = 0,
     [ValidateRange(0, 3600)][int]$LinkDownFor = 15,
     [ValidateRange(0, 32)][int]$LinkDownNode = 1,
+    # `-StallJoin <seconds> -StallJoinNode <n>` starves one joiner's **group
+    # handshake** for that long, right after it accepts the invitation.
+    #
+    # This is `S1-AA` shape (i) on demand. toxcore gives the handshake four
+    # attempts at three seconds inside `GC_UNCONFIRMED_PEER_TIMEOUT` = 12 s;
+    # past that the inviter's address-less peer entry is reaped, no `peer_exit`
+    # fires, nothing is logged, and there is no path back — a fresh invitation
+    # is refused inside `Messenger.c` because a chat with that id already
+    # exists. Seven runs of 134 hit it and nothing could make it happen.
+    #
+    # **Different from `-LinkDownAt`, and that is the point.** A link outage
+    # stops the *table's* messages at the application layer while toxcore keeps
+    # handshaking underneath; this stops the handshake itself and leaves the
+    # driver believing it holds a group, which is exactly what the seven
+    # measured victims believed.
+    #
+    # Use a value above 12 (25 or 30 is comfortable) and expect the seat to
+    # leave and rejoin: `JOIN_GRACE` = 25 s, `MAX_REJOINS` = 3, and the status
+    # line counts both.
+    #
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateRange(0, 300)][int]$StallJoin = 0,
+    [ValidateRange(0, 32)][int]$StallJoinNode = 1,
     [ValidateRange(0, 3600)][int]$DropAt = 0,
     [ValidateRange(0, 600)][int]$DropFor = 20,
     # A seat slower than this to enter the Tox group keeps the logs, however
@@ -208,13 +231,15 @@ for ($i = 0; $i -lt $Seats; $i++) {
 
     $diverge = if ($DivergeAt -gt 0 -and $i -eq $DivergeNode) { $DivergeAt } else { 0 }
     $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor)
+    $stall = if ($StallJoin -gt 0 -and $i -eq $StallJoinNode) { $StallJoin } else { 0 }
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall)
         if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
         if ($downAt -gt 0) {
             $env:P2P_POKER_LINK_DOWN_AT = "$downAt"
             $env:P2P_POKER_LINK_DOWN_FOR = "$downFor"
         }
+        if ($stall -gt 0) { $env:P2P_POKER_STALL_JOIN = "$stall" }
         $start = Get-Date
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
         & $exe @nodeArgs 2>&1 | ForEach-Object {
@@ -265,6 +290,11 @@ if ($LeaverSeconds -gt 0) {
 if ($DivergeAt -gt 0) {
     Write-Host "==> n$DivergeNode will hold a wrong end-of-hand state for hand $DivergeAt"
     Write-Host "    (needs a binary built with --features fault-harness)"
+}
+if ($StallJoin -gt 0) {
+    Write-Host "==> n$StallJoinNode starves its group handshake for $StallJoin s after accepting the invite"
+    Write-Host "    (S1-AA shape (i): past 12 s the inviter entry is reaped and there is no way back;"
+    Write-Host "     expect a leave-and-rejoin, counted on the status line. Needs --features fault-harness)"
 }
 if ($LinkDownAt -gt 0) {
     Write-Host "==> n$LinkDownNode loses its LINE at $LinkDownAt s for $LinkDownFor s; the process lives on"
