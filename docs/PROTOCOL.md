@@ -6258,10 +6258,27 @@ that the lobby is spammable and the mitigations are bounds on the damage, not a
 solution.
 
 There is a related, larger exposure that belongs in `THREAT_MODEL.md` rather than
-here: a fixed public `LOBBY_INFOHASH` publishes each player's IP address to
-roughly 100 arbitrary internet hosts per announce cycle, and Phase 0 observed a
-stranger re-announcing under a freshly generated random infohash within 24
-minutes — DHT crawling seen first-hand, not hypothesised. [DHT §7] That is a
+here: **the fixed public rendezvous key publishes each player's persistent
+`PeerId`, together with every address the swarm holds, and leaves it there for up
+to 48 hours after the player closes the client.** There is no way to withdraw it —
+`stop_providing` is a local operation and the remote copies run their own clock.
+Phase 0 observed a stranger re-announcing under a freshly generated random
+infohash within 24 minutes, so crawling was seen first-hand rather than
+hypothesised, and the audience is now *worse* than that observation suggests: the
+key is fixed and public, so the nodes closest to it are computable by anybody, and
+a node ground close to it receives every announcement for ever.
+
+The one thing that got better is worth stating beside it: a storing node refuses a
+provider record whose identity is not the peer on the authenticated connection
+that sent it, so **nobody can announce somebody else's `PeerId` in this lobby**.
+That is the whole of the improvement, and it does not make the lobby private.
+
+**This paragraph named `LOBBY_INFOHASH` and "roughly 100 arbitrary internet hosts
+per announce cycle" until 2026-09-02.** Both were Mainline's, measured against a
+mechanism `c7e6317` deleted, and no counterpart figure has been measured for
+Kademlia — how many distinct nodes one `get_providers` walk contacts is
+`NETWORK_STACK.md` §3.5's first `[UNMEASURED]`. It is left unquantified rather
+than re-quoted at a number that is no longer about anything. That is a
 discovery-layer property, not a lobby-protocol one, but a reader of this document
 should not come away thinking the lobby is private.
 
@@ -7592,10 +7609,36 @@ SNAPSHOT_PROTOCOL               = "/p2p-poker/lobby-snapshot/1"
 JOIN_PROTOCOL                   = "/p2p-poker/join/1"
 TABLE_PROTOCOL                  = "/p2p-poker/table/1"
 
-LOBBY_DERIVATION_STRING         = "p2p-poker/mainline-lobby/v1"
-LOBBY_INFOHASH                  = fd7c0d69433e32e425db3ca2b7d7718928739f01
-RELAY_DERIVATION_STRING         = "p2p-poker/mainline-relay/v1"
-RELAY_INFOHASH                  = 9c18d8c80f69de3aa079b2ef519bc4bbb67e1cc1
+LOBBY_DERIVATION_STRING         = "p2p-poker/main-lobby/v1"
+LOBBY_NAMESPACE_KEY             = 12207e342925602a7c6558d6ac574207bcc56f7989e17ad52b7694f2c964d772c4b6
+RELAY_DERIVATION_STRING         = "/libp2p/relay"
+RELAY_NAMESPACE_KEY             = 1220245eebd20d2cd4c81b5d4ac27c73746279f436d62f3ef52c452a369e6ef7b610
+
+  Each key is 34 bytes: the multihash prefix 0x12 (sha2-256) 0x20 (32-byte
+  digest) followed by sha256(derivation string). That is how go-libp2p's routing
+  discovery keys a namespace, and matching it is what lets a p2p-poker client and
+  a go-libp2p client agree on where the lobby is.
+
+  **These four lines were wrong until 2026-09-02 and this is the one place in
+  the corpus where being wrong is fatal to interoperability.** They still named
+  `"p2p-poker/mainline-lobby/v1"` and a 20-byte BitTorrent infohash,
+  `fd7c0d69…`, four days after `c7e6317` moved discovery to a libp2p Kademlia
+  provider record and deleted the `mainline` crate. So `PROTOCOL.md` §13 and
+  `NETWORK_STACK.md` §3.2 gave one name two values, which is exactly what
+  `NETWORK_STACK.md` §14's *"no value has two names anywhere in the corpus"* is
+  there to prevent, read from the other end — and a second implementation built
+  from §13 would have announced in the BitTorrent DHT and never found ours.
+  `S1-AB`.
+
+  The relay derivation string is **not** ours and deliberately so: `/libp2p/relay`
+  is where go-libp2p's own AutoRelay advertises and looks, so a p2p-poker
+  volunteer is findable by any libp2p client and vice versa. A private string
+  here would have made this project's relays invisible to the network whose
+  relays it wants to use.
+
+  Pinned by `the_lobby_rendezvous_key_is_the_published_one` in `src/net/run.rs`,
+  which asserts the bytes rather than recomputing them: a test that recomputes
+  the thing it checks passes whatever the code does.
 
 DOMAIN_EVENT                    = "p2p-poker/v1/event" NUL-padded to 24 bytes
   hex: 70 32 70 2d 70 6f 6b 65 72 2f 76 31 2f 65 76 65 6e 74 00 00 00 00 00 00
