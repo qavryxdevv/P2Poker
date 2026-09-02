@@ -1991,19 +1991,45 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // table, which is how a table stopped forming at
                             // all. Whoever is not reached this cycle is reached
                             // the next one.
+                            //
+                            // **And the sentence above was false until it was
+                            // measured.** A peer was recorded as dialled
+                            // *before* the per-cycle budget was checked, so
+                            // whoever the budget skipped was marked as reached
+                            // and `dialled_lobby` refused it for ever after.
+                            // With 140 providers on the lobby key and
+                            // `DIALS_PER_CYCLE` = 8, that is 132 peers a cycle
+                            // written off without one dial attempt.
+                            //
+                            // Measured, `split205429-2`: the founder found the
+                            // joiner in the lobby at 27.5 s among 140 providers
+                            // and never dialled it, found it four more times
+                            // over the next two minutes and never dialled it
+                            // again, and published its table advert nine times
+                            // out of nine into `NoPeersSubscribedToTopic`. The
+                            // joiner ended `NO TABLE` while both nodes held a
+                            // relay reservation and each knew the other's peer
+                            // id. It reads as a NAT or relay failure and is
+                            // neither.
+                            //
+                            // The budget is checked first now, and only a peer
+                            // actually dialled is recorded — so a peer past the
+                            // budget stays unknown and the next cycle takes it,
+                            // which is what the paragraph above always claimed.
                             let mut fresh = 0usize;
                             for peer in providers {
                                 if lobby {
                                     let _ = events.send(NodeEvent::LobbyPeer(peer)).await;
-                                    if !dialled_lobby.insert(peer) {
+                                    if dialled_lobby.contains(&peer) {
                                         continue;
                                     }
-                                    if dialled_lobby.len() > 512 {
-                                        dialled_lobby.clear();
+                                    if fresh >= DIALS_PER_CYCLE {
+                                        continue;
                                     }
                                     fresh += 1;
-                                    if fresh > DIALS_PER_CYCLE {
-                                        continue;
+                                    dialled_lobby.insert(peer);
+                                    if dialled_lobby.len() > 512 {
+                                        dialled_lobby.clear();
                                     }
                                 }
                                 // By peer id: the addresses came with the query
