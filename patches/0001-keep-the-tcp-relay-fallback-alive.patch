@@ -1,0 +1,37 @@
+diff --git a/toxcore/onion_client.c b/toxcore/onion_client.c
+index 041a0d8..f7ee4e5 100644
+--- a/toxcore/onion_client.c
++++ b/toxcore/onion_client.c
+@@ -2166,7 +2166,31 @@ void do_onion_client(Onion_Client *onion_c)
+     onion_c->udp_connected = dht_non_lan_connected(onion_c->dht);
+ 
+     if (mono_time_is_timeout(onion_c->mono_time, onion_c->first_run, ONION_CONNECTION_SECONDS * 2)) {
+-        set_tcp_onion_status(nc_get_tcp_c(onion_c->c), !onion_c->udp_connected);
++        /* p2p-poker: keep the TCP relay fallback alive even when UDP is healthy.
++         *
++         * Upstream passes `!onion_c->udp_connected`, so a node whose DHT is
++         * reachable over UDP tears its onion TCP connections down six seconds
++         * after start (ONION_CONNECTION_SECONDS * 2). That is fine for a
++         * messenger, and it breaks group invitations: the invite confirmation
++         * built in handle_gc_invite_accepted_packet fills its relay list from
++         * tcp_copy_connected_relays, which only reports relays whose status is
++         * TCP_CONN_CONNECTED. A UDP-healthy inviter therefore sends a
++         * confirmation with no relays in it, and a joiner that reaches the
++         * inviter over TCP has nothing to hand handle_gc_invite_confirmed_packet
++         * -- copy_friend_ip_port_to_gconn reads the friend's DHT ip_port, which a
++         * TCP-relayed friendship does not have -- so it returns -5, "Got invalid
++         * connection info from peer", and the join never completes.
++         *
++         * Measured across two subnets before this change: the joiner logged that
++         * error at 72.5 s and again after each of three re-invitations, and the
++         * group stayed at 0 seen / 0 confirmed for the whole run.
++         *
++         * `true` costs NUM_ONION_TCP_CONNECTIONS = 3 idle TCP relay connections
++         * for the life of the process, which is what every other Tox client
++         * already holds as a fallback and what this project's own D-001 assumes
++         * is there.
++         */
++        set_tcp_onion_status(nc_get_tcp_c(onion_c->c), true);
+     }
+ 
+     if (onion_connection_status(onion_c) != ONION_CONNECTION_STATUS_NONE) {

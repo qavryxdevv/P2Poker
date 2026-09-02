@@ -94,6 +94,46 @@ if (-not (Test-Path (Join-Path $tox 'third_party/cmp/cmp.c'))) {
 $cmpHead = (& git -C (Join-Path $tox 'third_party/cmp') rev-parse HEAD)
 if ($cmpHead -ne $CMP_COMMIT) { Fail "cmp is $cmpHead, not the pinned $CMP_COMMIT" }
 
+# --- our patches ------------------------------------------------------------
+#
+# **The vendored tree is fetched and gitignored, so a change to it has to live
+# here or it does not exist.** `patches/` is applied in name order to the clone
+# straight after the pin is verified, and the whole build stops if one does not
+# apply.
+#
+# **Failing loudly is the point.** A patch that silently does not apply produces
+# a library that looks right, links, runs, and is missing the fix — and the last
+# time this project had a defect that only showed under measurement it took a
+# day to find. `git apply --check` first, so a bad patch is reported before
+# anything has been half-applied.
+#
+# A patch is expected to stop applying when `$TOXCORE_COMMIT` moves. That is not
+# a reason to skip it: re-cut the patch against the new tree, and if the change
+# has landed upstream, delete the file.
+$patchDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'patches'
+if (Test-Path $patchDir) {
+    $patches = @(Get-ChildItem -Path $patchDir -Filter '*.patch' | Sort-Object Name)
+    if ($patches.Count -gt 0) {
+        Step "applying $($patches.Count) patch(es) to c-toxcore"
+        foreach ($patch in $patches) {
+            # Already applied? A rebuild against an existing clone must not fail
+            # for having succeeded last time.
+            & git -C $tox apply --reverse --check "$($patch.FullName)" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                Note "  $($patch.Name) is already applied"
+                continue
+            }
+            & git -C $tox apply --check "$($patch.FullName)" 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Fail "$($patch.Name) does not apply to c-toxcore $TOXCORE_TAG. Re-cut it against the pinned tree, or delete it if the change has landed upstream. Do NOT build without it: the whole point of the patch is a failure that only shows under measurement."
+            }
+            & git -C $tox apply "$($patch.FullName)"
+            if ($LASTEXITCODE -ne 0) { Fail "$($patch.Name) failed to apply after checking clean, which should be impossible" }
+            Note "  $($patch.Name)"
+        }
+    }
+}
+
 $sodium = Fetch 'libsodium' 'https://github.com/jedisct1/libsodium.git' $SODIUM_TAG $SODIUM_COMMIT
 
 # --- libsodium, static, x64 -------------------------------------------------
