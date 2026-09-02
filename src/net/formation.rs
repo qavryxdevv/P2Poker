@@ -166,6 +166,31 @@ pub struct Formation {
     /// Ratifications collected, by seat. Cleared whenever the roster changes,
     /// because a ratification names the serial it ratifies.
     ratified: BTreeMap<u8, Hash>,
+    /// **The ratifications themselves, so any seat can repair any other's.**
+    ///
+    /// `ratified` holds hashes, which is all `session_id` needs and all the
+    /// first-copy-wins test needs. It is not enough to *re-send* one, and that
+    /// was `S1-P`'s residue: `say_again` could repeat only this client's own
+    /// copy, so a seat that missed seat 3's ratification could be helped by
+    /// seat 3 alone — and if seat 3 had already settled and stopped saying
+    /// anything, by nobody.
+    ///
+    /// **Relaying a third party's signed event is sound and the corpus already
+    /// does it.** §9's join answer carries `advert_event` *"repeated verbatim so
+    /// the joiner is not relying on a gossip copy and can re-verify the table
+    /// key's signature itself"*. The same holds here: the bytes are signed by
+    /// the seat that made them, every receiver verifies that signature, and a
+    /// relayer that altered a byte would produce something no signature covers.
+    /// Carrying it proves nothing about the relayer and asserts nothing on the
+    /// author's behalf.
+    ///
+    /// Idempotent at the far end by construction: `take_ratification` returns
+    /// `Ok(())` on a byte-identical repeat and only a **differing** copy is
+    /// `RatifiedTwice`.
+    ///
+    /// Cost is one `TABLE_READY` per seat — about two hundred bytes each — held
+    /// only while the table has no session.
+    ratified_bytes: BTreeMap<u8, Vec<u8>>,
     sent_ready: bool,
     session: Option<Hash>,
     capabilities: Vec<Vec<u8>>,
@@ -257,6 +282,7 @@ impl Formation {
             my_buyin,
             pending: None,
             ratified: BTreeMap::new(),
+            ratified_bytes: BTreeMap::new(),
             sent_ready: false,
             session: None,
             capabilities: vec![DECK_CAPABILITY.to_vec()],
@@ -331,6 +357,7 @@ impl Formation {
                 my_buyin,
                 pending: Some(request_hash),
                 ratified: BTreeMap::new(),
+            ratified_bytes: BTreeMap::new(),
                 sent_ready: false,
                 session: None,
                 capabilities: vec![DECK_CAPABILITY.to_vec()],
@@ -420,6 +447,22 @@ impl Formation {
         }
         if let Some(r) = &self.said.ready {
             out.push(r.clone());
+        }
+        // **And every other seat's ratification this client holds.**
+        //
+        // `S1-P`. A seat that missed one `TABLE_READY` never computes a session
+        // and never plays; before this, only its author could re-send it, and
+        // only inside the 120 s in which GossipSub refuses a verbatim repeat.
+        // Every seat that heard it can now repair it, and D-019's amendment of
+        // 2026-09-02 puts these on the table's group where no duplicate cache
+        // applies.
+        //
+        // Own copy excluded because `said.ready` above is already it, and a
+        // second identical entry would be one wasted send per tick.
+        for (seat, bytes) in &self.ratified_bytes {
+            if Some(*seat) != self.my_seat {
+                out.push(bytes.clone());
+            }
         }
         out
     }
@@ -1027,6 +1070,7 @@ impl Formation {
             }
             None => {
                 self.ratified.insert(ready.my_seat, event_hash);
+                self.ratified_bytes.insert(ready.my_seat, bytes.to_vec());
             }
         }
         self.settle();
@@ -1750,6 +1794,127 @@ mod tests {
             joiner.say_again(NOW + 4),
             joiner_says,
             "a seat with no table key repeats what it has, byte for byte"
+        );
+    }
+
+    /// **A seat repeats every ratification it holds, not only its own.**
+    ///
+    /// `S1-P`'s residue. A `TABLE_READY` must arrive verbatim or not at all —
+    /// `emitted_at_unix_ms` is inside `EventBody`, so a re-signature is a
+    /// different `event_hash` and a different `session_id` — and GossipSub
+    /// refuses a byte-identical repeat for 120 s. So the one repair a seat can
+    /// make is the one the mesh will not carry, and until this the *only* peer
+    /// that could re-send seat 3's ratification was seat 3.
+    ///
+    /// That was the shape measured in `run205233-10`: seat 9 held
+    /// `ratified 1/10` — one, its own — for six and a half minutes while the
+    /// table played twenty-seven hands without it.
+    ///
+    /// Now every seat that heard a ratification carries it, and D-019's
+    /// amendment of 2026-09-02 puts these on the group, where no duplicate
+    /// cache applies. The assertion is that the founder's repeat contains the
+    /// **joiner's** bytes: a copy the founder did not author and could not
+    /// re-sign.
+    #[test]
+    fn a_seat_repeats_a_ratification_it_did_not_make() {
+        let (mut t, _, a, hash) = found(6, 2);
+        let table_id = t.founder.table_id();
+        let (mut joiner, req) = Formation::join(
+            key(2),
+            a.clone(),
+            hash,
+            table_id,
+            peer(2),
+            "joiner".into(),
+            1_000,
+            None,
+            None,
+            [2u8; 32],
+            NOW,
+            None,
+        )
+        .unwrap();
+        let out = t
+            .founder
+            .on_join_request(&req, &peer(2), false, NOW)
+            .expect("the seat is given");
+        let mut joiner_ratification: Option<Vec<u8>> = None;
+        for send in &out {
+            match send {
+                Send::Reply(b) => {
+                    let _ = joiner.on_join_answer(b, NOW).expect("the answer lands");
+                }
+                Send::Broadcast(b) => {
+                    // **The joiner ratifies the roster, not the answer.** Its
+                    // TABLE_READY comes out of `on_player_list`, which is what
+                    // the first draft of this test got wrong.
+                    if let Ok(sends) = joiner.on_player_list(b, NOW) {
+                        for s in sends {
+                            if let Send::Broadcast(bytes) = s {
+                                if joinwire::receive_player_list(&bytes).is_err() {
+                                    joiner_ratification = Some(bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let theirs = joiner_ratification.expect("the joiner ratified");
+        // The founder hears it, as it would on the wire.
+        t.founder
+            .on_table_ready(&theirs)
+            .expect("the founder accepts an honest ratification");
+
+        let repeat = t.founder.say_again(NOW + 1);
+        assert!(
+            repeat.iter().any(|b| b == &theirs),
+            "the founder must repeat the joiner's ratification byte for byte; it holds {} message(s)",
+            repeat.len()
+        );
+
+        // **Byte for byte, and that is the whole point.** A re-signature would
+        // be a different `event_hash`, so the far end would compute a different
+        // `session_id` from everybody else and `take_ratification` would name an
+        // honest seat as `RatifiedTwice`.
+        let carried = repeat.iter().find(|b| *b == &theirs).unwrap();
+        assert_eq!(carried, &theirs);
+
+        // And a third peer that never heard the joiner is repaired by it.
+        let (mut third, req3) = Formation::join(
+            key(3),
+            a.clone(),
+            hash,
+            table_id,
+            peer(3),
+            "third".into(),
+            1_000,
+            None,
+            None,
+            [3u8; 32],
+            NOW,
+            None,
+        )
+        .unwrap();
+        let out3 = t
+            .founder
+            .on_join_request(&req3, &peer(3), false, NOW)
+            .expect("a second seat is given");
+        for send in &out3 {
+            match send {
+                Send::Reply(b) => {
+                    let _ = third.on_join_answer(b, NOW);
+                }
+                Send::Broadcast(b) => {
+                    let _ = third.on_player_list(b, NOW);
+                }
+            }
+        }
+        // It never saw the joiner's ratification. The founder's repeat gives it
+        // one, and it is accepted.
+        assert!(
+            third.on_table_ready(&theirs).is_ok(),
+            "a relayed ratification is accepted like any other: it is signed by its author"
         );
     }
 
