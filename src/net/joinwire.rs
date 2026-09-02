@@ -49,10 +49,52 @@ use crate::table::join::{JoinAccept, JoinRequest, PlayerList, RejectReason, Tabl
 
 /// The most capabilities a `TABLE_READY` may declare (§4.3).
 pub const MAX_CAPABILITIES: usize = 32;
-/// The most bytes one capability string may take. Not in §4.3 by name; the
-/// message cap would otherwise be the only bound, and a bound that is only a
-/// total is a bound one field can spend entirely.
-pub const CAPABILITY_MAX: usize = 64;
+/// The most bytes one capability string may take.
+///
+/// **This was 64 and the corpus says 32, in three places.** §1.3: *"A capability
+/// is an ASCII name, `[a-z0-9/._-]{1,32}`, at most 32 per peer, transmitted as a
+/// sorted, de-duplicated array of byte strings."* §4.2's `n(5) capabilities`
+/// row: *"≤ 32 entries, each ≤ 32 B, sorted, unique, `[a-z0-9/._-]` only"*.
+/// §9.4's collection table: *"each name ≤ 32 B, sorted, unique"*.
+///
+/// The doc comment this replaces said the bound was *"not in §4.3 by name"* and
+/// invented one at twice the published value. It was not in §4.3; it was in
+/// §1.3, §4.2 and §9.4, and `S1-W`'s whole arithmetic — a maximal
+/// `capability_set` costing ~2 190 B against §9.3's 1 024 cap — was computed
+/// from the invented number and a wrong encoding rather than from the corpus.
+pub const CAPABILITY_MAX: usize = 32;
+
+/// Whether a capability set is one a conforming sender could have produced.
+///
+/// **Three published rules that nothing enforced.** §1.3, §4.2 and §9.4 all say
+/// *sorted*, *unique* and `[a-z0-9/._-]`; `seal_ready` and `receive_table_ready`
+/// checked the count and the length and nothing else. An unsorted, duplicated or
+/// upper-case set is an encoding no conforming implementation emits, and
+/// accepting one means this client admits messages a second implementation would
+/// refuse — the same interop asymmetry as the byte-string defect above, pointing
+/// the other way.
+///
+/// Sorted **and** unique in one pass: strictly ascending is both.
+fn capabilities_well_formed(caps: &[Vec<u8>]) -> Result<(), WireError> {
+    if caps.len() > MAX_CAPABILITIES {
+        return Err(WireError::TooLong("capability_set"));
+    }
+    for c in caps {
+        if c.is_empty() || c.len() > CAPABILITY_MAX {
+            return Err(WireError::TooLong("a capability"));
+        }
+        if !c
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        {
+            return Err(WireError::Malformed("a capability is outside [a-z0-9/._-]"));
+        }
+    }
+    if caps.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(WireError::Malformed("capability_set is not sorted and unique"));
+    }
+    Ok(())
+}
 /// §4.3: `peer_id` ≤ 42 B.
 pub const PEER_ID_MAX: usize = 42;
 /// §4.3: `display_name` ≤ 32 B of UTF-8.
@@ -258,8 +300,76 @@ pub struct TableReadyBody {
     pub table_params_hash: [u8; 32],
     #[n(3)]
     pub my_seat: u8,
-    #[n(4)]
+    #[cbor(n(4), with = "capability_bytes")]
     pub capability_set: Vec<Vec<u8>>,
+}
+
+/// `capability_set` as an array of CBOR **byte strings**, which is what the
+/// corpus declares and what the derive did not do.
+///
+/// `PROTOCOL.md` §4.2 and §4.3 both give the field the type `Vec<bytes>`. Every
+/// other byte-valued field in this file carries `with = "minicbor::bytes"`;
+/// this one carried a bare `#[n(4)]`, and minicbor's blanket impl for
+/// `Vec<u8>` is an **array of integers**. Measured before the fix, one
+/// `deck/bs-bg12-secp256k1/1` encoded as
+/// `81 9818 1864 1865 1863 …` — array(1), array(24), then two bytes per source
+/// byte.
+///
+/// **Two things were wrong with that and only one of them was the size.**
+///
+/// * It costs **51 bytes where the declared type costs 26** (`78 18` plus the
+///   twenty-four). That is what made `S1-W`'s arithmetic come out at ~2 190 B
+///   for a full set against §9.3's published 1 024 cap: half the overrun was
+///   this encoding rather than the bound.
+/// * **A conforming second implementation would have been refused at the
+///   canonicality gate.** It reads §4.2, writes a byte string, and this decoder
+///   demanded an array of integers. Nothing would have said why; the message
+///   would simply not have opened. That is the same class of defect as `S1-AB`'s
+///   two-valued lobby constant, and it is worse, because a constant mismatch
+///   makes two clients miss each other while this one makes them meet and fail.
+///
+/// Fixing it moves the bytes, so it moves `event_hash` and therefore
+/// `session_id`. Every peer moves together and no released client exists, so the
+/// change is a correction toward the specification rather than a wire break.
+mod capability_bytes {
+    use minicbor::encode::Write;
+    use minicbor::{Decoder, Encoder};
+
+    pub fn encode<C, W: Write>(
+        xs: &[Vec<u8>],
+        e: &mut Encoder<W>,
+        _ctx: &mut C,
+    ) -> Result<(), minicbor::encode::Error<W::Error>> {
+        e.array(xs.len() as u64)?;
+        for x in xs {
+            e.bytes(x)?;
+        }
+        Ok(())
+    }
+
+    pub fn decode<'b, C>(
+        d: &mut Decoder<'b>,
+        _ctx: &mut C,
+    ) -> Result<Vec<Vec<u8>>, minicbor::decode::Error> {
+        // **Definite length only.** Canonical CBOR has no indefinite arrays and
+        // §9.1's canonicality gate refuses them everywhere else; accepting one
+        // here would be a hole in exactly the field this fix is about.
+        let n = d
+            .array()?
+            .ok_or_else(|| minicbor::decode::Error::message("capability_set: indefinite array"))?;
+        // The count is refused before it is allocated against. `super::
+        // MAX_CAPABILITIES` is checked again by the caller, which is where the
+        // error the caller wants comes from; this is only so that a claimed
+        // length of four billion cannot ask for the memory first.
+        if n > super::MAX_CAPABILITIES as u64 {
+            return Err(minicbor::decode::Error::message("capability_set: too many"));
+        }
+        let mut out = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            out.push(d.bytes()?.to_vec());
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -618,12 +728,7 @@ pub fn publish_table_ready(
     now_ms: u64,
     next_deadline_ms: u32,
 ) -> Result<Vec<u8>, WireError> {
-    if ready.capability_set.len() > MAX_CAPABILITIES {
-        return Err(WireError::TooLong("capability_set"));
-    }
-    if ready.capability_set.iter().any(|c| c.len() > CAPABILITY_MAX) {
-        return Err(WireError::TooLong("a capability"));
-    }
+    capabilities_well_formed(&ready.capability_set)?;
     let body = TableReadyBody {
         roster_hash: ready.roster_hash,
         list_serial: ready.list_serial,
@@ -667,12 +772,7 @@ pub fn receive_table_ready(
     }
 
     let b: TableReadyBody = payload_of(&o, TABLE_READY_MAX)?;
-    if b.capability_set.len() > MAX_CAPABILITIES {
-        return Err(WireError::TooLong("capability_set"));
-    }
-    if b.capability_set.iter().any(|c| c.len() > CAPABILITY_MAX) {
-        return Err(WireError::TooLong("a capability"));
-    }
+    capabilities_well_formed(&b.capability_set)?;
     Ok((
         TableReady {
             roster_hash: b.roster_hash,
@@ -688,6 +788,91 @@ pub fn receive_table_ready(
 
 #[cfg(test)]
 mod tests {
+    /// **`capability_set` is an array of byte strings, asserted on the bytes.**
+    ///
+    /// `PROTOCOL.md` §4.2 and §4.3 type the field `Vec<bytes>`, and until
+    /// 2026-09-02 the derive emitted an array of **integers** — minicbor's
+    /// blanket impl for `Vec<u8>`, reached because this was the one byte-valued
+    /// field in the file without `with = "minicbor::bytes"`.
+    ///
+    /// **The assertion is on the encoded bytes and it has to be.** A test that
+    /// round-tripped the value, or compared the decoded `capability_set`, passes
+    /// under both encodings — this client agreed with itself perfectly, which is
+    /// exactly why nothing caught it. What differs is only what a *second*
+    /// implementation reads, and the byte string is the only thing that can be
+    /// compared against a specification written in CBOR major types.
+    ///
+    /// Measured before the fix: `81 9818 1864 1865 …` — array(1), array(24),
+    /// then `18 XX` per source byte, 51 bytes for a 24-byte capability. After:
+    /// `81 7818` and the 24 bytes themselves, 26.
+    #[test]
+    fn a_capability_is_a_cbor_byte_string_and_not_an_array_of_integers() {
+        use super::*;
+        let body = TableReadyBody {
+            roster_hash: [0xaa; 32],
+            list_serial: 1,
+            table_params_hash: [0xbb; 32],
+            my_seat: 0,
+            capability_set: vec![b"deck/bs-bg12-secp256k1/1".to_vec()],
+        };
+        let mut buf = Vec::new();
+        minicbor::encode(&body, &mut buf).expect("encodes");
+
+        // 0x81 = array(1) of capabilities; 0x58 0x18 = byte string of 24.
+        //
+        // Major type **2**, not 3. `0x78` would be a *text* string, and the
+        // first draft of this test asserted that and failed against a correct
+        // encoding — worth keeping in view, because a decoder that accepted
+        // text here would accept an encoding no honest sender emits, which is
+        // the same mistake `SeatWire::display_name`'s comment already warns of.
+        let want: Vec<u8> = [0x81u8, 0x58, 0x18]
+            .iter()
+            .copied()
+            .chain(b"deck/bs-bg12-secp256k1/1".iter().copied())
+            .collect();
+        assert!(
+            buf.ends_with(&want),
+            "capability_set is not an array of byte strings; encoded tail was {}",
+            buf[buf.len().saturating_sub(60)..]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+
+        // And the cost, because half of `S1-W`'s apparent overrun was this.
+        assert_eq!(want.len(), 27, "three bytes of framing and twenty-four of payload");
+
+        // It still decodes to what went in.
+        let back: TableReadyBody = minicbor::decode(&buf).expect("decodes");
+        assert_eq!(back.capability_set, body.capability_set);
+    }
+
+    /// An indefinite-length array is refused rather than accepted.
+    ///
+    /// Canonical CBOR has none, and §9.1's canonicality gate refuses them
+    /// everywhere else. A hand-written decoder is exactly where that rule gets
+    /// quietly dropped.
+    #[test]
+    fn an_indefinite_capability_array_is_refused() {
+        // 0x9f ... 0xff is the indefinite-length array.
+        let bytes = [0x9fu8, 0x41, b'x', 0xff];
+        let mut d = minicbor::Decoder::new(&bytes);
+        let r = super::capability_bytes::decode::<()>(&mut d, &mut ());
+        assert!(r.is_err(), "an indefinite array must not decode");
+    }
+
+    /// A claimed length beyond §4.3's thirty-two is refused before it is
+    /// allocated against.
+    #[test]
+    fn a_capability_count_beyond_the_bound_is_refused_before_allocating() {
+        // array(4294967295), then nothing. A decoder that reserved first would
+        // ask for four billion elements before discovering there are none.
+        let bytes = [0x9au8, 0xff, 0xff, 0xff, 0xff];
+        let mut d = minicbor::Decoder::new(&bytes);
+        let r = super::capability_bytes::decode::<()>(&mut d, &mut ());
+        assert!(r.is_err(), "a count above MAX_CAPABILITIES must be refused");
+    }
+
     use super::*;
     // The family caps, which the production paths no longer use: §9.3 gives
     // every message its own and `S1-W` is that the shared ones enforced none of

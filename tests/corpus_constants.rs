@@ -300,7 +300,7 @@ fn the_join_family_enforces_section_9_3s_own_caps() {
         ("JOIN_ACCEPT", JOIN_ACCEPT_MAX, 8_192),
         ("JOIN_REJECT", JOIN_REJECT_MAX, 128),
         ("PLAYER_LIST", PLAYER_LIST_MAX, 2_048),
-        ("TABLE_READY", TABLE_READY_MAX, 1_024),
+        ("TABLE_READY", TABLE_READY_MAX, 1_536),
     ] {
         assert_eq!(code, published, "{name}'s cap is §9.3's");
     }

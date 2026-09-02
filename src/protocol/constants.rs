@@ -122,15 +122,25 @@ pub const JOIN_REJECT_MAX: usize = 128;
 pub const PLAYER_LIST_MAX: usize = 2_048;
 /// §9.3: `TABLE_READY`, typical ~200.
 ///
-/// **This one is not derivable from the corpus's own bounds and that is `S1-W`'s
-/// second half.** §4.3 bounds `capability_set` at *"≤ 32"* entries and says
-/// nothing about how long one may be; `CAPABILITY_MAX` = 64 is this client's
-/// own invention, sound in itself — an unbounded element is unbounded input —
-/// and jointly with `MAX_CAPABILITIES` = 32 it admits a body of ~2 190 B, which
-/// this published cap forbids. Nothing hits it, because the one capability in
-/// use is `deck/bs-bg12-secp256k1/1` at 26 bytes; but the two bounds cannot both
-/// be right, and the corpus is the one missing a number.
-pub const TABLE_READY_MAX: usize = 1_024;
+/// **1 024 until 2026-09-02, and 1 024 cannot hold a `TABLE_READY` the corpus
+/// calls legal.** `S1-W`'s second half asked which of two bounds was wrong and
+/// answered it from the wrong end. The per-capability length was never missing:
+/// §1.3, §4.2 and §9.4 all publish 32 B. What was missing was the arithmetic —
+/// a maximal set is 32 names of 32 B, and as CBOR byte strings that is
+/// 32 × (2 + 32) = 1 088 B for the array alone, before `roster_hash` (34),
+/// `table_params_hash` (34), `list_serial`, `my_seat` and two array headers.
+/// About 1 160 B of body, against a published payload cap of 1 024.
+///
+/// So the cap is raised to 1 536 rather than a per-capability bound invented,
+/// which is also the corpus's own method: §9.4 derives a container from its
+/// collection bound, and `TABLE_AD_SIGNED_MAX` is the same 1 536.
+///
+/// Nothing has ever come near either number — the one capability in use is
+/// `deck/bs-bg12-secp256k1/1` at 24 bytes — so this decides what is *refused*,
+/// not what is sent. It mattered anyway, because a conforming peer that filled
+/// its capability set would have been refused by this client for sending
+/// exactly what §1.3 permits.
+pub const TABLE_READY_MAX: usize = 1_536;
 pub const TABLE_FRAME_MAX: usize = 262_144;
 pub const MAX_EMBEDDED_EVENT: usize = 32_768;
 

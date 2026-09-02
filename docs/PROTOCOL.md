@@ -7110,7 +7110,7 @@ reading the body.
 | `JOIN_ACCEPT` | 8 192 | ~1 800 |
 | `JOIN_REJECT` | 128 | ~45 |
 | `PLAYER_LIST` | 2 048 | ~1 200 |
-| `TABLE_READY` | 1 024 | ~200 |
+| `TABLE_READY` | 1 536 | ~200 |[^ready-cap]
 | `RNG_COMMIT` | 64 | 34 |
 | `RNG_REVEAL` | 128 | 68 |
 | `HAND_INIT` | 512 | ~140 |
@@ -7120,6 +7120,19 @@ reading the body.
 | `DECK_COMMIT` | 256 | 101 |
 | `DEAL_PRIVATE` | 4 096 | ≤ 18 × 132 = 2 376 |
 | `BOARD_REVEAL` | 1 024 | ≤ 3 × 132 = 396 |
+
+[^ready-cap]: **1 024 until 2026-09-02, and 1 024 could not hold a `TABLE_READY`
+    this specification calls legal.** §1.3 permits 32 capabilities of 32 bytes
+    each. As the sorted array of byte strings §1.3 requires, that is
+    32 × (2 + 32) = **1 088 B for `capability_set` alone**, before
+    `roster_hash` (34), `table_params_hash` (34), `list_serial`, `my_seat` and
+    two array headers — about 1 160 B of payload. A conforming peer that filled
+    its capability set would have been refused for sending exactly what §1.3
+    permits.
+
+    1 536 is not a new invention: it is `TABLE_AD_SIGNED_MAX`, and it is derived
+    the way §9.4 derives every other container — from the collection bound of
+    what it holds. `S1-W`.
 | `SHOWDOWN_REVEAL` | 512 | 264 |
 | `SHOWDOWN_MUCK` | 64 | ~10 |
 | `ACTION_*` | 64 | ~20 |

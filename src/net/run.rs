@@ -4714,11 +4714,50 @@ fn note_a_hand_ahead(
     if adrift.is_some() {
         return;
     }
-    let saying: Vec<u64> = ahead.values().copied().filter(|k| *k > mine).collect();
-    if saying.len() >= 2 {
-        *adrift = Some((saying.iter().copied().max().unwrap_or(hand_id), mine));
+    if let Some(out) = adrift_now(mine, ahead) {
+        *adrift = Some(out);
     }
 }
+
+/// The decision alone, so a test can reach it.
+///
+/// `note_a_hand_ahead` needs a whole `Hand` and a live table to be called; this
+/// is the part that decides, and a test that had to rebuild the caller would
+/// end up restating the rule instead of checking it.
+fn adrift_now(mine: u64, ahead: &std::collections::HashMap<u8, u64>) -> Option<(u64, u64)> {
+    let saying: Vec<u64> = ahead.values().copied().filter(|k| *k > mine).collect();
+    let furthest = saying.iter().copied().max()?;
+    // **Two seats, and two hands.** One seat running ahead is that peer's
+    // problem; one hand of margin is what a table looks like while somebody is
+    // still inside `Ended::pause`.
+    (saying.len() >= 2 && furthest >= mine + ADRIFT_MARGIN).then_some((furthest, mine))
+}
+
+/// How many hands ahead the table must be before this client calls itself out.
+///
+/// # This was one, and one is what an ordinary table looks like
+///
+/// **Measured over 134 table runs left on disk: 37 seats latched themselves
+/// out, and 36 of them were exactly one hand behind.** The single remaining
+/// case was five hands behind (`run212350-4`, hand 11 against 6) and is the one
+/// this mechanism was written for.
+///
+/// The reason a margin of one is not evidence is in the code beside it:
+/// `Ended::pause()` holds a finished hand at showdown for five seconds so a
+/// player can see the cards. A peer that has already paid that pause and opened
+/// hand `k+1` is a hand ahead of one still inside it, and on a table of four or
+/// more there are always at least two such peers — which is the whole of the
+/// `saying.len() >= 2` test. So the latch fired on ordinary progression skew,
+/// permanently, and the seat it removed was healthy.
+///
+/// Two hands is not a tuned number. A seat one hand behind catches up when its
+/// pause ends; a seat that is still behind after the table has played a further
+/// hand is not going to. Nothing is lost by waiting, because the latch is about
+/// refusing to *emit* into a hand nobody else has — and a seat that is one hand
+/// behind and will catch up emits into a hand everybody else already finished,
+/// which is late rather than divergent. §8.3's timeout certificate removes a
+/// seat that really has stopped, and it does not need this to fire first.
+const ADRIFT_MARGIN: u64 = 2;
 
 /// T47: hand `k+1`'s `HAND_INIT` stage has completed, so hand `k`'s checkpoint
 /// moves down to the boundary slot.
@@ -5956,6 +5995,54 @@ mod tests {
         // which is why its tests use it as a good address — two filters, two
         // jobs, and this one is stricter.
         assert!(yes("/ip4/1.1.1.1/tcp/1"));
+    }
+
+    /// **One hand behind is what an ordinary table looks like, and it used to be
+    /// enough to evict yourself for ever.**
+    ///
+    /// `note_a_hand_ahead` latched as soon as two seats reported any higher hand
+    /// id. Measured over 134 runs left on disk: 37 seats latched themselves out,
+    /// **36 of them at a margin of exactly one**, and the single true positive
+    /// was five hands behind. `Ended::pause()` holds a finished hand at showdown
+    /// for five seconds so a player can see the cards, so on any table of four
+    /// the seats that have already paid that pause are a hand ahead of the one
+    /// still inside it — always, and at least two of them, which is exactly the
+    /// `saying.len() >= 2` test. The latch was firing on the table working.
+    #[test]
+    fn one_hand_behind_is_not_adrift_and_two_is() {
+        use std::collections::HashMap;
+        let mine = 6u64;
+        let at = |pairs: &[(u8, u64)]| -> HashMap<u8, u64> {
+            pairs.iter().copied().collect()
+        };
+
+        // Three seats, one hand ahead: the showdown-pause skew, and the shape of
+        // thirty-six of the thirty-seven real evictions.
+        assert_eq!(
+            adrift_now(mine, &at(&[(1, mine + 1), (2, mine + 1), (3, mine + 1)])),
+            None,
+            "three seats one hand ahead is a pause, not a divergence"
+        );
+
+        // Two hands is past any pause.
+        assert_eq!(
+            adrift_now(mine, &at(&[(1, mine + 2), (2, mine + 2)])),
+            Some((mine + 2, mine)),
+            "two hands behind is adrift"
+        );
+
+        // The one true positive on record: five hands, run212350-4.
+        assert_eq!(
+            adrift_now(6, &at(&[(1, 11), (2, 11), (3, 10)])),
+            Some((11, 6)),
+            "the case this mechanism exists for still fires"
+        );
+
+        // One seat is never the table, whatever the margin.
+        assert_eq!(adrift_now(mine, &at(&[(1, mine + 9)])), None, "one seat is not the table");
+
+        // And a table nobody is ahead of says nothing.
+        assert_eq!(adrift_now(mine, &at(&[(1, mine), (2, mine - 1)])), None);
     }
 
     /// **And IPv6, on the same port, on both transports.**
