@@ -58,7 +58,6 @@ use libp2p::{
 };
 use tokio::sync::mpsc;
 
-use std::collections::HashSet;
 
 use super::advert;
 use super::formation::{Failed, Formation, Send};
@@ -136,6 +135,16 @@ const DIALS_PER_ANSWER: usize = 8;
 /// minute, not one per answer — and gives a live peer that was unreachable at
 /// 22.8 s a chance at 82.8 s rather than at never.
 const REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long before an unconfirmed lobby announcement is walked again.
+///
+/// Only while unconfirmed: once this client has seen its own record come back
+/// from the network, `libp2p-kad` owns the republish at its own twelve-hour
+/// interval and this stops. Five minutes is long enough that a slow walk is not
+/// duplicated and short enough that a client whose first walk reached nobody is
+/// not invisible for its whole session — which is what a joiner taking 386
+/// seconds to find a founder looks like from the other side.
+const REANNOUNCE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How many providers already tried may be tried **again** in one answer.
 ///
@@ -730,7 +739,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // Peers already asked for a reservation because identify said they relay.
     // Asking twice is not harmful, only noisy, and the noise is a log line per
     // identify push — which arrives every time the peer's addresses change.
-    let mut asked_hops: HashSet<libp2p::PeerId> = HashSet::new();
+    // **When each relay was last asked, not merely that it was.**
+    //
+    // A set recorded the intent and never the outcome, so a relay that refused
+    // once — or whose `listen_on` failed synchronously, which only warns — was
+    // banned for the life of the process. That includes the relay whose
+    // reservation later lapsed: `have_reservation` goes false again and the one
+    // host that could restore it is the one host this client will never ask.
+    // The same shape as `dialled_lobby`, found by the sweep `S1-AK` asked for.
+    let mut asked_hops: std::collections::HashMap<libp2p::PeerId, std::time::Instant> =
+        std::collections::HashMap::new();
 
     // Whether the public DHT has been asked who the relays are. Once is enough
     // to start: the answer arrives as providers, and each of those is then
@@ -739,7 +757,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
 
     // Whether this client's own record is in the public lobby. Set once the
     // announcement has an address in it, because one without is discarded.
+    // **Confirmed, not merely dispatched.**
+    //
+    // `start_providing` returning `Ok` means a query left this process; it says
+    // nothing about whether any peer stored the record, which is the ordinary
+    // failure when the walk happens seconds after the first reservation and the
+    // routing table is at its thinnest. `NETWORK_STACK.md` §3 step 5 says so in
+    // terms — *there is no repair … nothing widens it until the client
+    // restarts* — and this is that repair.
+    //
+    // The confirmation costs nothing because it is already in the log: this
+    // client provides the lobby key, so it appears in its own `get_providers`
+    // answers. Seeing itself is proof the record reached somebody and came back.
     let mut in_public_lobby = false;
+    let mut announced_at: Option<std::time::Instant> = None;
 
     // Whether this client has offered itself as a relay. Once only: the record
     // is republished by Kademlia on its own.
@@ -2010,7 +2041,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
 
                         let relays = info.protocols.contains(&libp2p::relay::HOP_PROTOCOL_NAME);
                         seen_a_relay |= relays;
-                        if relays && !have_reservation && !asked_hops.contains(&peer_id) {
+                        if relays
+                            && !have_reservation
+                            && !asked_hops
+                                .get(&peer_id)
+                                .is_some_and(|at| at.elapsed() < REDIAL_AFTER)
+                        {
                             // Their own address, with their identity and the
                             // circuit suffix. Listening on that IS the
                             // reservation request; there is no separate call.
@@ -2027,7 +2063,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // however reachable it turned out to be a second
                             // later.
                             if let Some(addr) = info.listen_addrs.iter().find(|a| reachable(a)) {
-                                asked_hops.insert(peer_id);
+                                asked_hops.insert(peer_id, std::time::Instant::now());
                                 let circuit = addr
                                     .clone()
                                     .with(libp2p::multiaddr::Protocol::P2p(peer_id))
@@ -2151,6 +2187,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // measured run, each spending a dial slot on
                                     // a connection that cannot succeed.
                                     if peer == me {
+                                        // **And this is the announce
+                                        // confirmation.** The record came back
+                                        // from the network, so somebody stored
+                                        // it. Nothing else in the client can say
+                                        // that.
+                                        in_public_lobby = true;
                                         continue;
                                     }
                                     // Recently tried, so not again yet. Not
@@ -2547,11 +2589,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // nobody can join.
                 if asked_public_dht {
                     let reachable_here = swarm.external_addresses().next().is_some();
-                    if reachable_here && !in_public_lobby {
+                    if reachable_here
+                        && !in_public_lobby
+                        && !announced_at.is_some_and(|at| at.elapsed() < REANNOUNCE_EVERY)
+                    {
                         match swarm.behaviour_mut().ipfs_kad.start_providing(lobby_namespace())
                         {
                             Ok(_) => {
-                                in_public_lobby = true;
+                                // Dispatched. `in_public_lobby` waits for this
+                                // client to see its own record come back.
+                                announced_at = Some(std::time::Instant::now());
                                 let _ = events.send(NodeEvent::Announced).await;
                             }
                             Err(e) => {
