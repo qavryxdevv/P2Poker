@@ -137,6 +137,21 @@ const DIALS_PER_ANSWER: usize = 8;
 /// 22.8 s a chance at 82.8 s rather than at never.
 const REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How many providers already tried may be tried **again** in one answer.
+///
+/// **A separate count, because a first dial and a re-dial are not the same
+/// purchase — and sharing one made the crawl worse.** `REDIAL_AFTER` entitles
+/// every provider on the key to one attempt a minute, and a lobby of ghosts has
+/// hundreds of them, so re-dials arrived at the front of answers and spent the
+/// budget on peers this client had already failed to reach while peers it had
+/// never tried at all waited.
+///
+/// Measured by replaying the committed loop over `split231719-2`'s own answer
+/// stream: one shared count issues **637 dials and reaches 250 providers**,
+/// where the loop before `REDIAL_AFTER` issued **304 and reached 304**. Two
+/// counts keep the retry without paying for it out of discovery.
+const REDIALS_PER_ANSWER: usize = 8;
+
 /// The namespace relay hosts advertise themselves under, as a DHT key.
 ///
 /// Derived, not copied: go-libp2p's routing discovery turns a namespace string
@@ -2095,9 +2110,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // actually dialled is recorded — so a peer past the
                             // budget stays unknown and the next cycle takes it,
                             // which is what the paragraph above always claimed.
+                            // Two counts, not one: see `REDIALS_PER_ANSWER`.
                             let mut fresh = 0usize;
+                            let mut again = 0usize;
                             let me = *swarm.local_peer_id();
                             for peer in providers {
+                                // `Some(true)` for a first dial, `Some(false)`
+                                // for a re-dial, `None` for a relay — which
+                                // keeps no book at all.
+                                let mut charge: Option<bool> = None;
                                 if lobby {
                                     let _ = events.send(NodeEvent::LobbyPeer(peer)).await;
                                     // **This client provides the lobby key too,
@@ -2109,16 +2130,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     // Recently tried, so not again yet. Not
                                     // *ever* again: see `REDIAL_AFTER`.
-                                    if dialled_lobby
-                                        .get(&peer)
-                                        .is_some_and(|at| at.elapsed() < REDIAL_AFTER)
-                                    {
+                                    let first = match dialled_lobby.get(&peer) {
+                                        Some(at) if at.elapsed() < REDIAL_AFTER => continue,
+                                        Some(_) => false,
+                                        None => true,
+                                    };
+                                    if first {
+                                        if fresh >= DIALS_PER_ANSWER {
+                                            continue;
+                                        }
+                                    } else if again >= REDIALS_PER_ANSWER {
                                         continue;
                                     }
-                                    if fresh >= DIALS_PER_ANSWER {
-                                        continue;
-                                    }
-                                    fresh += 1;
+                                    charge = Some(first);
+                                    // **The cooldown is stamped here and the
+                                    // budget is not.** A provider whose
+                                    // addresses `Bogonless` emptied is refused
+                                    // by `Swarm::dial` synchronously and never
+                                    // reaches the network, so charging it a slot
+                                    // spends discovery on nothing — but stamping
+                                    // it stops the same non-dial being retried
+                                    // on every one of the four hundred answers a
+                                    // run receives.
                                     dialled_lobby.insert(peer, std::time::Instant::now());
                                     // **Bounded, but never at the cost of the
                                     // one peer that matters.** This used to
@@ -2146,7 +2179,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing,
                                     )
                                     .build();
-                                let _ = swarm.dial(opts);
+                                // **The budget is spent only on a dial the swarm
+                                // accepted.** `Swarm::dial` returns
+                                // `NoAddresses`, `Denied` and
+                                // `DialPeerConditionFalse` **by value** with no
+                                // `SwarmEvent`
+                                // (`libp2p-swarm-0.47.1/src/lib.rs:444-511`), and
+                                // this call used to discard the `Result`. So a
+                                // provider whose addresses the bogon filter
+                                // emptied — 3 310 private addresses were refused
+                                // in the measured run — cost a slot and a
+                                // minute's silence for a dial that never
+                                // happened, and left no trace anywhere: the
+                                // asynchronous failure log is capped at twelve
+                                // and was spent by 12.6 s.
+                                if swarm.dial(opts).is_ok() {
+                                    match charge {
+                                        Some(true) => fresh += 1,
+                                        Some(false) => again += 1,
+                                        None => {}
+                                    }
+                                }
                             }
                         }
                     }
