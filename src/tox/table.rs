@@ -462,56 +462,34 @@ const SWEEP_EVERY: Duration = Duration::from_secs(5);
 /// only when it holds none.
 const REINVITE_EVERY: Duration = Duration::from_secs(30);
 
-/// How long the founder waits for its own transport before creating the group.
-///
-/// **This is the group's one guaranteed chance to be given TCP relays, and it
-/// was being spent on an empty list.**
-///
-/// `init_gc_tcp_connection` gives the chat a `TCP_Connections` instance of its
-/// own — a *different* instance from the one `tox_add_tcp_relay` feeds — and
-/// seeds it by copying whatever the main instance has **connected** at that
-/// instant (`group_chats.c:7271`, `add_tcp_relays_to_chat`). Every refill after
-/// that is gated on the main instance's connected count *changing*
-/// (`group_chats.c:7061`); that count settles at
-/// `RECOMMENDED_FRIEND_TCP_CONNECTIONS` = 3 and then stops changing, so the
-/// gate latches and the seeding never runs again.
-///
-/// The founder used to call `new_group` microseconds after `toxsink` offered
-/// the relay list, before a single relay had finished its handshake, so the
-/// copy took **zero** relays and the founder's DHT announce carried none
-/// (`Messenger.c:2457` reads the *chat's* instance, not the main one). That is
-/// the condition `S1-AA` traced the failed cross-network join to: a joiner that
-/// reaches the founder over a relay needs relays in the invite confirmation,
-/// and the founder had none to put there.
-///
-/// **Waiting on `connection()` rather than on a fixed delay** because the
-/// quantity that matters is whether anything is connected, and that is what the
-/// status answers.
-///
-/// **The bound is small on purpose, and the reason is a regression this caused
-/// on its first measured run.** The founder's caller does not wait for ever:
-/// `net::run` advertises the table only once `chat_id_ready` has produced a
-/// chat id, and gives up on the Tox group and rides the mesh if it does not
-/// come. The first draft of this constant was twenty seconds against a caller
-/// that waited five, so every founder fell back to the mesh — the group was
-/// never created at all, which is worse than a group with no relays. The two
-/// numbers are therefore **one number**: this is `pub` and `net::run` derives
-/// its timeout from it, so they cannot drift apart again.
-///
-/// A founder whose network never comes up must still start rather than hang, so
-/// after the budget the group is created anyway and the table fails the way it
-/// did before.
-pub const HOST_SEED_WAIT: Duration = Duration::from_secs(6);
-
-/// How much longer the founder iterates after its transport comes up.
-///
-/// **`connection()` is not the question, it is only the cheapest proxy for it.**
-/// It turns non-zero as soon as the DHT answers over UDP, which can be before a
-/// single TCP relay has finished its handshake — and it is the relays this wait
-/// exists for. toxcore exposes no count of connected relays, so there is
-/// nothing better to test; what can be done is to not stop on the first good
-/// answer. Inside `HOST_SEED_WAIT`, so the total budget is unchanged.
-const HOST_SEED_SETTLE: Duration = Duration::from_secs(2);
+// **There is deliberately no wait here for the founder's transport, and the
+// reason is worth keeping because the wait was written and then removed.**
+//
+// The argument for one was that `init_gc_tcp_connection` seeds the chat's own
+// `TCP_Connections` by copying whatever the main instance has *connected* at
+// the moment the chat is created (`group_chats.c:7271`), so a group created
+// before any relay has finished its handshake is seeded with nothing. That is
+// true, and it is not the whole rule.
+//
+// `do_gc_tcp` runs every `TCP_RELAYS_CHECK_INTERVAL` = 10 s and re-seeds the
+// chat whenever main's connected count **differs** from the count the chat
+// last recorded (`group_chats.c:7060-7066`). `chat->connected_tcp_relays`
+// starts at zero and `init_gc_tcp_connection` does not set it, so a group
+// created with nothing is re-seeded within about ten seconds of main's relays
+// coming up. The seeding is self-correcting, not one-shot; it only latches
+// once the two counts agree, which is the state you want it to latch in.
+//
+// So a wait bought roughly ten seconds of earliness, and it cost the node
+// loop: `tox_sink.start` creates the Tox instance at the moment a table is
+// founded rather than at startup, so the wait ran *before* the group existed
+// and `net::run`'s `chat_id_ready` await blocked the whole loop for its
+// duration -- exactly while the founder should have been forming its lobby
+// mesh. Bad trade, and the first draft of it was worse still: twenty seconds
+// against a caller that waited five, so no group was created at all.
+//
+// If this is ever wanted again, the shape that works is **pre-warming** -- 
+// create the Tox instance when the client starts and only the group when the
+// table is founded -- not blocking at the point of use.
 
 /// Start the driver on its own thread.
 ///
@@ -582,31 +560,6 @@ fn run(
     for key in &roster {
         if let Ok(n) = tox.add_friend(key) {
             friends.insert(n, *key);
-        }
-    }
-
-    // **Whatever toxcore reported while the founder was waiting below.**
-    //
-    // The wait has to call `iterate`, because `connection()` never moves
-    // without it — and `iterate` is also the only place events are delivered.
-    // Dropping them would lose a friend's up-edge, and the comment on
-    // `connected` above says what that costs: an invitation is sent from a
-    // condition now precisely because a missed edge left a seated player
-    // outside the group until the network hiccupped. So they are kept and
-    // handed to the first turn of the main loop.
-    let mut early: Vec<Event> = Vec::new();
-    if matches!(setup.role, Role::Host) {
-        let waiting_since = Instant::now();
-        let mut up_at: Option<Instant> = None;
-        while waiting_since.elapsed() < HOST_SEED_WAIT {
-            early.extend(tox.iterate());
-            if up_at.is_none() && tox.connection() != 0 {
-                up_at = Some(Instant::now());
-            }
-            if up_at.is_some_and(|t| t.elapsed() >= HOST_SEED_SETTLE) {
-                break;
-            }
-            std::thread::sleep(tox.interval().min(MAX_TICK));
         }
     }
 
@@ -769,11 +722,7 @@ fn run(
         }
 
         // --- one turn of toxcore's own loop --------------------------------
-        // `early` carries whatever arrived while the founder was waiting for
-        // its transport, and is empty from the second turn on.
-        let mut turn = std::mem::take(&mut early);
-        turn.extend(tox.iterate());
-        for e in turn {
+        for e in tox.iterate() {
             match e {
                 Event::FriendConnection { friend, status } if status != 0 => {
                     // Up. The founder invites every seat the roster names, once
