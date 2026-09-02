@@ -224,8 +224,10 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     `$seed = Join-Path `$seatKeys "far-n`$i.key"
     if (-not (Test-Path `$seed)) {
         New-Item -ItemType Directory -Force -Path `$seatKeys | Out-Null
+        # `::Fill` is .NET Core only; this runs under Windows PowerShell.
         `$b = New-Object byte[] 32
-        [System.Security.Cryptography.RandomNumberGenerator]::Fill(`$b)
+        `$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        try { `$rng.GetBytes(`$b) } finally { `$rng.Dispose() }
         [System.IO.File]::WriteAllBytes(`$seed, `$b)
     }
     Copy-Item `$seed (Join-Path `$p 'identity.key') -Force
@@ -286,8 +288,12 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         $seed = Join-Path $seatKeys "here-n$i.key"
         if (-not (Test-Path $seed)) {
             New-Item -ItemType Directory -Force -Path $seatKeys | Out-Null
+            # `::Fill` is .NET Core only; Windows PowerShell 5.1 runs on
+            # .NET Framework and has just the instance API. Measured: the run
+            # died with *does not contain a method named 'Fill'*.
             $b = New-Object byte[] 32
-            [System.Security.Cryptography.RandomNumberGenerator]::Fill($b)
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            try { $rng.GetBytes($b) } finally { $rng.Dispose() }
             [System.IO.File]::WriteAllBytes($seed, $b)
         }
         Copy-Item $seed (Join-Path $profileDir 'identity.key') -Force

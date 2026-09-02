@@ -232,7 +232,11 @@ for ($i = 0; $i -lt $Seats; $i++) {
     if (-not (Test-Path $seed)) {
         New-Item -ItemType Directory -Force -Path $seatKeys | Out-Null
         $b = New-Object byte[] 32
-        [System.Security.Cryptography.RandomNumberGenerator]::Fill($b)
+        # `::Fill` is .NET Core only; Windows PowerShell 5.1 runs on .NET
+        # Framework and has only the instance API. Measured: the run died
+        # with *does not contain a method named 'Fill'*.
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($b) } finally { $rng.Dispose() }
         [System.IO.File]::WriteAllBytes($seed, $b)
     }
     Copy-Item $seed (Join-Path $profileDir 'identity.key') -Force
