@@ -1378,6 +1378,46 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             ))
                                             .await;
                                     }
+                                    // **A superseded acceptance is not a
+                                    // failed table.** `admit_accept` refuses an
+                                    // answer whose `request_hash` is not the one
+                                    // this client is waiting for
+                                    // (`table/join.rs:331-333`), which is
+                                    // exactly what a *second* join request makes
+                                    // of the founder's honest answer to the
+                                    // first. Treating it as a teardown destroyed
+                                    // a table that had already formed.
+                                    //
+                                    // Measured, `split215815-2`: the joiner
+                                    // asked to join at 63.6 s and again at
+                                    // 64.7 s, was seated over the table topic at
+                                    // 64.9 s — *“2 seated … the table is set:
+                                    // session af7beef3”* — and 0.0 s later the
+                                    // late answer to the first request arrived
+                                    // as `Accept(WrongRequest)` and took the
+                                    // whole table with it. The seat held no
+                                    // `Formation` for the next 193 seconds, and
+                                    // when one was rebuilt it re-signed its own
+                                    // `TABLE_READY` at a fresh clock, so its
+                                    // `session_id` no longer matched the
+                                    // founder's and neither side could ever
+                                    // accept the other's — `take_ratification`
+                                    // is first-copy-wins by design.
+                                    //
+                                    // Ignored like `AlreadySeated` above: the
+                                    // request it answers is gone, and the table
+                                    // this client actually holds was not built
+                                    // by that answer.
+                                    Err(Failed::Accept(
+                                        crate::table::join::AcceptRefused::WrongRequest,
+                                    )) => {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(
+                                                "an acceptance for a join request this client has already replaced; the table it holds is untouched"
+                                                    .into(),
+                                            ))
+                                            .await;
+                                    }
                                     Err(Failed::Refused { reason, .. }) => {
                                         table = None;
                                         // The Tox group goes with the table. Dropping the handle
@@ -2691,6 +2731,34 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     NodeCommand::JoinTable { key, buyin, seat, password } => {
+                        // **One join at a time, because the second one replaces
+                        // the first and invalidates its answer.**
+                        //
+                        // `table = Some(f)` below overwrites a live `Formation`
+                        // with a new one carrying a new nonce, so the founder's
+                        // honest `JOIN_ACCEPT` for the earlier request then
+                        // fails `admit_accept`'s `request_hash` check and used
+                        // to tear the table down. The arm above no longer tears
+                        // anything down; this stops the second request being
+                        // made at all.
+                        //
+                        // It is not a hypothetical. `main.rs`'s headless mode
+                        // re-issues `JoinTable` on every `TableSeen` while it
+                        // has no seat, and the first one blocks this loop for
+                        // about a second inside `tox_sink.start` — long enough
+                        // for a second advert to queue behind it. Measured:
+                        // *“asking to join”* at 63.6 s and again at 64.7 s, with
+                        // the Tox warning printed twice, which is what two
+                        // commands look like from the outside.
+                        if table.is_some() {
+                            let _ = events
+                                .send(NodeEvent::Warning(
+                                    "already joining or seated at a table; leave it before joining another"
+                                        .into(),
+                                ))
+                                .await;
+                            continue;
+                        }
                         let Some(held) = state.lobby.get(&key).cloned() else {
                             let _ = events.send(NodeEvent::Warning(
                                 "that table is no longer advertised".into())).await;
