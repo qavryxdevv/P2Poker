@@ -591,6 +591,38 @@ impl Boundaries {
         self.open.get(&hand_id).map(|b| b.own)
     }
 
+    /// The first value seen at this checkpoint that differed from this peer's
+    /// own, if any. §6.3's retained evidence is the pair `(own, dissent)`.
+    pub fn dissent(&self, hand_id: u64) -> Option<Hash> {
+        self.store
+            .named(hand_id, checkwire::BOUNDARY_CHECKPOINT)
+            .and_then(|(_, c)| c.dissent())
+    }
+
+    /// Every distinct value heard in reconciliation round `r`.
+    ///
+    /// §6.3 reads the outcome off this: one value resolves, two fault. The
+    /// report §6.4 requires needs the values themselves and not only the count.
+    pub fn round_values(&self, hand_id: u64, round: u16) -> Vec<Hash> {
+        self.open
+            .get(&hand_id)
+            .and_then(|b| b.rounds.get(&round))
+            .map(|r| r.values.clone())
+            .unwrap_or_default()
+    }
+
+    /// Which seats were heard in the checkpoint's own stage, with the event
+    /// each was heard saying.
+    pub fn heard_at_checkpoint(&self, hand_id: u64) -> Vec<(SeatIdx, Hash)> {
+        let Some(b) = self.open.get(&hand_id) else {
+            return Vec::new();
+        };
+        b.participants
+            .iter()
+            .filter_map(|s| b.hash_stage.heard(*s).map(|h| (*s, h)))
+            .collect()
+    }
+
     /// `W`, this peer's contradiction set for hand `k`.
     pub fn contradicted(&self, hand_id: u64) -> Vec<SeatIdx> {
         self.open
@@ -969,6 +1001,61 @@ mod tests {
             RoundTook::Unresolved,
             "two values, and section 6.3's case (c) faults the table"
         );
+    }
+
+    /// The three things §6.4's divergence report reads off a faulted boundary
+    /// are all still there at the moment it is written.
+    ///
+    /// The report is written from inside the `RoundTook::Unresolved` arm, which
+    /// is to say **at the instant the table faults and not later**, and every
+    /// one of its inputs is a live accessor over state that `prune` will drop.
+    /// A refactor that let any of them start answering "nothing retained" would
+    /// leave a report that is still produced, still well-formed, and empty
+    /// where the evidence should be — which is the failure §6.4 is trying to
+    /// prevent, wearing the shape of a success.
+    #[test]
+    fn a_faulted_boundary_still_holds_what_the_divergence_report_prints() {
+        let mut b = Boundaries::new();
+        b.open(4, TABLE, TERMINAL, STATE, &[0, 1], &[0, 1]).expect("opens");
+        b.on_state_hash(4, 0, ev(0), STATE);
+        b.on_state_hash(4, 1, ev(1), [1u8; 32]);
+        b.open_round(4, 1, &[0, 1]).expect("the floor is met");
+        b.on_round_hash(4, 1, 0, ev(20), STATE);
+        assert_eq!(
+            b.on_round_hash(4, 1, 1, ev(21), [2u8; 32]),
+            RoundTook::Unresolved,
+            "two values: this is the moment the report is written"
+        );
+
+        assert_eq!(b.own_value(4), Some(STATE), "the peer's own derived value");
+        assert_eq!(
+            b.dissent(4),
+            Some([1u8; 32]),
+            "the first value that differed from it"
+        );
+        assert_eq!(b.contradicted(4), vec![1], "W");
+        assert_eq!(
+            b.get(4).map(|x| x.participants().to_vec()),
+            Some(vec![0, 1]),
+            "P(k)"
+        );
+        assert_eq!(
+            b.heard_at_checkpoint(4),
+            vec![(0, ev(0)), (1, ev(1))],
+            "who was heard, and the event each was heard saying"
+        );
+        assert_eq!(
+            b.round_values(4, 1),
+            vec![STATE, [2u8; 32]],
+            "both values of the round, which is what makes the fault legible"
+        );
+
+        // And a hand with no boundary answers empty rather than panicking: the
+        // report is written on a fault, and a fault is not a good moment to
+        // discover an unwrap.
+        assert!(b.heard_at_checkpoint(9).is_empty());
+        assert!(b.round_values(9, 1).is_empty());
+        assert!(b.round_values(4, 7).is_empty());
     }
 
     /// A round sits in the band §4.9 reserves, and nothing outside `1 ..= 7`

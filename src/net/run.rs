@@ -1434,6 +1434,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &mut frozen,
                                     &roster_seats,
                                     &mut no_round_said,
+                                    &profile_dir,
                                     &events,
                                 )
                                 .await
@@ -1477,6 +1478,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 &mut frozen,
                                                 &roster_seats,
                                                 &mut no_round_said,
+                                                &profile_dir,
                                                 &events,
                                                 table_topic.as_ref(),
                                                 &mut swarm,
@@ -2790,6 +2792,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         &mut frozen,
                         &roster_seats,
                         &mut no_round_said,
+                        &profile_dir,
                         &events,
                     )
                     .await
@@ -2824,6 +2827,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 &mut frozen,
                                 &roster_seats,
                                 &mut no_round_said,
+                                &profile_dir,
                                 &events,
                                 table_topic.as_ref(),
                                 &mut swarm,
@@ -3318,6 +3322,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &mut frozen,
                                     &roster_seats,
                                     &mut no_round_said,
+                                    &profile_dir,
                                     &events,
                                     table_topic.as_ref(),
                                     &mut swarm,
@@ -4710,6 +4715,7 @@ async fn publish_and_hear(
     frozen: &mut Option<(u64, u64)>,
     roster: &[u8],
     no_round_said: &mut bool,
+    profile: &std::path::Path,
     events: &Events,
     topic: Option<&gossipsub::IdentTopic>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
@@ -4736,6 +4742,7 @@ async fn publish_and_hear(
             frozen,
             roster,
             no_round_said,
+            profile,
             events,
         )
         .await
@@ -4981,6 +4988,125 @@ async fn try_to_reconcile(
     }
 }
 
+/// §6.4's divergence report, written to the profile directory when a
+/// reconciliation round completes carrying two values.
+///
+/// §6.4 says the client *"writes a reproducible divergence report to the profile
+/// directory containing the full transcript, every peer's `STATE_HASH`, and its
+/// own derived `PublicTableState`"*, and calls that report *"the bug report, and
+/// ... the diagnostic material of §6.3 case (c)"*.
+///
+/// **Nothing wrote one.** §6.4 had already withdrawn a stronger claim — that the
+/// evidence is deterministically adjudicable offline by a third party — on the
+/// grounds that no reference engine exists, and kept a weaker one: *"the evidence
+/// is preserved and is sufficient for a human ... to diagnose the divergence."*
+/// That weaker claim was untrue as well, because nothing preserved anything: a
+/// faulted table emitted one warning line and dropped its boundary on the next
+/// prune.
+///
+/// **This writes what the client actually holds, and names what it does not.**
+/// Two of §6.4's three items are not retained anywhere — the transcript is
+/// dropped with the hand's slot store, and `PublicTableState` is hashed rather
+/// than kept — so the file says so in a section of its own instead of quietly
+/// omitting them. A report that looked complete and was not would be worse for
+/// the human §6.4 is addressing than one that says where it stops.
+///
+/// Written atomically — temp file, `sync_all`, rename — because a report about a
+/// disagreement is worth nothing if it can be half a file.
+fn write_divergence_report(
+    profile: &std::path::Path,
+    hand_id: u64,
+    round: u16,
+    boundaries: &crate::table::boundary::Boundaries,
+    h: &crate::table::hand::Hand,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+
+    let hex = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    let table = hex(&h.table_id());
+    let mut s = String::new();
+    s.push_str("p2p-poker divergence report\n");
+    s.push_str("PROTOCOL.md section 6.4, cause 4: the participants could not agree.\n");
+    s.push_str("This table is closed. No further hand is dealt on it.\n\n");
+    s.push_str(&format!("table        {table}\n"));
+    s.push_str(&format!("hand         {hand_id}\n"));
+    s.push_str("checkpoint   8 (the hand boundary, section 4.9)\n");
+    s.push_str(&format!(
+        "round        {round} (the reconciliation round of section 6.3 step 3)\n"
+    ));
+    s.push_str(&format!("this seat    {}\n", h.my_seat()));
+    s.push_str(&format!(
+        "written at   {} (unix ms, by this client's own clock)\n\n",
+        super::node::now_unix_ms()
+    ));
+
+    s.push_str("-- what this peer derived --\n");
+    match boundaries.own_value(hand_id) {
+        Some(v) => s.push_str(&format!("own STATE_HASH   {}\n", hex(&v))),
+        None => s.push_str("own STATE_HASH   (not retained: the boundary is already gone)\n"),
+    }
+    match boundaries.dissent(hand_id) {
+        Some(v) => s.push_str(&format!("first differing  {}\n", hex(&v))),
+        None => s.push_str("first differing  (none recorded)\n"),
+    }
+    s.push_str(&format!(
+        "P(k), required   {:?}\nW, contradicted  {:?}\n\n",
+        boundaries
+            .get(hand_id)
+            .map(|b| b.participants().to_vec())
+            .unwrap_or_default(),
+        boundaries.contradicted(hand_id)
+    ));
+
+    s.push_str("-- who was heard at the checkpoint, and the event each was heard saying --\n");
+    let heard = boundaries.heard_at_checkpoint(hand_id);
+    if heard.is_empty() {
+        s.push_str("(nothing retained)\n");
+    }
+    for (seat, event) in heard {
+        s.push_str(&format!("seat {seat}   event {}\n", hex(&event)));
+    }
+    s.push('\n');
+
+    s.push_str(&format!(
+        "-- the distinct values in reconciliation round {round}; two of these is the fault --\n"
+    ));
+    let values = boundaries.round_values(hand_id, round);
+    if values.is_empty() {
+        s.push_str("(nothing retained)\n");
+    }
+    for v in values {
+        s.push_str(&format!("{}\n", hex(&v)));
+    }
+    s.push('\n');
+
+    s.push_str("-- what section 6.4 asks for that this report does not carry --\n");
+    s.push_str(
+        "the full transcript of the hand:  not retained. The hand's slot store is\n\
+         dropped when the hand ends, and nothing keeps a copy for this purpose.\n\
+         every peer's STATE_HASH:          only the event hash of each is held, above;\n\
+         the bodies are not retained past the stage that accepted them.\n\
+         this peer's own PublicTableState: hashed at the boundary, never kept.\n\n\
+         Those three are what a diagnosis would want most, and this client keeps\n\
+         none of them. They are named here rather than omitted, so that a reader\n\
+         knows the report is bounded and where it stops.\n",
+    );
+
+    let path = profile.join(format!(
+        "divergence-{}-hand{hand_id}-round{round}.txt",
+        &table[..16]
+    ));
+    let tmp = path.with_extension("txt.tmp");
+    std::fs::create_dir_all(profile)?;
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(s.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn checkpoint_event(
     bytes: &[u8],
@@ -4992,6 +5118,7 @@ async fn checkpoint_event(
     frozen: &mut Option<(u64, u64)>,
     roster: &[u8],
     no_round_said: &mut bool,
+    profile: &std::path::Path,
     events: &Events,
 ) -> Option<Vec<u8>> {
     use crate::table::boundary::{RoundTook, Took};
@@ -5058,9 +5185,17 @@ async fn checkpoint_event(
                     .await;
             }
             RoundTook::Unresolved => {
+                // §6.4. The table is faulted, and the evidence is written down
+                // — the only claim §6.4 still makes about diagnosis is that it
+                // is *preserved*, and until now nothing preserved anything.
+                let wrote = write_divergence_report(profile, hand_id, round, boundaries, h);
                 let _ = events
                     .send(NodeEvent::Warning(format!(
-                        "the divergence at hand {hand_id} did NOT reconcile in round {round}: two values, section 6.3 case (c), and this table deals no further hand"
+                        "the divergence at hand {hand_id} did NOT reconcile in round {round}: two values, section 6.3 case (c), and this table deals no further hand. {}",
+                        match &wrote {
+                            Ok(p) => format!("The divergence report is at {}", p.display()),
+                            Err(e) => format!("The divergence report could NOT be written: {e}"),
+                        }
                     )))
                     .await;
             }

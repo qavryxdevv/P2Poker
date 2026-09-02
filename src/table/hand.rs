@@ -3877,6 +3877,11 @@ impl Hand {
         self.open.table_id
     }
 
+    /// Which seat this client sits in.
+    pub fn my_seat(&self) -> SeatIdx {
+        self.open.my_seat
+    }
+
     /// Which seat holds an application key, if any.
     ///
     /// `seat_of` answers the same question and refuses with `NotAtThisTable`,
