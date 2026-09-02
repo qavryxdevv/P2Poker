@@ -4591,9 +4591,11 @@ fn short_hash(h: &[u8; 32]) -> String {
 /// verified by `open_in_hand`, which relaxes only the positional check — and
 /// the position is exactly what makes this event stale.
 ///
-/// A **disagreeing** value is a divergence and §6.3 is what answers it. That is
-/// not built, so it is said out loud and nothing else: saying nothing would be
-/// the silent divergence §6.1 exists to prevent.
+/// A **disagreeing** value is a divergence and §6.3 is what answers it: the
+/// freeze latches, a dispute goes out carrying this peer's own copy as evidence,
+/// and a reconciliation round opens as soon as the checkpoint's own stage has
+/// closed. This comment said *“that is not built”* until §6.3 was; a comment
+/// that outlives what it describes is worse than none.
 /// Notice that the table has gone on without this client, and latch it.
 ///
 /// **The failure this exists for, measured.** A seat whose link was down for 75

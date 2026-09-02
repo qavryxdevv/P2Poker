@@ -321,8 +321,9 @@ pub enum Took {
     Again,
     /// The same seat, a different event, in one stage.
     Equivocation { first: Hash, second: Hash },
-    /// A value differing from this peer's own. §6.3's freeze is not built, so
-    /// this is reported and nothing else happens.
+    /// A value differing from this peer's own: §6.3 step 1, and the caller
+    /// latches the freeze on it, declares with a dispute, and opens a
+    /// reconciliation round. `solitary_contradicted` is `N1`'s second half.
     Diverged { solitary_contradicted: bool },
     /// Not a seat this stage will hear, or no such checkpoint.
     Uninvited,
