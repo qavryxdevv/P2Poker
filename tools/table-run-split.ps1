@@ -117,8 +117,13 @@ if (-not $NoBuild) {
 # Belt and braces: even with -NoBuild, refuse to measure a binary older than
 # the newest source file. A stale measurement is worse than no measurement,
 # because it gets written down.
+# `src` and the vendored C, which are what the binary is built FROM. Not
+# `patches/`: those files document what was done to `vendor/`, they are not a
+# build input, and including them meant writing one after a successful build
+# refused the run that followed. That a patch is actually applied is checked by
+# the markers in `tools/build-tox.ps1`, which is the right instrument for it.
 $newest = Get-ChildItem -Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'src'),
-                              (Join-Path (Split-Path -Parent $PSScriptRoot) 'patches') `
+                              (Join-Path (Split-Path -Parent $PSScriptRoot) 'vendor\c-toxcore\toxcore') `
     -Recurse -File -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
 $exeTime = (Get-Item $Exe).LastWriteTime
