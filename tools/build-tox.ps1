@@ -117,7 +117,10 @@ $patched = @(
        Why    = '0002: without it a receive ring that has wrapped drops every further packet without ever asking for the message it is missing, and the peer never recovers' },
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker: every confirmed peer, or this is not a send'
-       Why    = '0003: without it a custom packet accepted by one peer of ten is reported to the caller as sent, so the application drops it and the other nine never see it' }
+       Why    = '0003: without it a custom packet accepted by one peer of ten is reported to the caller as sent, so the application drops it and the other nine never see it' },
+    @{ File   = 'toxcore/group_connection.c'
+       Marker = 'p2p-poker: the awaited chunk goes in even if its slot is taken'
+       Why    = '0004: without it a fragment sequence blocked on an occupied slot can never be unblocked, because unlike an ordinary packet the awaited chunk must be stored - the peer is lost until the sender times it out' }
 )
 
 Step 'checking the patches are in the vendored source'

@@ -1,0 +1,57 @@
+diff --git a/vendor/c-toxcore/toxcore/group_connection.c b/vendor/c-toxcore/toxcore/group_connection.c
+index 658e525..f7991eb 100644
+--- a/vendor/c-toxcore/toxcore/group_connection.c
++++ b/vendor/c-toxcore/toxcore/group_connection.c
+@@ -424,7 +424,52 @@ int gcc_handle_packet_fragment(const GC_Session *c, GC_Chat *chat, uint32_t peer
+                                uint64_t message_id, void *userdata)
+ {
+     if (length > 0) {
++        /* p2p-poker: the awaited chunk goes in even if its slot is taken.
++         *
++         * An ordinary lossless message that is the one being awaited
++         * (`message_id == received_message_id + 1`) never touches recv_array at
++         * all -- gcc_handle_received_message hands it straight to the handler --
++         * so however full the ring is, a retransmission of it is accepted and
++         * the stream drains. A GP_FRAGMENT is exempted from that path and must
++         * be STORED even when it is the awaited chunk, so when its slot is
++         * occupied the retransmission is refused. Every one of them, for ever:
++         * the sender re-sends on a power-of-two backoff, the receiver discards
++         * each copy, and gcc_check_recv_array will not drain anything while
++         * last_chunk_id is set. The stream is latched until the sender gives up
++         * at GC_CONFIRMED_PEER_TIMEOUT.
++         *
++         * Measured, ten seats over two machines, split130212-10. Seven local
++         * seats were blocked during the same table-wide burst and every one
++         * recovered, because they were blocked on ordinary packets. The eighth,
++         * n1, was blocked on chunk 4233 of a fragment sequence: the sender
++         * logged `Re-sent requested packet 4233` fifty-five times, all
++         * fifty-five arrived within a second of a rejection here, and n1 threw
++         * away every one. It was certified out of the table; the other seven
++         * played on.
++         *
++         * When the awaited chunk finds its slot occupied, the occupant is stale
++         * by construction: everything below `received_message_id` has been
++         * consumed, so an entry at `message_id % GCC_BUFFER_SIZE` holding a
++         * different id is a leftover from a wrap or from a sequence that was
++         * abandoned. Only that case is cleared, and only for the awaited chunk;
++         * an out-of-order chunk still fails, because there the occupant may be
++         * a legitimate future message.
++         */
++        if (message_id == gconn->received_message_id + 1) {
++            const uint16_t idx = gcc_get_array_index(message_id);
++            GC_Message_Array_Entry *const stale = &gconn->recv_array[idx];
++
++            if (!array_entry_is_empty(stale) && stale->message_id != message_id) {
++                LOGGER_DEBUG(chat->log, "clearing stale recv slot %u (held %llu, awaiting %llu)",
++                             idx, (unsigned long long)stale->message_id,
++                             (unsigned long long)message_id);
++                clear_array_entry(chat->mem, stale);
++            }
++        }
++
+         if (!store_in_recv_array(chat->log, chat->mem, chat->mono_time, gconn, chunk, length, packet_type, message_id)) {
++            LOGGER_DEBUG(chat->log, "failed to store fragment chunk %llu; the sequence is stuck",
++                         (unsigned long long)message_id);
+             return -1;
+         }
+ 
