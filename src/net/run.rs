@@ -4170,7 +4170,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let (seen, want) = tox_sink.group_seen();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "seats on the line: {}; tox self {}, group {seen} seen/{confirmed} confirmed/{want} wanted, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}",
+                                "seats on the line: {}; tox self {}, group {seen} seen/{confirmed} confirmed/{want} wanted, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}{}",
                                 line.join(", "),
                                 match tox_sink.tox_connection() {
                                     0 => "offline",
@@ -4213,6 +4213,39 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     )
                                 } else {
                                     String::new()
+                                },
+                                // **What the hand itself thinks, which nothing
+                                // used to say.**
+                                //
+                                // `Failed::NotYet` is not an error and is not
+                                // logged -- correctly, since an event for a
+                                // stage this client has not reached is ordinary
+                                // weather on a mesh that does not order. But it
+                                // means a client can fall behind in complete
+                                // silence, and in `split182531-10` that is
+                                // exactly what happened: zero dropped packets,
+                                // zero refusals, and `n0` still voted that seat
+                                // 1 was late while the other nine voted that
+                                // seat 7 was, because `n0` believed seat 8 was
+                                // on the clock and they believed seat 6 was.
+                                // Two subjects, both stuck at 8/9, and no
+                                // certificate possible from either.
+                                //
+                                // A held count and whose action this client is
+                                // waiting for would have said so in one line.
+                                // Printed only while a hand is open, and only
+                                // when there is something to say.
+                                match hand.as_ref() {
+                                    Some(h) if !h.over() => {
+                                        let held = h.held();
+                                        let owed = h.waiting_for();
+                                        if held > 0 || !owed.is_empty() {
+                                            format!(", hand waiting for {owed:?}, {held} event(s) held")
+                                        } else {
+                                            String::new()
+                                        }
+                                    }
+                                    _ => String::new(),
                                 },
                                 // **Said only when it changes.** A count that
                                 // repeats every thirty seconds is a number
