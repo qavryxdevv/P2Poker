@@ -60,7 +60,10 @@ param(
     #
     # Needs binaries built with `--features fault-harness` at both ends.
     [ValidateRange(0, 300)][int]$Stall = 0,
-    [ValidateRange(0, 8)][int]$StallSeat = 0
+    [ValidateRange(0, 8)][int]$StallSeat = 0,
+    # Skip the build. The staleness check below still runs, so this only saves
+    # the time of a no-op build -- it cannot be used to measure a stale binary.
+    [switch]$NoBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,6 +74,42 @@ if (-not $Exe) {
 }
 if (-not (Test-Path $Exe)) { throw "no binary at $Exe. cargo build --release" }
 $Exe = (Resolve-Path $Exe).Path
+
+# **The binary has to be newer than the source, and nothing here used to check.**
+#
+# The far-versus-local hash check further down proves both machines run the
+# SAME build. It says nothing about whether that build contains the change
+# being measured, and the difference is not academic: S1-AG withdrew a whole
+# measurement made against a binary three days stale, and on 2026-09-03 a
+# ten-seat run "verifying" the TIMEOUT_CERT_CAP fix ran a binary compiled
+# forty-eight minutes before the fix was written. Both times the hash check
+# passed and made it look verified.
+#
+# So: build, unless the caller says otherwise. A no-op build costs a second.
+if (-not $NoBuild) {
+    $root = Split-Path -Parent $PSScriptRoot
+    Write-Host "==> cargo build --release"
+    & cargo build --release --manifest-path (Join-Path $root 'Cargo.toml') 2>&1 |
+        Where-Object { $_ -match 'error|warning: unused|Compiling p2p-poker|Finished' } |
+        ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) { throw "the build failed; nothing was measured." }
+    $Exe = (Resolve-Path $Exe).Path
+}
+
+# Belt and braces: even with -NoBuild, refuse to measure a binary older than
+# the newest source file. A stale measurement is worse than no measurement,
+# because it gets written down.
+$newest = Get-ChildItem -Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'src'),
+                              (Join-Path (Split-Path -Parent $PSScriptRoot) 'patches') `
+    -Recurse -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$exeTime = (Get-Item $Exe).LastWriteTime
+if ($newest -and $newest.LastWriteTime -gt $exeTime) {
+    throw ("the binary is older than the source: $Exe is $exeTime, " +
+           "$($newest.Name) is $($newest.LastWriteTime). Every measurement from " +
+           "this run would have been about a build that predates the change. " +
+           "Drop -NoBuild, or build by hand.")
+}
 if (-not (Test-Path $KeyPath)) { throw "no key at $KeyPath. Plug the USB volume in or pass -KeyPath." }
 
 $seats = $Here + $There
