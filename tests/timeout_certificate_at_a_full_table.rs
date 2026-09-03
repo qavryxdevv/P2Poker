@@ -224,3 +224,234 @@ fn a_private_deal_at_its_documented_entry_count_fits_its_cap() {
          DEAL_PRIVATE_CAP = {DEAL_PRIVATE_CAP} B",
     );
 }
+
+// ---------------------------------------------------------------------------
+// The ending, at the seat count that broke it.
+//
+// The measurements above prove the bytes fit. They do not prove the table ends
+// the hand, and that distinction is the whole of S1-AO: every part of the
+// appeal worked in production — votes tallied, digests matched, unanimity was
+// reached at 9/9 — and the table still stopped dead, because the last message
+// could not be sent. So this half asserts the ending.
+//
+// It is also the coverage gap that let the defect through. Every test in this
+// repo that opens a table opens it with three seats: `opening3` in
+// `timeout_certificate.rs` and in `anti_replay_authority.rs`, and nothing else
+// opens one at all. At three seats the voter set is two and a certificate
+// carries two votes, so the documented maximum of nine had never been built by
+// anything.
+//
+// **What this half does NOT do, said plainly.** It does not reproduce the
+// production freeze. Its certificate is 3 454 B on the wire — see
+// `the_widest_event_a_full_table_emits_is_reported`, which prints the number —
+// and it therefore fits under the old 4 096 cap as well as the new one. The
+// silent seat here stalls at the first cryptographic stage it owes, where the
+// sequence numbers are small; in `split163641-10` it stalled at a betting stage
+// after a full ten-way shuffle, and that certificate was over 4 096. Roughly
+// 94 B per vote separates the two and this file does not account for it.
+//
+// So the regression guard is the byte measurement above, which is exact and
+// worst-case: nine votes at their widest come to 4 699 B, and a cap that
+// documents nine has to hold them. This half guards something different and
+// worth having on its own — that a full table reaches unanimity, seals nine
+// certificates, and ends the hand — which no test in the repo did before.
+// ---------------------------------------------------------------------------
+
+use p2p_poker::table::hand::{Failed, Hand, Opening, Send, GRACE_HANDS};
+
+const NOW: u64 = 1_700_000_000_000;
+/// Past the crypto-step and action deadlines, and far short of the hand
+/// deadline. Both halves matter: the first makes every survivor's clock expire
+/// on the silent seat, the second denies them the cause-1 abort that would end
+/// the hand without a certificate at all.
+const LATE: u64 = NOW + 120_000;
+
+/// The silent one. Present in the roster, never heard from — a peer whose
+/// process died before it wrote its first event.
+const SILENT: u8 = 2;
+
+fn opening_at_max_seats(my_seat: u8) -> Opening {
+    let n = usize::from(MAX_SEATS);
+    Opening {
+        table_id: [1; 32],
+        hand_id: 1,
+        session_id: [2; 32],
+        roster_hash: [3; 32],
+        genesis: [4; 32],
+        required: (0..MAX_SEATS).collect(),
+        readmitted: Vec::new(),
+        every_n_hands: 11,
+        first_small_blind: 50,
+        small_blind_cap: 50_000,
+        seats: (0..MAX_SEATS)
+            .map(|s| (s, key(10 + s).verifying_key().to_bytes(), 10_000))
+            .collect(),
+        max_players: MAX_SEATS,
+        small_blind: 50,
+        big_blind: 100,
+        level: 1,
+        my_seat,
+        crypto_step_timeout_ms: 30_000,
+        action_timeout_ms: 20_000,
+        action_grace_ms: 5_000,
+        hand_delay_ms: 7_000,
+        time_bank_ms: 0,
+        // **An hour, deliberately.** `LATE` is past the crypto-step and action
+        // deadlines and nowhere near this one, so the plain hand-deadline abort
+        // -- cause 1, which needs no certificate -- cannot end the hand. The
+        // only road out is the certificate, which is the road that broke.
+        hand_deadline_ms: 3_600_000,
+        grace: vec![GRACE_HANDS; n],
+        present_run: vec![0; n],
+        button: None,
+    }
+}
+
+/// The nine survivors. Seat `SILENT` has no `Hand` at all.
+struct FullTable {
+    hands: Vec<Hand>,
+    keys: Vec<SigningKey>,
+    seats: Vec<u8>,
+    refusals: Vec<(u8, String)>,
+    /// The largest event any seat broadcast. A certificate at a full table is
+    /// the biggest thing this protocol emits, and knowing the number is what
+    /// separates *"the cap holds"* from *"the cap happened to hold today"*.
+    widest: usize,
+}
+
+impl FullTable {
+    fn open() -> (Self, Vec<Vec<u8>>) {
+        let seats: Vec<u8> = (0..MAX_SEATS).filter(|&s| s != SILENT).collect();
+        let keys: Vec<SigningKey> = seats.iter().map(|&s| key(10 + s)).collect();
+        let mut hands = Vec::new();
+        let mut queue = Vec::new();
+        for (i, &s) in seats.iter().enumerate() {
+            let (h, out) = Hand::open(opening_at_max_seats(s), &keys[i], NOW, 30_000)
+                .expect("the hand opens");
+            hands.push(h);
+            for Send::Broadcast(b) in out {
+                queue.push(b);
+            }
+        }
+        (
+            FullTable {
+                hands,
+                keys,
+                seats,
+                refusals: Vec::new(),
+                widest: 0,
+            },
+            queue,
+        )
+    }
+
+    /// Deliver until nothing is left. Nine seats hearing everything the other
+    /// eight say is a great deal more traffic than the three-seat harness, so
+    /// the bound is generous — it is a runaway guard, not a limit on the run.
+    fn settle(&mut self, mut queue: Vec<Vec<u8>>, now_ms: u64) {
+        for _ in 0..20_000 {
+            if queue.is_empty() {
+                return;
+            }
+            let batch = std::mem::take(&mut queue);
+            for bytes in batch {
+                for to in 0..self.hands.len() {
+                    match self.hands[to].on_event(&bytes, &self.keys[to], now_ms) {
+                        Ok(out) => {
+                            for Send::Broadcast(b) in out {
+                                self.widest = self.widest.max(b.len());
+                                queue.push(b);
+                            }
+                        }
+                        Err(Failed::NotYet) => {
+                            let _ = self.hands[to].hold(bytes.clone());
+                        }
+                        Err(e) => self.refusals.push((self.seats[to], e.to_string())),
+                    }
+                }
+            }
+        }
+        panic!("the delivery loop never went quiet");
+    }
+
+    /// Every survivor's clock runs out. A vote is not an accusation and does
+    /// nothing alone; what it sets off is the certificate, and the abort the
+    /// certificate produces.
+    fn run_the_clocks_out(&mut self, now_ms: u64) {
+        let mut queue = Vec::new();
+        for i in 0..self.hands.len() {
+            if let Ok(out) = self.hands[i].vote_on_timeouts(&self.keys[i], now_ms) {
+                for Send::Broadcast(b) in out {
+                    self.widest = self.widest.max(b.len());
+                    queue.push(b);
+                }
+            }
+        }
+        self.settle(queue, now_ms);
+    }
+}
+
+#[test]
+fn a_silent_seat_at_a_full_table_is_certified_and_the_hand_ends() {
+    let (mut table, queue) = FullTable::open();
+    table.settle(queue, NOW);
+
+    // Every survivor's clock expires on the silent seat. Repeated, because the
+    // appeal is several stages: vote, unanimity, certificate, abort.
+    for _ in 0..6 {
+        table.run_the_clocks_out(LATE);
+    }
+
+    // The production failure, named exactly. Before S1-AO this refusal appeared
+    // on every seat once per attempt, for the rest of the run.
+    let over_cap: Vec<&(u8, String)> = table
+        .refusals
+        .iter()
+        .filter(|(_, e)| e.contains("over its cap"))
+        .collect();
+    assert!(
+        over_cap.is_empty(),
+        "a certificate at {MAX_SEATS} seats was refused for its size: {over_cap:?}. \
+         This is S1-AO: the votes reach unanimity, the certificate cannot be sent, \
+         and the table freezes for ever.",
+    );
+
+    // Positive, because "nothing was refused" also describes a hand that never
+    // reached the certificate at all. Nine survivors each emit one about the same
+    // subject, so every one of them should verify nine.
+    let want = table.hands.len();
+    for (i, &seat) in table.seats.iter().enumerate() {
+        let got = table.hands[i].verified_certificates();
+        assert_eq!(
+            got, want,
+            "seat {seat} verified {got} certificates, not the {want} a full table \
+             produces about one silent seat",
+        );
+    }
+
+    for (i, &seat) in table.seats.iter().enumerate() {
+        assert!(
+            table.hands[i].aborted().is_some(),
+            "seat {seat} never ended the hand, so the certificate it helped make did \
+             nothing. That is S1-AO's shape exactly. Refusals: {:?}",
+            table.refusals,
+        );
+    }
+}
+
+/// What a full table actually puts on the wire, printed rather than asserted
+/// away. `split163641-10` froze because a certificate would not fit and nobody
+/// knew how large one was; the number belongs somewhere a reader can find it.
+#[test]
+fn the_widest_event_a_full_table_emits_is_reported() {
+    let (mut table, queue) = FullTable::open();
+    table.settle(queue, NOW);
+    for _ in 0..6 {
+        table.run_the_clocks_out(LATE);
+    }
+    println!(
+        "widest event broadcast at {MAX_SEATS} seats: {} B (TIMEOUT_CERT_CAP = {})",
+        table.widest, TIMEOUT_CERT_CAP,
+    );
+    assert!(table.widest > 0, "a full table must broadcast something");
+}
