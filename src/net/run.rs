@@ -3566,6 +3566,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let now = super::node::now_unix_ms();
                 let Some(h) = hand.as_mut() else { continue };
 
+                // **A message parked on a clock has to be re-judged by a
+                // clock.** `replay_early` had exactly one caller in the tree —
+                // the `Ok` arm of `hand_event!` — so anything held with
+                // `Failed::NotYet` was reconsidered only when some *other*
+                // event happened to arrive and be accepted. Most held events
+                // are waiting for a stage this client has not reached, and for
+                // those an incoming event is the right trigger. A `HAND_ABORT`
+                // held because this receiver's own deadline has not passed is
+                // waiting for **time**, and nothing here made time a trigger.
+                //
+                // In `split173908-10` the fix above would have fired anyway,
+                // by luck: the eight stranded seats re-sent their votes for 293
+                // seconds and a duplicate vote returns `Ok`, which ran the
+                // replay. A quieter table has no such accident, and the whole
+                // point of the gate widening is that the moment it opens is a
+                // moment when nothing else is happening.
+                let (replayed, held_failures) = h.replay_early(&app_key, now);
+                for e in held_failures {
+                    let _ = events
+                        .send(NodeEvent::Warning(format!("a held event: {e}")))
+                        .await;
+                }
+                publish_hand(replayed, &mut swarm, &mut said, &tox_sink);
+                let Some(h) = hand.as_mut() else { continue };
+
                 // Say so first, if this client's own timer has run out on
                 // somebody. A vote is not an accusation and does nothing
                 // alone; only a complete set becomes a certificate, and only a

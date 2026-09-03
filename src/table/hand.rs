@@ -4206,8 +4206,54 @@ impl Hand {
         match body.cause {
             // The uncertified path. The gate: this receiver's **own** deadline
             // must have passed. Until it has, hold the message.
+            //
+            // **And `past_deadline` alone was not the whole of this
+            // receiver's own judgement, which stranded eight seats of a
+            // ten-seat table for ever.** `past_deadline` returns `false` for a
+            // **betting** stage by construction, deliberately, because a
+            // player thinking is legitimate. But a client in a betting stage
+            // still forms an opinion about that stage running late — it is
+            // `past_stage_deadline` that fires the `TIMEOUT_VOTE`, and it
+            // covers every stage. So a client could vote that this stage had
+            // timed out and, in the same breath, refuse a peer's assertion of
+            // exactly the same thing. Two expressions of one judgement,
+            // disagreeing.
+            //
+            // Measured, `split173908-10`: hand #4 reached a betting stage,
+            // seat 6 gave up on its own clock at 188.3 s and said so, the
+            // other seats' clocks ran out on seat 5 and they voted — 8/9 at
+            // 225.5 s, where it stayed for the remaining 375 seconds. The
+            // certificate needed seat 6's vote and seat 6 was no longer in the
+            // hand to cast it (`S1-AQ`); seat 6's abort would have ended the
+            // hand instead, and every one of the eight refused it here. Seats
+            // 5 and 6 ran on to hand #10 while the eight sat in hand #4. The
+            // table forked and neither half could recover.
+            //
+            // **`long_past_stage` and not `past_stage_deadline`, and the
+            // factor of two is the point.** `past_stage_deadline` is the
+            // instant the vote fires; accepting on it would end the hand
+            // anonymously at the very millisecond the mechanism that could
+            // have *named* the stalling seat began. `may_abandon` already
+            // refuses to do that on the origination side — *"the better
+            // mechanism gets to go first"* — and does it with exactly this
+            // predicate. Using the same one here makes the two sides of one
+            // rule agree: a peer gives up at `2 x next_deadline_for(owed)` and
+            // a peer accepts that giving-up at the same point.
+            //
+            // **A union, never a replacement.** `past_stage_deadline` is not a
+            // superset of `past_deadline`: it is `false` whenever `owed_type`
+            // is `None`, and it ignores the whole-hand budget, so replacing
+            // the call would delete the 55-minute backstop and re-create this
+            // same permanent `NotYet` somewhere else. `long_past_stage`
+            // returns `true` for `owed_type() == None`, and the `||` keeps
+            // every acceptance there is today.
+            //
+            // Nothing here reads a field of the sender's message: the receiver
+            // still decides on its own monotonic clock and against `§8.2`'s
+            // normative deadline, so no per-receiver quantity reaches a hash
+            // and D-012 is untouched.
             1 if body.attributed.is_empty() => {
-                if !self.past_deadline(now_ms) {
+                if !(self.past_deadline(now_ms) || self.long_past_stage(now_ms)) {
                     return Err(Failed::NotYet);
                 }
             }

@@ -1098,3 +1098,125 @@ fn the_hand_after_a_low_seat_is_dropped_can_still_shuffle() {
         );
     }
 }
+
+// ===========================================================================
+// S1-AQ: a peer that gives up must be able to say so to a peer that agrees.
+//
+// Measured in `split173908-10`, ten seats over two machines. Hand #4 reached a
+// betting stage. Seat 6 gave up on its own clock at 188.3 s and broadcast a
+// bare deadline abort. The other seats' clocks ran out on seat 5 and they
+// voted, reaching **8/9 at 225.5 s** -- where it stayed for the remaining 375
+// seconds of the run, because the ninth vote had to come from seat 6 and seat 6
+// was no longer in the hand to cast it. Seat 6's abort would have ended the
+// hand instead, and every one of the eight refused it: `past_deadline` returns
+// `false` for a betting stage by construction, so the abort was parked with
+// `Failed::NotYet` for ever. Seats 5 and 6 ran on to hand #10 while the other
+// eight sat in hand #4. The table forked and neither half could recover.
+//
+// The gate now reads `past_deadline || long_past_stage`, a union rather than a
+// replacement, at **twice** the stage budget rather than once -- the same
+// predicate and the same factor `may_abandon` already uses to decide when to
+// give up anonymously, so the two sides of one rule agree.
+//
+// These two cases are a pair and neither means much alone. The first is the
+// deadlock; the second is the property the gate exists for, which the first
+// must not buy.
+// ===========================================================================
+
+/// The receiver's own clock is long past this stage, so it accepts.
+#[test]
+fn a_peers_bare_abort_is_accepted_once_this_receiver_is_long_past_the_stage() {
+    let (mut t, opening) = Live::open(0);
+    t.settle(opening);
+
+    let owed = t.hands[0].waiting_for();
+    assert_eq!(
+        owed.len(),
+        1,
+        "a betting stage should owe exactly one seat an action, not {owed:?}"
+    );
+    let subject = owed[0];
+    let others: Vec<usize> = (0..3usize).filter(|s| *s as u8 != subject).collect();
+    let (leaver, receiver) = (others[0], others[1]);
+
+    // Twice `action_timeout_ms + action_grace_ms + time_bank_ms`, and one
+    // millisecond. `hand_deadline_ms` is 600_000, so the hand's own budget is
+    // nowhere near and `past_deadline` is still false: this is `long_past_stage`
+    // alone, which is the whole point.
+    let late = NOW + 2 * (20_000 + 5_000) + 1;
+
+    // The receiver's own judgement, stated out loud before the abort arrives:
+    // it votes that this stage is over. Everything below turns on the client
+    // not contradicting itself about that.
+    let votes = t.hands[receiver]
+        .vote_on_timeouts(&t.keys[receiver], late)
+        .expect("voting is not an error");
+    assert_eq!(
+        votes.len(),
+        1,
+        "seat {receiver} must have voted that seat {subject} is late at {late}"
+    );
+    assert_eq!(
+        t.hands[receiver].verified_certificates(),
+        0,
+        "no certificate may exist yet, or the hand would end by the other road \
+         and this test would prove nothing"
+    );
+
+    // And a peer gives the hand up on its own clock, exactly as seat 6 did.
+    let sends = t.hands[leaver]
+        .abort_now(
+            p2p_poker::table::hand::Abort::Deadline,
+            &t.keys[leaver],
+            late,
+        )
+        .expect("the abort is sealed");
+    assert_eq!(sends.len(), 1, "giving up puts one thing on the wire");
+    let Send::Broadcast(bytes) = &sends[0];
+
+    let outcome = t.hands[receiver].on_event(bytes, &t.keys[receiver], late);
+    assert!(
+        t.hands[receiver].aborted().is_some(),
+        "seat {receiver} refused a bare deadline abort about a stage it had \
+         itself just voted was over: {outcome:?}. That is S1-AQ, and in \
+         production it forked a ten-seat table permanently."
+    );
+}
+
+/// And it must still refuse before that, or the gate has been bought too cheap.
+///
+/// Without this the fix above could be "stop checking". The gate exists so that
+/// one peer cannot end a hand the others are legitimately still playing, and a
+/// seat inside its own action budget is legitimately still playing.
+#[test]
+fn a_peers_bare_abort_is_refused_while_this_receiver_is_still_in_time() {
+    let (mut t, opening) = Live::open(0);
+    t.settle(opening);
+
+    let subject = t.hands[0].waiting_for()[0];
+    let others: Vec<usize> = (0..3usize).filter(|s| *s as u8 != subject).collect();
+    let (leaver, receiver) = (others[0], others[1]);
+
+    // One millisecond short of twice the stage budget.
+    let early = NOW + 2 * (20_000 + 5_000) - 1;
+
+    let sends = t.hands[leaver]
+        .abort_now(
+            p2p_poker::table::hand::Abort::Deadline,
+            &t.keys[leaver],
+            early,
+        )
+        .expect("the abort is sealed");
+    let Send::Broadcast(bytes) = &sends[0];
+
+    let outcome = t.hands[receiver].on_event(bytes, &t.keys[receiver], early);
+    assert_eq!(
+        outcome,
+        Err(Failed::NotYet),
+        "a peer must not end a hand this receiver is still legitimately playing"
+    );
+    assert!(
+        t.hands[receiver].aborted().is_none(),
+        "and it must not have ended it anyway"
+    );
+}
