@@ -195,6 +195,22 @@ bool gcc_send_lossless_packet_fragments(const GC_Chat *chat, GC_Connection *gcon
     memcpy(chunk + 1, data, MAX_GC_PACKET_CHUNK_SIZE - 1);
 
     if (!add_to_send_array(chat->log, chat->mem, chat->mono_time, gconn, chunk, MAX_GC_PACKET_CHUNK_SIZE, GP_FRAGMENT)) {
+        /* p2p-poker: say so. This path and the two below returned false with no
+         * log at all, so a fragmented message the send array had no room for
+         * vanished without a trace -- and a fragmented message is every large
+         * one this client sends.
+         *
+         * It is not a silent LOSS, because the caller treats false as not-sent
+         * and `patches/0003` makes the group send report that honestly, so the
+         * application re-queues. It was a silent GAP IN THE ACCOUNTING, which is
+         * worse than it sounds: `create_array_entry` failures must equal logged
+         * receive drops plus logged send refusals, and that identity is the
+         * instrument `S1-AM` was found with. Measured on `split142946-10`, the
+         * founder had 901 array failures, zero receive drops and twenty logged
+         * send refusals -- 881 unaccounted for, all of them here.
+         */
+        LOGGER_DEBUG(chat->log, "no room for the first chunk of a fragmented packet (type: 0x%02x)",
+                     packet_type);
         return false;
     }
 
@@ -208,6 +224,8 @@ bool gcc_send_lossless_packet_fragments(const GC_Chat *chat, GC_Connection *gcon
         processed += chunk_len;
 
         if (!add_to_send_array(chat->log, chat->mem, chat->mono_time, gconn, chunk, chunk_len, GP_FRAGMENT)) {
+            LOGGER_DEBUG(chat->log, "no room for chunk %u of a fragmented packet (type: 0x%02x)",
+                         processed, packet_type);
             clear_send_queue_id_range(chat->mem, gconn, start_id, gconn->send_message_id);
             return false;
         }
@@ -215,6 +233,8 @@ bool gcc_send_lossless_packet_fragments(const GC_Chat *chat, GC_Connection *gcon
 
     // empty packet signals the end of the sequence
     if (!add_to_send_array(chat->log, chat->mem, chat->mono_time, gconn, nullptr, 0, GP_FRAGMENT)) {
+        LOGGER_DEBUG(chat->log, "no room for the terminator of a fragmented packet (type: 0x%02x)",
+                     packet_type);
         clear_send_queue_id_range(chat->mem, gconn, start_id, gconn->send_message_id);
         return false;
     }

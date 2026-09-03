@@ -120,7 +120,10 @@ $patched = @(
        Why    = '0003: without it a custom packet accepted by one peer of ten is reported to the caller as sent, so the application drops it and the other nine never see it' },
     @{ File   = 'toxcore/group_connection.c'
        Marker = 'p2p-poker: the awaited chunk goes in even if its slot is taken'
-       Why    = '0004: without it a fragment sequence blocked on an occupied slot can never be unblocked, because unlike an ordinary packet the awaited chunk must be stored - the peer is lost until the sender times it out' }
+       Why    = '0004: without it a fragment sequence blocked on an occupied slot can never be unblocked, because unlike an ordinary packet the awaited chunk must be stored - the peer is lost until the sender times it out' },
+    @{ File   = 'toxcore/group_connection.c'
+       Marker = 'no room for the first chunk of a fragmented packet'
+       Why    = '0005: diagnostic. Without it the fragmenting send path fails silently three times over, and the conservation identity that found S1-AM (array failures = receive drops + send refusals) is left with an unexplained residue' }
 )
 
 Step 'checking the patches are in the vendored source'
