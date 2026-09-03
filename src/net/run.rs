@@ -3032,6 +3032,41 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
                                 table_topic = Some(topic);
                                 table = Some(f);
+                                // **Ask the DHT for the founder before asking
+                                // the founder for a seat.**
+                                //
+                                // The advert carries `founder_peer_id` and no
+                                // address, and `send_request` dials by peer id —
+                                // so it can only succeed if the swarm already
+                                // holds an address for that peer. Nothing put
+                                // one there on purpose: they arrive as a
+                                // by-product of the sixty-second lobby crawl,
+                                // whenever a Kademlia response happens to carry
+                                // the founder's record.
+                                //
+                                // That is the whole of the formation time.
+                                // Measured, `split144400-10`, connection to the
+                                // founder against seating: `n1` **2.2 s**, `n2`
+                                // **97.5 s** — same machine, same binary, same
+                                // run. Once connected, seating took 0.1–3.7 s on
+                                // six of nine seats and the Tox group 10–24 s on
+                                // all of them, so this one step is the variance.
+                                //
+                                // A targeted lookup is the cheapest fix there
+                                // is: no wire change, no new field in the
+                                // advert, one query whose whole purpose is to
+                                // learn where a peer id lives. It runs beside
+                                // the request rather than before it, because a
+                                // swarm that already has the address should not
+                                // wait for a walk it does not need — and
+                                // `PeerCondition::DisconnectedAndNotDialing`
+                                // makes the redundant case free.
+                                if !swarm.is_connected(&founder) {
+                                    swarm
+                                        .behaviour_mut()
+                                        .ipfs_kad
+                                        .get_closest_peers(founder);
+                                }
                                 swarm.behaviour_mut().join.send_request(&founder, request);
                             }
                             Err(e) => {
