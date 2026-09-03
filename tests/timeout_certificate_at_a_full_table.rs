@@ -34,8 +34,12 @@ use minicbor::Encode;
 use p2p_poker::net::chained::{self, Slot};
 use p2p_poker::protocol::constants::MAX_SEATS;
 use p2p_poker::protocol::messages::EventType;
-use p2p_poker::table::hand::{HAND_COMPLETE_CAP, TIMEOUT_CERT_CAP, TIMEOUT_VOTE_CAP};
-use p2p_poker::table::handwire::{HandComplete, PotAward, Refund, TimeoutCert, TimeoutVote};
+use p2p_poker::table::hand::{
+    DEAL_PRIVATE_CAP, HAND_COMPLETE_CAP, HAND_INIT_CAP, TIMEOUT_CERT_CAP, TIMEOUT_VOTE_CAP,
+};
+use p2p_poker::table::handwire::{
+    DealPrivate, HandComplete, HandInit, PotAward, Refund, RevealEntry, TimeoutCert, TimeoutVote,
+};
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -165,5 +169,58 @@ fn a_settlement_at_max_seats_fits_its_cap() {
         encoded <= HAND_COMPLETE_CAP,
         "a settlement at {MAX_SEATS} seats encodes to {encoded} B, over \
          HAND_COMPLETE_CAP = {HAND_COMPLETE_CAP} B",
+    );
+}
+
+/// `HAND_INIT` carries four per-seat vectors and its cap is `PROTOCOL.md`
+/// §9.3's, so it is not free to change if it turns out to be tight. Measured at
+/// `MAX_SEATS` with every number at its widest.
+#[test]
+fn a_hand_init_at_max_seats_fits_its_cap() {
+    let body = HandInit {
+        hand_id: u64::MAX,
+        button_position: MAX_SEATS - 1,
+        sb_position: MAX_SEATS - 1,
+        bb_seat: MAX_SEATS - 1,
+        level: u16::MAX,
+        small_blind: u64::MAX,
+        big_blind: u64::MAX,
+        ante: u64::MAX,
+        dealt_in: (0..MAX_SEATS).collect(),
+        stacks: vec![u64::MAX; usize::from(MAX_SEATS)],
+        roster_hash: [0x33; 32],
+        ledger_delta: (0..MAX_SEATS).map(|s| (s, i64::MIN)).collect(),
+    };
+    let encoded = canonical(&body).len();
+    assert!(
+        encoded <= HAND_INIT_CAP,
+        "a hand init at {MAX_SEATS} seats encodes to {encoded} B, over \
+         HAND_INIT_CAP = {HAND_INIT_CAP} B — and that cap is PROTOCOL.md §9.3's, \
+         so the fix would be a corpus change and not a constant",
+    );
+}
+
+/// The reveal bodies are capped by an entry count rather than by the seat
+/// count, and `DEAL_PRIVATE_CAP`'s doc says so in terms — *"stated as a number
+/// here rather than derived from the seat count of whatever table happens to be
+/// running"*. Measured at the entry count the doc names, since that is the
+/// bound a peer can actually make this client hold.
+#[test]
+fn a_private_deal_at_its_documented_entry_count_fits_its_cap() {
+    const ENTRIES: usize = 25;
+    let body = DealPrivate {
+        entries: (0..ENTRIES)
+            .map(|i| RevealEntry {
+                deck_index: i as u8,
+                token: vec![0x44; 33],
+                proof: vec![0x55; 98],
+            })
+            .collect(),
+    };
+    let encoded = canonical(&body).len();
+    assert!(
+        encoded <= DEAL_PRIVATE_CAP,
+        "a private deal of {ENTRIES} entries encodes to {encoded} B, over \
+         DEAL_PRIVATE_CAP = {DEAL_PRIVATE_CAP} B",
     );
 }
