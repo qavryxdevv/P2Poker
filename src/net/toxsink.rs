@@ -426,6 +426,37 @@ impl TableSink {
         }
     }
 
+    /// **Why** the refusals happened, by `Tox_Err_Group_Send_Custom_Packet`:
+    /// index 1 group-not-found, 2 too-long, 3 empty, 4 disconnected,
+    /// 5 fail-send. Index 0 is unused.
+    ///
+    /// A bare count of refusals cannot be acted on. Code 4 is decided inside
+    /// `tox_group_send_custom_packet` before any peer is consulted -- this
+    /// client's own group connection is down -- and code 5 comes from the peer
+    /// loop, which is where `patches/0003` lives. The remedies have nothing in
+    /// common.
+    pub fn refused_why(&self) -> [u64; 6] {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => {
+                    let w = &t.trouble().refused_why;
+                    let mut out = [0u64; 6];
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        *slot = w[i].load(Ordering::Relaxed);
+                    }
+                    out
+                }
+                None => [0; 6],
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            [0; 6]
+        }
+    }
+
     /// Invitations sent, invitations refused, and friends the driver believes
     /// are connected.
     ///

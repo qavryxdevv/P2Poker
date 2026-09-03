@@ -3384,9 +3384,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let (refused, waiting, sent) = tox_sink.trouble();
                 if waiting > 0 || refused > tox_refused_said {
                     tox_refused_said = refused;
+                    // Which refusal, because the remedies have nothing in
+                    // common: code 4 is this client's own group connection
+                    // being down, decided before any peer is consulted, while
+                    // code 5 comes from the peer loop.
+                    let why = tox_sink.refused_why();
+                    let named = [
+                        (1usize, "group-not-found"),
+                        (2, "too-long"),
+                        (3, "empty"),
+                        (4, "disconnected"),
+                        (5, "fail-send"),
+                    ]
+                    .iter()
+                    .filter(|(i, _)| why[*i] > 0)
+                    .map(|(i, name)| format!("{} {name}", why[*i]))
+                    .collect::<Vec<_>>();
+                    let breakdown = if named.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", named.join(", "))
+                    };
                     let _ = events
                         .send(NodeEvent::Warning(format!(
-                            "the table's transport is behind: {waiting} message(s) queued,                              {refused} fragment(s) refused of {} offered",
+                            "the table's transport is behind: {waiting} message(s) queued, \
+                             {refused} fragment(s) refused of {} offered{breakdown}",
                             refused + sent
                         )))
                         .await;

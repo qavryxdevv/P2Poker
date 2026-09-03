@@ -213,6 +213,25 @@ pub struct Trouble {
     /// Fragments toxcore would not take. The queue was full or the group had
     /// nobody in it; either way the message stays and is tried again.
     pub refused: AtomicU64,
+    /// **And which of those it was.** Indexed by
+    /// `Tox_Err_Group_Send_Custom_Packet`: 0 ok, 1 group-not-found, 2 too-long,
+    /// 3 empty, **4 disconnected**, 5 fail-send.
+    ///
+    /// The code was always there -- `Tox::send` returns
+    /// `Failed::Api { call, error }` -- and `flush` threw it away for a bare
+    /// `refused += 1`. That cost a whole reading. In `split182531-10` `n0`
+    /// refused 2 481 fragments of 6 804 and `far-n1` 1 854 of 5 638, and
+    /// nothing said whether the group was disconnected under this client's feet
+    /// (code 4, decided in `tox_group_send_custom_packet` before any peer is
+    /// consulted) or whether a peer would not take it (code 5, which is where
+    /// `patches/0003` lives). Those have completely different remedies, and the
+    /// difference is one array.
+    ///
+    /// It also settles a question about this project's own patch: 0003 logs
+    /// *“custom packet reached N of M confirmed peers”* whenever it refuses,
+    /// and that line appears **zero** times in that run -- so the refusals were
+    /// upstream of it. This counter says which upstream.
+    pub refused_why: [AtomicU64; 6],
     /// Whole messages waiting to go out. A number that does not come down is a
     /// transport that has stopped keeping up, which at a table shows as seats
     /// being certified late for saying things they did say.
@@ -1148,8 +1167,16 @@ fn flush(
         };
         let mut sent_all = true;
         for part in &parts {
-            if tox.send(group, part).is_err() {
+            if let Err(e) = tox.send(group, part) {
                 trouble.refused.fetch_add(1, Ordering::Relaxed);
+                // Which refusal, not merely that there was one.
+                let code = match e {
+                    crate::tox::Failed::Api { error, .. } => error as usize,
+                    _ => 0,
+                };
+                if let Some(c) = trouble.refused_why.get(code.min(5)) {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
                 sent_all = false;
                 break;
             }
