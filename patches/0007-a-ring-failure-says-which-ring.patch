@@ -1,0 +1,54 @@
+diff --git a/vendor/c-toxcore/toxcore/group_connection.c b/vendor/c-toxcore/toxcore/group_connection.c
+index 9c12260..66d4388 100644
+--- a/vendor/c-toxcore/toxcore/group_connection.c
++++ b/vendor/c-toxcore/toxcore/group_connection.c
+@@ -90,11 +90,28 @@ void gcc_set_recv_message_id(GC_Connection *gconn, uint64_t id)
+  *
+  * Return true on success.
+  */
++/* p2p-poker: which ring, because the two are different faults.
++ *
++ * This function is called from add_to_send_array and from store_in_recv_array
++ * and logged the same sentence for both, so every count of it anywhere is the
++ * SUM of a send-side and a receive-side failure. They have nothing in common:
++ * a full SEND ring means this client cannot hand toxcore another message for
++ * that peer and the application's own queue starts growing; a full RECEIVE
++ * ring means a peer's stream is stalled behind a message this client is
++ * missing. One is back-pressure, the other is head-of-line blocking.
++ *
++ * A whole day's readings were taken against the sum. The direction survived --
++ * 19 768 to 2 072 across the fragment-sizing change of S1-AR -- but the
++ * attribution did not, and the question "why are the sends being refused"
++ * cannot be answered from a number that also counts receives.
++ */
+ static bool create_array_entry(const Logger *_Nonnull log, const Memory *_Nonnull mem, const Mono_Time *_Nonnull mono_time, GC_Message_Array_Entry *_Nonnull array_entry,
+-                               const uint8_t *_Nullable data, uint16_t length, uint8_t packet_type, uint64_t message_id)
++                               const uint8_t *_Nullable data, uint16_t length, uint8_t packet_type, uint64_t message_id,
++                               const char *_Nonnull side)
+ {
+     if (!array_entry_is_empty(array_entry)) {
+-        LOGGER_WARNING(log, "Failed to create array entry; entry is not empty.");
++        LOGGER_WARNING(log, "Failed to create %s array entry; entry is not empty. (id: %llu, type: 0x%02x)",
++                       side, (unsigned long long)message_id, packet_type);
+         return false;
+     }
+ 
+@@ -145,7 +162,8 @@ static bool add_to_send_array(const Logger *_Nonnull log, const Memory *_Nonnull
+     const uint16_t idx = gcc_get_array_index(gconn->send_message_id);
+     GC_Message_Array_Entry *array_entry = &gconn->send_array[idx];
+ 
+-    if (!create_array_entry(log, mem, mono_time, array_entry, data, length, packet_type, gconn->send_message_id)) {
++    if (!create_array_entry(log, mem, mono_time, array_entry, data, length, packet_type, gconn->send_message_id,
++                            "send")) {
+         return false;
+     }
+ 
+@@ -361,7 +379,7 @@ static bool store_in_recv_array(const Logger *_Nonnull log, const Memory *_Nonnu
+     const uint16_t idx = gcc_get_array_index(message_id);
+     GC_Message_Array_Entry *ary_entry = &gconn->recv_array[idx];
+ 
+-    return create_array_entry(log, mem, mono_time, ary_entry, data, length, packet_type, message_id);
++    return create_array_entry(log, mem, mono_time, ary_entry, data, length, packet_type, message_id, "recv");
+ }
+ 
+ /**

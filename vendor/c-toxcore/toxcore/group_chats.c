@@ -5097,7 +5097,8 @@ int gc_send_custom_packet(const GC_Chat *chat, bool lossless, const uint8_t *dat
             /* The same test send_lossless_group_packet makes, made here so the
              * denominator is what it can satisfy. */
             if (!gconn->handshaked || gconn->pending_delete) {
-                LOGGER_DEBUG(chat->log, "peer %u is confirmed but cannot be sent to; not waited for", i);
+                LOGGER_DEBUG(chat->log, "peer %u is confirmed but cannot be sent to (%s); not waited for",
+                             i, gconn->pending_delete ? "pending delete" : "not handshaked");
                 continue;
             }
 
