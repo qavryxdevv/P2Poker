@@ -1,0 +1,46 @@
+diff --git a/toxcore/group_chats.c b/toxcore/group_chats.c
+index 7bc741e..8214ab8 100644
+--- a/toxcore/group_chats.c
++++ b/toxcore/group_chats.c
+@@ -6084,7 +6084,40 @@ static bool handle_gc_lossless_packet(const GC_Session *_Nonnull c, GC_Chat *_No
+         LOGGER_DEBUG(chat->log, "failed to handle packet %llu (type: 0x%02x, id: %llu)",
+                      (unsigned long long)message_id, packet_type, (unsigned long long)message_id);
+         mem_delete(chat->mem, data);
+-        return false;
++
++        /* p2p-poker: ask for the missing message on this path too.
++         *
++         * This branch is reached when store_in_recv_array fails, and it fails
++         * for exactly one reason: create_array_entry found recv_array[message_id
++         * % GCC_BUFFER_SIZE] already occupied. That is the state where a single
++         * lost message has been followed by more than GCC_BUFFER_SIZE = 2048
++         * further ones, so the ring has wrapped onto entries still waiting for
++         * it.
++         *
++         * Upstream returns false here and sends nothing. The branch immediately
++         * below -- the same situation while the ring still has room -- answers
++         * with gc_send_message_ack(.., GR_ACK_REQ), which is the only signal a
++         * receiver has for "I am missing message N, send it again". So the
++         * repair is switched off precisely when the gap is at its largest, and
++         * from then on recovery depends entirely on the sender's own retry,
++         * which backs off on powers of two (group_connection.c: `delta > 1 &&
++         * is_power_of_2(delta)`) -- 2, 4, 8, 16, 32, 64 seconds. If those
++         * retransmissions are also being lost, nothing ever asks again and the
++         * peer is finished: every subsequent packet hits an occupied slot.
++         *
++         * Measured, ten seats across two machines, split110500-10: four of the
++         * five seats on one host logged this line 4082, 9361, 963 and 12970
++         * times -- tens of thousands of consecutive drops with no request
++         * between them -- while the fifth seat on the SAME host and the five
++         * seats on the other logged it zero times. All four were then certified
++         * out of the table; the fifth played to the end.
++         *
++         * Asking costs one small packet per dropped one and cannot make the
++         * state worse: the request names received_message_id + 1, which is the
++         * one message that would let process_recv_array drain everything behind
++         * it and empty the ring.
++         */
++        return gc_send_message_ack(chat, gconn, gconn->received_message_id + 1, GR_ACK_REQ);
+     }
+ 
+     /* Duplicate packet */
