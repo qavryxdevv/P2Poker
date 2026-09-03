@@ -49,11 +49,46 @@ use std::collections::BTreeMap;
 /// framing and not of protocol, and both ends of one table run one build.
 pub const HEADER: usize = 8;
 
-/// Tox's own limit, and the smallest MTU this is expected to run over.
+/// What toxcore carries in **one** lossless message, which is not what its API
+/// will accept.
 ///
-/// `TOX_GROUP_MAX_CUSTOM_LOSSLESS_PACKET_LENGTH`, from
-/// `vendor/c-toxcore/toxcore/tox.h:3106`.
-pub const TOX_PACKET: usize = 1373;
+/// **It was 1 373 — `TOX_GROUP_MAX_CUSTOM_LOSSLESS_PACKET_LENGTH`, the API
+/// maximum — and sizing to the maximum was the single most expensive decision
+/// in this transport.** `send_lossless_group_packet`
+/// (`vendor/c-toxcore/toxcore/group_chats.c`) sends a packet whole only while
+/// `length <= MAX_GC_PACKET_CHUNK_SIZE`, which is **500**
+/// (`group_common.h:42`). Above it the library fragments again, underneath a
+/// layer that has already fragmented, and that second cut is expensive in two
+/// ways that compound:
+///
+/// * **Four message ids instead of one.** A 1 373-byte packet becomes
+///   500 + 500 + 374 plus a terminator, and each consumes one slot of that
+///   peer's 2 047-entry send ring. At a measured ten fragments a second that is
+///   forty ids per peer per second, and the ring fills in **51 s** —
+///   *seven seconds before* `GC_CONFIRMED_PEER_TIMEOUT` (58 s), which is the
+///   bound `patches/0003` relies on to release a peer that cannot accept.
+/// * **Only the terminating chunk is acked.** `handle_gc_packet_fragment` acks
+///   on `frag_ret == 0` alone, so three quarters of every entry sit in the ring
+///   until a retransmission triggers the duplicate path — a minimum of three
+///   seconds, and 5, 9, 17 or 33 on a lost retransmission.
+///
+/// **Measured, `split203824-10`, ten seats over two machines.** Of 8 355
+/// receive-side `create_array_entry` failures on one node, **8 292 are type
+/// `0xf2` — `GP_FRAGMENT`**. On the send side `Failed to add payload to send
+/// array` fired 796 times, again `0xf2`, and `patches/0003` logged *“custom
+/// packet reached **8 of 9** confirmed peers”* 647 times: one peer's ring full,
+/// the whole table's message refused and re-offered.
+///
+/// **500 is the boundary, and smaller fragments are cheaper even though there
+/// are more of them.** A nine-kilobyte `SHUFFLE_STEP` costs seven packets of
+/// four ids at 1 373, and nineteen packets of one id at 500 — 19 against 28,
+/// with none of them on the ack-starved path.
+///
+/// Changing it is transport framing and not protocol, exactly as [`HEADER`]
+/// says: it sits under the signed envelope and both ends of one table run one
+/// build, which `tools/table-run-split.ps1` verifies by SHA-256 before it
+/// measures anything.
+pub const TOX_PACKET: usize = 500;
 
 /// How much of one packet is message.
 pub const fn payload_for(mtu: usize) -> usize {
@@ -350,11 +385,27 @@ mod tests {
     /// prose: the protocol's own message sizes against Tox's packet.
     #[test]
     fn the_fragment_counts_are_what_the_sizes_say() {
+        // **The one that matters, and it is a relationship rather than a
+        // number.** A packet larger than `MAX_GC_PACKET_CHUNK_SIZE` = 500 is
+        // cut again inside libtoxcore, underneath a layer that has already cut
+        // it: four send-array slots instead of one, and only the terminating
+        // chunk acked. `TOX_PACKET` was the API maximum, 1 373, and
+        // `split203824-10` measured what that cost -- 8 292 of 8 355
+        // receive-side ring failures were type `0xf2`, `GP_FRAGMENT`. If this
+        // assertion ever fails again, S1-AR is back.
+        assert!(
+            TOX_PACKET <= 500,
+            "a fragment of {TOX_PACKET} B is over MAX_GC_PACKET_CHUNK_SIZE and \
+             will be cut a second time inside libtoxcore (S1-AR)",
+        );
+
         let p = payload_for(TOX_PACKET);
-        assert_eq!(p, 1365);
-        // A SHUFFLE_STEP is about 9 KB, a SHUFFLE_PROOF about 5.6 KB.
-        assert_eq!(9_000usize.div_ceil(p), 7);
-        assert_eq!(5_600usize.div_ceil(p), 5);
+        assert_eq!(p, 492);
+        // A SHUFFLE_STEP is about 9 KB, a SHUFFLE_PROOF about 5.6 KB. More
+        // packets than at 1 373 and cheaper all the same: nineteen ids against
+        // twenty-eight, none of them on the ack-starved path.
+        assert_eq!(9_000usize.div_ceil(p), 19);
+        assert_eq!(5_600usize.div_ceil(p), 12);
         // And the largest HAND_ABORT this client will build.
         assert_eq!(MAX_FRAGMENTS, MAX_MESSAGE.div_ceil(p));
         assert!(
@@ -478,11 +529,19 @@ mod tests {
         let mut r = Reassembler::new(TOX_PACKET);
         r.accept(&1u8, &frames[0], NOW).unwrap();
 
+        // Derived, not chosen: a literal here silently stopped being a lie when
+        // `TOX_PACKET` changed and 4 000 bytes started needing exactly that
+        // many fragments.
+        let truth = u16::try_from(frames.len()).expect("a small count");
+        let lie = truth + 1;
         let mut lying = frames[1].clone();
-        lying[6..8].copy_from_slice(&9u16.to_be_bytes());
+        lying[6..8].copy_from_slice(&lie.to_be_bytes());
         assert_eq!(
             r.accept(&1u8, &lying, NOW),
-            Err(Bad::TotalChanged { was: 3, now: 9 })
+            Err(Bad::TotalChanged {
+                was: truth,
+                now: lie
+            })
         );
         assert_eq!(r.outstanding(), 0);
     }
