@@ -63,7 +63,24 @@ param(
     [ValidateRange(0, 8)][int]$StallSeat = 0,
     # Skip the build. The staleness check below still runs, so this only saves
     # the time of a no-op build -- it cannot be used to measure a stale binary.
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    # **Build without `fault-harness`, and therefore without toxcore's log.**
+    #
+    # `src/tox/mod.rs` registers `tox_options_set_log_callback` only under that
+    # feature, so a binary built without it writes NO toxcore line of any level
+    # -- not merely no DEBUG. Every "zero drops", "zero retransmits", "zero
+    # ring-full refusals" conclusion drawn from such a run is unsupported: the
+    # measurement was absent, not the event.
+    #
+    # That happened. The build step added to this script on 2026-09-03 omitted
+    # the feature, and `split173908-10` and `split182531-10` carry zero toxcore
+    # lines where `split163641-10` carries 155 on one node alone. Two readings
+    # were made against it before the gap was noticed.
+    #
+    # It is a real trade: at `MIN_LOGGER_LEVEL=DEBUG` the library is loud, and
+    # the writing costs something. `-Quiet` is here for a run that is measuring
+    # timing rather than diagnosing, and it must be passed deliberately.
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,8 +105,9 @@ $Exe = (Resolve-Path $Exe).Path
 # So: build, unless the caller says otherwise. A no-op build costs a second.
 if (-not $NoBuild) {
     $root = Split-Path -Parent $PSScriptRoot
-    Write-Host "==> cargo build --release"
-    & cargo build --release --manifest-path (Join-Path $root 'Cargo.toml') 2>&1 |
+    $feat = if ($Quiet) { @() } else { @('--features', 'fault-harness') }
+    Write-Host "==> cargo build --release $($feat -join ' ')"
+    & cargo build --release @feat --manifest-path (Join-Path $root 'Cargo.toml') 2>&1 |
         Where-Object { $_ -match 'error|warning: unused|Compiling p2p-poker|Finished' } |
         ForEach-Object { Write-Host "    $_" }
     if ($LASTEXITCODE -ne 0) { throw "the build failed; nothing was measured." }
@@ -122,6 +140,7 @@ Write-Host "table  $table"
 Write-Host "seats  $seats  ($Here here, $There on $Target)"
 Write-Host "for    $Seconds s"
 Write-Host "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
+Write-Host "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
 Write-Host "work   $work"
 Write-Host ''
 
