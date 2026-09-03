@@ -455,3 +455,68 @@ fn the_widest_event_a_full_table_emits_is_reported() {
     );
     assert!(table.widest > 0, "a full table must broadcast something");
 }
+
+/// **The same shape as S1-AO, asked of the abort's evidence budget — and the
+/// answer is that the budget is wrong by very nearly a factor of two.**
+///
+/// `HAND_ABORT_MAX = 2 * ABORT_EVIDENCE_MAX + ABORT_FIXED_MAX` adds the two
+/// evidence elements to a fixed allowance as though each costs what it
+/// measures. `HandAbort::evidence` is `Vec<Vec<u8>>` with a plain `#[n(3)]` —
+/// the same missing `minicbor::bytes` that made a certificate nearly double —
+/// so an element of *n* bytes does not cost *n* on the wire. `attributed:
+/// Vec<[u8; 32]>` has the same omission. Measured below: **99 190 B against a
+/// declared 51 200**, and over `GOSSIP_MAX_TRANSMIT` = 65 536 too, so the
+/// compile-time assertion `HAND_ABORT_MAX <= GOSSIP_MAX_TRANSMIT` passes only
+/// because the arithmetic it checks understates the thing it bounds.
+///
+/// **It is latent rather than live, but the margin is not comfortable.** Real
+/// evidence is a `SHUFFLE_STEP` at about 9 KB or a `SHUFFLE_PROOF` at about
+/// 5.6 KB, and `FRAME_CAP` = 16 384 bounds what can become evidence at all. Two
+/// nine-kilobyte elements encode to **37 750 B**, which is 74 % of the declared
+/// 51 200 — so nothing is broken today, and a shuffle step half as large again
+/// would break it. What is already wrong is the *reasoning* the constant
+/// records, and S1-AO is what a wrong size calculation costs when something
+/// finally reaches it.
+///
+/// **Neither repair is an implementation's to make**, which is why this pins
+/// the discrepancy instead of removing it: annotating `evidence` with
+/// `minicbor::bytes` changes the bytes on the wire, and lowering
+/// `ABORT_EVIDENCE_MAX` to roughly 12 000 — where the arithmetic would hold —
+/// narrows what a receiver accepts. `ABORT_EVIDENCE_MAX`'s own doc says as
+/// much: *"Both are wire decisions and neither is one an implementation may
+/// take on its own."* Filed with `S1-A` and `S1-AO`.
+#[test]
+fn the_aborts_evidence_budget_is_wrong_by_the_encoding_and_this_pins_it() {
+    use p2p_poker::protocol::constants::{ABORT_EVIDENCE_MAX, HAND_ABORT_MAX};
+    use p2p_poker::table::handwire::HandAbort;
+
+    let at = |bytes: usize| HandAbort {
+        cause: 2,
+        attributed: vec![[0x66; 32]; usize::from(MAX_SEATS)],
+        cert_hash: Some([0x77; 32]),
+        evidence: vec![vec![0x88; bytes]; 2],
+        deltas: vec![i64::MIN; usize::from(MAX_SEATS)],
+        final_stacks: vec![u64::MAX; usize::from(MAX_SEATS)],
+    };
+
+    // What actually gets sent: a shuffle step and its proof, at the sizes
+    // ABORT_EVIDENCE_MAX's own doc quotes. This is the guarantee that matters
+    // and it must never stop holding.
+    let real = canonical(&at(9 * 1024)).len();
+    assert!(
+        real <= HAND_ABORT_MAX,
+        "an abort carrying evidence at the real size ({real} B) must fit          HAND_ABORT_MAX = {HAND_ABORT_MAX} B — this one is not latent",
+    );
+
+    // And the discrepancy itself, pinned. If either the encoding or the
+    // constants change, this stops holding and the register row needs revisiting
+    // rather than the number quietly drifting.
+    let declared = canonical(&at(ABORT_EVIDENCE_MAX)).len();
+    assert!(
+        declared > HAND_ABORT_MAX,
+        "an abort at the documented evidence budget now encodes to {declared} B,          within HAND_ABORT_MAX = {HAND_ABORT_MAX} B. That is good news and this          test is stale: someone has fixed the encoding or the arithmetic. Update          S1-A and delete this half.",
+    );
+    println!(
+        "abort at the documented budget: {declared} B declared vs          HAND_ABORT_MAX {HAND_ABORT_MAX} B (real evidence: {real} B)"
+    );
+}
