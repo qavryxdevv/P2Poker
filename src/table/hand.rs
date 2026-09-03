@@ -4954,6 +4954,33 @@ impl Hand {
             if self.voters(seat).len() < 2 {
                 continue;
             }
+            // **And this client has to be one of the voters.**
+            //
+            // `on_timeout_vote` already refuses a vote from a seat outside
+            // `voters(subject)` — *“if !self.voters(body.subject_seat)
+            // .contains(&seat)”* — but the emit side had no such test, and
+            // `take_vote` below inserts `my_seat` unconditionally. So a seat the
+            // table had already certified out went on voting **for itself**,
+            // `certify_if_unanimous` saw `held = |voters| + 1`, sealed, and
+            // broadcast a certificate carrying a voter nobody else has in
+            // `dealt_in`. Every receiver then refused it at `on_timeout_cert`'s
+            // `c.voters.is_subset(&nominal)` and this client's own copy of the
+            // hand was the only one that could accept it.
+            //
+            // Measured, `split215300-10`: **443** certificates refused
+            // table-wide with *“acting as though every voter were dealt in”*,
+            // and every one of them from a seat that had been certified out —
+            // **394 from seat 2, 25 from seat 0, 24 from seat 9**, against a
+            // roster whose narrowings were `certified [2]`, `[4]`, `[7]`, `[8]`
+            // and `[9, 0]`. The fingerprint is a tally over its own
+            // denominator: `4/3`, `7/6`, `8/7`, `9/8`, `5/4` — always exactly
+            // one too many, always this client's own.
+            //
+            // The same predicate as the receive path, applied where the vote is
+            // made rather than where it lands.
+            if !self.voters(seat).contains(&self.open.my_seat) {
+                continue;
+            }
             let bytes = self.say_at(
                 EventType::TimeoutVote,
                 &subject,
@@ -6976,6 +7003,96 @@ mod tests {
             present_run: vec![0; 3],
             button: None,
         }
+    }
+
+    /// Five seats, which is the smallest table at which a certified-out seat's
+    /// own vote is not masked by the two-voter floor.
+    ///
+    /// At three seats, certifying one out leaves one voter, and
+    /// `voters(seat).len() < 2` refuses the vote before anything else is
+    /// checked. At five it leaves three, the floor passes, and the question of
+    /// whether this client belongs in its own voter set is finally asked. That
+    /// is why nothing in this repo caught it: every table-opening test here
+    /// used three seats or two.
+    fn opening5(my_seat: SeatIdx) -> Opening {
+        Opening {
+            table_id: [1; 32],
+            hand_id: 1,
+            session_id: [2; 32],
+            roster_hash: [3; 32],
+            genesis: [4; 32],
+            required: vec![0, 1, 2, 3, 4],
+            readmitted: Vec::new(),
+            every_n_hands: 11,
+            first_small_blind: 50,
+            small_blind_cap: 50_000,
+            seats: (0..5u8)
+                .map(|s| (s, key(10 + s).verifying_key().to_bytes(), 10_000u64))
+                .collect(),
+            max_players: 5,
+            small_blind: 50,
+            big_blind: 100,
+            level: 1,
+            my_seat,
+            crypto_step_timeout_ms: 30_000,
+            action_timeout_ms: 20_000,
+            action_grace_ms: 5_000,
+            hand_delay_ms: 7_000,
+            time_bank_ms: 0,
+            hand_deadline_ms: 600_000,
+            grace: vec![GRACE_HANDS; 5],
+            present_run: vec![0; 5],
+            button: None,
+        }
+    }
+
+    /// **A seat the table has certified out must stop voting**, and it had not.
+    ///
+    /// `on_timeout_vote` refuses a vote from a seat outside `voters(subject)`.
+    /// The emit side had no such test and `take_vote` inserted `my_seat`
+    /// unconditionally, so a certified-out seat went on voting for itself,
+    /// `certify_if_unanimous` saw one more vote than there were voters, sealed,
+    /// and broadcast a certificate carrying a voter nobody else had in
+    /// `dealt_in` — which every receiver then refused.
+    ///
+    /// Measured in `split215300-10`: **443** certificates refused table-wide,
+    /// **394 from seat 2, 25 from seat 0, 24 from seat 9**, against roster
+    /// narrowings of `certified [2]`, `[4]`, `[7]`, `[8]` and `[9, 0]`. Every
+    /// refusal came from a seat that had been certified out. The fingerprint is
+    /// a tally over its own denominator — `4/3`, `7/6`, `8/7`, `9/8` — always
+    /// exactly one too many, always its own.
+    #[test]
+    fn a_certified_out_seat_does_not_vote_for_itself() {
+        let (mut hand, _) =
+            Hand::open(opening5(4), &key(14), NOW, 30_000).expect("the hand opens");
+
+        // Before: seat 4 is a voter about seat 0 like anyone else.
+        assert!(
+            hand.voters(0).contains(&4),
+            "the fixture must start with seat 4 inside the voter set",
+        );
+
+        // The table certifies seat 4 out. That is the state the run was in.
+        hand.commit_certificate(4);
+        assert!(
+            !hand.voters(0).contains(&4),
+            "a certified seat must leave the voter set",
+        );
+        assert!(
+            hand.voters(0).len() >= 2,
+            "and the two-voter floor must still pass, or this test proves \
+             nothing that three seats would not have",
+        );
+
+        // It must now say nothing, whatever its clock thinks.
+        let out = hand
+            .vote_on_timeouts(&key(14), NOW + 600_000)
+            .expect("voting is not an error");
+        assert!(
+            out.is_empty(),
+            "a seat outside its own voter set voted anyway, and every receiver \
+             will refuse the certificate that vote is sealed into",
+        );
     }
 
     /// Three seats, which is the smallest table at which a collective stage
