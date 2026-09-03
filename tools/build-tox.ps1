@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Fetches and builds what `--features tox` needs: c-toxcore's source and a
+    Builds what `--features tox` needs from the vendored source in this
     static libsodium. Run once; `cargo build --features tox` does the rest.
 
 .DESCRIPTION
@@ -58,83 +58,76 @@ function Fail($m) { Write-Host "FAIL  $m" -ForegroundColor Red; exit 1 }
 $root   = Split-Path -Parent $PSScriptRoot
 $vendor = Join-Path $root 'vendor'
 
-function Fetch($name, $url, $tag, $commit) {
+# **The vendored trees are committed to this repository, so nothing is fetched.**
+#
+# They used to be cloned here at a pinned commit and patched on the way past.
+# That has a failure mode a committed tree does not: a library that looks right,
+# links, runs and is missing the fix. This project has already lost a day to a
+# defect that only showed under measurement, and it now carries two patches to
+# toxcore rather than none.
+#
+# So this checks that the source is present. The commit ids above are what the
+# trees were taken from and are kept for a reader and for a version bump; there
+# is no `.git` here to interrogate any more, and that is the point -- the answer
+# is in this repository's own history, and `patches/` is the delta against those
+# commits.
+function Have($name, $probe) {
     $dir = Join-Path $vendor $name
-    if ((Test-Path $dir) -and -not $Force) {
-        $have = (& git -C $dir rev-parse HEAD 2>$null)
-        if ($have -eq $commit) {
-            Note "$name already at $commit"
-            return $dir
-        }
-        Note "$name is at $have, wanted $commit - refetching"
-        Remove-Item -Recurse -Force $dir
-    } elseif (Test-Path $dir) {
-        Remove-Item -Recurse -Force $dir
+    if (-not (Test-Path (Join-Path $dir $probe))) {
+        Fail "$name is missing from vendor/. It is committed to this repository, so this is a partial checkout or a deleted directory - restore it with 'git checkout -- vendor/$name'."
     }
-    Step "fetching $name $tag"
-    & git clone --depth 1 --branch $tag --quiet $url $dir
-    if ($LASTEXITCODE -ne 0) { Fail "could not clone $name" }
-    $have = (& git -C $dir rev-parse HEAD)
-    if ($have -ne $commit) {
-        Fail "$name $tag is $have, not the pinned $commit. The tag moved, which is exactly what pinning is for - check what changed before editing this script."
-    }
+    Note "$name present"
     return $dir
 }
 
-$tox = Fetch 'c-toxcore' 'https://github.com/TokTok/c-toxcore.git' $TOXCORE_TAG $TOXCORE_COMMIT
+$tox = Have 'c-toxcore' 'toxcore/group_chats.c'
 
-# `third_party/cmp` is a submodule and a shallow clone does not bring it. Its
+# `third_party/cmp` came from a submodule of the original clone. Its
 # `cmp.c` is the first entry of `toxcore_SOURCES`, so without this the build
 # fails on a missing file rather than on a missing dependency.
+# `third_party/cmp` was a submodule of the clone and is committed here with the
+# rest of the tree. Its `cmp.c` is the first entry of `toxcore_SOURCES`, so
+# without it the build fails on a missing file rather than a missing dependency.
 if (-not (Test-Path (Join-Path $tox 'third_party/cmp/cmp.c'))) {
-    Step 'fetching the cmp submodule'
-    & git -C $tox submodule update --init --depth 1 third_party/cmp
-    if ($LASTEXITCODE -ne 0) { Fail 'could not fetch third_party/cmp' }
+    Fail "third_party/cmp/cmp.c is missing. It is committed to this repository; restore it with 'git checkout -- vendor/c-toxcore'."
 }
-$cmpHead = (& git -C (Join-Path $tox 'third_party/cmp') rev-parse HEAD)
-if ($cmpHead -ne $CMP_COMMIT) { Fail "cmp is $cmpHead, not the pinned $CMP_COMMIT" }
 
 # --- our patches ------------------------------------------------------------
 #
-# **The vendored tree is fetched and gitignored, so a change to it has to live
-# here or it does not exist.** `patches/` is applied in name order to the clone
-# straight after the pin is verified, and the whole build stops if one does not
-# apply.
+# **They are already in the tree, because the tree is committed.** `patches/`
+# is no longer applied here; it is the record of what this repository's copy of
+# c-toxcore differs from upstream by, which is what a reader needs and what a
+# version bump needs.
 #
-# **Failing loudly is the point.** A patch that silently does not apply produces
-# a library that looks right, links, runs, and is missing the fix — and the last
-# time this project had a defect that only showed under measurement it took a
-# day to find. `git apply --check` first, so a bad patch is reported before
-# anything has been half-applied.
+# What is checked is that the patched lines are still there. A tree that was
+# reverted, half-merged or restored from an unpatched copy would otherwise build
+# clean and be missing the fix -- the exact failure that cost this project a day
+# and the reason the source is committed at all.
 #
-# A patch is expected to stop applying when `$TOXCORE_COMMIT` moves. That is not
-# a reason to skip it: re-cut the patch against the new tree, and if the change
-# has landed upstream, delete the file.
-$patchDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'patches'
-if (Test-Path $patchDir) {
-    $patches = @(Get-ChildItem -Path $patchDir -Filter '*.patch' | Sort-Object Name)
-    if ($patches.Count -gt 0) {
-        Step "applying $($patches.Count) patch(es) to c-toxcore"
-        foreach ($patch in $patches) {
-            # Already applied? A rebuild against an existing clone must not fail
-            # for having succeeded last time.
-            & git -C $tox apply --reverse --check "$($patch.FullName)" 2>$null
-            if ($LASTEXITCODE -eq 0) {
-                Note "  $($patch.Name) is already applied"
-                continue
-            }
-            & git -C $tox apply --check "$($patch.FullName)" 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                Fail "$($patch.Name) does not apply to c-toxcore $TOXCORE_TAG. Re-cut it against the pinned tree, or delete it if the change has landed upstream. Do NOT build without it: the whole point of the patch is a failure that only shows under measurement."
-            }
-            & git -C $tox apply "$($patch.FullName)"
-            if ($LASTEXITCODE -ne 0) { Fail "$($patch.Name) failed to apply after checking clean, which should be impossible" }
-            Note "  $($patch.Name)"
-        }
+# Each entry is a marker unique to one patch and a sentence saying what is lost
+# without it. Adding a patch means adding a line here; that is deliberate
+# friction, because a patch nothing verifies is a patch that can quietly stop
+# existing.
+$patched = @(
+    @{ File   = 'toxcore/onion_client.c'
+       Marker = 'set_tcp_onion_status(nc_get_tcp_c(onion_c->c), true)'
+       Why    = '0001: without it a UDP-healthy node keeps no TCP relay, so its invite confirmations carry none and a relayed joiner can never complete a group join' },
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker: ask for the missing message on this path too'
+       Why    = '0002: without it a receive ring that has wrapped drops every further packet without ever asking for the message it is missing, and the peer never recovers' }
+)
+
+Step 'checking the patches are in the vendored source'
+foreach ($p in $patched) {
+    $path = Join-Path $tox $p.File
+    if (-not (Test-Path $path)) { Fail "$($p.File) is missing from the vendored tree" }
+    if (-not (Select-String -Path $path -SimpleMatch -Pattern $p.Marker -Quiet)) {
+        Fail "$($p.File) does not contain the patch marker '$($p.Marker)'. $($p.Why). Restore the tree with 'git checkout -- vendor/c-toxcore', or re-apply patches/ if you are moving to a new upstream."
     }
+    Note "  $($p.File): patched"
 }
 
-$sodium = Fetch 'libsodium' 'https://github.com/jedisct1/libsodium.git' $SODIUM_TAG $SODIUM_COMMIT
+$sodium = Have 'libsodium' 'src/libsodium/sodium/core.c'
 
 # --- libsodium, static, x64 -------------------------------------------------
 $lib = Join-Path $sodium 'bin\x64\Release\v143\static\libsodium.lib'

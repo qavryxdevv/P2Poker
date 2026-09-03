@@ -19,11 +19,26 @@ desktop.ini
 /vendor/**/target/
 /profile/
 
-# The vendored C for D-019's Tox transport, fetched at pinned commits by
-# tools/build-tox.ps1 rather than committed. 12.7 MB for a transport whose
-# whole point - a measurement across two networks - has not been taken yet;
-# the script carries the argument and the hashes, and says what would change
-# the answer. `vendor/ziffle` IS committed, so this is the exception and not
-# the rule.
-/vendor/c-toxcore/
-/vendor/libsodium/
+# The vendored C for D-019's Tox transport IS committed, and the note that used
+# to sit here saying otherwise has been withdrawn on its own terms.
+#
+# It read: "12.7 MB for a transport whose whole point - a measurement across two
+# networks - has not been taken yet; the script carries the argument and the
+# hashes, and says what would change the answer." The measurement has now been
+# taken many times over, and this client carries **two patches** to toxcore:
+# `patches/0001` keeps the TCP relay fallback alive, and `patches/0002` asks for
+# the missing message when the receive ring is full. A tree that is fetched and
+# then patched at build time has a failure mode a committed one does not - a
+# library that looks right, links, runs, and is missing the fix - and this
+# project has already lost a day to a defect that only showed under measurement.
+#
+# So the trees are here, patched, at the commits `tools/build-tox.ps1` records:
+#   c-toxcore  v0.2.23        d9ca3c577e5abd4303d180eb5270167b4133ea4c
+#   cmp                       52bfcfa17d2eb4322da2037ad625f5575129cece
+#   libsodium  1.0.20-RELEASE 9511c982fb1d046470a8b42aa36556cdb7da15de
+# `patches/` stays as the record of what differs from those commits, which is
+# what a reader needs and what a version bump needs.
+#
+# Their own `.gitignore` files come with them and keep their build output out:
+# `obj`, `bin` and `build` are ignored by upstream's rules, not by ours.
+

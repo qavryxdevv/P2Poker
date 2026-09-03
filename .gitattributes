@@ -1,0 +1,13 @@
+# The vendored C is stored byte for byte as upstream published it.
+#
+# `-text` turns off end-of-line normalisation for these trees. Without it git
+# rewrites the CRLF files libsodium ships — its MSVC solutions, project files,
+# `resource.rc` — to LF on the way in, and the working tree stops being
+# byte-identical to the upstream commit `tools/build-tox.ps1` names.
+#
+# That matters here for one concrete reason: `patches/` is a diff against those
+# commits, and a re-cut against a normalised tree would carry whitespace changes
+# that have nothing to do with the fix. It also lets anyone check the trees
+# against upstream with a plain `diff -r` and get only our two patches back.
+/vendor/c-toxcore/** -text
+/vendor/libsodium/** -text
