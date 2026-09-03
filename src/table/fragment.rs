@@ -72,12 +72,17 @@ pub const HEADER: usize = 8;
 ///   until a retransmission triggers the duplicate path — a minimum of three
 ///   seconds, and 5, 9, 17 or 33 on a lost retransmission.
 ///
-/// **Measured, `split203824-10`, ten seats over two machines.** Of 8 355
-/// receive-side `create_array_entry` failures on one node, **8 292 are type
-/// `0xf2` — `GP_FRAGMENT`**. On the send side `Failed to add payload to send
-/// array` fired 796 times, again `0xf2`, and `patches/0003` logged *“custom
-/// packet reached **8 of 9** confirmed peers”* 647 times: one peer's ring full,
-/// the whole table's message refused and re-offered.
+/// **Measured, `split203824-10` against `split210848-10`, which differ in this
+/// constant and in nothing else.** Ring failures **19 768 → 2 072**, `Failed to
+/// add payload to send array` **800 → 3**, and hand #3's sealed-to-your-turn
+/// across ten seats **5.8–8.5 s → 2.0–4.1 s**.
+///
+/// **The reasoning above is read from the source, not witnessed in a log, and
+/// an earlier version of this comment claimed otherwise.** It cited 8 292
+/// failures of type `0xf2` as fragments; `0xf2` is `GP_CUSTOM_PACKET` and
+/// `GP_FRAGMENT` is `0xef`, which appears **zero times in every run measured**.
+/// Only failures are logged, and fragment entries did not fail, so those counts
+/// say nothing either way about which path was taken.
 ///
 /// **500 is the boundary, and smaller fragments are cheaper even though there
 /// are more of them.** A nine-kilobyte `SHUFFLE_STEP` costs seven packets of
