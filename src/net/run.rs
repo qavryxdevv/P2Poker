@@ -470,6 +470,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut deck_reported: Option<(Option<u8>, bool)> = None;
     // Whether this hand's own cards have been handed to the interface.
     let mut cards_reported = false;
+    // **The abort is a standing property, not an event.** `aborted()` stays
+    // `Some` for the rest of the hand, and this block had no once-flag while
+    // `deck_reported`, `cards_reported` and `turn_reported` all do -- so every
+    // further event accepted before `next_hand_at` replaced the hand reprinted
+    // the sentence. Measured in `split163641-10`: `far-n3` printed the void
+    // four times, `far-n1` four, `far-n0` three. A reader counting seats from
+    // a grep over-counts them, which is a bad property in the one message that
+    // says a hand died.
+    let mut abort_reported = false;
     // The last turn told to the interface, so a stage per action does not
     // become a redraw per action.
     let mut turn_reported: Option<(Option<u8>, u64, u64, bool)> = None;
@@ -975,7 +984,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             )))
                                             .await;
                                     }
-                                    if let Some(why) = $h.aborted() {
+                                    if let Some(why) =
+                                        $h.aborted().filter(|_| !abort_reported)
+                                    {
+                                        abort_reported = true;
                                         act_by = None;
                                         // **Which abort, and not one
                                         // sentence for all of them.** This
@@ -1549,6 +1561,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         hand_reported = false;
                         deck_reported = None;
                         cards_reported = false;
+                        abort_reported = false;
                         turn_reported = None;
                         said.clear();
                         next_hand_at = None;
@@ -1594,6 +1607,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         hand_reported = false;
                         deck_reported = None;
                         cards_reported = false;
+                        abort_reported = false;
                         turn_reported = None;
                         said.clear();
                         next_hand_at = None;
@@ -3085,6 +3099,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         hand_reported = false;
                         deck_reported = None;
                         cards_reported = false;
+                        abort_reported = false;
                         turn_reported = None;
                         said.clear();
                         next_hand_at = None;
@@ -3171,6 +3186,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         hand_reported = false;
                         deck_reported = None;
                         cards_reported = false;
+                        abort_reported = false;
                         turn_reported = None;
                         said.clear();
                         next_hand_at = None;
@@ -3601,6 +3617,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 act_by = None;
+                // Which clock, taken before the abort resets the phase. Two
+                // budgets can produce this abort and they send a reader to
+                // completely different places -- see `Hand::expired_budget`.
+                let budget = h.expired_budget(now);
                 match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
                     Ok(sends) => {
                         publish_hand(sends, &mut swarm, &mut said, &tox_sink);
@@ -3644,9 +3664,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             String::new()
                         };
+                        let which = budget
+                            .map(|b| format!(" -- {b}"))
+                            .unwrap_or_default();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "the hand ran out of time; every stack is restored{why}"
+                                "the hand ran out of time{which}; every stack is                                  restored{why}"
                             )))
                             .await;
                         // Straight on: an abort has nothing to look at, so

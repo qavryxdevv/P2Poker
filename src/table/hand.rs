@@ -4577,6 +4577,51 @@ impl Hand {
     /// a deadline is measured on the peer's own monotonic clock and never on
     /// anybody's wall time, which is why nothing in the chain depends on two
     /// peers agreeing about when it passed.
+    /// **Which** of the two budgets expired, in words a reader can act on.
+    ///
+    /// `abort_now(Abort::Deadline)` carries no reason, so the report said *"the
+    /// hand ran out of time"* for a thirty-second stage stall as readily as for
+    /// a fifty-five-minute hand -- and the two send a reader looking in
+    /// completely different places. Measured in `split163641-10`: `n0` opened
+    /// hand 1 at 108.3 s and aborted at 169.3 s, sixty seconds later, against a
+    /// `hand_deadline_ms` of `RATED_HAND_DEADLINE_MS` = 3 300 000. Nothing in a
+    /// three-minute-old process can have consumed fifty-five minutes, so the
+    /// clock that fired was the stage's; the sentence named the other one.
+    ///
+    /// `None` when neither has expired, which is also the answer for a betting
+    /// stage: `past_deadline` deliberately does not bound one, because a player
+    /// thinking is legitimate and it is `action_timeout_ms` that answers it.
+    pub fn expired_budget(&self, now_ms: u64) -> Option<String> {
+        let waiting = self.waiting_for();
+        let who = if waiting.is_empty() {
+            String::new()
+        } else {
+            format!(", still waiting for seat(s) {waiting:?}")
+        };
+        let hand = now_ms.saturating_sub(self.opened_at_ms);
+        if hand >= u64::from(self.open.hand_deadline_ms) {
+            return Some(format!(
+                "the hand's own budget: {} s of {} s{who}",
+                hand / 1_000,
+                self.open.hand_deadline_ms / 1_000,
+            ));
+        }
+        if !self.crypto_stage() {
+            return None;
+        }
+        let stage = now_ms.saturating_sub(self.stage_at_ms);
+        if stage >= u64::from(self.open.crypto_step_timeout_ms) {
+            return Some(format!(
+                "this stage's budget: {} s of {} s{who} (the hand itself has used                  {} s of {} s)",
+                stage / 1_000,
+                self.open.crypto_step_timeout_ms / 1_000,
+                hand / 1_000,
+                self.open.hand_deadline_ms / 1_000,
+            ));
+        }
+        None
+    }
+
     fn past_deadline(&self, now_ms: u64) -> bool {
         // The hand's own budget, which every stage shares and which has to be
         // long enough for a whole legal hand of everybody thinking.
