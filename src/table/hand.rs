@@ -619,7 +619,40 @@ pub const TIMEOUT_VOTE_CAP: usize = 128;
 
 /// The cap on a `TIMEOUT_CERT` body: a digest and up to `MAX_SEATS - 1`
 /// embedded signed votes.
-pub const TIMEOUT_CERT_CAP: usize = 4_096;
+///
+/// **It has to actually hold them, and at 4 096 it did not.** A sealed
+/// `TIMEOUT_VOTE` is 266 B, `MAX_SEATS - 1` of them are carried whole, and
+/// `TimeoutCert::votes` is a plain `Vec<Vec<u8>>` — no `minicbor::bytes`, so
+/// each vote encodes as a CBOR array of integers rather than a byte string and
+/// very nearly doubles. Nine votes plus the digest come to **4 699 B**.
+///
+/// Nothing caught it because nothing ever built a large one:
+/// `tests/timeout_certificate.rs` is a thousand lines and every case in it
+/// opens three seats, where the voter set is two. The largest certificate this
+/// repo had ever encoded carried two votes against a documented maximum of
+/// nine.
+///
+/// What it cost, measured on `split163641-10`: hand #4 stalled with nine seats
+/// at *"your turn"* and the tenth still at *"the deck is shuffled and sealed"*
+/// — it had never learned it was on the clock. The nine ran their clocks out on
+/// it and the tally climbed to **9/9 agree at 376.0 s**. Unanimous. And every
+/// seat then logged `TooLong("the payload is over its cap")` once per attempt
+/// for the remaining four minutes. The hand never ended. A full table could not
+/// certify a timeout at all, so one seat missing one message froze the table
+/// permanently — the worst failure this protocol has, because to every honest
+/// seat it is indistinguishable from the table being over.
+///
+/// 8 192 is the next power of two above the measured worst case and leaves 74 %
+/// headroom. `tests/timeout_certificate_at_a_full_table.rs` pins the arithmetic
+/// at `MAX_SEATS - 1` so it cannot drift under again.
+///
+/// The encoding itself is left alone deliberately. Annotating `votes` with
+/// `minicbor::bytes` would halve the certificate — worth having, because this
+/// message is sent precisely when the network is already struggling and a
+/// smaller body is fewer fragments to lose — but it changes the bytes on the
+/// wire, hence the event hash, hence everything chained from it. That is the
+/// owner's call, not a bug fix, and it is filed as one.
+pub const TIMEOUT_CERT_CAP: usize = 8_192;
 
 pub use crate::protocol::constants::MAX_CONSECUTIVE_AUTO_ACTIONS;
 
