@@ -4586,6 +4586,35 @@ impl Hand {
         // waits one more stage's worth; where it is not — heads-up, and below
         // the floor generally — it fires at once, because nothing better is
         // coming.
+        // **A follower ends no hand, and the corpus says so rather than this
+        // comment.** `required` decides who is a member of a **stage** —
+        // `begin_settlement` says exactly that and enforces the identical test
+        // one function away — and `PROTOCOL.md` §4.10 gives a seat outside
+        // `P(k)` **exactly one** legal chained event, `PLAYER_SIT_IN`, with
+        // §4.9's checkpoint-8 `STATE_HASH` the only exemption. `HAND_ABORT` is
+        // on neither list, so a non-member emitting one is a wire violation and
+        // not merely impolite.
+        //
+        // **And it is the fork.** Its own deadline is about a hand it is not a
+        // party to, and the terminal it produces — `abort_terminal` — is hashed
+        // under a different domain from the settled branch's `HAND_COMPLETE`
+        // stage hash, so `GENESIS(k+1)` diverges from the table's the moment it
+        // fires.
+        //
+        // Measured, `split110500-10`, ten seats across two machines: seats 1, 4,
+        // 5 and 6 were certified out one per hand between 306 s and 413 s, each
+        // **derived its own removal** — the log prints the shrinking `required`
+        // set — and each went on to open three more hands and then abort hand 9
+        // on its own deadline while the other six settled it. The adrift latch
+        // caught them 0.8 s later, which is `ADRIFT_MARGIN` working; what it
+        // could not do was stop the abort that made the fork inevitable.
+        //
+        // A non-member now waits for `Abort::Told` or for a complete
+        // `HAND_COMPLETE` stage from the seats that are parties. If neither
+        // comes it stalls, which is what the adrift latch is for.
+        if !self.open.required.contains(&self.open.my_seat) {
+            return false;
+        }
         if self.certificate_possible() && !self.long_past_stage(now_ms) {
             return false;
         }
