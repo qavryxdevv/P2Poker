@@ -5056,9 +5056,36 @@ int gc_send_custom_packet(const GC_Chat *chat, bool lossless, const uint8_t *dat
          * stops acking, and gcc_resend_packets already times such a peer out
          * after GC_CONFIRMED_PEER_TIMEOUT (58 s), after which it is no longer
          * confirmed and no longer counted here.
+         *
+         * p2p-poker, second pass: THE DENOMINATOR HAS TO BE THE PEERS A SEND
+         * CAN REACH, AND `confirmed` IS NOT THAT SET.
+         *
+         * send_lossless_group_packet opens with
+         *   if (!gconn->handshaked || gconn->pending_delete) return false;
+         * so a peer that is confirmed but mid-handshake, or on its way out,
+         * can never accept -- and counting it here made `sent <
+         * confirmed_peers` permanently true, so EVERY send failed and the
+         * application re-queued each one for ever. One peer re-handshaking
+         * stopped the whole table.
+         *
+         * Skipping it loses that peer nothing, which is the point: toxcore
+         * refuses to queue for an un-handshaked peer BEFORE add_to_send_array,
+         * so there was never a copy held for it to ask about. Waiting delivers
+         * to nobody and starves the other eight. A peer that finishes its
+         * handshake resyncs through the handshake itself; one that does not is
+         * dropped at GC_CONFIRMED_PEER_TIMEOUT and certified out by the table,
+         * which is the outcome the protocol is built to handle.
+         *
+         * Measured, split210848-10: with the send-array pressure gone
+         * (fragment sizing, S1-AR) far-n0 still logged 382 x "6 of 7" and
+         * 133 x "5 of 7" against THREE send-array failures in the whole run --
+         * so the refusals were this branch, not a full ring. Its log carries
+         * "UDP handshake failed and no TCP relays to fall back on" and nine
+         * "Send handshake packet failed". It opened seven hands where the other
+         * nine opened ten.
          */
         uint32_t sent = 0;
-        uint32_t confirmed_peers = 0;
+        uint32_t reachable_peers = 0;
 
         for (uint32_t i = 1; i < chat->numpeers; ++i) {
             GC_Connection *gconn = get_gc_connection(chat, i);
@@ -5067,18 +5094,25 @@ int gc_send_custom_packet(const GC_Chat *chat, bool lossless, const uint8_t *dat
                 continue;
             }
 
-            ++confirmed_peers;
+            /* The same test send_lossless_group_packet makes, made here so the
+             * denominator is what it can satisfy. */
+            if (!gconn->handshaked || gconn->pending_delete) {
+                LOGGER_DEBUG(chat->log, "peer %u is confirmed but cannot be sent to; not waited for", i);
+                continue;
+            }
+
+            ++reachable_peers;
 
             if (send_lossless_group_packet(chat, gconn, data, length, GP_CUSTOM_PACKET)) {
                 ++sent;
             }
         }
 
-        if (sent < confirmed_peers) {
-            LOGGER_DEBUG(chat->log, "custom packet reached %u of %u confirmed peers", sent, confirmed_peers);
+        if (sent < reachable_peers) {
+            LOGGER_DEBUG(chat->log, "custom packet reached %u of %u reachable peers", sent, reachable_peers);
         }
 
-        success = sent == confirmed_peers;
+        success = sent == reachable_peers;
     } else {
         success = send_gc_lossy_packet_all_peers(chat, data, length, GP_CUSTOM_PACKET);
     }

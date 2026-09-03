@@ -123,7 +123,10 @@ $patched = @(
        Why    = '0004: without it a fragment sequence blocked on an occupied slot can never be unblocked, because unlike an ordinary packet the awaited chunk must be stored - the peer is lost until the sender times it out' },
     @{ File   = 'toxcore/group_connection.c'
        Marker = 'no room for the first chunk of a fragmented packet'
-       Why    = '0005: diagnostic. Without it the fragmenting send path fails silently three times over, and the conservation identity that found S1-AM (array failures = receive drops + send refusals) is left with an unexplained residue' }
+       Why    = '0005: diagnostic. Without it the fragmenting send path fails silently three times over, and the conservation identity that found S1-AM (array failures = receive drops + send refusals) is left with an unexplained residue' },
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'is confirmed but cannot be sent to; not waited for'
+       Why    = '0006: corrects 0003. Without it the denominator counts peers send_lossless_group_packet refuses outright - not handshaked, or pending delete - so one peer mid-handshake makes every send fail for ever and one re-handshaking peer stops the whole table' }
 )
 
 Step 'checking the patches are in the vendored source'
