@@ -5025,7 +5025,60 @@ int gc_send_custom_packet(const GC_Chat *chat, bool lossless, const uint8_t *dat
     bool success;
 
     if (lossless) {
-        success = send_gc_lossless_packet_all_peers(chat, data, length, GP_CUSTOM_PACKET);
+        /* p2p-poker: every confirmed peer, or this is not a send.
+         *
+         * send_gc_lossless_packet_all_peers ends `return sent > 0 ||
+         * confirmed_peers == 0`, so on a ten-seat group a message accepted by
+         * one peer and refused by nine is reported to the caller as success.
+         * The application then drops it from its own queue and the nine never
+         * see it -- and cannot ask for it later either, because a message
+         * gcc_send_lossless_packet refused was never put in the send array, so
+         * gcc_resend_packets will never re-send it and a GR_ACK_REQ for it can
+         * never be answered.
+         *
+         * That is not a hypothetical. Ten seats over two machines,
+         * split121913-10: `Failed to add payload to send array` 480 times on one
+         * node, 118 on another, 46 on a third -- while this client's own
+         * send-side counter, which faithfully records every refusal the API
+         * reports, read ZERO. The refusals were invisible because this line
+         * called them a success.
+         *
+         * A group whose peers are ALL still confirmed but cannot accept is a
+         * group whose next message must wait, not one whose message may be
+         * dropped: this transport carries a poker hand and every seat must see
+         * every event or the table forks. So the loop is repeated here with the
+         * honest test. It is not applied to
+         * send_gc_lossless_packet_all_peers itself, whose five other callers --
+         * GP_BROADCAST, GP_SHARED_STATE, GP_MOD_LIST, GP_TOPIC and the
+         * sanctions list -- may reasonably treat "reached somebody" as enough.
+         *
+         * The wait is bounded without any new timer: a peer that cannot accept
+         * stops acking, and gcc_resend_packets already times such a peer out
+         * after GC_CONFIRMED_PEER_TIMEOUT (58 s), after which it is no longer
+         * confirmed and no longer counted here.
+         */
+        uint32_t sent = 0;
+        uint32_t confirmed_peers = 0;
+
+        for (uint32_t i = 1; i < chat->numpeers; ++i) {
+            GC_Connection *gconn = get_gc_connection(chat, i);
+
+            if (gconn == nullptr || !gconn->confirmed) {
+                continue;
+            }
+
+            ++confirmed_peers;
+
+            if (send_lossless_group_packet(chat, gconn, data, length, GP_CUSTOM_PACKET)) {
+                ++sent;
+            }
+        }
+
+        if (sent < confirmed_peers) {
+            LOGGER_DEBUG(chat->log, "custom packet reached %u of %u confirmed peers", sent, confirmed_peers);
+        }
+
+        success = sent == confirmed_peers;
     } else {
         success = send_gc_lossy_packet_all_peers(chat, data, length, GP_CUSTOM_PACKET);
     }

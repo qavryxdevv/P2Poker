@@ -114,7 +114,10 @@ $patched = @(
        Why    = '0001: without it a UDP-healthy node keeps no TCP relay, so its invite confirmations carry none and a relayed joiner can never complete a group join' },
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker: ask for the missing message on this path too'
-       Why    = '0002: without it a receive ring that has wrapped drops every further packet without ever asking for the message it is missing, and the peer never recovers' }
+       Why    = '0002: without it a receive ring that has wrapped drops every further packet without ever asking for the message it is missing, and the peer never recovers' },
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker: every confirmed peer, or this is not a send'
+       Why    = '0003: without it a custom packet accepted by one peer of ten is reported to the caller as sent, so the application drops it and the other nine never see it' }
 )
 
 Step 'checking the patches are in the vendored source'

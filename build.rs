@@ -62,6 +62,22 @@ mod tox {
 
         println!("cargo:rerun-if-changed={}", tox.join("CMakeLists.txt").display());
 
+        // **And the sources themselves, because they are ours to edit now.**
+        //
+        // While the tree was fetched and patched at build time this was
+        // unnecessary: a change meant a re-fetch, which recreated the whole
+        // directory. The tree is committed and patched in place now, so without
+        // these lines an edit to `group_chats.c` produces `Finished in 0.57s`
+        // and a binary containing the *previous* library — measured, on the
+        // first edit after the trees were committed. That is the same shape as
+        // the defect that cost this project a day: something that looks built,
+        // links, runs, and is missing the change.
+        //
+        // A directory is walked by cargo, so this covers every file the library
+        // is made of without listing them.
+        println!("cargo:rerun-if-changed={}", tox.join("toxcore").display());
+        println!("cargo:rerun-if-changed={}", tox.join("third_party/cmp").display());
+
         let sources = sources(&tox.join("CMakeLists.txt"));
         assert!(
             sources.len() > 40,
