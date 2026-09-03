@@ -146,6 +146,16 @@ const REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 /// seconds to find a founder looks like from the other side.
 const REANNOUNCE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How often a frozen peer looks again at whether it may deal.
+///
+/// A freeze is `§6.3`'s answer to two peers disagreeing at a boundary
+/// checkpoint, and it ends when the round resolves to one value. Nothing tells
+/// this loop that it ended, so the timer that would have opened the next hand
+/// is pushed forward by this much instead of being thrown away, and the first
+/// tick after the freeze lifts deals. Five seconds because that is already the
+/// showdown pause, so a resumed table behaves like one that never stopped.
+const FROZEN_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How many providers already tried may be tried **again** in one answer.
 ///
 /// **A separate count, because a first dial and a re-dial are not the same
@@ -3705,6 +3715,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     frozen_said = false;
                 }
                 if let Some((k, _)) = frozen {
+                    // **Re-armed, not consumed.** The line above cleared the
+                    // timer before this branch was reached, and nothing puts it
+                    // back: `*frozen = None` on reconciliation sends its warning
+                    // and touches no timer, and the only other arming site fires
+                    // when a hand *ends*, which cannot happen while none starts.
+                    // So a peer that froze and then reconciled announced *the
+                    // divergence reconciled* and then dealt nothing for the rest
+                    // of its life.
+                    //
+                    // Clearing it was not wrong on its own — leaving it set makes
+                    // this arm fire every tick — so the timer is pushed forward
+                    // instead. The peer re-checks on a slow cadence while frozen
+                    // and deals on the first tick after the freeze lifts, with no
+                    // plumbing between `§6.3`'s reconciliation and this loop's
+                    // locals.
+                    next_hand_at =
+                        Some(tokio::time::Instant::now() + FROZEN_RECHECK);
                     if !frozen_said {
                         frozen_said = true;
                         let _ = events
