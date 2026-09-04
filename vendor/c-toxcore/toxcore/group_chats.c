@@ -2511,6 +2511,14 @@ static int handle_gc_ping(GC_Chat *_Nonnull chat, GC_Connection *_Nonnull gconn,
                     && !ipport_equal(&gconn->addr.ip_port, &ip_port)) {
                 LOGGER_DEBUG(chat->log, "refused a ping-carried address for a peer we hear directly");
             } else {
+                /* p2p-poker: say when a peer's stored address changes (ping). */
+                if (gcc_ip_port_is_set(gconn) && !ipport_equal(&gconn->addr.ip_port, &ip_port)) {
+                    Ip_Ntoa old_str;
+                    Ip_Ntoa new_str;
+                    LOGGER_DEBUG(chat->log, "ping changed a peer's address from %s:%u to %s:%u",
+                                 net_ip_ntoa(&gconn->addr.ip_port.ip, &old_str), net_ntohs(gconn->addr.ip_port.port),
+                                 net_ip_ntoa(&ip_port.ip, &new_str), net_ntohs(ip_port.port));
+                }
                 gcc_set_ip_port(gconn, &ip_port);
                 add_gc_saved_peers(chat, gconn);
             }
@@ -5758,6 +5766,14 @@ static int handle_gc_handshake_response(const GC_Chat *_Nonnull chat, const IP_P
     }
 
     if (ipp != nullptr) {
+        if (gcc_ip_port_is_set(gconn) && !ipport_equal(&gconn->addr.ip_port, ipp)) {
+            /* p2p-poker: say when a peer's stored address changes (handshake). */
+            Ip_Ntoa old_str;
+            Ip_Ntoa new_str;
+            LOGGER_DEBUG(chat->log, "handshake changed a peer's address from %s:%u to %s:%u",
+                         net_ip_ntoa(&gconn->addr.ip_port.ip, &old_str), net_ntohs(gconn->addr.ip_port.port),
+                         net_ip_ntoa(&ipp->ip, &new_str), net_ntohs(ipp->port));
+        }
         gcc_set_ip_port(gconn, ipp);
         gconn->last_received_direct_time = mono_time_get(chat->mono_time);
     }
@@ -5880,6 +5896,14 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
     }
 
     if (ipp != nullptr) {
+        if (gcc_ip_port_is_set(gconn) && !ipport_equal(&gconn->addr.ip_port, ipp)) {
+            /* p2p-poker: say when a peer's stored address changes (handshake). */
+            Ip_Ntoa old_str;
+            Ip_Ntoa new_str;
+            LOGGER_DEBUG(chat->log, "handshake changed a peer's address from %s:%u to %s:%u",
+                         net_ip_ntoa(&gconn->addr.ip_port.ip, &old_str), net_ntohs(gconn->addr.ip_port.port),
+                         net_ip_ntoa(&ipp->ip, &new_str), net_ntohs(ipp->port));
+        }
         gcc_set_ip_port(gconn, ipp);
         gconn->last_received_direct_time = mono_time_get(chat->mono_time);
     }
@@ -6176,6 +6200,9 @@ static bool handle_gc_lossless_packet(const GC_Session *_Nonnull c, GC_Chat *_No
                                       const uint8_t *_Nonnull packet, uint16_t length, bool direct_conn, void *_Nullable userdata)
 {
     if (length < GC_MIN_LOSSLESS_PAYLOAD_SIZE) {
+        /* p2p-poker: this returned silently; S1-BN's enumeration of the
+         * receive path found these two to be the only drops with no line. */
+        LOGGER_DEBUG(chat->log, "lossless packet too short: %u", length);
         return false;
     }
 
@@ -6184,6 +6211,7 @@ static bool handle_gc_lossless_packet(const GC_Session *_Nonnull c, GC_Chat *_No
     GC_Connection *gconn = get_gc_connection(chat, peer_number);
 
     if (gconn == nullptr) {
+        LOGGER_DEBUG(chat->log, "lossless packet from a peer this group does not hold");
         return false;
     }
 
@@ -6602,6 +6630,29 @@ static int handle_gc_udp_packet(void *_Nonnull object, const IP_Port *_Nonnull s
 
     const uint8_t *payload = packet + 1 + ENC_PUBLIC_KEY_SIZE;
     uint16_t payload_len = length - 1 - ENC_PUBLIC_KEY_SIZE;
+
+    /* p2p-poker: a packet from an address other than the one held for its peer.
+     *
+     * S1-BN: one direction of one pair went dark for exactly the 58 s peer
+     * timeout while the other direction flowed, both carriers reported clean,
+     * and no line on either node said what address a peer was held at or
+     * arrived from. Whatever re-addressed that pair could not be seen. DEBUG,
+     * so it costs nothing outside the fault-harness build. */
+    if (packet_type == NET_PACKET_GC_LOSSLESS || packet_type == NET_PACKET_GC_LOSSY) {
+        const int seen_peer = get_peer_number_of_enc_pk(chat, sender_pk, false);
+        const GC_Connection *seen_gconn = get_gc_connection(chat, seen_peer);
+
+        if (seen_gconn != nullptr && gcc_ip_port_is_set(seen_gconn)
+                && !ipport_equal(&seen_gconn->addr.ip_port, source)) {
+            Ip_Ntoa held_str;
+            Ip_Ntoa from_str;
+            LOGGER_DEBUG(chat->log, "peer %d arrived from %s:%u but is held at %s:%u", seen_peer,
+                         net_ip_ntoa(&source->ip, &from_str), net_ntohs(source->port),
+                         net_ip_ntoa(&seen_gconn->addr.ip_port.ip, &held_str),
+                         net_ntohs(seen_gconn->addr.ip_port.port));
+        }
+    }
+
     bool ret = false;
 
     switch (packet_type) {
@@ -7280,8 +7331,20 @@ static void do_self_connection(const GC_Session *_Nonnull c, GC_Chat *_Nonnull c
         return;
     }
 
+    /* p2p-poker: our own UDP status or self address changed. S1-BN: this is
+     * the address a ping may carry to peers, and nothing said when it moved. */
+    const IP_Port self_before = chat->self_ip_port;
     const unsigned int self_udp_status = ipport_self_copy(c->messenger->dht, &chat->self_ip_port);
     const bool udp_change = (chat->self_udp_status != self_udp_status) && (self_udp_status != SELF_UDP_STATUS_NONE);
+
+    if (udp_change || !ipport_equal(&self_before, &chat->self_ip_port)) {
+        Ip_Ntoa old_str;
+        Ip_Ntoa new_str;
+        LOGGER_DEBUG(chat->log, "self udp status %u -> %u, self address %s:%u -> %s:%u",
+                     (unsigned int)chat->self_udp_status, self_udp_status,
+                     net_ip_ntoa(&self_before.ip, &old_str), net_ntohs(self_before.port),
+                     net_ip_ntoa(&chat->self_ip_port.ip, &new_str), net_ntohs(chat->self_ip_port.port));
+    }
 
     // We flag a group announce if our UDP status has changed since last run, or if our last announced TCP
     // relay is no longer valid. Additionally, we will always flag an announce in the specified interval

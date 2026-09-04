@@ -118,6 +118,7 @@ typedef struct GC_Connection {
 
     int         tcp_connection_num;
     int32_t     friend_number; /* The messenger friend number associated with this group connection. Used to discover the peer's IP/port if it wasn't available during the initial invite. */
+    bool        last_send_was_direct; /* p2p-poker: so gcc_send_packet can say when the path flips (S1-BN) */
     uint64_t    last_sent_tcp_relays_time;  /* the last time we attempted to send this peer our tcp relays */
     uint16_t    tcp_relay_share_index;
     uint64_t    last_received_direct_time;   /* the last time we received a direct UDP packet from this connection */

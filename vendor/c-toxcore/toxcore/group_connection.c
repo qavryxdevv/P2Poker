@@ -744,6 +744,17 @@ void gcc_resend_packets(const GC_Chat *chat, GC_Connection *gconn)
         const uint64_t delta = array_entry_loop->last_send_try - array_entry_loop->time_added;
         array_entry_loop->last_send_try = tm;
 
+        /* p2p-poker: the first blind re-send of the head of the array, with
+         * where it is going and how. S1-BN: a stuck head was only ever
+         * announced 58 s later, when the peer was already being dropped. */
+        if (i == start && delta == 2) {
+            Ip_Ntoa dst_str;
+            LOGGER_DEBUG(chat->log, "first blind re-send of message %llu to %s:%u (%s)",
+                         (unsigned long long)array_entry_loop->message_id,
+                         net_ip_ntoa(&gconn->addr.ip_port.ip, &dst_str), net_ntohs(gconn->addr.ip_port.port),
+                         gcc_conn_is_direct(chat->mono_time, gconn) ? "direct" : "relayed");
+        }
+
         /* if this occurrs less than once per second this won't be reliable */
         if (delta > 1 && is_power_of_2(delta)) {
             gcc_encrypt_and_send_lossless_packet(chat, gconn, array_entry_loop->data, array_entry_loop->data_length,
@@ -759,6 +770,23 @@ bool gcc_send_packet(const GC_Chat *chat, GC_Connection *gconn, const uint8_t *p
     }
 
     bool direct_send_attempt = false;
+
+    /* p2p-poker: a connection flipped between direct and relayed.
+     *
+     * S1-BN. "direct" is decided by the inbound side alone, the direct branch
+     * below returns the bare sendto result with no fallback, and nothing said
+     * when a peer crossed that line. One line per crossing. */
+    {
+        const bool direct_now = gcc_direct_conn_is_possible(chat, gconn)
+                                && gcc_conn_is_direct(chat->mono_time, gconn);
+
+        if (direct_now != gconn->last_send_was_direct) {
+            Ip_Ntoa dst_str;
+            LOGGER_DEBUG(chat->log, "sends to %s:%u are now %s", net_ip_ntoa(&gconn->addr.ip_port.ip, &dst_str),
+                         net_ntohs(gconn->addr.ip_port.port), direct_now ? "direct" : "relayed");
+            gconn->last_send_was_direct = direct_now;
+        }
+    }
 
     if (gcc_direct_conn_is_possible(chat, gconn)) {
         if (gcc_conn_is_direct(chat->mono_time, gconn)) {
