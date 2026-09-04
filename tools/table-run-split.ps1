@@ -35,6 +35,20 @@
 param(
     [ValidateRange(1, 9)][int]$Here = 5,
     [ValidateRange(1, 9)][int]$There = 5,
+    # **420 covers everything a run is read for. Longer is habit, not method.**
+    #
+    # Measured over five ten-seat runs on 2026-09-04: the founder sealed the
+    # table between 18.7 s and 153.6 s, and every timeout certificate this
+    # register has a timestamp for landed between 289.8 s and 358.2 s. Seven
+    # minutes therefore contains formation with a wide margin and the whole of
+    # the window where a seat is first voted out, which are the two things a
+    # run is looked at for.
+    #
+    # Fifteen minutes was passed on the command line all day and bought
+    # nothing but a slower loop: the last eight minutes of a 900-second run
+    # have never yet changed a reading. Ask for longer only when the question
+    # is specifically about the long tail -- throughput drift, a late
+    # divergence, a peer that flaps -- and say so when you do.
     [ValidateRange(60, 3600)][int]$Seconds = 420,
     [string]$Target = 'user@172.16.0.20',
     [string]$KeyPath = 'X:\keys\far-machine-key',
