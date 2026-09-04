@@ -4477,6 +4477,53 @@ bool tox_group_send_custom_packet(
     const uint8_t data[], size_t length,
     Tox_Err_Group_Send_Custom_Packet *error);
 
+/**
+ * @brief Ask a peer to re-send the message we are missing from it.
+ *
+ * p2p-poker: ask the peer for the message this stage is waiting on.
+ *
+ * The blind repair schedule in `gcc_resend_packets` puts the sender's attempts
+ * in the seconds T+3, T+5, T+9, T+17 and T+33, and the application's own stage
+ * budget is 30 s — so a message whose early attempts are refused by the wire
+ * arrives after the stage that was waiting for it has already expired, and its
+ * sender is voted out for a message that was in flight.
+ *
+ * The carrier already has a fast path: `GR_ACK_REQ` is answered by an immediate
+ * retransmission with no backoff at all, one round trip. It is only ever used
+ * when the receiver can SEE a hole, which needs a later message to have arrived
+ * — and a stage waiting on one seat usually has nothing later to reveal it.
+ * The application does know, and this is how it says so.
+ *
+ * Costs one small lossy packet, throttled by `gc_send_message_ack` to one per
+ * second per connection. Harmless when the peer never sent the message: the
+ * sender's handler looks the id up in its send array and does nothing if it is
+ * not there, so a genuinely silent seat is not helped and not disturbed.
+ *
+ * Nothing here changes a packet format, a packet type or the retransmit
+ * schedule: `GR_ACK_REQ` is stock toxcore and a stock peer answers it.
+ *
+ * @param group_number The group the peer is in.
+ * @param peer_public_key The peer's real encryption public key.
+ *
+ * @return true if the request was sent or is already pending this second.
+ */
+bool tox_group_peer_request_missing(
+    const Tox *tox, Tox_Group_Number group_number,
+    const uint8_t peer_public_key[]);
+
+/**
+ * @brief How many messages from this peer are stalled behind a hole.
+ *
+ * Positive evidence that the peer is talking and the carrier is mid-delivery,
+ * which is what the application needs before it decides a seat is silent.
+ * Reads local memory and sends nothing.
+ *
+ * @return the count, or 0 if the group or the peer is not found.
+ */
+uint16_t tox_group_peer_recv_pending(
+    const Tox *tox, Tox_Group_Number group_number,
+    const uint8_t peer_public_key[]);
+
 typedef enum Tox_Err_Group_Send_Custom_Private_Packet {
 
     /**

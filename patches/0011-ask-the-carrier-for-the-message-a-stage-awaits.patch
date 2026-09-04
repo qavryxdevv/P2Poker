@@ -1,0 +1,200 @@
+diff --git a/vendor/c-toxcore/toxcore/group_connection.c b/vendor/c-toxcore/toxcore/group_connection.c
+index 2b6a217..3cf1b32 100644
+--- a/vendor/c-toxcore/toxcore/group_connection.c
++++ b/vendor/c-toxcore/toxcore/group_connection.c
+@@ -300,6 +300,25 @@ bool gcc_send_lossless_packet_fragments(const GC_Chat *chat, GC_Connection *gcon
+     return true;
+ }
+ 
++/* p2p-poker: how many messages are stalled behind a hole. See the header for
++ * why the application needs this before it decides a seat is silent. */
++uint16_t gcc_recv_pending(const GC_Connection *gconn)
++{
++    if (gconn->recv_array == nullptr) {
++        return 0;
++    }
++
++    uint16_t pending = 0;
++
++    for (uint16_t i = 0; i < GCC_BUFFER_SIZE; ++i) {
++        if (!array_entry_is_empty(&gconn->recv_array[i])) {
++            ++pending;
++        }
++    }
++
++    return pending;
++}
++
+ bool gcc_handle_ack(const Logger *log, const Memory *mem, GC_Connection *gconn, uint64_t message_id)
+ {
+     uint16_t idx = gcc_get_array_index(message_id);
+diff --git a/vendor/c-toxcore/toxcore/group_connection.h b/vendor/c-toxcore/toxcore/group_connection.h
+index 05b3686..4f04489 100644
+--- a/vendor/c-toxcore/toxcore/group_connection.h
++++ b/vendor/c-toxcore/toxcore/group_connection.h
+@@ -63,6 +63,21 @@ uint16_t gcc_get_array_index(uint64_t message_id);
+  */
+ bool gcc_handle_ack(const Logger *_Nonnull log, const Memory *_Nonnull mem, GC_Connection *_Nonnull gconn, uint64_t message_id);
+ 
++/** @brief How many messages from this peer are stalled behind a hole.
++ *
++ * p2p-poker: how many messages are stalled behind a hole.
++ *
++ * An entry sits in `recv_array` when it arrived out of order: the peer sent it,
++ * it got here, and it cannot be delivered because something earlier has not.
++ * A non-zero count is therefore positive evidence that the peer is **talking**
++ * and that the gap is the carrier's, not the peer's silence — which is exactly
++ * the distinction the application cannot otherwise make, and the one it needs
++ * before it accuses a seat of not speaking.
++ *
++ * Reads local memory and sends nothing.
++ */
++uint16_t gcc_recv_pending(const GC_Connection *_Nonnull gconn);
++
+ /** @brief Sets the send_message_id and send_array_start for `gconn` to `id`.
+  *
+  * This should only be used to initialize a new lossless connection.
+diff --git a/vendor/c-toxcore/toxcore/tox.c b/vendor/c-toxcore/toxcore/tox.c
+index 4a5ce14..53d94de 100644
+--- a/vendor/c-toxcore/toxcore/tox.c
++++ b/vendor/c-toxcore/toxcore/tox.c
+@@ -26,6 +26,7 @@
+ #include "group.h"
+ #include "group_chats.h"
+ #include "group_common.h"
++#include "group_connection.h"
+ #include "logger.h"
+ #include "mem.h"
+ #include "mono_time.h"
+@@ -4118,6 +4119,73 @@ Tox_Group_Message_Id tox_group_send_private_message(const Tox *_Nonnull tox, uin
+     return -1;
+ }
+ 
++bool tox_group_peer_request_missing(const Tox *_Nonnull tox, uint32_t group_number,
++                                   const uint8_t *_Nonnull peer_public_key)
++{
++    assert(tox != nullptr);
++
++    tox_lock(tox);
++    const GC_Chat *chat = gc_get_group(tox->m->group_handler, group_number);
++
++    if (chat == nullptr) {
++        tox_unlock(tox);
++        return false;
++    }
++
++    const int peer_number = get_peer_number_of_enc_pk(chat, peer_public_key, false);
++
++    if (peer_number < 0) {
++        tox_unlock(tox);
++        return false;
++    }
++
++    GC_Connection *gconn = get_gc_connection(chat, peer_number);
++
++    if (gconn == nullptr) {
++        tox_unlock(tox);
++        return false;
++    }
++
++    /* The next id we have not seen: exactly the one a stage waiting on this
++     * peer is missing. `gc_send_message_ack` throttles this to one per second
++     * per connection by itself. */
++    const bool ret = gc_send_message_ack(chat, gconn, gconn->received_message_id + 1, GR_ACK_REQ);
++    tox_unlock(tox);
++    return ret;
++}
++
++uint16_t tox_group_peer_recv_pending(const Tox *_Nonnull tox, uint32_t group_number,
++                                     const uint8_t *_Nonnull peer_public_key)
++{
++    assert(tox != nullptr);
++
++    tox_lock(tox);
++    const GC_Chat *chat = gc_get_group(tox->m->group_handler, group_number);
++
++    if (chat == nullptr) {
++        tox_unlock(tox);
++        return 0;
++    }
++
++    const int peer_number = get_peer_number_of_enc_pk(chat, peer_public_key, false);
++
++    if (peer_number < 0) {
++        tox_unlock(tox);
++        return 0;
++    }
++
++    const GC_Connection *gconn = get_gc_connection(chat, peer_number);
++
++    if (gconn == nullptr) {
++        tox_unlock(tox);
++        return 0;
++    }
++
++    const uint16_t pending = gcc_recv_pending(gconn);
++    tox_unlock(tox);
++    return pending;
++}
++
+ bool tox_group_send_custom_packet(const Tox *_Nonnull tox, uint32_t group_number, bool lossless, const uint8_t *_Nonnull data,
+                                   size_t length, Tox_Err_Group_Send_Custom_Packet *_Nullable error)
+ {
+diff --git a/vendor/c-toxcore/toxcore/tox.h b/vendor/c-toxcore/toxcore/tox.h
+index 30f14fe..c72221b 100644
+--- a/vendor/c-toxcore/toxcore/tox.h
++++ b/vendor/c-toxcore/toxcore/tox.h
+@@ -4477,6 +4477,53 @@ bool tox_group_send_custom_packet(
+     const uint8_t data[], size_t length,
+     Tox_Err_Group_Send_Custom_Packet *error);
+ 
++/**
++ * @brief Ask a peer to re-send the message we are missing from it.
++ *
++ * p2p-poker: ask the peer for the message this stage is waiting on.
++ *
++ * The blind repair schedule in `gcc_resend_packets` puts the sender's attempts
++ * in the seconds T+3, T+5, T+9, T+17 and T+33, and the application's own stage
++ * budget is 30 s — so a message whose early attempts are refused by the wire
++ * arrives after the stage that was waiting for it has already expired, and its
++ * sender is voted out for a message that was in flight.
++ *
++ * The carrier already has a fast path: `GR_ACK_REQ` is answered by an immediate
++ * retransmission with no backoff at all, one round trip. It is only ever used
++ * when the receiver can SEE a hole, which needs a later message to have arrived
++ * — and a stage waiting on one seat usually has nothing later to reveal it.
++ * The application does know, and this is how it says so.
++ *
++ * Costs one small lossy packet, throttled by `gc_send_message_ack` to one per
++ * second per connection. Harmless when the peer never sent the message: the
++ * sender's handler looks the id up in its send array and does nothing if it is
++ * not there, so a genuinely silent seat is not helped and not disturbed.
++ *
++ * Nothing here changes a packet format, a packet type or the retransmit
++ * schedule: `GR_ACK_REQ` is stock toxcore and a stock peer answers it.
++ *
++ * @param group_number The group the peer is in.
++ * @param peer_public_key The peer's real encryption public key.
++ *
++ * @return true if the request was sent or is already pending this second.
++ */
++bool tox_group_peer_request_missing(
++    const Tox *tox, Tox_Group_Number group_number,
++    const uint8_t peer_public_key[]);
++
++/**
++ * @brief How many messages from this peer are stalled behind a hole.
++ *
++ * Positive evidence that the peer is talking and the carrier is mid-delivery,
++ * which is what the application needs before it decides a seat is silent.
++ * Reads local memory and sends nothing.
++ *
++ * @return the count, or 0 if the group or the peer is not found.
++ */
++uint16_t tox_group_peer_recv_pending(
++    const Tox *tox, Tox_Group_Number group_number,
++    const uint8_t peer_public_key[]);
++
+ typedef enum Tox_Err_Group_Send_Custom_Private_Packet {
+ 
+     /**

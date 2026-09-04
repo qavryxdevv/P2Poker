@@ -300,6 +300,25 @@ bool gcc_send_lossless_packet_fragments(const GC_Chat *chat, GC_Connection *gcon
     return true;
 }
 
+/* p2p-poker: how many messages are stalled behind a hole. See the header for
+ * why the application needs this before it decides a seat is silent. */
+uint16_t gcc_recv_pending(const GC_Connection *gconn)
+{
+    if (gconn->recv_array == nullptr) {
+        return 0;
+    }
+
+    uint16_t pending = 0;
+
+    for (uint16_t i = 0; i < GCC_BUFFER_SIZE; ++i) {
+        if (!array_entry_is_empty(&gconn->recv_array[i])) {
+            ++pending;
+        }
+    }
+
+    return pending;
+}
+
 bool gcc_handle_ack(const Logger *log, const Memory *mem, GC_Connection *gconn, uint64_t message_id)
 {
     uint16_t idx = gcc_get_array_index(message_id);

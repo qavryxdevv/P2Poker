@@ -73,10 +73,40 @@ mod tox {
         // the defect that cost this project a day: something that looks built,
         // links, runs, and is missing the change.
         //
-        // A directory is walked by cargo, so this covers every file the library
-        // is made of without listing them.
-        println!("cargo:rerun-if-changed={}", tox.join("toxcore").display());
-        println!("cargo:rerun-if-changed={}", tox.join("third_party/cmp").display());
+        // **Name every file. A directory is not enough, and the belief that it
+        // was cost four days of stale library.**
+        //
+        // This was two `rerun-if-changed` lines naming the two directories,
+        // with a comment saying cargo walks a directory so the files need not
+        // be listed. On this platform it does not: editing a file *inside*
+        // `toxcore/` leaves the directory's own mtime alone, nothing looks
+        // changed, and the C is not recompiled. Measured on 2026-09-04, adding
+        // two entry points to `tox.c` and `group_connection.c`: `cargo build`
+        // reported `Finished`, and `libtoxcore.a` in the target directory was
+        // still the one built on 2026-08-31, without either symbol in it. The
+        // comment those lines carried is the one directly above, warning about
+        // exactly this failure — it was written for the previous instance of it
+        // and the fix it describes did not hold.
+        //
+        // So: one line per file, which is what cargo is documented to honour
+        // without qualification. A few hundred lines of build output is a small
+        // price for a library that is actually the source next to it.
+        for dir in [tox.join("toxcore"), tox.join("third_party/cmp")] {
+            let mut stack = vec![dir];
+            while let Some(d) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&d) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        println!("cargo:rerun-if-changed={}", path.display());
+                    }
+                }
+            }
+        }
 
         let sources = sources(&tox.join("CMakeLists.txt"));
         assert!(

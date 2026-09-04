@@ -125,7 +125,7 @@ $patched = @(
        Marker = 'no room for the first chunk of a fragmented packet'
        Why    = '0005: diagnostic. Without it the fragmenting send path fails silently three times over, and the conservation identity that found S1-AM (array failures = receive drops + send refusals) is left with an unexplained residue' },
     @{ File   = 'toxcore/group_chats.c'
-       Marker = 'is confirmed but cannot be sent to; not waited for'
+       Marker = 'is confirmed but cannot be sent to'
        Why    = '0006: corrects 0003. Without it the denominator counts peers send_lossless_group_packet refuses outright - not handshaked, or pending delete - so one peer mid-handshake makes every send fail for ever and one re-handshaking peer stops the whole table' },
     @{ File   = 'toxcore/group_connection.c'
        Marker = 'Failed to create %s array entry'
@@ -136,6 +136,21 @@ $patched = @(
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker: receiving a packet is not requesting one'
        Why    = '0009: without it handle_gc_lossless_helper stamps last_requested_packet_time on every successfully handled packet, and that field is the sole gate on GR_ACK_REQ - so a receiver cannot ask for a missing message for the rest of any second in which it handled anything, the fast one-RTT repair path is switched off, and recovery falls to the senders blind retry whose floor is three seconds' },
+    @{ File   = 'toxcore/tox.h'
+       Marker = 'p2p-poker: ask the peer for the message this stage is waiting on'
+       Why    = '0011: without it the application cannot tell the carrier which message a stalled stage is waiting for, so the one-round-trip GR_ACK_REQ repair is only ever reached by accident - when a LATER message happens to arrive and reveal the hole. A stage waiting on a single seat has nothing later to reveal it, so recovery falls to the blind ladder at T+3/+5/+9/+17/+33 and the 30 s stage budget expires first, certifying out a seat whose message was in flight' },
+    @{ File   = 'toxcore/group_connection.c'
+       Marker = 'p2p-poker: how many messages are stalled behind a hole'
+       Why    = '0011: without it the vote cannot tell a peer the carrier is mid-delivery with from a peer that is genuinely silent, and accuses both. recv_array holds messages that arrived out of order, so a non-zero count is positive evidence the peer is talking' },
+    # **The retransmit ladder is frozen by this list.** `CARRIER_LADDER_LAST_MS`
+    # in src/protocol/constants.rs is derived from `gcc_resend_packets` firing on
+    # `delta > 1 && is_power_of_2(delta)`, and nothing in a Rust build can notice
+    # if that changes. 0011 deliberately adds a new entry point beside the ladder
+    # rather than editing it, and no later patch may edit it either: change the
+    # ladder and the constant silently becomes a lie.
+    @{ File   = 'toxcore/group_connection.c'
+       Marker = 'delta > 1 && is_power_of_2(delta)'
+       Why    = 'the retransmit ladder T+3/+5/+9/+17/+33, which src/protocol/constants.rs mirrors as CARRIER_LADDER_LAST_MS and asserts the stage budget against. If this marker is gone the ladder was edited and that constant is stale - re-derive it before anything else' },
     @{ File   = 'toxcore/group_connection.c'
        Marker = 'p2p-poker: read the id BEFORE the entry is wiped'
        Why    = '0010: without it process_recv_array_entry acks every drained message with id 0, because clear_array_entry zeroes the struct before array_entry->message_id is read - so the senders slot is never cleared, its time_added never moves, and gcc_resend_packets drops the peer at 58 s unless a later blind duplicate happens to ack it correctly' }

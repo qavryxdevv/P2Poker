@@ -63,6 +63,21 @@ uint16_t gcc_get_array_index(uint64_t message_id);
  */
 bool gcc_handle_ack(const Logger *_Nonnull log, const Memory *_Nonnull mem, GC_Connection *_Nonnull gconn, uint64_t message_id);
 
+/** @brief How many messages from this peer are stalled behind a hole.
+ *
+ * p2p-poker: how many messages are stalled behind a hole.
+ *
+ * An entry sits in `recv_array` when it arrived out of order: the peer sent it,
+ * it got here, and it cannot be delivered because something earlier has not.
+ * A non-zero count is therefore positive evidence that the peer is **talking**
+ * and that the gap is the carrier's, not the peer's silence — which is exactly
+ * the distinction the application cannot otherwise make, and the one it needs
+ * before it accuses a seat of not speaking.
+ *
+ * Reads local memory and sends nothing.
+ */
+uint16_t gcc_recv_pending(const GC_Connection *_Nonnull gconn);
+
 /** @brief Sets the send_message_id and send_array_start for `gconn` to `id`.
  *
  * This should only be used to initialize a new lossless connection.

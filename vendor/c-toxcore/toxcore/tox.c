@@ -26,6 +26,7 @@
 #include "group.h"
 #include "group_chats.h"
 #include "group_common.h"
+#include "group_connection.h"
 #include "logger.h"
 #include "mem.h"
 #include "mono_time.h"
@@ -4116,6 +4117,73 @@ Tox_Group_Message_Id tox_group_send_private_message(const Tox *_Nonnull tox, uin
     LOGGER_FATAL(tox->m->log, "impossible return value: %d", ret);
 
     return -1;
+}
+
+bool tox_group_peer_request_missing(const Tox *_Nonnull tox, uint32_t group_number,
+                                   const uint8_t *_Nonnull peer_public_key)
+{
+    assert(tox != nullptr);
+
+    tox_lock(tox);
+    const GC_Chat *chat = gc_get_group(tox->m->group_handler, group_number);
+
+    if (chat == nullptr) {
+        tox_unlock(tox);
+        return false;
+    }
+
+    const int peer_number = get_peer_number_of_enc_pk(chat, peer_public_key, false);
+
+    if (peer_number < 0) {
+        tox_unlock(tox);
+        return false;
+    }
+
+    GC_Connection *gconn = get_gc_connection(chat, peer_number);
+
+    if (gconn == nullptr) {
+        tox_unlock(tox);
+        return false;
+    }
+
+    /* The next id we have not seen: exactly the one a stage waiting on this
+     * peer is missing. `gc_send_message_ack` throttles this to one per second
+     * per connection by itself. */
+    const bool ret = gc_send_message_ack(chat, gconn, gconn->received_message_id + 1, GR_ACK_REQ);
+    tox_unlock(tox);
+    return ret;
+}
+
+uint16_t tox_group_peer_recv_pending(const Tox *_Nonnull tox, uint32_t group_number,
+                                     const uint8_t *_Nonnull peer_public_key)
+{
+    assert(tox != nullptr);
+
+    tox_lock(tox);
+    const GC_Chat *chat = gc_get_group(tox->m->group_handler, group_number);
+
+    if (chat == nullptr) {
+        tox_unlock(tox);
+        return 0;
+    }
+
+    const int peer_number = get_peer_number_of_enc_pk(chat, peer_public_key, false);
+
+    if (peer_number < 0) {
+        tox_unlock(tox);
+        return 0;
+    }
+
+    const GC_Connection *gconn = get_gc_connection(chat, peer_number);
+
+    if (gconn == nullptr) {
+        tox_unlock(tox);
+        return 0;
+    }
+
+    const uint16_t pending = gcc_recv_pending(gconn);
+    tox_unlock(tox);
+    return pending;
 }
 
 bool tox_group_send_custom_packet(const Tox *_Nonnull tox, uint32_t group_number, bool lossless, const uint8_t *_Nonnull data,
