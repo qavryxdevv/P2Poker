@@ -3824,9 +3824,20 @@ impl Hand {
                     "settlement disagreement with seat {seat} in a field this report does not enumerate                      - HandComplete::disagreement is missing a field the derive compares"
                 )
             } else {
+                // **And where this client's own view stands.** Two state
+                // hashes name a disagreement and nothing else; the sequence
+                // and the head this client hashed into `transcript_head` let
+                // two nodes' notes be lined up offline. Measured before this:
+                // one hand in two camps with every chip equal, and no way to
+                // say from nine logs which field differed.
                 format!(
-                    "settlement disagreement with seat {seat}: {}",
-                    what.join("; ")
+                    "settlement disagreement with seat {seat}: {}; my view is at sequence {} with head {}",
+                    what.join("; "),
+                    self.slot.sequence,
+                    self.slot.previous_event_hash[..4]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
                 )
             });
             // **Noted, not refused — and that one word is the whole of `S1-BD`.**
@@ -5481,8 +5492,13 @@ impl Hand {
                 )
             } else {
                 format!(
-                    "late settlement disagreement with seat {seat}: {}",
-                    what.join("; ")
+                    "late settlement disagreement with seat {seat}: {}; my view is at sequence {} with head {}",
+                    what.join("; "),
+                    self.slot.sequence,
+                    self.slot.previous_event_hash[..4]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
                 )
             })
         };
