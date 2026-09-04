@@ -279,10 +279,14 @@ pub enum NodeEvent {
     /// a mid-table silence would matter, and it is a `Warning`, which
     /// `is_advisory` marks droppable.
     ///
-    /// **Not advisory.** A client that has heard nobody must be able to say so
-    /// rather than telling its user it is playing: measured, a seat that never
-    /// entered the group was certified out and exited printing `TABLE FORMED
-    /// seats=10` after 900 s at a table it had been removed from.
+    /// **Advisory, and it has to be.** A client that has heard nobody must be
+    /// able to say so rather than telling its user it is playing — measured, a
+    /// seat that never entered the group was certified out and exited printing
+    /// `TABLE FORMED seats=10` after 900 s at a table it had been removed from.
+    /// But this arrives every housekeeping tick and the verdict needs four
+    /// ticks of silence, so no single reading is load-bearing, and a
+    /// non-advisory send on a full channel stops the whole `select!` — see
+    /// `Events::send`.
     Carrier { seen: u16, want: u16 },
     Swept { now_ms: u64 },
     /// Somebody is in the lobby, under this name.
@@ -374,6 +378,20 @@ impl NodeEvent {
                 | NodeEvent::Swept { .. }
                 | NodeEvent::TableRefused { .. }
                 | NodeEvent::Warning(_)
+                // **A periodic reading, and dropping one costs nothing.**
+                //
+                // This was NOT advisory at first, on the reasoning that what a
+                // client tells its user must not be droppable. That is right
+                // for a one-shot event and wrong for this one: it arrives every
+                // housekeeping tick with the same value, and the verdict it
+                // feeds needs `DEAF_MS` = four ticks of silence to mature, so a
+                // dropped reading delays nothing that can be seen. Waiting for
+                // it, on the other hand, is what the comment on `Events::send`
+                // warns about in so many words — a non-advisory send on a full
+                // channel stops the whole `select!`, timers included, and that
+                // has already cost this project a run where housekeeping did
+                // not fire for three minutes.
+                | NodeEvent::Carrier { .. }
         )
     }
 }
