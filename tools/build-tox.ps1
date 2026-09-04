@@ -135,7 +135,10 @@ $patched = @(
        Why    = '0008: without it a fragmented send that fails part-way rewinds gconn->send_message_id to send_message_id % 65536 - clear_send_queue_id_range assigns start_id back - so past the first 65 536 messages to a peer the whole stream jumps backwards by up to 65 535, every later message reuses a consumed id, and that peer is silently broken for the rest of the session' },
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker: receiving a packet is not requesting one'
-       Why    = '0009: without it handle_gc_lossless_helper stamps last_requested_packet_time on every successfully handled packet, and that field is the sole gate on GR_ACK_REQ - so a receiver cannot ask for a missing message for the rest of any second in which it handled anything, the fast one-RTT repair path is switched off, and recovery falls to the senders blind retry whose floor is three seconds' }
+       Why    = '0009: without it handle_gc_lossless_helper stamps last_requested_packet_time on every successfully handled packet, and that field is the sole gate on GR_ACK_REQ - so a receiver cannot ask for a missing message for the rest of any second in which it handled anything, the fast one-RTT repair path is switched off, and recovery falls to the senders blind retry whose floor is three seconds' },
+    @{ File   = 'toxcore/group_connection.c'
+       Marker = 'p2p-poker: read the id BEFORE the entry is wiped'
+       Why    = '0010: without it process_recv_array_entry acks every drained message with id 0, because clear_array_entry zeroes the struct before array_entry->message_id is read - so the senders slot is never cleared, its time_added never moves, and gcc_resend_packets drops the peer at 58 s unless a later blind duplicate happens to ack it correctly' }
 )
 
 Step 'checking the patches are in the vendored source'

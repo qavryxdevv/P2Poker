@@ -533,7 +533,20 @@ pub fn spawn(tox: Tox, setup: Setup) -> ToxTable {
     // refuses silently when it is full, and refusing a *re-send* is free while
     // refusing a new event costs a seat its deadline.
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
-    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<FromTable>(256);
+    // **Deep enough to absorb one peer's ring releasing at once.**
+    //
+    // It was 256, and 256 is smaller than the burst this transport produces by
+    // construction. A peer whose stream is blocked buffers up to GCC_BUFFER_SIZE
+    // = 2048 messages; when the missing one finally arrives they are all
+    // delivered in a rush. `patches/0009` made that repair happen in one round
+    // trip instead of three seconds, which makes the rush both more frequent and
+    // no smaller.
+    //
+    // Measured, `split101212-10`: 1 282 hand events dropped on one node, 1 018
+    // on another, in bursts of 174 to 602 -- every one of them a game event that
+    // reached this client and went in the bin, and every one of them a seat
+    // diverging from the table. 2048 is that bound rather than a guess.
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<FromTable>(2_048);
     let (ctl_tx, ctl_rx) = sync_mpsc::channel::<Command>();
     let (chat_tx, chat_rx) = tokio::sync::watch::channel::<Option<[u8; 32]>>(None);
     let trouble = Arc::new(Trouble::default());
