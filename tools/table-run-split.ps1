@@ -301,7 +301,7 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         `$start = Get-Date
         `$inv = [System.Globalization.CultureInfo]::InvariantCulture
         & "$FarDir\p2p-poker.exe" --headless $(if ($NoMdns) { '--no-mdns' }) --autoplay --for $Seconds --profile `$p --join $table 2>&1 |
-            ForEach-Object { ((((Get-Date) - `$start).TotalSeconds).ToString('F1', `$inv)).PadLeft(7) + '  ' + `$_ } |
+            ForEach-Object { (Get-Date).ToUniversalTime().ToString('HH:mm:ss.fff', `$inv) + ' ' + ((((Get-Date) - `$start).TotalSeconds).ToString('F1', `$inv)).PadLeft(7) + '  ' + `$_ } |
             Out-File -FilePath `$log -Encoding utf8
     }
     Start-Sleep -Milliseconds 400
@@ -368,9 +368,32 @@ for (`$i = 0; `$i -lt $There; `$i++) {
 
         $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log -ScriptBlock {
             param($exe, $nodeArgs, $log)
+            # **A wall clock, not an elapsed one, because the columns get
+            # compared across nodes.**
+            #
+            # This was `(Get-Date) - $start` with `$start` captured INSIDE the
+            # job, so every log counted from its own zero — and the loop below
+            # sleeps 3 s after the founder and 400 ms after each later seat, so
+            # the zeros were up to 7 s apart in start order. Subtracting two
+            # such columns subtracts nothing, and it produced a clean, stable,
+            # entirely fictitious result: node ranks 0.0, 0.8, 1.4, 2.0, 2.6,
+            # 3.2, 4.1, 4.4, 5.6, 7.1 s apart, with the same node opening every
+            # one of 33 hands first. Reconstructing the origins from message
+            # causality alone reproduced those figures to within 0.2 s, and with
+            # them removed all ten peers open each hand within **0.2 s** and the
+            # order reshuffles every hand.
+            #
+            # The check that should have caught it needs no arithmetic: every
+            # node played exactly 33 hands, so none of them was seven seconds
+            # behind.
+            #
+            # UTC on both hosts, so the two files are directly comparable as
+            # long as the machine clocks are. The elapsed figure is kept beside
+            # it because a run is read in elapsed terms.
             $start = Get-Date
             $inv = [System.Globalization.CultureInfo]::InvariantCulture
             & $exe @nodeArgs 2>&1 | ForEach-Object {
+                (Get-Date).ToUniversalTime().ToString('HH:mm:ss.fff', $inv) + ' ' +
                 ((((Get-Date) - $start).TotalSeconds).ToString('F1', $inv)).PadLeft(7) + '  ' + $_
             } | Out-File -FilePath $log -Encoding utf8
         }
