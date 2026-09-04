@@ -6053,11 +6053,41 @@ bool handle_gc_lossless_helper(const GC_Session *c, GC_Chat *chat, uint32_t peer
         return false;
     }
 
-    peer = get_gc_peer(chat, peer_number);
-
-    if (peer != nullptr) {
-        peer->gconn.last_requested_packet_time = mono_time_get(chat->mono_time);
-    }
+    /* p2p-poker: receiving a packet is not requesting one, and writing this
+     * field here switched off the receiver's own repair path.
+     *
+     * `last_requested_packet_time` has exactly three references in the whole
+     * vendored tree. group_chats.c:5273 READS it -- the only reader -- as the
+     * gate on GR_ACK_REQ; :5277 writes it immediately after that gate, which is
+     * the throttle working as intended; and this line wrote it on EVERY
+     * successfully handled lossless packet. Its own declaration in
+     * group_common.h says what it is for: "The last time we requested a missing
+     * packet from this peer". Requested, not received.
+     *
+     * The effect was that a receiver could not ask for a missing message during
+     * the remainder of any second in which it had successfully handled anything
+     * from that peer. This application's traffic is bursts of events separated
+     * by silence, so the packet that reveals a gap almost always arrives inside
+     * a second that has already handled its neighbours -- the request is
+     * suppressed, and recovery falls through to the sender's blind retry, whose
+     * floor is T+3 seconds (create_array_entry stamps whole seconds and
+     * gcc_resend_packets fires on delta > 1 && is_power_of_2(delta), giving
+     * T+3, T+5, T+9, T+17, T+33).
+     *
+     * That is why the three-second floor was the common case rather than the
+     * exception. handle_gc_message_ack answers a GR_ACK_REQ with an immediate
+     * retransmission and no backoff at all, so the fast path is one round trip
+     * -- 36 to 326 ms on this link -- and it was being gated off by a field
+     * that means something else.
+     *
+     * It also gated `patches/0002`, which asks for the missing message when the
+     * receive ring has wrapped, for the same reason and with the same cost.
+     *
+     * The throttle itself is untouched: 5273 and 5277 still allow one request
+     * per second per connection. Deleting this write can therefore change
+     * nothing except how soon a request may go out, and the peer re-fetch above
+     * it existed only to reach it -- nothing below uses `peer`.
+     */
 
     return true;
 }

@@ -479,6 +479,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // a grep over-counts them, which is a bad property in the one message that
     // says a hand died.
     let mut abort_reported = false;
+    // Hand events dropped for want of a draining reader, said when it moves.
+    let mut inbox_dropped_said: u64 = 0;
     // The last turn told to the interface, so a stage per action does not
     // become a redraw per action.
     let mut turn_reported: Option<(Option<u8>, u64, u64, bool)> = None;
@@ -3381,6 +3383,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // certified late for something it did say looks, from every log
                 // this client writes, like a seat that said nothing. The
                 // difference is here.
+                // **A dropped hand event is a seat diverging, so it is said
+                // the moment it is not zero.** It is not in the line below
+                // because that one is about the transport being behind, and
+                // this is about an event that reached this client and was
+                // thrown away inside it.
+                let dropped = tox_sink.inbox_dropped();
+                if dropped > inbox_dropped_said {
+                    inbox_dropped_said = dropped;
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "{dropped} hand event(s) were received and dropped because this                              client was not draining; a seat that loses one diverges"
+                        )))
+                        .await;
+                }
+
                 let (refused, waiting, sent) = tox_sink.trouble();
                 if waiting > 0 || refused > tox_refused_said {
                     tox_refused_said = refused;

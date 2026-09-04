@@ -426,6 +426,23 @@ impl TableSink {
         }
     }
 
+    /// Hand events received and thrown away because the node loop was not
+    /// draining. Any non-zero value is a seat diverging from the table.
+    pub fn inbox_dropped(&self) -> u64 {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().inbox_dropped.load(Ordering::Relaxed),
+                None => 0,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            0
+        }
+    }
+
     /// **Why** the refusals happened, by `Tox_Err_Group_Send_Custom_Packet`:
     /// index 1 group-not-found, 2 too-long, 3 empty, 4 disconnected,
     /// 5 fail-send. Index 0 is unused.

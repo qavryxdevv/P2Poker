@@ -238,6 +238,17 @@ pub struct Trouble {
     pub waiting: AtomicU64,
     /// Fragments handed to toxcore and accepted.
     pub sent: AtomicU64,
+    /// **Hand events received off the group and thrown away because the node
+    /// loop was not draining.**
+    ///
+    /// Dropping is the right thing to do — blocking here would stop
+    /// `tox_iterate`, and a transport that stalls the network to wait for its
+    /// reader loses the connection as well as the message. Dropping *silently*
+    /// is not: a seat that never sees an event is a seat that diverges, and
+    /// with no counter and no log line a fork of that shape is invisible in
+    /// every log this client writes. Which is the same defect as reading a
+    /// zero that was never measured.
+    pub inbox_dropped: AtomicU64,
     /// Whether every other seat on the roster is in the group right now.
     ///
     /// **Here because a table whose group is not complete deals a hand nobody
@@ -881,6 +892,12 @@ fn run(
                                 // transport that stalls the network to wait for
                                 // its reader is a transport that loses the
                                 // connection as well as the message.
+                                //
+                                // **Counted, because it was silent.** This is a
+                                // game event going into the bin; the seat that
+                                // loses it diverges from the table, and until
+                                // this counter existed nothing anywhere said so.
+                                trouble.inbox_dropped.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         Ok(None) => {}
