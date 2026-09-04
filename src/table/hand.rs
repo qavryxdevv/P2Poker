@@ -666,11 +666,20 @@ pub use crate::protocol::constants::MAX_CONSECUTIVE_AUTO_ACTIONS;
 /// about `dealt_in` is a different `HAND_INIT` at every seat: the chain forks
 /// with nobody lying.
 ///
-/// Hands are agreed by construction. `signed_this_hand` is `P(k)` (§3.2), it is
-/// already inside the end-of-hand state hash, and the bank below is a pure
-/// function of the sequence of those sets from hand one — so two peers that
-/// agree on every `signed_this_hand` agree on every seat's bank, and the
-/// checkpoint that compares one compares the other.
+/// Hands are agreed by construction. `signed_this_hand` is `P(k)` (§3.2) and
+/// the bank below is a pure function of the sequence of those sets from hand
+/// one, so two peers that agree on every `signed_this_hand` agree on every
+/// seat's bank.
+///
+/// **What is no longer true is the second half of that sentence.** It used to
+/// end *"and the checkpoint that compares one compares the other"*, because
+/// §6.1 field 28 hashed `signed_this_hand` into the state hash. Field 28 is
+/// deleted: it was an observation of the listener rather than a fact about the
+/// hand, so two honest peers on a lossy link had to differ in it, and requiring
+/// them to agree removed honest players for it (`S1-AZ` … `S1-BD`). The bank is
+/// still guarded, by the settlement comparison — `on_hand_complete` recomputes
+/// and compares pots, deltas, final stacks, refunds and busted seats — which
+/// never depended on field 28.
 ///
 /// Two hands is about a minute at this table's pace, which is the interval the
 /// owner asked for, expressed in the one unit that cannot drift.
@@ -1278,9 +1287,10 @@ impl Hand {
         // a seat still opens the hand and follows it, which is what §4.9's
         // readmission route needs of it, and says nothing while it does.
         //
-        // **The `signed` bool is the half that bites.** It is
-        // `signed_this_hand`, §6.1 hashes it into `PublicTableState`, and the
-        // settlement carries that hash — so a seat that marked itself into its
+        // **The `signed` bool used to be the half that bit.** It is
+        // `signed_this_hand`, and while §6.1 field 28 hashed it into
+        // `PublicTableState` the settlement carried that hash — so a seat that
+        // marked itself into its
         // own `P(k)` for an event no receiver accepted derived a settlement
         // that differed from everybody's by one bit, and every arriving copy
         // came back `DeckDisagrees { what: "settlement" }`. Measured, and it
@@ -3755,7 +3765,6 @@ impl Hand {
             ledger_in: self.mine.stacks.iter().sum(),
             ledger_out: 0,
             transcript_head: self.slot.previous_event_hash,
-            signed_this_hand: self.heard_from_flags().to_vec(),
         };
         view.state_hash()
             .map_err(|_| Failed::Wire(WireError::Unencodable("the end-of-hand state")))
@@ -3987,9 +3996,11 @@ impl Hand {
     /// # This is not the same question `participants` answers, and that is `S1-V`
     ///
     /// [`participants`](Self::participants) returns the raw `signed` set — who
-    /// was **heard from** — and it is what §6.1 hashes as `signed_this_hand` and
-    /// what §4.9 makes the boundary checkpoint's required set. This method is
-    /// what `R(k+1)` and the whole `grace`/`present_run` fold read.
+    /// was **heard from** — and it is what §4.9 makes the boundary checkpoint's
+    /// required set. It was also §6.1 field 28 until that field was deleted for
+    /// being an observation of the listener rather than a fact about the hand.
+    /// This method is what `R(k+1)` and the whole `grace`/`present_run` fold
+    /// read.
     ///
     /// So the quantity every peer **compares** at the checkpoint and the
     /// quantity every peer **acts on** at the next hand are different
@@ -3999,9 +4010,11 @@ impl Hand {
     /// # The reason given for leaving it open was false, and it was checked
     ///
     /// This comment used to end: *"changing `participants` would move
-    /// `state_hash`, which is a §6.1 wire change"*. **It would not.**
-    /// [`state_hash`](Self::state_hash) fills `signed_this_hand` from
-    /// [`heard_from_flags`](Self::heard_from_flags); `participants()` has no
+    /// `state_hash`, which is a §6.1 wire change"*. **It would not**, and since
+    /// field 28 was deleted the question no longer arises at all:
+    /// [`state_hash`](Self::state_hash) reads neither. It used to fill
+    /// `signed_this_hand` from
+    /// [`heard_from_flags`](Self::heard_from_flags); `participants()` had no
     /// caller inside it, and
     /// outside this file it is read only by `run.rs` to build §4.9's required
     /// emitter set. Changing it moves `P(k)` and leaves §6.1 field 28
@@ -4062,9 +4075,10 @@ impl Hand {
 
     /// [`heard_from`](Self::heard_from) for every seat, in seat order.
     ///
-    /// §6.1 hashes `signed_this_hand` as a flag per seat rather than as a list,
-    /// so [`state_hash`](Self::state_hash) needs this shape. It is the stored
-    /// vector and it is the wire's own ordering, which is why this returns it
+    /// §6.1 hashed `signed_this_hand` as a flag per seat rather than as a list,
+    /// which is where this shape came from; field 28 is now deleted and
+    /// [`state_hash`](Self::state_hash) no longer reads it. It is still the
+    /// stored vector in the wire's own ordering, which is why this returns it
     /// rather than rebuilding it: a rebuild that disagreed with the field by
     /// one element would move field 28 and be found at a boundary checkpoint,
     /// not here.

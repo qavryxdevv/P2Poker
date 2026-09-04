@@ -13,9 +13,38 @@
 //! single normative statement of that order; it was given twice, differently, in
 //! two documents until one was deleted.
 //!
-//! `signed_this_hand` is **appended last** rather than placed with the other
-//! per-seat flags, so the order stays append-only and an older peer's encoding
-//! remains a prefix of a newer one's.
+//! # Field 28 is gone, and it is the only field ever measured to disagree
+//!
+//! `signed_this_hand` was appended last, as *"the seats that signed at least one
+//! chained event of this hand **which this peer accepted**"*. That qualifier is
+//! the defect: it is an observation of the listener, not a fact about the hand,
+//! and two honest peers on a lossy link **must** differ in it. The protocol
+//! nonetheless required them to agree on a hash containing it.
+//!
+//! What that cost, measured on ten-seat two-machine runs (`S1-AZ` … `S1-BD`):
+//! **124 settlement disagreements in one 900-second run, 553 in another, and in
+//! 100 % of them the differing field was this hash** — while the count
+//! mentioning stacks, deltas, pots, refunds or busted seats was **zero**. The
+//! money agreed everywhere, always. A refused settlement then left the seat
+//! still waited for, its action clock ran out, and it was certified out for a
+//! silence it had not committed; **35 % of all timeout accusations named a seat
+//! heard at the very stage it was accused of ignoring**. It could never return,
+//! because §4.9 readmission wants a state hash that agrees about who took part
+//! in a hand the seat did not take part in. And §6.3's freeze, the terminus for
+//! exactly this, fired **zero** times against those 124, because the refusal
+//! that detects the disagreement is also what stops the checkpoint being
+//! reached.
+//!
+//! §6.1 put it here *"so that agreement there is agreement about `P` itself"*.
+//! The measurement says that agreement was never attainable, so the field
+//! detected a difference it could not resolve and removed honest players for it.
+//! Removing it is a truncation of an append-only encoding, which is why it was
+//! last.
+//!
+//! **The settlement comparison is untouched and is what guards the money.**
+//! `on_hand_complete` recomputes and compares the whole `HandComplete` — pots,
+//! deltas, final stacks, refunds, busted — independently of this hash. Chip
+//! conservation does not rest on field 28 and never did.
 //!
 //! # Why the ledger is in here
 //!
@@ -134,13 +163,6 @@ pub struct PublicTableState {
     /// The stage hash of the last completed stage.
     #[cbor(n(27), with = "minicbor::bytes")]
     pub transcript_head: [u8; 32],
-
-    /// `P(k)` as a vector: the seats that signed at least one chained event of
-    /// this hand which this peer accepted.
-    ///
-    /// Appended last so the field order stays append-only.
-    #[n(28)]
-    pub signed_this_hand: Vec<bool>,
 }
 
 impl PublicTableState {
@@ -148,7 +170,7 @@ impl PublicTableState {
     ///
     /// Pinned because a field added anywhere but the end is a silent
     /// incompatibility: the encoding is positional.
-    pub const FIELD_COUNT: usize = 29;
+    pub const FIELD_COUNT: usize = 28;
 
     /// The hash two peers compare at a checkpoint.
     pub fn state_hash(&self) -> Result<Hash, serialization::Error> {
@@ -203,7 +225,6 @@ mod tests {
             ledger_in: 20_000,
             ledger_out: 0,
             transcript_head: [0xEE; 32],
-            signed_this_hand: vec![true, true],
         }
     }
 
@@ -262,7 +283,7 @@ mod tests {
     fn every_field_reaches_the_hash() {
         let base = sample().state_hash().unwrap();
         type Mutate = fn(&mut PublicTableState);
-        let mutations: [(&str, Mutate); 29] = [
+        let mutations: [(&str, Mutate); 28] = [
             ("protocol_version", |s| s.protocol_version = 2),
             ("table_id", |s| s.table_id = [0xFF; 32]),
             ("hand_id", |s| s.hand_id = 8),
@@ -291,7 +312,6 @@ mod tests {
             ("ledger_in", |s| s.ledger_in = 1),
             ("ledger_out", |s| s.ledger_out = 1),
             ("transcript_head", |s| s.transcript_head = [0; 32]),
-            ("signed_this_hand", |s| s.signed_this_hand = vec![true, false]),
         ];
         assert_eq!(mutations.len(), PublicTableState::FIELD_COUNT);
 
