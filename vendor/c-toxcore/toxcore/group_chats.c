@@ -2506,7 +2506,26 @@ static int handle_gc_ping(GC_Chat *_Nonnull chat, GC_Connection *_Nonnull gconn,
              * one is at best redundant and at worst this. Refuse it, and say
              * so, because the count of these is the instrument this fault
              * never had. */
-            if (gcc_conn_is_direct(chat->mono_time, gconn)
+            if (gcc_ip_port_is_set(gconn) && ip_is_lan(&gconn->addr.ip_port.ip)
+                    && !ip_is_lan(&ip_port.ip)) {
+                /* p2p-poker: a LAN address is never replaced by a non-LAN one.
+                 *
+                 * The first run with patch 0013's instrument showed the poison
+                 * happening: at 96 s the far seat's stored addresses for three
+                 * local seats went from 192.168.1.20 to 198.51.100.17 -- this
+                 * LAN's public IP, carried by their pings -- and the refusal
+                 * below did not fire once. It refuses only while the peer is
+                 * heard directly within GCC_UDP_DIRECT_TIMEOUT, and a peer that
+                 * has gone quiet for 16 s is exactly the peer whose address is
+                 * about to be overwritten. This rule needs no timer: a peer we
+                 * hold on our own LAN cannot be better reached through the
+                 * public internet, whatever its ping says. */
+                Ip_Ntoa held_str;
+                Ip_Ntoa new_str;
+                LOGGER_DEBUG(chat->log, "refused a non-LAN address %s:%u over a LAN one %s:%u",
+                             net_ip_ntoa(&ip_port.ip, &new_str), net_ntohs(ip_port.port),
+                             net_ip_ntoa(&gconn->addr.ip_port.ip, &held_str), net_ntohs(gconn->addr.ip_port.port));
+            } else if (gcc_conn_is_direct(chat->mono_time, gconn)
                     && gcc_ip_port_is_set(gconn)
                     && !ipport_equal(&gconn->addr.ip_port, &ip_port)) {
                 LOGGER_DEBUG(chat->log, "refused a ping-carried address for a peer we hear directly");
@@ -7218,6 +7237,15 @@ static bool ping_peer(const GC_Chat *_Nonnull chat, GC_Connection *_Nonnull gcon
         if (packed_ipp_len > 0) {
             packed_len += packed_ipp_len;
             gconn->last_sent_ip_time = mono_time_get(chat->mono_time);
+            /* p2p-poker: say what was offered to whom. The instrument's other
+             * half: the receiver logs what it stored, this logs what was sent. */
+            {
+                Ip_Ntoa self_str;
+                Ip_Ntoa peer_str;
+                LOGGER_DEBUG(chat->log, "offered self address %s:%u to a peer held at %s:%u",
+                             net_ip_ntoa(&chat->self_ip_port.ip, &self_str), net_ntohs(chat->self_ip_port.port),
+                             net_ip_ntoa(&gconn->addr.ip_port.ip, &peer_str), net_ntohs(gconn->addr.ip_port.port));
+            }
         }
     }
 
