@@ -27,6 +27,7 @@
 #include "group_common.h"
 #include "group_connection.h"
 #include "group_moderation.h"
+#include "LAN_discovery.h"
 #include "group_pack.h"
 #include "logger.h"
 #include "mem.h"
@@ -2476,8 +2477,43 @@ static int handle_gc_ping(GC_Chat *_Nonnull chat, GC_Connection *_Nonnull gconn,
 
         if (unpack_ip_port(&ip_port, data + GC_PING_PACKET_MIN_DATA_SIZE,
                            length - GC_PING_PACKET_MIN_DATA_SIZE, false) > 0) {
-            gcc_set_ip_port(gconn, &ip_port);
-            add_gc_saved_peers(chat, gconn);
+            /* p2p-poker: a claim must not overwrite a working direct address.
+             *
+             * This stored whatever address the ping carried, unconditionally
+             * and silently, on top of an address we were receiving from at
+             * that very moment. The sender's claim is its own DHT self-image,
+             * which ipport_self_copy builds by PREFERRING a non-LAN echo -- so
+             * for a peer on our own LAN it is the router's WAN address, and
+             * every packet we then send it goes to the router and is dropped
+             * there, while sendto reports success and nothing on either side
+             * logs a thing.
+             *
+             * This is a hardening, not a diagnosis. The event that led here --
+             * one lossless message re-sent on request 31 times over 57 s and
+             * never landing, the founder voted out for it, the same shape in
+             * ten of fourteen runs of one day -- was examined by three
+             * independent readings, and each excluded THIS route for that
+             * event by the code's own rule: the ping carries an address only
+             * to a peer the sender does not count direct, and the receiver had
+             * delivered twenty of the sender's packets in the two seconds
+             * before the loss. What did re-address that pair is not known;
+             * patch 0013 adds the lines that would show it. This guard closes
+             * a door that was open; it is not known to be the door that was
+             * used.
+             *
+             * If we are receiving from this peer directly right now, the
+             * address we are receiving from is the one that works. A different
+             * one is at best redundant and at worst this. Refuse it, and say
+             * so, because the count of these is the instrument this fault
+             * never had. */
+            if (gcc_conn_is_direct(chat->mono_time, gconn)
+                    && gcc_ip_port_is_set(gconn)
+                    && !ipport_equal(&gconn->addr.ip_port, &ip_port)) {
+                LOGGER_DEBUG(chat->log, "refused a ping-carried address for a peer we hear directly");
+            } else {
+                gcc_set_ip_port(gconn, &ip_port);
+                add_gc_saved_peers(chat, gconn);
+            }
         }
     }
 
@@ -7108,14 +7144,29 @@ static bool ping_peer(const GC_Chat *_Nonnull chat, GC_Connection *_Nonnull gcon
         LOGGER_FATAL(chat->log, "Packed length is impossible");
     }
 
+    /* p2p-poker: my WAN address is poison to a peer on my own LAN.
+     *
+     * self_ip_port is what ipport_self_copy chose, and it prefers a non-LAN
+     * echo, so on a NATed host it is the router. Offered to a peer whose own
+     * address is on our LAN it cannot be right: the peer stores it (see
+     * handle_gc_ping) and its next sixty seconds of sends to us go to the
+     * router. Do not offer it to such a peer.
+     *
+     * And stamp last_sent_ip_time. It was written exactly once, at peer
+     * creation, and never after a send, so GC_SEND_IP_PORT_INTERVAL throttled
+     * nothing: after the first minute of a peer's life EVERY ping to a peer we
+     * did not count as direct carried the address, every twelve seconds. */
     if (chat->self_udp_status == SELF_UDP_STATUS_WAN && !gcc_conn_is_direct(chat->mono_time, gconn)
-            && mono_time_is_timeout(chat->mono_time, gconn->last_sent_ip_time, GC_SEND_IP_PORT_INTERVAL)) {
+            && mono_time_is_timeout(chat->mono_time, gconn->last_sent_ip_time, GC_SEND_IP_PORT_INTERVAL)
+            && !(gcc_ip_port_is_set(gconn) && ip_is_lan(&gconn->addr.ip_port.ip)
+                 && !ip_is_lan(&chat->self_ip_port.ip))) {
 
         const int packed_ipp_len = pack_ip_port(chat->log, data + buf_size - sizeof(IP_Port), sizeof(IP_Port),
                                                 &chat->self_ip_port);
 
         if (packed_ipp_len > 0) {
             packed_len += packed_ipp_len;
+            gconn->last_sent_ip_time = mono_time_get(chat->mono_time);
         }
     }
 
