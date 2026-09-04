@@ -1113,6 +1113,9 @@ pub struct Hand {
     /// outside every required set from the following hand, which is how one
     /// silent seat costs exactly one hand rather than the table.
     signed: Vec<bool>,
+    /// Per seat, the stage sequence this client last accepted anything from
+    /// it at. Diagnostic only: it enters no hash and no wire body.
+    last_heard_at: Vec<Option<u64>>,
     /// The boundary checkpoint's value for this hand, once the hand has one.
     ///
     /// `(state_hash, TERMINAL(k))` — §6.1's hash of the settled state, and the
@@ -1305,6 +1308,7 @@ impl Hand {
         Ok((
             Hand {
                 signed,
+                last_heard_at: vec![None; usize::from(o.max_players)],
             checkpoint8: None,
                 tally: None,
                 certs: BTreeMap::new(),
@@ -1482,9 +1486,43 @@ impl Hand {
 
     /// Note that a seat has signed something this hand.
     fn note_signed(&mut self, seat: SeatIdx) {
+        // **And at which stage, because an accusation needs its evidence.**
+        //
+        // `S1-BB`: a seat was certified out for letting its clock run when it
+        // had answered every prompt in the same millisecond it arrived. The two
+        // candidate causes -- its action was lost, or the two engines disagree
+        // about which stage the hand is on -- are told apart by exactly one
+        // fact: the stage this client last heard that seat at, against the
+        // stage this client is accusing it for. Nothing recorded the first, so
+        // the run could not separate them.
+        //
+        // This is the one place a seat is marked heard, so it is the one place
+        // that has to remember where.
+        let at = self.slot.sequence;
+        if let Some(slot) = self.last_heard_at.get_mut(usize::from(seat)) {
+            *slot = Some(at);
+        }
         if let Some(slot) = self.signed.get_mut(usize::from(seat)) {
             *slot = true;
         }
+    }
+
+    /// The stage sequence this client last accepted anything from `seat` at.
+    ///
+    /// `None` means nothing at all this hand. Compare it against
+    /// [`stage_sequence`](Self::stage_sequence): equal means the seat spoke at
+    /// the very stage it is being accused of ignoring, which is a divergence
+    /// and not a silence.
+    pub fn last_heard_at(&self, seat: SeatIdx) -> Option<u64> {
+        self.last_heard_at
+            .get(usize::from(seat))
+            .copied()
+            .flatten()
+    }
+
+    /// The stage this client is at, which is what it accuses a seat against.
+    pub fn stage_sequence(&self) -> u64 {
+        self.slot.sequence
     }
 
     /// Which seat a sender is, or nobody.

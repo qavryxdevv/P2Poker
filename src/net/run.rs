@@ -3653,10 +3653,32 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 format!("seat {s} @{}: {held}/{need} agree", short_hash(&d))
                             })
                             .unwrap_or_default();
+                        // **And what was last heard from each of them**, which
+                        // is the fact that tells a lost message from a
+                        // divergence. `S1-BB`: a seat was certified out for
+                        // letting its clock run when it had answered every
+                        // prompt in the same millisecond it arrived, and the
+                        // run could not say which of the two it was because
+                        // nothing recorded where that seat was last heard.
+                        //
+                        // Equal to this client's own stage means the seat spoke
+                        // at the very stage it is accused of ignoring, which is
+                        // a divergence. Lower means it never spoke there, which
+                        // is a message that did not arrive.
+                        let at = h.stage_sequence();
+                        let seen: Vec<String> = h
+                            .waiting_for()
+                            .iter()
+                            .map(|s| match h.last_heard_at(*s) {
+                                Some(l) => format!("{s} last heard at stage {l}"),
+                                None => format!("{s} never heard this hand"),
+                            })
+                            .collect();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "my clock has run out on seat {} — {mine}",
-                                who.join(", ")
+                                "my clock has run out on seat {} — {mine}; I am at stage {at}, {}",
+                                who.join(", "),
+                                seen.join(", ")
                             )))
                             .await;
                         if let Some(n) = h.take_cert_note() {
