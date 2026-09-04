@@ -2142,6 +2142,13 @@ drained-out table is a drain hand, and §9.3 condition 1 fires on its boundary.
 > `PublicTableState`; **this document names what the checkpoint must be *about* and reproduces no
 > part of the hash** (D-011 rule 1). **One of those quantities is not in §6.1 today and the
 > checkpoint is worth little without it**: `signed_this_hand` must join `PublicTableState`, and
+> — **that was done, and then undone.** It became §6.1's field 28 and was deleted again
+> when measurement showed two honest peers on a lossy link cannot agree about it, so a
+> hash containing it manufactured the divergence it was meant to detect. `PROTOCOL.md`
+> §6.1 carries the figures. The engine still maintains the set under this name for its
+> own use; what is gone is the requirement that two peers agree about it. The rest of
+> this paragraph is left as written because the reasoning it records is sound and only
+> its premise failed:
 > that is the half of K-3 that belongs to `PROTOCOL.md` and is recorded on `DECISIONS.md`'s open
 > list rather than decided here (§13 item 40). Until it is there, checkpoint 8 compares a hand
 > boundary and not the participation set, which catches a stack or a button that has forked and

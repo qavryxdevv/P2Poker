@@ -1583,10 +1583,17 @@ the worst defect each time:
    contradiction within one network delay of the first solitary hand, so eviction
    reaches only a contradiction that has been in flight for thousands of hands —
    which is the bidirectional partition this rule already concedes it cannot see.
-3. **§6.1's `signed_this_hand`.** It is what makes the checkpoint-8 exemption a
-   refinement rather than a hole: without it, two peers whose `P` has forked can
-   agree at checkpoint 8, and the one message that could separate "alone" from
-   "wrong" separates nothing.
+3. ~~**§6.1's `signed_this_hand`.**~~ **Deleted, and the item is kept struck
+   through because the reasoning above still refers to it.** It was what made the
+   checkpoint-8 exemption a refinement rather than a hole. The premise was that
+   two honest peers could be made to agree about it; they cannot, because the
+   rule that set it — *this peer accepted an event signed by that seat* — is a
+   fact about the accepted chain of **one** peer, and on a lossy link the two
+   accept different sets. Measured, it manufactured the divergence it was meant
+   to detect: 124 refused settlements in one nine-minute run, 100 % of them
+   differing in this hash and none in any figure of money. §6.1 records the
+   removal and the measurement; §4.9's box records what now carries the
+   exemption, and that it carries less.
 4. **§4.9's cardinality floor on the reconciliation stage**, which is what makes
    the freeze a freeze. The freeze routes into §6.3, and §6.3 step 3 ends in a
    stage whose completion releases it; while that stage was required of *the
@@ -3717,10 +3724,14 @@ reason.
 > about who is in `P` is still resolved onto a **stalled stage 0** by §4.10's box
 > and by this one — loud, disposed of by §8, and held back from becoming a silent
 > fork by §3.2's solitary-stage rule — one hand later and only for a seat that
-> really signed. And because
-> agreement at checkpoint 8 is agreement about the participation set itself
-> (§6.1's `signed_this_hand`), a seat readmitted by the second route has signed
-> this receiver's own account of who was playing. **`A` does not thaw a freeze:**
+> really signed. That sentence used to continue *"and because agreement at
+> checkpoint 8 is agreement about the participation set itself (§6.1's
+> `signed_this_hand`), a seat readmitted by the second route has signed this
+> receiver's own account of who was playing"* — and field 28 is deleted, so it
+> no longer does. A seat readmitted by the second route has signed this
+> receiver's account of the **settled state**: the transcript head, the deck
+> commitment, the board and every final stack. Not of who was heard. The box
+> above says what that trade buys and what it costs. **`A` does not thaw a freeze:**
 > a latched solitary divergence is released by the reconciliation stage of the box
 > above and by nothing else (§6.3 step 3).
 
@@ -3760,19 +3771,42 @@ Neither reaches a hand this receiver has already initialised, which is the one
 thing the close was protecting.
 
 **A checkpoint-8 `STATE_HASH` from a seat outside `P` is the second case exempt
-from §3.2's solitary-stage rule, and the exemption is safe only because §6.1
-hashes `signed_this_hand`.** A solitary peer that froze on this message would
-fault the table on the one message that can tell it whether it is alone or merely
-wrong — and it would fault it in **both** cases, including the case where the two
-peers agree. With `signed_this_hand` inside `state_hash` (§6.1), agreement at
-checkpoint 8 is agreement about the participation set itself, so two peers whose
-`P` has forked **cannot** agree here: the comparison separates the two situations
-§3.2 says a solitary peer cannot otherwise tell apart, and it separates them
-without freezing the case where nothing is wrong — the out-of-set copy agrees, its
-sender joins `P`, and the next hand is not solitary. Take `signed_this_hand` back
-out of §6.1 and this exemption becomes a hole in the solitary-stage rule rather
-than a refinement of it. **The two edits are one fix and an editor who deletes
-either has reopened K1 by way of the other.**
+from §3.2's solitary-stage rule.** A solitary peer that froze on this message
+would fault the table on the one message that can tell it whether it is alone or
+merely wrong — and it would fault it in **both** cases, including the case where
+the two peers agree.
+
+**The exemption used to rest on §6.1 hashing `signed_this_hand`, and that field
+is deleted. What carries it now is weaker, and this paragraph says how much.**
+The old argument was exact: agreement at checkpoint 8 *was* agreement about the
+participation set, so two peers whose `P` had forked could not agree here. It
+was also unusable — the field was a per-receiver quantity, so two *honest* peers
+could not agree here either, and §6.1 records what that cost.
+
+The twenty-eight remaining fields still make agreement hard to reach from a
+forked chain rather than impossible to reach only from a matching one.
+`transcript_head` is the `stage_hash` of the last completed stage; `roster`
+carries every seat's final stack; `deck_commitment` and the board carry the
+hand's cryptography; and `GENESIS(k)` commits to `participants` = `R(k)`
+(§3.1), so a fork in the *required* set forks the chain outright and cannot
+reach a common checkpoint at all. What is no longer separated is a fork in the
+**accepted** set alone, where two peers agree about every quantity above and
+differ only in whom they heard. That case now agrees at checkpoint 8 and admits
+the out-of-set sender.
+
+**Which is the intended behaviour, and the reason the trade is worth taking.**
+That case is exactly the honest one: two peers who computed the same money and
+heard different neighbours. Admitting it is the readmission this document wants
+and the old rule refused — measured, readmissions went from zero in a
+nine-minute run to twenty. What is lost is the ability to distinguish it from a
+*dishonest* peer claiming an accepted set it did not have, and the cost of that
+is bounded by what such a peer must still reproduce to be admitted: the
+transcript head, the deck commitment, the board and every final stack, none
+computable without having followed the chain it claims to have followed.
+
+`Q-10` is not closed by this and is not made worse by it. What changed is that
+the residual is now a quantity nobody compares, rather than one everybody
+compares and honest peers fail.
 
 **The exemption is from freezing on *arrival*, never from freezing on
 *disagreement*, and reading it the other way was half of `N1`.** A checkpoint-8
@@ -5466,30 +5500,65 @@ state_hash = h("p2p-poker v1 state", [ canonical_cbor(PublicTableState) ])
 | `deck_commitment` | `final_deck_hash` from `DECK_COMMIT`, or 32 zero bytes before it |
 | `ledger_in`, `ledger_out` | `u64` each; the running totals of accepted buy-ins and of removed stacks (§4.4's `ledger_delta`). They are inside `state_hash` because otherwise two peers could disagree about the ledger and never detect it (C-9) |
 | `transcript_head` | `stage_hash` of the last completed stage |
-| `signed_this_hand` | `Vec<bool>` by seat ascending: `true` where that seat signed at least one chained event of this hand that this peer accepted. It is `P(k)` (§3.2) as a vector, and it is **appended last** so the field order stays append-only (§2.2 rule 5) |
 
-**`signed_this_hand` is in this struct because checkpoint 8 is worth little
-without it, and that is the wire half of `K-3` (L2).** `STATE_MACHINE.md` §5.2
-places checkpoint 8 at every hand boundary and says in terms what it needs from
-here: *"until it is there, checkpoint 8 compares a hand boundary and not the
-participation set … and misses the input K-1 is actually about."* Every other
-quantity the boundary checkpoint covers — the stacks, the button, the level, the
-ledger — is a function of the previous boundary and is already bound into
-`GENESIS(k)`, so two honest peers cannot hold it differently without having
-already rejected each other's `HAND_INIT`. **The participation set is the one
-input to hand `k+1` that two honest peers can hold differently and never notice**
-(§3.2's `Q-10` residual), and putting it in `state_hash` is what turns it from a
-quantity each peer reads alone into one they compare. It is what §4.9's
-checkpoint-8 box means by *"its body is a claim about who the participants are"*,
-and it is what makes that box's out-of-set admission safe rather than a hole in
-§3.2's solitary-stage rule.
+**`signed_this_hand` WAS field 28 of this struct, and it is deleted. The
+argument for it was sound and its premise was false, and the difference was only
+visible under measurement.**
 
-**It is not a fifth status vector and must not be read as one.** `absent` was
-deleted two paragraphs below because nothing set it; this vector is set by exactly
-one rule, *this peer accepted an event of hand `k` signed by that seat*, which is
-a fact about the accepted chain and not an observation about a connection. It has
-no local signal an implementer could wire it to, which is the trap `absent` was.
-The engine maintains it under the same name and the same rule (`STATE_MACHINE.md`
+The argument ran: every other quantity the boundary checkpoint covers — the
+stacks, the button, the level, the ledger — is a function of the previous
+boundary and already bound into `GENESIS(k)`, so two honest peers cannot hold it
+differently without having already rejected each other's `HAND_INIT`. The
+participation set is the one input to hand `k+1` that two honest peers can hold
+differently and never notice (§3.2's `Q-10` residual), so putting it in
+`state_hash` turns a quantity each peer reads alone into one they compare.
+
+**The false premise is that the two peers can be made to agree about it.** The
+rule that set the vector was *this peer accepted an event of hand `k` signed by
+that seat*, and this document defended that as *"a fact about the accepted chain
+and not an observation about a connection"*. It is a fact about the accepted
+chain **of one peer**. On a link that loses packets two honest peers accept
+different sets, so they must differ here, and a hash containing it can never be
+made to agree. The comparison did not detect a divergence; it manufactured one.
+
+**What that cost, measured on ten-seat two-machine runs.** 124 refused
+settlements in one nine-minute run and 553 in another, and in **100 % of them the
+differing field was this hash** — while the number differing in stacks, deltas,
+pots, refunds or busted seats was **zero**. The money agreed everywhere, always.
+A refused settlement leaves the seat still awaited, so its action clock runs out
+and it is certified out for a silence it did not commit: **35 % of all timeout
+accusations named a seat heard at the very stage it was accused of ignoring**. It
+could then never return, because §4.9's readmission wants a `state_hash` that
+agrees about who took part in a hand the seat did not take part in — readmissions
+in a whole run: zero. And §6.3's freeze, the terminus this document provides for
+exactly this disagreement, fired **zero** times against those 124, because the
+refusal that detects the disagreement is also what stops the checkpoint being
+reached. One hand ended by abort on every node with the pot never awarded, which
+is `D-026` violated by leaving things alone.
+
+**With the field removed, measured on the same rig the following day:** refused
+settlements **124 → 0**, false timeout accusations **14 → 0**, readmissions
+**10 → 20**, hands opened by all ten seats **16 → 19**.
+
+**What still guards what it was guarding.** Chip conservation never rested on it:
+`HAND_COMPLETE` carries the pots, the deltas, the final stacks, the refunds and
+the busted seats, and every peer recomputes and compares that whole body
+independently of this hash. A participation-set divergence still surfaces, one
+stage earlier and in a form two peers *can* agree about: it changes `dealt_in`,
+`dealt_in` is `HAND_INIT`'s `n(8)`, and `HAND_INIT` bodies are compared whole at
+stage 0. The difference is that a `HAND_INIT` body contains no observation of the
+listener.
+
+**What is genuinely weaker, stated rather than glossed.** §4.9's out-of-set
+checkpoint-8 admission was justified by this field and is now justified by the
+twenty-eight that remain — see that section's box. That is a weaker claim and it
+is written there as one.
+
+**The lesson worth keeping is about the shape, not this field.** A value every
+peer must agree on may contain only quantities every peer derives identically. A
+predicate with *this peer* in it is not such a quantity, however factual it is
+about that peer. The engine maintains the same set under the same name for its
+own use (`STATE_MACHINE.md`
 §2.8, §5.3 step 4) and neither document restates the other's derivation (D-011
 rule 1).
 
@@ -5652,10 +5721,15 @@ nothing left to open.
 derived stage (§3.2, §4.10): every receiver recomputes every field, and a
 mismatching copy is rejected at the stage rather than caught later at a
 checkpoint. **Row 8 is not that checkpoint and does not reopen the question.** It
-is not a comparison of the settlement — that comparison is the stage — but of the
-one boundary quantity `HAND_COMPLETE`'s collectivity cannot police:
-`signed_this_hand` (§6.1), which is not a field of `HAND_COMPLETE` and which two
-peers that have each stopped expecting the other never exchange at all. That is
+was a comparison of the one boundary quantity `HAND_COMPLETE`'s collectivity
+cannot police: `signed_this_hand`, which is not a field of `HAND_COMPLETE` and
+which two peers that have each stopped expecting the other never exchange at
+all. **Field 28 is deleted and row 8 no longer compares it.** What row 8
+compares now is the settled state — the transcript head, the roster with its
+stacks, the deck commitment and the board — which two peers that have stopped
+expecting each other still cannot both produce from a forked chain. It no
+longer separates a fork in the *accepted* set alone; §4.9's box says why that
+case is now admitted rather than faulted. That is
 also why row 8 is placed on the aborted path, where there is no `HAND_COMPLETE`
 stage to recompute anything.
 
@@ -5791,9 +5865,11 @@ On the comparison route it is the checkpoint the two `state_hash` values were
 observed at, which the `STATE_HASH` payload's `n(0) checkpoint` names. On the
 **solitary-stage** route the event that froze this peer is not a `STATE_HASH` at
 all, and the disputed checkpoint is **checkpoint 8 of the hand that event names**
-— the only checkpoint a solitary hand places (§6.2 row 8), the one whose body is
-the participation set the contradiction is about (§6.1's `signed_this_hand`), and
-the one whose `stage_hash` the reconciliation round chains from. Without that
+— the only checkpoint a solitary hand places (§6.2 row 8), the one whose
+`stage_hash` the reconciliation round chains from, and the one whose body was
+the participation set the contradiction is about until field 28 was deleted
+(§6.1). Its body is now the settled state, which is what the reconciliation
+round compares. Without that
 sentence the solitary freeze had no checkpoint to name and therefore no stage to
 be released by, which is the other half of what made it releasable by nothing but
 a timer. That stage is the artefact the engine consumes:
@@ -7424,7 +7500,7 @@ outcome is.
 | **replaying a signed, *agreeing* checkpoint-8 `STATE_HASH` to re-enlarge a required emitter set once per hand** — also free, also no key, valid for the 4 096 hands §5.3 retains a record for | §4.9: the readmission set widens an **accepted** emitter set and never a required one, so only a seat's own **current-chain** signature can grow `R` (§4.4, §3.2, `P2`) | `THREAT_MODEL.md` X8, same family |
 | faulting a table with a false `state_hash` | §6.3 case (c) and §6.4 | `THREAT_MODEL.md` X29 |
 | a provably illegal message — bad signature, non-canonical encoding, out-of-range field, failed proof, illegal action against an agreed checkpoint | the `DISPUTE { kind = 3 }` carrier and the two-tier removal rule of §4.9, `HAND_ABORT cause = 6` (§4.10), and the re-entry bar on `PLAYER_SIT_IN` (§4.10) | `DECISIONS.md` D-014 |
-| two peers privately playing on as if the other were gone | the boundary checkpoint of §4.9 and §6.2 row 8, compared over a set wider than the one it is required of, with `signed_this_hand` inside `state_hash` (§6.1); §3.2's solitary-stage rule, fired by §4.0 step 10b through **both** its routes, membership and comparison; and §4.9's floor on the reconciliation stage, `\|R(c) ∪ W\| >= 2`, which is what stops the frozen peer from releasing its own freeze (§6.3 step 3) | `DECISIONS.md` K-1 |
+| two peers privately playing on as if the other were gone | the boundary checkpoint of §4.9 and §6.2 row 8, compared over a set wider than the one it is required of (field 28, `signed_this_hand`, was inside `state_hash` and is deleted — §6.1 and §4.9's box); §3.2's solitary-stage rule, fired by §4.0 step 10b through **both** its routes, membership and comparison; and §4.9's floor on the reconciliation stage, `\|R(c) ∪ W\| >= 2`, which is what stops the frozen peer from releasing its own freeze (§6.3 step 3) | `DECISIONS.md` K-1 |
 
 **Three statements of this document's own limits, kept here because they are
 about the wire and not about the threat model:**
@@ -7467,7 +7543,7 @@ about the wire and not about the threat model:**
 | **Q-07** | On `HAND_ABORT cause = 4` (unresolvable divergence) the chips are restored, because no peer can be attributed, so any single peer has a free escape from a losing pot at the price of the table (§6.4). The alternatives — forfeiting an unnamed party's commitment, or settling from the last `STATE_ACK`-agreed checkpoint — each need a numbered decision and neither is adopted here. D-010 decides the first half **against** for the MVP; what stays open is whether settling from the last agreed checkpoint is worth building. Formerly this document's `OQ-D` (R-2). | §6.4, `STATE_MACHINE.md` | project owner |
 | **Q-08** | **Moot in version 1 (D-015): there are no votes.** Should a required voter be obliged to publish a signed `ACTION_SEEN { sequence, event_hash }` before it may vote, so that vote-and-seen are two events by one key in one slot and a lying voter becomes provable (§8.3)? A design change with a cost in messages and latency; not adopted. Formerly this document's `OQ-C` (R-2). | §8.3, §8.4 | project owner |
 | **Q-09** | **CLOSED (K2), and closed a second time in this pass for a second message (L1).** *Which chain does an event that sits between two hands belong to, and at what `sequence`?* It was asked of the hand-boundary single-writer events and answered for them; **checkpoint 8** arrived at the same position from `STATE_MACHINE.md` with the same four quantities undefined, and §4.9's checkpoint-8 box answers it in the same shape — chain `k`, `hand_id = k`, parent `TERMINAL(k)`, `sequence` in the reserved band `BOUNDARY_CHECKPOINT_BASE … +15`, total order by the collective stage rule. **The reusable finding is that the position between `TERMINAL(k)` and `HAND_INIT(k+1)` needs a rule per message that occupies it, not one rule**, and the next message placed there will need a third. **Answer for the boundary events, in §4.10's boundary-window box:** chain `k`, `hand_id = k`, `sequence = BOUNDARY_SEQUENCE_BASE + sender_seat`, `previous_event_hash = TERMINAL(k)` for every event of the window, total order ascending seat index, one event per seat per boundary, window closing at this receiver's acceptance of a complete `HAND_INIT(k+1)`. The grade this row carried — *"a placement decision, not a wire change"* — **was wrong**: `hand_id` and `sequence` are inside `TO_BE_SIGNED` (§2.4) and in the slot key (§5.2.1), so two placements are two signed byte strings for one intent. Chain `k+1` is refused because a boundary event would then chain from a `GENESIS(k+1)` that a `PLAYER_LEAVE` is an input to. | — | closed in this pass |
-| **Q-10** | **What ratifies a contribution to the stage that stalled?** For every stage that completed, `P(k)` (§3.2) is exactly `stage_hash` membership and two peers holding the same prefix agree by construction. For the one stage that stalled — the reason the hand aborted — no `stage_hash` exists, so "seat `s` contributed there" is strictly *who was heard*, the quantity P3 refused. **Named default, adopted in §3.2: a contribution to the stalled stage counts; a terminal `HAND_ABORT` and a `PLAYER_LEAVE` never do; and a peer's own emission does (K1's sub-question, answered).** It cannot simply be excluded: a hand that stalls at `HAND_INIT` completes no stage, so excluding it empties the next hand's set. **The claim that the residual was "loud rather than silent" is withdrawn and was K1**: it costs a hand at the deadline on the *first* iteration and a permanent silent fork on the second, because both peers then narrow to `{self}` and every collective stage self-completes. What replaces it is not a ratification but a detection — §3.2's **solitary-stage rule**, which makes a peer whose `P` has narrowed to itself freeze on the first contradicting event instead of playing on. **That rule could not fire as first written and now can (L4):** its trigger is a property of the hand the event names, answered from §5.3's retained record at §4.0 step 10b, because a solitary hand completes in microseconds and the contradicting event is late by construction. A second detection route was added with it: §6.2's checkpoint 8, compared over a wider set than it is required of (§4.9), with `signed_this_hand` inside `state_hash` (§6.1) so that agreement there is agreement about `P` itself. `Q-10` itself stays open: nothing ratifies the stalled stage, and no construction can, because agreeing it needs a collective step at the point collectivity failed. Same question as `STATE_MACHINE.md` **Q8**, which filed it here; referenced, never redefined there. | §3.2, §4.4 | project owner |
+| **Q-10** | **What ratifies a contribution to the stage that stalled?** For every stage that completed, `P(k)` (§3.2) is exactly `stage_hash` membership and two peers holding the same prefix agree by construction. For the one stage that stalled — the reason the hand aborted — no `stage_hash` exists, so "seat `s` contributed there" is strictly *who was heard*, the quantity P3 refused. **Named default, adopted in §3.2: a contribution to the stalled stage counts; a terminal `HAND_ABORT` and a `PLAYER_LEAVE` never do; and a peer's own emission does (K1's sub-question, answered).** It cannot simply be excluded: a hand that stalls at `HAND_INIT` completes no stage, so excluding it empties the next hand's set. **The claim that the residual was "loud rather than silent" is withdrawn and was K1**: it costs a hand at the deadline on the *first* iteration and a permanent silent fork on the second, because both peers then narrow to `{self}` and every collective stage self-completes. What replaces it is not a ratification but a detection — §3.2's **solitary-stage rule**, which makes a peer whose `P` has narrowed to itself freeze on the first contradicting event instead of playing on. **That rule could not fire as first written and now can (L4):** its trigger is a property of the hand the event names, answered from §5.3's retained record at §4.0 step 10b, because a solitary hand completes in microseconds and the contradicting event is late by construction. A second detection route was added with it: §6.2's checkpoint 8, compared over a wider set than it is required of (§4.9), which until field 28 was deleted carried `signed_this_hand` inside `state_hash` so that agreement there was agreement about `P` itself — §6.1 records why that was unattainable between honest peers and what replaced it. `Q-10` itself stays open: nothing ratifies the stalled stage, and no construction can, because agreeing it needs a collective step at the point collectivity failed. Same question as `STATE_MACHINE.md` **Q8**, which filed it here; referenced, never redefined there. | §3.2, §4.4 | project owner |
 
 ### The corpus-wide open questions — `DECISIONS.md`'s letters, adopted (R-2)
 
