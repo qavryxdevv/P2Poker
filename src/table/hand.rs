@@ -5451,12 +5451,41 @@ impl Hand {
         if late.stage.heard(seat) == Some(opened.event_hash) {
             return Ok(Vec::new());
         }
-        if theirs != late.body {
-            return Err(Failed::DeckDisagrees {
-                seat,
-                what: "settlement",
-            });
-        }
+        // **Noted, not refused — `S1-BD`'s one word, on its sibling (`S1-BP`).**
+        //
+        // This returned `DeckDisagrees` here, before `stage.hear`, so a
+        // disagreeing copy never entered the late stage, the stage never
+        // completed, `late.closed` stayed `None`, and `next_hand` fell through
+        // to the abort terminal while the seats that settled kept the
+        // settlement's — the fork the `HAND_COMPLETE`-wins rule exists to
+        // prevent, produced by the check meant to guard it.
+        //
+        // **Hearing it cannot move a chip, on either road here.** When this
+        // client gave up while settling, `give_up` carried its own stage and
+        // its own body across, so `late.body` is this client's OWN settlement
+        // and `late.closed` applies those stacks and no other seat's. When it
+        // gave up before settling, `late.body` is whichever peer spoke first —
+        // and that stage can never complete: `Collective::complete` needs every
+        // seat of the required set, this client is in that set, and it never
+        // published a `HAND_COMPLETE` for this stage to hear. So a peer-seeded
+        // body reaches neither `next_hand` nor `GENESIS(k+1)`, and D-012 is
+        // not in question.
+        let note = if theirs == late.body {
+            None
+        } else {
+            let what = late.body.disagreement(&theirs);
+            Some(if what.is_empty() {
+                format!(
+                    "late settlement disagreement with seat {seat} in a field this report does not enumerate \
+                     - HandComplete::disagreement is missing a field the derive compares"
+                )
+            } else {
+                format!(
+                    "late settlement disagreement with seat {seat}: {}",
+                    what.join("; ")
+                )
+            })
+        };
         match late.stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
             Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
@@ -5474,6 +5503,9 @@ impl Hand {
             let hash = late.stage.hash().ok_or(Failed::NotInThisStage)?;
             let stacks = late.body.final_stacks.clone();
             late.closed = Some((hash, stacks));
+        }
+        if note.is_some() {
+            self.settle_note = note;
         }
         Ok(Vec::new())
     }
@@ -7786,6 +7818,137 @@ mod tests {
         assert!(
             h.participants().contains(&2),
             "and it is counted into P(k+1), which is what makes it dealable at k+2"
+        );
+    }
+
+    /// `S1-BP`: a disagreeing settlement that arrives after this client gave
+    /// up is heard, not refused — the sibling of `S1-BD`.
+    ///
+    /// Seat 1 publishes its own settlement, then its deadline expires before
+    /// seat 0's copy lands (§4.10's race, exactly). Seat 0's copy differs in
+    /// one field. Before: `on_late_settlement` returned `DeckDisagrees` before
+    /// `stage.hear`, the late stage never closed, and `next_hand` fell through
+    /// to the abort terminal while seat 0 kept the settlement's — a fork. Now
+    /// the disagreement is reported, the body is heard, the stage closes on
+    /// seat 1's OWN stacks, and `GENESIS(k+1)` is built from the settlement.
+    #[test]
+    fn a_disagreeing_late_settlement_is_heard_and_the_settlement_wins_over_the_abort() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+        queue.push((1, deliver(&mut b, &a_deck, &key(11))));
+        queue.push((0, deliver(&mut a, &b_deck, &key(10))));
+
+        let keys = [key(10), key(11)];
+        let late = NOW + 10 * 60 * 1000;
+        let is_settlement = |bytes: &[u8], at: &Slot| {
+            chained::open(bytes, FRAME_CAP, EventType::HandComplete, at).is_ok()
+        };
+        // Seat 0's settlement, held back and re-sealed with a changed field.
+        let mut held: Option<Vec<u8>> = None;
+        let mut b_settled = false;
+        let mut done = false;
+
+        for _ in 0..256 {
+            if held.is_some() && b_settled && !done {
+                done = true;
+                // Seat 1's own deadline goes first, with its settlement
+                // already published: `give_up` carries the stage across.
+                let _abort = b.abort_now(Abort::Deadline, &keys[1], late).unwrap();
+                assert!(b.aborted().is_some());
+                let abort_next = b.next_hand().expect("an abort has a successor");
+                // And then seat 0's differing copy arrives.
+                let bytes = held.take().unwrap();
+                assert_eq!(
+                    b.on_event(&bytes, &keys[1], late),
+                    Ok(Vec::new()),
+                    "a disagreeing late settlement must be heard, not refused"
+                );
+                let note = b.take_settle_note().expect("the disagreement is reported");
+                assert!(note.starts_with("late settlement disagreement with seat 0"), "{note}");
+                let settled_next = b.next_hand().expect("a settled hand has a successor");
+                assert_ne!(
+                    settled_next.genesis, abort_next.genesis,
+                    "the late stage never closed, so the abort terminal still stands"
+                );
+                continue;
+            }
+            if let Some((from, sends)) = queue.pop() {
+                if sends.is_empty() {
+                    continue;
+                }
+                let to = 1 - from;
+                let sends = if from == 0 && held.is_none() {
+                    let at = a.slot();
+                    let mut out = Vec::new();
+                    for s in &sends {
+                        let Send::Broadcast(bytes) = s;
+                        if is_settlement(bytes, &at) && held.is_none() {
+                            held = Some(tamper::<HandComplete>(
+                                bytes,
+                                EventType::HandComplete,
+                                &at,
+                                HAND_COMPLETE_CAP,
+                                |c| c.state_hash[0] ^= 1,
+                            ));
+                        } else {
+                            out.push(s.clone());
+                        }
+                    }
+                    out
+                } else {
+                    sends
+                };
+                if sends.is_empty() {
+                    continue;
+                }
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let out = deliver(hand, &sends, &keys[usize::from(to)]);
+                if to == 1 && !b_settled {
+                    let at = b.slot();
+                    b_settled = out.iter().any(|s| {
+                        let Send::Broadcast(bytes) = s;
+                        is_settlement(bytes, &at)
+                    });
+                }
+                queue.push((to, out));
+                continue;
+            }
+            if done {
+                break;
+            }
+            let Some(turn) = a.turn().or_else(|| b.turn()) else {
+                break;
+            };
+            let seat = turn.seat;
+            let hand: &mut Hand = if seat == 0 { &mut a } else { &mut b };
+            let action = if hand.turn().expect("that hand agrees").legal.can_check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            let out = hand.act(action, &keys[usize::from(seat)], NOW).unwrap();
+            if seat == 1 && !b_settled {
+                let at = b.slot();
+                b_settled = out.iter().any(|s| {
+                    let Send::Broadcast(bytes) = s;
+                    is_settlement(bytes, &at)
+                });
+            }
+            queue.push((seat, out));
+        }
+
+        assert!(done, "the race was never staged: seat 1 never settled before seat 0's copy was held");
+        // Seat 0 settled normally on seat 1's genuine copy, and the two agree
+        // on every chip: only the state hash was changed.
+        let next_a = a.next_hand().expect("seat 0 settled");
+        let next_b = b.next_hand().expect("seat 1 took the settlement");
+        assert_eq!(
+            next_a.seats.iter().map(|(_, _, c)| *c).collect::<Vec<_>>(),
+            next_b.seats.iter().map(|(_, _, c)| *c).collect::<Vec<_>>(),
+            "the settlement's stacks on both, not the abort's on one"
         );
     }
 
