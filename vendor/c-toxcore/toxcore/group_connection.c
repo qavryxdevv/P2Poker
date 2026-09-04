@@ -205,7 +205,30 @@ bool gcc_send_lossless_packet_fragments(const GC_Chat *chat, GC_Connection *gcon
         return false;
     }
 
-    const uint16_t start_id = gconn->send_message_id;
+    /* p2p-poker: this id must not be truncated, because it is written back.
+     *
+     * It was `const uint16_t start_id = gconn->send_message_id;` and
+     * send_message_id is a uint64_t. The truncation is harmless everywhere it
+     * is used as an INDEX -- gcc_get_array_index is % GCC_BUFFER_SIZE and
+     * 65536 % 2048 == 0, so the array walk is identical -- but
+     * clear_send_queue_id_range ends with
+     *
+     *     gconn->send_message_id = start_id;
+     *
+     * so on the unwind path the whole stream is REWOUND to
+     * send_message_id % 65536. Past the first 65 536 messages to a peer that is
+     * a jump backwards of up to 65 535: every later message reuses an id the
+     * receiver has already consumed, the receiver discards them all as
+     * duplicates, and that peer is broken for the rest of the session with no
+     * error anywhere.
+     *
+     * Reachable only when add_to_send_array fails part-way through a fragmented
+     * send -- a full send ring -- which is a state this project has measured
+     * (800 such failures in one ten-seat run before the fragment sizing of
+     * S1-AR). The highest id reached in a ten-minute run was about 25 000, so
+     * it has not fired here; a longer table or a busier one arrives at 65 536.
+     */
+    const uint64_t start_id = gconn->send_message_id;
 
     // First packet segment is comprised of packet type + first chunk of payload
     uint8_t chunk[MAX_GC_PACKET_CHUNK_SIZE];

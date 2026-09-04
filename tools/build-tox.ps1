@@ -129,7 +129,10 @@ $patched = @(
        Why    = '0006: corrects 0003. Without it the denominator counts peers send_lossless_group_packet refuses outright - not handshaked, or pending delete - so one peer mid-handshake makes every send fail for ever and one re-handshaking peer stops the whole table' },
     @{ File   = 'toxcore/group_connection.c'
        Marker = 'Failed to create %s array entry'
-       Why    = '0007: diagnostic. create_array_entry is called from both add_to_send_array and store_in_recv_array and logged one sentence for both, so every count of it is the SUM of back-pressure and head-of-line blocking - two faults with nothing in common, and a whole day of readings was taken against the sum' }
+       Why    = '0007: diagnostic. create_array_entry is called from both add_to_send_array and store_in_recv_array and logged one sentence for both, so every count of it is the SUM of back-pressure and head-of-line blocking - two faults with nothing in common, and a whole day of readings was taken against the sum' },
+    @{ File   = 'toxcore/group_connection.c'
+       Marker = 'p2p-poker: this id must not be truncated, because it is written back'
+       Why    = '0008: without it a fragmented send that fails part-way rewinds gconn->send_message_id to send_message_id % 65536 - clear_send_queue_id_range assigns start_id back - so past the first 65 536 messages to a peer the whole stream jumps backwards by up to 65 535, every later message reuses a consumed id, and that peer is silently broken for the rest of the session' }
 )
 
 Step 'checking the patches are in the vendored source'
