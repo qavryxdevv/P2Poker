@@ -455,3 +455,56 @@ fn every_table_row_has_the_columns_its_header_declares() {
         wrong.join("\n")
     );
 }
+
+/// **The code and the corpus disagree about `PublicTableState`, deliberately,
+/// and nothing else in this tree would notice.**
+///
+/// `signed_this_hand` was §6.1's field 28 and is deleted from
+/// `PublicTableState` — it was *"true where that seat signed at least one
+/// chained event of this hand **that this peer accepted**"*, an observation of
+/// the listener rather than a fact about the hand, so two honest peers on a
+/// lossy link had to differ in it while the protocol required them to agree.
+/// Measured across ten-seat runs before and after: settlement disagreements
+/// **124 → 0**, false timeout accusations **14 → 0**, readmissions **10 → 20**
+/// (`S1-AZ` … `S1-BD`, and the row that records the removal).
+///
+/// **The corpus is not an implementation's to edit** (D-011 rule 1), so
+/// `PROTOCOL.md` §6.1 still lists the field. That is a real interop hazard and
+/// not a cosmetic one: `PublicTableState` is `#[cbor(array)]`, so the element
+/// count is part of the encoding — the array header goes `0x98 0x1D` to
+/// `0x98 0x1C` — and a second implementation transcribed from the document
+/// would derive a different `state_hash` for identical state at every
+/// checkpoint of every hand. §6.1's table is declared the single normative
+/// statement of that field order and the only list an implementer reads.
+///
+/// Nothing else catches it. `corpus_constants` does not cover `FIELD_COUNT`,
+/// and this file's other checks only assert that a cited section exists, not
+/// that it says what the citation claims.
+///
+/// So the divergence is pinned rather than hidden: this test passes only while
+/// both halves are in the state described. **When the owner corrects §6.1, this
+/// test fails — and the right response is to delete it**, not to weaken it.
+#[test]
+fn the_corpus_still_lists_a_field_the_code_has_removed() {
+    let corpus = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/PROTOCOL.md"),
+    )
+    .expect("the corpus is readable");
+
+    assert_eq!(
+        p2p_poker::protocol::state_view::PublicTableState::FIELD_COUNT,
+        28,
+        "the struct's field count moved; if a field was added or removed, this \
+         pin and PROTOCOL.md §6.1 both need revisiting"
+    );
+
+    let listed = corpus
+        .lines()
+        .any(|l| l.starts_with("| `signed_this_hand`"));
+    assert!(
+        listed,
+        "PROTOCOL.md §6.1 no longer lists `signed_this_hand`, so the corpus and \
+         the code finally agree. Delete this test: it exists only to hold the \
+         divergence visible while it lasts."
+    );
+}

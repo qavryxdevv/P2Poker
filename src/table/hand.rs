@@ -676,10 +676,21 @@ pub use crate::protocol::constants::MAX_CONSECUTIVE_AUTO_ACTIONS;
 /// §6.1 field 28 hashed `signed_this_hand` into the state hash. Field 28 is
 /// deleted: it was an observation of the listener rather than a fact about the
 /// hand, so two honest peers on a lossy link had to differ in it, and requiring
-/// them to agree removed honest players for it (`S1-AZ` … `S1-BD`). The bank is
-/// still guarded, by the settlement comparison — `on_hand_complete` recomputes
-/// and compares pots, deltas, final stacks, refunds and busted seats — which
-/// never depended on field 28.
+/// them to agree removed honest players for it (`S1-AZ` … `S1-BD`).
+///
+/// **And the bank is not guarded by the settlement comparison — that sentence
+/// stood here for one commit and was wrong.** No wire body carries `grace` or
+/// the bank; both are local derivations, so `on_hand_complete` cannot compare
+/// them. What guards them is one step earlier and is enough: the bank decides
+/// `dealt_in` through `grace > 0`, `dealt_in` is `HAND_INIT`'s `n(8)`, and
+/// `on_hand_init` compares the whole `HAND_INIT` body at stage 0 exactly as
+/// `on_hand_complete` compares the whole settlement. So a bank two peers
+/// disagree about surfaces as a `HAND_INIT` they disagree about, at the first
+/// stage of the hand rather than the last.
+///
+/// The difference from the settlement case, and it is the whole point: a
+/// `HAND_INIT` body contains no observation of the listener, so that comparison
+/// is satisfiable. Field 28's was not.
 ///
 /// Two hands is about a minute at this table's pace, which is the interval the
 /// owner asked for, expressed in the one unit that cannot drift.
@@ -4077,7 +4088,15 @@ impl Hand {
     ///
     /// §6.1 hashed `signed_this_hand` as a flag per seat rather than as a list,
     /// which is where this shape came from; field 28 is now deleted and
-    /// [`state_hash`](Self::state_hash) no longer reads it. It is still the
+    /// [`state_hash`](Self::state_hash) no longer reads it.
+    ///
+    /// **So this accessor has no caller, and that is the point of leaving it
+    /// documented rather than deleting it quietly.** Its only purpose was to
+    /// feed the field, and the field was removed because it is an observation
+    /// of the listener. A future caller that reaches for it is reaching for a
+    /// per-receiver quantity; if the answer wanted is *who took part*, that is
+    /// [`participants`](Self::participants), and if it is *who is required
+    /// next*, that is [`took_part`](Self::took_part). It is still the
     /// stored vector in the wire's own ordering, which is why this returns it
     /// rather than rebuilding it: a rebuild that disagreed with the field by
     /// one element would move field 28 and be found at a boundary checkpoint,
