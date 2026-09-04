@@ -152,6 +152,31 @@ pub struct AppState {
     pub newest_seen: u64,
 }
 
+impl Seat {
+    /// **Whether this client can still hear the table it is sitting at.**
+    ///
+    /// `S1-BH`: a seat is certified out precisely *because* it cannot hear the
+    /// group, and the certificate that removes it is a hand event, so it rides
+    /// that same group — the one party who needs it is the one party guaranteed
+    /// not to get it. Measured: a seat that never entered the group was struck
+    /// out and exited printing `TABLE FORMED seats=10` after 900 s at a table
+    /// it had been removed from.
+    ///
+    /// **Nothing has to be sent to fix that.** Every peer that CAN hear the
+    /// group receives its own certificate and applies it — measured, within two
+    /// seconds. The only peer left uninformed is the one that hears nothing,
+    /// and that peer can see its own silence. It just never looked.
+    pub fn deaf(&self, now_ms: u64) -> bool {
+        self.silent_since
+            .is_some_and(|at| now_ms.saturating_sub(at) >= crate::protocol::constants::DEAF_MS)
+    }
+
+    /// Sitting at a table that has formed **and** can be heard.
+    pub fn playing(&self, now_ms: u64) -> bool {
+        self.session.is_some() && !self.deaf(now_ms)
+    }
+}
+
 /// Where this client is sitting, as the panes read it.
 ///
 /// A **local view** like everything else here: it is what this client believes
@@ -170,6 +195,16 @@ pub struct Seat {
     /// The session identity, once the table is real. `None` means the table has
     /// **not** started, whatever else is filled in.
     pub session: Option<[u8; 32]>,
+    /// **How many other seats this client can hear, and since when it could
+    /// hear none (`S1-BH`).**
+    ///
+    /// `heard` is the last carrier reading. `silent_since` is the clock of the
+    /// first reading of zero that was not followed by a better one — cleared
+    /// the moment anybody is heard, so a transient cannot latch. A client that
+    /// has been at zero for `DEAF_MS` is not playing, whatever its session says,
+    /// and `playing()` is where that judgement is made once.
+    pub heard: Option<u16>,
+    pub silent_since: Option<u64>,
     /// The table's name and shape, from the node rather than from the lobby.
     pub name: String,
     pub seats: u8,
@@ -429,6 +464,17 @@ impl AppState {
                     self.waiting_for = seats;
                 }
             }
+            NodeEvent::Carrier { seen, want } => {
+                let now = self.last_sweep_ms;
+                if let Some(s) = self.seated.as_mut() {
+                    s.heard = Some(seen);
+                    if seen > 0 || want == 0 {
+                        s.silent_since = None;
+                    } else if s.silent_since.is_none() {
+                        s.silent_since = Some(now);
+                    }
+                }
+            }
             NodeEvent::Swept { now_ms } => {
                 self.last_sweep_ms = now_ms;
                 // A player who has stopped saying they are here stops being
@@ -462,7 +508,36 @@ impl AppState {
                 // lobby — the node has its own — and a copy that took the
                 // node's word would drift from it silently the first time a
                 // message was dropped, which this channel is allowed to do.
-                let now = ad.timestamp_unix_ms.max(self.newest_seen);
+                // **A stranger's clock is not this client's clock.**
+                //
+                // This was `ad.timestamp_unix_ms.max(self.newest_seen)`, so the
+                // value that decides what has expired was taken from the
+                // advertisement being offered. §7.2 rule 5 accepts a timestamp
+                // up to `MAX_CLOCK_SKEW_MS` = 120 s in the future, and
+                // `AD_TTL_MS` is 90 s — **120 > 90 is the whole bug**. One
+                // advert signed with `timestamp_unix_ms = now + 120 s` passes
+                // `lobby::admit`, sets this clock 120 s ahead, and the
+                // `expire(now)` on the next line then drops every record whose
+                // `received_at_ms` is not within 90 s of it — which is every
+                // honest table. Reproduced: three tables in the list, one such
+                // advert, and the list held the attacker's table alone. The
+                // node's own store is unharmed because it ages on the real
+                // clock, so the two copies simply disagree. Honest founders
+                // re-broadcast and come back within a cycle, but an attacker
+                // sending one of these every 30 s — far under
+                // `MAX_ADS_PER_PEER_PER_MIN` = 20 — keeps the user's list empty
+                // for as long as it cares to.
+                //
+                // `newest_seen` exists because this layer has no wall clock of
+                // its own; it is fed events. But it *is* fed a real one, in
+                // `Swept { now_ms }`, so use that and let the advert's claim
+                // count only before the first sweep has arrived. Monotone
+                // either way, which is what `offer` and `expire` need.
+                let now = if self.last_sweep_ms > 0 {
+                    self.last_sweep_ms.max(self.newest_seen)
+                } else {
+                    ad.timestamp_unix_ms.max(self.newest_seen)
+                };
                 self.newest_seen = now;
                 self.lobby.expire(now);
                 match self.lobby.offer(key, *ad, params_hash, advert_hash, now) {
@@ -846,6 +921,107 @@ mod tests {
             now_ms: now + AD_TTL_MS + 1,
         });
         assert_eq!(s.view().tables.len(), 0, "and it is gone from the screen");
+    }
+
+    /// One advert with a future timestamp must not empty the screen.
+    ///
+    /// §7.2 rule 5 admits a timestamp up to `MAX_CLOCK_SKEW_MS` = 120 s ahead
+    /// and `AD_TTL_MS` is 90 s, so an advert signed 120 s in the future used to
+    /// carry this copy's expiry clock 120 s with it and drop every honest record
+    /// in one call — leaving the attacker's table alone in the user's list. Its
+    /// own re-broadcast rate limit is 20 a minute, so keeping the list empty
+    /// cost one message every 30 s.
+    #[test]
+    fn a_future_advert_does_not_sweep_the_screen() {
+        use crate::protocol::constants::MAX_CLOCK_SKEW_MS;
+
+        let mut s = AppState::new();
+        let now = 1_700_000_000_000u64;
+
+        fn see(s: &mut AppState, name: &str, key: u8, at: u64) {
+            s.apply(NodeEvent::TableSeen {
+                key: [key; 32],
+                ad: Box::new(crate::net::lobby::TableAd::rated_sng(
+                    name.into(),
+                    [key; 32],
+                    vec![1, 2, 3],
+                    at,
+                )),
+                params_hash: [1u8; 32],
+                advert_hash: [key; 32],
+            });
+        }
+
+        // A real clock arrives first, as it does in the running client: the
+        // sweep is what tells this layer what time it is.
+        s.apply(NodeEvent::Swept { now_ms: now });
+        see(&mut s, "honest one", 1, now);
+        see(&mut s, "honest two", 2, now);
+        assert_eq!(s.view().tables.len(), 2, "both honest tables are on screen");
+
+        // And now one signed as far ahead as the rules allow.
+        see(&mut s, "far ahead", 3, now + MAX_CLOCK_SKEW_MS);
+
+        assert_eq!(
+            s.view().tables.len(),
+            3,
+            "a future timestamp expired the honest tables"
+        );
+        assert!(
+            s.newest_seen <= now,
+            "a stranger's timestamp moved this client's clock to {}",
+            s.newest_seen
+        );
+    }
+
+    /// A client that has heard nobody stops claiming to be playing — and a
+    /// client that hears somebody again says so at once.
+    ///
+    /// `S1-BH`. The measured case: a seat that never entered the table's Tox
+    /// group was certified out by the other nine, logged **not one mention of
+    /// it** — the certificate is a hand event and rides the very group it
+    /// cannot hear — and exited after 900 s printing `TABLE FORMED seats=10`.
+    /// It had the fact all along: it prints `group 0 seen/0 confirmed/9 wanted`
+    /// every housekeeping tick. It simply never acted on its own measurement.
+    #[test]
+    fn a_client_that_hears_nobody_does_not_claim_to_be_playing() {
+        use crate::protocol::constants::DEAF_MS;
+
+        let mut s = AppState::new();
+        let now = 1_700_000_000_000u64;
+        s.apply(NodeEvent::Swept { now_ms: now });
+        s.apply(NodeEvent::Hosting { key: [7u8; 32] });
+        s.apply(NodeEvent::TableReal {
+            key: [7u8; 32],
+            session: [3u8; 32],
+        });
+
+        let seat = |s: &AppState| s.seated.clone().expect("this client is seated");
+        assert!(
+            seat(&s).playing(now),
+            "a table that has just formed is being played at"
+        );
+
+        // Nobody in the group, and the clock moves.
+        s.apply(NodeEvent::Carrier { seen: 0, want: 9 });
+        assert!(
+            seat(&s).playing(now),
+            "one reading of zero is a transient, not a verdict"
+        );
+
+        let later = now + DEAF_MS;
+        assert!(
+            !seat(&s).playing(later),
+            "after DEAF_MS of hearing nobody this client still claimed to be playing"
+        );
+        assert!(seat(&s).deaf(later), "and it can say why");
+
+        // And one voice is enough to take it all back.
+        s.apply(NodeEvent::Carrier { seen: 1, want: 9 });
+        assert!(
+            seat(&s).playing(later),
+            "a client that can hear the table again is playing at it again"
+        );
     }
 
     #[test]

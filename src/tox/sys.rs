@@ -228,6 +228,27 @@ extern "C" {
         chat_id: *mut u8,
         error: *mut c_int,
     ) -> bool;
+    /// **`patches/0011`.** Ask one peer to re-send the message we are missing
+    /// from it — the fast repair path, answered by an immediate retransmission
+    /// with no backoff, against the blind ladder's T+3/+5/+9/+17/+33.
+    ///
+    /// Costs one small lossy packet and toxcore throttles it to one per second
+    /// per connection, so calling it on every tick is safe. It does nothing at
+    /// all if the peer never sent the message, which is what keeps it from
+    /// helping a seat that is simply silent.
+    pub fn tox_group_peer_request_missing(
+        tox: *const Tox,
+        group_number: u32,
+        peer_public_key: *const u8,
+    ) -> bool;
+    /// **`patches/0011`.** How many messages from this peer are stalled behind
+    /// a hole: positive evidence that it is talking and the carrier is
+    /// mid-delivery. Reads local memory and sends nothing.
+    pub fn tox_group_peer_recv_pending(
+        tox: *const Tox,
+        group_number: u32,
+        peer_public_key: *const u8,
+    ) -> u16;
     /// `tox.h:4475`
     pub fn tox_group_send_custom_packet(
         tox: *const Tox,

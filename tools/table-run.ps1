@@ -480,7 +480,17 @@ Write-Host '--- result ---'
 if ($formed) {
     Write-Host ($formed | Select-Object -Last 1)
 } else {
-    Write-Host 'NO TABLE - the seats never all arrived'
+    # **Two different failures, and they were the same sentence.** Since
+    # `S1-BH` a client that formed a table and then heard nobody from it says
+    # `NOT PLAYING` rather than claiming a seat it no longer has, so the
+    # absence of `TABLE FORMED` no longer means only that nobody arrived.
+    $deaf = $lines | Where-Object { $_ -match 'NOT PLAYING session=(\w+)' }
+    if ($deaf) {
+        Write-Host ($deaf | Select-Object -Last 1)
+        Write-Host 'the table formed and this client could not hear it - not the same as never forming'
+    } else {
+        Write-Host 'NO TABLE - the seats never all arrived'
+    }
 }
 Write-Host "hands opened   $($opens.Count)  (founder)"
 Write-Host "hands finished $overs  (founder)"

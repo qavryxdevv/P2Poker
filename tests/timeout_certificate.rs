@@ -156,7 +156,7 @@ fn a_silent_seat_is_certified_and_the_hand_ends_on_both_survivors() {
     let mut queue = Vec::new();
     for s in 0..2usize {
         let out = t.hands[s]
-            .vote_on_timeouts(&t.keys[s], LATE)
+            .vote_on_timeouts(&t.keys[s], LATE, 0)
             .expect("a vote is sealed");
         assert_eq!(out.len(), 1, "seat {s} should vote about seat 2, once");
         for Send::Broadcast(b) in out {
@@ -298,7 +298,7 @@ fn nobody_votes_a_seat_late_until_its_reserve_has_run_out() {
     let plain = NOW + 20_000 + 5_000 + 1;
     for &s in &survivors {
         let out = t.hands[s]
-            .vote_on_timeouts(&t.keys[s], plain)
+            .vote_on_timeouts(&t.keys[s], plain, 0)
             .expect("voting is not an error");
         assert!(
             out.is_empty(),
@@ -310,7 +310,7 @@ fn nobody_votes_a_seat_late_until_its_reserve_has_run_out() {
     let spent = NOW + 20_000 + 5_000 + BANK + 1;
     for &s in &survivors {
         let out = t.hands[s]
-            .vote_on_timeouts(&t.keys[s], spent)
+            .vote_on_timeouts(&t.keys[s], spent, 0)
             .expect("voting is not an error");
         assert_eq!(
             out.len(),
@@ -328,7 +328,7 @@ fn a_table_without_a_reserve_votes_at_the_plain_deadline() {
     let subject = t.hands[0].waiting_for()[0];
     let voter = (0..3usize).find(|s| *s as u8 != subject).expect("a voter");
     let out = t.hands[voter]
-        .vote_on_timeouts(&t.keys[voter], NOW + 20_000 + 5_000 + 1)
+        .vote_on_timeouts(&t.keys[voter], NOW + 20_000 + 5_000 + 1, 0)
         .expect("voting is not an error");
     assert_eq!(out.len(), 1, "with no reserve the plain deadline is the whole deadline");
 }
@@ -352,7 +352,7 @@ fn a_peers_certificate_arriving_first_does_not_silence_this_client() {
     let mut votes = Vec::new();
     for s in 0..2usize {
         let out = t.hands[s]
-            .vote_on_timeouts(&t.keys[s], LATE)
+            .vote_on_timeouts(&t.keys[s], LATE, 0)
             .expect("a vote is sealed");
         assert_eq!(out.len(), 1);
         for Send::Broadcast(b) in out {
@@ -425,7 +425,7 @@ fn both_survivors_derive_the_same_next_hand() {
     let mut queue = Vec::new();
     for s in 0..2usize {
         for Send::Broadcast(b) in t.hands[s]
-            .vote_on_timeouts(&t.keys[s], LATE)
+            .vote_on_timeouts(&t.keys[s], LATE, 0)
             .expect("a vote is sealed")
         {
             queue.push(b);
@@ -678,7 +678,7 @@ fn the_subject_applies_a_certificate_about_a_stage_it_has_left() {
     let mut appeal: Vec<Vec<u8>> = Vec::new();
     for s in 0..2usize {
         for Send::Broadcast(b) in hands[s]
-            .vote_on_timeouts(&keys[s], LATE_ENOUGH)
+            .vote_on_timeouts(&keys[s], LATE_ENOUGH, 0)
             .expect("a vote is sealed")
         {
             appeal.push(b);
@@ -901,7 +901,7 @@ fn the_author_of_a_certificate_banks_it_like_everybody_else() {
     let mut votes: Vec<(usize, Vec<u8>)> = Vec::new();
     for s in 0..2usize {
         for Send::Broadcast(b) in t.hands[s]
-            .vote_on_timeouts(&t.keys[s], LATE)
+            .vote_on_timeouts(&t.keys[s], LATE, 0)
             .expect("a vote is sealed")
         {
             votes.push((s, b));
@@ -1016,7 +1016,7 @@ fn the_hand_after_a_low_seat_is_dropped_can_still_shuffle() {
     let mut appeal: Vec<Vec<u8>> = Vec::new();
     for to in 0..2usize {
         for Send::Broadcast(b) in hands[to]
-            .vote_on_timeouts(&keys[seat_of[to]], LATE)
+            .vote_on_timeouts(&keys[seat_of[to]], LATE, 0)
             .expect("a vote is sealed")
         {
             appeal.push(b);
@@ -1149,7 +1149,7 @@ fn a_peers_bare_abort_is_accepted_once_this_receiver_is_long_past_the_stage() {
     // it votes that this stage is over. Everything below turns on the client
     // not contradicting itself about that.
     let votes = t.hands[receiver]
-        .vote_on_timeouts(&t.keys[receiver], late)
+        .vote_on_timeouts(&t.keys[receiver], late, 0)
         .expect("voting is not an error");
     assert_eq!(
         votes.len(),

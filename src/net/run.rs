@@ -643,6 +643,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // is.
     let mut hand_one_progress: Option<(u64, std::time::Instant)> = None;
     let mut hand_one_forced_said = false;
+
     // Said once per node: the reason hand one cannot be built from the roster
     // this client holds. See `say_why_no_hand_one`.
     let mut why_no_hand_one_said = false;
@@ -1141,6 +1142,88 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
         }};
     }
+    // **Everything a table leaves behind, cleared in one place.**
+    //
+    // Leaving was four copies of the same list of assignments, and the comment
+    // inside it records the last time this went wrong: `ever_dealt` was set true
+    // and never set back, so the *next* table in the same process refused every
+    // stranger, never opened hand 1, never re-said a ratification, never
+    // released a silent seat and was never re-advertised — five mechanisms, all
+    // by not running, all from one boolean nobody reset. That was fixed by
+    // adding one line to each of the four copies, which is exactly the shape of
+    // fix that leaves the next field to be found the same way.
+    //
+    // Twelve more were still being carried across. They matter because **the
+    // next table restarts the hand-id sequence at 1** (`opening_for_hand_one` is
+    // `Opening::from_formation(f, 1)`), so anything keyed by hand id meets the
+    // previous table's record under the same key:
+    //
+    //  * `ahead` holds a raw hand id per seat and is filled by ORDINARY play —
+    //    the `ADRIFT_MARGIN` note records 36 of 134 runs with a seat exactly one
+    //    hand behind from `Ended::pause` skew, and says a table of four or more
+    //    always has at least two. Within one table those age out as ids rise.
+    //    At the next table every one of them is in the future again, so the
+    //    first ordinary skew event at hand 1 can latch `adrift` on a client that
+    //    never drifted. **`adrift` has no clearing site at all.**
+    //  * `frozen` is released only by `RoundTook::Resolved` for the OLD hand id,
+    //    whose evidence is the old table's signed bytes carrying the old
+    //    `table_id`, which no seat at the new table can verify. And a frozen
+    //    client emits nothing, so the seats waiting on its `STATE_HASH` wait for
+    //    ever: **it stalls the new table, not just this peer.**
+    //  * `boundaries` is admitted on the hand id alone — `Boundaries::holds`
+    //    is `open.contains_key(&hand_id)` — and the table is only checked
+    //    afterwards. A `Boundary` already carries a `table_id`; it is read when
+    //    sealing outgoing events and never to refuse an incoming one.
+    //
+    // So this is a macro and not four more lines: there is one list, adding to
+    // it is one edit, and a `leave_the_table!()` that compiles is a leave that
+    // forgot nothing. `table` itself is not in here — two of the four sites have
+    // already cleared it and one has never set it — and neither is `tox_sink`,
+    // whose teardown must run before this and joins a thread.
+    macro_rules! leave_the_table {
+        () => {{
+            table_closed = false;
+            tournament_started = false;
+            ever_dealt = false;
+            hand = None;
+            hand_reported = false;
+            deck_reported = None;
+            cards_reported = false;
+            abort_reported = false;
+            turn_reported = None;
+            said.clear();
+            next_hand_at = None;
+            act_by = None;
+            // Keyed by hand id, and the next table starts again at 1.
+            boundaries = crate::table::boundary::Boundaries::new();
+            early_checkpoints.clear();
+            crossed_for = None;
+            checkpoint_said = false;
+            frozen = None;
+            ahead.clear();
+            adrift = None;
+            adrift_said = false;
+            // **Its own doc says *cleared when the freeze is*, and the line
+            // above clears the freeze.** Left behind, the next table's first
+            // freeze would be silent — the one state that stops a client
+            // dealing, with nothing said about why.
+            frozen_said = false;
+            // Both hang off the freeze and the reconciliation round, which are
+            // per table: `no_round_said` reports why no round could be opened,
+            // and `disputes_seen` is counted so that "none arrived" and
+            // "several arrived and agreed" are not the same silence.
+            no_round_said = false;
+            disputes_seen = 0;
+            // Per table by their own meaning.
+            roster_seats.clear();
+            readmitted.clear();
+            hand_one_held_since = None;
+            hand_one_progress = None;
+            hand_one_forced_said = false;
+            why_no_hand_one_said = false;
+        }};
+    }
+
     loop {
         tokio::select! {
             event = SwarmStreamExt::select_next_some(&mut swarm) => {
@@ -1548,26 +1631,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     Err(e) => {
                                         table = None;
-                                        table_closed = false;
-                        tournament_started = false;
-                        // **Per table, not per process.** Its own doc says
-                        // *whether this table has ever dealt a hand*, and it was
-                        // set true and never set back — so after one hand at one
-                        // table, the next table in the same process refused every
-                        // stranger (`on_join_request` reads it as `started`),
-                        // never opened hand 1, never re-said a ratification,
-                        // never released a silent seat and was never
-                        // re-advertised. Five mechanisms, all by not running.
-                        ever_dealt = false;
-                        hand = None;
-                        hand_reported = false;
-                        deck_reported = None;
-                        cards_reported = false;
-                        abort_reported = false;
-                        turn_reported = None;
-                        said.clear();
-                        next_hand_at = None;
-                        act_by = None;
+                        leave_the_table!();
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -1594,26 +1658,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(t) = table_topic.take() {
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
-                        table_closed = false;
-                        tournament_started = false;
-                        // **Per table, not per process.** Its own doc says
-                        // *whether this table has ever dealt a hand*, and it was
-                        // set true and never set back — so after one hand at one
-                        // table, the next table in the same process refused every
-                        // stranger (`on_join_request` reads it as `started`),
-                        // never opened hand 1, never re-said a ratification,
-                        // never released a silent seat and was never
-                        // re-advertised. Five mechanisms, all by not running.
-                        ever_dealt = false;
-                        hand = None;
-                        hand_reported = false;
-                        deck_reported = None;
-                        cards_reported = false;
-                        abort_reported = false;
-                        turn_reported = None;
-                        said.clear();
-                        next_hand_at = None;
-                        act_by = None;
+                        leave_the_table!();
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -3086,26 +3131,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 swarm.behaviour_mut().join.send_request(&founder, request);
                             }
                             Err(e) => {
-                                table_closed = false;
-                        tournament_started = false;
-                        // **Per table, not per process.** Its own doc says
-                        // *whether this table has ever dealt a hand*, and it was
-                        // set true and never set back — so after one hand at one
-                        // table, the next table in the same process refused every
-                        // stranger (`on_join_request` reads it as `started`),
-                        // never opened hand 1, never re-said a ratification,
-                        // never released a silent seat and was never
-                        // re-advertised. Five mechanisms, all by not running.
-                        ever_dealt = false;
-                        hand = None;
-                        hand_reported = false;
-                        deck_reported = None;
-                        cards_reported = false;
-                        abort_reported = false;
-                        turn_reported = None;
-                        said.clear();
-                        next_hand_at = None;
-                        act_by = None;
+                        leave_the_table!();
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -3173,26 +3199,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
                         table = None;
-                        table_closed = false;
-                        tournament_started = false;
-                        // **Per table, not per process.** Its own doc says
-                        // *whether this table has ever dealt a hand*, and it was
-                        // set true and never set back — so after one hand at one
-                        // table, the next table in the same process refused every
-                        // stranger (`on_join_request` reads it as `started`),
-                        // never opened hand 1, never re-said a ratification,
-                        // never released a silent seat and was never
-                        // re-advertised. Five mechanisms, all by not running.
-                        ever_dealt = false;
-                        hand = None;
-                        hand_reported = false;
-                        deck_reported = None;
-                        cards_reported = false;
-                        abort_reported = false;
-                        turn_reported = None;
-                        said.clear();
-                        next_hand_at = None;
-                        act_by = None;
+                        leave_the_table!();
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
@@ -3630,6 +3637,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 publish_hand(replayed, &mut swarm, &mut said, &tox_sink);
                 let Some(h) = hand.as_mut() else { continue };
 
+                // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
+                // and the carrier's blind repair ladder puts its attempts in
+                // the seconds T+3, T+5, T+9, T+17 and T+33, so a message whose
+                // early sends the wire refused arrives after the stage waiting
+                // for it has expired, and its sender is voted out for a message
+                // that was in flight. The carrier has a fast path — one round
+                // trip, 36 to 326 ms — but it fires only when the receiver can
+                // SEE a hole, which needs a later message to have arrived. A
+                // stage waiting on one seat has nothing later to reveal it.
+                //
+                // This client does know. So before it says anybody is late, it
+                // asks each seat it is waiting for to re-send. A request for a
+                // message the peer never sent is looked up in that peer's send
+                // array and quietly does nothing, so a seat that is genuinely
+                // silent is neither helped nor disturbed and gains nothing by
+                // stalling — which is what keeps `D-026` intact.
+                for seat in h.waiting_for() {
+                    if let Some(key) = h.key_of(seat) {
+                        tox_sink.nudge(key, seat);
+                    }
+                }
+
                 // Say so first, if this client's own timer has run out on
                 // somebody. A vote is not an accusation and does nothing
                 // alone; only a complete set becomes a certificate, and only a
@@ -3637,7 +3666,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // more this is the answer, and the abort below is what happens
                 // when it is not available — heads-up, where "unanimity" would
                 // be the one opponent.
-                match h.vote_on_timeouts(&app_key, now) {
+                match h.vote_on_timeouts(&app_key, now, tox_sink.mid_delivery()) {
                     Ok(sends) if !sends.is_empty() => {
                         // Said out loud, because a table that is waiting on
                         // somebody looks exactly like one that is stuck, and
@@ -4229,6 +4258,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let (sent, refused, up) = tox_sink.invite_counts();
                         let (rejoins, join_fails, confirmed, founder_link) = tox_sink.join_trouble();
                         let (seen, want) = tox_sink.group_seen();
+                        // The same numbers, as a fact rather than a sentence:
+                        // the line below is advisory and may be dropped, and
+                        // what the client tells its user must not be.
+                        let _ = events
+                            .send(NodeEvent::Carrier {
+                                seen: u16::try_from(seen).unwrap_or(u16::MAX),
+                                want: u16::try_from(want).unwrap_or(u16::MAX),
+                            })
+                            .await;
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "seats on the line: {}; tox self {}, group {seen} seen/{confirmed} confirmed/{want} wanted, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}{}",

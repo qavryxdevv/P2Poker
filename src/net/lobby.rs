@@ -262,9 +262,18 @@ pub fn admit(ad: &TableAd, now_unix_ms: u64) -> Result<(), AdRejected> {
     if ad.action_grace_ms > 30_000 {
         return Err(AdRejected::Range("action_grace_ms is over 30s"));
     }
-    if !(1_000..=120_000).contains(&ad.crypto_step_timeout_ms) {
+    // **Floored at the carrier, not at one second.** `S1-BK`: this admitted
+    // 1_000, and a stage that must close in a second cannot survive a carrier
+    // whose blind repair ladder reaches T+33 — every seat whose datagram the
+    // wire refused is voted out for a message that was on its way. The ceiling
+    // is the carrier's own patience: past `CARRIER_GIVES_UP_MS` the peer is no
+    // longer in the group, so a longer budget waits for nobody.
+    if !(crate::protocol::constants::CRYPTO_STEP_MIN_MS
+        ..=crate::protocol::constants::CARRIER_GIVES_UP_MS)
+        .contains(&ad.crypto_step_timeout_ms)
+    {
         return Err(AdRejected::Range(
-            "crypto_step_timeout_ms is outside 1s to 120s",
+            "crypto_step_timeout_ms is outside the carrier's repair window",
         ));
     }
     if ad.join_deadline_ms as u64 > HAND_DEADLINE_CAP_MS {
@@ -1462,8 +1471,13 @@ mod tests {
                 }),
             ),
             (
+                // In range and not the preset's, which is what this row tests.
+                // It was 20_000, and since `S1-BK` floored §7.2 at the
+                // carrier's repair ladder that is refused as `Range` before it
+                // can reach the preset check — a green test that had stopped
+                // testing the thing it names.
                 "crypto_step_timeout_ms",
-                Box::new(|a: &mut TableAd| a.crypto_step_timeout_ms = 20_000),
+                Box::new(|a: &mut TableAd| a.crypto_step_timeout_ms = 45_000),
             ),
         ];
         for (what, mutate) in mutations {

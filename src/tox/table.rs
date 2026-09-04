@@ -30,7 +30,7 @@
 //! reason a chat id travelling in a public advertisement costs nothing.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as sync_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -168,6 +168,27 @@ pub enum Command {
     /// and pretending otherwise would put a second membership answer beside
     /// the roster's.
     Unseated([u8; 32]),
+    /// **`patches/0011`. Ask this seat for the message a stage is waiting on.**
+    ///
+    /// A lost group message is normally repaired in one round trip: the
+    /// receiver sees a hole, sends `GR_ACK_REQ`, and the sender answers with an
+    /// immediate retransmission and no backoff — 36 to 326 ms on the
+    /// two-machine bed. But a hole is only *visible* once a later message has
+    /// arrived, and a stage waiting on one seat usually has nothing later to
+    /// reveal it. Recovery then falls to the sender's blind ladder, whose
+    /// attempts land in the seconds T+3, T+5, T+9, T+17 and T+33 — against a
+    /// 30 s stage budget, so the seat is voted out for a message that was in
+    /// flight.
+    ///
+    /// The application is the only party that knows it is waiting. This carries
+    /// that knowledge down to the carrier. Named by **application** key, which
+    /// is what a seat is; the driver maps it through `known_as`.
+    Nudge {
+        app_key: [u8; 32],
+        /// The seat this key sits at, so the driver can record what it finds in
+        /// `Trouble::mid_delivery` without knowing anything about rosters.
+        seat: u8,
+    },
     /// A group peer's own key, and the application key that was verified to
     /// have signed a message from it. See `peer_for`.
     KnownAs {
@@ -210,6 +231,19 @@ pub enum Command {
 /// mechanism by which a busy table falls behind, and it was being swallowed.
 #[derive(Default)]
 pub struct Trouble {
+    /// **Which seats the carrier is mid-delivery with, one bit per seat.**
+    ///
+    /// Set while `gcc_recv_pending` reports messages from that seat sitting in
+    /// the receive array — they arrived out of order, so the seat is *talking*
+    /// and something earlier has not landed yet. That is the one fact which
+    /// separates a seat that is late from a seat that is silent, and a timeout
+    /// vote has never had it.
+    ///
+    /// Written by the driver when the application nudges a seat, which it does
+    /// for exactly the seats a stage is waiting on. A bit is therefore as fresh
+    /// as the last tick that cared about it, and stale bits cost nothing: the
+    /// suppression they feed is bounded by the carrier's own patience.
+    pub mid_delivery: AtomicU32,
     /// Fragments toxcore would not take. The queue was full or the group had
     /// nobody in it; either way the message stays and is tried again.
     pub refused: AtomicU64,
@@ -670,6 +704,43 @@ fn run(
         let mut stop = false;
         while let Ok(cmd) = control.try_recv() {
             match cmd {
+                Command::Nudge { app_key, seat } => {
+                    // Costs one small lossy packet, and toxcore throttles it to
+                    // one per second per connection, so a caller may ask on
+                    // every tick. It does nothing at all if the peer never sent
+                    // the message — which is what stops it helping a seat that
+                    // is simply silent, and is why it cannot be used to grief.
+                    // **The reverse of `known_as`, not `peer_for`.**
+                    //
+                    // Both entry points take a public key, so the peer NUMBER
+                    // is not wanted — and `peer_for` finds one by walking
+                    // `0..PEER_SCAN` = 64 with a `tox_group_peer_get_public_key`
+                    // for each, every one of which takes the Tox lock. At nine
+                    // waiting seats on a two-second tick that is up to 576
+                    // lock-taking FFI calls a tick, on the thread whose job is
+                    // to pump the group's messages. Measured, the first version
+                    // of this did exactly that: **the table dropped from 44
+                    // hands in 900 s to 18, and one seat ran eight hands ahead
+                    // of the rest.** The map the driver already keeps answers
+                    // the same question with no FFI and no lock at all.
+                    if let Some(g) = group {
+                        let group_key = known_as
+                            .iter()
+                            .find(|(_, a)| **a == app_key)
+                            .map(|(gk, _)| *gk);
+                        if let Some(group_key) = group_key {
+                            tox.request_missing(g, &group_key);
+                            // And record whether this seat is talking, for the
+                            // vote that is about to be considered.
+                            let bit = 1u32 << u32::from(seat.min(31));
+                            if tox.recv_pending(g, &group_key) > 0 {
+                                trouble.mid_delivery.fetch_or(bit, Ordering::Relaxed);
+                            } else {
+                                trouble.mid_delivery.fetch_and(!bit, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
                 Command::Seated(key) if key == me => {
                     // This client. Not a friend of itself and not a peer of
                     // itself; see `me` above for what happened when it was.

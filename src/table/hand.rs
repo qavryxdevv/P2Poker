@@ -3829,10 +3829,30 @@ impl Hand {
                     what.join("; ")
                 )
             });
-            return Err(Failed::DeckDisagrees {
-                seat,
-                what: "settlement",
-            });
+            // **Noted, not refused — and that one word is the whole of `S1-BD`.**
+            //
+            // This returned here, before `stage.hear`. So a disagreeing
+            // settlement never entered the stage; the stage never completed;
+            // `close_settlement_if_done` never ran; `checkpoint8` stayed `None`;
+            // no checkpoint-8 `STATE_HASH` was ever emitted — and the two
+            // differing values never met at the checkpoint that exists to
+            // compare them. §6.3's freeze is fully implemented and was
+            // unreachable from above: measured, 124 settlement disagreements in
+            // one run and **zero** freeze or reconciliation lines. The hand
+            // ended by abort instead, the pot was restored rather than awarded,
+            // and that is `D-026` violated by doing nothing — a hand in
+            // progress cancelled with nobody paid.
+            //
+            // **Hearing it cannot corrupt anything, which is what makes this
+            // safe.** `close_settlement_if_done` applies `mine.final_stacks` —
+            // this client's OWN settlement — and publishes this client's own
+            // `state_hash`. It never adopts the other seat's numbers. So a
+            // differing copy does not move a chip here; it lets the stage
+            // close, which is what publishes the checkpoint, which is what
+            // surfaces the difference where §6.3 can act on it.
+            //
+            // The report above is kept and is now the only thing that refusal
+            // was really achieving.
         }
         match stage.hear(seat, opened.event_hash) {
             Heard::Counted | Heard::Bystander | Heard::Again => {}
@@ -4998,10 +5018,14 @@ impl Hand {
     /// only *"my timer expired and I have accepted nothing from that seat at
     /// this stage"* — it is not an accusation, it does nothing alone, and it is
     /// not evidence against anybody until a complete set exists.
+    /// `mid_delivery` is a bit per seat, set where the carrier is still
+    /// delivering that seat's traffic — see `Trouble::mid_delivery`. Pass 0
+    /// where there is no carrier to ask.
     pub fn vote_on_timeouts(
         &mut self,
         key: &SigningKey,
         now_ms: u64,
+        mid_delivery: u32,
     ) -> Result<Vec<Send>, Failed> {
         if self.over() || !self.past_stage_deadline(now_ms) {
             return Ok(Vec::new());
@@ -5010,6 +5034,26 @@ impl Hand {
         for seat in self.waiting_for() {
             // Never about oneself, and never twice.
             if seat == self.open.my_seat {
+                continue;
+            }
+            // **A seat the carrier is mid-delivery with is late, not silent.**
+            //
+            // `S1-BK`. A bit here means messages from this seat are sitting in
+            // the receive array: they arrived out of order, so the seat IS
+            // sending and something earlier has not landed yet. Accusing it of
+            // not speaking is accusing it of the carrier's backlog, and the
+            // stage clock alone cannot tell those apart — this is the only
+            // fact in the system that can.
+            //
+            // **Bounded, on purpose.** A seat could otherwise buy silence for
+            // ever by sending later messages while withholding the one a stage
+            // needs. Past `long_past_stage` — twice the budget, which is just
+            // beyond the point where the carrier itself gives a confirmed peer
+            // up at 58 s — the suppression stops and the vote goes ahead
+            // whatever the carrier says. `D-026` is what that bound is for.
+            if !self.long_past_stage(now_ms)
+                && mid_delivery & (1u32 << u32::from(seat.min(31))) != 0
+            {
                 continue;
             }
             let Some(subject) = self.subject_now(seat) else {
@@ -6710,6 +6754,18 @@ impl Hand {
     }
 
     /// Which seats the stage now open is still waiting for.
+    /// The application key seated at `seat` in this hand.
+    ///
+    /// Used to name a seat to the carrier: `waiting_for` says which seats a
+    /// stage is missing, and the carrier knows peers by key.
+    pub fn key_of(&self, seat: SeatIdx) -> Option<[u8; 32]> {
+        self.open
+            .seats
+            .iter()
+            .find(|(s, _, _)| *s == seat)
+            .map(|(_, key, _)| *key)
+    }
+
     pub fn waiting_for(&self) -> Vec<SeatIdx> {
         match &self.phase {
             Phase::Init(stage) => stage.waiting_for(),
@@ -7157,7 +7213,7 @@ mod tests {
 
         // It must now say nothing, whatever its clock thinks.
         let out = hand
-            .vote_on_timeouts(&key(14), NOW + 600_000)
+            .vote_on_timeouts(&key(14), NOW + 600_000, 0)
             .expect("voting is not an error");
         assert!(
             out.is_empty(),
@@ -7741,6 +7797,100 @@ mod tests {
     /// ever caught"*, and a comparison is worth nothing unless two honest peers
     /// that played the same hand produce the same value. So the value is
     /// compared, and so is the slot: `sequence = BOUNDARY_CHECKPOINT_BASE` with
+    /// A settlement this client disagrees with is **heard**, so the checkpoint
+    /// that exists to judge it is reached.
+    ///
+    /// `S1-BD`. `on_hand_complete` used to return before `stage.hear`, and
+    /// everything followed from that: the stage never completed, so
+    /// `close_settlement_if_done` never ran, so `checkpoint8` stayed `None`, so
+    /// no checkpoint-8 `STATE_HASH` was published — and the two differing
+    /// values never met at §6.3's comparison. Measured, one 900-second run: 124
+    /// settlement disagreements and **zero** freeze lines. The hand ended by
+    /// abort instead and the pot was restored rather than awarded, which is the
+    /// outcome `D-026` forbids.
+    ///
+    /// Hearing it moves no chips: `close_settlement_if_done` applies this
+    /// client's OWN `final_stacks` and publishes its OWN `state_hash`.
+    #[test]
+    fn a_disagreeing_settlement_is_heard_so_the_checkpoint_is_reached() {
+        let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let b_deck = deliver(&mut b, &from_a, &key(11));
+        let a_deck = deliver(&mut a, &from_b, &key(10));
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+        queue.push((1, deliver(&mut b, &a_deck, &key(11))));
+        queue.push((0, deliver(&mut a, &b_deck, &key(10))));
+
+        let keys = [key(10), key(11)];
+        let mut swapped = false;
+
+        for _ in 0..256 {
+            if let Some((from, sends)) = queue.pop() {
+                if sends.is_empty() {
+                    continue;
+                }
+                let to = 1 - from;
+
+                // The one interception: seat 0's settlement, re-sealed with a
+                // changed field, so seat 1 hears a body it disagrees with.
+                let sends = if from == 0 && !swapped {
+                    let at = a.slot();
+                    let mut out = Vec::new();
+                    for s in &sends {
+                        let Send::Broadcast(bytes) = s;
+                        let mine: Result<_, _> =
+                            chained::open(bytes, FRAME_CAP, EventType::HandComplete, &at);
+                        if mine.is_ok() && !swapped {
+                            swapped = true;
+                            out.push(Send::Broadcast(tamper::<HandComplete>(
+                                bytes,
+                                EventType::HandComplete,
+                                &at,
+                                HAND_COMPLETE_CAP,
+                                |c| c.state_hash[0] ^= 1,
+                            )));
+                        } else {
+                            out.push(s.clone());
+                        }
+                    }
+                    out
+                } else {
+                    sends
+                };
+
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let out = deliver(hand, &sends, &keys[usize::from(to)]);
+                queue.push((to, out));
+                continue;
+            }
+            if a.over() && b.over() {
+                break;
+            }
+            let Some(turn) = a.turn().or_else(|| b.turn()) else {
+                break;
+            };
+            let seat = turn.seat;
+            let hand: &mut Hand = if seat == 0 { &mut a } else { &mut b };
+            let action = if hand.turn().expect("that hand agrees").legal.can_check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            let out = hand.act(action, &keys[usize::from(seat)], NOW).unwrap();
+            queue.push((seat, out));
+        }
+
+        assert!(swapped, "no settlement was ever intercepted, so nothing was tested");
+        assert!(
+            b.take_settle_note().is_some(),
+            "the disagreement was not reported, and the report is what the refusal was really for"
+        );
+        assert!(
+            b.checkpoint8().is_some(),
+            "the settlement stage never closed, so §6.3's checkpoint is still unreachable"
+        );
+    }
+
     /// `previous_event_hash = TERMINAL(k)`, which is §4.9's rule and not the
     /// next stage after the hand.
     ///
@@ -8232,7 +8382,7 @@ mod tests {
         let late = NOW + 60_000;
 
         let votes = hands[usize::from(rogue)]
-            .vote_on_timeouts(&keys[usize::from(rogue)], late)
+            .vote_on_timeouts(&keys[usize::from(rogue)], late, 0)
             .unwrap();
         assert_eq!(votes.len(), 1, "a rogue may say its own timer expired");
 
@@ -8254,6 +8404,64 @@ mod tests {
         }
     }
 
+    /// A seat the carrier is still delivering from is late, not silent — and
+    /// the reprieve runs out.
+    ///
+    /// `S1-BK`. The stage clock cannot tell a seat that said nothing from a
+    /// seat whose message the wire refused and whose carrier is still trying;
+    /// the receive array can, because a message sitting in it arrived out of
+    /// order, which means that seat IS sending. Voting anyway accuses a player
+    /// of the carrier's backlog.
+    ///
+    /// The bound is the other half and it is what keeps `D-026` intact: a seat
+    /// could otherwise buy silence for ever by sending later messages while
+    /// withholding the one a stage needs, so past twice the stage budget the
+    /// vote goes ahead whatever the carrier says.
+    #[test]
+    fn a_seat_the_carrier_is_still_delivering_is_not_accused_yet() {
+        // Past the betting stage's own deadline — `action_timeout` 20 s plus
+        // `grace` 5 s — but well inside twice it, which is where the reprieve
+        // lives. Outside that window there is nothing to test: the vote goes
+        // ahead by design.
+        let late = NOW + 30_000;
+
+        let (mut hands, keys) = three_to_the_bet();
+        let up = hands[0].turn().expect("somebody is to act").seat;
+        let voter = (0..3u8).find(|s| *s != up).expect("a third seat");
+
+        // With the carrier saying nothing, the vote is made, as it always was.
+        let plain = hands[usize::from(voter)]
+            .vote_on_timeouts(&keys[usize::from(voter)], late, 0)
+            .unwrap();
+        assert_eq!(plain.len(), 1, "a silent seat is voted on");
+
+        // A fresh table, because the vote above is remembered.
+        let (mut hands, keys) = three_to_the_bet();
+        let up = hands[0].turn().expect("somebody is to act").seat;
+        let voter = (0..3u8).find(|s| *s != up).expect("a third seat");
+        let bit = 1u32 << u32::from(up);
+
+        let held = hands[usize::from(voter)]
+            .vote_on_timeouts(&keys[usize::from(voter)], late, bit)
+            .unwrap();
+        assert!(
+            held.is_empty(),
+            "a seat whose traffic is still arriving was accused of silence"
+        );
+
+        // And the reprieve ends. Twice the stage budget is past the point where
+        // the carrier gives a confirmed peer up, so nothing is owed to it.
+        let much_later = NOW + 600_000;
+        let forced = hands[usize::from(voter)]
+            .vote_on_timeouts(&keys[usize::from(voter)], much_later, bit)
+            .unwrap();
+        assert_eq!(
+            forced.len(),
+            1,
+            "the carrier's word suppressed the vote for ever, which is D-026's exploit"
+        );
+    }
+
     /// Unanimity of the voter set does force it, and the effect is the one the
     /// rules give: **check when nothing is owed, fold when facing a bet**.
     #[test]
@@ -8268,7 +8476,7 @@ mod tests {
         let mut said: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
         for v in &voters {
             let out = hands[usize::from(*v)]
-                .vote_on_timeouts(&keys[usize::from(*v)], late)
+                .vote_on_timeouts(&keys[usize::from(*v)], late, 0)
                 .unwrap();
             assert_eq!(out.len(), 1, "seat {v} votes once");
             said.push((*v, out));
@@ -8335,10 +8543,10 @@ mod tests {
 
         let late = NOW + 60_000;
         assert!(
-            a.vote_on_timeouts(&keys[0], late).unwrap().is_empty(),
+            a.vote_on_timeouts(&keys[0], late, 0).unwrap().is_empty(),
             "with one voter there is nothing a vote could become"
         );
-        assert!(b.vote_on_timeouts(&keys[1], late).unwrap().is_empty());
+        assert!(b.vote_on_timeouts(&keys[1], late, 0).unwrap().is_empty());
     }
 
     /// Before its own timer expires a peer says nothing, whatever anybody else
@@ -8351,7 +8559,7 @@ mod tests {
         let other = (0..3u8).find(|s| *s != up).unwrap();
         assert!(
             hands[usize::from(other)]
-                .vote_on_timeouts(&keys[usize::from(other)], NOW + 1_000)
+                .vote_on_timeouts(&keys[usize::from(other)], NOW + 1_000, 0)
                 .unwrap()
                 .is_empty(),
             "one second in, nobody's timer has expired"

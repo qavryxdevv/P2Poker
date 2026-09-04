@@ -2319,6 +2319,32 @@ duplicate `seat`. **The joiner then connects directly to every peer in the roste
 and runs the §1.2 handshake with each.** It does not take the founder's word for
 who is at the table — see `TABLE_READY`.
 
+> **`roster_so_far` is a snapshot and this message gives the receiver no way to
+> tell how old it is.** `PLAYER_LIST` and `TABLE_READY` both carry
+> `list_serial`; `JOIN_ACCEPT` does not, and the validation list above has no
+> rule about recency. The founder emits the reply and the broadcast in the same
+> turn, but they do not arrive together: measured, one joiner asked at t=10.6 s
+> and was answered at t=20.6 s, and in those ten seconds two more seats were
+> filled and it had adopted every list up to the last. A reply that slow
+> describes an *older* table than the one its receiver already holds, and
+> carries nothing that says so.
+>
+> Adopting it blind rewinds the roster to exactly `seat + 1` entries. Measured
+> at ten seats over 900 s, that prediction held for every affected peer with no
+> exceptions: the seat that fell from ten members to eight never sealed a table
+> and played no hand in the remaining 880 s, and the one that fell to nine had
+> **already sealed**, so it went on computing `roster_hash(0)` — and therefore
+> `GENESIS(1)` — over nine entries where everybody else used ten. It opened
+> every hand about 11.8 s late and finished none of them.
+>
+> An implementation must therefore not let a `JOIN_ACCEPT` replace a roster it
+> cannot prove is newer. This one takes the seat unconditionally and the roster
+> only when what it holds does not already seat it where the founder says, which
+> is a ranking and not a comparison. **The proper fix is a field**: give
+> `JOIN_ACCEPT` the `list_serial` its two siblings carry, and this becomes the
+> same `NotNewer` check as everywhere else. That is a wire change and is not
+> made here.
+
 ---
 
 **`0x0203 JOIN_REJECT`**
@@ -6141,7 +6167,7 @@ unambiguous before the first card exists.
 | `n(13) blind_schedule` | `BlindSchedule` | see below |
 | `n(14) action_timeout_ms` | `u32` | `5_000 ≤ … ≤ 300_000` [RULES B3] |
 | `n(15) action_grace_ms` | `u32` | `≤ 30_000` |
-| `n(16) crypto_step_timeout_ms` | `u32` | `1_000 ≤ … ≤ 120_000` |
+| `n(16) crypto_step_timeout_ms` | `u32` | `30_000 ≤ … ≤ 58_000` — **the carrier's repair window, not an arbitrary range.** The floor was `1_000`, which is a stage that must close in a second on a carrier whose blind repair ladder reaches T+33 s: every seat whose datagram the wire refused is voted out for a message that was on its way (`S1-BK`). The ceiling is `GC_CONFIRMED_PEER_TIMEOUT`, past which the peer is no longer in the group and a longer budget waits for nobody. Both are mirrored in `constants.rs` beside static assertions, and the ladder they are derived from is a checked patch marker. |
 | `n(17) hand_deadline_ms` | `u32` | `HAND_DEADLINE_MIN(n(11)) ≤ … ≤ 3_600_000` — the lower bound is derived, not a literal (`P3`, and raised by one `REOPENING_COST` in this pass by `G5-Q6`); it is a function of `n(11)`, `n(14)`, `n(15)`, `n(16)` and `n(19)`, it is derived in §8.2, and an advert below it is rejected by rule 2a below. A single figure here made legal play at six seats and up abort itself, and the floor alone let the first re-raise do the same |
 | `n(18) join_deadline_ms` | `u32` | `≤ 3_600_000` |
 | `n(19) hand_delay_ms` | `u32` | `≤ 60_000` |

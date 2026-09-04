@@ -597,6 +597,42 @@ impl TableSink {
         }
     }
 
+    /// **Ask a seat for the message a stage is waiting on (`patches/0011`).**
+    ///
+    /// A no-op without a Tox carrier, and a no-op at the driver when the seat
+    /// is not a group peer yet or has nothing outstanding. Safe to call every
+    /// tick: toxcore throttles the request it turns into to one per second per
+    /// connection.
+    #[allow(unused_variables)]
+    pub fn nudge(&self, app_key: [u8; 32], seat: u8) {
+        #[cfg(feature = "tox")]
+        {
+            if let Some(t) = self.inner.as_ref() {
+                t.tell(crate::tox::table::Command::Nudge { app_key, seat });
+            }
+        }
+    }
+
+    /// **Which seats the carrier is still delivering from, one bit per seat.**
+    ///
+    /// Refreshed by the driver whenever `nudge` asks about a seat, which the
+    /// stall tick does for exactly the seats a stage is waiting on. Zero
+    /// without a Tox carrier, which makes the vote behave as it always did.
+    pub fn mid_delivery(&self) -> u32 {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().mid_delivery.load(Ordering::Relaxed),
+                None => 0,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            0
+        }
+    }
+
     /// Give it up, leaving the group.
     pub fn clear(&mut self) {
         #[cfg(feature = "tox")]

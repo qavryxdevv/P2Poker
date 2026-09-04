@@ -380,7 +380,7 @@ impl FullTable {
     fn run_the_clocks_out(&mut self, now_ms: u64) {
         let mut queue = Vec::new();
         for i in 0..self.hands.len() {
-            if let Ok(out) = self.hands[i].vote_on_timeouts(&self.keys[i], now_ms) {
+            if let Ok(out) = self.hands[i].vote_on_timeouts(&self.keys[i], now_ms, 0) {
                 for Send::Broadcast(b) in out {
                     self.widest = self.widest.max(b.len());
                     queue.push(b);

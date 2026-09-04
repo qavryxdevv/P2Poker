@@ -833,6 +833,39 @@ impl Tox {
             .count()
     }
 
+    /// Ask `peer` for the message this client is missing from it.
+    ///
+    /// **The repair the carrier already had and never reached.** A lost group
+    /// message is normally recovered in one round trip: the receiver sees a
+    /// hole and sends `GR_ACK_REQ`, and the sender answers with an immediate
+    /// retransmission and no backoff — 36 to 326 ms on the two-machine bed.
+    /// But a hole is only visible once something *later* has arrived, and a
+    /// stage waiting on one seat usually has nothing later. Recovery then falls
+    /// to the blind ladder, whose attempts land in the seconds T+3, T+5, T+9,
+    /// T+17 and T+33 — and the stage budget is 30 s, so the seat is voted out
+    /// for a message that was in flight and would have arrived.
+    ///
+    /// The application knows what it is waiting for. This is how it says so.
+    ///
+    /// Returns false when the group or the peer is not found. Says nothing
+    /// about whether the message existed: a request for a message the peer
+    /// never sent is looked up in its send array and quietly does nothing,
+    /// which is exactly why this cannot help a seat that is genuinely silent.
+    pub fn request_missing(&self, group: u32, peer_key: &[u8; 32]) -> bool {
+        // SAFETY: `peer_key` is 32 bytes, which is `TOX_PUBLIC_KEY_SIZE`.
+        unsafe { sys::tox_group_peer_request_missing(self.ptr, group, peer_key.as_ptr()) }
+    }
+
+    /// How many of `peer`'s messages are waiting behind a hole.
+    ///
+    /// Non-zero means the peer is sending and the carrier has not finished
+    /// delivering — which is the one thing that separates *late* from *silent*,
+    /// and the thing a timeout vote must know before it accuses a seat.
+    pub fn recv_pending(&self, group: u32, peer_key: &[u8; 32]) -> u16 {
+        // SAFETY: as above; the call only reads.
+        unsafe { sys::tox_group_peer_recv_pending(self.ptr, group, peer_key.as_ptr()) }
+    }
+
     pub fn peer_key(&self, group: u32, peer: u32) -> Result<[u8; 32], Failed> {
         let mut out = [0u8; 32];
         let mut err: c_int = 0;

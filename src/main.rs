@@ -484,13 +484,30 @@ fn headless(player: Player, run: Run, join: Option<String>) {
         // The one line a scripted run reads back. A table with a session is a
         // table that formed; anything else is not, and saying which is the whole
         // point of running two of these.
-        match state.seated.as_ref().and_then(|s| s.session) {
-            Some(session) => println!(
+        // **`TABLE FORMED` is unchanged for a seat that is actually playing**,
+        // because it is the line every scripted run greps. What changes is that
+        // a seat which formed a table and then heard nothing from it for
+        // `DEAF_MS` no longer claims to be at one — `S1-BH`. It is the same
+        // client, saying the thing it already knew and never said.
+        let now = state.last_sweep_ms;
+        match state.seated.as_ref() {
+            Some(s) if s.playing(now) => println!(
                 "TABLE FORMED session={} seats={}",
-                session[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                state.seated.as_ref().map(|s| s.roster.len()).unwrap_or(0)
+                s.session
+                    .map(|x| x[..8].iter().map(|b| format!("{b:02x}")).collect::<String>())
+                    .unwrap_or_default(),
+                s.roster.len()
             ),
-            None => println!("NO TABLE"),
+            Some(s) if s.session.is_some() => println!(
+                "NOT PLAYING session={} seats={} heard={} of {}",
+                s.session
+                    .map(|x| x[..8].iter().map(|b| format!("{b:02x}")).collect::<String>())
+                    .unwrap_or_default(),
+                s.roster.len(),
+                s.heard.unwrap_or(0),
+                s.roster.len().saturating_sub(1)
+            ),
+            _ => println!("NO TABLE"),
         }
         println!("done");
     });

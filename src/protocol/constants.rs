@@ -482,7 +482,65 @@ const _: () = assert!(SNAPSHOT_RESP_MAX <= TABLE_FRAME_MAX);
 /// these constants satisfy it exactly. The assertion said `2 *` for a long time,
 /// which is a weaker claim than the corpus makes and than the comment above it
 /// made: it would have admitted a pair that tolerates one loss, not two.
+/// **The carrier's own blind repair ladder, mirrored here because a Rust
+/// constant is measured against it.**
+///
+/// `gcc_resend_packets` retries an unacked send-array entry only when `delta`
+/// reaches a power of two in whole seconds, and `create_array_entry` stamps
+/// whole seconds — so the attempts fall in the seconds **T+3, T+5, T+9, T+17
+/// and T+33** after the message was queued. T+65 does not exist: the head check
+/// drops the peer at `GC_CONFIRMED_PEER_TIMEOUT` = `GC_PING_TIMEOUT * 4 + 10` =
+/// 58 s first.
+///
+/// This number lives in C and nothing in a Rust build can notice it changing,
+/// so `tools/build-tox.ps1` carries the ladder's own expression as a checked
+/// patch marker. If that marker is ever gone, this constant is stale and must
+/// be re-derived before it is trusted.
+pub const CARRIER_LADDER_LAST_MS: u32 = 33_000;
+
+/// **How long a client may hear nothing from a table before it stops saying
+/// it is playing at one (`S1-BH`).**
+///
+/// Derived rather than picked. `CARRIER_GIVES_UP_MS` = 58 000 is the point at
+/// which the carrier itself drops a confirmed peer, `CARRIER_LADDER_LAST_MS` =
+/// 33 000 is its last blind repair, and housekeeping reads the group at its own
+/// interval — so a reading may be that stale on top. Two minutes is past all
+/// three with room, which matters because the cost of being wrong here is
+/// telling a player who is fine that they are not.
+pub const DEAF_MS: u64 = 120_000;
+
+/// When the carrier itself concludes a confirmed peer is gone.
+///
+/// `GC_CONFIRMED_PEER_TIMEOUT` in `group_chats.h`. Past it there is nothing
+/// left to wait for: the peer is no longer in the group.
+pub const CARRIER_GIVES_UP_MS: u32 = 58_000;
+
+/// **The shortest stage budget a table may advertise.**
+///
+/// `S1-BK`: a stage that must finish in less time than the carrier needs to
+/// repair one dropped datagram votes out seats for messages that are in flight
+/// and would have arrived. §7.2 admitted anything from **one second**, which is
+/// thirty-three times shorter than the blind ladder.
+///
+/// The floor is the ladder rather than something larger because `patches/0011`
+/// removes the ladder from the common path: a stage that is waiting asks the
+/// seats it is waiting for to re-send, and that request is answered by an
+/// immediate retransmission — one round trip, 36 to 326 ms measured. The blind
+/// ladder is what remains when the request itself is lost, and a table that
+/// wants to survive *that* may advertise more. It may not advertise less.
+pub const CRYPTO_STEP_MIN_MS: u32 = 30_000;
+
 const _: () = assert!(AD_REBROADCAST_MS * 3 <= AD_TTL_MS);
+
+/// **The two numbers meet here, which is what `S1-BK` says nothing did.**
+const _: () = assert!(
+    CRYPTO_STEP_MIN_MS < CARRIER_GIVES_UP_MS,
+    "a stage budget past the carrier's own patience waits for a peer that is already gone"
+);
+const _: () = assert!(
+    CRYPTO_STEP_MIN_MS >= CARRIER_LADDER_LAST_MS - 3_000,
+    "the floor must leave the fast repair room to land inside one stage"
+);
 const _: () = assert!(PRESENCE_HEARTBEAT_MS * 3 <= PRESENCE_TTL_MS);
 
 /// The boundary window sits above the stage numbers and below the boundary

@@ -925,7 +925,55 @@ impl Formation {
 
         self.pending = None;
         self.my_seat = Some(accept.seat);
-        self.roster = roster;
+
+        // **A `JOIN_ACCEPT` is a bootstrap, not an update.**
+        //
+        // `roster_so_far` is the roster as it stood *at the instant the founder
+        // accepted this joiner* — exactly `seat + 1` entries. This write used to
+        // be unconditional, and it is the one membership mutation of the four in
+        // this type that moves no version: `on_join_request` and
+        // `release_seat_before_the_first_hand` both do `serial += 1`, and
+        // `on_player_list` is guarded by `admit_list`'s `NotNewer`. This one
+        // touched neither `serial` nor `ratified` nor `session`, and
+        // `JoinAcceptBody` carries no `list_serial` at all, so the snapshot
+        // cannot even be *ordered* against what is held.
+        //
+        // It is not a race lost by microseconds: the reply is slow. Measured,
+        // the peer this killed asked to join at t=10.6 s and was answered at
+        // t=20.6 s, and in those ten seconds the founder seated two more players
+        // and it adopted every list up to the founder's last. So the condition
+        // is narrow — the accept lands after the last `PLAYER_LIST` this peer
+        // will ever adopt, and the peer is not the last seat.
+        //
+        // Then this line rewound a correct roster to the founder's older
+        // snapshot, and because `serial` was left untouched, every later
+        // rebroadcast died at `list_serial <= held`. Permanently — including
+        // down `say_again`, which is a genuine full-state anti-entropy push,
+        // is called on every gossipsub `Subscribed`, and re-emits at the
+        // *current* serial, so it is refused by the same equality it exists to
+        // repair.
+        //
+        // Measured, ten seats, 900 s: the roster of every clobbered peer fell to
+        // exactly `my_seat + 1`, with no exceptions. Seat 7 sat at `ratified
+        // 5/8, 10 held` for the remaining 880 s and never sealed a table, and
+        // seat 8 was clobbered 100 ms *after* it sealed — keeping a session
+        // whose roster hash nobody else computes, which is why it opened every
+        // hand late and finished none. Seat 9 was unharmed because by then the
+        // snapshot was already the whole table, and the early joiners recovered
+        // because a higher serial still followed.
+        //
+        // So: take the seat, and take the roster only when what is held does not
+        // already seat us where the founder says. That covers both directions —
+        // a stale snapshot cannot rewind a list, and a list that does not yet
+        // contain us cannot leave us seated but absent from our own roster.
+        // Giving `JOIN_ACCEPT` a `list_serial` would let the two be compared
+        // properly rather than merely ranked; that is a wire change and is
+        // recorded as such.
+        let seated_here_already =
+            self.roster.seat_of(&self.app.verifying_key().to_bytes()) == Some(accept.seat);
+        if !seated_here_already {
+            self.roster = roster;
+        }
         let _ = now_ms;
         Ok(vec![])
     }
@@ -1529,6 +1577,88 @@ mod tests {
             j.session(),
             t.founder.session(),
             "the two seats disagree about the session"
+        );
+    }
+
+    /// A `JOIN_ACCEPT` overtaken by a newer roster must not rewind it.
+    ///
+    /// The founder answers a join with `roster_so_far` — the table as it stood
+    /// when it said yes — and broadcasts a `PLAYER_LIST` in the same turn. Their
+    /// order at the joiner is not fixed, and `Formation::table` says so. When a
+    /// later seat's list wins the race, the reply that follows it is *older*
+    /// than what the joiner already holds, and it carries no `list_serial` to
+    /// say so.
+    ///
+    /// This is written as the failing peer saw it: adopt the full roster, then
+    /// deliver the stale accept. Before the fix the roster fell to `my_seat + 1`
+    /// and stayed there, because `serial` was untouched and every rebroadcast of
+    /// the founder's last list was then refused as `NotNewer`.
+    #[test]
+    fn a_late_accept_does_not_rewind_a_roster() {
+        let (mut t, _, a, hash) = found(6, 2);
+        let table_id = t.founder.table_id();
+
+        let join_as = |seed: u8, name: &str| {
+            Formation::join(
+                key(seed),
+                a.clone(),
+                hash,
+                table_id,
+                peer(seed),
+                name.into(),
+                1_000,
+                None,
+                None,
+                [seed; 32],
+                NOW,
+                None,
+            )
+            .unwrap()
+        };
+
+        let (mut two, req2) = join_as(2, "two");
+        let (_three, req3) = join_as(3, "three");
+
+        // The founder seats `two`. Its reply is held back, unsent, exactly as a
+        // slow round trip holds it.
+        let mut stale_accept = None;
+        for send in t.founder.on_join_request(&req2, &peer(2), false, NOW).unwrap() {
+            if let Send::Reply(b) = send {
+                stale_accept = Some(b);
+            }
+        }
+        let stale_accept = stale_accept.expect("the founder answers a join");
+
+        // Meanwhile `three` is seated too, so the founder's next list is newer
+        // and larger than the snapshot inside that unsent reply.
+        let mut newer_list = None;
+        for send in t.founder.on_join_request(&req3, &peer(3), false, NOW).unwrap() {
+            if let Send::Broadcast(b) = send {
+                if joinwire::receive_player_list(&b).is_ok() {
+                    newer_list = Some(b);
+                }
+            }
+        }
+        let newer_list = newer_list.expect("a roster is announced for the second joiner");
+
+        // The list wins the race, which is the ordinary case on a fast network.
+        two.on_player_list(&newer_list, NOW).unwrap();
+        let full = two.roster().seats().len();
+        assert_eq!(full, 3, "the founder and both joiners");
+
+        // And only now the reply arrives, carrying the two-seat table.
+        two.on_join_answer(&stale_accept, NOW)
+            .expect("a late accept is not an error");
+
+        assert_eq!(
+            two.roster().seats().len(),
+            full,
+            "the late accept rewound the roster to its own snapshot"
+        );
+        assert_eq!(
+            two.roster().seat_of(&key(3).verifying_key().to_bytes()),
+            Some(2),
+            "the seat that was seated after the accept was dropped from the roster"
         );
     }
 

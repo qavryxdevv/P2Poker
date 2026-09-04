@@ -84,6 +84,19 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# **A run that fell over must not be able to look like a run that passed.**
+# Under `powershell -File`, an uncaught exception prints its message and then
+# leaves the exit code at 0. An invocation that died on `cargo is not
+# recognized` — before a single seat started — therefore reported success to
+# the thing that launched it, and the empty log directory had to be caught by
+# eye. Same class as measuring a stale binary: the run did not happen and the
+# result said otherwise.
+trap {
+    Write-Host "the run did not complete: $($_.Exception.Message)"
+    exit 1
+}
+
 $inv = [System.Globalization.CultureInfo]::InvariantCulture
 
 if (-not $Exe) {
@@ -106,8 +119,15 @@ $Exe = (Resolve-Path $Exe).Path
 if (-not $NoBuild) {
     $root = Split-Path -Parent $PSScriptRoot
     $feat = if ($Quiet) { @() } else { @('--features', 'fault-harness') }
+    # **Resolve cargo, do not assume the PATH has it.** Launched with
+    # `powershell -NoProfile` — which is how a background job starts it — the
+    # rustup shim is not on the PATH, `& cargo` raises CommandNotFoundException,
+    # and the run dies before it builds anything.
+    $cargo = (Get-Command cargo -ErrorAction SilentlyContinue).Source
+    if (-not $cargo) { $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe' }
+    if (-not (Test-Path $cargo)) { throw "cargo is neither on the PATH nor at $cargo; nothing can be built." }
     Write-Host "==> cargo build --release $($feat -join ' ')"
-    & cargo build --release @feat --manifest-path (Join-Path $root 'Cargo.toml') 2>&1 |
+    & $cargo build --release @feat --manifest-path (Join-Path $root 'Cargo.toml') 2>&1 |
         Where-Object { $_ -match 'error|warning: unused|Compiling p2p-poker|Finished' } |
         ForEach-Object { Write-Host "    $_" }
     if ($LASTEXITCODE -ne 0) { throw "the build failed; nothing was measured." }
@@ -421,16 +441,56 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         $group = $null
         $opens = 0
         $overs = 0
+        # **Which seat is this, so that `opened` can mean *dealt in*.** A
+        # certified-out peer keeps following the table and keeps logging
+        # `hand #k opens`, with a seat list that does not contain it — seat 3
+        # logged hand 25 with `seats [0, 4, 5, 6, 7, 8, 9]` 167 s after it was
+        # struck. Counting those made a seat that had been removed for three
+        # minutes look like a seat that was playing, and a first reading of
+        # `S1-BH` concluded from exactly that arithmetic that certification was
+        # being recovered from. It was not; the peer was watching.
+        $mySeat = $null
+        $dealtIn = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($l in $lines) {
+            if ($null -eq $mySeat -and $l -match 'seat ([0-9]+) at ') { $mySeat = [int]$Matches[1] }
+            if ($null -eq $mySeat -and $l -match 'hosting ') { $mySeat = 0 }
+        }
         foreach ($l in $lines) {
             if ($l -match '([0-9]+) seated') {
                 $n = [int]$Matches[1]
                 if ($n -gt $seated) { $seated = $n }
             }
-            if ($null -eq $group -and $l -match "^\s*([0-9.]+)\s+in the table's Tox group") {
+            # **Skip the UTC stamp.** This was anchored on the elapsed figure
+            # being the first field on the line. Adding a wall clock in front of
+            # it — so that two machines' logs could be compared at all — moved
+            # the elapsed figure to second place and this stopped matching, on
+            # every node, silently. The column then read `never` for all ten
+            # seats, including the nine that were plainly in the group, and it
+            # is the ONE column that separates *found the table but could not
+            # join the Tox side* from *never found it*. A run where exactly one
+            # seat failed that way reported the same thing as a run where none
+            # did. The optional `HH:MM:SS.fff` is what makes it read both the
+            # old logs and the new.
+            if ($null -eq $group -and $l -match "^\s*(?:[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\s+)?([0-9.]+)\s+in the table's Tox group") {
                 $group = [double]::Parse($Matches[1], [System.Globalization.CultureInfo]::InvariantCulture)
             }
-            if ($l -match 'opens at genesis') { $opens++ }
-            if ($l -match 'hand #\d+ is over') { $overs++ }
+            if ($l -match 'hand #([0-9]+) opens at genesis') {
+                # Dealt in, or merely watching? The seat list is on the line.
+                $hid = $Matches[1]
+                if ($l -match 'with seats \[([0-9, ]*)\]' -and $null -ne $mySeat) {
+                    $in = $Matches[1] -split ',' | ForEach-Object { $_.Trim() }
+                    if ($in -contains "$mySeat") { $opens++; $null = $dealtIn.Add($hid) }
+                } else {
+                    $opens++
+                    $null = $dealtIn.Add($hid)
+                }
+            }
+            # **The same hands, or the two columns measure different things.**
+            # `opened` counting only hands this seat was dealt while `finished`
+            # counted every hand it watched produced rows like `opened 8,
+            # finished 22`, which reads as a broken client and is really two
+            # different questions in one table.
+            if ($l -match 'hand #([0-9]+) is over' -and $dealtIn.Contains($Matches[1])) { $overs++ }
         }
         [pscustomobject]@{ Node = $name; Seated = $seated; Group = $group; Opens = $opens; Overs = $overs }
     }

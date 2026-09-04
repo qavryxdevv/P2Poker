@@ -271,6 +271,19 @@ pub enum NodeEvent {
     /// table that no longer existed stayed on the screen until the client was
     /// restarted. Expiry is a function of time passing, and time passing has to
     /// be an event or it is not noticed.
+    /// **How many other seats this client can actually hear (`S1-BH`).**
+    ///
+    /// Emitted from housekeeping, which runs whatever else is happening — the
+    /// sentence that says the same thing today lives inside `hand_one_may_open`
+    /// behind an `!ever_dealt` gate, so it stops being said at the exact moment
+    /// a mid-table silence would matter, and it is a `Warning`, which
+    /// `is_advisory` marks droppable.
+    ///
+    /// **Not advisory.** A client that has heard nobody must be able to say so
+    /// rather than telling its user it is playing: measured, a seat that never
+    /// entered the group was certified out and exited printing `TABLE FORMED
+    /// seats=10` after 900 s at a table it had been removed from.
+    Carrier { seen: u16, want: u16 },
     Swept { now_ms: u64 },
     /// Somebody is in the lobby, under this name.
     ///
@@ -416,7 +429,13 @@ impl NodeEvent {
             | Self::LobbySaid { .. } => true,
 
             // Log only. Chatty, repetitive, and worth a second's delay.
-            Self::Listening(_)
+            //
+            // The carrier reading arrives on every housekeeping tick with the
+            // same value nearly every time, and the verdict it feeds -- whether
+            // this client is deaf to its table -- takes DEAF_MS to mature, so a
+            // tick's delay in repainting it changes nothing a player can see.
+            Self::Carrier { .. }
+            | Self::Listening(_)
             | Self::Discovered { .. }
             | Self::TableRefused { .. }
             | Self::PortMapped { .. }
