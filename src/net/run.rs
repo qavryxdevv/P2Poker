@@ -604,6 +604,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_repair: Option<crate::table::hand::Opening> = None;
     // The hand whose boundary wait has been said.
     let mut genesis_wait_said: Option<u64> = None;
+    // **fault-harness only.** `P2P_POKER_DELAY_CERTS_MS=<ms>` parks every
+    // `TIMEOUT_CERT` this seat receives for that long before it is judged —
+    // the shape `S1-BS` measured (the copies twenty-odd seconds late at one
+    // seat), induced on purpose so the late roster repair is seen live. A
+    // build without the feature never reads the variable.
+    let delay_certs_ms: Option<u64> = if cfg!(feature = "fault-harness") {
+        std::env::var("P2P_POKER_DELAY_CERTS_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v > 0)
+    } else {
+        None
+    };
+    let mut delayed_certs: Vec<(tokio::time::Instant, Vec<u8>)> = Vec::new();
+    let mut releasing_certs = false;
+    let mut delay_said = false;
     // Said once: why no reconciliation round could be opened. Its causes are
     // permanent ones only — a stage that has not closed yet is retried in
     // silence, because it is the ordinary case and not a fault.
@@ -909,6 +925,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         ($h:expr, $bytes:expr) => {{
             use crate::table::hand::Failed;
             let now = super::node::now_unix_ms();
+            // fault-harness: a certificate copy is parked, not judged (see
+            // `delay_certs_ms`). Accepted for the mesh — it is a peer's
+            // honest copy — and released by the stall tick when due.
+            if delay_certs_ms.is_some()
+                && !releasing_certs
+                && matches!(
+                    crate::net::chained::peek($bytes, TABLE_FRAME_PEEK),
+                    Ok((crate::protocol::messages::EventType::TimeoutCert, _, _))
+                )
+            {
+                let ms = delay_certs_ms.unwrap_or(0);
+                delayed_certs.push((
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(ms),
+                    $bytes.to_vec(),
+                ));
+                if !delay_said {
+                    delay_said = true;
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "fault-harness: every TIMEOUT_CERT this seat receives is parked for {ms} ms before it is judged"
+                        )))
+                        .await;
+                }
+                Some(gossipsub::MessageAcceptance::Accept)
+            } else {
                             match $h.on_event($bytes, &app_key, now) {
                             Ok(sends) => {
                                 // Anything held for a stage this client had
@@ -1226,6 +1267,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 Some(gossipsub::MessageAcceptance::Reject)
                             }
                         }
+            }
         }};
     }
     // **Everything a table leaves behind, cleared in one place.**
@@ -3708,6 +3750,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // cryptographic ones are bounded per stage rather than per hand.
             _ = stall.tick() => {
                 let now = super::node::now_unix_ms();
+                // fault-harness: parked certificate copies that are due.
+                if !delayed_certs.is_empty() {
+                    let at_now = tokio::time::Instant::now();
+                    let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut delayed_certs)
+                        .into_iter()
+                        .partition(|(at, _)| *at <= at_now);
+                    delayed_certs = later;
+                    if !due.is_empty() {
+                        releasing_certs = true;
+                        if let Some(h) = hand.as_mut() {
+                            for (_, b) in due {
+                                let _ = hand_event!(h, &b);
+                            }
+                        }
+                        releasing_certs = false;
+                    }
+                }
                 // `S1-BS`: the retained hand replays what it holds, and a
                 // certificate that banked there re-derives the running hand.
                 if let Some(p) = previous.as_mut() {

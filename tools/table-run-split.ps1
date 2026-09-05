@@ -77,6 +77,10 @@ param(
     [ValidateRange(0, 8)][int]$StallSeat = 0,
     # Skip the build. The staleness check below still runs, so this only saves
     # the time of a no-op build -- it cannot be used to measure a stale binary.
+    # fault-harness: park every TIMEOUT_CERT received by far seat
+    # -DelayCertsSeat for -DelayCerts ms (0 = off). Induces the S1-BS shape.
+    [ValidateRange(0, 600000)][int]$DelayCerts = 0,
+    [ValidateRange(0, 8)][int]$DelayCertsSeat = 0,
     [switch]$NoBuild,
     # **Build without `fault-harness`, and therefore without toxcore's log.**
     #
@@ -180,6 +184,7 @@ Write-Host "seats  $seats  ($Here here, $There on $Target)"
 Write-Host "for    $Seconds s"
 Write-Host "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
 Write-Host "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
+Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_CERT frames parked $DelayCerts ms on far seat $DelayCertsSeat (fault-harness)" } else { 'none' })"
 Write-Host "work   $work"
 Write-Host ''
 
@@ -332,6 +337,7 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     `$jobs += Start-Job -ArgumentList `$p, `$log, `$i -ScriptBlock {
         param(`$p, `$log, `$seat)
         if ($Stall -gt 0 -and `$seat -eq $StallSeat) { `$env:P2P_POKER_STALL_JOIN = '$Stall' }
+        if ($DelayCerts -gt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_MS = '$DelayCerts' }
         `$start = Get-Date
         `$inv = [System.Globalization.CultureInfo]::InvariantCulture
         & "$FarDir\p2p-poker.exe" --headless $(if ($NoMdns) { '--no-mdns' }) --autoplay --for $Seconds --profile `$p --join $table 2>&1 |
