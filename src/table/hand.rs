@@ -565,6 +565,12 @@ pub struct CertFact {
 /// the mesh: a kept event was worth forwarding, an event of another hand is
 /// somebody else's business and costs its sender nothing, and a malformed one
 /// is the sender's fault and must not be forwarded in this client's name.
+/// How many roster seats must name one foreign genesis at sequence 0 of this
+/// hand before this client says so: the same floor `adrift_now` uses for
+/// *a hand ahead*, and for the same reason — one seat's word is one seat's
+/// word.
+pub const FOREIGN_GENESIS_FLOOR: usize = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Holding {
     Kept,
@@ -1079,6 +1085,13 @@ pub struct Hand {
     settle_note: Option<String>,
     /// Diagnostic: what the certificate path last decided.
     cert_note: Vec<String>,
+    /// Seat → the genesis its sequence-0 `HAND_INIT` of this hand named, when
+    /// that is not this client's. A roster seat's signed word that it opened
+    /// this hand elsewhere: the evidence a client on a private branch can
+    /// get, read off the envelope `opened()` throws away as `NotYet`.
+    foreign_genesis: BTreeMap<SeatIdx, Hash>,
+    /// Said once per hand, when `FOREIGN_GENESIS_FLOOR` seats name one value.
+    genesis_note: Option<String>,
     /// The last seat a certificate acted for, and what it did.
     ///
     /// Read once by the node so it can say so: an action nobody took is the one
@@ -1341,6 +1354,8 @@ impl Hand {
                 shuffle_note: None,
                 settle_note: None,
                 cert_note: Vec::new(),
+                foreign_genesis: BTreeMap::new(),
+                genesis_note: None,
                 acted_for: None,
                 votes: BTreeMap::new(),
                 voted: BTreeSet::new(),
@@ -6326,6 +6341,50 @@ impl Hand {
                 seat: self.seat_of_key(&opened.sender),
             };
         }
+        // **The same bytes twice are one held event.** The power-of-two re-send
+        // puts every recent stage on the wire again at ticks 2, 4, 8, 16, 32,
+        // and each copy used to take a slot of its own: `split092359-10`,
+        // `far-n1`, thirteen held for seven seats. A re-open's replay rests
+        // on the copies surviving a queue of sixty-four.
+        if self.early.iter().any(|b| *b == bytes) {
+            return Holding::Kept;
+        }
+        // **A `HAND_INIT` of this hand at a genesis this client does not
+        // hold is a roster seat's signed word that the table opened the hand
+        // elsewhere** — `chained::open_inner` computes exactly that
+        // (*a different parent: the sender is on another chain*) and
+        // `opened()` collapses it into `NotYet`, so until now no client on a
+        // private branch could tell a slow table from a lost one. Recorded
+        // per seat, and said once when `FOREIGN_GENESIS_FLOOR` seats name one
+        // value. Read off a signed envelope field, never a body, and it
+        // decides nothing about R (D-012): it says when to look.
+        if kind == EventType::HandInit
+            && opened.envelope.sequence == 0
+            && self.slot.sequence == 0
+            && opened.envelope.previous_event_hash != self.open.genesis
+        {
+            if let Some(seat) = self.seat_of_key(&opened.sender) {
+                self.foreign_genesis
+                    .insert(seat, opened.envelope.previous_event_hash);
+                if self.genesis_note.is_none() {
+                    if let Some((g, seats)) = self.foreign_genesis_named() {
+                        let short = |h: &Hash| -> String {
+                            h[..4].iter().map(|b| format!("{b:02x}")).collect()
+                        };
+                        self.genesis_note = Some(format!(
+                            "hand #{}: seat(s) {:?} opened it at genesis {}; this client opened it at {} \
+                             and nobody has been heard at that genesis. A certificate about hand #{} \
+                             would repair it",
+                            self.open.hand_id,
+                            seats,
+                            short(&g),
+                            short(&self.open.genesis),
+                            self.open.hand_id.saturating_sub(1)
+                        ));
+                    }
+                }
+            }
+        }
         // Bounded: this is fed from the network, and everything fed from the
         // network is bounded where it is consumed.
         if self.early.len() >= 64 {
@@ -6333,6 +6392,25 @@ impl Hand {
         }
         self.early.push_back(bytes);
         Holding::Kept
+    }
+
+    /// The foreign genesis named by at least `FOREIGN_GENESIS_FLOOR` roster
+    /// seats' sequence-0 `HAND_INIT`s of this hand, with those seats — the
+    /// most-named value if there are several. `None` below the floor.
+    pub fn foreign_genesis_named(&self) -> Option<(Hash, Vec<SeatIdx>)> {
+        let mut by_value: BTreeMap<Hash, Vec<SeatIdx>> = BTreeMap::new();
+        for (seat, g) in &self.foreign_genesis {
+            by_value.entry(*g).or_default().push(*seat);
+        }
+        by_value
+            .into_iter()
+            .filter(|(_, seats)| seats.len() >= FOREIGN_GENESIS_FLOOR)
+            .max_by_key(|(_, seats)| seats.len())
+    }
+
+    /// The once-per-hand foreign-genesis line, taken rather than read.
+    pub fn take_genesis_note(&mut self) -> Option<String> {
+        self.genesis_note.take()
     }
 
     /// Judge everything that was held, now that the stage may have moved.
@@ -8067,6 +8145,49 @@ mod tests {
             next_b.seats.iter().map(|(_, _, c)| *c).collect::<Vec<_>>(),
             "the settlement's stacks on both, not the abort's on one"
         );
+    }
+
+    /// `S1-BS`'s detector: a `HAND_INIT` of this hand at a genesis this client
+    /// does not hold is recorded per seat and said once when two seats name one
+    /// value — and it is still held, still not counted, and held only once.
+    #[test]
+    fn a_hand_init_at_a_foreign_genesis_is_recorded_and_not_counted() {
+        let (mut a, _) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
+        let mut elsewhere_b = opening3(1);
+        elsewhere_b.genesis = [9; 32];
+        let mut elsewhere_c = opening3(2);
+        elsewhere_c.genesis = [9; 32];
+        let (_b, from_b) = Hand::open(elsewhere_b, &key(11), NOW, 30_000).unwrap();
+        let (_c, from_c) = Hand::open(elsewhere_c, &key(12), NOW, 30_000).unwrap();
+        let Send::Broadcast(init_b) = &from_b[0];
+        let Send::Broadcast(init_c) = &from_c[0];
+
+        // Seat 1's copy: a different parent, so held — and recorded.
+        assert_eq!(a.on_event(init_b, &key(10), NOW), Err(Failed::NotYet));
+        assert!(matches!(a.hold(init_b.clone()), Holding::Kept));
+        assert!(a.foreign_genesis_named().is_none(), "one seat's word is one seat's word");
+        assert!(a.take_genesis_note().is_none());
+        // Seat 2's copy reaches the floor.
+        assert_eq!(a.on_event(init_c, &key(10), NOW), Err(Failed::NotYet));
+        assert!(matches!(a.hold(init_c.clone()), Holding::Kept));
+        assert_eq!(a.foreign_genesis_named(), Some(([9; 32], vec![1, 2])));
+        let note = a.take_genesis_note().expect("said once");
+        assert!(note.contains("seat(s) [1, 2] opened it at genesis 09090909"), "{note}");
+        assert!(a.take_genesis_note().is_none(), "and only once");
+        // Nothing was counted: seat 0 is still waiting for everybody.
+        assert_eq!(a.waiting_for(), vec![1, 2]);
+        // Held once each, however often the re-send repeats them.
+        assert_eq!(a.held(), 2);
+        assert!(matches!(a.hold(init_b.clone()), Holding::Kept));
+        assert_eq!(a.held(), 2, "the same bytes twice are one held event");
+
+        // And a copy at this client's own genesis records nothing.
+        let (mut a2, _) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
+        let (_b2, from_b2) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
+        let Send::Broadcast(init_b2) = &from_b2[0];
+        assert!(a2.on_event(init_b2, &key(10), NOW).is_ok());
+        assert!(a2.foreign_genesis_named().is_none());
+        assert_eq!(a2.waiting_for(), vec![2]);
     }
 
     /// `S1-BQ`'s fixture. Three seats; seat 0 is one action behind — the last

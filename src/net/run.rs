@@ -588,6 +588,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut frozen_said = false;
     // When a vote was last reported as owed and not cast (`vote_state`).
     let mut vote_state_said: u64 = 0;
+    // The hand whose "a certificate about the previous hand arrived too late
+    // to be kept" line has been said.
+    let mut late_cert_said: Option<u64> = None;
     // Said once: why no reconciliation round could be opened. Its causes are
     // permanent ones only — a stage that has not closed yet is retried in
     // silence, because it is the ordinary case and not a fault.
@@ -1107,6 +1110,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             &mut ahead,
                                             &mut adrift,
                                         );
+                                        // **A certificate about the hand just
+                                        // finished, arriving during the next
+                                        // one, was dropped here with no line**
+                                        // — `S1-BS`: eight seats banked one,
+                                        // the ninth never had it before its
+                                        // hand ended, and whether a copy ever
+                                        // reached it afterwards was
+                                        // unobservable. Said once per hand;
+                                        // the roster half it carries is what a
+                                        // late roster repair would read.
+                                        if hand_id.saturating_add(1) == $h.hand_id()
+                                            && matches!(
+                                                crate::net::chained::peek($bytes, TABLE_FRAME_PEEK),
+                                                Ok((crate::protocol::messages::EventType::TimeoutCert, _, _))
+                                            )
+                                            && late_cert_said != Some($h.hand_id())
+                                        {
+                                            late_cert_said = Some($h.hand_id());
+                                            let _ = events
+                                                .send(NodeEvent::Warning(format!(
+                                                    "a certificate about hand #{hand_id} from seat {seat:?} arrived during hand #{}: hand #{hand_id} is no longer held here, so it cannot repair anything",
+                                                    $h.hand_id()
+                                                )))
+                                                .await;
+                                        }
                                         gossipsub::MessageAcceptance::Accept
                                     }
                                     Holding::Malformed => {
@@ -1188,6 +1216,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             tournament_started = false;
             ever_dealt = false;
             hand = None;
+            late_cert_said = None;
             hand_reported = false;
             deck_reported = None;
             cards_reported = false;
@@ -3575,8 +3604,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 //   Repeating the whole hand on its behalf costs every other
                 //   seat the bandwidth.
                 let here = h.slot().sequence;
-                if here != resend_at {
-                    resend_at = here;
+                // **Keyed on the hand as well as the sequence** (`S1-BU`). A
+                // run of hands that all end at sequence 0 — a table waiting
+                // for one seat's `HAND_INIT`, sixty seconds a hand — left
+                // `here` at 0 across every boundary, so the counter never
+                // reset and the new hand's terminal and `HAND_INIT` went out
+                // at ticks 32, 64, 128: once a hand at best, then never.
+                let stamp = (h.hand_id() << 20) | (here & 0xF_FFFF);
+                if stamp != resend_at {
+                    resend_at = stamp;
                     resend_ticks = 0;
                 }
                 resend_ticks = resend_ticks.saturating_add(1);
@@ -3727,6 +3763,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .send(NodeEvent::Warning(format!("the clock: {e}")))
                             .await;
                     }
+                }
+                // Two seats have signed this hand at a genesis this client
+                // does not hold. Said once per hand (`S1-BS`).
+                if let Some(n) = h.take_genesis_note() {
+                    let _ = events.send(NodeEvent::Warning(n)).await;
                 }
                 // A vote that is owed and not cast, with every gate's value.
                 // Measured before this: eight seats waiting on one for 370 s,
