@@ -5877,6 +5877,10 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
 
     int peer_number = get_peer_number_of_enc_pk(chat, sender_pk, false);
     const bool is_new_peer = peer_number < 0;
+    /* p2p-poker (patch 0015): this request arrived at a connection this node
+     * still holds as handshaked, so both message rings are about to be stale.
+     * See the two sites below. */
+    bool in_place_rehandshake = false;
 
     if (is_new_peer) {
         peer_number = peer_add(chat, ipp, sender_pk);
@@ -5895,7 +5899,14 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
 
         if (gconn->handshaked) {
             gconn->handshaked = false;
-            LOGGER_DEBUG(chat->log, "Handshaked peer %d sent a handshake request; re-handshaking", peer_number);
+            /* p2p-poker (patch 0015, S1-BO): noted here, acted on where the
+             * re-handshake is committed. The rings are cleared beside
+             * gcc_set_recv_message_id at the end of this function, because
+             * four `return -1` paths lie between here and there and on those
+             * the re-handshake never happens -- stock loses nothing on them
+             * and an early clear would have thrown both rings away for no
+             * reason. */
+            in_place_rehandshake = true;
         }
     }
 
@@ -5967,6 +5978,27 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
         gcc_mark_for_deletion(gconn, chat->tcp_conn, GC_EXIT_TYPE_DISCONNECTED, nullptr, 0);
         LOGGER_DEBUG(chat->log, "Ignoring invalid invite request");
         return -1;
+    }
+
+    /* p2p-poker (patch 0015, S1-BO): the numbering is replaced on this line
+     * and the shared key was replaced a few lines above, so both rings are now
+     * addressed by counters that no longer describe them: a send entry the
+     * remote will never ack and a recv entry the drain can never reach, since
+     * gcc_check_recv_array only ever inspects received_message_id + 1. Kept,
+     * they collide with the new stream -- add_to_send_array refuses on an
+     * occupied slot, the entry's time_added is already older than
+     * GC_CONFIRMED_PEER_TIMEOUT, and gcc_resend_packets times the peer out
+     * again -- and a recv entry that happens to sit at the reset index is
+     * handed up as the new stream's next message, because
+     * process_recv_array_entry reads the entry's own id only to acknowledge
+     * it. Measured over two ten-seat runs: 44 of 63 peer timeouts follow this
+     * line. */
+    if (in_place_rehandshake) {
+        uint32_t send_dropped = 0;
+        uint32_t recv_dropped = 0;
+        gcc_reset_rings(chat->mem, gconn, &send_dropped, &recv_dropped);
+        LOGGER_DEBUG(chat->log, "Handshaked peer %d sent a handshake request; re-handshaking (%u send, %u recv stale ring entries cleared)",
+                     peer_number, send_dropped, recv_dropped);
     }
 
     gcc_set_recv_message_id(gconn, 1);  // handshake request is always first packet

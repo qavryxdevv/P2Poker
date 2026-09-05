@@ -604,6 +604,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_repair: Option<crate::table::hand::Opening> = None;
     // The hand whose boundary wait has been said.
     let mut genesis_wait_said: Option<u64> = None;
+    // The hand a certificate banked late for, so a redelivery of that
+    // certificate after the hand was dropped is not reported as a repair
+    // missed.
+    let mut late_banked_for: Option<u64> = None;
     // **fault-harness only.** `P2P_POKER_DELAY_CERTS_MS=<ms>` parks every
     // `TIMEOUT_CERT` this seat receives for that long before it is judged —
     // the shape `S1-BS` measured (the copies twenty-odd seconds late at one
@@ -1225,18 +1229,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                             .await;
                                                     }
                                                     if p.take_late_roster() {
+                                                        late_banked_for = Some(p.hand_id());
                                                         pending_repair = p.next_hand();
                                                     }
                                                 }
                                                 _ => {
                                                     if late_cert_said != Some($h.hand_id()) {
                                                         late_cert_said = Some($h.hand_id());
-                                                        let _ = events
-                                                            .send(NodeEvent::Warning(format!(
+                                                        // **What the node knows, and not a word more.**
+                                                        // Banking is keyed on the subject digest and a
+                                                        // hand can certify two seats, so "an earlier
+                                                        // copy of this certificate" is more than the
+                                                        // hand id can prove — the same false second
+                                                        // clause `S1-BV` was opened for.
+                                                        let line = if late_banked_for == Some(hand_id) {
+                                                            format!(
+                                                                "a certificate about hand #{hand_id} from seat {seat:?} arrived during hand #{}; hand #{hand_id} is no longer held here, and a certificate about it did bank here before retention ended",
+                                                                $h.hand_id()
+                                                            )
+                                                        } else {
+                                                            format!(
                                                                 "a certificate about hand #{hand_id} from seat {seat:?} arrived during hand #{}: hand #{hand_id} is no longer held here, so it cannot repair anything",
                                                                 $h.hand_id()
-                                                            )))
-                                                            .await;
+                                                            )
+                                                        };
+                                                        let _ = events.send(NodeEvent::Warning(line)).await;
                                                     }
                                                 }
                                             }
@@ -1339,6 +1356,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             next_inits.clear();
             pending_repair = None;
             genesis_wait_said = None;
+            late_banked_for = None;
             hand_reported = false;
             deck_reported = None;
             cards_reported = false;
@@ -3797,6 +3815,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                     }
                     if p.take_late_roster() {
+                        late_banked_for = Some(p.hand_id());
                         pending_repair = p.next_hand();
                     }
                 }
@@ -4386,6 +4405,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
+                // A repair the stall tick has not applied yet: the arm must
+                // not succeed the hand it is about. A peer's abort arms this
+                // timer 800 ms ahead and the tick is two seconds; succeeding
+                // here dropped hand k and the tick's re-open then refused on
+                // the id (found by reading, not by a run).
+                if pending_repair.is_some() {
+                    next_hand_at = Some(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                    );
+                    continue;
+                }
+
                 // `S1-BS`: never deal the next hand alone. More seats signed
                 // this hand at one other genesis than were counted here, so
                 // the hand this client would derive is on a branch nobody
@@ -4487,13 +4518,61 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `A`'s life** (§4.9). A set read anywhere else is a set
                         // two peers can come to disagree about.
                         opening.readmitted = std::mem::take(&mut readmitted);
-                        if !opening.readmitted.is_empty() {
-                            let _ = events
-                                .send(NodeEvent::Warning(format!(
-                                    "seat(s) {:?} are heard again at this hand, and dealt in at the next",
-                                    opening.readmitted
-                                )))
-                                .await;
+                        // **Said about other seats, and never about this
+                        // one.** The `Bystander` arm writes `A` for any roster
+                        // seat the checkpoint stage did not count, and this
+                        // client's own seat qualifies whenever it did not sign
+                        // the hand — so a muted seat announced its own return,
+                        // three times, in `split125944-9`.
+                        //
+                        // **The set itself keeps that seat.** `open_with` builds
+                        // `accepted` from `required ∪ readmitted` and decides
+                        // from it whether this client seals its own `HAND_INIT`
+                        // at stage 0. For a seat still in `required` that is the
+                        // same either way; for a certified-out bystander —
+                        // the only seat that ever gets here — `readmitted` is
+                        // the whole of why it may sign, and taking it out would
+                        // silence §4.9's route for the seat it was built for.
+                        // So the filter is on the sentence, not on the set.
+                        let spoken: Vec<_> = opening
+                            .readmitted
+                            .iter()
+                            .copied()
+                            .filter(|s| *s != opening.my_seat)
+                            .collect();
+                        if !spoken.is_empty() {
+                            // **Two different facts, and the line used to assert
+                            // one of them for both.** `A` is written from the
+                            // checkpoint stage's `signed` set and `R(k+1)` is
+                            // derived from `certified`, so a seat this client
+                            // heard nothing from — but which nobody certified
+                            // out — is in the roster of this hand *and* in `A`.
+                            // For that seat "not dealt in" is false. Measured
+                            // fifteen times across the corpus in its first half
+                            // (in `required`, never signed); the second half has
+                            // not co-occurred yet, and the sentence must not
+                            // depend on that.
+                            let (dealt, out): (Vec<_>, Vec<_>) = spoken
+                                .into_iter()
+                                .partition(|s| opening.required.contains(s));
+                            if !out.is_empty() {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "seat(s) {out:?} are heard again: they agree at hand #{}'s checkpoint, so their HAND_INIT is accepted while hand #{}'s stage 0 is open. The roster is monotone (D-024), so they are not dealt into it",
+                                        opening.hand_id.saturating_sub(1),
+                                        opening.hand_id
+                                    )))
+                                    .await;
+                            }
+                            if !dealt.is_empty() {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "seat(s) {dealt:?} agreed with this client's checkpoint for hand #{} without being counted into it here; they are still in the roster and are dealt into hand #{}",
+                                        opening.hand_id.saturating_sub(1),
+                                        opening.hand_id
+                                    )))
+                                    .await;
+                            }
                         }
                         // Quiet if two seats already signed this hand at one
                         // other genesis and none at this one (`S1-BS`).

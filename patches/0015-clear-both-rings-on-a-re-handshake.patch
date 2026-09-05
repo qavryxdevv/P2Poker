@@ -1,0 +1,145 @@
+diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
+index 012b801..f790bc7 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.c
++++ b/vendor/c-toxcore/toxcore/group_chats.c
+@@ -5877,6 +5877,10 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
+ 
+     int peer_number = get_peer_number_of_enc_pk(chat, sender_pk, false);
+     const bool is_new_peer = peer_number < 0;
++    /* p2p-poker (patch 0015): this request arrived at a connection this node
++     * still holds as handshaked, so both message rings are about to be stale.
++     * See the two sites below. */
++    bool in_place_rehandshake = false;
+ 
+     if (is_new_peer) {
+         peer_number = peer_add(chat, ipp, sender_pk);
+@@ -5895,7 +5899,14 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
+ 
+         if (gconn->handshaked) {
+             gconn->handshaked = false;
+-            LOGGER_DEBUG(chat->log, "Handshaked peer %d sent a handshake request; re-handshaking", peer_number);
++            /* p2p-poker (patch 0015, S1-BO): noted here, acted on where the
++             * re-handshake is committed. The rings are cleared beside
++             * gcc_set_recv_message_id at the end of this function, because
++             * four `return -1` paths lie between here and there and on those
++             * the re-handshake never happens -- stock loses nothing on them
++             * and an early clear would have thrown both rings away for no
++             * reason. */
++            in_place_rehandshake = true;
+         }
+     }
+ 
+@@ -5969,6 +5980,27 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
+         return -1;
+     }
+ 
++    /* p2p-poker (patch 0015, S1-BO): the numbering is replaced on this line
++     * and the shared key was replaced a few lines above, so both rings are now
++     * addressed by counters that no longer describe them: a send entry the
++     * remote will never ack and a recv entry the drain can never reach, since
++     * gcc_check_recv_array only ever inspects received_message_id + 1. Kept,
++     * they collide with the new stream -- add_to_send_array refuses on an
++     * occupied slot, the entry's time_added is already older than
++     * GC_CONFIRMED_PEER_TIMEOUT, and gcc_resend_packets times the peer out
++     * again -- and a recv entry that happens to sit at the reset index is
++     * handed up as the new stream's next message, because
++     * process_recv_array_entry reads the entry's own id only to acknowledge
++     * it. Measured over two ten-seat runs: 44 of 63 peer timeouts follow this
++     * line. */
++    if (in_place_rehandshake) {
++        uint32_t send_dropped = 0;
++        uint32_t recv_dropped = 0;
++        gcc_reset_rings(chat->mem, gconn, &send_dropped, &recv_dropped);
++        LOGGER_DEBUG(chat->log, "Handshaked peer %d sent a handshake request; re-handshaking (%u send, %u recv stale ring entries cleared)",
++                     peer_number, send_dropped, recv_dropped);
++    }
++
+     gcc_set_recv_message_id(gconn, 1);  // handshake request is always first packet
+ 
+     gconn->is_pending_handshake_response = true;
+diff --git a/vendor/c-toxcore/toxcore/group_connection.c b/vendor/c-toxcore/toxcore/group_connection.c
+index 8d70201..6b42714 100644
+--- a/vendor/c-toxcore/toxcore/group_connection.c
++++ b/vendor/c-toxcore/toxcore/group_connection.c
+@@ -885,6 +885,64 @@ void gcc_mark_for_deletion(GC_Connection *gconn, TCP_Connections *tcp_conn, Grou
+     }
+ }
+ 
++/* p2p-poker: both rings cleared on a re-handshake (patch 0015, S1-BO).
++ *
++ * An in-place re-handshake -- the remote deleted this node and re-added it,
++ * and sends a handshake request to a connection this node still holds --
++ * resets send_message_id, received_message_id and the shared key, and left
++ * both rings as they were. Every entry in them is under the OLD numbering:
++ * a send entry the remote will never ack (it expects the new numbering) and
++ * a recv entry the remote will never complete. Kept, they collide with the
++ * new stream at the same slot: add_to_send_array refuses ('entry is not
++ * empty'), the entry's time_added is already older than
++ * GC_CONFIRMED_PEER_TIMEOUT, and gcc_resend_packets times the peer out
++ * again -- measured across two ten-seat runs at 2 to 177 s after a
++ * re-handshake, with the median at one timeout window, for the rest of the
++ * run, and cascading: the peer that times us out re-adds us and we
++ * re-handshake it in turn. Cleared, the new stream starts on empty rings.
++ * The application above keeps its own re-send of the last stages, so
++ * nothing a table needs rides on an entry the remote could not accept.
++ *
++ * An entry is occupied when its time_added is set, NOT when it holds a
++ * pointer: create_array_entry stores a zero-length message with a null data
++ * pointer, and the count below is what the acceptance of this patch is read
++ * off. The rings are declared _Nullable and are allocated in peer_add, so a
++ * caller that reaches a half-built connection finds them null rather than
++ * empty.
++ *
++ * THE TWO RINGS ARE COUNTED APART, and patch 0007 is the reason: it split the
++ * one 'Failed to create array entry' line into a send line and a recv line
++ * because the two are different faults, and its comment records that a whole
++ * day's readings had been taken against the sum. This patch's acceptance is
++ * read off the line below, so it must not re-merge them.
++ *
++ * Writes the two counts out; returns nothing. */
++void gcc_reset_rings(const Memory *mem, GC_Connection *gconn, uint32_t *send_dropped, uint32_t *recv_dropped)
++{
++    *send_dropped = 0;
++    *recv_dropped = 0;
++
++    if (gconn->send_array == nullptr || gconn->recv_array == nullptr) {
++        return;
++    }
++
++    for (size_t i = 0; i < GCC_BUFFER_SIZE; ++i) {
++        if (!array_entry_is_empty(&gconn->send_array[i])) {
++            ++*send_dropped;
++        }
++
++        clear_array_entry(mem, &gconn->send_array[i]);
++
++        if (!array_entry_is_empty(&gconn->recv_array[i])) {
++            ++*recv_dropped;
++        }
++
++        clear_array_entry(mem, &gconn->recv_array[i]);
++    }
++
++    gconn->last_chunk_id = 0;
++}
++
+ void gcc_peer_cleanup(const Memory *mem, GC_Connection *gconn)
+ {
+     for (size_t i = 0; i < GCC_BUFFER_SIZE; ++i) {
+diff --git a/vendor/c-toxcore/toxcore/group_connection.h b/vendor/c-toxcore/toxcore/group_connection.h
+index 4f04489..d09b301 100644
+--- a/vendor/c-toxcore/toxcore/group_connection.h
++++ b/vendor/c-toxcore/toxcore/group_connection.h
+@@ -84,6 +84,12 @@ uint16_t gcc_recv_pending(const GC_Connection *_Nonnull gconn);
+  */
+ void gcc_set_send_message_id(GC_Connection *_Nonnull gconn, uint64_t id);
+ 
++/** @brief p2p-poker (patch 0015): clears every entry of both message rings and
++ * the fragment state, for an in-place re-handshake. The two counts are
++ * separate because the two rings are different faults (patch 0007). */
++void gcc_reset_rings(const Memory *_Nonnull mem, GC_Connection *_Nonnull gconn,
++                     uint32_t *_Nonnull send_dropped, uint32_t *_Nonnull recv_dropped);
++
+ /** @brief Sets the received_message_id for `gconn` to `id`. */
+ void gcc_set_recv_message_id(GC_Connection *_Nonnull gconn, uint64_t id);
+ 

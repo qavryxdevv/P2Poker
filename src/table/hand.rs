@@ -222,10 +222,17 @@ pub struct Opening {
     /// reachable by replay, so a read that enlarged a *required* set would let
     /// one stale agreeing copy stall stage 0 to the hand deadline once per hand
     /// for every hand `§5.3` retains. Widening the accepted set costs a map
-    /// lookup and completes nothing on its own. A seat readmitted this way is
-    /// **not** dealt in at `k+1`; it is counted into `P(k+1)` by its own
-    /// `HAND_INIT`, and is required and dealable at `k+2` — one hand later,
-    /// which is what D-013's promise costs when the news arrives late.
+    /// lookup and completes nothing on its own.
+    ///
+    /// **And that is all it is.** This comment used to end by saying the seat
+    /// is counted into `P(k+1)` by its own `HAND_INIT` and *"is required and
+    /// dealable at `k+2` — one hand later"*. It is not: `next_hand` builds
+    /// `required` by filtering `self.open.required` in **both** branches, so
+    /// `R(k+1) ⊆ R(k)` and a seat outside `R` cannot re-enter by being heard
+    /// from — measured over a whole run in `S1-BV`, where seven clients
+    /// announced a readmission six times each and dealt nobody in. Widening
+    /// the accepted set lets the seat *sign* stage 0. The door back into the
+    /// roster is `S1-BM`'s return certificate and it is not built.
     pub readmitted: Vec<SeatIdx>,
     /// Seat, public key and starting stack, ascending by seat.
     pub seats: Vec<(SeatIdx, [u8; 32], u64)>,
@@ -1126,6 +1133,10 @@ pub struct Hand {
     /// The stage at which the "abort held: a vote this client joined is
     /// open" note was said, so it is said once per stage.
     abort_hold_said: Option<u64>,
+    /// The subjects whose voter-set-shortfall HELD note has been said: the
+    /// replay pass re-judges a held copy every two seconds, and the note
+    /// used to come with it every time.
+    shortfall_said: BTreeSet<Hash>,
     /// The last seat a certificate acted for, and what it did.
     ///
     /// Read once by the node so it can say so: an action nobody took is the one
@@ -1367,11 +1378,16 @@ impl Hand {
         // turned §4.9's readmission route into a §6.3 divergence.
         // **The ACCEPTED set, not the required one**, and the difference is
         // §4.9's whole readmission route. A seat in `A` is admitted at this
-        // stage without counting towards its completion, and emitting here is
-        // exactly how it earns its way into `P(k)` and is required again at
-        // `k+2`. Gating on `required` instead shut that door on the seat it was
-        // built for — caught by
+        // stage without counting towards its completion. Gating on `required`
+        // instead shut that door on the seat it was built for — caught by
         // `a_readmitted_seat_is_accepted_at_stage_zero_and_never_required`.
+        //
+        // **What emitting here does NOT do is earn the seat its place back.**
+        // This comment used to say it "is required again at `k+2`". `next_hand`
+        // filters `self.open.required` in both branches, so the roster only
+        // ever shrinks (`S1-BV`, `D-024`); signing stage 0 puts the seat in
+        // `P(k)` and no further. `S1-BM`'s return certificate is the door, and
+        // it is not built.
         let a_member = accepted.contains(&o.my_seat);
         let mut signed = vec![false; usize::from(o.max_players)];
         if a_member {
@@ -1416,6 +1432,7 @@ impl Hand {
                 voice,
                 own_init,
                 abort_hold_said: None,
+                shortfall_said: BTreeSet::new(),
                 acted_for: None,
                 votes: BTreeMap::new(),
                 voted: BTreeSet::new(),
@@ -6022,11 +6039,17 @@ impl Hand {
         let mine: BTreeSet<SeatIdx> =
             self.voters(c.subject.subject_seat).into_iter().collect();
         if !mine.is_subset(&c.voters) {
-            self.cert_note.push(format!(
-                "cert: from seat {seat} about seat {} with voters {:?}; this client \
-                 derives {mine:?} and is missing a certificate the emitters hold — HELD",
-                c.subject.subject_seat, c.voters
-            ));
+            // **Said once per subject.** The replay pass re-judges every held
+            // copy on every two-second tick, and the note came with it every
+            // time: a retained hand in the boundary wait printed one line per
+            // held copy for as long as it waited.
+            if self.shortfall_said.insert(c.subject.subject_digest()) {
+                self.cert_note.push(format!(
+                    "cert: from seat {seat} about seat {} with voters {:?}; this client \
+                     derives {mine:?} and is missing a certificate the emitters hold — HELD",
+                    c.subject.subject_seat, c.voters
+                ));
+            }
             return Err(Failed::NotYet);
         }
 

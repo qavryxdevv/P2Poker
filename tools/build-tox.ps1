@@ -176,6 +176,12 @@ $patched = @(
        Marker = 'offered self address %s:%u to a peer held at'
        Why    = '0014: instrumentation. Without it the sender side of an address offer is invisible; the receiver logs what it stored and nothing logs what was sent' },
     @{ File   = 'toxcore/group_connection.c'
+       Marker = 'p2p-poker: both rings cleared on a re-handshake'
+       Why    = '0015: without it an in-place re-handshake resets the message-id counters and the key and leaves both rings full of entries under the old numbering; the new stream collides with them and the peer is timed out again, 2 to 177 s later and then for the rest of the run (S1-BO: 44 of the 63 timeouts in two runs follow a re-handshake on the same node; the other 19 are S1-BN)' },
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 're-handshaking (%u send, %u recv stale ring entries cleared)'
+       Why    = '0015: the call site in handle_gc_handshake_request, and the count in the line the register reads' },
+    @{ File   = 'toxcore/group_connection.c'
        Marker = 'p2p-poker: read the id BEFORE the entry is wiped'
        Why    = '0010: without it process_recv_array_entry acks every drained message with id 0, because clear_array_entry zeroes the struct before array_entry->message_id is read - so the senders slot is never cleared, its time_added never moves, and gcc_resend_packets drops the peer at 58 s unless a later blind duplicate happens to ack it correctly' }
 )

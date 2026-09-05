@@ -84,6 +84,12 @@ uint16_t gcc_recv_pending(const GC_Connection *_Nonnull gconn);
  */
 void gcc_set_send_message_id(GC_Connection *_Nonnull gconn, uint64_t id);
 
+/** @brief p2p-poker (patch 0015): clears every entry of both message rings and
+ * the fragment state, for an in-place re-handshake. The two counts are
+ * separate because the two rings are different faults (patch 0007). */
+void gcc_reset_rings(const Memory *_Nonnull mem, GC_Connection *_Nonnull gconn,
+                     uint32_t *_Nonnull send_dropped, uint32_t *_Nonnull recv_dropped);
+
 /** @brief Sets the received_message_id for `gconn` to `id`. */
 void gcc_set_recv_message_id(GC_Connection *_Nonnull gconn, uint64_t id);
 

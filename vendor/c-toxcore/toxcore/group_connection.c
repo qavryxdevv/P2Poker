@@ -885,6 +885,64 @@ void gcc_mark_for_deletion(GC_Connection *gconn, TCP_Connections *tcp_conn, Grou
     }
 }
 
+/* p2p-poker: both rings cleared on a re-handshake (patch 0015, S1-BO).
+ *
+ * An in-place re-handshake -- the remote deleted this node and re-added it,
+ * and sends a handshake request to a connection this node still holds --
+ * resets send_message_id, received_message_id and the shared key, and left
+ * both rings as they were. Every entry in them is under the OLD numbering:
+ * a send entry the remote will never ack (it expects the new numbering) and
+ * a recv entry the remote will never complete. Kept, they collide with the
+ * new stream at the same slot: add_to_send_array refuses ('entry is not
+ * empty'), the entry's time_added is already older than
+ * GC_CONFIRMED_PEER_TIMEOUT, and gcc_resend_packets times the peer out
+ * again -- measured across two ten-seat runs at 2 to 177 s after a
+ * re-handshake, with the median at one timeout window, for the rest of the
+ * run, and cascading: the peer that times us out re-adds us and we
+ * re-handshake it in turn. Cleared, the new stream starts on empty rings.
+ * The application above keeps its own re-send of the last stages, so
+ * nothing a table needs rides on an entry the remote could not accept.
+ *
+ * An entry is occupied when its time_added is set, NOT when it holds a
+ * pointer: create_array_entry stores a zero-length message with a null data
+ * pointer, and the count below is what the acceptance of this patch is read
+ * off. The rings are declared _Nullable and are allocated in peer_add, so a
+ * caller that reaches a half-built connection finds them null rather than
+ * empty.
+ *
+ * THE TWO RINGS ARE COUNTED APART, and patch 0007 is the reason: it split the
+ * one 'Failed to create array entry' line into a send line and a recv line
+ * because the two are different faults, and its comment records that a whole
+ * day's readings had been taken against the sum. This patch's acceptance is
+ * read off the line below, so it must not re-merge them.
+ *
+ * Writes the two counts out; returns nothing. */
+void gcc_reset_rings(const Memory *mem, GC_Connection *gconn, uint32_t *send_dropped, uint32_t *recv_dropped)
+{
+    *send_dropped = 0;
+    *recv_dropped = 0;
+
+    if (gconn->send_array == nullptr || gconn->recv_array == nullptr) {
+        return;
+    }
+
+    for (size_t i = 0; i < GCC_BUFFER_SIZE; ++i) {
+        if (!array_entry_is_empty(&gconn->send_array[i])) {
+            ++*send_dropped;
+        }
+
+        clear_array_entry(mem, &gconn->send_array[i]);
+
+        if (!array_entry_is_empty(&gconn->recv_array[i])) {
+            ++*recv_dropped;
+        }
+
+        clear_array_entry(mem, &gconn->recv_array[i]);
+    }
+
+    gconn->last_chunk_id = 0;
+}
+
 void gcc_peer_cleanup(const Memory *mem, GC_Connection *gconn)
 {
     for (size_t i = 0; i < GCC_BUFFER_SIZE; ++i) {
