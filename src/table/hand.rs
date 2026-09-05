@@ -5022,6 +5022,68 @@ impl Hand {
             .collect()
     }
 
+    /// Why this client is not voting, if a vote is owed and has not been cast.
+    ///
+    /// `None` while nothing is owed — the hand is over, nobody is waited for,
+    /// or the stage is inside its deadline — or while this client has already
+    /// voted about everyone it waits for. Otherwise every gate of
+    /// `vote_on_timeouts`, with its value: measured in `split084211-10`, eight
+    /// seats waited on one for 370 s, four voted within half a second of each
+    /// other, four never did, and nothing in nine logs said which gate held
+    /// them. Read by the node's stall tick, said at most every 30 s.
+    pub fn vote_state(&self, now_ms: u64, mid_delivery: u32) -> Option<String> {
+        if self.over() {
+            return None;
+        }
+        let waiting = self.waiting_for();
+        if waiting.is_empty() {
+            return None;
+        }
+        let owed = self.owed_type();
+        let deadline = owed.map(|o| u64::from(self.next_deadline_for(o)));
+        let age = now_ms.saturating_sub(self.stage_at_ms);
+        if deadline.is_some_and(|d| age < d) {
+            return None;
+        }
+        let mut owing = false;
+        let seats: Vec<String> = waiting
+            .iter()
+            .map(|s| {
+                let subject = self.subject_now(*s);
+                let digest = subject.as_ref().map(|sub| sub.subject_digest());
+                let voted = digest.as_ref().is_some_and(|d| self.voted.contains(d));
+                let held = digest
+                    .as_ref()
+                    .and_then(|d| self.votes.get(d))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if !voted && *s != self.open.my_seat {
+                    owing = true;
+                }
+                format!(
+                    "seat {s}: subject {}, voters {:?}, I voted {voted}, votes held {held}, mid-delivery {}",
+                    if subject.is_some() { "yes" } else { "NONE" },
+                    self.voters(*s),
+                    (mid_delivery >> u32::from((*s).min(31))) & 1 == 1
+                )
+            })
+            .collect();
+        if !owing {
+            return None;
+        }
+        Some(format!(
+            "not voting: stage {} open {} s, deadline {:?} s for {:?}, long past {}, my seat {}, sequence {}; {}",
+            self.stage_seq,
+            age / 1_000,
+            deadline.map(|d| d / 1_000),
+            owed,
+            self.long_past_stage(now_ms),
+            self.open.my_seat,
+            self.slot.sequence,
+            seats.join("; ")
+        ))
+    }
+
     /// Vote about every seat this client's own timer has run out on.
     ///
     /// Called by the node, because the deadline is measured on the node's own

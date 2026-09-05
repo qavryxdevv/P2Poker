@@ -586,6 +586,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut roster_seats: Vec<u8> = Vec::new();
     // Said once: why the table has stopped. Cleared when the freeze is.
     let mut frozen_said = false;
+    // When a vote was last reported as owed and not cast (`vote_state`).
+    let mut vote_state_said: u64 = 0;
     // Said once: why no reconciliation round could be opened. Its causes are
     // permanent ones only — a stage that has not closed yet is retried in
     // silence, because it is the ordinary case and not a fault.
@@ -3724,6 +3726,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let _ = events
                             .send(NodeEvent::Warning(format!("the clock: {e}")))
                             .await;
+                    }
+                }
+                // A vote that is owed and not cast, with every gate's value.
+                // Measured before this: eight seats waiting on one for 370 s,
+                // four votes, and no line saying what held the other four.
+                if let Some(line) = h.vote_state(now, tox_sink.mid_delivery()) {
+                    if now.saturating_sub(vote_state_said) >= 30_000 {
+                        vote_state_said = now;
+                        let _ = events.send(NodeEvent::Warning(line)).await;
                     }
                 }
 
