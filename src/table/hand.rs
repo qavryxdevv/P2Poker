@@ -4991,8 +4991,39 @@ impl Hand {
         // could not do was stop the abort that made the fork inevitable.
         //
         // A non-member now waits for `Abort::Told` or for a complete
-        // `HAND_COMPLETE` stage from the seats that are parties. If neither
-        // comes it stalls, which is what the adrift latch is for.
+        // `HAND_COMPLETE` stage from the seats that are parties.
+        //
+        // **And if neither comes, it stalls — which the adrift latch does NOT
+        // answer, whatever this comment used to say (`S1-BW`).** The latch is
+        // read by the next-hand timer arm, and that arm is reached only once
+        // the running hand is over, so a follower stuck inside a hand sets the
+        // latch and nothing acts on it: measured at 283 seconds in one hand in
+        // `split125944-9`, ended only by the harness. What answers it is
+        // upstream of here — the boundary now keeps every event of the next
+        // hand rather than only its `HAND_INIT`, so the stage a late-opening
+        // follower needs is replayed into it instead of being dropped. A
+        // follower's own local terminus remains available if that is not
+        // enough, and is `S1-BW`'s option (2).
+        //
+        // **And membership is asked of `required` alone, deliberately
+        // (`S1-BY`).** A certificate about this very seat can bank in the
+        // middle of the hand, and it is tempting to read `certified` here too:
+        // §4.10 gives a seat outside `P(k)` no terminal to emit, and the seat
+        // goes on believing it is a party. That was built and reverted, and
+        // the reason is worth keeping. `required` is **this hand's** party set
+        // and `certified` is **the next hand's** roster; §4.10 does not narrow
+        // the first within the hand, on purpose, so `HAND_COMPLETE` is a
+        // collective stage over `required` that cannot complete anywhere
+        // without this seat's own copy — which a seat stages behind cannot
+        // produce. Silencing it therefore leaves it with no terminus at all,
+        // which is `S1-BW`'s stall moved onto a different seat. And the
+        // measurement says the emission is not the fault it looks like: in
+        // `split092359-10` this seat's abort **was** the terminal the table
+        // adopted, four nodes taking it as `Abort::Told` within 230 ms, with
+        // every later hand at one genesis, because `abort_terminal` is a
+        // function of `GENESIS(k)` alone. `certified` also grows for a kind-1
+        // certificate, which removes nobody, so reading it here would let one
+        // auto-fold disarm this backstop for the rest of the hand.
         if !self.open.required.contains(&self.open.my_seat) {
             return false;
         }
@@ -8846,6 +8877,27 @@ mod tests {
         assert!(
             a.may_abandon(NOW + 60_000),
             "and the hand is given up at twice the budget, exactly as before design A"
+        );
+    }
+
+    /// `S1-BY`, the negative: a certificate about this client's own seat does
+    /// **not** take away its right to end the hand, and the guard that made it
+    /// do so was reverted. What ends the hand for the other seats in the
+    /// measured run is this seat's own abort.
+    #[test]
+    fn a_seat_certified_out_mid_hand_still_ends_the_hand_it_is_inside() {
+        let (mut a, _b, _c, keys) = three_at_the_deck_stage();
+        let t2 = NOW + 60_000;
+        assert!(
+            !a.vote_on_timeouts(&keys[0], t2, 0).unwrap().is_empty(),
+            "this client votes about the silent seat"
+        );
+        assert!(a.may_abandon(NOW + 90_000), "and the ceiling lets it give the hand up");
+        a.certified.push(0);
+        assert!(
+            a.may_abandon(NOW + 90_000),
+            "a certificate about its own seat changes nothing here: `certified` is the \
+             next hand's roster and this is this hand's party set"
         );
     }
 

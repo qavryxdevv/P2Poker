@@ -599,6 +599,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // the next hand's held queue when it opens, and read for whether its
     // parent is contested before this client signs.
     let mut next_inits: Vec<Vec<u8>> = Vec::new();
+    // Everything else of the next hand that arrives before this client opens
+    // it (`S1-BW`), with the seat that signed it so no one seat can fill it.
+    // Kept apart from the `HAND_INIT`s because those decide the genesis and
+    // this must not reach that decision.
+    let mut next_early: Vec<(u8, Vec<u8>)> = Vec::new();
     // A re-derived opening for the running hand, applied by the stall tick
     // outside the hand borrow.
     let mut pending_repair: Option<crate::table::hand::Opening> = None;
@@ -1257,17 +1262,35 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     }
                                                 }
                                             }
-                                        } else if hand_id == $h.hand_id().saturating_add(1)
-                                            && kind == Some(crate::protocol::messages::EventType::HandInit)
-                                            && seat.is_some()
-                                            && next_inits.len() < NEXT_INITS_CAP
-                                            && !next_inits.iter().any(|b| b[..] == $bytes[..])
-                                        {
-                                            // The next hand's `HAND_INIT`s, kept for it: they
-                                            // arrive during this client's 800 ms pause and
-                                            // used to be dropped, so a far seat heard them
-                                            // only from the tick-8 re-send (`S1-BS`).
-                                            next_inits.push($bytes.to_vec());
+                                        } else if seat.is_some() {
+                                            // The next hand's events, kept for it: they arrive
+                                            // during this client's 800 ms pause at the boundary
+                                            // and used to be dropped. The `HAND_INIT`s were the
+                                            // first half of this (`S1-BS`); everything else was
+                                            // still dropped, and that cost a bystander hand
+                                            // #16's whole `DECK_INIT` stage and 283 seconds
+                                            // inside it (`S1-BW`).
+                                            match keep_for_next_hand(kind, hand_id, $h.hand_id()) {
+                                                Keep::Init
+                                                    if next_inits.len() < NEXT_INITS_CAP
+                                                        && !next_inits.iter().any(|b| b[..] == $bytes[..]) =>
+                                                {
+                                                    next_inits.push($bytes.to_vec());
+                                                }
+                                                Keep::Early
+                                                    if next_early.len() < NEXT_EARLY_CAP
+                                                        && seat.is_some_and(|s| {
+                                                            next_early.iter().filter(|(f, _)| *f == s).count()
+                                                                < NEXT_EARLY_PER_SEAT
+                                                        })
+                                                        && !next_early.iter().any(|(_, b)| b[..] == $bytes[..]) =>
+                                                {
+                                                    if let Some(s) = seat {
+                                                        next_early.push((s, $bytes.to_vec()));
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                         gossipsub::MessageAcceptance::Accept
                                     }
@@ -1354,6 +1377,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             late_cert_said = None;
             previous = None;
             next_inits.clear();
+            next_early.clear();
             pending_repair = None;
             genesis_wait_said = None;
             late_banked_for = None;
@@ -4581,6 +4605,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             opening,
                             voice,
                             &mut next_inits,
+                            &mut next_early,
                             &app_key,
                             &mut hand,
                             &mut said,
@@ -5617,10 +5642,17 @@ async fn begin_hand(
     tox: &super::toxsink::TableSink,
 ) {
     let mut none: Vec<Vec<u8>> = Vec::new();
+    // **Hand one, which has no boundary behind it and therefore no buffer.**
+    // What the loop holds for the hand after the running one belongs to the
+    // loop and stays there; `reopen_hand` does not see it either, and for the
+    // same reason: it re-opens the hand this client is already in, so the
+    // buffer is still keyed on the hand after that one.
+    let mut none_either: Vec<(u8, Vec<u8>)> = Vec::new();
     begin_hand_with(
         opening,
         crate::table::hand::Voice::Speak,
         &mut none,
+        &mut none_either,
         app_key,
         hand,
         said,
@@ -5634,6 +5666,91 @@ async fn begin_hand(
 /// How many of the next hand's `HAND_INIT`s are kept for it while this one
 /// ends: one per seat, and a little room for a re-send.
 const NEXT_INITS_CAP: usize = 16;
+
+/// How many of the next hand's other events are kept for it.
+///
+/// The hand's own early queue holds sixty-four and drops the oldest when it is
+/// full, so what goes in from here has to leave room for what arrives live.
+/// Sixteen `HAND_INIT`s and thirty-two of these is forty-eight, which covers a
+/// full table's cryptographic stage with a re-send and leaves a quarter of the
+/// queue for events that arrive after the hand opens. The measured case needed
+/// seven.
+const NEXT_EARLY_CAP: usize = 32;
+
+/// And how many of them one seat may contribute.
+///
+/// **The sibling buffer needs no such bound and this one does.** A seat has one
+/// `HAND_INIT` per hand, so `NEXT_INITS_CAP` is bounded per seat by the
+/// protocol; this buffer holds stage traffic, and a seat may sign as much of
+/// that as it likes. Without a per-seat bound one seated peer fills all
+/// thirty-two slots and the bystander loses the stage it was waiting for —
+/// which is the fault this buffer exists to fix, re-created by the fix. Six is
+/// a seat's own events across the few stages the boundary window can span.
+const NEXT_EARLY_PER_SEAT: usize = 6;
+
+/// What an event of a hand this client has not opened yet is worth to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// A `HAND_INIT` of hand k+1. Kept apart because it decides which genesis
+    /// this client opens k+1 at (`quiet_if_contested`), and that decision must
+    /// rest on `HAND_INIT`s alone.
+    Init,
+    /// Any other event of hand k+1.
+    Early,
+    /// Nothing this client can use: another hand entirely, or unreadable.
+    No,
+}
+
+/// **The boundary is a pause, and the table does not wait in it.**
+///
+/// A hand ends here, the next one is armed 800 ms later, and the seats that
+/// have already opened it deal on. Everything of hand k+1 that arrives in
+/// those 800 ms — or in the five-second showdown pause before them — reaches a
+/// client whose `hand` is still k, where `hold` answers `AnotherHand`: worth
+/// relaying, not worth holding.
+///
+/// **For a seat that is dealt in, dropping it costs nothing** — the table
+/// cannot leave a stage without that seat's copy, so it repeats the stage
+/// until the seat has caught up. **For a seat that is only following, it costs
+/// the hand.** Nobody waits for a bystander, the senders' re-send covers the
+/// last few stages only, and the stage it needed has gone by the time it opens.
+/// Measured in `split125944-9`: `far-n0` opened hand #16 about two seconds
+/// after the table dealt it, every `DECK_INIT` had already been dropped, and it
+/// sat at stage 1 of that hand for the remaining 283 seconds of the run with no
+/// terminus available to it (`S1-BW`).
+///
+/// So both are kept. The cap and the signature check are on the caller; this
+/// decides only what kind of use the event is.
+fn keep_for_next_hand(
+    kind: Option<crate::protocol::messages::EventType>,
+    hand_id: u64,
+    mine: u64,
+) -> Keep {
+    use crate::protocol::messages::EventType;
+    if hand_id != mine.saturating_add(1) {
+        return Keep::No;
+    }
+    match kind {
+        Some(EventType::HandInit) => Keep::Init,
+        // **The four that decide a hand's fate are not carried into it.** A
+        // terminal, a vote or a certificate replayed out of this queue would
+        // end or narrow a hand from a frame the hand was opened without, and a
+        // hand opened `Quiet` — which is withholding its own signature on
+        // purpose — could emit a terminal from it. Each of the four has its own
+        // road already: a `TIMEOUT_CERT` about the hand before this one is kept
+        // by the late-certificate arm, and an abort, a settlement or a vote of
+        // the hand about to open is re-sent by its own emitters, who are still
+        // in that hand. What this buffer is for is the stage traffic nobody
+        // re-sends to a seat that was not there, which is what a bystander
+        // lost.
+        Some(EventType::HandComplete)
+        | Some(EventType::HandAbort)
+        | Some(EventType::TimeoutVote)
+        | Some(EventType::TimeoutCert) => Keep::No,
+        Some(_) => Keep::Early,
+        None => Keep::No,
+    }
+}
 
 /// `Quiet` when at least `FOREIGN_GENESIS_FLOOR` roster seats have already
 /// signed this hand at one genesis that is not the one this client derived,
@@ -5827,6 +5944,7 @@ async fn begin_hand_with(
     opening: crate::table::hand::Opening,
     voice: crate::table::hand::Voice,
     next_inits: &mut Vec<Vec<u8>>,
+    next_early: &mut Vec<(u8, Vec<u8>)>,
     app_key: &ed25519_dalek::SigningKey,
     hand: &mut Option<crate::table::hand::Hand>,
     said: &mut Vec<Vec<u8>>,
@@ -5837,6 +5955,7 @@ async fn begin_hand_with(
     use crate::table::hand::{Hand, Voice};
     if hand.is_some() {
         next_inits.clear();
+        next_early.clear();
         return;
     }
     let now = super::node::now_unix_ms();
@@ -5852,8 +5971,14 @@ async fn begin_hand_with(
                     .await;
             }
             // The next hand's copies that arrived during the last one.
+            // `HAND_INIT`s first: they are what stage 0 is waiting for, and the
+            // hand's own queue evicts the oldest when it is full.
             let buffered = std::mem::take(next_inits);
             for b in buffered {
+                let _ = h.hold(b);
+            }
+            let carried = std::mem::take(next_early);
+            for (_seat, b) in carried {
                 let _ = h.hold(b);
             }
             let (more, failures) = h.replay_early(app_key, now);
@@ -7665,6 +7790,39 @@ mod late_roster_tests {
         assert!(!wait_at_boundary(2, 2));
         assert!(!wait_at_boundary(0, 0));
         assert!(!wait_at_boundary(1, 0), "one seat's word is one seat's word");
+    }
+
+    /// The boundary keeps the next hand whole, not only its `HAND_INIT`
+    /// (`S1-BW`).
+    #[test]
+    fn the_boundary_keeps_every_kind_of_the_next_hand() {
+        use crate::protocol::messages::EventType;
+        assert_eq!(keep_for_next_hand(Some(EventType::HandInit), 8, 7), Keep::Init);
+        assert_eq!(keep_for_next_hand(Some(EventType::DeckInit), 8, 7), Keep::Early);
+        assert_eq!(keep_for_next_hand(Some(EventType::ShuffleStep), 8, 7), Keep::Early);
+        assert_eq!(
+            keep_for_next_hand(Some(EventType::HandAbort), 8, 7),
+            Keep::No,
+            "a terminal is not carried into the hand it would end"
+        );
+        assert_eq!(keep_for_next_hand(Some(EventType::HandComplete), 8, 7), Keep::No);
+        assert_eq!(keep_for_next_hand(Some(EventType::TimeoutVote), 8, 7), Keep::No);
+        assert_eq!(
+            keep_for_next_hand(Some(EventType::TimeoutCert), 8, 7),
+            Keep::No,
+            "and a certificate has the late-certificate arm"
+        );
+        assert_eq!(
+            keep_for_next_hand(Some(EventType::DeckInit), 9, 7),
+            Keep::No,
+            "two hands ahead is not the hand this client is about to open"
+        );
+        assert_eq!(
+            keep_for_next_hand(Some(EventType::TimeoutCert), 6, 7),
+            Keep::No,
+            "a hand behind belongs to the late-certificate arm, not to this buffer"
+        );
+        assert_eq!(keep_for_next_hand(None, 8, 7), Keep::No, "unreadable");
     }
 
     /// A seat that signed a hand, or was muted on it, never signs it again.
