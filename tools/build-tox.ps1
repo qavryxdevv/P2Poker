@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Builds what `--features tox` needs from the vendored source in this
     static libsodium. Run once; `cargo build --features tox` does the rest.
@@ -175,6 +175,9 @@ $patched = @(
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'offered self address %s:%u to a peer held at'
        Why    = '0014: instrumentation. Without it the sender side of an address offer is invisible; the receiver logs what it stored and nothing logs what was sent' },
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker (patch 0016): one-directional deafness'
+       Why    = '0016: the test instrument S1-BO needs. Patch 0015 fires only on an ASYMMETRIC peer timeout, and nothing above this layer can make one: the application''s outage knob leaves the transport alive on purpose, so the pings keep the peer timer fed. A node that ignores its peers'' lossless and lossy group packets for longer than GC_CONFIRMED_PEER_TIMEOUT while still sending to them times them out, they keep it, and its handshake requests then land on connections they still hold. Entirely inside #ifdef P2P_POKER_FAULT_HARNESS, which build.rs defines only under the cargo feature' },
     @{ File   = 'toxcore/group_connection.c'
        Marker = 'p2p-poker: both rings cleared on a re-handshake'
        Why    = '0015: without it an in-place re-handshake resets the message-id counters and the key and leaves both rings full of entries under the old numbering; the new stream collides with them and the peer is timed out again, 2 to 177 s later and then for the rest of the run (S1-BO: 44 of the 63 timeouts in two runs follow a re-handshake on the same node; the other 19 are S1-BN)' },

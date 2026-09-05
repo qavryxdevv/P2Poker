@@ -142,6 +142,15 @@ mod tox {
         // any of it. `LOGGER_LEVEL_DEBUG` is 1 in `logger.h`'s enum.
         if std::env::var("CARGO_FEATURE_FAULT_HARNESS").is_ok() {
             cc.define("MIN_LOGGER_LEVEL", "1");
+            // **And the fault instruments in the C, on the same switch**
+            // (`patch 0016`). `S1-BO`'s fix fires only on an asymmetric peer
+            // timeout, and nothing above this layer can produce one: the
+            // application's own outage knob leaves the transport alive on
+            // purpose, so toxcore's pings keep the peer timer fed. Every line
+            // it enables is inside `#ifdef P2P_POKER_FAULT_HARNESS`, so a
+            // release build has no path to any of it, which is the same
+            // property the Rust side's `fault-harness` feature has.
+            cc.define("P2P_POKER_FAULT_HARNESS", None);
         }
 
         if cfg!(target_env = "msvc") {

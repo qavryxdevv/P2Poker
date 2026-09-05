@@ -6247,6 +6247,81 @@ static bool handle_gc_packet_fragment(const GC_Session *_Nonnull c, GC_Chat *_No
  *
  * Returns true if packet is successfully handled.
  */
+#ifdef P2P_POKER_FAULT_HARNESS
+#include <stdlib.h>
+
+/* p2p-poker (patch 0016): one-directional deafness, and it is a test
+ * instrument rather than a repair.
+ *
+ * P2P_POKER_DEAF_AT=<s> P2P_POKER_DEAF_FOR=<s> make this node ignore every
+ * lossless and lossy group packet for that window, measured from the first
+ * group packet it ever handled -- which is the moment it joined the group and
+ * is the only anchor available down here. P2P_POKER_DEAF_PEER=<n> narrows it
+ * to one peer number; without it every peer is ignored.
+ *
+ * WHAT IT IS FOR. patch 0015 clears both message rings when a confirmed peer
+ * re-handshakes in place, and that branch fires only when the timeout was
+ * ASYMMETRIC: this node still holds the peer as handshaked while the peer has
+ * deleted this node and re-added it. A node that goes deaf but keeps sending
+ * produces exactly that, and nothing else in this tree can: the application's
+ * outage knob leaves the transport alive by design, so the pings keep
+ * last_received_packet_time fresh and no peer_timed_out ever fires. With a
+ * window past GC_CONFIRMED_PEER_TIMEOUT the deaf node times its peers out and
+ * deletes them, they keep it because they can still hear it, and when it
+ * re-adds them its handshake requests land on connections they still hold.
+ *
+ * HANDSHAKES ARE NOT DROPPED, only the two packet kinds that feed the timer.
+ * A node that could not handshake could never come back, and coming back is
+ * the whole point. */
+static bool p2p_poker_deaf_to(const GC_Chat *_Nonnull chat, uint32_t peer_number)
+{
+    static int state = 0;          /* 0 unread, 1 armed, -1 off */
+    static uint32_t only_peer = UINT32_MAX;
+    static uint64_t at_s = 0;
+    static uint64_t for_s = 0;
+    static uint64_t anchor = 0;
+
+    if (state == 0) {
+        const char *at = getenv("P2P_POKER_DEAF_AT");
+        const char *dur = getenv("P2P_POKER_DEAF_FOR");
+        const char *who = getenv("P2P_POKER_DEAF_PEER");
+
+        state = -1;
+
+        if (at != nullptr && dur != nullptr) {
+            at_s = (uint64_t)strtoull(at, nullptr, 10);
+            for_s = (uint64_t)strtoull(dur, nullptr, 10);
+
+            if (for_s > 0) {
+                if (who != nullptr) {
+                    only_peer = (uint32_t)strtoul(who, nullptr, 10);
+                }
+
+                state = 1;
+            }
+        }
+    }
+
+    if (state != 1) {
+        return false;
+    }
+
+    const uint64_t now = mono_time_get(chat->mono_time);
+
+    if (anchor == 0) {
+        anchor = now;
+    }
+
+    if (only_peer != UINT32_MAX && peer_number != only_peer) {
+        return false;
+    }
+
+    const uint64_t age = now - anchor;
+
+    return age >= at_s && age < at_s + for_s;
+}
+#endif
+
 static bool handle_gc_lossless_packet(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat, const uint8_t *_Nonnull sender_pk,
                                       const uint8_t *_Nonnull packet, uint16_t length, bool direct_conn, void *_Nullable userdata)
 {
@@ -6269,6 +6344,12 @@ static bool handle_gc_lossless_packet(const GC_Session *_Nonnull c, GC_Chat *_No
     if (gconn->pending_delete) {
         return true;
     }
+
+#ifdef P2P_POKER_FAULT_HARNESS
+    if (p2p_poker_deaf_to(chat, (uint32_t)peer_number)) {
+        return false;
+    }
+#endif
 
     uint8_t *data = (uint8_t *)mem_balloc(chat->mem, length);
 
@@ -6453,6 +6534,12 @@ static bool handle_gc_lossy_packet(const GC_Session *_Nonnull c, GC_Chat *_Nonnu
         LOGGER_DEBUG(chat->log, "Got lossy packet from invalid peer");
         return false;
     }
+
+#ifdef P2P_POKER_FAULT_HARNESS
+    if (p2p_poker_deaf_to(chat, (uint32_t)peer_number)) {
+        return false;
+    }
+#endif
 
     uint8_t *data = (uint8_t *)mem_balloc(chat->mem, length);
 

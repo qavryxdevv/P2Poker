@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     One table, its seats split across two machines, and what every seat saw.
 
@@ -89,6 +89,17 @@ param(
     [ValidateRange(0, 3600)][int]$LinkDownAt = 0,
     [ValidateRange(0, 3600)][int]$LinkDownFor = 0,
     [ValidateRange(0, 8)][int]$LinkDownSeat = 0,
+    # fault-harness, in the C (patch 0016): local seat -DeafSeat ignores every
+    # lossless and lossy group packet from -DeafAt s (of its first group
+    # packet) for -DeafFor s (0 = off). It keeps SENDING, so its peers do not
+    # time it out while it times them out -- the asymmetric timeout that is the
+    # only trigger for the in-place re-handshake patch 0015 clears up after.
+    #
+    # **-DeafFor must exceed 58 s** (GC_CONFIRMED_PEER_TIMEOUT) or nothing is
+    # timed out and the knob does nothing at all.
+    [ValidateRange(0, 3600)][int]$DeafAt = 0,
+    [ValidateRange(0, 3600)][int]$DeafFor = 0,
+    [ValidateRange(0, 8)][int]$DeafSeat = 0,
     [switch]$NoBuild,
     # **Build without `fault-harness`, and therefore without toxcore's log.**
     #
@@ -194,6 +205,7 @@ Write-Host "mdns   $(if ($NoMdns) { 'off - every seat finds every other through 
 Write-Host "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
 Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on far seat $DelayCertsSeat$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
 Write-Host "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
+Write-Host "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
 Write-Host "work   $work"
 Write-Host ''
 
@@ -420,6 +432,10 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         if ($LinkDownFor -gt 0 -and $i -eq $LinkDownSeat) {
             $knobs['P2P_POKER_LINK_DOWN_AT'] = "$LinkDownAt"
             $knobs['P2P_POKER_LINK_DOWN_FOR'] = "$LinkDownFor"
+        }
+        if ($DeafFor -gt 0 -and $i -eq $DeafSeat) {
+            $knobs['P2P_POKER_DEAF_AT'] = "$DeafAt"
+            $knobs['P2P_POKER_DEAF_FOR'] = "$DeafFor"
         }
         $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $knobs -ScriptBlock {
             param($exe, $nodeArgs, $log, $knobs)
