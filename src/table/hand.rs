@@ -1152,6 +1152,13 @@ pub struct Hand {
     votes: BTreeMap<Hash, BTreeMap<SeatIdx, Vec<u8>>>,
     /// Subjects this client has already voted about, so it votes once.
     voted: BTreeSet<Hash>,
+    /// When this client cast its own vote at the stage now open (`S1-BT`).
+    ///
+    /// The round is given a stage budget of air measured from here rather than
+    /// from the stage, because what has to fit in it is the other seats'
+    /// copies of a vote this client has just sent, and they start when it is
+    /// sent. Cleared with the rest of the stage's vote state in `mark_stage`.
+    own_vote_at: Option<u64>,
     /// The certificate stage now open, if one is.
     certifying: Option<Certifying>,
     /// Seats a completed certificate has named.
@@ -1436,6 +1443,7 @@ impl Hand {
                 acted_for: None,
                 votes: BTreeMap::new(),
                 voted: BTreeSet::new(),
+                own_vote_at: None,
                 certifying: None,
                 certified: Vec::new(),
                 strikes: vec![0; usize::from(o.max_players)],
@@ -4464,19 +4472,40 @@ impl Hand {
                 // runs on a clock only a sequence move resets.
                 let hand_budget_spent = now_ms.saturating_sub(self.opened_at_ms)
                     >= u64::from(self.open.hand_deadline_ms);
+                // **Both sides of the rule move together (`S1-BT`).** The
+                // emitter's gate is `may_abandon` and this is the receiver's;
+                // if only one of them waited, the first seat to reach its own
+                // bound would still end the hand at every other seat and the
+                // round would die exactly as before. `party_to_vote` rather
+                // than `vote_joined` for the same reason: a seat that owes a
+                // vote it has not cast is still a party to the round.
                 let admitted = hand_budget_spent
-                    || self.long_past_stage(now_ms)
-                    || (self.past_deadline(now_ms) && !self.vote_joined());
+                    || (self.long_past_stage(now_ms)
+                        && (!self.crypto_stage() || self.round_has_had_air(now_ms)))
+                    || (self.past_deadline(now_ms) && !self.party_to_vote());
                 if !admitted {
                     if self.past_deadline(now_ms) && self.abort_hold_said != Some(self.slot.sequence) {
                         self.abort_hold_said = Some(self.slot.sequence);
+                        // The bound the note counts down to is the one the
+                        // gate above actually uses: three budgets, or one
+                        // budget after this client's own vote, whichever comes
+                        // first (`S1-BT`).
                         let allowed = self
                             .owed_type()
-                            .map(|o| u64::from(self.next_deadline_for(o)).saturating_mul(2))
+                            .map(|o| {
+                                let b = u64::from(self.next_deadline_for(o));
+                                let ceiling = b.saturating_mul(3);
+                                match self.own_vote_at {
+                                    Some(v) => ceiling.min(
+                                        v.saturating_sub(self.stage_at_ms).saturating_add(b),
+                                    ),
+                                    None => ceiling,
+                                }
+                            })
                             .unwrap_or(0);
                         let age = now_ms.saturating_sub(self.stage_at_ms);
                         self.cert_note.push(format!(
-                            "abort from seat {seat} held: a vote this client joined about seat(s) {:?} is open at stage {}, {} s to twice the budget",
+                            "abort from seat {seat} held: a vote round this client is party to about seat(s) {:?} is open at stage {}, {} s to the end of the round",
                             self.waiting_for(),
                             self.slot.sequence,
                             allowed.saturating_sub(age) / 1_000
@@ -4967,7 +4996,24 @@ impl Hand {
         if !self.open.required.contains(&self.open.my_seat) {
             return false;
         }
-        if self.certificate_possible() && !self.long_past_stage(now_ms) {
+        // **`S1-BT`, and the owner's ruling of 2026-09-05.** Twice the budget
+        // is when the vote round *starts* — the mid-delivery lever releases at
+        // exactly that instant — so aborting there killed every round before it
+        // could gather, and the seat that stalled the stage was never named.
+        // The round now gets one stage budget of air after this client's own
+        // vote, with a ceiling of three budgets so a round that cannot complete
+        // still ends the hand.
+        //
+        // **The crypto-stage escape is here for the same reason it is on the
+        // receiving side.** `past_deadline` returns true on the whole-hand
+        // budget before it ever looks at the stage, so without this a betting
+        // stage that has spent the hand's entire budget would have its backstop
+        // deferred by a vote round — and that budget is the one deadline the
+        // protocol makes unconditional.
+        if self.certificate_possible()
+            && !(self.long_past_stage(now_ms)
+                && (!self.crypto_stage() || self.round_has_had_air(now_ms)))
+        {
             return false;
         }
         true
@@ -5029,6 +5075,7 @@ impl Hand {
         self.certifying = None;
         self.votes.clear();
         self.voted.clear();
+        self.own_vote_at = None;
     }
 
     /// `GENESIS(k)`: what this hand's first stage hangs off.
@@ -5210,19 +5257,75 @@ impl Hand {
         ))
     }
 
-    /// A certificate this client is party to is one copy away: this client
-    /// has voted about a seat the open stage still waits for, or a
-    /// certificate stage is open here. Stage-local by construction — the
-    /// digest commits to the subject's sequence and parent, and
-    /// `mark_stage` clears all of it when the sequence moves.
-    fn vote_joined(&self) -> bool {
+    /// Whether this client is a party to a vote round that is open at this
+    /// stage: a certificate stage is open here, or this client is one of the
+    /// voters a subject the stage still waits on needs.
+    ///
+    /// It does **not** ask whether this client has voted. That was
+    /// `vote_joined`'s question and it is the wrong one.
+    ///
+    /// **Owed or cast, and the difference is the whole of `S1-BT`.**
+    /// `vote_joined` asks only whether this client has already voted. A seat
+    /// whose own timer has not yet fired is not "joined" by that test and will
+    /// admit a peer's abort at one budget — killing the round for everybody
+    /// including the seats that did vote, because an abort ends the hand at
+    /// every receiver. The round is a collective object and every seat whose
+    /// vote it needs is a party to it, whether or not that seat has got round
+    /// to voting.
+    ///
+    /// **Stage-local by construction**, which is what makes it safe to read at
+    /// a gate: `waiting_for` is the open stage's own set, `voters` is derived
+    /// from the roster at this stage, and `mark_stage` clears every piece of
+    /// vote state when the sequence moves. Nothing here can be true about a
+    /// stage the hand has left. This replaced `vote_joined`, whose test was
+    /// *has this client voted* rather than *is this client needed*.
+    fn party_to_vote(&self) -> bool {
         if self.certifying.is_some() {
             return true;
         }
         self.waiting_for().iter().any(|s| {
-            self.subject_now(*s)
-                .is_some_and(|sub| self.voted.contains(&sub.subject_digest()))
+            *s != self.open.my_seat
+                && self.voters(*s).len() >= 2
+                && self.voters(*s).contains(&self.open.my_seat)
         })
+    }
+
+    /// Whether the vote round open at this stage has had its budget of air.
+    ///
+    /// **The bound, stated in one place because two gates read it.** True when
+    /// there is nothing owed at all; when the stage is three budgets old, which
+    /// is the ceiling and the thing that makes this terminate; when this client
+    /// is not a party to any round, so there is nothing to wait for; or when a
+    /// full stage budget has passed since this client cast its own vote, which
+    /// is the time the other seats' copies need to arrive.
+    ///
+    /// **Why the ceiling is three and not two.** Two is where the round starts:
+    /// the mid-delivery lever releases the vote at twice the budget
+    /// (`S1-BK`), so a round that begins at all begins there, and a bound of
+    /// two would give it no air whatever. Three is that plus one budget, which
+    /// is the same budget every other stage of this hand gets.
+    ///
+    /// **`certificate_possible` and not `party_to_vote`, and the difference
+    /// splits a table.** `may_abandon`'s own guard is `certificate_possible`,
+    /// so if this predicate asked a narrower question the two would disagree
+    /// exactly where it matters: a client whose own seat has been certified out
+    /// mid-hand is no longer in `voters(s)`, so `party_to_vote` is false for it
+    /// while `certificate_possible` is still true — and it would abort at two
+    /// budgets while every seat that can vote holds to three. One seat ending
+    /// hand k with a bare abort while the rest end it with a certificate is two
+    /// different `R(k+1)` from one chain. `party_to_vote` is the right question
+    /// at the receive gate's third clause, where it really is *is this client
+    /// needed*, and it stays there.
+    fn round_has_had_air(&self, now_ms: u64) -> bool {
+        let Some(owed) = self.owed_type() else {
+            return true;
+        };
+        let budget = u64::from(self.next_deadline_for(owed));
+        now_ms.saturating_sub(self.stage_at_ms) >= budget.saturating_mul(3)
+            || !self.certificate_possible()
+            || self
+                .own_vote_at
+                .is_some_and(|t| now_ms.saturating_sub(t) >= budget)
     }
 
     /// Vote about every seat this client's own timer has run out on.
@@ -5318,6 +5421,17 @@ impl Hand {
                 now_ms,
             )?;
             self.voted.insert(digest);
+            // **`S1-BT`: the LAST vote, not the first.** This loop walks every
+            // seat the stage waits on and the mid-delivery lever is applied per
+            // seat, so a stage waiting on two seats with different bits votes
+            // about the unheld one a whole budget before the held one. Keeping
+            // the first vote's time spent the round's air on a round that had
+            // not started: at twice the budget the lever released the second
+            // vote and the abort fired in the same tick, which is the collision
+            // this row exists to remove. The three-budget ceiling still bounds
+            // it, because the lever cannot withhold a vote past
+            // `long_past_stage`.
+            self.own_vote_at = Some(now_ms);
             self.take_vote(digest, self.open.my_seat, bytes.clone(), subject);
             self.tally = Some((
                 seat,
@@ -8576,9 +8690,10 @@ mod tests {
         assert!(sends.is_empty() && m.speak().is_none() && !m.spoke());
     }
 
-    /// Three seats at the deck stage, seat 2 silent: seats 0 and 1 wait for
-    /// it, vote at the stage budget, and seat 2 gives the hand up unattributed.
-    fn two_voters_and_a_silent_seat() -> (Hand, Hand, [SigningKey; 3], Vec<u8>, Vec<u8>, Vec<u8>) {
+    /// Three seats brought to the deck stage with seat 2 silent, and nobody
+    /// has voted yet. `S1-BT`'s tests start here, because what design A
+    /// changes is what happens between the stage budget and the vote.
+    fn three_at_the_deck_stage() -> (Hand, Hand, Hand, [SigningKey; 3]) {
         let (mut a, from_a) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
         let (mut b, from_b) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
         let (mut c, from_c) = Hand::open(opening3(2), &key(12), NOW, 30_000).unwrap();
@@ -8592,6 +8707,13 @@ mod tests {
         let _ = deliver(&mut b, &deck_a, &keys[1]);
         let _ = deliver(&mut a, &deck_b, &keys[0]);
         assert_eq!(a.waiting_for(), vec![2], "a cryptographic stage waiting on seat 2");
+        (a, b, c, keys)
+    }
+
+    /// Three seats at the deck stage, seat 2 silent: seats 0 and 1 wait for
+    /// it, vote at the stage budget, and seat 2 gives the hand up unattributed.
+    fn two_voters_and_a_silent_seat() -> (Hand, Hand, [SigningKey; 3], Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (mut a, mut b, mut c, keys) = three_at_the_deck_stage();
         let t1 = NOW + 30_000;
         let va = a.vote_on_timeouts(&keys[0], t1, 0).unwrap();
         let vb = b.vote_on_timeouts(&keys[1], t1, 0).unwrap();
@@ -8648,6 +8770,186 @@ mod tests {
         let t3 = NOW + 60_000;
         assert!(a.on_event(&abort, &keys[0], t3).is_ok(), "admitted at twice the budget");
         assert_eq!(a.aborted(), Some(Abort::Told { cause: 1 }));
+    }
+
+    /// `S1-BT` design A, the shape the owner approved on 2026-09-05.
+    ///
+    /// **The collision.** The mid-delivery lever holds the vote on a seat the
+    /// carrier is still delivering until twice the stage budget (`S1-BK`), and
+    /// `may_abandon` waited for exactly the same instant. The stall tick votes
+    /// and then aborts, so every voter cast its vote and ended the hand in one
+    /// tick, the abort ended it at every receiver before the copies could
+    /// gather, and the seat that stalled the stage was never named — measured
+    /// in `split092359-10`, one vote of seven on every hand.
+    ///
+    /// The round now gets one stage budget of air after this client's own
+    /// vote. This test is the whole of it: the vote is withheld to 60 s by the
+    /// lever, the hand may not be abandoned at 62 s, and the certificate that
+    /// completes at 70 s ends the hand with its subject named.
+    #[test]
+    fn a_lever_held_round_gets_its_air_and_certifies_instead_of_aborting() {
+        let (mut a, mut b, _c, keys) = three_at_the_deck_stage();
+        let held = 1u32 << 2;
+        let t1 = NOW + 30_000;
+        assert!(
+            a.vote_on_timeouts(&keys[0], t1, held).unwrap().is_empty(),
+            "the lever holds the vote at one budget"
+        );
+        assert!(!a.may_abandon(t1), "and the hand is not given up at one budget either");
+
+        let t2 = NOW + 60_000;
+        let va = a.vote_on_timeouts(&keys[0], t2, held).unwrap();
+        let vb = b.vote_on_timeouts(&keys[1], t2, held).unwrap();
+        assert!(!va.is_empty() && !vb.is_empty(), "the lever releases at twice the budget");
+        assert!(
+            !a.may_abandon(NOW + 62_000),
+            "the round has just started and must not be aborted in the same tick"
+        );
+
+        let Send::Broadcast(va) = &va[0];
+        let Send::Broadcast(vb) = &vb[0];
+        let t3 = NOW + 70_000;
+        let ca = a.on_event(vb, &keys[0], t3).unwrap();
+        let cb = b.on_event(va, &keys[1], t3).unwrap();
+        assert!(!ca.is_empty() && !cb.is_empty(), "each voter seals a copy");
+        let Send::Broadcast(ca) = &ca[0];
+        let Send::Broadcast(cb) = &cb[0];
+        assert!(a.on_event(cb, &keys[0], t3).is_ok());
+        assert!(b.on_event(ca, &keys[1], t3).is_ok());
+        assert_eq!(
+            a.aborted(),
+            Some(Abort::Told { cause: 1 }),
+            "ended by the certificate, with the seat named"
+        );
+        assert!(!a.took_part(2), "and it leaves the roster");
+        let na = a.next_hand().expect("an aborted hand has a successor");
+        let nb = b.next_hand().expect("on both");
+        assert!(!na.required.contains(&2), "{:?}", na.required);
+        assert_eq!(na.genesis, nb.genesis, "one GENESIS(k+1)");
+    }
+
+    /// Design A costs nothing where the carrier says nothing is in flight.
+    ///
+    /// With every mid-delivery bit clear the vote is cast at one budget, so
+    /// the round has had its air by two — which is where `long_past_stage`
+    /// opens and where this client gave the hand up before the change. The
+    /// extra wait is paid only by a round the lever actually held.
+    #[test]
+    fn a_round_that_was_never_held_ends_the_hand_where_it_always_did() {
+        let (mut a, _b, _c, keys) = three_at_the_deck_stage();
+        let t1 = NOW + 30_000;
+        assert!(
+            !a.vote_on_timeouts(&keys[0], t1, 0).unwrap().is_empty(),
+            "nothing is in flight, so the vote is cast at one budget"
+        );
+        assert!(!a.may_abandon(NOW + 59_999), "still inside the certificate's window");
+        assert!(
+            a.may_abandon(NOW + 60_000),
+            "and the hand is given up at twice the budget, exactly as before design A"
+        );
+    }
+
+    /// The ceiling, which is what makes design A terminate: a round that
+    /// cannot complete — the other voter's copy never arrives — still ends the
+    /// hand, at three stage budgets and not one tick later.
+    #[test]
+    fn a_round_that_cannot_complete_still_ends_the_hand_at_three_budgets() {
+        let (mut a, _b, _c, keys) = three_at_the_deck_stage();
+        let held = 1u32 << 2;
+        let t2 = NOW + 60_000;
+        assert!(
+            !a.vote_on_timeouts(&keys[0], t2, held).unwrap().is_empty(),
+            "this client votes at twice the budget"
+        );
+        assert!(!a.may_abandon(NOW + 89_999), "the round still has air");
+        assert!(a.may_abandon(NOW + 90_000), "and the ceiling ends it");
+    }
+
+    /// Two seats silent at one stage with different mid-delivery bits, which
+    /// is where the first shape of design A still had the collision: the vote
+    /// about the seat whose bit is clear is cast a budget before the lever
+    /// releases the other, and if the round's air were measured from that first
+    /// vote it would already be spent when the second one is cast.
+    #[test]
+    fn a_second_round_at_one_stage_gets_its_own_air() {
+        let keys: Vec<SigningKey> = (10..15).map(key).collect();
+        let mut hands: Vec<Hand> = Vec::new();
+        let mut inits: Vec<Vec<u8>> = Vec::new();
+        for seat in 0..5u8 {
+            let (h, sends) = Hand::open(opening5(seat), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            let Send::Broadcast(b) = &sends[0];
+            inits.push(b.clone());
+            hands.push(h);
+        }
+        let mut decks: Vec<Vec<Send>> = vec![Vec::new(); 5];
+        for to in 0..5usize {
+            for from in 0..5usize {
+                if from != to {
+                    let mut out =
+                        deliver(&mut hands[to], &[Send::Broadcast(inits[from].clone())], &keys[to]);
+                    decks[to].append(&mut out);
+                }
+            }
+        }
+        // Seats 0, 1 and 2 hear only each other: the deck stage waits on two.
+        for to in 0..3usize {
+            for from in 0..3usize {
+                if from != to {
+                    let _ = deliver(&mut hands[to], &decks[from], &keys[to]);
+                }
+            }
+            assert_eq!(hands[to].waiting_for(), vec![3, 4], "seat {to} waits on two seats");
+        }
+        // Seat 4's traffic is still arriving; seat 3's is not.
+        let held = 1u32 << 4;
+        let t1 = NOW + 30_000;
+        let first = hands[0].vote_on_timeouts(&keys[0], t1, held).unwrap();
+        assert!(!first.is_empty(), "the seat whose bit is clear is voted on at one budget");
+        assert!(!hands[0].may_abandon(t1), "and the hand is not given up there");
+
+        let t2 = NOW + 60_000;
+        let second = hands[0].vote_on_timeouts(&keys[0], t2, held).unwrap();
+        assert!(!second.is_empty(), "the lever releases the second vote at twice the budget");
+        assert!(
+            !hands[0].may_abandon(NOW + 62_000),
+            "the second round has just started: its air is its own, not the first round's"
+        );
+        assert!(hands[0].may_abandon(NOW + 90_000), "and the ceiling still ends the hand");
+    }
+
+    /// The difference between *has this client voted* and *is this client
+    /// needed*, which is why design A reads `party_to_vote` and not
+    /// `vote_joined`.
+    ///
+    /// A seat whose own timer has not fired yet is still one of the voters the
+    /// round needs. Under the old test it was not "joined", so it admitted a
+    /// peer's abort at one budget — and an abort ends the hand at every
+    /// receiver, so that one seat killed the round for the seats that had
+    /// voted.
+    #[test]
+    fn a_voter_that_owes_a_vote_it_has_not_cast_still_holds_the_abort() {
+        let (mut a, mut b, mut c, keys) = three_at_the_deck_stage();
+        let t1 = NOW + 30_000;
+        let sends = c.abort_now(Abort::Deadline, &keys[2], t1).unwrap();
+        let Send::Broadcast(abort) = &sends[0];
+        let t2 = NOW + 31_000;
+        assert_eq!(
+            b.on_event(abort, &keys[1], t2),
+            Err(Failed::NotYet),
+            "seat 1 has not voted, but the round needs its vote"
+        );
+        assert!(b.aborted().is_none(), "so the hand did not end on a peer's word");
+        // Seat 0 is a voter for the same subject, so it holds it too. The seat
+        // the round does not need is seat 2 itself, which is the subject and
+        // is not a party to a round about itself; this fixture has no fourth
+        // seat to show that with, and `party_to_vote`'s own `*s !=
+        // self.open.my_seat` is what implements it.
+        assert_eq!(
+            a.on_event(abort, &keys[0], t2),
+            Err(Failed::NotYet),
+            "seat 0 is a voter too, so it holds it as well"
+        );
+        assert!(a.aborted().is_none(), "held, not refused: only NotYet is re-judged later");
     }
 
     /// `S1-BQ`'s fixture. Three seats; seat 0 is one action behind — the last
