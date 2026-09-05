@@ -1119,6 +1119,9 @@ pub struct Hand {
     voice: Voice,
     /// The withheld `HAND_INIT`, while the voice is `Quiet`.
     own_init: Option<Vec<u8>>,
+    /// The stage at which the "abort held: a vote this client joined is
+    /// open" note was said, so it is said once per stage.
+    abort_hold_said: Option<u64>,
     /// The last seat a certificate acted for, and what it did.
     ///
     /// Read once by the node so it can say so: an action nobody took is the one
@@ -1407,6 +1410,7 @@ impl Hand {
                 late_roster: false,
                 voice,
                 own_init,
+                abort_hold_said: None,
                 acted_for: None,
                 votes: BTreeMap::new(),
                 voted: BTreeSet::new(),
@@ -4418,7 +4422,44 @@ impl Hand {
             // normative deadline, so no per-receiver quantity reaches a hash
             // and D-012 is untouched.
             1 if body.attributed.is_empty() => {
-                if !(self.past_deadline(now_ms) || self.long_past_stage(now_ms)) {
+                // **Three admissions, and the middle one is `S1-BS` option 1.**
+                // The whole-hand budget admits unconditionally: it is §4.10's
+                // literal trigger and the fifty-five-minute backstop. Twice the
+                // stage budget admits unconditionally: D-026 gives the
+                // certificate round the air between one budget and two, and no
+                // more. One stage budget admits only while no certificate this
+                // client is party to is one copy away — a vote cast about a
+                // seat the open stage still waits for, or a certificate stage
+                // open here. Before this a received bare abort was applied at
+                // one budget of a cryptographic stage while this client's own
+                // `may_abandon` waited to two when a certificate was possible:
+                // the two sides of one rule disagreed, and a table whose vote
+                // was one copy short ended the hand on the abort with nothing
+                // banked at the seats that had not sealed yet. At a betting
+                // stage `past_deadline` is false by construction, so the gate
+                // there was already twice the budget; this changes the
+                // cryptographic stages only. Bounded by `long_past_stage`, which
+                // runs on a clock only a sequence move resets.
+                let hand_budget_spent = now_ms.saturating_sub(self.opened_at_ms)
+                    >= u64::from(self.open.hand_deadline_ms);
+                let admitted = hand_budget_spent
+                    || self.long_past_stage(now_ms)
+                    || (self.past_deadline(now_ms) && !self.vote_joined());
+                if !admitted {
+                    if self.past_deadline(now_ms) && self.abort_hold_said != Some(self.slot.sequence) {
+                        self.abort_hold_said = Some(self.slot.sequence);
+                        let allowed = self
+                            .owed_type()
+                            .map(|o| u64::from(self.next_deadline_for(o)).saturating_mul(2))
+                            .unwrap_or(0);
+                        let age = now_ms.saturating_sub(self.stage_at_ms);
+                        self.cert_note.push(format!(
+                            "abort from seat {seat} held: a vote this client joined about seat(s) {:?} is open at stage {}, {} s to twice the budget",
+                            self.waiting_for(),
+                            self.slot.sequence,
+                            allowed.saturating_sub(age) / 1_000
+                        ));
+                    }
                     return Err(Failed::NotYet);
                 }
             }
@@ -5145,6 +5186,21 @@ impl Hand {
             self.slot.sequence,
             seats.join("; ")
         ))
+    }
+
+    /// A certificate this client is party to is one copy away: this client
+    /// has voted about a seat the open stage still waits for, or a
+    /// certificate stage is open here. Stage-local by construction — the
+    /// digest commits to the subject's sequence and parent, and
+    /// `mark_stage` clears all of it when the sequence moves.
+    fn vote_joined(&self) -> bool {
+        if self.certifying.is_some() {
+            return true;
+        }
+        self.waiting_for().iter().any(|s| {
+            self.subject_now(*s)
+                .is_some_and(|sub| self.voted.contains(&sub.subject_digest()))
+        })
     }
 
     /// Vote about every seat this client's own timer has run out on.
@@ -8489,6 +8545,80 @@ mod tests {
         assert_eq!(b.waiting_for(), vec![2]);
         let (mut m, sends) = Hand::open_with(opening3(0), &key(10), NOW, 30_000, Voice::Muted).unwrap();
         assert!(sends.is_empty() && m.speak().is_none() && !m.spoke());
+    }
+
+    /// Three seats at the deck stage, seat 2 silent: seats 0 and 1 wait for
+    /// it, vote at the stage budget, and seat 2 gives the hand up unattributed.
+    fn two_voters_and_a_silent_seat() -> (Hand, Hand, [SigningKey; 3], Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (mut a, from_a) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
+        let (mut c, from_c) = Hand::open(opening3(2), &key(12), NOW, 30_000).unwrap();
+        let keys = [key(10), key(11), key(12)];
+        let _ = deliver(&mut b, &from_a, &keys[1]);
+        let _ = deliver(&mut c, &from_a, &keys[2]);
+        let _ = deliver(&mut a, &from_b, &keys[0]);
+        let _ = deliver(&mut c, &from_b, &keys[2]);
+        let deck_a = deliver(&mut a, &from_c, &keys[0]);
+        let deck_b = deliver(&mut b, &from_c, &keys[1]);
+        let _ = deliver(&mut b, &deck_a, &keys[1]);
+        let _ = deliver(&mut a, &deck_b, &keys[0]);
+        assert_eq!(a.waiting_for(), vec![2], "a cryptographic stage waiting on seat 2");
+        let t1 = NOW + 30_000;
+        let va = a.vote_on_timeouts(&keys[0], t1, 0).unwrap();
+        let vb = b.vote_on_timeouts(&keys[1], t1, 0).unwrap();
+        assert!(!va.is_empty() && !vb.is_empty(), "both voters vote at the budget");
+        let Send::Broadcast(va) = &va[0];
+        let Send::Broadcast(vb) = &vb[0];
+        let sends = c.abort_now(Abort::Deadline, &keys[2], t1).unwrap();
+        let Send::Broadcast(abort) = &sends[0];
+        (a, b, keys, va.clone(), vb.clone(), abort.clone())
+    }
+
+    /// `S1-BS` option 1: an unattributed abort arriving between one and two
+    /// stage budgets of a cryptographic stage, while this client has voted,
+    /// is held; the certificate that completes meanwhile banks the roster and
+    /// ends the hand with its subject named; the replayed abort is neither
+    /// applied over it nor refused. With the old gate the first assertion
+    /// fails: `past_deadline` is true at 31 s of a deck stage.
+    #[test]
+    fn an_unattributed_abort_waits_for_a_vote_this_client_joined() {
+        let (mut a, mut b, keys, va, vb, abort) = two_voters_and_a_silent_seat();
+        let t2 = NOW + 31_000;
+        assert_eq!(a.on_event(&abort, &keys[0], t2), Err(Failed::NotYet), "held: a vote is open");
+        assert!(a.aborted().is_none(), "the hand did not end on a peer's word");
+        assert!(matches!(a.hold(abort.clone()), Holding::Kept));
+        let note = a.take_cert_note().expect("the hold is said");
+        assert!(note.contains("abort from seat 2 held"), "{note}");
+        // The vote completes: each voter seals on the other's vote and hears the other's copy.
+        let ca = a.on_event(&vb, &keys[0], t2).unwrap();
+        let cb = b.on_event(&va, &keys[1], t2).unwrap();
+        assert!(!ca.is_empty() && !cb.is_empty(), "each voter seals a copy");
+        let Send::Broadcast(ca) = &ca[0];
+        let Send::Broadcast(cb) = &cb[0];
+        assert!(a.on_event(cb, &keys[0], t2).is_ok());
+        assert!(b.on_event(ca, &keys[1], t2).is_ok());
+        assert_eq!(a.aborted(), Some(Abort::Told { cause: 1 }), "ended by the certificate, subject named");
+        assert!(!a.took_part(2), "the roster half is banked");
+        // The held abort is replayed as the node replays it: nothing undone, nothing refused.
+        let (_out, failures) = a.replay_early(&keys[0], t2);
+        assert!(failures.is_empty(), "the replayed abort must not become a refusal: {failures:?}");
+        assert_eq!(a.aborted(), Some(Abort::Told { cause: 1 }));
+        let na = a.next_hand().expect("an aborted hand has a successor");
+        let nb = b.next_hand().expect("on both");
+        assert!(!na.required.contains(&2), "{:?}", na.required);
+        assert_eq!(na.genesis, nb.genesis, "one GENESIS(k+1)");
+    }
+
+    /// The bound: with no certificate completing, the held abort is admitted
+    /// at twice the stage budget regardless — `S1-AQ`'s permanent `NotYet`
+    /// cannot come back through this gate.
+    #[test]
+    fn a_held_abort_is_admitted_at_twice_the_budget_without_a_certificate() {
+        let (mut a, _b, keys, _va, _vb, abort) = two_voters_and_a_silent_seat();
+        assert_eq!(a.on_event(&abort, &keys[0], NOW + 31_000), Err(Failed::NotYet));
+        let t3 = NOW + 60_000;
+        assert!(a.on_event(&abort, &keys[0], t3).is_ok(), "admitted at twice the budget");
+        assert_eq!(a.aborted(), Some(Abort::Told { cause: 1 }));
     }
 
     /// `S1-BQ`'s fixture. Three seats; seat 0 is one action behind — the last
