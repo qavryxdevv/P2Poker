@@ -81,6 +81,9 @@ param(
     # -DelayCertsSeat for -DelayCerts ms (0 = off). Induces the S1-BS shape.
     [ValidateRange(0, 600000)][int]$DelayCerts = 0,
     [ValidateRange(0, 8)][int]$DelayCertsSeat = 0,
+    # ... only for frames arriving before this many seconds of that seat's run
+    # (0 = the whole run).
+    [ValidateRange(0, 3600)][int]$DelayCertsUntil = 0,
     # fault-harness: local seat -LinkDownSeat drops every table message both
     # ways from -LinkDownAt s (of its own start) for -LinkDownFor s (0 = off).
     [ValidateRange(0, 3600)][int]$LinkDownAt = 0,
@@ -189,7 +192,7 @@ Write-Host "seats  $seats  ($Here here, $There on $Target)"
 Write-Host "for    $Seconds s"
 Write-Host "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
 Write-Host "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
-Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on far seat $DelayCertsSeat (fault-harness)" } else { 'none' })"
+Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on far seat $DelayCertsSeat$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
 Write-Host "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
 Write-Host "work   $work"
 Write-Host ''
@@ -344,6 +347,7 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         param(`$p, `$log, `$seat)
         if ($Stall -gt 0 -and `$seat -eq $StallSeat) { `$env:P2P_POKER_STALL_JOIN = '$Stall' }
         if ($DelayCerts -gt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_MS = '$DelayCerts' }
+        if ($DelayCerts -gt 0 -and $DelayCertsUntil -gt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_UNTIL_S = '$DelayCertsUntil' }
         `$start = Get-Date
         `$inv = [System.Globalization.CultureInfo]::InvariantCulture
         & "$FarDir\p2p-poker.exe" --headless $(if ($NoMdns) { '--no-mdns' }) --autoplay --for $Seconds --profile `$p --join $table 2>&1 |

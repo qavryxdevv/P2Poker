@@ -617,6 +617,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // ... and only until this many seconds after the loop started, so a run
+    // can park one hand's votes and copies and let the later ones through.
+    let delay_certs_until: Option<std::time::Duration> = if cfg!(feature = "fault-harness") {
+        std::env::var("P2P_POKER_DELAY_CERTS_UNTIL_S")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+    } else {
+        None
+    };
+    let delay_since = tokio::time::Instant::now();
     let mut delayed_certs: Vec<(tokio::time::Instant, Vec<u8>)> = Vec::new();
     let mut releasing_certs = false;
     let mut delay_said = false;
@@ -930,6 +941,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // honest copy — and released by the stall tick when due.
             if delay_certs_ms.is_some()
                 && !releasing_certs
+                && delay_certs_until.map_or(true, |u| delay_since.elapsed() < u)
                 && matches!(
                     crate::net::chained::peek($bytes, TABLE_FRAME_PEEK),
                     Ok((

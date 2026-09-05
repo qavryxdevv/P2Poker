@@ -1111,6 +1111,10 @@ pub struct Hand {
     foreign_genesis: BTreeMap<SeatIdx, Hash>,
     /// Said once per hand, when `FOREIGN_GENESIS_FLOOR` seats name one value.
     genesis_note: Option<String>,
+    /// Whether it has been said: the note is taken by the node, and without
+    /// this every re-sent copy re-armed it — one line every two seconds in
+    /// `split124308-9`.
+    genesis_said: bool,
     /// A certificate banked after this hand's abort terminal: the next hand's
     /// roster is to be re-derived (`S1-BS`). Taken by the node.
     late_roster: bool,
@@ -1407,6 +1411,7 @@ impl Hand {
                 cert_note: Vec::new(),
                 foreign_genesis: BTreeMap::new(),
                 genesis_note: None,
+                genesis_said: false,
                 late_roster: false,
                 voice,
                 own_init,
@@ -6512,8 +6517,9 @@ impl Hand {
             {
                 self.foreign_genesis
                     .insert(seat, opened.envelope.previous_event_hash);
-                if self.genesis_note.is_none() {
+                if !self.genesis_said {
                     if let Some((g, seats)) = self.foreign_genesis_named() {
+                        self.genesis_said = true;
                         let short = |h: &Hash| -> String {
                             h[..4].iter().map(|b| format!("{b:02x}")).collect()
                         };
