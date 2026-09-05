@@ -5817,8 +5817,47 @@ impl Hand {
             return Err(Failed::NotYet);
         }
 
-        // The roster half, wherever this client happens to stand.
+        // The roster half, wherever this client happens to stand — and it
+        // comes FIRST, before the positional half below can hold. `bank` is
+        // the only writer of `certified` and `strikes` on receipt, and
+        // `next_hand` derives R(k+1) from `certified` through `took_part`;
+        // a client that holds a certificate it never gets to replay — its
+        // hand ended first, which in `split003741-10` was every one of the
+        // five measured cases — must still open hand k+1 at the genesis the
+        // table opens it at. Banking is keyed on the subject digest, so a
+        // replayed copy banks once and `banked` is false on the replay.
         let banked = self.bank_certificate(&c);
+
+        // **Behind is not forked (`S1-BQ`).** A certificate about a betting
+        // stage this client has not reached yet is held and replayed when
+        // it gets there, like every other early event (`PROTOCOL.md` §5.2.5,
+        // normative: *an event of a stage not yet reached is held*). It used
+        // to be consumed here with the fork report below — `Ok`, so never
+        // replayed — and every voter's copy went the same way; on catching
+        // up the client had no certificate stage. The fork the report
+        // describes (D-024 point 4: two parents at one sequence) needs this
+        // client to have chained something AT that sequence, which a client
+        // behind it has not; equal-with-a-different-parent or ahead is the
+        // fork, and stays below. Said once, on the first copy: the replay
+        // pass re-delivers every held copy every 2 s, and a note per pass
+        // would be a line every 2 s until the hand ends.
+        //
+        // Two things this does not repair, measured in the same run: a
+        // client that is behind because an EARLIER event was lost never
+        // reaches the sequence at all, and holding changes nothing for it;
+        // and the held FIFO is 64 deep, so a client 64 events behind loses
+        // the copies before it could replay them. Both are the carrier's
+        // loss, not the certificate's disposition.
+        if c.subject.kind == 1 && self.slot.sequence < c.subject.subject_sequence {
+            if banked {
+                self.cert_note.push(format!(
+                    "cert: from seat {seat} about seat {} at sequence {} reached this client at \
+                     sequence {} — roster banked, positional half HELD until it is in position",
+                    c.subject.subject_seat, c.subject.subject_sequence, self.slot.sequence
+                ));
+            }
+            return Err(Failed::NotYet);
+        }
 
         let in_position = self.slot.sequence == c.subject.subject_sequence
             && self.slot.previous_event_hash == c.subject.parent_event_hash;
@@ -7965,6 +8004,198 @@ mod tests {
             next_a.seats.iter().map(|(_, _, c)| *c).collect::<Vec<_>>(),
             next_b.seats.iter().map(|(_, _, c)| *c).collect::<Vec<_>>(),
             "the settlement's stacks on both, not the abort's on one"
+        );
+    }
+
+    /// `S1-BQ`'s fixture. Three seats; seat 0 is one action behind — the last
+    /// action before its own turn has not reached it — and seats 1 and 2
+    /// time seat 0 out, vote, seal a `TIMEOUT_CERT` at the sequence of seat
+    /// 0's turn, and close their own certificate stage on each other's copy.
+    ///
+    /// Returns the three hands, the keys, every certificate copy, and the
+    /// action seat 0 has not heard yet.
+    fn one_action_behind_with_a_certificate() -> (
+        Hand,
+        Hand,
+        Hand,
+        [SigningKey; 3],
+        Vec<Vec<u8>>,
+        Vec<Send>,
+        u64,
+    ) {
+        let (mut a, from_a) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
+        let (mut c, from_c) = Hand::open(opening3(2), &key(12), NOW, 30_000).unwrap();
+        let keys = [key(10), key(11), key(12)];
+        let mut queue: Vec<(SeatIdx, Vec<Send>)> = Vec::new();
+        queue.push((1, deliver(&mut b, &from_a, &keys[1])));
+        queue.push((2, deliver(&mut c, &from_a, &keys[2])));
+        queue.push((0, deliver(&mut a, &from_b, &keys[0])));
+        queue.push((2, deliver(&mut c, &from_b, &keys[2])));
+        queue.push((0, deliver(&mut a, &from_c, &keys[0])));
+        queue.push((1, deliver(&mut b, &from_c, &keys[1])));
+
+        // Once the cards are out, seat 0 hears every action one step late.
+        let mut lagging = false;
+        let mut to_a: Vec<Send> = Vec::new();
+        let mut staged = false;
+
+        for _ in 0..512 {
+            if !queue.is_empty() {
+                let (from, sends) = queue.remove(0);
+                if sends.is_empty() {
+                    continue;
+                }
+                for to in 0..3u8 {
+                    if to == from {
+                        continue;
+                    }
+                    if to == 0 && lagging {
+                        let earlier = std::mem::take(&mut to_a);
+                        if !earlier.is_empty() {
+                            let out = deliver(&mut a, &earlier, &keys[0]);
+                            queue.push((0, out));
+                        }
+                        to_a.extend(sends.iter().cloned());
+                        continue;
+                    }
+                    let hand: &mut Hand = match to {
+                        0 => &mut a,
+                        1 => &mut b,
+                        _ => &mut c,
+                    };
+                    let out = deliver(hand, &sends, &keys[usize::from(to)]);
+                    queue.push((to, out));
+                }
+                continue;
+            }
+            if !lagging && a.dealt() && b.dealt() && c.dealt() {
+                lagging = true;
+            }
+            let Some(turn) = b.turn() else {
+                break;
+            };
+            if turn.seat == 0 && lagging && !to_a.is_empty() {
+                staged = true;
+                break;
+            }
+            let seat = turn.seat;
+            let hand: &mut Hand = match seat {
+                0 => &mut a,
+                1 => &mut b,
+                _ => &mut c,
+            };
+            let action = if hand.turn().expect("that hand agrees").legal.can_check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            let out = hand.act(action, &keys[usize::from(seat)], NOW).unwrap();
+            queue.push((seat, out));
+        }
+        assert!(staged, "the fixture never reached seat 0's turn with seat 0 one action behind");
+        assert_eq!(
+            a.slot().sequence + 1,
+            b.slot().sequence,
+            "seat 0 must be exactly one sequence behind the voters"
+        );
+
+        // Seats 1 and 2 time seat 0 out and seal the certificate between them.
+        let late = NOW + 600_000;
+        let vb = b.vote_on_timeouts(&keys[1], late, 0).unwrap();
+        let vc = c.vote_on_timeouts(&keys[2], late, 0).unwrap();
+        assert!(!vb.is_empty() && !vc.is_empty(), "both voters must vote");
+        let mut certs: Vec<Vec<u8>> = Vec::new();
+        let mut from_b = deliver(&mut b, &vc, &keys[1]);
+        let mut from_c = deliver(&mut c, &vb, &keys[2]);
+        from_b.append(&mut from_c);
+        for s in &from_b {
+            let Send::Broadcast(bytes) = s;
+            if chained::open_in_hand(bytes, FRAME_CAP, EventType::TimeoutCert, &[1; 32], 1).is_ok() {
+                certs.push(bytes.clone());
+            }
+        }
+        assert!(!certs.is_empty(), "no certificate was sealed, so nothing is tested");
+        // Each voter hears the other's copy, so their certificate stage closes
+        // the way it does at a table: on every voter's copy, not on its own.
+        for cert in &certs {
+            let rb = b.on_event(cert, &keys[1], late);
+            assert!(rb.is_ok(), "seat 1 hears a voter's copy: {rb:?}");
+            let rc = c.on_event(cert, &keys[2], late);
+            assert!(rc.is_ok(), "seat 2 hears a voter's copy: {rc:?}");
+        }
+        assert_eq!(b.slot(), c.slot(), "the voters stand together after the certificate");
+        (a, b, c, keys, certs, to_a, late)
+    }
+
+    /// `S1-BQ`: a certificate about a stage this client has not reached yet is
+    /// held, and applied when it gets there — not consumed with a fork report.
+    ///
+    /// Before: banked, reported as *this hand has forked*, and returned `Ok`
+    /// — every copy, never replayed — so on catching up the client had no
+    /// certificate stage. Now: `NotYet`, held the way `run.rs` holds it, and
+    /// once the missing action lands, `replay_early` re-delivers the copies,
+    /// seat 0 applies the certificate and stands where the voters stand. The
+    /// roster half is banked at once: seat 0 is out of the voter sets while
+    /// the positional half still waits.
+    #[test]
+    fn a_certificate_for_a_stage_not_yet_reached_is_held_and_then_applied() {
+        let (mut a, b, _c, keys, certs, to_a, late) = one_action_behind_with_a_certificate();
+
+        // The certificate reaches seat 0 one sequence early: held, not forked.
+        for cert in &certs {
+            assert_eq!(
+                a.on_event(cert, &keys[0], late),
+                Err(Failed::NotYet),
+                "a certificate for a stage not yet reached must be held"
+            );
+            assert!(
+                matches!(a.hold(cert.clone()), Holding::Kept),
+                "and the node keeps it for replay"
+            );
+        }
+        assert!(a.take_fork().is_none(), "and it is not a fork: nothing else was chained there");
+        assert!(
+            !a.voters(1).contains(&0),
+            "the roster half is banked at once: the certified seat has left the voter sets"
+        );
+        let note = a.take_cert_note().expect("the hold is said");
+        assert!(note.contains("HELD until it is in position"), "{note}");
+
+        // The missing action lands, seat 0 is in position, and the replay
+        // pass — the one `run.rs` runs after every accepted event — delivers
+        // the held copies.
+        let _ = deliver(&mut a, &to_a, &keys[0]);
+        let (_more, failures) = a.replay_early(&keys[0], late);
+        assert!(failures.is_empty(), "replayed copies were refused: {failures:?}");
+        assert_eq!(
+            a.slot(),
+            b.slot(),
+            "seat 0 applied the certificate and stands where the voters stand"
+        );
+        assert!(a.take_fork().is_none(), "no fork was ever declared");
+    }
+
+    /// `S1-BQ`'s refuted first shape, kept as a test. Holding BEFORE banking
+    /// lost the roster half for a client whose hand ends before it reaches the
+    /// sequence — every one of the five measured cases — and such a client
+    /// then kept the certified seat in R(k+1) and opened hand k+1 at a genesis
+    /// the table did not hold. The roster half is banked first, so a client
+    /// that never replays the certificate still derives the table's roster.
+    #[test]
+    fn a_certificate_held_behind_still_narrows_the_next_hand() {
+        let (mut a, _b, _c, keys, certs, _to_a, late) = one_action_behind_with_a_certificate();
+        for cert in &certs {
+            assert_eq!(a.on_event(cert, &keys[0], late), Err(Failed::NotYet));
+        }
+        // Seat 0 never gets there: its own deadline ends the hand first.
+        let _ = a.abort_now(Abort::Deadline, &keys[0], late).unwrap();
+        let next = a.next_hand().expect("an abort has a successor");
+        assert!(
+            !next.required.contains(&0),
+            "the certified seat must be outside R(k+1) on the client that held the certificate, \
+             or that client opens hand k+1 at a genesis nobody else holds: {:?}",
+            next.required
         );
     }
 
