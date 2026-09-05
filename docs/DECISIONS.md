@@ -2907,8 +2907,10 @@ subject of it.** That is not a corner: it is the shape of the event.
    `dealt_in \ {subject}`. A *shortfall* against the receiver's own `V` is
    **held**, never refused: a receiver missing an earlier certificate derives a
    larger `V`, and the peer that most reliably misses one is the subject.
-6. **The roster freezes with the terminal**, or `next_hand` races a wall clock
-   against the mesh.
+6. **The roster freezes with a *settled* terminal**, or `next_hand` races a wall clock
+   against the mesh. After an **abort** terminal it still moves on a verified
+   certificate about that hand until `HAND_INIT(k+1)` completes at this receiver,
+   and every move re-derives `Opening(k+1)` — amended in place by D-027 (`S1-BS`).
 
 ### What replaces the receiver's cursor
 
@@ -3011,6 +3013,44 @@ the fold and resets `stage_at_ms`, and the abort re-parks.
 
 `may_abandon` is unchanged and stays unchanged until the certificate is
 reachable.
+
+## D-027 — an aborted hand's roster moves on a certificate until the next hand's stage 0 completes, and hand k+1 re-opens at the corrected genesis
+
+**Decided by the project owner, 2026-09-05, in answer to `S1-BS`** (*proveď 3 a 1*): a client that opened hand `k+1` at a genesis nobody
+else holds, because a certificate about hand `k` reached it after its hand had ended, repairs the roster at the genesis rather than
+dealing on alone. Five readers, three designers and two judges went over the shape before a line was written; what they settled is in
+`S1-BS`'s row, and the ruling is stated here in D-024's form.
+
+1. **Hand `k` is retained until hand `k+1` leaves sequence 0 here**, or the table is left. Its record is what a late certificate is
+   verified against — `verify_certificate` reads the opening and `dealt_in` and nothing of the phase — and what re-derives hand `k+1`.
+2. **A certificate banks late only after an abort terminal.** `bank` refuses a settled hand (`betting_over`, or an abort with a late
+   settlement closed); after an abort terminal it banks the roster half, keyed on the subject digest, and says so. A hand that is over
+   takes the roster half and nothing else: no certificate stage, no fork report, nothing sealed. `commit_certificate` follows the same
+   rule, so the two roads agree after the terminal. This amends D-024 point 6 in place.
+3. **Every late bank re-derives `Opening(k+1)`** through `next_hand` — the one derivation every seat runs, so every field agrees, not
+   only `required` — and a changed genesis re-opens hand `k+1` **only from a sequence 0 this client never left**, carrying the held
+   events and the readmission set `A`, and purging this client's own events of hand `k+1` from the re-send list. A derivation that
+   names the genesis this client already holds changes nothing; one that contradicts a genesis two or more seats signed waits, because
+   a certificate only this client received could carry it to a third branch (D-012). A failed re-open leaves the old hand exactly as it
+   was; a seat is never left with no hand.
+4. **No seat signs one hand twice.** A second signed `HAND_INIT` at `(k+1, 0)` with a corrected parent is §5.2.3's equivocation by an
+   honest peer — undetected today only because every receiver turns a foreign parent into `NotYet` before the stage hears it — so the
+   re-open of a hand this client already signed is **muted**: its own copy heard, never sent, the corrected hand followed silently,
+   the seat back at `k+2`. A client that holds two seats' `HAND_INIT(k+1)` at one other genesis and none at its own *before* it opens
+   opens **quietly**, and speaks when as many seats are counted at its genesis as at any other, or on the re-open — its first
+   signature. The `k+1` road with a knowing exception to §5.2.3 is **not taken**; it is the owner's next ruling, if any.
+5. **Never deal the next hand alone.** At the boundary, a hand that ended at sequence 0 while more seats signed it at one other
+   genesis than were counted here is not succeeded; the client waits, re-checks every thirty seconds, a late certificate still repairs
+   it, and the *a hand ahead* latch (`adrift`) is the terminus — one line, no hand dealt alone, where `split092359-10` dealt seven.
+6. **What it does not change:** the `|V| >= 2` floor, unanimity, the subject-digest dedup, `verify_certificate`'s deadline floor, the
+   terminal (`ABORT_TERMINAL(k)` is a function of `GENESIS(k)` alone, so a late bank moves `R(k+1)` and nothing older), and §4.10's
+   gate for a bare abort, which is option 1's separate landing.
+7. **What it does not repair:** a certificate that never arrives (`S1-BN`'s carrier); a table that cannot certify a mid-delivery seat at
+   a cryptographic stage (`S1-BT`), which is why convergence is at `k+2` on this hardware and the pass criterion of every run is *one
+   genesis per hand on every client*, not *hand k+1 played*; and `hand_deadline_ms`, which restarts at a re-open while §8.2 measures
+   it from `TERMINAL(k)` — a pre-existing divergence, named and not moved.
+
+The engine-phase half of a re-opened or quietly opened stage 0 is owed to `STATE_MACHINE.md` under D-011 rule 1 and is in the open list.
 
 ## D-025 — the anti-replay slot key is deleted, not wired in
 

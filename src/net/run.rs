@@ -591,6 +591,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // The hand whose "a certificate about the previous hand arrived too late
     // to be kept" line has been said.
     let mut late_cert_said: Option<u64> = None;
+    // `S1-BS`: hand k, retained until hand k+1 leaves stage 0, so a
+    // certificate about it arriving late still banks its roster half and
+    // re-derives hand k+1.
+    let mut previous: Option<crate::table::hand::Hand> = None;
+    // `HAND_INIT`s of the next hand that arrived during this one: drained into
+    // the next hand's held queue when it opens, and read for whether its
+    // parent is contested before this client signs.
+    let mut next_inits: Vec<Vec<u8>> = Vec::new();
+    // A re-derived opening for the running hand, applied by the stall tick
+    // outside the hand borrow.
+    let mut pending_repair: Option<crate::table::hand::Opening> = None;
+    // The hand whose boundary wait has been said.
+    let mut genesis_wait_said: Option<u64> = None;
     // Said once: why no reconciliation round could be opened. Its causes are
     // permanent ones only — a stage that has not closed yet is retried in
     // silence, because it is the ordinary case and not a fault.
@@ -1120,20 +1133,53 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         // unobservable. Said once per hand;
                                         // the roster half it carries is what a
                                         // late roster repair would read.
+                                        let kind = crate::net::chained::peek($bytes, TABLE_FRAME_PEEK)
+                                            .ok()
+                                            .map(|(k, _, _)| k);
                                         if hand_id.saturating_add(1) == $h.hand_id()
-                                            && matches!(
-                                                crate::net::chained::peek($bytes, TABLE_FRAME_PEEK),
-                                                Ok((crate::protocol::messages::EventType::TimeoutCert, _, _))
-                                            )
-                                            && late_cert_said != Some($h.hand_id())
+                                            && kind == Some(crate::protocol::messages::EventType::TimeoutCert)
                                         {
-                                            late_cert_said = Some($h.hand_id());
-                                            let _ = events
-                                                .send(NodeEvent::Warning(format!(
-                                                    "a certificate about hand #{hand_id} from seat {seat:?} arrived during hand #{}: hand #{hand_id} is no longer held here, so it cannot repair anything",
-                                                    $h.hand_id()
-                                                )))
-                                                .await;
+                                            match previous.as_mut() {
+                                                // The hand it is about is still held: it
+                                                // banks there, and a new bank re-derives
+                                                // the running hand (`S1-BS`).
+                                                Some(p) if p.hand_id() == hand_id => {
+                                                    let now = super::node::now_unix_ms();
+                                                    let _ = p.on_event($bytes, &app_key, now);
+                                                    let _ = p.replay_early(&app_key, now);
+                                                    if let Some(n) = p.take_cert_note() {
+                                                        let _ = events
+                                                            .send(NodeEvent::Warning(format!(
+                                                                "hand #{hand_id} (over): {n}"
+                                                            )))
+                                                            .await;
+                                                    }
+                                                    if p.take_late_roster() {
+                                                        pending_repair = p.next_hand();
+                                                    }
+                                                }
+                                                _ => {
+                                                    if late_cert_said != Some($h.hand_id()) {
+                                                        late_cert_said = Some($h.hand_id());
+                                                        let _ = events
+                                                            .send(NodeEvent::Warning(format!(
+                                                                "a certificate about hand #{hand_id} from seat {seat:?} arrived during hand #{}: hand #{hand_id} is no longer held here, so it cannot repair anything",
+                                                                $h.hand_id()
+                                                            )))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                        } else if hand_id == $h.hand_id().saturating_add(1)
+                                            && kind == Some(crate::protocol::messages::EventType::HandInit)
+                                            && next_inits.len() < NEXT_INITS_CAP
+                                            && !next_inits.iter().any(|b| b[..] == $bytes[..])
+                                        {
+                                            // The next hand's `HAND_INIT`s, kept for it: they
+                                            // arrive during this client's 800 ms pause and
+                                            // used to be dropped, so a far seat heard them
+                                            // only from the tick-8 re-send (`S1-BS`).
+                                            next_inits.push($bytes.to_vec());
                                         }
                                         gossipsub::MessageAcceptance::Accept
                                     }
@@ -1217,6 +1263,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             ever_dealt = false;
             hand = None;
             late_cert_said = None;
+            previous = None;
+            next_inits.clear();
+            pending_repair = None;
+            genesis_wait_said = None;
             hand_reported = false;
             deck_reported = None;
             cards_reported = false;
@@ -3648,6 +3698,65 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // cryptographic ones are bounded per stage rather than per hand.
             _ = stall.tick() => {
                 let now = super::node::now_unix_ms();
+                // `S1-BS`: the retained hand replays what it holds, and a
+                // certificate that banked there re-derives the running hand.
+                if let Some(p) = previous.as_mut() {
+                    let _ = p.replay_early(&app_key, now);
+                    if let Some(n) = p.take_cert_note() {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!("hand #{} (over): {n}", p.hand_id())))
+                            .await;
+                    }
+                    if p.take_late_roster() {
+                        pending_repair = p.next_hand();
+                    }
+                }
+                // Retention ends when the running hand leaves stage 0: from
+                // there its genesis is what the table chained from.
+                if hand.as_ref().is_some_and(|h| h.slot().sequence >= 1) {
+                    previous = None;
+                }
+                if let Some(o) = pending_repair.take() {
+                    if frozen.is_none() && adrift.is_none() {
+                        let reopened = reopen_hand(
+                            o,
+                            &mut hand,
+                            &mut said,
+                            &mut swarm,
+                            &events,
+                            &tox_sink,
+                            &app_key,
+                        )
+                        .await;
+                        if reopened {
+                            hand_reported = false;
+                            deck_reported = None;
+                            cards_reported = false;
+                            turn_reported = None;
+                            abort_reported = false;
+                        }
+                    }
+                }
+                // A quiet hand speaks once the table is counted at its genesis:
+                // as many seats at this genesis as at any other, or nobody
+                // anywhere else.
+                if let Some(h) = hand.as_mut() {
+                    if h.voice() == crate::table::hand::Voice::Quiet && h.slot().sequence == 0 {
+                        let foreign = h.foreign_genesis_named().map(|(_, s)| s.len()).unwrap_or(0);
+                        let counted = h.counted_at_stage_zero().len();
+                        if counted >= foreign.max(1) {
+                            if let Some(s) = h.speak() {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "hand #{}: signed after all — {counted} seat(s) counted at this genesis, {foreign} at another",
+                                        h.hand_id()
+                                    )))
+                                    .await;
+                                publish_hand(vec![s], &mut swarm, &mut said, &tox_sink);
+                            }
+                        }
+                    }
+                }
                 let Some(h) = hand.as_mut() else { continue };
 
                 // **A message parked on a clock has to be re-judged by a
@@ -4168,6 +4277,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
 
+                // `S1-BS`: never deal the next hand alone. More seats signed
+                // this hand at one other genesis than were counted here, so
+                // the hand this client would derive is on a branch nobody
+                // shares: it waits — a late certificate about the previous
+                // hand can still repair this one, and the adrift latch above
+                // ends the wait when the table is two hands on.
+                if let Some(h) = hand.as_ref() {
+                    if h.slot().sequence == 0 {
+                        if let Some((g, seats)) = h.foreign_genesis_named() {
+                            let counted = h.counted_at_stage_zero();
+                            if seats.len() > counted.len() {
+                                if genesis_wait_said != Some(h.hand_id()) {
+                                    genesis_wait_said = Some(h.hand_id());
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "hand #{} ended with no peer at its genesis: seat(s) {:?} hold {} and this client holds {} with {:?} counted; hand #{} is not dealt here until a certificate about hand #{} repairs it",
+                                            h.hand_id(),
+                                            seats,
+                                            short_hash(&g),
+                                            short_hash(&h.genesis()),
+                                            counted,
+                                            h.hand_id().saturating_add(1),
+                                            h.hand_id().saturating_sub(1)
+                                        )))
+                                        .await;
+                                }
+                                next_hand_at = Some(
+                                    tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
                 let next = hand.as_ref().and_then(|h| h.next_hand());
                 if let (Some(h), Some(o)) = (hand.as_ref(), next.as_ref()) {
                     if o.required != h.required_now() {
@@ -4181,11 +4324,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                     }
                 }
-                hand = None;
+                // Retained, not dropped: a certificate about this hand that
+                // arrives during the next one still banks here (`S1-BS`).
+                previous = hand.take();
                 hand_reported = false;
                 deck_reported = None;
                 cards_reported = false;
                 turn_reported = None;
+                abort_reported = false;
                 // **All of hand k goes, except the one event hand k ended
                 // with.** The five-second loop re-broadcasts this client's own
                 // events because GossipSub keeps no history and a peer grafted
@@ -4240,11 +4386,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 )))
                                 .await;
                         }
-                        begin_hand(
+                        // Quiet if two seats already signed this hand at one
+                        // other genesis and none at this one (`S1-BS`).
+                        let voice = quiet_if_contested(&opening, &next_inits);
+                        begin_hand_with(
                             opening,
+                            voice,
+                            &mut next_inits,
                             &app_key,
                             &mut hand,
-                                    &mut said,
+                            &mut said,
                             &mut swarm,
                             &events,
                             &tox_sink,
@@ -5274,27 +5425,222 @@ async fn begin_hand(
     hand: &mut Option<crate::table::hand::Hand>,
     said: &mut Vec<Vec<u8>>,
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
-    // No topic. A hand is Tox-only by instruction and by capacity, and the way
-    // that rule is kept is by not handing the swarm's topic to anything on the
-    // hand path -- see `publish_hand`.
     events: &Events,
     tox: &super::toxsink::TableSink,
 ) {
-    use crate::table::hand::Hand;
+    let mut none: Vec<Vec<u8>> = Vec::new();
+    begin_hand_with(
+        opening,
+        crate::table::hand::Voice::Speak,
+        &mut none,
+        app_key,
+        hand,
+        said,
+        swarm,
+        events,
+        tox,
+    )
+    .await;
+}
 
+/// How many of the next hand's `HAND_INIT`s are kept for it while this one
+/// ends: one per seat, and a little room for a re-send.
+const NEXT_INITS_CAP: usize = 16;
+
+/// `Quiet` when at least `FOREIGN_GENESIS_FLOOR` roster seats have already
+/// signed this hand at one genesis that is not the one this client derived,
+/// and no seat has signed it at this client's: the parent is contested
+/// before the open, so this client's own signature waits for the table or
+/// for a certificate (`S1-BS`).
+fn quiet_if_contested(
+    o: &crate::table::hand::Opening,
+    inits: &[Vec<u8>],
+) -> crate::table::hand::Voice {
+    use crate::protocol::messages::EventType;
+    use crate::table::hand::{Voice, FOREIGN_GENESIS_FLOOR, FRAME_CAP};
+    let seat_of = |key: &[u8; 32]| o.seats.iter().find(|(_, k, _)| k == key).map(|(s, _, _)| *s);
+    let mut foreign: std::collections::BTreeMap<crate::poker::state::Hash, std::collections::BTreeSet<u8>> =
+        std::collections::BTreeMap::new();
+    let mut at_mine: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
+    for b in inits {
+        let Ok(opened) =
+            crate::net::chained::open_in_hand(b, FRAME_CAP, EventType::HandInit, &o.table_id, o.hand_id)
+        else {
+            continue;
+        };
+        if opened.envelope.sequence != 0 {
+            continue;
+        }
+        let Some(seat) = seat_of(&opened.sender) else { continue };
+        if seat == o.my_seat {
+            continue;
+        }
+        if opened.envelope.previous_event_hash == o.genesis {
+            at_mine.insert(seat);
+        } else {
+            foreign.entry(opened.envelope.previous_event_hash).or_default().insert(seat);
+        }
+    }
+    let most = foreign.values().map(|s| s.len()).max().unwrap_or(0);
+    if most >= FOREIGN_GENESIS_FLOOR && at_mine.is_empty() {
+        Voice::Quiet
+    } else {
+        Voice::Speak
+    }
+}
+
+/// Drop this client's own events of one hand from the re-send list — a
+/// re-opened hand must not put its first `HAND_INIT` beside its second.
+fn purge_hand_from_said(said: &mut Vec<Vec<u8>>, hand_id: u64) {
+    said.retain(|b| {
+        crate::net::chained::peek(b, TABLE_FRAME_PEEK)
+            .map(|(_, h, _)| h != hand_id)
+            .unwrap_or(true)
+    });
+}
+
+/// `S1-BS`: re-open the running hand at a re-derived opening — the same hand
+/// id, a corrected genesis. Only from a stage 0 this client never left, and
+/// only when the derivation names a different genesis; muted when this
+/// client already signed the hand at the old one, so no seat ever signs one
+/// hand twice. The held copies and the readmission set carry over. On any
+/// refusal the old hand stays exactly as it was. Returns whether it re-opened.
+async fn reopen_hand(
+    mut opening: crate::table::hand::Opening,
+    hand: &mut Option<crate::table::hand::Hand>,
+    said: &mut Vec<Vec<u8>>,
+    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    events: &Events,
+    tox: &super::toxsink::TableSink,
+    app_key: &ed25519_dalek::SigningKey,
+) -> bool {
+    use crate::table::hand::{Hand, Voice};
+    let Some(mut old) = hand.take() else { return false };
+    if old.hand_id() != opening.hand_id || old.slot().sequence != 0 {
+        *hand = Some(old);
+        return false;
+    }
+    if opening.genesis == old.genesis() {
+        // The certificate re-derived what this client already holds.
+        *hand = Some(old);
+        return false;
+    }
+    if let Some((g, seats)) = old.foreign_genesis_named() {
+        if g != opening.genesis {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "a certificate about hand #{} re-derives hand #{} at genesis {}, but seat(s) {:?} hold {}: a certificate the table has is still missing here; not re-opening",
+                    opening.hand_id.saturating_sub(1),
+                    opening.hand_id,
+                    short_hash(&opening.genesis),
+                    seats,
+                    short_hash(&g)
+                )))
+                .await;
+            *hand = Some(old);
+            return false;
+        }
+    }
+    let voice = if old.spoke() { Voice::Muted } else { Voice::Speak };
+    let early = old.take_early();
+    opening.readmitted = old.readmitted().to_vec();
+    let was = (old.genesis(), old.required().to_vec());
+    let now = super::node::now_unix_ms();
+    let deadline = opening.crypto_step_timeout_ms;
+    let (genesis, required) = (opening.genesis, opening.required.clone());
+    match Hand::open_with(opening, app_key, now, deadline, voice) {
+        Ok((mut h, sends)) => {
+            purge_hand_from_said(said, h.hand_id());
+            let carried = early.len();
+            for b in early {
+                let _ = h.hold(b);
+            }
+            let (more, failures) = h.replay_early(app_key, now);
+            for e in failures {
+                let _ = events
+                    .send(NodeEvent::Warning(format!("a held event was refused: {e}")))
+                    .await;
+            }
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "hand #{} re-opens at genesis {} with seats {:?} (was {} with seats {:?}); {carried} held event(s) carried over; {}",
+                    h.hand_id(),
+                    short_hash(&genesis),
+                    required,
+                    short_hash(&was.0),
+                    was.1,
+                    match voice {
+                        Voice::Muted => "muted: this seat signed the hand once already and follows the corrected one silently, rejoining at the next hand",
+                        _ => "speaking: this seat signs the hand for the first time here",
+                    }
+                )))
+                .await;
+            publish_hand(sends, swarm, said, tox);
+            publish_hand(more, swarm, said, tox);
+            let _ = events
+                .send(NodeEvent::HandWaiting {
+                    hand_id: h.hand_id(),
+                    seats: h.waiting_for(),
+                })
+                .await;
+            *hand = Some(h);
+            true
+        }
+        Err(e) => {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "hand #{} could not be re-opened: {e}; the old one stands",
+                    old.hand_id()
+                )))
+                .await;
+            *hand = Some(old);
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn begin_hand_with(
+    opening: crate::table::hand::Opening,
+    voice: crate::table::hand::Voice,
+    next_inits: &mut Vec<Vec<u8>>,
+    app_key: &ed25519_dalek::SigningKey,
+    hand: &mut Option<crate::table::hand::Hand>,
+    said: &mut Vec<Vec<u8>>,
+    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    events: &Events,
+    tox: &super::toxsink::TableSink,
+) {
+    use crate::table::hand::{Hand, Voice};
     if hand.is_some() {
+        next_inits.clear();
         return;
     }
     let now = super::node::now_unix_ms();
     let deadline = opening.crypto_step_timeout_ms;
-    match Hand::open(opening, app_key, now, deadline) {
-        Ok((h, sends)) => {
-            // Through the same door as every other hand message, so that
-            // `HAND_INIT` is remembered and re-sent like the rest. It is in
-            // fact the one that goes missing: it is published the moment the
-            // roster ratifies, which is before the last joiner has been
-            // grafted into anybody's mesh for this topic.
+    match Hand::open_with(opening, app_key, now, deadline, voice) {
+        Ok((mut h, sends)) => {
+            if voice == Voice::Quiet {
+                let _ = events
+                    .send(NodeEvent::Warning(format!(
+                        "hand #{}: two seats or more signed it at another genesis before this client opened it, and none at this one — this client's own HAND_INIT is withheld until the table is counted here or a certificate re-derives the hand",
+                        h.hand_id()
+                    )))
+                    .await;
+            }
+            // The next hand's copies that arrived during the last one.
+            let buffered = std::mem::take(next_inits);
+            for b in buffered {
+                let _ = h.hold(b);
+            }
+            let (more, failures) = h.replay_early(app_key, now);
+            for e in failures {
+                let _ = events
+                    .send(NodeEvent::Warning(format!("a held event was refused: {e}")))
+                    .await;
+            }
             publish_hand(sends, swarm, said, tox);
+            publish_hand(more, swarm, said, tox);
             // What this hand hangs off, said out loud. Two peers that opened
             // hand one from different views of the formation produce different
             // genesis values, and every message each sends is then "a different
@@ -7047,5 +7393,43 @@ mod ad_is_admissible {
                 "the advert this client publishes at {seats} seats is one it would refuse"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod late_roster_tests {
+    use super::*;
+
+    /// A re-open must not put this seat's first `HAND_INIT` of the hand beside
+    /// its second on the wire: the hand's own events leave the re-send list,
+    /// the previous hand's terminal stays.
+    #[test]
+    fn a_re_open_purges_the_hand_from_the_resend_list_and_keeps_the_terminal() {
+        use crate::protocol::messages::EventType;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let seal = |kind: EventType, hand_id: u64| -> Vec<u8> {
+            let slot = crate::net::chained::Slot {
+                table_id: [1; 32],
+                hand_id,
+                sequence: 0,
+                previous_event_hash: [2; 32],
+            };
+            crate::net::chained::seal(kind, &slot, &0u8, &key, 1_000, 30_000, 4096).unwrap()
+        };
+        let mut said = vec![
+            seal(EventType::HandAbort, 7),
+            seal(EventType::HandInit, 8),
+            seal(EventType::TimeoutVote, 8),
+            seal(EventType::StateHash, 7),
+        ];
+        purge_hand_from_said(&mut said, 8);
+        let kinds: Vec<(EventType, u64)> = said
+            .iter()
+            .map(|b| {
+                let (k, h, _) = crate::net::chained::peek(b, TABLE_FRAME_PEEK).unwrap();
+                (k, h)
+            })
+            .collect();
+        assert_eq!(kinds, vec![(EventType::HandAbort, 7), (EventType::StateHash, 7)]);
     }
 }

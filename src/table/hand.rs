@@ -421,7 +421,7 @@ pub const HAND_INIT_CAP: usize = 512;
 /// Bayer-Groth argument, two hashes and an envelope. Sixteen kilobytes leaves
 /// room for the 8192 B the protocol allows a proof and is still small enough
 /// that a peer cannot make this client hold much by sending nonsense.
-const FRAME_CAP: usize = 16_384;
+pub const FRAME_CAP: usize = 16_384;
 
 /// The frame cap for a `STATE_HASH`.
 ///
@@ -565,6 +565,25 @@ pub struct CertFact {
 /// the mesh: a kept event was worth forwarding, an event of another hand is
 /// somebody else's business and costs its sender nothing, and a malformed one
 /// is the sender's fault and must not be forwarded in this client's name.
+/// Whether this client signs its own `HAND_INIT` when a hand opens.
+///
+/// `Speak` is every ordinary hand. `Quiet` opens the hand with this client's
+/// own copy heard but **not sent**: the parent was contested before the open
+/// — two seats had already signed this hand at another genesis — and a
+/// signature at a parent the table may not hold is withheld until either a
+/// seat is counted at this genesis (`speak`) or a certificate re-derives the
+/// hand. `Muted` never sends: this client already signed this hand at a
+/// genesis the table does not hold, and a second `HAND_INIT` from one seat at
+/// one slot is the equivocation §5.2.3 forbids of an honest peer, so the
+/// corrected hand is followed silently and the seat rejoins at the next one
+/// (`S1-BS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Voice {
+    Speak,
+    Quiet,
+    Muted,
+}
+
 /// How many roster seats must name one foreign genesis at sequence 0 of this
 /// hand before this client says so: the same floor `adrift_now` uses for
 /// *a hand ahead*, and for the same reason — one seat's word is one seat's
@@ -1092,6 +1111,14 @@ pub struct Hand {
     foreign_genesis: BTreeMap<SeatIdx, Hash>,
     /// Said once per hand, when `FOREIGN_GENESIS_FLOOR` seats name one value.
     genesis_note: Option<String>,
+    /// A certificate banked after this hand's abort terminal: the next hand's
+    /// roster is to be re-derived (`S1-BS`). Taken by the node.
+    late_roster: bool,
+    /// Whether this client's own `HAND_INIT` went out, is withheld, or never
+    /// goes out.
+    voice: Voice,
+    /// The withheld `HAND_INIT`, while the voice is `Quiet`.
+    own_init: Option<Vec<u8>>,
     /// The last seat a certificate acted for, and what it did.
     ///
     /// Read once by the node so it can say so: an action nobody took is the one
@@ -1185,6 +1212,18 @@ impl Hand {
         key: &SigningKey,
         now_ms: u64,
         next_deadline_ms: u32,
+    ) -> Result<(Hand, Vec<Send>), Failed> {
+        Self::open_with(o, key, now_ms, next_deadline_ms, Voice::Speak)
+    }
+
+    /// [`open`](Hand::open) with a [`Voice`]: whether this client's own
+    /// `HAND_INIT` is sent now, withheld, or never sent.
+    pub fn open_with(
+        o: Opening,
+        key: &SigningKey,
+        now_ms: u64,
+        next_deadline_ms: u32,
+        voice: Voice,
     ) -> Result<(Hand, Vec<Send>), Failed> {
         let occupied: Vec<SeatIdx> = o.seats.iter().map(|(s, _, _)| *s).collect();
         let button = o
@@ -1338,6 +1377,15 @@ impl Hand {
             }
         }
 
+        // **Heard here whatever the voice, sent only when speaking.** A quiet
+        // or muted hand is a member like any other — its own copy is in its
+        // own stage, so the stage completes the moment the table's copies
+        // land — and only the wire is withheld.
+        let (sends, own_init) = match (a_member, voice) {
+            (true, Voice::Speak) => (vec![Send::Broadcast(bytes)], None),
+            (true, Voice::Quiet) => (Vec::new(), Some(bytes)),
+            (true, Voice::Muted) | (false, _) => (Vec::new(), None),
+        };
         let opened_at_ms = now_ms;
         Ok((
             Hand {
@@ -1356,6 +1404,9 @@ impl Hand {
                 cert_note: Vec::new(),
                 foreign_genesis: BTreeMap::new(),
                 genesis_note: None,
+                late_roster: false,
+                voice,
+                own_init,
                 acted_for: None,
                 votes: BTreeMap::new(),
                 voted: BTreeSet::new(),
@@ -1372,12 +1423,9 @@ impl Hand {
                 params: DeckParams::new(),
                 early: VecDeque::new(),
             },
-            // Nothing goes out from a seat that is in no `R` of this hand.
-            if a_member {
-                vec![Send::Broadcast(bytes)]
-            } else {
-                Vec::new()
-            },
+            // Nothing goes out from a seat that is in no `R` of this hand,
+            // and nothing from a quiet or muted one.
+            sends,
         ))
     }
 
@@ -5794,10 +5842,28 @@ impl Hand {
     /// and never shrinks its own roster. Measured: the subject banked the
     /// certificate about itself and dropped to `[1, 2]` while its author stayed
     /// at `[0, 1, 2]`, and the two forked at the next genesis.
+    /// A hand whose terminal is a **settlement**: `TERMINAL(k)` is the
+    /// `HAND_COMPLETE` stage hash, which a client that did not chain the
+    /// certificate stage cannot reach, so a late certificate there is D-024
+    /// point 4's fork and the roster is frozen. After an **abort** terminal
+    /// the roster still moves on a verified certificate about this hand
+    /// until the next hand's stage 0 completes at this receiver (`S1-BS`):
+    /// `ABORT_TERMINAL(k)` is a function of `GENESIS(k)` alone, so the
+    /// terminal does not move — only R(k+1) does, and re-deriving it is what
+    /// puts this client on the table's genesis instead of one of its own.
+    fn settled(&self) -> bool {
+        self.betting_over()
+            || (self.aborted().is_some() && self.late.as_ref().is_some_and(|l| l.closed.is_some()))
+    }
+
     fn bank(&mut self, subject: &TimeoutVote, event_hash: Hash, raw: &[u8]) -> bool {
-        // The roster freezes with the terminal, or `next_hand` is racing a wall
-        // clock against the mesh.
-        if self.over() || self.banked.len() >= BANKED_CAP {
+        // The roster freezes with a settled terminal. After an abort terminal
+        // a certificate still banks — and says so, so the node re-derives the
+        // next hand (`late_roster`). `S1-BS`: eight seats banked a certificate
+        // before the abort ended the hand, the ninth received no copy until
+        // after, refused it here, and opened the next hand with the certified
+        // seat still in R — a genesis nobody else held.
+        if self.settled() || self.banked.len() >= BANKED_CAP {
             return false;
         }
         self.certs.insert(
@@ -5819,6 +5885,14 @@ impl Hand {
         if let Some(n) = self.strikes.get_mut(usize::from(subject.subject_seat)) {
             *n = n.saturating_add(1);
         }
+        if self.aborted().is_some() {
+            self.late_roster = true;
+            self.cert_note.push(format!(
+                "cert: about seat {} banked after the terminal; the roster of hand #{} is re-derived",
+                subject.subject_seat,
+                self.open.hand_id.saturating_add(1)
+            ));
+        }
         true
     }
 
@@ -5837,7 +5911,8 @@ impl Hand {
     fn commit_certificate(&mut self, subject: SeatIdx) {
         self.certifying = None;
         self.note_signed(subject);
-        if self.certified.contains(&subject) {
+        // The same rule as `bank`: a settled hand's roster does not move.
+        if self.settled() || self.certified.contains(&subject) {
             return;
         }
         self.certified.push(subject);
@@ -5904,6 +5979,15 @@ impl Hand {
         // table opens it at. Banking is keyed on the subject digest, so a
         // replayed copy banks once and `banked` is false on the replay.
         let banked = self.bank_certificate(&c);
+
+        // **A hand that is over takes the roster half and nothing else.** No
+        // certificate stage is built on a finished hand, no fork is reported
+        // about a stage it will never reach, and nothing is sealed or sent;
+        // the bank above is the whole of what a late copy can do (`S1-BS`).
+        if self.aborted().is_some() {
+            let _ = banked;
+            return Ok(Vec::new());
+        }
 
         // **Behind is not forked (`S1-BQ`).** A certificate about a betting
         // stage this client has not reached yet is held and replayed when
@@ -6411,6 +6495,56 @@ impl Hand {
     /// The once-per-hand foreign-genesis line, taken rather than read.
     pub fn take_genesis_note(&mut self) -> Option<String> {
         self.genesis_note.take()
+    }
+
+    /// Whether a certificate banked after this hand's abort terminal since
+    /// the last time this was asked: the next hand's roster is to be
+    /// re-derived through [`next_hand`](Hand::next_hand).
+    pub fn take_late_roster(&mut self) -> bool {
+        std::mem::take(&mut self.late_roster)
+    }
+
+    /// The seats other than this client's whose sequence-0 `HAND_INIT` of
+    /// this hand was counted at this client's genesis. Meaningful while the
+    /// hand is at sequence 0, and readable after it ended there.
+    pub fn counted_at_stage_zero(&self) -> Vec<SeatIdx> {
+        self.signed
+            .iter()
+            .enumerate()
+            .filter(|(s, on)| **on && *s != usize::from(self.open.my_seat))
+            .map(|(s, _)| s as SeatIdx)
+            .collect()
+    }
+
+    /// The held events, taken: a re-opened hand inherits them.
+    pub fn take_early(&mut self) -> VecDeque<Vec<u8>> {
+        std::mem::take(&mut self.early)
+    }
+
+    /// §4.9's readmission set this hand was opened with.
+    pub fn readmitted(&self) -> &[SeatIdx] {
+        &self.open.readmitted
+    }
+
+    pub fn voice(&self) -> Voice {
+        self.voice
+    }
+
+    /// Whether this client's own `HAND_INIT` of this hand went out.
+    pub fn spoke(&self) -> bool {
+        self.voice == Voice::Speak
+            && self.signed.get(usize::from(self.open.my_seat)).copied().unwrap_or(false)
+    }
+
+    /// Send the withheld `HAND_INIT` of a quiet hand — once. `None` for a
+    /// hand that is speaking already, muted, or not a member.
+    pub fn speak(&mut self) -> Option<Send> {
+        if self.voice != Voice::Quiet {
+            return None;
+        }
+        let bytes = self.own_init.take()?;
+        self.voice = Voice::Speak;
+        Some(Send::Broadcast(bytes))
     }
 
     /// Judge everything that was held, now that the stage may have moved.
@@ -8188,6 +8322,166 @@ mod tests {
         assert!(a2.on_event(init_b2, &key(10), NOW).is_ok());
         assert!(a2.foreign_genesis_named().is_none());
         assert_eq!(a2.waiting_for(), vec![2]);
+    }
+
+    /// `S1-BS`: a certificate that reaches this client after its hand ended by
+    /// an abort still banks its roster half, says so, and narrows the next
+    /// hand — and a second copy banks nothing twice.
+    #[test]
+    fn a_certificate_about_an_aborted_hand_still_banks() {
+        let (mut a, _b, _c, keys, certs, _to_a, late) = one_action_behind_with_a_certificate();
+        // The hand ends first, on this client's own deadline.
+        let _ = a.abort_now(Abort::Deadline, &keys[0], late).unwrap();
+        assert!(a.aborted().is_some());
+        for cert in &certs {
+            let r = a.on_event(cert, &keys[0], late);
+            assert_eq!(r, Ok(Vec::new()), "a late copy banks and stops: {r:?}");
+        }
+        assert!(a.take_fork().is_none(), "no fork is reported about a stage a finished hand never reaches");
+        assert!(a.take_late_roster(), "the first copy banked after the terminal");
+        assert!(!a.take_late_roster(), "and the second did not bank it twice");
+        let note = a.take_cert_note().expect("the late bank is said");
+        assert!(note.contains("banked after the terminal"), "{note}");
+        let next = a.next_hand().expect("an abort has a successor");
+        assert_eq!(next.required, vec![1, 2], "the certified seat left R(k+1)");
+    }
+
+    /// `S1-BS`, the whole shape at hand level, converging at k+2 without a
+    /// second signature.
+    ///
+    /// Five seats. Seat 4 goes quiet at the deck stage; seats 0 to 3 vote.
+    /// Seat 0 holds every vote, seals, and banks `certified [4]`; seat 1
+    /// holds two votes and seals nothing. Seat 4's own unattributed abort ends
+    /// the hand on both: same terminal, and R(2) differs by seat 4 — seat 1
+    /// opens hand 2 at a genesis nobody else holds and signs it. Then seat 0's
+    /// certificate copy reaches seat 1 during hand 2: hand 1, retained, banks
+    /// it and re-derives hand 2 at seat 0's genesis; seat 1 re-opens hand 2
+    /// there **muted**, inherits the held copies, and never signs hand 2
+    /// twice. Hand 2 dies on both — it cannot complete without seat 1's
+    /// signature — and hand 3 opens at one genesis on both.
+    #[test]
+    fn a_late_certificate_re_derives_the_next_hand_and_the_table_converges_at_the_hand_after() {
+        let keys: Vec<SigningKey> = (10..15).map(key).collect();
+        let mut hands: Vec<Hand> = Vec::new();
+        let mut inits: Vec<Vec<u8>> = Vec::new();
+        for seat in 0..5u8 {
+            let (h, sends) = Hand::open(opening5(seat), &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            let Send::Broadcast(b) = &sends[0];
+            inits.push(b.clone());
+            hands.push(h);
+        }
+        // Stage 0 completes everywhere; every seat emits its DECK_INIT.
+        let mut decks: Vec<Vec<Send>> = vec![Vec::new(); 5];
+        for to in 0..5usize {
+            for from in 0..5usize {
+                if from == to {
+                    continue;
+                }
+                let mut out = deliver(&mut hands[to], &[Send::Broadcast(inits[from].clone())], &keys[to]);
+                decks[to].append(&mut out);
+            }
+            assert!(!decks[to].is_empty(), "seat {to} emits its deck contribution");
+        }
+        // Seats 0..3 hear each other's decks; seat 4's never arrives.
+        for to in 0..4usize {
+            for from in 0..4usize {
+                if from != to {
+                    let _ = deliver(&mut hands[to], &decks[from], &keys[to]);
+                }
+            }
+            assert_eq!(hands[to].waiting_for(), vec![4], "seat {to} waits for seat 4");
+        }
+        // Votes at the stage budget. Seat 0 hears every vote; seat 1 hears seat 0's only.
+        let t1 = NOW + 30_000;
+        let mut votes: Vec<Vec<u8>> = Vec::new();
+        for s in 0..4usize {
+            let v = hands[s].vote_on_timeouts(&keys[s], t1, 0).unwrap();
+            let Send::Broadcast(b) = &v[0];
+            votes.push(b.clone());
+        }
+        let table_id = hands[0].slot().table_id;
+        let mut cert_copy: Option<Vec<u8>> = None;
+        for s in 1..4usize {
+            let out = hands[0].on_event(&votes[s], &keys[0], t1).unwrap();
+            for o in out {
+                let Send::Broadcast(b) = o;
+                if chained::open_in_hand(&b, FRAME_CAP, EventType::TimeoutCert, &table_id, 1).is_ok() {
+                    cert_copy = Some(b);
+                }
+            }
+        }
+        let cert_copy = cert_copy.expect("seat 0 sealed its copy on the fourth vote");
+        assert!(hands[1].on_event(&votes[0], &keys[1], t1).unwrap().is_empty(), "two of four votes seal nothing");
+        // Seat 4's own unattributed abort ends the hand on both, at twice the budget.
+        let t2 = NOW + 60_000;
+        let ab = hands[4].abort_now(Abort::Deadline, &keys[4], t2).unwrap();
+        let Send::Broadcast(abort) = &ab[0];
+        assert!(hands[0].on_event(abort, &keys[0], t2).is_ok());
+        assert!(hands[1].on_event(abort, &keys[1], t2).is_ok());
+        let oa = hands[0].next_hand().expect("seat 0 has a successor");
+        let ob = hands[1].next_hand().expect("seat 1 has a successor");
+        assert_eq!(oa.required, vec![0, 1, 2, 3], "seat 0 banked the certificate when it sealed");
+        assert_eq!(ob.required, vec![0, 1, 2, 3, 4], "seat 1 never had a copy");
+        assert_ne!(oa.genesis, ob.genesis, "the fork S1-BS measured");
+
+        // Hand 2: both speak at their own genesis; seat 0's copy is foreign at seat 1.
+        let (mut a2, from_a2) = Hand::open(oa.clone(), &keys[0], NOW, 30_000).unwrap();
+        let (mut b2, _from_b2) = Hand::open(ob, &keys[1], NOW, 30_000).unwrap();
+        assert!(b2.spoke(), "seat 1 signed hand 2 at its own genesis");
+        let Send::Broadcast(init_a2) = &from_a2[0];
+        assert_eq!(b2.on_event(init_a2, &keys[1], NOW), Err(Failed::NotYet));
+        assert!(matches!(b2.hold(init_a2.clone()), Holding::Kept));
+
+        // The late copy: hand 2 cannot keep it, hand 1 banks it and re-derives.
+        assert_eq!(b2.on_event(&cert_copy, &keys[1], NOW), Err(Failed::NotYet));
+        assert!(matches!(b2.hold(cert_copy.clone()), Holding::AnotherHand { hand_id: 1, seat: Some(0) }));
+        assert_eq!(hands[1].on_event(&cert_copy, &keys[1], t2), Ok(Vec::new()));
+        assert!(hands[1].take_late_roster());
+        let mut ob2 = hands[1].next_hand().expect("re-derived");
+        assert_eq!(ob2.required, vec![0, 1, 2, 3]);
+        assert_eq!(ob2.genesis, oa.genesis, "the table's genesis, from the certificate alone");
+
+        // Re-open muted: no second signature, the held copies carried over.
+        ob2.readmitted = b2.readmitted().to_vec();
+        let early = b2.take_early();
+        let (mut b2m, sends) = Hand::open_with(ob2, &keys[1], NOW, 30_000, Voice::Muted).unwrap();
+        assert!(sends.is_empty(), "a muted hand sends nothing");
+        assert!(!b2m.spoke() && b2m.speak().is_none());
+        for e in early {
+            let _ = b2m.hold(e);
+        }
+        let (_more, failures) = b2m.replay_early(&keys[1], NOW);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(b2m.genesis(), a2.genesis());
+        assert_eq!(b2m.waiting_for(), vec![2, 3], "seat 0's copy counted at the corrected genesis");
+
+        // Hand 2 dies on both; hand 3 opens at one genesis on both.
+        let _ = a2.abort_now(Abort::Deadline, &keys[0], t2).unwrap();
+        let _ = b2m.abort_now(Abort::Deadline, &keys[1], t2).unwrap();
+        let na = a2.next_hand().expect("hand 3 on seat 0");
+        let nb = b2m.next_hand().expect("hand 3 on seat 1");
+        assert_eq!(na.required, vec![0, 1, 2, 3]);
+        assert_eq!(na.genesis, nb.genesis, "converged at k+2 without a second signature");
+    }
+
+    /// A quiet hand hears itself, counts the table's copies, and speaks once
+    /// when asked; a muted one never does.
+    #[test]
+    fn a_quiet_hand_speaks_once_and_a_muted_one_never() {
+        let (mut a, sends) = Hand::open_with(opening3(0), &key(10), NOW, 30_000, Voice::Quiet).unwrap();
+        assert!(sends.is_empty() && !a.spoke() && a.voice() == Voice::Quiet);
+        let (mut b, from_b) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
+        let (_c, from_c) = Hand::open(opening3(2), &key(12), NOW, 30_000).unwrap();
+        let _ = deliver(&mut a, &from_b, &key(10));
+        let _ = deliver(&mut a, &from_c, &key(10));
+        assert_eq!(a.counted_at_stage_zero(), vec![1, 2]);
+        assert!(a.dealt(), "its own copy was heard, so stage 0 completed here");
+        let spoken = a.speak().expect("the withheld HAND_INIT");
+        assert!(a.spoke() && a.speak().is_none(), "once");
+        let _ = deliver(&mut b, &[spoken], &key(11));
+        assert_eq!(b.waiting_for(), vec![2]);
+        let (mut m, sends) = Hand::open_with(opening3(0), &key(10), NOW, 30_000, Voice::Muted).unwrap();
+        assert!(sends.is_empty() && m.speak().is_none() && !m.spoke());
     }
 
     /// `S1-BQ`'s fixture. Three seats; seat 0 is one action behind — the last
