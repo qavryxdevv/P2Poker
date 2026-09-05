@@ -81,6 +81,11 @@ param(
     # -DelayCertsSeat for -DelayCerts ms (0 = off). Induces the S1-BS shape.
     [ValidateRange(0, 600000)][int]$DelayCerts = 0,
     [ValidateRange(0, 8)][int]$DelayCertsSeat = 0,
+    # fault-harness: local seat -LinkDownSeat drops every table message both
+    # ways from -LinkDownAt s (of its own start) for -LinkDownFor s (0 = off).
+    [ValidateRange(0, 3600)][int]$LinkDownAt = 0,
+    [ValidateRange(0, 3600)][int]$LinkDownFor = 0,
+    [ValidateRange(0, 8)][int]$LinkDownSeat = 0,
     [switch]$NoBuild,
     # **Build without `fault-harness`, and therefore without toxcore's log.**
     #
@@ -184,7 +189,8 @@ Write-Host "seats  $seats  ($Here here, $There on $Target)"
 Write-Host "for    $Seconds s"
 Write-Host "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
 Write-Host "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
-Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_CERT frames parked $DelayCerts ms on far seat $DelayCertsSeat (fault-harness)" } else { 'none' })"
+Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on far seat $DelayCertsSeat (fault-harness)" } else { 'none' })"
+Write-Host "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
 Write-Host "work   $work"
 Write-Host ''
 
@@ -406,8 +412,14 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         if ($i -eq 0) { $nodeArgs += @('--host', $table, '--seats', "$seats") }
         else { $nodeArgs += @('--join', $table) }
 
-        $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log -ScriptBlock {
-            param($exe, $nodeArgs, $log)
+        $knobs = @{}
+        if ($LinkDownFor -gt 0 -and $i -eq $LinkDownSeat) {
+            $knobs['P2P_POKER_LINK_DOWN_AT'] = "$LinkDownAt"
+            $knobs['P2P_POKER_LINK_DOWN_FOR'] = "$LinkDownFor"
+        }
+        $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $knobs -ScriptBlock {
+            param($exe, $nodeArgs, $log, $knobs)
+            foreach ($k in $knobs.Keys) { Set-Item -Path "env:$k" -Value $knobs[$k] }
             # **A wall clock, not an elapsed one, because the columns get
             # compared across nodes.**
             #

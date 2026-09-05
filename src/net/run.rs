@@ -932,9 +932,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 && !releasing_certs
                 && matches!(
                     crate::net::chained::peek($bytes, TABLE_FRAME_PEEK),
-                    Ok((crate::protocol::messages::EventType::TimeoutCert, _, _))
+                    Ok((
+                        crate::protocol::messages::EventType::TimeoutCert
+                            | crate::protocol::messages::EventType::TimeoutVote,
+                        _,
+                        _
+                    ))
                 )
             {
+                // Votes too: a seat that holds every vote seals its own copy
+                // and banks it, so the odd seat of `S1-BS` is one that missed
+                // the votes as well as the copies.
                 let ms = delay_certs_ms.unwrap_or(0);
                 delayed_certs.push((
                     tokio::time::Instant::now() + std::time::Duration::from_millis(ms),
@@ -944,7 +952,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     delay_said = true;
                     let _ = events
                         .send(NodeEvent::Warning(format!(
-                            "fault-harness: every TIMEOUT_CERT this seat receives is parked for {ms} ms before it is judged"
+                            "fault-harness: every TIMEOUT_VOTE and TIMEOUT_CERT this seat receives is parked for {ms} ms before it is judged"
                         )))
                         .await;
                 }
