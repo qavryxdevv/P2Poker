@@ -6447,7 +6447,13 @@ impl Hand {
             && self.slot.sequence == 0
             && opened.envelope.previous_event_hash != self.open.genesis
         {
-            if let Some(seat) = self.seat_of_key(&opened.sender) {
+            // Roster seats of this hand only: a seat certified out of it
+            // opens the hand it thinks it is in, and its word does not
+            // contest this one.
+            if let Some(seat) = self
+                .seat_of_key(&opened.sender)
+                .filter(|s| self.open.required.contains(s))
+            {
                 self.foreign_genesis
                     .insert(seat, opened.envelope.previous_event_hash);
                 if self.genesis_note.is_none() {
@@ -8450,8 +8456,9 @@ mod tests {
         for e in early {
             let _ = b2m.hold(e);
         }
-        let (_more, failures) = b2m.replay_early(&keys[1], NOW);
+        let (more, failures) = b2m.replay_early(&keys[1], NOW);
         assert!(failures.is_empty(), "{failures:?}");
+        assert!(more.is_empty(), "nothing goes out from a muted hand's replay either");
         assert_eq!(b2m.genesis(), a2.genesis());
         assert_eq!(b2m.waiting_for(), vec![2, 3], "seat 0's copy counted at the corrected genesis");
 

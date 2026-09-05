@@ -3038,7 +3038,9 @@ dealing on alone. Five readers, three designers and two judges went over the sha
    re-open of a hand this client already signed is **muted**: its own copy heard, never sent, the corrected hand followed silently,
    the seat back at `k+2`. A client that holds two seats' `HAND_INIT(k+1)` at one other genesis and none at its own *before* it opens
    opens **quietly**, and speaks when as many seats are counted at its genesis as at any other, or on the re-open — its first
-   signature. The `k+1` road with a knowing exception to §5.2.3 is **not taken**; it is the owner's next ruling, if any.
+   signature. *The seat back at `k+2`* holds on the certificate road, `|R(k+1)| >= 3`; heads-up, the other seat derives `R(k+2)`
+   from what it heard, which is the pre-existing heads-up cost. A muted hand re-opened again stays muted. The `k+1` road with a
+   knowing exception to §5.2.3 is **not taken**; it is the owner's next ruling, if any.
 5. **Never deal the next hand alone.** At the boundary, a hand that ended at sequence 0 while more seats signed it at one other
    genesis than were counted here is not succeeded; the client waits, re-checks every thirty seconds, a late certificate still repairs
    it, and the *a hand ahead* latch (`adrift`) is the terminus — one line, no hand dealt alone, where `split092359-10` dealt seven.

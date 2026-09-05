@@ -1145,7 +1145,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 // the running hand (`S1-BS`).
                                                 Some(p) if p.hand_id() == hand_id => {
                                                     let now = super::node::now_unix_ms();
-                                                    let _ = p.on_event($bytes, &app_key, now);
+                                                    // Held there too: a copy the
+                                                    // retained hand cannot judge yet
+                                                    // (a voter-set shortfall, D-024
+                                                    // point 5) is re-judged by its
+                                                    // replay once another banks.
+                                                    if let Err(Failed::NotYet) =
+                                                        p.on_event($bytes, &app_key, now)
+                                                    {
+                                                        let _ = p.hold($bytes.to_vec());
+                                                    }
                                                     let _ = p.replay_early(&app_key, now);
                                                     if let Some(n) = p.take_cert_note() {
                                                         let _ = events
@@ -1172,6 +1181,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         } else if hand_id == $h.hand_id().saturating_add(1)
                                             && kind == Some(crate::protocol::messages::EventType::HandInit)
+                                            && seat.is_some()
                                             && next_inits.len() < NEXT_INITS_CAP
                                             && !next_inits.iter().any(|b| b[..] == $bytes[..])
                                         {
@@ -3717,7 +3727,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     previous = None;
                 }
                 if let Some(o) = pending_repair.take() {
-                    if frozen.is_none() && adrift.is_none() {
+                    if frozen.is_some() {
+                        // Kept until the freeze lifts: a repair is not lost to it.
+                        pending_repair = Some(o);
+                    } else if adrift.is_none() {
                         let reopened = reopen_hand(
                             o,
                             &mut hand,
@@ -3729,6 +3742,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await;
                         if reopened {
+                            // A timer armed about the old hand must not fire
+                            // about the new one.
+                            next_hand_at = None;
+                            act_by = None;
                             hand_reported = false;
                             deck_reported = None;
                             cards_reported = false;
@@ -3741,7 +3758,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // as many seats at this genesis as at any other, or nobody
                 // anywhere else.
                 if let Some(h) = hand.as_mut() {
-                    if h.voice() == crate::table::hand::Voice::Quiet && h.slot().sequence == 0 {
+                    // Whatever the sequence: a `HAND_INIT` at (k+1, 0) is as
+                    // valid sent late, and a quiet hand whose stage 0 completed
+                    // between two ticks still owes the table its copy.
+                    if h.voice() == crate::table::hand::Voice::Quiet {
                         let foreign = h.foreign_genesis_named().map(|(_, s)| s.len()).unwrap_or(0);
                         let counted = h.counted_at_stage_zero().len();
                         if counted >= foreign.max(1) {
@@ -4027,6 +4047,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }, if next_hand_at.is_some() => {
                 next_hand_at = None;
+                // **Never succeed a hand that is not over.** This arm rested
+                // on an invariant — the timer fires only about a hand that
+                // ended — that a re-open (`S1-BS`) broke: a repair can put a
+                // running hand under a timer armed about the old one, and
+                // `next_hand()` is `None` for a running hand, which used to
+                // end here with `hand = None` and a seat that had no hand for
+                // the rest of the table. Found by the refuters, not the run.
+                if hand.as_ref().is_some_and(|h| !h.over()) {
+                    continue;
+                }
                 // **No further hand while frozen.** §6.3's freeze stops emission
                 // as well as acceptance, and a peer that dealt on would be
                 // building hand `k+1` on a state it has been told is contested.
@@ -4287,7 +4317,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if h.slot().sequence == 0 {
                         if let Some((g, seats)) = h.foreign_genesis_named() {
                             let counted = h.counted_at_stage_zero();
-                            if seats.len() > counted.len() {
+                            if wait_at_boundary(seats.len(), counted.len()) {
                                 if genesis_wait_said != Some(h.hand_id()) {
                                     genesis_wait_said = Some(h.hand_id());
                                     let _ = events
@@ -5472,7 +5502,9 @@ fn quiet_if_contested(
             continue;
         }
         let Some(seat) = seat_of(&opened.sender) else { continue };
-        if seat == o.my_seat {
+        if seat == o.my_seat || !o.required.contains(&seat) {
+            // A seat outside R — certified out of this hand — opens the hand
+            // it thinks it is in; its word does not contest this one.
             continue;
         }
         if opened.envelope.previous_event_hash == o.genesis {
@@ -5484,6 +5516,25 @@ fn quiet_if_contested(
     let most = foreign.values().map(|s| s.len()).max().unwrap_or(0);
     if most >= FOREIGN_GENESIS_FLOOR && at_mine.is_empty() {
         Voice::Quiet
+    } else {
+        Voice::Speak
+    }
+}
+
+/// Whether the boundary waits: more roster seats signed this hand at one
+/// other genesis than were counted at this client's, this client's own seat
+/// counted on its side. Ties deal on (§4.9's late-roster-repair box).
+fn wait_at_boundary(named_elsewhere: usize, counted_here_without_me: usize) -> bool {
+    named_elsewhere > counted_here_without_me + 1
+}
+
+/// The voice of a re-open: muted once this seat has signed the hand, or
+/// once it was muted — a muted hand re-opened again must not speak, or one
+/// seat would sign one hand twice on the second certificate.
+fn reopen_voice(spoke: bool, was: crate::table::hand::Voice) -> crate::table::hand::Voice {
+    use crate::table::hand::Voice;
+    if spoke || was == Voice::Muted {
+        Voice::Muted
     } else {
         Voice::Speak
     }
@@ -5517,6 +5568,16 @@ async fn reopen_hand(
     use crate::table::hand::{Hand, Voice};
     let Some(mut old) = hand.take() else { return false };
     if old.hand_id() != opening.hand_id || old.slot().sequence != 0 {
+        let _ = events
+            .send(NodeEvent::Warning(format!(
+                "a certificate about hand #{} re-derives hand #{} at genesis {}, but hand #{} has left stage 0 here (sequence {}); not re-opened",
+                opening.hand_id.saturating_sub(1),
+                opening.hand_id,
+                short_hash(&opening.genesis),
+                old.hand_id(),
+                old.slot().sequence
+            )))
+            .await;
         *hand = Some(old);
         return false;
     }
@@ -5541,7 +5602,7 @@ async fn reopen_hand(
             return false;
         }
     }
-    let voice = if old.spoke() { Voice::Muted } else { Voice::Speak };
+    let voice = reopen_voice(old.spoke(), old.voice());
     let early = old.take_early();
     opening.readmitted = old.readmitted().to_vec();
     let was = (old.genesis(), old.required().to_vec());
@@ -5593,6 +5654,10 @@ async fn reopen_hand(
                     old.hand_id()
                 )))
                 .await;
+            // Exactly as it was: the held queue goes back too.
+            for b in early {
+                let _ = old.hold(b);
+            }
             *hand = Some(old);
             false
         }
@@ -7431,5 +7496,26 @@ mod late_roster_tests {
             })
             .collect();
         assert_eq!(kinds, vec![(EventType::HandAbort, 7), (EventType::StateHash, 7)]);
+    }
+
+    /// Ties deal on, with this client's own seat counted on its side.
+    #[test]
+    fn the_boundary_waits_only_for_a_strict_majority_elsewhere() {
+        assert!(wait_at_boundary(7, 0));
+        assert!(wait_at_boundary(3, 1));
+        assert!(!wait_at_boundary(2, 1), "two against two: a tie deals on");
+        assert!(!wait_at_boundary(2, 2));
+        assert!(!wait_at_boundary(0, 0));
+        assert!(!wait_at_boundary(1, 0), "one seat's word is one seat's word");
+    }
+
+    /// A seat that signed a hand, or was muted on it, never signs it again.
+    #[test]
+    fn a_re_open_speaks_only_for_a_seat_that_never_signed_the_hand() {
+        use crate::table::hand::Voice;
+        assert_eq!(reopen_voice(true, Voice::Speak), Voice::Muted);
+        assert_eq!(reopen_voice(false, Voice::Muted), Voice::Muted);
+        assert_eq!(reopen_voice(false, Voice::Quiet), Voice::Speak);
+        assert_eq!(reopen_voice(false, Voice::Speak), Voice::Speak, "a non-member that never signed");
     }
 }
