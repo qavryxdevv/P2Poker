@@ -48,3 +48,6 @@ desktop.ini
 # ignored by git because they are hundreds of megabytes, and kept on disk
 # because a register row is only as good as the log it names.
 /runs/
+
+# Windows OpenSSH once left this here on every run; see tools/table-run-split.ps1
+/NUL

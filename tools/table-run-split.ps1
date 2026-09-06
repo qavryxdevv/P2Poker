@@ -316,9 +316,18 @@ if (-not $probe.TcpTestSucceeded) {
 }
 $bind = $probe.SourceAddress.IPAddress
 
-# `UserKnownHostsFile=NUL` because otherwise `ssh` tries to write the file and
-# fails with *the system cannot find the path specified*, which also reads as a
-# routing failure. The far end is on a private network and is pinned by the key.
+# `UserKnownHostsFile` is pointed at the null device because otherwise `ssh`
+# tries to write the file and fails with *the system cannot find the path
+# specified*, which also reads as a routing failure. The far end is on a private
+# network and is pinned by the key.
+#
+# **The value is `/dev/null` and not `NUL`, which is what it said until
+# 2026-09-06.** Windows OpenSSH does not map the bare `NUL` device name here: it
+# opens it as an ordinary relative path and leaves a 94-byte file called `NUL`
+# in the working directory — which is the repository root — after every run.
+# Git then refuses `git add -A` outright with *short read while indexing NUL*,
+# and the file cannot be deleted without the `\?\` prefix. `/dev/null` is
+# understood by Windows OpenSSH and leaves nothing behind.
 #
 # **`-o BindAddress=` and not `-b`, because this list is handed to `scp` too.**
 # `ssh` takes `-b`; `scp` does not — its `-b` is `sftp`'s batch-file option and
@@ -329,8 +338,8 @@ $bind = $probe.SourceAddress.IPAddress
 $ssh = @('-i', $privKey,
          '-o', "BindAddress=$bind",
          '-o', 'StrictHostKeyChecking=accept-new',
-         '-o', 'UserKnownHostsFile=NUL',
-         # `UserKnownHostsFile=NUL` means the host key is re-added on every call,
+         '-o', 'UserKnownHostsFile=/dev/null',
+         # A null known-hosts file means the host key is re-added on every call,
          # so `ssh` prints *Permanently added ... to the list of known hosts* to
          # stderr every time. Under `$ErrorActionPreference = 'Stop'` PowerShell
          # turns a native command's stderr into a terminating NativeCommandError,
