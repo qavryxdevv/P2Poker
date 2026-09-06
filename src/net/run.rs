@@ -852,6 +852,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // a live peer that was not reachable at 22.8 s be reached at 82.8 s. A peer
     // already connected costs nothing to re-dial:
     // `PeerCondition::DisconnectedAndNotDialing` makes it a no-op.
+    let mut dialled_lobby: std::collections::HashMap<libp2p::PeerId, std::time::Instant> =
+        std::collections::HashMap::new();
+
     // When this loop started, which is what `FAST_REDIAL_WINDOW` is measured
     // from. The node's own clock and not the wall: a run's opening minute is a
     // fact about this process, not about the time of day.
@@ -885,8 +888,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut fast_lane: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
     let mut fast_budget: u32 = FAST_REDIAL_BUDGET;
-    let mut dialled_lobby: std::collections::HashMap<libp2p::PeerId, std::time::Instant> =
-        std::collections::HashMap::new();
 
     // How many discovery cycles in a row this client has been comfortably under
     // its connection budget. Three, and the budget comes down a step.
@@ -2295,7 +2296,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // **A second look, for this site's own dial and for a
                         // failure that is the far end's.** `Denied` never
                         // reaches here while the budget is below its ceiling —
-                        // and 601 of 601 logs on disk reach that ceiling, at a
+                        // and 637 of the 644 logs on disk reach that ceiling, at a
                         // median of 24.4 s, so it very much reaches here after
                         // that. It is this client's own limiter refusing a
                         // connection that was already established, which makes
@@ -2618,6 +2619,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // on every one of the four hundred answers a
                                     // run receives.
                                     dialled_lobby.insert(peer, std::time::Instant::now());
+                                    // **And the entitlement is spent with the
+                                    // stamp, for the reason the stamp is made
+                                    // here.** It used to be spent only when
+                                    // `Swarm::dial` returned `Ok`, and the
+                                    // three refusals it returns *by value* --
+                                    // `NoAddresses`, `Denied`,
+                                    // `DialPeerConditionFalse` -- restamped the
+                                    // cooldown without spending it. A provider
+                                    // whose addresses the bogon filter empties
+                                    // would then hold its ten-second lane for
+                                    // the rest of the run, long past
+                                    // `FAST_REDIAL_WINDOW`, because the window
+                                    // gates only where a lane is *granted*.
+                                    fast_lane.remove(&peer);
                                     // **Bounded, but never at the cost of the
                                     // one peer that matters.** This used to
                                     // `clear()`, which on a lobby larger than
@@ -2667,14 +2682,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // branch above — so a provider of some other
                                     // key neither spends the budget nor earns
                                     // from it.
+                                    // Only a dial the crawl itself decided to
+                                    // make, and only one the swarm accepted:
+                                    // this loop walks the providers of whichever
+                                    // key the query named, and `charge` is
+                                    // `Some` only inside the lobby branch above.
+                                    // The entitlement was spent up there with
+                                    // the stamp; what is recorded here is the
+                                    // dial that will actually produce an event.
                                     if charge.is_some() {
-                                        // **The entitlement is spent here, not
-                                        // on the next failure.** One failed dial
-                                        // buys one fast look; earning another
-                                        // costs the budget again, so a peer that
-                                        // fails for ever cannot hold the fast
-                                        // lane for ever.
-                                        fast_lane.remove(&peer);
                                         lobby_dials.insert(id, peer);
                                     }
                                     // Belt and braces. Every dial ends in an
@@ -6488,21 +6504,33 @@ fn publish_hand(
 
 /// Whether a dial failure is the **far end's** rather than this client's.
 ///
-/// The list is closed and short on purpose. `Transport` is the far end not
-/// answering on any address offered; `WrongPeerId` is an address that belongs
-/// to somebody else, which is a stale record and mends itself when a fresher
-/// one arrives; `Aborted` is the connection dropped in flight. Everything else
-/// is ours or is not a failure of the peer at all — `Denied` is this client's
-/// own connection limiter refusing a connection that was **already
-/// established**, so the peer is provably alive; `LocalPeerId` is dialling
-/// ourselves; `NoAddresses` and `DialPeerConditionFalse` are refused by
-/// `Swarm::dial` by value and never produce an event.
+/// The list is closed and short on purpose, and it is **two** members rather
+/// than the three it was written with. `Transport` is the far end not answering
+/// on any address offered; `WrongPeerId` is an address that belongs to somebody
+/// else, which is a stale record and mends itself when a fresher one arrives.
+///
+/// Everything else is ours or is not a failure of the peer at all. `Denied` is
+/// this client's own connection limiter refusing a connection that was
+/// **already established**, so the peer is provably alive — counting it was the
+/// worst defect of this row's first design. `LocalPeerId` is dialling
+/// ourselves. `NoAddresses` and `DialPeerConditionFalse` are refused by
+/// `Swarm::dial` **by value** and never produce an event at all.
+///
+/// **`Aborted` was in this list and is not, and it was wrong twice over.** It
+/// is produced in exactly one place — `libp2p-swarm-0.47.1`
+/// `connection/pool/task.rs:100-106`, when the `oneshot` held in
+/// `PendingConnection.abort_notifier` is cancelled — and the only taker of that
+/// notifier is `Pool::abort()`, reached only from `Pool::disconnect`, reached
+/// only from `Swarm::disconnect_peer_id` and `ToSwarm::CloseConnection`.
+/// Neither appears anywhere in this tree, and the one crate in the registry
+/// that emits `CloseConnection` is `libp2p-allow-block-list`, which this client
+/// does not use. So the arm was unreachable — and had it ever been reached it
+/// would have meant **this client cancelled its own dial**, which is `Denied`'s
+/// class and the opposite of the sentence that admitted it.
 fn the_peers_own_dial_failure(error: &libp2p::swarm::DialError) -> bool {
     matches!(
         error,
-        libp2p::swarm::DialError::Transport(_)
-            | libp2p::swarm::DialError::WrongPeerId { .. }
-            | libp2p::swarm::DialError::Aborted
+        libp2p::swarm::DialError::Transport(_) | libp2p::swarm::DialError::WrongPeerId { .. }
     )
 }
 
@@ -8014,13 +8042,37 @@ mod the_fast_lane {
     /// the one that made it net harmful was `Denied` — this client's own
     /// connection limiter refusing a connection that was **already
     /// established**, so the peer is provably alive. The arm above it swallows
-    /// `Denied` only while the connection budget is below its ceiling, and 601
-    /// of 601 logs on disk reach that ceiling at a median of 24.4 s, so for
+    /// `Denied` only while the connection budget is below its ceiling, and 637
+    /// of the 644 logs on disk reach that ceiling at a median of 24.4 s, so for
     /// most of every run it fell straight through to the counter.
     #[test]
     fn only_the_far_end_s_own_failures_buy_a_second_look() {
-        assert!(the_peers_own_dial_failure(&DialError::Aborted));
         assert!(the_peers_own_dial_failure(&DialError::Transport(Vec::new())));
+        assert!(the_peers_own_dial_failure(&DialError::WrongPeerId {
+            obtained: libp2p::PeerId::random(),
+            address: "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
+        }));
+
+        // **`Denied`, which is what the paragraph above is about and what
+        // nothing pinned.** It is not a hypothetical at this arm: the arm that
+        // swallows it does so only while the connection budget is below
+        // `CONNECTION_CEILING` = 320, and 637 of the 644 logs on disk reach that
+        // ceiling, at a median of 24.4 s, 634 of them inside the 120 s the lane
+        // is open. So for most of the window this predicate is the only thing
+        // between this client's own limiter refusing an **already established**
+        // connection and that peer being charged a failure for it.
+        assert!(!the_peers_own_dial_failure(&DialError::Denied {
+            cause: libp2p::swarm::ConnectionDenied::new(std::io::Error::other("our own limiter")),
+        }));
+
+        // **`Aborted` is this client cancelling its own dial, and it cannot
+        // happen here at all.** Its only producer is the cancellation of
+        // `PendingConnection.abort_notifier`, whose only taker is
+        // `Pool::disconnect`, whose only callers are `Swarm::disconnect_peer_id`
+        // and `ToSwarm::CloseConnection` — neither of which this tree contains.
+        // It was admitted to the list as *"the connection dropped in flight"*,
+        // which is the opposite of what it means.
+        assert!(!the_peers_own_dial_failure(&DialError::Aborted));
 
         assert!(
             !the_peers_own_dial_failure(&DialError::LocalPeerId {
