@@ -117,6 +117,22 @@ param(
     # table has already dealt it. The frames that arrive in between are exactly
     # what the next-hand buffer exists to keep. -1 = off.
     [ValidateRange(-1, 8)][int]$DelayCertsHere = -1,
+    # `-Think <ms>` makes EVERY seat wait that long before it acts, which is
+    # `--autoplay <ms>` rather than the bare `--autoplay` this harness has
+    # always passed. It is not a fault knob: it is the table's speed.
+    #
+    # It exists because `S1-BW`'s bystander state is bounded by two windows that
+    # do not overlap at full speed. Getting a seat certified out needs about
+    # 39 s of silence; the adrift latch tolerates `ADRIFT_MARGIN` = 2 hands,
+    # which at the 14.4-second hands of `split130616-9` is 29 s. Slowing every
+    # seat's action stretches the second window and leaves the first where it
+    # is: at 3 000 ms and nine seats a hand is minutes rather than seconds, so a
+    # forty-second mute costs a fraction of one hand instead of five.
+    #
+    # A run with this set measures a SLOW table and its formation and hand
+    # counts are not comparable with the rest of the corpus. Say so when
+    # reporting one.
+    [ValidateRange(0, 60000)][int]$Think = 0,
     # fault-harness, in the C (patch 0016): local seat -DeafSeat ignores every
     # lossless and lossy group packet from -DeafAt s (of its first group
     # packet) for -DeafFor s (0 = off). It keeps SENDING, so its peers do not
@@ -243,6 +259,7 @@ Write-Host "mdns   $(if ($NoMdns) { 'off - every seat finds every other through 
 Write-Host "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
 Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on $(if ($DelayCertsHere -ge 0) { "local seat $DelayCertsHere" } else { "far seat $DelayCertsSeat" })$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
 Write-Host "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
+Write-Host "think  $(if ($Think -gt 0) { "every seat waits ${Think} ms before it acts - a SLOW table, not comparable with the rest of the corpus" } else { 'no delay: seats act at once' })"
 Write-Host "mute   $(if ($MuteFor -gt 0) { "local seat $MuteSeat sends no hand message from $MuteAt s for $MuteFor s and hears everything (fault-harness)$(if ($MuteFor -le 30) { ' - WARNING: under the 30 s decision deadline, so the table will not vote it out' })" } else { 'nobody is muted' })"
 Write-Host "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
 Write-Host "work   $work"
@@ -401,7 +418,7 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         if ($DelayCerts -gt 0 -and $DelayCertsHere -lt 0 -and $DelayCertsUntil -gt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_UNTIL_S = '$DelayCertsUntil' }
         `$start = Get-Date
         `$inv = [System.Globalization.CultureInfo]::InvariantCulture
-        & "$FarDir\p2p-poker.exe" --headless $(if ($NoMdns) { '--no-mdns' }) --autoplay --for $Seconds --profile `$p --join $table 2>&1 |
+        & "$FarDir\p2p-poker.exe" --headless $(if ($NoMdns) { '--no-mdns' }) --autoplay $(if ($Think -gt 0) { "$Think" }) --for $Seconds --profile `$p --join $table 2>&1 |
             ForEach-Object { (Get-Date).ToUniversalTime().ToString('HH:mm:ss.fff', `$inv) + ' ' + ((((Get-Date) - `$start).TotalSeconds).ToString('F1', `$inv)).PadLeft(7) + '  ' + `$_ } |
             Out-File -FilePath `$log -Encoding utf8
     }
@@ -462,7 +479,9 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         }
         Copy-Item $seed (Join-Path $profileDir 'identity.key') -Force
         $log = Join-Path $work "n$i.log"
-        $nodeArgs = @('--headless', '--autoplay', '--for', "$Seconds", '--profile', $profileDir)
+        $nodeArgs = @('--headless') `
+            + $(if ($Think -gt 0) { @('--autoplay', "$Think") } else { @('--autoplay') }) `
+            + @('--for', "$Seconds", '--profile', $profileDir)
         if ($NoMdns) { $nodeArgs += '--no-mdns' }
         if ($i -eq 0) { $nodeArgs += @('--host', $table, '--seats', "$seats") }
         else { $nodeArgs += @('--join', $table) }
