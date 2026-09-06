@@ -1214,6 +1214,30 @@ pub struct Hand {
     /// the peers all say their clocks ran out and nothing ever happens — so the
     /// count is reported rather than inferred.
     tally: Option<(SeatIdx, usize, usize, Hash)>,
+    /// What the carrier was holding **at the moment this client cast its own
+    /// vote**: subject seat, the seat's `mid-delivery` bit, and whether the
+    /// stage was already past twice its budget.
+    ///
+    /// **`S1-BB`'s discriminator, and it exists because the other sample is
+    /// conditioned.** `vote_state` prints the same bit only for a client that
+    /// has **not** voted — and one reason not to have voted is the lever that
+    /// bit itself sets, so of 79 certifications with a reading nearby, 79 read
+    /// `mid-delivery true` and the sample cannot say otherwise. Sampled here the
+    /// condition is gone: every vote this client casts leaves a reading,
+    /// whatever the bit says.
+    ///
+    /// **And the two values it can take are the two hypotheses.** The lever
+    /// skips a seat whose bit is set, so a vote is cast either with the bit
+    /// **clear** — the carrier had nothing of that seat's and the silence was
+    /// real, which is the divergence reading — or with it **set and
+    /// `long_past` true**, the bound releasing an accusation the carrier still
+    /// contradicts, which is the tail-of-burst reading. Nothing else can appear
+    /// here, and a third value would mean the lever is not doing what
+    /// `vote_on_timeouts` says it does.
+    ///
+    /// A `Vec`, because one call votes about every seat the stage waits on.
+    /// Drained by the node rather than read, like `tally` beside it.
+    own_vote_carrier: Vec<(SeatIdx, bool, bool)>,
     /// `event_hash` of every `TIMEOUT_CERT` this client has verified, its own
     /// included. An abort that names a subject carries the hash of the
     /// certificate that justifies the naming (§4.10), and this is what lets a
@@ -1575,6 +1599,7 @@ impl Hand {
                 last_heard_at: vec![None; usize::from(o.max_players)],
             checkpoint8: None,
                 tally: None,
+                own_vote_carrier: Vec::new(),
                 certs: BTreeMap::new(),
                 banked: BTreeSet::new(),
                 proof: None,
@@ -5605,6 +5630,15 @@ impl Hand {
                 now_ms,
             )?;
             self.voted.insert(digest);
+            // **`S1-BB`: the carrier, sampled where the accusation is made.**
+            // Read from the same `mid_delivery` word the lever above consulted,
+            // so the two cannot drift; recorded after `say_at` has succeeded,
+            // because a vote that failed to seal is not an accusation.
+            self.own_vote_carrier.push((
+                seat,
+                mid_delivery & (1u32 << u32::from(seat.min(31))) != 0,
+                self.long_past_stage(now_ms),
+            ));
             // **`S1-BT`: the LAST vote, not the first.** This loop walks every
             // seat the stage waits on and the mid-delivery lever is applied per
             // seat, so a stage waiting on two seats with different bits votes
@@ -6666,6 +6700,12 @@ impl Hand {
 
     pub fn take_tally(&mut self) -> Option<(SeatIdx, usize, usize, Hash)> {
         self.tally.take()
+    }
+
+    /// `S1-BB`'s reading: what the carrier held about each seat this client has
+    /// just voted about. Taken rather than read; see the field.
+    pub fn take_vote_carrier(&mut self) -> Vec<(SeatIdx, bool, bool)> {
+        std::mem::take(&mut self.own_vote_carrier)
     }
 
     /// What a certificate last did, taken rather than read: the node reports
@@ -9156,6 +9196,60 @@ mod tests {
         );
         assert!(!a.may_abandon(NOW + 89_999), "the round still has air");
         assert!(a.may_abandon(NOW + 90_000), "and the ceiling ends it");
+    }
+
+    /// `S1-BB`'s discriminator, and this test is the whole of what makes it one.
+    ///
+    /// The row's open question is whether a certified-out seat had really gone
+    /// silent or whether its last message was lost in flight, and the reading it
+    /// has — `vote_state`'s `mid-delivery` bit — is sampled only where a vote is
+    /// **held back**, which is the one place the lever guarantees the bit is
+    /// set. 79 of 79 read `true` and the sample could not have said otherwise.
+    ///
+    /// Sampled at the vote instead, only two readings are reachable, and they
+    /// are the two hypotheses: **bit clear**, so the carrier had nothing of that
+    /// seat's and the silence was real; or **bit set with `long past` true**, the
+    /// bound releasing an accusation the carrier still contradicts. A third —
+    /// set with `long past` false — would mean the lever let a vote through it
+    /// was supposed to hold, and this asserts it cannot appear.
+    #[test]
+    fn the_carrier_is_sampled_where_the_accusation_is_made() {
+        // The carrier holding the subject's traffic. The lever withholds the
+        // vote for one budget and releases it at two.
+        let (mut a, _b, _c, keys) = three_at_the_deck_stage();
+        let held = 1u32 << 2;
+        assert!(
+            a.vote_on_timeouts(&keys[0], NOW + 30_000, held).unwrap().is_empty(),
+            "the lever holds the vote at one budget"
+        );
+        assert!(
+            a.take_vote_carrier().is_empty(),
+            "a vote that was never cast is not an accusation and must leave no reading"
+        );
+        let cast = a.vote_on_timeouts(&keys[0], NOW + 60_000, held).unwrap();
+        assert!(!cast.is_empty(), "the lever releases at twice the budget");
+        assert_eq!(
+            a.take_vote_carrier(),
+            vec![(2, true, true)],
+            "released by the bound, with the carrier still holding: the tail-of-burst reading"
+        );
+        assert!(
+            a.take_vote_carrier().is_empty(),
+            "taken rather than read, so the node reports it once"
+        );
+
+        // And the other reading, on a fresh client: nothing of the subject's in
+        // the carrier, so the vote goes at one budget and the silence is real.
+        let (mut d, _e, _f, keys) = three_at_the_deck_stage();
+        assert!(
+            !d.vote_on_timeouts(&keys[0], NOW + 30_000, 0).unwrap().is_empty(),
+            "with the bit clear there is nothing to hold the vote"
+        );
+        assert_eq!(
+            d.take_vote_carrier(),
+            vec![(2, false, false)],
+            "cast at one budget with an empty carrier: the divergence reading"
+        );
     }
 
     /// Two seats silent at one stage with different mid-delivery bits, which

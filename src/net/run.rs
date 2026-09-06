@@ -1178,6 +1178,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             )))
                                             .await;
                                     }
+                                    // **`S1-BB`: the carrier at the moment of
+                                    // the accusation, not at the moment of
+                                    // holding back.** One line per vote this
+                                    // client casts, whatever the bit says, so
+                                    // the sample is not conditioned on the
+                                    // lever the bit itself sets.
+                                    for (subject, mid, long_past) in $h.take_vote_carrier() {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "voted about seat {subject}: mid-delivery {mid}, \
+                                                 long past {long_past}"
+                                            )))
+                                            .await;
+                                    }
                                     // A seat the table acted for, once.
                                     if let Some((seat, what)) = $h.take_certified_action() {
                                         let _ = events
@@ -4266,6 +4280,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 seen.join(", ")
                             )))
                             .await;
+                        // The same reading as at the macro's site, because a
+                        // vote cast on this tick must not go unsampled just
+                        // because the tick reports differently (`S1-BB`).
+                        for (subject, mid, long_past) in h.take_vote_carrier() {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "voted about seat {subject}: mid-delivery {mid}, \
+                                     long past {long_past}"
+                                )))
+                                .await;
+                        }
                         if let Some(n) = h.take_cert_note() {
                             let _ = events.send(NodeEvent::Warning(n)).await;
                         }
