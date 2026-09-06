@@ -6473,6 +6473,14 @@ fn link_is_down() -> bool {
 /// two answer different questions.
 #[cfg(feature = "fault-harness")]
 fn mouth_is_shut() -> bool {
+    // **The clock is anchored here whichever form is in use.** In the on-turn
+    // form this branch never reads `mute_start`, so without this line the
+    // `OnceLock` behind it was first initialised inside `arm_the_mute` — at the
+    // first action of the run — and `MUTE_AT` was then counted from **that**
+    // rather than from the loop. Measured in `split184533-9`, which armed
+    // hundreds of seconds late and certified nobody. It is the same trap
+    // `S1-CC` records, in the code written to remove it.
+    let _ = mute_start();
     match mute_window() {
         Some((at, dur)) => {
             if on_turn() {
