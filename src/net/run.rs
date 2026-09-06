@@ -4059,6 +4059,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // Kept until the freeze lifts: a repair is not lost to it.
                         pending_repair = Some(o);
                     } else if adrift.is_none() {
+                        // **And when this client has latched itself out the
+                        // repair is dropped, deliberately but until now
+                        // silently.** The arm above keeps a repair through a
+                        // freeze and says so; this one takes it and lets it go,
+                        // which is right today because a latched client deals
+                        // no further hand and the latch is a terminus by
+                        // design. It is written down because it stops being
+                        // harmless the moment the latch becomes reachable from
+                        // inside a running hand — which is what `S1-BW` and
+                        // `S1-CD` are both asking for, and it would arm the
+                        // gate that discards the repair (`S1-CE`).
                         let reopened = reopen_hand(
                             o,
                             &mut hand,
