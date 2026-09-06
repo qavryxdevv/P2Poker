@@ -171,6 +171,67 @@ const FROZEN_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 /// counts keep the retry without paying for it out of discovery.
 const REDIALS_PER_ANSWER: usize = 8;
 
+/// What a provider waits after a dial **the far end failed**, rather than the
+/// whole discovery cycle.
+///
+/// `REDIAL_AFTER` is right for a record that may simply be dead and wrong for
+/// the first minute of a run, where a live peer's dial fails for two reasons
+/// that both mend themselves in seconds: the DHT still serves a previous run's
+/// circuit addresses while the founder's own announcement walk is still going,
+/// and a circuit hop collides with a relay dial this client already has in
+/// flight. Ten seconds is longer than either takes to clear and short enough to
+/// fit six times into the minute the joiner would otherwise spend holding a
+/// provider it could not act on.
+///
+/// Measured, `split122959-9`: every seat had the founder in a lobby answer
+/// inside thirteen seconds, four of them took forty-five to sixty more to
+/// connect to it, and the founder was offered again **20, 24, 27 and 31 times**
+/// in that gap with the cooldown refusing every one.
+const FAST_REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many fast second looks this process grants in its whole life.
+///
+/// **The bound is on the process and not on the provider, and that is the
+/// entire safety argument.** A per-provider bound is inflatable: provider
+/// records are unauthenticated and peer ids are free, so a peer that fills the
+/// lobby with fakes earns a fresh allowance for each one and pins this client
+/// at its redial ceiling for ever. A per-process bound cannot be inflated in
+/// that direction at all — a flooder can **consume** it, and consuming it
+/// removes a benefit rather than creating traffic, so the worst case is exactly
+/// the behaviour this client has today.
+///
+/// **A ceiling and not a rate, and the difference is the whole point.** Simply
+/// shortening the cooldown for everyone is not an option: `REDIALS_PER_ANSWER`
+/// is 8 and a 420-second run draws **707 answers**, so a lane every stale
+/// record could hold would issue up to 5 656 re-dials where the committed loop
+/// issues about 300. The budget is what keeps the worst case additive.
+///
+/// A hundred and twenty-eight against roughly 600 dials in a run is a fifth
+/// more in the worst case, and the worst case is the only case it can produce.
+///
+/// **And it is the number the corpus asks for, which is the half of this that
+/// was guessed first.** Replaying every nine- and ten-seat log on disk: the
+/// founder's position in the order its providers are first offered is **median
+/// 15, p90 99, max 192**, and it is beyond 128 in **24 of 521** joiner logs. So
+/// a budget spent oldest-first reaches the founder in 95% of them, and in the
+/// other 5% the lane is simply shut and the client behaves as it does today.
+/// The lobbies themselves are much larger than that — median 74 providers
+/// offered inside the opening two minutes, p90 288, max 454 — which is why the
+/// budget is spent on rank rather than on size.
+const FAST_REDIAL_BUDGET: u32 = 128;
+
+/// How long after this process started the fast lane is open at all.
+///
+/// **The fault is the opening minute of a run and the budget should be spent
+/// there.** `split122959-9` found the founder in a lobby answer at 1.9, 2.7,
+/// 11.9 and 12.7 seconds on the four seats that then waited a full cycle for
+/// it — so the founder's failed dial is among the earliest this client makes,
+/// and a budget spent oldest-first reaches it. After this the lane is shut and
+/// the crawl is exactly what it is today: a stale record that has been dead for
+/// five minutes has earned no favours, and the client has by then either found
+/// its table or has a different problem.
+const FAST_REDIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The namespace relay hosts advertise themselves under, as a DHT key.
 ///
 /// Derived, not copied: go-libp2p's routing discovery turns a namespace string
@@ -791,6 +852,39 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // a live peer that was not reachable at 22.8 s be reached at 82.8 s. A peer
     // already connected costs nothing to re-dial:
     // `PeerCondition::DisconnectedAndNotDialing` makes it a no-op.
+    // When this loop started, which is what `FAST_REDIAL_WINDOW` is measured
+    // from. The node's own clock and not the wall: a run's opening minute is a
+    // fact about this process, not about the time of day.
+    let started = std::time::Instant::now();
+    // **Both fault clocks are anchored here rather than at their first use.**
+    // Each holds a `OnceLock` initialised on the first call, and
+    // `mouth_is_shut` is only ever called from the two hand-send sites — so its
+    // window would otherwise begin at the first hand, a minute and a half into
+    // a run, and `-MuteAt 180` would mean a different moment in every run.
+    // `link_is_down` is called from arms that fire immediately and so anchors
+    // itself correctly today; it is armed here too, because a knob whose clock
+    // depends on which arm happens to fire first is a knob that measures
+    // something else the day an arm moves.
+    let _ = link_is_down();
+    let _ = mouth_is_shut();
+    // **This site's own dials, by the `ConnectionId` its `DialOpts` carries.**
+    // Five other subsystems dial these same peers by id — the join
+    // request-response, `dcutr`, `autonat`'s dial-backs, both `kad`
+    // behaviours and the mDNS arm — and `dcutr` alone spends three dials per
+    // `AttemptsExceeded`, which one log on disk reaches 33 times. Without this
+    // the crawl's budget would be emptied by failures the crawl never caused.
+    // Entries are transient: every dial ends in an established connection or
+    // an error, and all three arms remove theirs.
+    let mut lobby_dials: std::collections::HashMap<
+        libp2p::swarm::ConnectionId,
+        libp2p::PeerId,
+    > = std::collections::HashMap::new();
+    // Providers entitled to one fast second look. Bounded by construction:
+    // an entry is spent the moment the provider is re-dialled, and
+    // `FAST_REDIAL_BUDGET` caps how many are ever granted.
+    let mut fast_lane: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
+    let mut fast_budget: u32 = FAST_REDIAL_BUDGET;
     let mut dialled_lobby: std::collections::HashMap<libp2p::PeerId, std::time::Instant> =
         std::collections::HashMap::new();
 
@@ -1479,7 +1573,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let _ = events.send(NodeEvent::Listening(address)).await;
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                        lobby_dials.remove(&connection_id);
                         state_peers += 1;
                         // A connection that has just been made is evidence the
                         // peer is there, and it is the only evidence available
@@ -2179,8 +2274,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // is not a cap at all.
                     SwarmEvent::OutgoingConnectionError {
                         error: libp2p::swarm::DialError::Denied { .. },
+                        connection_id,
                         ..
                     } if budget < CONNECTION_CEILING => {
+                        lobby_dials.remove(&connection_id);
                         {
                             let raised = (budget + budget / 4).min(CONNECTION_CEILING);
                             budget = raised;
@@ -2194,7 +2291,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                         }
                     }
-                    SwarmEvent::OutgoingConnectionError { error, .. } => {
+                    SwarmEvent::OutgoingConnectionError { error, connection_id, .. } => {
+                        // **A second look, for this site's own dial and for a
+                        // failure that is the far end's.** `Denied` never
+                        // reaches here while the budget is below its ceiling —
+                        // and 601 of 601 logs on disk reach that ceiling, at a
+                        // median of 24.4 s, so it very much reaches here after
+                        // that. It is this client's own limiter refusing a
+                        // connection that was already established, which makes
+                        // the peer provably alive and the failure ours.
+                        if let Some(peer) = lobby_dials.remove(&connection_id) {
+                            if earns_a_fast_look(
+                                the_peers_own_dial_failure(&error),
+                                fast_budget,
+                                started.elapsed() < FAST_REDIAL_WINDOW,
+                            ) {
+                                fast_budget = fast_budget.saturating_sub(1);
+                                fast_lane.insert(peer);
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "a second look at {peer} in {}s after a failed dial ({fast_budget} left)",
+                                        FAST_REDIAL_AFTER.as_secs()
+                                    )))
+                                    .await;
+                            }
+                        }
                         let _ = events
                             .send(NodeEvent::DialFailed { reason: error.to_string() })
                             .await;
@@ -2463,8 +2584,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     // Recently tried, so not again yet. Not
                                     // *ever* again: see `REDIAL_AFTER`.
+                                    // **The cooldown a provider is on, which
+                                    // is the whole of `S1-CB`.** A provider
+                                    // whose own dial the far end failed waits
+                                    // ten seconds rather than the full cycle,
+                                    // once, and only while the process's budget
+                                    // lasts.
+                                    let waits = if fast_lane.contains(&peer) {
+                                        FAST_REDIAL_AFTER
+                                    } else {
+                                        REDIAL_AFTER
+                                    };
                                     let first = match dialled_lobby.get(&peer) {
-                                        Some(at) if at.elapsed() < REDIAL_AFTER => continue,
+                                        Some(at) if at.elapsed() < waits => continue,
                                         Some(_) => false,
                                         None => true,
                                     };
@@ -2526,7 +2658,35 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // happened, and left no trace anywhere: the
                                 // asynchronous failure log is capped at twelve
                                 // and was spent by 12.6 s.
+                                let id = opts.connection_id();
                                 if swarm.dial(opts).is_ok() {
+                                    // **Only a dial the crawl itself decided to
+                                    // make.** This loop walks the providers of
+                                    // whichever key the query named, and
+                                    // `charge` is `Some` only inside the lobby
+                                    // branch above — so a provider of some other
+                                    // key neither spends the budget nor earns
+                                    // from it.
+                                    if charge.is_some() {
+                                        // **The entitlement is spent here, not
+                                        // on the next failure.** One failed dial
+                                        // buys one fast look; earning another
+                                        // costs the budget again, so a peer that
+                                        // fails for ever cannot hold the fast
+                                        // lane for ever.
+                                        fast_lane.remove(&peer);
+                                        lobby_dials.insert(id, peer);
+                                    }
+                                    // Belt and braces. Every dial ends in an
+                                    // established connection or an error and
+                                    // all three arms remove their entry, so
+                                    // this cannot grow — but a map that grows
+                                    // only because of a bug nobody noticed is
+                                    // the shape this row has already been
+                                    // caught by once.
+                                    if lobby_dials.len() > 1024 {
+                                        lobby_dials.clear();
+                                    }
                                     match charge {
                                         Some(true) => fresh += 1,
                                         Some(false) => again += 1,
@@ -5985,10 +6145,26 @@ async fn begin_hand_with(
             // `HAND_INIT`s first: they are what stage 0 is waiting for, and the
             // hand's own queue evicts the oldest when it is full.
             let buffered = std::mem::take(next_inits);
+            let carried = std::mem::take(next_early);
+            // **Said out loud, because `S1-BW` cannot otherwise be measured.**
+            // The buffer's whole effect is on a client that opens a hand later
+            // than the table dealt it, and the old code dropped those frames
+            // silently — so a run in which the fix worked and a run in which
+            // nothing arrived early looked identical in the log. Only when
+            // something was actually carried, so a healthy table says nothing.
+            if !buffered.is_empty() || !carried.is_empty() {
+                let _ = events
+                    .send(NodeEvent::Warning(format!(
+                        "hand #{}: {} init(s) and {} early frame(s) had arrived before it opened here",
+                        h.hand_id(),
+                        buffered.len(),
+                        carried.len()
+                    )))
+                    .await;
+            }
             for b in buffered {
                 let _ = h.hold(b);
             }
-            let carried = std::mem::take(next_early);
             for (_seat, b) in carried {
                 let _ = h.hold(b);
             }
@@ -6308,6 +6484,35 @@ fn publish_hand(
         }
         said.push(out);
     }
+}
+
+/// Whether a dial failure is the **far end's** rather than this client's.
+///
+/// The list is closed and short on purpose. `Transport` is the far end not
+/// answering on any address offered; `WrongPeerId` is an address that belongs
+/// to somebody else, which is a stale record and mends itself when a fresher
+/// one arrives; `Aborted` is the connection dropped in flight. Everything else
+/// is ours or is not a failure of the peer at all — `Denied` is this client's
+/// own connection limiter refusing a connection that was **already
+/// established**, so the peer is provably alive; `LocalPeerId` is dialling
+/// ourselves; `NoAddresses` and `DialPeerConditionFalse` are refused by
+/// `Swarm::dial` by value and never produce an event.
+fn the_peers_own_dial_failure(error: &libp2p::swarm::DialError) -> bool {
+    matches!(
+        error,
+        libp2p::swarm::DialError::Transport(_)
+            | libp2p::swarm::DialError::WrongPeerId { .. }
+            | libp2p::swarm::DialError::Aborted
+    )
+}
+
+/// Whether this failure buys the provider a quicker second look.
+///
+/// Separate and pure because the budget is the whole safety argument of
+/// `S1-CB`'s third design, and a bound that cannot be tested is a bound
+/// nobody checks.
+fn earns_a_fast_look(peers_own_fault: bool, budget: u32, opening: bool) -> bool {
+    peers_own_fault && budget > 0 && opening
 }
 
 /// Eight hex characters of a hash, which is what a person can compare.
@@ -7796,6 +8001,69 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod the_fast_lane {
+    use super::{earns_a_fast_look, the_peers_own_dial_failure, FAST_REDIAL_BUDGET};
+    use libp2p::swarm::DialError;
+
+    /// **Which failures are the peer's, and it is the closed list that matters.**
+    ///
+    /// The first shape of `S1-CB` counted every `OutgoingConnectionError`, and
+    /// the one that made it net harmful was `Denied` — this client's own
+    /// connection limiter refusing a connection that was **already
+    /// established**, so the peer is provably alive. The arm above it swallows
+    /// `Denied` only while the connection budget is below its ceiling, and 601
+    /// of 601 logs on disk reach that ceiling at a median of 24.4 s, so for
+    /// most of every run it fell straight through to the counter.
+    #[test]
+    fn only_the_far_end_s_own_failures_buy_a_second_look() {
+        assert!(the_peers_own_dial_failure(&DialError::Aborted));
+        assert!(the_peers_own_dial_failure(&DialError::Transport(Vec::new())));
+
+        assert!(
+            !the_peers_own_dial_failure(&DialError::LocalPeerId {
+                address: "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
+            }),
+            "dialling ourselves is not the peer's fault"
+        );
+        assert!(
+            !the_peers_own_dial_failure(&DialError::NoAddresses),
+            "no address is this client's own view, not a failure of the peer"
+        );
+        assert!(
+            !the_peers_own_dial_failure(&DialError::DialPeerConditionFalse(
+                libp2p::swarm::dial_opts::PeerCondition::Disconnected
+            )),
+            "a condition this client set is this client's"
+        );
+    }
+
+    /// **The budget is on the process, and that is the whole safety argument.**
+    ///
+    /// A per-provider allowance is inflatable — provider records are
+    /// unauthenticated and peer ids are free — so a flooder earns a fresh one
+    /// per fake and pins this client at its redial ceiling for ever. Consuming
+    /// a per-process budget only removes a benefit: at zero the lane is exactly
+    /// today's behaviour, which is what this test pins.
+    #[test]
+    fn the_budget_is_the_process_s_and_running_out_is_todays_behaviour() {
+        assert!(earns_a_fast_look(true, FAST_REDIAL_BUDGET, true));
+        assert!(earns_a_fast_look(true, 1, true), "the last one is still granted");
+        assert!(
+            !earns_a_fast_look(true, 0, true),
+            "and at zero a flooder has bought nothing but the absence of a favour"
+        );
+        assert!(
+            !earns_a_fast_look(false, FAST_REDIAL_BUDGET, true),
+            "a failure that is ours never reaches the budget at all"
+        );
+        assert!(
+            !earns_a_fast_look(true, FAST_REDIAL_BUDGET, false),
+            "and the lane is shut once the opening window has passed, whatever              is left in the budget"
+        );
+    }
 }
 
 #[cfg(test)]

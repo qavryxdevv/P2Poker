@@ -105,6 +105,18 @@ param(
     [ValidateRange(0, 3600)][int]$MuteAt = 0,
     [ValidateRange(0, 3600)][int]$MuteFor = 0,
     [ValidateRange(0, 8)][int]$MuteSeat = 0,
+    # `-DelayCertsHere <n>` puts -DelayCerts on a LOCAL seat instead of a far
+    # one. The two knobs are the same instrument; only the node it is set on
+    # differs, and the far-only wiring was an accident of where the shape was
+    # first needed.
+    #
+    # It exists so **one** seat can carry the mute and the cert delay together,
+    # which is `S1-BW`'s shape and cannot be had any other way: the mute gets
+    # the seat certified out without letting it fall behind, and the delay makes
+    # it learn that late, so it re-derives and re-opens hand k+1 **after** the
+    # table has already dealt it. The frames that arrive in between are exactly
+    # what the next-hand buffer exists to keep. -1 = off.
+    [ValidateRange(-1, 8)][int]$DelayCertsHere = -1,
     # fault-harness, in the C (patch 0016): local seat -DeafSeat ignores every
     # lossless and lossy group packet from -DeafAt s (of its first group
     # packet) for -DeafFor s (0 = off). It keeps SENDING, so its peers do not
@@ -229,7 +241,7 @@ Write-Host "seats  $seats  ($Here here, $There on $Target)"
 Write-Host "for    $Seconds s"
 Write-Host "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
 Write-Host "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
-Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on far seat $DelayCertsSeat$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
+Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on $(if ($DelayCertsHere -ge 0) { "local seat $DelayCertsHere" } else { "far seat $DelayCertsSeat" })$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
 Write-Host "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
 Write-Host "mute   $(if ($MuteFor -gt 0) { "local seat $MuteSeat sends no hand message from $MuteAt s for $MuteFor s and hears everything (fault-harness)$(if ($MuteFor -le 30) { ' - WARNING: under the 30 s decision deadline, so the table will not vote it out' })" } else { 'nobody is muted' })"
 Write-Host "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
@@ -385,8 +397,8 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     `$jobs += Start-Job -ArgumentList `$p, `$log, `$i -ScriptBlock {
         param(`$p, `$log, `$seat)
         if ($Stall -gt 0 -and `$seat -eq $StallSeat) { `$env:P2P_POKER_STALL_JOIN = '$Stall' }
-        if ($DelayCerts -gt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_MS = '$DelayCerts' }
-        if ($DelayCerts -gt 0 -and $DelayCertsUntil -gt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_UNTIL_S = '$DelayCertsUntil' }
+        if ($DelayCerts -gt 0 -and $DelayCertsHere -lt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_MS = '$DelayCerts' }
+        if ($DelayCerts -gt 0 -and $DelayCertsHere -lt 0 -and $DelayCertsUntil -gt 0 -and `$seat -eq $DelayCertsSeat) { `$env:P2P_POKER_DELAY_CERTS_UNTIL_S = '$DelayCertsUntil' }
         `$start = Get-Date
         `$inv = [System.Globalization.CultureInfo]::InvariantCulture
         & "$FarDir\p2p-poker.exe" --headless $(if ($NoMdns) { '--no-mdns' }) --autoplay --for $Seconds --profile `$p --join $table 2>&1 |
@@ -459,6 +471,10 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         if ($LinkDownFor -gt 0 -and $i -eq $LinkDownSeat) {
             $knobs['P2P_POKER_LINK_DOWN_AT'] = "$LinkDownAt"
             $knobs['P2P_POKER_LINK_DOWN_FOR'] = "$LinkDownFor"
+        }
+        if ($DelayCerts -gt 0 -and $DelayCertsHere -ge 0 -and $i -eq $DelayCertsHere) {
+            $knobs['P2P_POKER_DELAY_CERTS_MS'] = "$DelayCerts"
+            if ($DelayCertsUntil -gt 0) { $knobs['P2P_POKER_DELAY_CERTS_UNTIL_S'] = "$DelayCertsUntil" }
         }
         if ($MuteFor -gt 0 -and $i -eq $MuteSeat) {
             $knobs['P2P_POKER_MUTE_AT'] = "$MuteAt"
