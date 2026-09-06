@@ -8361,6 +8361,78 @@ mod the_pre_open_buffer {
         );
     }
 
+    /// **A payload-maximal frame of every type this buffer carries must fit its
+    /// own ceiling**, or the gate refuses a legal frame — and `Hand::hold`
+    /// answers `Malformed`, which the node turns into a gossip `Reject`, so the
+    /// client stops forwarding it too. A `const` assertion cannot check this:
+    /// the envelope's size is a property of the encoder rather than of the
+    /// constants, which is why `ENVELOPE_MAX` is the specification's 384 and
+    /// not the 214 the fields count to.
+    ///
+    /// The sequence and `hand_id` are large on purpose: CBOR encodes small
+    /// integers in one byte and large ones in nine, and a test that seals at
+    /// sequence 0 measures the cheapest envelope there is.
+    #[test]
+    fn a_payload_maximal_frame_of_every_carried_type_fits_its_own_ceiling() {
+        use crate::table::hand::{
+            ACTION_CAP, BOARD_REVEAL_CAP, DECK_COMMIT_CAP, DECK_INIT_CAP, DEAL_PRIVATE_CAP,
+            HAND_INIT_CAP, SHOWDOWN_MUCK_CAP, SHOWDOWN_REVEAL_CAP, SHUFFLE_PROOF_CAP,
+            SHUFFLE_STEP_CAP,
+        };
+        use crate::net::chained::{seal, Slot};
+        #[derive(minicbor::Encode)]
+        #[cbor(array)]
+        struct Fat(#[cbor(n(0), with = "minicbor::bytes")] Vec<u8>);
+
+        // The payload cap counts the payload's own encoding, so a byte string
+        // of `cap` bytes is slightly over it; `cap - 8` leaves room for the
+        // CBOR header and still measures the worst case within a few bytes.
+        for (kind, cap) in [
+            (EventType::HandInit, HAND_INIT_CAP),
+            (EventType::DeckInit, DECK_INIT_CAP),
+            (EventType::ShuffleStep, SHUFFLE_STEP_CAP),
+            (EventType::ShuffleProof, SHUFFLE_PROOF_CAP),
+            (EventType::DeckCommit, DECK_COMMIT_CAP),
+            (EventType::DealPrivate, DEAL_PRIVATE_CAP),
+            (EventType::BoardReveal, BOARD_REVEAL_CAP),
+            (EventType::ShowdownReveal, SHOWDOWN_REVEAL_CAP),
+            (EventType::ShowdownMuck, SHOWDOWN_MUCK_CAP),
+            (EventType::ActionBet, ACTION_CAP),
+            // The four `hold` also gates but the pre-open buffer refuses by
+            // kind. `hold` applies the ceiling to everything, and a certificate
+            // rejected as `Malformed` would be rejected for the gossip mesh
+            // too — which is a roster fault, not a buffering one.
+            (EventType::TimeoutVote, crate::table::hand::TIMEOUT_VOTE_CAP),
+            (EventType::TimeoutCert, crate::table::hand::TIMEOUT_CERT_CAP),
+            (EventType::HandComplete, crate::table::hand::HAND_COMPLETE_CAP),
+            (EventType::StateHash, 512),
+        ] {
+            let wire = seal(
+                kind,
+                &Slot {
+                    table_id: [6u8; 32],
+                    hand_id: u64::MAX / 3,
+                    sequence: u64::MAX / 5,
+                    previous_event_hash: [9u8; 32],
+                },
+                &Fat(vec![7u8; cap - 8]),
+                &ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]),
+                u64::MAX / 7,
+                u32::MAX,
+                crate::table::hand::FRAME_CAP,
+            )
+            .expect("a sealed maximal frame");
+            let ceiling = frame_ceiling(kind);
+            assert!(
+                wire.len() <= ceiling,
+                "{kind:?}: a payload-maximal frame is {} bytes against a ceiling of \
+                 {ceiling} — the gate would refuse a legal frame, and `hold` answers \
+                 Malformed, which also stops it being forwarded",
+                wire.len()
+            );
+        }
+    }
+
     /// The same bytes twice are one entry. The five-second re-send puts every
     /// recent stage on the wire again at ticks 2, 4, 8, 16, 32, so without this
     /// a buffer of eighty is a buffer of a handful of distinct frames.
