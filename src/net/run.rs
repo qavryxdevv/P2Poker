@@ -2086,6 +2086,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     None if frozen.is_some() => {
                                         Some(gossipsub::MessageAcceptance::Ignore)
                                     }
+                                    // §4.10's hand boundary window, for the same
+                                    // reason the checkpoint is taken above: it
+                                    // belongs to the hand that has just ended
+                                    // and the live one would answer it with
+                                    // `WrongType` (`S1-BZ`).
+                                    //
+                                    // **Below the freeze, and a dispute is
+                                    // above it.** A boundary event is a chained
+                                    // event of a hand, so §6.3 step 1 covers it
+                                    // like any other; a dispute is what may
+                                    // *cause* the freeze and cannot be behind
+                                    // it. A frozen table deals no further hand,
+                                    // so there is nothing for a readmission to
+                                    // be readmitted to.
+                                    None if boundary_event(
+                                        &message.data,
+                                        h,
+                                        &mut boundaries,
+                                        &mut readmitted,
+                                        &events,
+                                    )
+                                    .await =>
+                                    {
+                                        Some(gossipsub::MessageAcceptance::Accept)
+                                    }
                                     None => hand_event!(h, &message.data),
                                     Some(out) => {
                                         if !out.is_empty() {
@@ -3730,6 +3755,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // own — and the hand's own is not applied while §6.3
                         // step 1's freeze is latched.
                         None => {
+                            // The same three-way dispatch as the gossipsub
+                            // branch above, and in the same order: a dispute is
+                            // unchained, out of stage and may itself cause the
+                            // freeze, so it is above it; §4.10's window is a
+                            // chained event of a hand and is below it, beside
+                            // the hand's own.
                             if !dispute_event(
                                 &item.bytes,
                                 h,
@@ -3740,6 +3771,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             )
                             .await
                                 && frozen.is_none()
+                                && !boundary_event(
+                                    &item.bytes,
+                                    h,
+                                    &mut boundaries,
+                                    &mut readmitted,
+                                    &events,
+                                )
+                                .await
                             {
                                 let _ = hand_event!(h, &item.bytes);
                             }
@@ -7389,6 +7428,229 @@ fn write_divergence_report(
     Ok(path)
 }
 
+/// Where a boundary event sat, against where §4.10 says it must.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowPosition {
+    Right,
+    /// The `sequence` is not `BOUNDARY_SEQUENCE_BASE + sender_seat`.
+    NotTheSeatsSlot,
+    /// The parent is not `TERMINAL(k)`.
+    NotTheTerminal,
+}
+
+/// The two envelope rules §4.10 puts **in place of** §4.0 step 10a's chain
+/// cursor, which `open_in_hand` relaxes for this type.
+///
+/// Pure, and lifted out of [`boundary_event`] so that it can be falsified
+/// without a swarm: the whole of what makes the window safe is that these two
+/// comparisons are exact.
+///
+/// **The seat is the input and the sequence is the thing compared.** Reading the
+/// seat out of the sequence instead would let a sender nominate its own slot,
+/// and a seat with two slots is a seat that can sign two boundary events for one
+/// hand — the defect class §5.2 closed for `DISPUTE` and §4.8 for `TIMEOUT_VOTE`.
+fn window_position(
+    seat: crate::poker::state::SeatIdx,
+    sequence: u64,
+    parent: &crate::poker::state::Hash,
+    terminal: &crate::poker::state::Hash,
+) -> WindowPosition {
+    if crate::table::seatwire::window_sequence(seat) != Some(sequence) {
+        return WindowPosition::NotTheSeatsSlot;
+    }
+    if parent != terminal {
+        return WindowPosition::NotTheTerminal;
+    }
+    WindowPosition::Right
+}
+
+/// One event of `PROTOCOL.md` §4.10's **hand boundary window**, taken here
+/// rather than by the hand — `S1-BZ`.
+///
+/// Returns whether this frame was one: `false` means it is not a boundary type
+/// at all and the caller carries on down its dispatch, `true` means it has been
+/// disposed of, accepted or refused. That is `dispute_event`'s shape and not
+/// `checkpoint_event`'s, because nothing here ever produces a reply — the window
+/// is a fan of single-writer stages with no `stage_hash`, so there is no stage
+/// for this client to complete and nothing to publish in answer.
+///
+/// **Why not `Hand::on_event`.** The window belongs to chain `k`, the hand that
+/// has just ended, and closes at the acceptance of a complete `HAND_INIT(k+1)`.
+/// For most of its life the live `Hand` is `k+1` and would refuse every one of
+/// these for naming a hand it has left — which is exactly what it did: three
+/// declared chained types answered with `Failed::Wire(WrongType)`, and the node
+/// then handing them to the formation handler, which has no use for them either.
+///
+/// **The envelope rules are all here, and they are stricter than the cursor they
+/// replace.** `open_in_hand` relaxes §4.0 step 10a's two positional comparisons
+/// — this is the second of the document's exactly two exemptions from it — and
+/// §4.10 replaces them with an exact identity and an exact parent:
+/// `sequence == BOUNDARY_SEQUENCE_BASE + sender_seat`, and
+/// `previous_event_hash == TERMINAL(k)` for every event of the window whichever
+/// seat emits. The seat in that identity is read from the **sender's key** and
+/// the sequence is then compared against it, never the other way round: reading
+/// the seat out of the sequence would let a sender nominate the slot it
+/// occupies, and one seat with two slots is the defect class §5.2 closed for
+/// `DISPUTE` and §4.8 for `TIMEOUT_VOTE`.
+async fn boundary_event(
+    bytes: &[u8],
+    h: &crate::table::hand::Hand,
+    boundaries: &mut crate::table::boundary::Boundaries,
+    readmitted: &mut Vec<u8>,
+    events: &Events,
+) -> bool {
+    use crate::protocol::messages::EventType;
+    use crate::table::boundary::WindowTook;
+    use crate::table::seatwire;
+
+    let Ok((kind, hand_id, sequence)) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK) else {
+        return false;
+    };
+    if !kind.is_boundary() {
+        // **And the band is refused to everybody else here.** §4.10: a receiver
+        // *"rejects any other chained type at a `sequence >= BOUNDARY_SEQUENCE_BASE`"*.
+        // §4.9's checkpoint band sits above this one and is not the window's to
+        // refuse, so only the window's own ten slots are claimed.
+        //
+        // Refused by consuming it, which is what `true` means to the caller: a
+        // `DECK_COMMIT` at seat 3's boundary slot must not go on to the hand,
+        // where the slot comparison would reject it for a different reason and
+        // report it as an ordinary stale frame.
+        return seatwire::in_the_window(sequence);
+    }
+    // A window this peer does not hold: it has not opened, or T47 closed it.
+    // §4.10 disposes of both the same way and the seat re-emits at the next
+    // boundary. Consumed rather than passed on: the hand would answer a
+    // boundary type with `WrongType`, which is the whole of `S1-BZ`.
+    if !boundaries.holds(hand_id) {
+        return true;
+    }
+    let Ok(opened) = crate::net::chained::open_in_hand(
+        bytes,
+        TABLE_FRAME_PEEK,
+        kind,
+        &h.table_id(),
+        hand_id,
+    ) else {
+        return true;
+    };
+    // The payload, under its own cap and never `FRAME_CAP`. Decoded before
+    // anything is recorded so that a malformed body is refused rather than
+    // filed: §4.10 gives two of the three a `reason` and `PLAYER_SIT_IN` an
+    // empty one, and a type whose body does not decode is not that type.
+    let reason = match kind {
+        EventType::PlayerSitOut => {
+            match crate::net::chained::payload::<seatwire::SitOut>(
+                &opened,
+                seatwire::BOUNDARY_EVENT_CAP,
+            ) {
+                Ok(b) => Some(b.reason),
+                Err(_) => return true,
+            }
+        }
+        EventType::PlayerLeave => {
+            match crate::net::chained::payload::<seatwire::Leave>(
+                &opened,
+                seatwire::BOUNDARY_EVENT_CAP,
+            ) {
+                Ok(b) => Some(b.reason),
+                Err(_) => return true,
+            }
+        }
+        // No fields beyond the envelope, so there is nothing to decode and
+        // nothing to check: the payload is whatever the emitter put there and
+        // no rule in §4.10 reads it.
+        _ => None,
+    };
+    let Some(seat) = h.seat_of_key(&opened.sender) else {
+        return true;
+    };
+    let Some(terminal) = boundaries.get(hand_id).map(|b| b.terminal()) else {
+        return true;
+    };
+    match window_position(seat, sequence, &opened.envelope.previous_event_hash, &terminal) {
+        WindowPosition::Right => {}
+        WindowPosition::NotTheSeatsSlot => {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "seat {seat} sent a {} for hand {hand_id} at sequence {sequence}, and its \
+                     only slot in the boundary window is {:?}: refused",
+                    kind.name(),
+                    seatwire::window_sequence(seat)
+                )))
+                .await;
+            return true;
+        }
+        WindowPosition::NotTheTerminal => {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "seat {seat} sent a {} for hand {hand_id} chained from something other than \
+                     TERMINAL({hand_id}): refused",
+                    kind.name()
+                )))
+                .await;
+            return true;
+        }
+    }
+    match boundaries.on_boundary_event(hand_id, seat, kind) {
+        WindowTook::Took(EventType::PlayerSitIn) => {
+            // §4.9's readmission set `A`, and the second thing that writes it —
+            // the first is a checkpoint-8 `STATE_HASH` from outside `P(k)` whose
+            // value agrees. Held by the node loop rather than by any hand,
+            // because it is read and cleared at exactly one place: the next hand
+            // init.
+            //
+            // **`A` is `accepted` and never `required`** (`P2`, §4.9). The seat
+            // may sign stage 0 of the next hand; it does not thereby re-enter
+            // the roster, because `next_hand` filters `self.open.required` in
+            // both branches and `R(k+1) ⊆ R(k)` (`D-024`). The door back into
+            // the roster is `S1-BM`'s return certificate and it is not built.
+            if !readmitted.contains(&seat) {
+                readmitted.push(seat);
+                readmitted.sort_unstable();
+            }
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "seat {seat} asked to sit in at the boundary of hand {hand_id}; it may sign \
+                     the next hand's opening"
+                )))
+                .await;
+        }
+        WindowTook::Took(k) => {
+            // Recorded and read by nobody yet, which is stated in the log rather
+            // than implied by silence. A `PLAYER_LEAVE` removes no seat from
+            // `roster_hash` and counts into no `P` (§3.1, §3.2); its chips leave
+            // through `HAND_INIT`'s `n(11) ledger_delta`, inside a collective
+            // body, and that is `S1-BM`'s.
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "seat {seat} sent a {} at the boundary of hand {hand_id}{}: recorded, and no \
+                     seat leaves the roster of a table that has one",
+                    k.name(),
+                    match reason {
+                        Some(r) => format!(" (reason {r})"),
+                        None => String::new(),
+                    }
+                )))
+                .await;
+        }
+        WindowTook::AlreadySpoke => {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "seat {seat} has already spoken in the boundary window of hand {hand_id}; a \
+                     second boundary event of any type is a stage violation and is refused"
+                )))
+                .await;
+        }
+        // Not worth a line each: a sit-in from a seat already in `P(k)` is what
+        // a client that does not track its own participation sends, and a
+        // sender that is not a seat of this table is refused everywhere else
+        // too.
+        WindowTook::DecidesNothing | WindowTook::NotASeat | WindowTook::Closed => {}
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn checkpoint_event(
     bytes: &[u8],
@@ -8769,5 +9031,99 @@ mod late_roster_tests {
         assert_eq!(reopen_voice(false, Voice::Muted), Voice::Muted);
         assert_eq!(reopen_voice(false, Voice::Quiet), Voice::Speak);
         assert_eq!(reopen_voice(false, Voice::Speak), Voice::Speak, "a non-member that never signed");
+    }
+}
+
+/// §4.10's hand boundary window at the wire — the rules `boundary_event`
+/// applies before anything reaches the store (`S1-BZ`).
+#[cfg(test)]
+mod the_boundary_window_at_the_wire {
+    use super::*;
+    use crate::protocol::constants::{BOUNDARY_SEQUENCE_BASE, MAX_SEATS};
+    use crate::table::seatwire;
+
+    const TERMINAL: crate::poker::state::Hash = [7u8; 32];
+    const OTHER: crate::poker::state::Hash = [8u8; 32];
+
+    #[test]
+    fn every_seat_is_admitted_at_its_own_slot_and_at_no_other() {
+        for seat in 0..MAX_SEATS {
+            let mine = BOUNDARY_SEQUENCE_BASE + u64::from(seat);
+            assert_eq!(
+                window_position(seat, mine, &TERMINAL, &TERMINAL),
+                WindowPosition::Right
+            );
+            for other in 0..MAX_SEATS {
+                if other == seat {
+                    continue;
+                }
+                assert_eq!(
+                    window_position(seat, BOUNDARY_SEQUENCE_BASE + u64::from(other), &TERMINAL, &TERMINAL),
+                    WindowPosition::NotTheSeatsSlot,
+                    "seat {seat} was admitted at seat {other}'s slot"
+                );
+            }
+        }
+    }
+
+    /// The fan's one parent. A window event whose parent is anything but
+    /// `TERMINAL(k)` is refused even at the right slot — otherwise a peer could
+    /// chain a boundary event from a stage it invented and the window would
+    /// stop being a function of an agreed value.
+    #[test]
+    fn the_parent_is_the_terminal_and_nothing_else() {
+        assert_eq!(
+            window_position(3, BOUNDARY_SEQUENCE_BASE + 3, &OTHER, &TERMINAL),
+            WindowPosition::NotTheTerminal
+        );
+        assert_eq!(
+            window_position(3, BOUNDARY_SEQUENCE_BASE + 3, &[0u8; 32], &TERMINAL),
+            WindowPosition::NotTheTerminal,
+            "the zero hash is not a wildcard"
+        );
+    }
+
+    /// The slot is checked **before** the parent, and a wrong slot is reported
+    /// as a wrong slot: the two refusals have different meanings to whoever
+    /// reads the log, and a seat at somebody else's slot with a correct parent
+    /// is the more alarming of the two.
+    #[test]
+    fn a_wrong_slot_is_not_reported_as_a_wrong_parent() {
+        assert_eq!(
+            window_position(3, BOUNDARY_SEQUENCE_BASE + 4, &OTHER, &TERMINAL),
+            WindowPosition::NotTheSeatsSlot
+        );
+    }
+
+    /// §4.10: a receiver *"rejects any other chained type at a
+    /// `sequence >= BOUNDARY_SEQUENCE_BASE`"*. The band's ten slots belong to
+    /// the three types and to nothing else — and `boundary_event` consumes such
+    /// a frame rather than passing it to the hand, which is what
+    /// `in_the_window` decides for it.
+    #[test]
+    fn the_band_belongs_to_the_three_types_alone() {
+        for seat in 0..MAX_SEATS {
+            assert!(seatwire::in_the_window(BOUNDARY_SEQUENCE_BASE + u64::from(seat)));
+        }
+        // An ordinary stage index is not in the band, so an ordinary event
+        // still reaches the hand — the one thing this must not break.
+        for sequence in [0u64, 1, 12, 2_047] {
+            assert!(!seatwire::in_the_window(sequence));
+        }
+    }
+
+    /// A seat index the table does not have has no slot at all, so a sender
+    /// claiming one cannot be admitted by arithmetic that happens to line up.
+    #[test]
+    fn a_seat_off_the_table_has_no_slot() {
+        assert_eq!(
+            window_position(
+                MAX_SEATS,
+                BOUNDARY_SEQUENCE_BASE + u64::from(MAX_SEATS),
+                &TERMINAL,
+                &TERMINAL
+            ),
+            WindowPosition::NotTheSeatsSlot
+        );
     }
 }

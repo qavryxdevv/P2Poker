@@ -460,13 +460,16 @@ pub const ENVELOPE_MAX: usize = 384;
 /// the catalogue later must be classified here rather than admitted at
 /// `FRAME_CAP` by an arm nobody revisited.
 ///
-/// **Five types fall back to `FRAME_CAP` and it is stated rather than hidden:**
-/// `RngCommit`, `RngReveal`, `Dispute`, `StateAck` and the three `PLAYER_*`
-/// boundary types publish no payload cap anywhere in this tree — the last three
-/// because `S1-BZ` records that the state machine answers them with
-/// `WrongType` and the boundary window that would own them is not built. They
-/// are charged what they are charged today, which is no worse, and the day one
-/// of them gets a cap this function is where it lands.
+/// **Four types fall back to `FRAME_CAP` and it is stated rather than hidden:**
+/// `RngCommit`, `RngReveal`, `Dispute` and `StateAck` publish no payload cap
+/// anywhere in this tree. They are charged what they are charged today, which is
+/// no worse, and the day one of them gets a cap this function is where it lands.
+///
+/// **The three `PLAYER_*` boundary types were the fifth and are not any more.**
+/// They stood here because `S1-BZ` recorded that the state machine answered them
+/// with `WrongType` and the window that would own them was not built. It is
+/// built, so they are charged [`seatwire::BOUNDARY_EVENT_CAP`] — the largest of
+/// the three bodies is a one-element array holding a `u16`.
 pub fn frame_ceiling(kind: EventType) -> usize {
     let payload = match kind {
         EventType::HandInit => HAND_INIT_CAP,
@@ -488,14 +491,15 @@ pub fn frame_ceiling(kind: EventType) -> usize {
         EventType::HandComplete => HAND_COMPLETE_CAP,
         EventType::HandAbort => HAND_ABORT_CAP,
         EventType::StateHash => STATE_HASH_CAP,
-        // The five with no published cap, and the reason is in the doc above.
+        // §4.10's hand boundary window, whose bodies are one `u16` or nothing.
+        EventType::PlayerSitOut | EventType::PlayerSitIn | EventType::PlayerLeave => {
+            crate::table::seatwire::BOUNDARY_EVENT_CAP
+        }
+        // The four with no published cap, and the reason is in the doc above.
         EventType::RngCommit
         | EventType::RngReveal
         | EventType::Dispute
-        | EventType::StateAck
-        | EventType::PlayerSitOut
-        | EventType::PlayerSitIn
-        | EventType::PlayerLeave => return FRAME_CAP,
+        | EventType::StateAck => return FRAME_CAP,
         // Not chained, so they never reach a hold queue; and an unknown type
         // is refused by `check_envelope` long before this.
         EventType::Hello
