@@ -308,6 +308,26 @@ Write-Host "think  $(if ($Think -gt 0) { "every seat waits ${Think} ms before it
 Write-Host "mute   $(if ($MuteFor -gt 0) { "local seat $MuteSeat sends no hand message for $MuteFor s $(if ($MuteOnTurn) { "from its first action at or after $MuteAt s" } else { "from $MuteAt s" }) and hears everything (fault-harness)$(if ($MuteFor -le 30) { ' - WARNING: under the 30 s decision deadline, so the table will not vote it out' })" } else { 'nobody is muted' })"
 Write-Host "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
 Write-Host "work   $work"
+# **`S1-AY`: the far box has four logical processors and the split can starve
+# it.** Measured, and the numbers are the row's: with five seats there the far
+# half opened 11 to 14 hands where the local half opened 31 and 32, and moving
+# to eight here and two there took the same two far seats to 33 and 34 -- level
+# with the best local ones -- while peer timeouts went 3 to 0 and settlement
+# disagreements 553 to 64. That is CPU starvation reading as a protocol
+# regression, and a large part of what this register attributed to the protocol
+# across four runs was this.
+#
+# **Said and not enforced, deliberately.** The lossy two-machine rig is the
+# only place packet loss is reproducible here and it must not be "fixed"; which
+# split to run is the experiment's design and the owner's (`S1-AY`, and this
+# script's parameter defaults are still 5 and 5). What an instrument may do is
+# refuse to be silent about a condition it has already measured, so a run that
+# will not be comparable says so in its own header rather than in the reading
+# of it a week later.
+if ($There -gt 2) {
+    Write-Host "rig    WARNING: $There seats on a 4-core far box. S1-AY measured this as CPU starvation" -ForegroundColor Yellow
+    Write-Host "       that reads as a protocol regression; 2 there is level with the local seats." -ForegroundColor Yellow
+}
 Write-Host ''
 
 # Windows OpenSSH refuses a key on removable media and reports it as
