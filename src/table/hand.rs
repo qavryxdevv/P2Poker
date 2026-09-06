@@ -430,6 +430,93 @@ pub const HAND_INIT_CAP: usize = 512;
 /// that a peer cannot make this client hold much by sending nonsense.
 pub const FRAME_CAP: usize = 16_384;
 
+/// What a signed envelope costs around a payload of nothing.
+///
+/// `PROTOCOL.md` §9.2 accounts for it as *"frame − 128 B"* for the body and
+/// *"body − 256 B"* for the payload, so 384 is the specification's own
+/// allowance. Counting the wire gives **214**: `EventBody` is a twelve-element
+/// array of 1 + 1 + 34 + 9 + 9 + 34 + 3 + 3 + 34 + 9 + 5 + 1 + 1 = 144 B, and
+/// `SignedEvent` adds 1 + 3 + 2 + 64 = 70. The specification's number is used
+/// rather than the counted one, with its 170 bytes of slack, because a gate
+/// that refuses a **legal** frame is indistinguishable in the log from the loss
+/// this whole row exists to end — and `src/net/relay.rs` already budgets 220
+/// for the same quantity, so 214 is not comfortably above every encoder.
+pub const ENVELOPE_MAX: usize = 384;
+
+/// The largest a frame of this type may legitimately be, payload cap plus
+/// envelope — **the ceiling a buffer should charge it, rather than
+/// `FRAME_CAP`.**
+///
+/// **Why this exists.** Nothing between the wire and `Hand::early` or
+/// `next_early` bounds a frame by its own type: `open_in_hand` is given
+/// `FRAME_CAP`, `check_envelope` reads the version, the chain scope, the event
+/// class and the unchained sentinels and never the payload's length, and the
+/// per-type caps below are applied at **replay**, by `chained::payload`. So a
+/// `DECK_COMMIT` — cap 160 — could occupy 16 384 bytes of a hold queue for a
+/// whole boundary and be discarded minutes later. Thirty-two such slots are
+/// half a megabyte, and a client holds four such queues plus a retained hand.
+///
+/// **The match is exhaustive with no wildcard, deliberately.** A type added to
+/// the catalogue later must be classified here rather than admitted at
+/// `FRAME_CAP` by an arm nobody revisited.
+///
+/// **Five types fall back to `FRAME_CAP` and it is stated rather than hidden:**
+/// `RngCommit`, `RngReveal`, `Dispute`, `StateAck` and the three `PLAYER_*`
+/// boundary types publish no payload cap anywhere in this tree — the last three
+/// because `S1-BZ` records that the state machine answers them with
+/// `WrongType` and the boundary window that would own them is not built. They
+/// are charged what they are charged today, which is no worse, and the day one
+/// of them gets a cap this function is where it lands.
+pub fn frame_ceiling(kind: EventType) -> usize {
+    let payload = match kind {
+        EventType::HandInit => HAND_INIT_CAP,
+        EventType::DeckInit => DECK_INIT_CAP,
+        EventType::ShuffleStep => SHUFFLE_STEP_CAP,
+        EventType::ShuffleProof => SHUFFLE_PROOF_CAP,
+        EventType::DeckCommit => DECK_COMMIT_CAP,
+        EventType::DealPrivate => DEAL_PRIVATE_CAP,
+        EventType::BoardReveal => BOARD_REVEAL_CAP,
+        EventType::ShowdownReveal => SHOWDOWN_REVEAL_CAP,
+        EventType::ShowdownMuck => SHOWDOWN_MUCK_CAP,
+        EventType::ActionCheck
+        | EventType::ActionCall
+        | EventType::ActionBet
+        | EventType::ActionRaise
+        | EventType::ActionFold => ACTION_CAP,
+        EventType::TimeoutVote => TIMEOUT_VOTE_CAP,
+        EventType::TimeoutCert => TIMEOUT_CERT_CAP,
+        EventType::HandComplete => HAND_COMPLETE_CAP,
+        EventType::HandAbort => HAND_ABORT_CAP,
+        EventType::StateHash => STATE_HASH_CAP,
+        // The five with no published cap, and the reason is in the doc above.
+        EventType::RngCommit
+        | EventType::RngReveal
+        | EventType::Dispute
+        | EventType::StateAck
+        | EventType::PlayerSitOut
+        | EventType::PlayerSitIn
+        | EventType::PlayerLeave => return FRAME_CAP,
+        // Not chained, so they never reach a hold queue; and an unknown type
+        // is refused by `check_envelope` long before this.
+        EventType::Hello
+        | EventType::Capabilities
+        | EventType::LobbyTableAd
+        | EventType::LobbyTableRemove
+        | EventType::LobbyPlayerPresence
+        | EventType::LobbySnapshotRequest
+        | EventType::LobbySnapshotResponse
+        | EventType::LobbyChat
+        | EventType::JoinRequest
+        | EventType::JoinAccept
+        | EventType::JoinReject
+        | EventType::PlayerList
+        | EventType::TableReady => return FRAME_CAP,
+    };
+    // Never above what the frame decoder itself would accept: this may only
+    // ever refuse relative to today, never admit.
+    payload.saturating_add(ENVELOPE_MAX).min(FRAME_CAP)
+}
+
 /// The frame cap for a `STATE_HASH`.
 ///
 /// Three fields — a `u16` and two thirty-two-byte hashes — so this is generous
@@ -618,13 +705,56 @@ pub enum Holding {
     Malformed,
 }
 
+/// What one seat's whole run from the deal to the first bet costs, at its own
+/// caps.
+///
+/// The stage layout is `DECK_INIT`, then the shuffle chain as a pair of stages
+/// per dealt-in seat, then `DECK_COMMIT`, then `DEAL_PRIVATE` — so **five
+/// frames from each seat** stand between a hand opening and its first bet, and
+/// `PROTOCOL.md` §4.6's *"exactly `2(m−1)` entries in one body"* is what
+/// forbids a sixth.
+pub const PRE_BET_BYTES_PER_SEAT: usize = DECK_INIT_CAP
+    + SHUFFLE_STEP_CAP
+    + SHUFFLE_PROOF_CAP
+    + DECK_COMMIT_CAP
+    + DEAL_PRIVATE_CAP
+    + 5 * ENVELOPE_MAX;
+
+/// What the pre-open buffer guarantees **each seat**, in bytes.
+///
+/// One whole run to the first bet, plus one more frame of the largest type this
+/// buffer can carry. The spare is what buys the betting frames that arrive
+/// while a bystander is still opening, and it absorbs exactly one legally-sized
+/// but junk arrival before that seat starts costing itself its own
+/// `DEAL_PRIVATE`.
+pub const NEXT_EARLY_BYTES_PER_SEAT: usize =
+    PRE_BET_BYTES_PER_SEAT + SHUFFLE_PROOF_CAP + ENVELOPE_MAX;
+
+/// The whole pre-open buffer's budget: the per-seat share times `MAX_SEATS`.
+///
+/// **The part and the whole are one rule counted twice**, which is the point:
+/// no seat can ever be evicted on another seat's behalf, because the aggregate
+/// is exactly the sum of the shares.
+pub const NEXT_EARLY_BYTES: usize =
+    (crate::protocol::constants::MAX_SEATS as usize) * NEXT_EARLY_BYTES_PER_SEAT;
+
 /// How many events of a hand ahead of this one are held for the replay.
 ///
 /// Sixty-four was written inline and is kept: it is four full collective stages
 /// at nine seats, which is what a client one boundary behind has to swallow.
 /// What changed with `S1-CD` is **which** entry goes when it is full — the
 /// highest sequence, never the oldest arrival.
-const EARLY_CAP: usize = 64;
+pub const EARLY_CAP: usize = 96;
+
+/// And the bytes, because a slot without a ceiling is a `FRAME_CAP` slot.
+///
+/// Twice the pre-open buffer's budget: `begin_hand_with` pours both pre-open
+/// queues through `hold` into this one, and a retained previous hand keeps a
+/// second `early` alive until the running hand leaves stage 0 — which is
+/// precisely the boundary, so the client pays for two of these at once. The
+/// factor of two is the drain headroom `NEXT_EARLY_CAP`'s own comment intended,
+/// written in the unit that binds.
+pub const EARLY_BYTES: usize = 2 * NEXT_EARLY_BYTES;
 
 /// A settlement being collected while this client is in `Phase::Aborted`.
 ///
@@ -6730,7 +6860,15 @@ impl Hand {
         // already is for a byte-duplicate above: it means the event was
         // verified and answered — and it is what the relay decision reads — not
         // that a slot was spent on it.
-        if self.early.len() >= EARLY_CAP {
+        // **Refused at the door for being larger than its own type allows.**
+        // Nothing between the wire and this queue bounds a frame by its type:
+        // `open_in_hand` above was given `FRAME_CAP`, so without this a
+        // `DECK_COMMIT` whose cap is 160 bytes could sit here occupying 16 384.
+        if bytes.len() > frame_ceiling(kind) {
+            return Holding::Malformed;
+        }
+        let held_bytes: usize = self.early.iter().map(Vec::len).sum();
+        if self.early.len() >= EARLY_CAP || held_bytes + bytes.len() > EARLY_BYTES {
             let highest = self
                 .early
                 .iter()
@@ -6744,6 +6882,27 @@ impl Hand {
                     self.early.remove(i);
                 }
                 _ => return Holding::Kept,
+            }
+            // **A loop and not an `if`.** Giving up one 544-byte `DECK_COMMIT`
+            // does not make room for an 8 704-byte `SHUFFLE_PROOF`, and the
+            // bound that binds is now the byte one. It terminates: every pass
+            // removes an entry and `max_by_key` answers `None` on an empty
+            // queue.
+            while self.early.len() >= EARLY_CAP
+                || self.early.iter().map(Vec::len).sum::<usize>() + bytes.len() > EARLY_BYTES
+            {
+                let next = self
+                    .early
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, b)| chained::peek(b, PEEK_CAP).ok().map(|(_, _, q)| (i, q)))
+                    .max_by_key(|(_, q)| *q);
+                match next {
+                    Some((i, q)) if q > opened.envelope.sequence => {
+                        self.early.remove(i);
+                    }
+                    _ => return Holding::Kept,
+                }
             }
         }
         self.early.push_back(bytes);

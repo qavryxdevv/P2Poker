@@ -674,6 +674,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // Kept apart from the `HAND_INIT`s because those decide the genesis and
     // this must not reach that decision.
     let mut next_early: Vec<(u8, Vec<u8>)> = Vec::new();
+    // What the pre-open buffer **lost**, as `(refused, evicted)`.
+    //
+    // **The open line reported what survived and never what was thrown away**,
+    // which is why it took two runs to see one bug: a frame refused at a full
+    // buffer and a frame that never arrived produced the same log. Cleared at
+    // each boundary with the buffers themselves.
+    let mut next_early_lost: (u32, u32) = (0, 0);
     // A re-derived opening for the running hand, applied by the stall tick
     // outside the hand borrow.
     let mut pending_repair: Option<crate::table::hand::Opening> = None;
@@ -1383,7 +1390,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 }
                                                 Keep::Early => {
                                                     if let Some(s) = seat {
-                                                        keep_early(&mut next_early, s, $bytes);
+                                                        keep_early(
+                                                            &mut next_early,
+                                                            s,
+                                                            $bytes,
+                                                            &mut next_early_lost,
+                                                        );
                                                     }
                                                 }
                                                 _ => {}
@@ -4800,6 +4812,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             voice,
                             &mut next_inits,
                             &mut next_early,
+                            &mut next_early_lost,
                             &app_key,
                             &mut hand,
                             &mut said,
@@ -5847,6 +5860,8 @@ async fn begin_hand(
         crate::table::hand::Voice::Speak,
         &mut none,
         &mut none_either,
+        // This path opens hand one, where nothing can have arrived early.
+        &mut (0, 0),
         app_key,
         hand,
         said,
@@ -5869,7 +5884,8 @@ const NEXT_INITS_CAP: usize = 16;
 /// full table's cryptographic stage with a re-send and leaves a quarter of the
 /// queue for events that arrive after the hand opens. The measured case needed
 /// seven.
-const NEXT_EARLY_CAP: usize = 32;
+const NEXT_EARLY_CAP: usize =
+    (crate::protocol::constants::MAX_SEATS as usize) * NEXT_EARLY_PER_SEAT;
 
 /// And how many of them one seat may contribute.
 ///
@@ -5880,7 +5896,14 @@ const NEXT_EARLY_CAP: usize = 32;
 /// thirty-two slots and the bystander loses the stage it was waiting for —
 /// which is the fault this buffer exists to fix, re-created by the fix. Six is
 /// a seat's own events across the few stages the boundary window can span.
-const NEXT_EARLY_PER_SEAT: usize = 6;
+const NEXT_EARLY_PER_SEAT: usize = 8;
+
+/// The drain's invariant, which held by luck and is now pinned: everything both
+/// pre-open buffers can hold must fit the queue they are poured into.
+const _: () = assert!(
+    NEXT_INITS_CAP + NEXT_EARLY_CAP <= crate::table::hand::EARLY_CAP,
+    "the pre-open buffers can overflow Hand::early on the drain"
+);
 
 /// What an event of a hand this client has not opened yet is worth to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6139,6 +6162,7 @@ async fn begin_hand_with(
     voice: crate::table::hand::Voice,
     next_inits: &mut Vec<Vec<u8>>,
     next_early: &mut Vec<(u8, Vec<u8>)>,
+    lost: &mut (u32, u32),
     app_key: &ed25519_dalek::SigningKey,
     hand: &mut Option<crate::table::hand::Hand>,
     said: &mut Vec<Vec<u8>>,
@@ -6150,6 +6174,7 @@ async fn begin_hand_with(
     if hand.is_some() {
         next_inits.clear();
         next_early.clear();
+        *lost = (0, 0);
         return;
     }
     let now = super::node::now_unix_ms();
@@ -6175,16 +6200,19 @@ async fn begin_hand_with(
             // silently — so a run in which the fix worked and a run in which
             // nothing arrived early looked identical in the log. Only when
             // something was actually carried, so a healthy table says nothing.
-            if !buffered.is_empty() || !carried.is_empty() {
+            if !buffered.is_empty() || !carried.is_empty() || *lost != (0, 0) {
                 let _ = events
                     .send(NodeEvent::Warning(format!(
-                        "hand #{}: {} init(s) and {} early frame(s) had arrived before it opened here",
+                        "hand #{}: {} init(s) and {} early frame(s) had arrived before it opened here ({} refused, {} evicted)",
                         h.hand_id(),
                         buffered.len(),
-                        carried.len()
+                        carried.len(),
+                        lost.0,
+                        lost.1
                     )))
                     .await;
             }
+            *lost = (0, 0);
             for b in buffered {
                 let _ = h.hold(b);
             }
@@ -6536,10 +6564,20 @@ fn publish_hand(
 /// The per-seat allowance is enforced first and against that seat's own
 /// highest, so one loud seat cannot evict another's low sequences; the whole
 /// buffer's cap is enforced second, against the highest anywhere.
-fn keep_early(held: &mut Vec<(u8, Vec<u8>)>, seat: u8, bytes: &[u8]) {
-    let Ok((_, _, arriving)) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK) else {
+fn keep_early(held: &mut Vec<(u8, Vec<u8>)>, seat: u8, bytes: &[u8], lost: &mut (u32, u32)) {
+    let Ok((kind, _, arriving)) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK) else {
         return;
     };
+    // **Refused at the door for being larger than its own type allows, and
+    // this is what makes the budget below affordable.** Nothing between the
+    // wire and here bounds a frame by its type — `open_in_hand` is given
+    // `FRAME_CAP` and `check_envelope` never reads the payload's length — so
+    // every slot was a sixteen-kilobyte slot and a `DECK_COMMIT` whose cap is
+    // 160 bytes could hold one for a whole boundary.
+    if bytes.len() > crate::table::hand::frame_ceiling(kind) {
+        lost.0 = lost.0.saturating_add(1);
+        return;
+    }
     if held.iter().any(|(_, b)| b[..] == bytes[..]) {
         return;
     }
@@ -6555,18 +6593,41 @@ fn keep_early(held: &mut Vec<(u8, Vec<u8>)>, seat: u8, bytes: &[u8]) {
             })
             .max_by_key(|(_, q)| *q)
     };
-    if held.iter().filter(|(s, _)| *s == seat).count() >= NEXT_EARLY_PER_SEAT {
+    let mine = |held: &[(u8, Vec<u8>)]| -> (usize, usize) {
+        held.iter()
+            .filter(|(s, _)| *s == seat)
+            .fold((0, 0), |(n, b), (_, v)| (n + 1, b + v.len()))
+    };
+    // **Loops, not `if`s, because the bound that binds is now the byte one**
+    // and giving up one 544-byte `DECK_COMMIT` does not make room for an
+    // 8 704-byte `SHUFFLE_PROOF`. Each pass removes an entry, so both
+    // terminate.
+    loop {
+        let (n, b) = mine(held);
+        if n < NEXT_EARLY_PER_SEAT
+            && b + bytes.len() <= crate::table::hand::NEXT_EARLY_BYTES_PER_SEAT
+        {
+            break;
+        }
         match highest(held, Some(seat)) {
             Some((i, q)) if q > arriving => {
                 held.remove(i);
+                lost.1 = lost.1.saturating_add(1);
             }
             _ => return,
         }
     }
-    if held.len() >= NEXT_EARLY_CAP {
+    loop {
+        let all: usize = held.iter().map(|(_, b)| b.len()).sum();
+        if held.len() < NEXT_EARLY_CAP
+            && all + bytes.len() <= crate::table::hand::NEXT_EARLY_BYTES
+        {
+            break;
+        }
         match highest(held, None) {
             Some((i, q)) if q > arriving => {
                 held.remove(i);
+                lost.1 = lost.1.saturating_add(1);
             }
             _ => return,
         }
@@ -8134,124 +8195,183 @@ mod tests {
 #[cfg(test)]
 mod the_pre_open_buffer {
     use super::{keep_early, NEXT_EARLY_CAP, NEXT_EARLY_PER_SEAT};
+    use crate::table::hand::{frame_ceiling, NEXT_EARLY_BYTES_PER_SEAT};
+    use crate::protocol::messages::EventType;
 
-    /// A frame whose header `peek` can read, at a chosen sequence.
+    /// A real sealed frame of `kind` at `seq`, whose payload is `fill` bytes.
     ///
-    /// Built from a real `HAND_INIT` envelope rather than by hand, because the
-    /// whole point of the function under test is that it reads the sequence out
-    /// of the bytes it is given.
-    fn frame(seq: u64, salt: u8) -> Vec<u8> {
+    /// Built with `seal` rather than by hand because everything under test
+    /// reads the sequence, the type and the length out of the bytes it is
+    /// given, and a hand-rolled envelope would test the fixture.
+    fn at(kind: EventType, seq: u64, fill: usize, salt: u8) -> Vec<u8> {
         use crate::net::chained::{seal, Slot};
-        use crate::protocol::messages::EventType;
         #[derive(minicbor::Encode)]
         #[cbor(array)]
-        struct Probe(#[n(0)] u8);
+        struct Probe(#[n(0)] u8, #[cbor(n(1), with = "minicbor::bytes")] Vec<u8>);
         seal(
-            EventType::RngCommit,
+            kind,
             &Slot {
                 table_id: [6u8; 32],
                 hand_id: 2,
                 sequence: seq,
                 previous_event_hash: [9u8; 32],
             },
-            &Probe(salt),
+            &Probe(salt, vec![salt; fill]),
             &ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]),
             1_700_000_000_000,
             30_000,
-            4096,
+            crate::table::hand::FRAME_CAP,
         )
         .expect("a sealed probe")
     }
 
-    /// **The buffer is structurally too small, so what it does when full is the
-    /// whole behaviour.**
-    ///
-    /// At eight dealt-in seats the run before the first bet is 8 `DECK_INIT` +
-    /// 8 `SHUFFLE_STEP` + 8 `SHUFFLE_PROOF` + 8 `DECK_COMMIT` + 8 `DEAL_PRIVATE`
-    /// = 40 frames against a cap of 32. The old code answered that with a match
-    /// guard that dropped every later arrival; `split135059-9` measured a
-    /// bystander opening a hand with exactly 32 held and stalling eight stages
-    /// later, one frame short.
+    /// A small frame: `DECK_COMMIT` is the smallest cap in the pre-bet run.
+    fn frame(seq: u64, salt: u8) -> Vec<u8> {
+        at(EventType::DeckCommit, seq, 8, salt)
+    }
+
+    /// **The measurement that changed the unit.** Nothing between the wire and
+    /// this buffer bounds a frame by its own type — `open_in_hand` is given
+    /// `FRAME_CAP` and `check_envelope` never reads the payload's length — so
+    /// every one of the old thirty-two slots was a sixteen-kilobyte slot and a
+    /// `DECK_COMMIT` whose cap is 160 bytes could hold one for a whole
+    /// boundary. Charging each frame its own ceiling is what makes eighty slots
+    /// cost less than the old thirty-two.
+    #[test]
+    fn a_frame_larger_than_its_own_type_allows_is_refused_at_the_door() {
+        let mut held: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut lost = (0u32, 0u32);
+
+        let fat = at(EventType::DeckCommit, 5, 2_000, 1);
+        assert!(
+            fat.len() > frame_ceiling(EventType::DeckCommit),
+            "the fixture must exceed the ceiling to test it"
+        );
+        keep_early(&mut held, 1, &fat, &mut lost);
+        assert!(held.is_empty(), "refused");
+        assert_eq!(lost, (1, 0), "and counted, so a run can tell this from a loss");
+
+        let ok = frame(5, 1);
+        assert!(ok.len() <= frame_ceiling(EventType::DeckCommit));
+        keep_early(&mut held, 1, &ok, &mut lost);
+        assert_eq!(held.len(), 1, "a legal frame of the same type is admitted");
+    }
+
+    /// **The bytes bind before the slots.** A seat's share is one whole run to
+    /// the first bet plus one spare frame of the largest type; eight
+    /// `SHUFFLE_PROOF`s do not fit in it, and the eviction that follows is by
+    /// sequence like every other.
+    #[test]
+    fn the_bytes_bind_before_the_slots_when_the_frames_are_large() {
+        let mut held: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut lost = (0u32, 0u32);
+        for i in 0..NEXT_EARLY_PER_SEAT {
+            keep_early(
+                &mut held,
+                3,
+                &at(EventType::ShuffleProof, 100 + i as u64, 6_000, i as u8),
+                &mut lost,
+            );
+        }
+        let bytes: usize = held.iter().map(|(_, b)| b.len()).sum();
+        assert!(
+            held.len() < NEXT_EARLY_PER_SEAT,
+            "the byte share bound before the slot count did: {} slots",
+            held.len()
+        );
+        assert!(
+            bytes <= NEXT_EARLY_BYTES_PER_SEAT,
+            "{bytes} over the per-seat share"
+        );
+    }
+
+    /// A full buffer gives up its highest sequence for a lower arrival. The old
+    /// rule was a match guard, and a guard that fails drops the arrival — which
+    /// is how a bystander came to open a hand holding exactly the first
+    /// thirty-two frames to arrive and none of what it needed next.
     #[test]
     fn a_full_buffer_gives_up_its_highest_sequence_for_a_lower_arrival() {
         let mut held: Vec<(u8, Vec<u8>)> = Vec::new();
-        // Thirty-two frames from four seats, sequences 100..132: the buffer is
-        // full and everything in it is above what arrives next.
-        for i in 0..NEXT_EARLY_CAP {
-            let seat = (i % 4) as u8;
-            held.push((seat, frame(100 + i as u64, i as u8)));
+        let mut lost = (0u32, 0u32);
+        // Ten seats at their full allowance: the slot cap is exactly that.
+        for s in 0..10u8 {
+            for i in 0..NEXT_EARLY_PER_SEAT {
+                keep_early(
+                    &mut held,
+                    s,
+                    &frame(100 + i as u64, s * 16 + i as u8),
+                    &mut lost,
+                );
+            }
         }
-        assert_eq!(held.len(), NEXT_EARLY_CAP);
+        assert_eq!(held.len(), NEXT_EARLY_CAP, "full");
 
-        keep_early(&mut held, 7, &frame(18, 200));
-        assert_eq!(held.len(), NEXT_EARLY_CAP, "the cap still binds");
+        keep_early(&mut held, 4, &frame(18, 200), &mut lost);
         assert!(
             held.iter().any(|(_, b)| b[..] == frame(18, 200)[..]),
             "the low arrival is in"
         );
-        assert!(
-            !held.iter().any(|(_, b)| b[..] == frame(131, 31)[..]),
-            "and the highest sequence is the one that left"
-        );
+        assert!(lost.1 >= 1, "and something was evicted for it");
+        assert!(held.len() <= NEXT_EARLY_CAP, "the cap still binds");
     }
 
     /// The other half, and it is what makes the rule safe: a client that is
     /// behind needs the low sequences, so an arrival that is itself the highest
-    /// is the one to drop. Otherwise a peer racing ahead would push the frames
-    /// under a stuck cursor out one at a time.
+    /// is the one to drop.
     #[test]
     fn an_arrival_above_everything_held_is_the_one_dropped() {
         let mut held: Vec<(u8, Vec<u8>)> = Vec::new();
-        for i in 0..NEXT_EARLY_CAP {
-            held.push(((i % 4) as u8, frame(10 + i as u64, i as u8)));
+        let mut lost = (0u32, 0u32);
+        for i in 0..NEXT_EARLY_PER_SEAT {
+            keep_early(&mut held, 2, &frame(10 + i as u64, i as u8), &mut lost);
         }
         let before: Vec<Vec<u8>> = held.iter().map(|(_, b)| b.clone()).collect();
 
-        keep_early(&mut held, 7, &frame(9_999, 200));
-        assert_eq!(held.len(), NEXT_EARLY_CAP);
+        keep_early(&mut held, 2, &frame(9_999, 200), &mut lost);
         let after: Vec<Vec<u8>> = held.iter().map(|(_, b)| b.clone()).collect();
         assert_eq!(before, after, "nothing moved and the arrival was dropped");
     }
 
     /// The per-seat allowance is enforced against **that seat's own** highest,
     /// so one loud seat cannot spend its eviction on another seat's low
-    /// sequences. Checked separately because it binds before the whole-buffer
-    /// cap and the two used to be one guard.
+    /// sequences. That is the exact-partition property: the aggregate budget is
+    /// the sum of the shares, so no seat is ever evicted on another's behalf.
     #[test]
     fn a_seat_at_its_allowance_evicts_only_its_own() {
         let mut held: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut lost = (0u32, 0u32);
         for i in 0..NEXT_EARLY_PER_SEAT {
-            held.push((3, frame(500 + i as u64, i as u8)));
+            keep_early(&mut held, 3, &frame(500 + i as u64, i as u8), &mut lost);
         }
-        held.push((5, frame(1, 200)));
+        keep_early(&mut held, 5, &frame(1, 200), &mut lost);
 
-        keep_early(&mut held, 3, &frame(20, 201));
+        keep_early(&mut held, 3, &frame(20, 201), &mut lost);
         assert!(
             held.iter().any(|(s, b)| *s == 5 && b[..] == frame(1, 200)[..]),
             "seat 5's low frame is untouched"
         );
-        assert!(
-            !held
-                .iter()
-                .any(|(_, b)| b[..] == frame(500 + NEXT_EARLY_PER_SEAT as u64 - 1, NEXT_EARLY_PER_SEAT as u8 - 1)[..]),
-            "seat 3 gave up its own highest"
-        );
         assert_eq!(
             held.iter().filter(|(s, _)| *s == 3).count(),
             NEXT_EARLY_PER_SEAT,
-            "and the allowance still binds"
+            "and seat 3's allowance still binds"
+        );
+        assert!(
+            held.iter().any(|(s, b)| *s == 3 && b[..] == frame(20, 201)[..]),
+            "with the low arrival in it"
         );
     }
 
     /// The same bytes twice are one entry. The five-second re-send puts every
     /// recent stage on the wire again at ticks 2, 4, 8, 16, 32, so without this
-    /// a buffer of 32 is a buffer of a handful of distinct frames.
+    /// a buffer of eighty is a buffer of a handful of distinct frames.
     #[test]
     fn a_byte_duplicate_takes_no_second_slot() {
         let mut held: Vec<(u8, Vec<u8>)> = Vec::new();
-        keep_early(&mut held, 1, &frame(7, 0));
-        keep_early(&mut held, 1, &frame(7, 0));
+        let mut lost = (0u32, 0u32);
+        keep_early(&mut held, 1, &frame(7, 0), &mut lost);
+        keep_early(&mut held, 1, &frame(7, 0), &mut lost);
         assert_eq!(held.len(), 1);
+        assert_eq!(lost, (0, 0), "a duplicate is neither refused nor an eviction");
     }
 }
 
