@@ -668,7 +668,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // `HAND_INIT`s of the next hand that arrived during this one: drained into
     // the next hand's held queue when it opens, and read for whether its
     // parent is contested before this client signs.
-    let mut next_inits: Vec<Vec<u8>> = Vec::new();
+    let mut next_inits: Vec<(u8, Vec<u8>)> = Vec::new();
     // Everything else of the next hand that arrives before this client opens
     // it (`S1-BW`), with the seat that signed it so no one seat can fill it.
     // Kept apart from the `HAND_INIT`s because those decide the genesis and
@@ -1384,9 +1384,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             match keep_for_next_hand(kind, hand_id, $h.hand_id()) {
                                                 Keep::Init
                                                     if next_inits.len() < NEXT_INITS_CAP
-                                                        && !next_inits.iter().any(|b| b[..] == $bytes[..]) =>
+                                                        && seat.is_some_and(|s| {
+                                                            next_inits
+                                                                .iter()
+                                                                .filter(|(f, _)| *f == s)
+                                                                .count()
+                                                                < NEXT_INITS_PER_SEAT
+                                                        })
+                                                        && !next_inits
+                                                            .iter()
+                                                            .any(|(_, b)| b[..] == $bytes[..]) =>
                                                 {
-                                                    next_inits.push($bytes.to_vec());
+                                                    if let Some(s) = seat {
+                                                        next_inits.push((s, $bytes.to_vec()));
+                                                    }
                                                 }
                                                 Keep::Early => {
                                                     if let Some(s) = seat {
@@ -5859,7 +5870,7 @@ async fn begin_hand(
     events: &Events,
     tox: &super::toxsink::TableSink,
 ) {
-    let mut none: Vec<Vec<u8>> = Vec::new();
+    let mut none: Vec<(u8, Vec<u8>)> = Vec::new();
     // **Hand one, which has no boundary behind it and therefore no buffer.**
     // What the loop holds for the hand after the running one belongs to the
     // loop and stays there; `reopen_hand` does not see it either, and for the
@@ -5883,18 +5894,37 @@ async fn begin_hand(
     .await;
 }
 
+/// How many of the next hand's `HAND_INIT`s one **seat** may leave here.
+///
+/// One for the hand it opens, one for a re-send. A seat may seal its
+/// `HAND_INIT` at as many genesis values as it likes — each is a different
+/// signed frame and the byte-identical dedup does not touch them — so without
+/// a per-seat term one seat fills this buffer alone and the other nine are
+/// starved out of the boundary they open on. `quiet_if_contested` survives that
+/// (it folds by seat into a `BTreeSet`), the hand's stage 0 does not.
+const NEXT_INITS_PER_SEAT: usize = 2;
+
 /// How many of the next hand's `HAND_INIT`s are kept for it while this one
-/// ends: one per seat, and a little room for a re-send.
-const NEXT_INITS_CAP: usize = 16;
+/// ends: **one per seat, and a little room for a re-send** — which is what this
+/// constant has always said and, until `S1-CE`'s panel read the admission arm,
+/// not what it did. The arm tested this total and a byte-identical dedup and
+/// nothing else.
+const NEXT_INITS_CAP: usize =
+    (crate::protocol::constants::MAX_SEATS as usize) * NEXT_INITS_PER_SEAT;
 
 /// How many of the next hand's other events are kept for it.
 ///
-/// The hand's own early queue holds sixty-four and drops the oldest when it is
-/// full, so what goes in from here has to leave room for what arrives live.
-/// Sixteen `HAND_INIT`s and thirty-two of these is forty-eight, which covers a
-/// full table's cryptographic stage with a re-send and leaves a quarter of the
-/// queue for events that arrive after the hand opens. The measured case needed
-/// seven.
+/// **A slot bound; the one that binds is the byte budget**
+/// (`NEXT_EARLY_BYTES`). It is `MAX_SEATS` times the per-seat allowance so the
+/// two are one rule counted twice, and `EARLY_CAP` is pinned above the sum of
+/// both pre-open buffers by a `const` assertion — which until `S1-CD` held by
+/// luck.
+///
+/// The arithmetic this doc used to carry — *sixteen `HAND_INIT`s and thirty-two
+/// of these is forty-eight, which covers a full table's cryptographic stage* —
+/// was wrong twice over and both halves are measured: a nine-handed table's run
+/// before the first bet is **forty** frames, not thirty-two, and each slot cost
+/// `FRAME_CAP` rather than its own type's cap.
 const NEXT_EARLY_CAP: usize =
     (crate::protocol::constants::MAX_SEATS as usize) * NEXT_EARLY_PER_SEAT;
 
@@ -5987,7 +6017,7 @@ fn keep_for_next_hand(
 /// for a certificate (`S1-BS`).
 fn quiet_if_contested(
     o: &crate::table::hand::Opening,
-    inits: &[Vec<u8>],
+    inits: &[(u8, Vec<u8>)],
 ) -> crate::table::hand::Voice {
     use crate::protocol::messages::EventType;
     use crate::table::hand::{Voice, FOREIGN_GENESIS_FLOOR, FRAME_CAP};
@@ -5995,7 +6025,7 @@ fn quiet_if_contested(
     let mut foreign: std::collections::BTreeMap<crate::poker::state::Hash, std::collections::BTreeSet<u8>> =
         std::collections::BTreeMap::new();
     let mut at_mine: std::collections::BTreeSet<u8> = std::collections::BTreeSet::new();
-    for b in inits {
+    for (_, b) in inits {
         let Ok(opened) =
             crate::net::chained::open_in_hand(b, FRAME_CAP, EventType::HandInit, &o.table_id, o.hand_id)
         else {
@@ -6171,7 +6201,7 @@ async fn reopen_hand(
 async fn begin_hand_with(
     opening: crate::table::hand::Opening,
     voice: crate::table::hand::Voice,
-    next_inits: &mut Vec<Vec<u8>>,
+    next_inits: &mut Vec<(u8, Vec<u8>)>,
     next_early: &mut Vec<(u8, Vec<u8>)>,
     lost: &mut (u32, u32),
     app_key: &ed25519_dalek::SigningKey,
@@ -6203,7 +6233,8 @@ async fn begin_hand_with(
             // The next hand's copies that arrived during the last one.
             // `HAND_INIT`s first: they are what stage 0 is waiting for, and the
             // hand's own queue evicts the oldest when it is full.
-            let buffered = std::mem::take(next_inits);
+            let buffered: Vec<Vec<u8>> =
+                std::mem::take(next_inits).into_iter().map(|(_, b)| b).collect();
             let carried = std::mem::take(next_early);
             // **Said out loud, because `S1-BW` cannot otherwise be measured.**
             // The buffer's whole effect is on a client that opens a hand later

@@ -744,7 +744,7 @@ pub const NEXT_EARLY_BYTES: usize =
 /// at nine seats, which is what a client one boundary behind has to swallow.
 /// What changed with `S1-CD` is **which** entry goes when it is full — the
 /// highest sequence, never the oldest arrival.
-pub const EARLY_CAP: usize = 96;
+pub const EARLY_CAP: usize = 100;
 
 /// And the bytes, because a slot without a ceiling is a `FRAME_CAP` slot.
 ///
