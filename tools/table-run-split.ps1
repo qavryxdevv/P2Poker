@@ -89,6 +89,22 @@ param(
     [ValidateRange(0, 3600)][int]$LinkDownAt = 0,
     [ValidateRange(0, 3600)][int]$LinkDownFor = 0,
     [ValidateRange(0, 8)][int]$LinkDownSeat = 0,
+    # fault-harness: local seat -MuteSeat drops every HAND message it would
+    # SEND, from -MuteAt s (of its own start) for -MuteFor s (0 = off), and
+    # hears everything throughout. One direction, and that is the whole
+    # instrument.
+    #
+    # It is the only way to certify a seat out **without making it fall
+    # behind**: every other knob here works by cutting what reaches a seat, so
+    # by the time the table has voted the seat is hands behind and is no longer
+    # a bystander. `S1-BW`'s fix is about the seat that is certified out and
+    # still level, which is where the buffered next hand is worth anything.
+    #
+    # **-MuteFor must exceed one decision deadline** (30 s) or the table never
+    # votes and the knob only delays that seat's stage.
+    [ValidateRange(0, 3600)][int]$MuteAt = 0,
+    [ValidateRange(0, 3600)][int]$MuteFor = 0,
+    [ValidateRange(0, 8)][int]$MuteSeat = 0,
     # fault-harness, in the C (patch 0016): local seat -DeafSeat ignores every
     # lossless and lossy group packet from -DeafAt s (of its first group
     # packet) for -DeafFor s (0 = off). It keeps SENDING, so its peers do not
@@ -215,6 +231,7 @@ Write-Host "mdns   $(if ($NoMdns) { 'off - every seat finds every other through 
 Write-Host "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
 Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on far seat $DelayCertsSeat$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
 Write-Host "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
+Write-Host "mute   $(if ($MuteFor -gt 0) { "local seat $MuteSeat sends no hand message from $MuteAt s for $MuteFor s and hears everything (fault-harness)$(if ($MuteFor -le 30) { ' - WARNING: under the 30 s decision deadline, so the table will not vote it out' })" } else { 'nobody is muted' })"
 Write-Host "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
 Write-Host "work   $work"
 Write-Host ''
@@ -442,6 +459,10 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         if ($LinkDownFor -gt 0 -and $i -eq $LinkDownSeat) {
             $knobs['P2P_POKER_LINK_DOWN_AT'] = "$LinkDownAt"
             $knobs['P2P_POKER_LINK_DOWN_FOR'] = "$LinkDownFor"
+        }
+        if ($MuteFor -gt 0 -and $i -eq $MuteSeat) {
+            $knobs['P2P_POKER_MUTE_AT'] = "$MuteAt"
+            $knobs['P2P_POKER_MUTE_FOR'] = "$MuteFor"
         }
         if ($DeafFor -gt 0 -and $i -eq $DeafSeat) {
             $knobs['P2P_POKER_DEAF_AT'] = "$DeafAt"

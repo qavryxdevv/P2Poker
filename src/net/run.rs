@@ -3799,7 +3799,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // client's own log already called it *“NOT enough to carry
                     // a hand”*. The owner's instruction is that a hand never
                     // travels on libp2p; the capacity is the reason.
-                    if tox_sink.is_on_tox() {
+                    //
+                    // **And it asks whether anything may leave at all, which it
+                    // did not.** `link_is_down`'s own doc says it drops *every*
+                    // table message this client would send; this site is the
+                    // one that got away, so a seat with its link down went on
+                    // broadcasting the last `RESEND_STAGES` stages on every
+                    // power-of-two tick for the whole outage. The knob was
+                    // therefore measuring something quieter than a link that is
+                    // down, and every run taken with it — `split220636-9` among
+                    // them, one of `S1-BW`'s two failed reproductions — was
+                    // taken against a seat that was still speaking.
+                    if tox_sink.is_on_tox() && !nothing_leaves() {
                         for out in recent {
                             tox_sink.try_broadcast(out);
                         }
@@ -6168,6 +6179,73 @@ fn link_is_down() -> bool {
     false
 }
 
+/// **A seat that hears everything and is heard by nobody**, which is the one
+/// fault shape this tree could not produce and the one `S1-BW` needs.
+///
+/// `P2P_POKER_MUTE_AT=<s>` and `P2P_POKER_MUTE_FOR=<s>` drop every **hand**
+/// message this client would send, for that window, measured from the first
+/// call. Nothing it receives is touched.
+///
+/// **Why the asymmetry is the whole instrument.** A seat is certified out when
+/// it misses a decision deadline, and every other knob in this tree makes a
+/// seat miss deadlines by cutting what reaches it — so by the time the table
+/// has voted, the seat is hands behind and is no longer a bystander but a
+/// stranger. `S1-BW`'s fix is about the seat that is certified out **and still
+/// level with the table**: it keeps following, opens the next hand outside
+/// `R`, and completes it from the buffer. `split125944-9` reached that state by
+/// coincidence — its own certificates were parked — and this reaches it on
+/// purpose, because silence in one direction costs a seat its seat without
+/// costing it a single stage of what the table did next.
+///
+/// **Only the hand.** Formation traffic is untouched: a seat that could not
+/// ratify would never be seated, and the state this exists to reach is on the
+/// far side of that. It is also why this is not `link_is_down` with a flag —
+/// that one is *an outage*, both directions and everything on them, and the
+/// two answer different questions.
+#[cfg(feature = "fault-harness")]
+fn mouth_is_shut() -> bool {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static WINDOW: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    let window = WINDOW.get_or_init(|| {
+        let at = std::env::var("P2P_POKER_MUTE_AT")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        let dur = std::env::var("P2P_POKER_MUTE_FOR")
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()?;
+        Some((at, dur))
+    });
+    match window {
+        Some((at, dur)) => {
+            let s = start.elapsed().as_secs();
+            s >= *at && s < at.saturating_add(*dur)
+        }
+        None => false,
+    }
+}
+
+/// The constant `false`, in every build that did not ask for the harness.
+#[cfg(not(feature = "fault-harness"))]
+fn mouth_is_shut() -> bool {
+    false
+}
+
+/// **Every reason a hand's bytes do not leave this client**, in one place.
+///
+/// The two knobs are different faults — an outage is both directions, a mute is
+/// one — and a send site cannot tell them apart or want to. A receive site
+/// **can**: it asks `link_is_down` alone, because a muted seat is still
+/// listening, and that difference is the instrument.
+fn nothing_leaves() -> bool {
+    link_is_down() || mouth_is_shut()
+}
+
 /// Send a hand's bytes, **over Tox and nowhere else**.
 ///
 /// # The instruction, and the number behind it
@@ -6205,7 +6283,7 @@ fn publish_hand(
     tox: &super::toxsink::TableSink,
 ) {
     let _ = swarm;
-    let down = link_is_down();
+    let down = nothing_leaves();
     for crate::table::hand::Send::Broadcast(out) in sends {
         if down {
             // Nothing leaves. It is still put in `said`, because `said` is the
