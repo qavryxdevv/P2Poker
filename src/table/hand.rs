@@ -1363,6 +1363,16 @@ pub struct Hand {
     /// is one step ahead is not a peer that is wrong. The same reason
     /// `Formation` keeps one.
     early: VecDeque<Vec<u8>>,
+    /// Seats **this client has removed** that signed this hand at a genesis
+    /// this client does not hold.
+    ///
+    /// **The one case a certificate cannot repair, and it was being discarded.**
+    /// A certificate only removes, so a divergence is mendable only while this
+    /// client's roster is a superset of the table's. A seat outside this
+    /// client's `required`, signing this hand at the genesis the table is
+    /// using, is proof of the opposite: this client shrank further than the
+    /// table did, and `D-024`'s monotone roster forbids the way back. `S1-CE`.
+    foreign_outside: std::collections::BTreeSet<SeatIdx>,
 }
 
 impl Hand {
@@ -1594,6 +1604,7 @@ impl Hand {
                 phase: Phase::Init(stage),
                 params: DeckParams::new(),
                 early: VecDeque::new(),
+                foreign_outside: std::collections::BTreeSet::new(),
             },
             // Nothing goes out from a seat that is in no `R` of this hand,
             // and nothing from a quiet or muted one.
@@ -6817,6 +6828,19 @@ impl Hand {
             // Roster seats of this hand only: a seat certified out of it
             // opens the hand it thinks it is in, and its word does not
             // contest this one.
+            // **A seat this client removed and the table did not**, signing
+            // this hand at the genesis the table is using. Recorded rather than
+            // dropped: it is the proof that this client's roster is a strict
+            // subset of the table's, which is the one divergence no certificate
+            // can mend (`S1-CE`).
+            if let Some(seat) = self
+                .seat_of_key(&opened.sender)
+                .filter(|s| !self.open.required.contains(s))
+            {
+                if opened.envelope.previous_event_hash != self.open.genesis {
+                    self.foreign_outside.insert(seat);
+                }
+            }
             if let Some(seat) = self
                 .seat_of_key(&opened.sender)
                 .filter(|s| self.open.required.contains(s))
@@ -6829,15 +6853,33 @@ impl Hand {
                         let short = |h: &Hash| -> String {
                             h[..4].iter().map(|b| format!("{b:02x}")).collect()
                         };
+                        // **What can and cannot repair it, said honestly.** A
+                        // certificate only removes a seat, so it mends this only
+                        // while this client's roster is a superset of the
+                        // table's. If a seat this client has removed is signing
+                        // at the other genesis, the opposite is true and nothing
+                        // in this protocol can add it back (`D-024`, `S1-CE`).
+                        let outside: Vec<SeatIdx> =
+                            self.foreign_outside.iter().copied().collect();
+                        let road = if outside.is_empty() {
+                            format!(
+                                "A certificate about hand #{} would repair it",
+                                self.open.hand_id.saturating_sub(1)
+                            )
+                        } else {
+                            format!(
+                                "seat(s) {outside:?} are at that genesis and this client has \
+                                 removed them, so its roster is a strict subset of the table's \
+                                 and NO certificate can repair it: a certificate only removes"
+                            )
+                        };
                         self.genesis_note = Some(format!(
                             "hand #{}: seat(s) {:?} opened it at genesis {}; this client opened it at {} \
-                             and nobody has been heard at that genesis. A certificate about hand #{} \
-                             would repair it",
+                             and nobody has been heard at that genesis. {road}",
                             self.open.hand_id,
                             seats,
                             short(&g),
                             short(&self.open.genesis),
-                            self.open.hand_id.saturating_sub(1)
                         ));
                     }
                 }
