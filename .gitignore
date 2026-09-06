@@ -42,3 +42,9 @@ desktop.ini
 # Their own `.gitignore` files come with them and keep their build output out:
 # `obj`, `bin` and `build` are ignored by upstream's rules, not by ours.
 
+# Table run logs. They live here rather than in the temp directory because
+# Storage Sense deleted the whole of the old work root on 2026-09-06, taking
+# every run the register cites with it. They are evidence, not build output:
+# ignored by git because they are hundreds of megabytes, and kept on disk
+# because a register row is only as good as the log it names.
+/runs/

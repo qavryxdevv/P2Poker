@@ -192,10 +192,20 @@ if ($newest -and $newest.LastWriteTime -gt $exeTime) {
 }
 if (-not (Test-Path $KeyPath)) { throw "no key at $KeyPath. Plug the USB volume in or pass -KeyPath." }
 
+# **Where the logs go, and it is not the temp directory (2026-09-06).**
+#
+# Storage Sense is on for this account with temp-file cleanup enabled, and it
+# deleted the whole of the old work root -- 76 runs, 277 MB, including every run
+# the register cites by name -- between one read of a log and the next. They came
+# back from the recycle bin, but nothing warned, and a register row that says
+# *measured in `split092359-10`* is worth exactly as much as the log it points
+# at. The repository's own `runs/` is ignored by git and untouched by Windows.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+
 $seats = $Here + $There
 $stamp = (Get-Date).ToString('HHmmss')
 $table = "split$stamp-$seats"
-$work = Join-Path $env:TEMP "p2p-table-split\$table"
+$work = Join-Path $repoRoot (Join-Path 'runs' $table)
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 Write-Host "table  $table"

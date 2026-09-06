@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Play a table of N seats on this machine and report what a hand costs.
 
@@ -161,10 +161,20 @@ $Exe = (Resolve-Path $Exe).Path
 # A table name that cannot collide with another run on this machine. The name is
 # display data and never an identifier (PROTOCOL.md 4.3); it is how a scripted
 # joiner recognises the table it was told to sit at, and nothing more.
+# **Where the logs go, and it is not the temp directory (2026-09-06).**
+#
+# Storage Sense is on for this account with temp-file cleanup enabled, and it
+# deleted the whole of the old work root -- 76 runs, 277 MB, including every run
+# the register cites by name -- between one read of a log and the next. They came
+# back from the recycle bin, but nothing warned, and a register row that says
+# *measured in `split092359-10`* is worth exactly as much as the log it points
+# at. The repository's own `runs/` is ignored by git and untouched by Windows.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+
 $stamp = (Get-Date).ToString('HHmmss')
 $table = "run$stamp-$Seats"
 
-$work = Join-Path $env:TEMP "p2p-table-run\$table"
+$work = Join-Path $repoRoot (Join-Path 'runs' $table)
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 # **One shared Tox node list for every run on this machine.**
@@ -181,7 +191,7 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 # The client refreshes at most daily and merges the cache with its compiled-in
 # list, so seeding a profile from a shared copy is exactly what a second run on
 # the same day would have done for itself.
-$shared = Join-Path $env:TEMP (Join-Path "p2p-table-run" "tox-nodes.json")
+$shared = Join-Path $repoRoot (Join-Path 'runs' 'tox-nodes.json')
 $seed = (Test-Path $shared) -and
         ((Get-Date) - (Get-Item $shared).LastWriteTime).TotalHours -lt 24
 if ($seed) { Write-Host "nodes  seeded from the shared cache, no fetch needed" }
