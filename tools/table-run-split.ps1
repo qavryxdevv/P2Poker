@@ -31,6 +31,20 @@
     the table, and a seat that reached it and never entered the group found it
     and could not join the Tox side.
 #>
+# **PowerShell 7, and refusing is the point.**
+#
+# This script sets `$ErrorActionPreference = 'Stop'` and pipes several native
+# commands through `2>&1` — cargo, ssh, scp and every seat. Windows PowerShell
+# 5.1 turns each stderr line into a terminating `ErrorRecord`; PowerShell 7.4
+# and later do not, unless `$PSNativeCommandUseErrorActionPreference` is set. So
+# under 5.1 a **successful** build kills the run and the trap reports cargo's
+# own *"Finished `release` profile"* as the failure — measured on 2026-09-06.
+#
+# `#Requires` refuses the wrong shell outright, which is this file's own rule:
+# a run that fell over must not be able to look like a run that passed, and a
+# run that could not start must not be able to look like one that did.
+#Requires -Version 7.0
+
 [CmdletBinding()]
 param(
     [ValidateRange(1, 9)][int]$Here = 5,
@@ -217,10 +231,32 @@ if (-not $NoBuild) {
     if (-not $cargo) { $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe' }
     if (-not (Test-Path $cargo)) { throw "cargo is neither on the PATH nor at $cargo; nothing can be built." }
     Write-Host "==> cargo build --release $($feat -join ' ')"
+    # **`2>&1` on a native command and `ErrorActionPreference = 'Stop'` are a
+    # trap, and which shell you are in decides whether it springs.** cargo
+    # writes *every* progress line — `Compiling`, `Finished`, and a clean
+    # build's whole output — to **stderr**. `2>&1` turns each into an
+    # `ErrorRecord`, and under `Stop` an `ErrorRecord` entering the pipeline is
+    # terminating. Windows PowerShell 5.1 does that; PowerShell 7.4 and later do
+    # not, unless `$PSNativeCommandUseErrorActionPreference` is set.
+    #
+    # So the same script, the same arguments and the same successful build:
+    # under `pwsh` it runs, under `powershell -File` it dies on the trap with
+    # *"the run did not complete: Finished `release` profile … in 0.53s"* —
+    # the success line reported as the failure. Measured on 2026-09-06, and it
+    # cost a run.
+    #
+    # Suppressed only around the call, and `$LASTEXITCODE` is what decides the
+    # outcome — which is the right instrument for a native command's success
+    # and always was. The preference is restored immediately, so nothing else
+    # in this script loses its `Stop`.
+    $wasStop = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     & $cargo build --release @feat --manifest-path (Join-Path $root 'Cargo.toml') 2>&1 |
         Where-Object { $_ -match 'error|warning: unused|Compiling p2p-poker|Finished' } |
         ForEach-Object { Write-Host "    $_" }
-    if ($LASTEXITCODE -ne 0) { throw "the build failed; nothing was measured." }
+    $built = $LASTEXITCODE
+    $ErrorActionPreference = $wasStop
+    if ($built -ne 0) { throw "the build failed; nothing was measured." }
     $Exe = (Resolve-Path $Exe).Path
 }
 
