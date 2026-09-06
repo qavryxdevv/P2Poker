@@ -195,10 +195,19 @@ const FAST_REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(10
 /// entire safety argument.** A per-provider bound is inflatable: provider
 /// records are unauthenticated and peer ids are free, so a peer that fills the
 /// lobby with fakes earns a fresh allowance for each one and pins this client
-/// at its redial ceiling for ever. A per-process bound cannot be inflated in
-/// that direction at all — a flooder can **consume** it, and consuming it
-/// removes a benefit rather than creating traffic, so the worst case is exactly
-/// the behaviour this client has today.
+/// at its redial ceiling for ever. A per-process bound cannot be renewed at
+/// all: a flooder can **spend** it, once.
+///
+/// **Spending it is not free, and an earlier draft of this comment said it
+/// was.** A unit is consumed precisely to buy a dial the loop would otherwise
+/// have refused inside the minute, so consuming the budget *is* creating
+/// traffic — at most one extra dial per unit, a measured median of 0.51.
+/// Replaying the loop over the 642 usable logs on disk, the opening 120
+/// seconds carry a median **1.67x** the dials they carry today, p90 2.47x, max
+/// 3.90x, and the budget drains fully in 334 of 643. What makes that safe is
+/// not that it is nothing but that it is **additive and once**: the worst a
+/// flooder buys is the fifth more dials priced below, spent inside two minutes
+/// and never renewed.
 ///
 /// **A ceiling and not a rate, and the difference is the whole point.** Simply
 /// shortening the cooldown for everyone is not an option: `REDIALS_PER_ANSWER`
