@@ -47,6 +47,102 @@ use p2p_poker::app::AppState;
 use p2p_poker::gui::lobby::short_key;
 use p2p_poker::gui::render;
 use p2p_poker::net::node::{NodeCommand, NodeEvent};
+use p2p_poker::net::swarm::JOIN_RPC_TIMEOUT_MS;
+
+/// The floor between two asks from the headless driver, on the
+/// founder-connection edge alone.
+///
+/// A seat comes back 0.1 to 0.5 s after the ask in every seating in the corpus
+/// (`split083343-9` far-n0: ask at 82.7 s, seat at 82.9 s), so five seconds
+/// cannot race one already in flight. It is also what stops a founder reached
+/// over two transports at once — one peer, two `ConnectionEstablished` events —
+/// from becoming two asks.
+const REASK_FLOOR: Duration = Duration::from_secs(5);
+
+/// The most asks the founder-connection edge makes in one run.
+///
+/// A ceiling and not a schedule: nothing here fires on a timer, so reaching it
+/// takes eight separate connections to the founder, where the corpus has at
+/// most two per seat. The advert edge is deliberately **not** capped, so a
+/// driver that reaches this falls back to exactly today's behaviour rather
+/// than going quiet.
+const MAX_CONNECT_ASKS: u32 = 8;
+
+/// How long an unanswered `JOIN_REQUEST` keeps the founder edge quiet.
+///
+/// The node refuses a second `JoinTable` while one is in flight, so an ask
+/// made inside this window is spent on nothing. It is a **window** and not a
+/// latch because three arms of that handler answer with a warning and no
+/// event at all — the table has left the node's own lobby store, the advert's
+/// founder id will not parse, the RNG failed — and a flag those paths never
+/// clear would silence the founder edge for the life of the process, which is
+/// this row's own fault one level down.
+///
+/// The length is the join RPC's own request timeout plus one `REASK_FLOOR`:
+/// past `JOIN_RPC_TIMEOUT_MS` the request has failed by the node's definition,
+/// and the margin covers the gap between the timeout firing and `LeftTable`
+/// arriving. Overrunning it costs one ask the node answers with a warning,
+/// which is exactly what the driver did before this row existed.
+const JOIN_ASK_LINGERS: Duration = Duration::from_millis(JOIN_RPC_TIMEOUT_MS + 5_000);
+
+/// Which edge, if either, has earned a `JOIN_REQUEST` this turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// An advert got past the limiter. Unchanged and unbounded: it is what the
+    /// driver has always done.
+    Advert,
+    /// The founder became dialable while an advert was held and this client
+    /// had no seat.
+    FounderUp,
+}
+
+/// **The second edge a join needs, which nothing watched.**
+///
+/// A `JOIN_REQUEST` can be answered only when two things are true at once:
+/// this client holds an advert for the table, and the founder is dialable.
+/// Only the first was ever a trigger, and the advert limiter guarantees the
+/// two will often not coincide — `Window::admit` is a **tumbling** minute
+/// admitting four per table key while a founder publishes about ten, so the
+/// budget is spent in the first ten seconds and the rest of the minute is
+/// deaf.
+///
+/// Measured: holes of 51.1 s (`split111249-10` n3, 77.1 to 128.2), 56.5 s
+/// (`split083343-9` far-n0, 26.2 to 82.7) and twice in one run, 49.9 s and
+/// 52.2 s (`split214929-9` n7, that run's slowest seat). In each of them the
+/// founder came up inside the hole and was not asked.
+///
+/// Pure and separate from the loop because the two bounds it carries are the
+/// whole safety argument for the new edge, and a bound that cannot be tested
+/// is a bound nobody checks.
+fn ask_for(
+    seen: bool,
+    founder_up: bool,
+    since_join_ask: Option<Duration>,
+    since_last_ask: Option<Duration>,
+    connect_asks: u32,
+) -> Option<Ask> {
+    if seen {
+        return Some(Ask::Advert);
+    }
+    // **Not while a join is already in flight, and this is not politeness.**
+    // The node refuses a second `JoinTable` for the whole life of the request,
+    // and the connection the request itself dialled is what raises this edge —
+    // so without the test the driver spends one of its eight asks on one
+    // nobody will take, at the exact moment it is closest to a seat. Measured
+    // in 21 of 524 joiner logs, which record the founder's connection dying
+    // with a request in flight; in each of those the edge was consumed by a
+    // dropped ask, and when the request then failed the founder was still
+    // connected, so no further connection event was ever raised for it and the
+    // driver was back to waiting for an advert the limiter is deaf to.
+    if founder_up
+        && since_join_ask.map_or(true, |d| d >= JOIN_ASK_LINGERS)
+        && connect_asks < MAX_CONNECT_ASKS
+        && since_last_ask.map_or(true, |d| d >= REASK_FLOOR)
+    {
+        return Some(Ask::FounderUp);
+    }
+    None
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -409,6 +505,18 @@ fn headless(player: Player, run: Run, join: Option<String>) {
         }
 
         let mut state = AppState::new();
+        // The last ask, whichever edge made it. A floor under the new
+        // edge, never a timer: it is read and never waited on.
+        let mut last_ask: Option<std::time::Instant> = None;
+        // Asks made by the founder-connection edge alone, against
+        // `MAX_CONNECT_ASKS`.
+        let mut connect_asks: u32 = 0;
+        // When this driver last asked for a seat and has heard nothing
+        // back. The node refuses a second `JoinTable` while the first is in
+        // flight, so an ask made inside `JOIN_ASK_LINGERS` of this would be
+        // spent on nothing — and it is an instant rather than a flag because
+        // the arms that answer with a warning alone would never clear one.
+        let mut join_asked: Option<std::time::Instant> = None;
         let deadline = async {
             match bounded {
                 Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
@@ -432,6 +540,30 @@ fn headless(player: Player, run: Run, join: Option<String>) {
                     // Folded through the same state the window uses, so the two
                     // modes cannot disagree about what happened.
                     let seen = matches!(event, NodeEvent::TableSeen { .. });
+                    // The founder becoming dialable, read off the event
+                    // **before** the fold consumes it: `AppState` folds this
+                    // one into a peer count and throws the id away, and the id
+                    // is the whole question. `PeerConnected` rather than an
+                    // identified poker peer, because the join request needs a
+                    // connection and not a negotiated protocol, and it is the
+                    // earlier of the two. The bytes compare directly: an
+                    // advert's `founder_peer_id` is the same encoding, so this
+                    // needs no parse and cannot fail.
+                    let connected: Option<Vec<u8>> = match &event {
+                        NodeEvent::PeerConnected(p) => Some(p.to_bytes()),
+                        _ => None,
+                    };
+                    // Every way a join this driver sent can end. `LeftTable`
+                    // carries the founder that did not answer, `JoinRefused` a
+                    // seat refused outright, and a seat is the success.
+                    if matches!(
+                        event,
+                        NodeEvent::LeftTable { .. }
+                            | NodeEvent::JoinRefused { .. }
+                            | NodeEvent::Seated { .. }
+                    ) {
+                        join_asked = None;
+                    }
                     // What the log had before, so only new lines are printed.
                     // Most events add none — a re-broadcast this client already
                     // holds, a peer count — and printing `log.back()` after
@@ -460,22 +592,70 @@ fn headless(player: Player, run: Run, join: Option<String>) {
                     // Checked **after** the fold, not before: the store is what
                     // the fold fills, and the first version asked it a question
                     // one event too early and never joined anything.
-                    if let (Some(want), true, None) = (&join, seen, state.seated.as_ref()) {
-                        let found = state
-                            .lobby
-                            .tables()
-                            .find(|l| &l.held.ad.table_name == want)
-                            .map(|l| (*l.key, l.held.ad.max_buyin));
-                        if let Some((key, buyin)) = found {
-                            println!("asking to join {want}");
-                            let _ = commands
-                                .send(NodeCommand::JoinTable {
-                                    key,
-                                    buyin,
-                                    seat: None,
-                                    password: None,
-                                })
-                                .await;
+                    if let (Some(want), None) = (&join, state.seated.as_ref()) {
+                        // Only the two edges reach the store. Every other
+                        // event — a peer count, a ping, a line of chat — leaves
+                        // this alone, exactly as before.
+                        if seen || connected.is_some() {
+                            let found = state
+                                .lobby
+                                .tables()
+                                .find(|l| &l.held.ad.table_name == want)
+                                .map(|l| {
+                                    (
+                                        *l.key,
+                                        l.held.ad.max_buyin,
+                                        l.held.ad.founder_peer_id.clone(),
+                                    )
+                                });
+                            if let Some((key, buyin, founder)) = found {
+                                // One decision for both edges, so the two
+                                // cannot disagree about which table they mean
+                                // or how often they may speak.
+                                let edge = ask_for(
+                                    seen,
+                                    connected.as_deref() == Some(founder.as_slice()),
+                                    join_asked.map(|t| t.elapsed()),
+                                    last_ask.map(|t| t.elapsed()),
+                                    connect_asks,
+                                );
+                                match edge {
+                                    Some(Ask::Advert) => println!("asking to join {want}"),
+                                    Some(Ask::FounderUp) => {
+                                        connect_asks += 1;
+                                        // Its own words, so a run can be
+                                        // counted rather than eyeballed.
+                                        println!(
+                                            "asking to join {want} (the founder is on the line)"
+                                        );
+                                    }
+                                    None => {}
+                                }
+                                // **The floor is the founder edge's own.**
+                                // It is there so one founder reached over two
+                                // transports is one ask, and an advert-edge ask
+                                // must not arm it: the join request is dropped
+                                // within the same poll when the swarm holds no
+                                // address for the founder, which is the ordinary
+                                // case, and the same command fires the query that
+                                // makes the founder dialable a second later. An
+                                // advert ask arming the floor therefore silenced
+                                // the founder edge in exactly the fast case.
+                                if edge == Some(Ask::FounderUp) {
+                                    last_ask = Some(std::time::Instant::now());
+                                }
+                                if edge.is_some() {
+                                    join_asked = Some(std::time::Instant::now());
+                                    let _ = commands
+                                        .send(NodeCommand::JoinTable {
+                                            key,
+                                            buyin,
+                                            seat: None,
+                                            password: None,
+                                        })
+                                        .await;
+                                }
+                            }
                         }
                     }
                 }
@@ -1350,5 +1530,75 @@ mod tests {
             .map(|s| (*s).to_owned())
             .collect();
         assert_eq!(software_args(&args), vec!["--table", "--renderer", "software"]);
+    }
+
+    /// The two edges a join needs, and the two bounds on the new one.
+    ///
+    /// The advert edge is what the driver has always had and is unchanged:
+    /// unbounded, and it wins whenever it fires. The founder edge is the one
+    /// the advert limiter made necessary, and it carries a floor and a
+    /// ceiling because it is triggered by something a peer can repeat.
+    #[test]
+    fn a_join_is_asked_for_on_either_edge_and_the_new_one_is_bounded() {
+        // The old behaviour, untouched: an advert asks, whatever else is true.
+        assert_eq!(ask_for(true, false, None, None, 0), Some(Ask::Advert));
+        assert_eq!(
+            ask_for(
+                true,
+                false,
+                Some(Duration::ZERO),
+                Some(Duration::from_millis(1)),
+                MAX_CONNECT_ASKS
+            ),
+            Some(Ask::Advert),
+            "the advert edge has no floor and no ceiling, and does not wait"
+        );
+
+        // The new edge: the founder came up while an advert was held.
+        assert_eq!(ask_for(false, true, None, None, 0), Some(Ask::FounderUp));
+        assert_eq!(
+            ask_for(false, true, None, Some(REASK_FLOOR), 0),
+            Some(Ask::FounderUp),
+            "the floor is inclusive"
+        );
+
+        // And its three bounds.
+        assert_eq!(
+            ask_for(false, true, None, Some(REASK_FLOOR - Duration::from_millis(1)), 0),
+            None,
+            "one founder reached over two transports is one ask, not two"
+        );
+        assert_eq!(
+            ask_for(false, true, None, None, MAX_CONNECT_ASKS),
+            None,
+            "and the ceiling holds even with no ask behind it"
+        );
+        assert_eq!(
+            ask_for(false, true, Some(Duration::ZERO), None, 0),
+            None,
+            "and an ask is not spent on one the node will refuse: the connection \
+             the join request itself dialled raises this edge"
+        );
+        assert_eq!(
+            ask_for(
+                false,
+                true,
+                Some(JOIN_ASK_LINGERS - Duration::from_millis(1)),
+                None,
+                0
+            ),
+            None,
+            "still silent while the request could still be answered"
+        );
+        assert_eq!(
+            ask_for(false, true, Some(JOIN_ASK_LINGERS), None, 0),
+            Some(Ask::FounderUp),
+            "but it is a window, not a latch: three arms of the node's join \
+             handler answer with a warning and no event, and a flag they never \
+             clear would silence this edge for the life of the process"
+        );
+
+        // Nothing at all: every other event leaves the driver alone.
+        assert_eq!(ask_for(false, false, None, None, 0), None);
     }
 }
