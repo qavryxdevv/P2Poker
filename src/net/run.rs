@@ -6044,6 +6044,16 @@ fn keep_for_next_hand(
         | Some(EventType::HandAbort)
         | Some(EventType::TimeoutVote)
         | Some(EventType::TimeoutCert) => Keep::No,
+        // **§4.10's boundary window is not a stage of the hand and must not be
+        // replayed into one.** The reachable case is narrow — a boundary event
+        // carries the id of the hand that **ended**, so this arm is reached only
+        // at a client a whole hand behind — and the disposition is the
+        // specification's own: a boundary event that finds no open window *"is
+        // rejected as out of stage; the seat re-emits at the next boundary"*.
+        // Buffering it instead would replay it into `HAND_INIT(k+1)`'s hand,
+        // where the only answer available is `WrongType`, which is the whole of
+        // `S1-BZ` reintroduced through a queue.
+        Some(k) if k.is_boundary() => Keep::No,
         Some(_) => Keep::Early,
         None => Keep::No,
     }
