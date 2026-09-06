@@ -618,6 +618,14 @@ pub enum Holding {
     Malformed,
 }
 
+/// How many events of a hand ahead of this one are held for the replay.
+///
+/// Sixty-four was written inline and is kept: it is four full collective stages
+/// at nine seats, which is what a client one boundary behind has to swallow.
+/// What changed with `S1-CD` is **which** entry goes when it is full — the
+/// highest sequence, never the oldest arrival.
+const EARLY_CAP: usize = 64;
+
 /// A settlement being collected while this client is in `Phase::Aborted`.
 ///
 /// The aborted peer never computed a settlement of its own, so it cannot
@@ -6707,8 +6715,36 @@ impl Hand {
         }
         // Bounded: this is fed from the network, and everything fed from the
         // network is bounded where it is consumed.
-        if self.early.len() >= 64 {
-            self.early.pop_front();
+        //
+        // **The highest sequence goes, not the oldest arrival, and that is the
+        // whole of `S1-CD`'s receiver half.** This was `pop_front`, which for a
+        // client walking stages upward evicts the run immediately above its
+        // cursor — precisely the frames it is about to need — and guarantees the
+        // replay stalls again at the next hole. Measured in `split135059-9`: a
+        // bystander stuck at stage 18 held this queue **saturated at 64** from
+        // 510 s to the end of the run while the frame it needed sat one
+        // sequence above its cursor.
+        //
+        // An arrival that is itself the highest is dropped rather than making
+        // room, for the same reason. `Holding::Kept` is still the answer, as it
+        // already is for a byte-duplicate above: it means the event was
+        // verified and answered — and it is what the relay decision reads — not
+        // that a slot was spent on it.
+        if self.early.len() >= EARLY_CAP {
+            let highest = self
+                .early
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    chained::peek(b, PEEK_CAP).ok().map(|(_, _, q)| (i, q))
+                })
+                .max_by_key(|(_, q)| *q);
+            match highest {
+                Some((i, q)) if q > opened.envelope.sequence => {
+                    self.early.remove(i);
+                }
+                _ => return Holding::Kept,
+            }
         }
         self.early.push_back(bytes);
         Holding::Kept
