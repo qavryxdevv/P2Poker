@@ -2312,7 +2312,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // the peer provably alive and the failure ours.
                         if let Some(peer) = lobby_dials.remove(&connection_id) {
                             if earns_a_fast_look(
-                                the_peers_own_dial_failure(&error),
+                                the_failure_mends_itself(&error),
                                 fast_budget,
                                 started.elapsed() < FAST_REDIAL_WINDOW,
                             ) {
@@ -6511,19 +6511,47 @@ fn publish_hand(
     }
 }
 
-/// Whether a dial failure is the **far end's** rather than this client's.
+/// Whether a dial failure is one that **mends by itself**, so that trying
+/// again in ten seconds is worth a slot.
+///
+/// **The question is transience, not blame, and this predicate was written
+/// around the wrong one.** It used to ask whether the failure was *the far
+/// end's rather than this client's*, and that principle is false for almost
+/// everything it selects. Reconstructing the multi-line `dial failed:` records
+/// across all 642 logs and keeping only those naming a peer offered as a lobby
+/// provider — the population `charge.is_some()` admits — gives 1 552
+/// `Transport` records, of which **1 479, 95%,** carry *"Response from
+/// behaviour was canceled: oneshot canceled"*. That is not the far end: it is
+/// `libp2p-relay` dialling the relay under the default
+/// `DisconnectedAndNotDialing` condition and dropping the pending circuit on
+/// any dial failure, so a circuit through a relay this client is **already
+/// dialling** dies synchronously. Ours, both ends of it — and it mends in
+/// seconds, when that relay is connected and the same address needs no dial at
+/// all. Which is the whole of `FAST_REDIAL_AFTER`'s argument, and it survives
+/// the correction untouched.
 ///
 /// The list is closed and short on purpose, and it is **two** members rather
-/// than the three it was written with. `Transport` is the far end not answering
-/// on any address offered; `WrongPeerId` is an address that belongs to somebody
-/// else, which is a stale record and mends itself when a fresher one arrives.
+/// than the three it was written with. `Transport` covers that relay collision
+/// and a stale address a later answer replaces; `WrongPeerId` is an address
+/// that belongs to somebody else, which is a stale record and mends the same
+/// way.
 ///
-/// Everything else is ours or is not a failure of the peer at all. `Denied` is
-/// this client's own connection limiter refusing a connection that was
-/// **already established**, so the peer is provably alive — counting it was the
-/// worst defect of this row's first design. `LocalPeerId` is dialling
-/// ourselves. `NoAddresses` and `DialPeerConditionFalse` are refused by
-/// `Swarm::dial` **by value** and never produce an event at all.
+/// Everything excluded is excluded because it does **not** mend on its own.
+/// `Denied` is this client's own connection limiter refusing a connection that
+/// was **already established**: the limiter is saturated and stays saturated,
+/// and counting it was the worst defect of this row's first design.
+/// `LocalPeerId` is dialling ourselves and will be true for ever.
+/// `NoAddresses` and `DialPeerConditionFalse` are refused by `Swarm::dial` **by
+/// value** and never produce an event at all.
+///
+/// **One imprecision left in, deliberately.** Across the whole corpus 62% of
+/// `Transport` records are *"Unsupported resolved address"* — this client's own
+/// transport unable to dial a webtransport or webrtc-direct address, which
+/// never mends in ten seconds. They do not reach the lane, but only because
+/// they name relay-key providers that `charge.is_some()` excludes, not because
+/// this predicate excludes them. Telling them apart needs matching on a
+/// formatted error string, which is a worse dependency than the imprecision:
+/// the cost of admitting one is a single extra dial out of a budget of 128.
 ///
 /// **`Aborted` was in this list and is not, and it was wrong twice over.** It
 /// is produced in exactly one place — `libp2p-swarm-0.47.1`
@@ -6536,7 +6564,7 @@ fn publish_hand(
 /// does not use. So the arm was unreachable — and had it ever been reached it
 /// would have meant **this client cancelled its own dial**, which is `Denied`'s
 /// class and the opposite of the sentence that admitted it.
-fn the_peers_own_dial_failure(error: &libp2p::swarm::DialError) -> bool {
+fn the_failure_mends_itself(error: &libp2p::swarm::DialError) -> bool {
     matches!(
         error,
         libp2p::swarm::DialError::Transport(_) | libp2p::swarm::DialError::WrongPeerId { .. }
@@ -8042,22 +8070,26 @@ mod tests {
 
 #[cfg(test)]
 mod the_fast_lane {
-    use super::{earns_a_fast_look, the_peers_own_dial_failure, FAST_REDIAL_BUDGET};
+    use super::{earns_a_fast_look, the_failure_mends_itself, FAST_REDIAL_BUDGET};
     use libp2p::swarm::DialError;
 
-    /// **Which failures are the peer's, and it is the closed list that matters.**
+    /// **Which failures mend by themselves, and it is the closed list that
+    /// matters.**
     ///
     /// The first shape of `S1-CB` counted every `OutgoingConnectionError`, and
     /// the one that made it net harmful was `Denied` — this client's own
     /// connection limiter refusing a connection that was **already
-    /// established**, so the peer is provably alive. The arm above it swallows
+    /// established**. It is excluded because a saturated limiter stays
+    /// saturated, not because of whose fault it is: 95% of the `Transport`
+    /// failures this predicate *admits* are also this client's own, and they
+    /// are admitted because they clear in seconds. The arm above swallows
     /// `Denied` only while the connection budget is below its ceiling, and 637
     /// of the 644 logs on disk reach that ceiling at a median of 24.4 s, so for
-    /// most of every run it fell straight through to the counter.
+    /// most of every run it falls straight through to the counter.
     #[test]
-    fn only_the_far_end_s_own_failures_buy_a_second_look() {
-        assert!(the_peers_own_dial_failure(&DialError::Transport(Vec::new())));
-        assert!(the_peers_own_dial_failure(&DialError::WrongPeerId {
+    fn only_failures_that_mend_by_themselves_buy_a_second_look() {
+        assert!(the_failure_mends_itself(&DialError::Transport(Vec::new())));
+        assert!(the_failure_mends_itself(&DialError::WrongPeerId {
             obtained: libp2p::PeerId::random(),
             address: "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
         }));
@@ -8070,7 +8102,7 @@ mod the_fast_lane {
         // is open. So for most of the window this predicate is the only thing
         // between this client's own limiter refusing an **already established**
         // connection and that peer being charged a failure for it.
-        assert!(!the_peers_own_dial_failure(&DialError::Denied {
+        assert!(!the_failure_mends_itself(&DialError::Denied {
             cause: libp2p::swarm::ConnectionDenied::new(std::io::Error::other("our own limiter")),
         }));
 
@@ -8081,20 +8113,20 @@ mod the_fast_lane {
         // and `ToSwarm::CloseConnection` — neither of which this tree contains.
         // It was admitted to the list as *"the connection dropped in flight"*,
         // which is the opposite of what it means.
-        assert!(!the_peers_own_dial_failure(&DialError::Aborted));
+        assert!(!the_failure_mends_itself(&DialError::Aborted));
 
         assert!(
-            !the_peers_own_dial_failure(&DialError::LocalPeerId {
+            !the_failure_mends_itself(&DialError::LocalPeerId {
                 address: "/ip4/127.0.0.1/tcp/1".parse().unwrap(),
             }),
             "dialling ourselves is not the peer's fault"
         );
         assert!(
-            !the_peers_own_dial_failure(&DialError::NoAddresses),
+            !the_failure_mends_itself(&DialError::NoAddresses),
             "no address is this client's own view, not a failure of the peer"
         );
         assert!(
-            !the_peers_own_dial_failure(&DialError::DialPeerConditionFalse(
+            !the_failure_mends_itself(&DialError::DialPeerConditionFalse(
                 libp2p::swarm::dial_opts::PeerCondition::Disconnected
             )),
             "a condition this client set is this client's"
