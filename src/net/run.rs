@@ -6473,31 +6473,92 @@ fn link_is_down() -> bool {
 /// two answer different questions.
 #[cfg(feature = "fault-harness")]
 fn mouth_is_shut() -> bool {
-    use std::sync::OnceLock;
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    static WINDOW: OnceLock<Option<(u64, u64)>> = OnceLock::new();
-    let start = START.get_or_init(std::time::Instant::now);
-    let window = WINDOW.get_or_init(|| {
-        let at = std::env::var("P2P_POKER_MUTE_AT")
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()?;
-        let dur = std::env::var("P2P_POKER_MUTE_FOR")
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()?;
-        Some((at, dur))
-    });
-    match window {
+    match mute_window() {
         Some((at, dur)) => {
-            let s = start.elapsed().as_secs();
-            s >= *at && s < at.saturating_add(*dur)
+            if on_turn() {
+                // Armed by `arm_the_mute`, at the first action this client
+                // would publish at or after `at`. Before that it is silent
+                // about nothing.
+                match *mute_armed().lock().expect("the mute clock") {
+                    Some(armed) => armed.elapsed().as_secs() < dur,
+                    None => false,
+                }
+            } else {
+                let s = mute_start().elapsed().as_secs();
+                s >= at && s < at.saturating_add(dur)
+            }
         }
         None => false,
     }
 }
+
+/// When this loop started, for the wall-clock form of the mute.
+#[cfg(feature = "fault-harness")]
+fn mute_start() -> &'static std::time::Instant {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now)
+}
+
+/// `(at, for)`, read once.
+#[cfg(feature = "fault-harness")]
+fn mute_window() -> Option<(u64, u64)> {
+    static WINDOW: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let at = std::env::var("P2P_POKER_MUTE_AT").ok()?.trim().parse::<u64>().ok()?;
+        let dur = std::env::var("P2P_POKER_MUTE_FOR").ok()?.trim().parse::<u64>().ok()?;
+        Some((at, dur))
+    })
+}
+
+/// Whether the window is measured from this seat's own turn.
+#[cfg(feature = "fault-harness")]
+fn on_turn() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("P2P_POKER_MUTE_ON_TURN").is_ok())
+}
+
+/// The instant the on-turn window was armed, if it has been.
+#[cfg(feature = "fault-harness")]
+fn mute_armed() -> &'static std::sync::Mutex<Option<std::time::Instant>> {
+    static ARMED: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    ARMED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// **Arm the mute on the first action this client would publish**, at or after
+/// `P2P_POKER_MUTE_AT`.
+///
+/// A mute measured in seconds costs the table nothing unless the seat happens
+/// to be due to act inside it, and whether it is depends on where the button
+/// was when the run started — which is why four runs of one recipe produced
+/// four different outcomes (`S1-CD`). Armed here, the seat is silent across a
+/// turn it certainly owed, which is what the table has to miss for a
+/// certificate to form.
+#[cfg(feature = "fault-harness")]
+fn arm_the_mute(kind: crate::protocol::messages::EventType) {
+    use crate::protocol::messages::EventType as E;
+    if !on_turn() {
+        return;
+    }
+    if !matches!(
+        kind,
+        E::ActionCheck | E::ActionCall | E::ActionBet | E::ActionRaise | E::ActionFold
+    ) {
+        return;
+    }
+    let Some((at, _)) = mute_window() else { return };
+    if mute_start().elapsed().as_secs() < at {
+        return;
+    }
+    let mut armed = mute_armed().lock().expect("the mute clock");
+    if armed.is_none() {
+        *armed = Some(std::time::Instant::now());
+    }
+}
+
+/// Nothing to arm in a build without the harness.
+#[cfg(not(feature = "fault-harness"))]
+fn arm_the_mute(_kind: crate::protocol::messages::EventType) {}
 
 /// The constant `false`, in every build that did not ask for the harness.
 #[cfg(not(feature = "fault-harness"))]
@@ -6552,8 +6613,15 @@ fn publish_hand(
     tox: &super::toxsink::TableSink,
 ) {
     let _ = swarm;
-    let down = nothing_leaves();
     for crate::table::hand::Send::Broadcast(out) in sends {
+        // **Arm the on-turn mute before asking whether anything may leave**,
+        // so the window starts at the action this client owed rather than at a
+        // second on the clock. A no-op in every other mode and in every build
+        // without the harness.
+        if let Ok((kind, _, _)) = crate::net::chained::peek(&out, TABLE_FRAME_PEEK) {
+            arm_the_mute(kind);
+        }
+        let down = nothing_leaves();
         if down {
             // Nothing leaves. It is still put in `said`, because `said` is the
             // re-send buffer and a message that could not go out is exactly what

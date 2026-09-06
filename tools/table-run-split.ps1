@@ -105,6 +105,15 @@ param(
     [ValidateRange(0, 3600)][int]$MuteAt = 0,
     [ValidateRange(0, 3600)][int]$MuteFor = 0,
     [ValidateRange(0, 8)][int]$MuteSeat = 0,
+    # `-MuteOnTurn` measures the mute window from the first ACTION that seat
+    # would publish at or after -MuteAt, instead of from -MuteAt itself.
+    #
+    # Four runs of the same wall-clock recipe gave four different outcomes,
+    # because a mute in seconds costs the table nothing unless the seat happens
+    # to be due to act inside it, and whether it is depends on where the button
+    # was when the run started. On the turn it is silent across a turn it
+    # certainly owed, which is what the table has to miss for a certificate.
+    [switch]$MuteOnTurn,
     # `-DelayCertsHere <n>` puts -DelayCerts on a LOCAL seat instead of a far
     # one. The two knobs are the same instrument; only the node it is set on
     # differs, and the far-only wiring was an accident of where the shape was
@@ -260,7 +269,7 @@ Write-Host "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not rea
 Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on $(if ($DelayCertsHere -ge 0) { "local seat $DelayCertsHere" } else { "far seat $DelayCertsSeat" })$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
 Write-Host "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
 Write-Host "think  $(if ($Think -gt 0) { "every seat waits ${Think} ms before it acts - a SLOW table, not comparable with the rest of the corpus" } else { 'no delay: seats act at once' })"
-Write-Host "mute   $(if ($MuteFor -gt 0) { "local seat $MuteSeat sends no hand message from $MuteAt s for $MuteFor s and hears everything (fault-harness)$(if ($MuteFor -le 30) { ' - WARNING: under the 30 s decision deadline, so the table will not vote it out' })" } else { 'nobody is muted' })"
+Write-Host "mute   $(if ($MuteFor -gt 0) { "local seat $MuteSeat sends no hand message for $MuteFor s $(if ($MuteOnTurn) { "from its first action at or after $MuteAt s" } else { "from $MuteAt s" }) and hears everything (fault-harness)$(if ($MuteFor -le 30) { ' - WARNING: under the 30 s decision deadline, so the table will not vote it out' })" } else { 'nobody is muted' })"
 Write-Host "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
 Write-Host "work   $work"
 Write-Host ''
@@ -498,6 +507,7 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         if ($MuteFor -gt 0 -and $i -eq $MuteSeat) {
             $knobs['P2P_POKER_MUTE_AT'] = "$MuteAt"
             $knobs['P2P_POKER_MUTE_FOR'] = "$MuteFor"
+            if ($MuteOnTurn) { $knobs['P2P_POKER_MUTE_ON_TURN'] = '1' }
         }
         if ($DeafFor -gt 0 -and $i -eq $DeafSeat) {
             $knobs['P2P_POKER_DEAF_AT'] = "$DeafAt"
