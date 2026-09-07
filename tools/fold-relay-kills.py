@@ -51,6 +51,18 @@ LINE = re.compile(
 STAMP = re.compile(r'^\d\d:\d\d:\d\d\.\d\d\d\s+([0-9.]+)\s')
 CONNECTED = 2
 
+# **The correlation this tool exists to refuse as well as to report.**
+#
+# The tempting story is: the reaper takes the REGISTERED slot, so the next
+# group handshake has no path and fails. If that were happening, a handshake
+# failure would follow a kill ON THE SAME NODE more often than chance. So the
+# tool prints that comparison beside the counts, and prints what chance alone
+# predicts, because a raw count of coincidences persuades and a comparison
+# does not.
+FAIL = re.compile(r'no TCP relay carried it either')
+OK = re.compile(r'out-of-band REGISTERED relay carried')
+WINDOW = 30.0
+
 
 def fold(run):
     d = os.path.join('runs', run)
@@ -102,6 +114,47 @@ def fold(run):
             lost_online, lost_registered, lost_neither, no_breakdown)
 
 
+def against_failures(run):
+    """Do handshake failures follow kills on the same node? -> (fails, after,
+    expected_by_chance, oob_successes, span_seconds)"""
+    d = os.path.join('runs', run)
+    fails = after = oks = 0
+    covered = 0.0
+    logs = 0
+    horizon = 0.0
+    for f in sorted(os.listdir(d)):
+        if not f.endswith('.log'):
+            continue
+        logs += 1
+        ks, fs = [], []
+        last_t = 0.0
+        for raw in io.open(os.path.join(d, f), encoding='utf-8', errors='replace'):
+            m = STAMP.match(raw)
+            if not m:
+                continue
+            t = float(m.group(1))
+            last_t = max(last_t, t)
+            if LINE.search(raw):
+                ks.append(t)
+            elif FAIL.search(raw):
+                fs.append(t)
+            elif OK.search(raw):
+                oks += 1
+        fails += len(fs)
+        after += len([t for t in fs if any(0 <= t - k <= WINDOW for k in ks)])
+        span = []
+        for k in sorted(ks):
+            a, b = k, k + WINDOW
+            if span and a <= span[-1][1]:
+                span[-1] = (span[-1][0], max(span[-1][1], b))
+            else:
+                span.append((a, b))
+        covered += sum(b - a for a, b in span)
+        horizon += last_t
+    frac = (covered / horizon) if horizon else 0.0
+    return fails, after, frac * fails, oks, frac
+
+
 def main():
     root = 'runs'
     want = sys.argv[1:] or sorted(
@@ -137,6 +190,13 @@ def main():
         if first is not None:
             print('  between %.0f s and %.0f s into the run' % (first, last))
         print('  per node: %s' % dict(per_node))
+        fails, after, expected, oks, frac = against_failures(run)
+        if fails or oks:
+            print('  handshake failures %d, out-of-band successes %d' % (fails, oks))
+            print('  failures within %.0f s AFTER a kill on the same node: '
+                  '%d, against %.1f expected by chance (post-kill windows '
+                  'cover %.1f %% of the run)'
+                  % (WINDOW, after, expected, frac * 100))
         print()
     if silent:
         if len(silent) == len(want):
