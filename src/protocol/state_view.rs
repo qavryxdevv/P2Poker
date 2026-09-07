@@ -160,7 +160,20 @@ pub struct PublicTableState {
     #[n(26)]
     pub ledger_out: u64,
 
-    /// The stage hash of the last completed stage.
+    /// The stage hash the settlement **chains from**.
+    ///
+    /// **§6.1 calls this *“the stage hash of the last completed stage”* and it
+    /// cannot be that** (`S1-CJ`). This value is `slot.previous_event_hash`
+    /// read while `HandComplete` is being **built** — `state_hash` is a field
+    /// of that struct — so the `HAND_COMPLETE` stage has not been sealed, let
+    /// alone completed. A field cannot carry the hash of the stage that
+    /// carries it, so no implementation can satisfy the sentence.
+    ///
+    /// It is harmless because every peer computes it identically, and the
+    /// comment is corrected rather than the code: which of the two moves is a
+    /// wire-format decision under §10.2's pre-release deadline and belongs to
+    /// the owner. The `STATE_HASH` frame's field of the same name carries
+    /// `TERMINAL(k)` instead, one stage later — see `table::checkwire`.
     #[cbor(n(27), with = "minicbor::bytes")]
     pub transcript_head: [u8; 32],
 }
