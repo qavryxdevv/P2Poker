@@ -297,17 +297,33 @@ $table = "split$stamp-$seats"
 $work = Join-Path $repoRoot (Join-Path 'runs' $table)
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-Write-Host "table  $table"
-Write-Host "seats  $seats  ($Here here, $There on $Target)"
-Write-Host "for    $Seconds s"
-Write-Host "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
-Write-Host "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
-Write-Host "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on $(if ($DelayCertsHere -ge 0) { "local seat $DelayCertsHere" } else { "far seat $DelayCertsSeat" })$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
-Write-Host "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
-Write-Host "think  $(if ($Think -gt 0) { "every seat waits ${Think} ms before it acts - a SLOW table, not comparable with the rest of the corpus" } else { 'no delay: seats act at once' })"
-Write-Host "mute   $(if ($MuteFor -gt 0) { "local seat $MuteSeat sends no hand message for $MuteFor s $(if ($MuteOnTurn) { "from its first action at or after $MuteAt s" } else { "from $MuteAt s" }) and hears everything (fault-harness)$(if ($MuteFor -le 30) { ' - WARNING: under the 30 s decision deadline, so the table will not vote it out' })" } else { 'nobody is muted' })"
-Write-Host "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
-Write-Host "work   $work"
+# **The header goes to the archive as well as to the terminal, and it is built
+# once so the two cannot disagree.**
+#
+# A run directory used to hold only the logs and `far.ps1`. `far.ps1` records the
+# FAR seat's arguments; every fault knob is applied to a LOCAL seat, so nothing
+# in `runs/<name>/` said whether a run was clean or muted. Every fold over the
+# corpus then has to guess, and a fold that guesses wrong reads a manufactured
+# silence as a natural one -- which is exactly the distinction `S1-BB` turns on.
+# It cost two readings on 2026-09-07 before anybody noticed the archive could not
+# answer the question at all.
+$header = @(
+    "table  $table"
+    "seats  $seats  ($Here here, $There on $Target)"
+    "for    $Seconds s"
+    "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
+    "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
+    "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on $(if ($DelayCertsHere -ge 0) { "local seat $DelayCertsHere" } else { "far seat $DelayCertsSeat" })$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
+    "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
+    "think  $(if ($Think -gt 0) { "every seat waits ${Think} ms before it acts - a SLOW table, not comparable with the rest of the corpus" } else { 'no delay: seats act at once' })"
+    "mute   $(if ($MuteFor -gt 0) { "local seat $MuteSeat sends no hand message for $MuteFor s $(if ($MuteOnTurn) { "from its first action at or after $MuteAt s" } else { "from $MuteAt s" }) and hears everything (fault-harness)$(if ($MuteFor -le 30) { ' - WARNING: under the 30 s decision deadline, so the table will not vote it out' })" } else { 'nobody is muted' })"
+    "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
+    "work   $work"
+)
+$header | ForEach-Object { Write-Host $_ }
+# Written before the seats start, so a run that dies half way still says what it
+# was. `-Encoding utf8` to match the logs beside it.
+$header | Out-File -FilePath (Join-Path $work 'run.txt') -Encoding utf8
 # **`S1-AY`: the far box has four logical processors and the split can starve
 # it.** Measured, and the numbers are the row's: with five seats there the far
 # half opened 11 to 14 hands where the local half opened 31 and 32, and moving
