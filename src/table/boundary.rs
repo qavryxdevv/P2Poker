@@ -51,7 +51,7 @@
 //! that can come to disagree. A `Boundary` whose record the store has released
 //! would accept events into a stage nothing compares.
 //!
-//! # §4.10's hand boundary window lives here too, and closes earlier
+//! # §4.10's hand boundary window lives beside the checkpoint, not inside it
 //!
 //! The window carrying `PLAYER_SIT_OUT`, `PLAYER_SIT_IN` and `PLAYER_LEAVE`
 //! opens at the same instant this checkpoint does — `TERMINAL(k)` fixed — and
@@ -60,13 +60,25 @@
 //! three chained types were declared on the wire and answered with *wrong type*
 //! by the only handler that saw them.
 //!
+//! **It was folded into [`Boundary`] and that was wrong, on the one path that
+//! matters.** The two open at the same instant but not on the same paths.
+//! `Boundaries::open` is reached only through `Hand::checkpoint8`, which is
+//! `None` after an abort — §6.2 row 8's aborted checkpoint is `S1-R` and is not
+//! built — so a window inside the checkpoint existed on the **settled path
+//! alone**. §4.10 places the window on both, and gives the abort path's parent
+//! by name: `ABORT_TERMINAL(k)`, *"a function of `GENESIS(k)` alone"*, which
+//! needs no stage and no agreement about the middle of the hand. **And the
+//! abort path is the one a seat goes quiet on**, so the half that was missing
+//! was the half the window's whole population lives in. It has its own store
+//! now, opened from [`Hand::terminal`], which answers §3.1's question on both
+//! paths.
+//!
 //! **It closes at T47 and the checkpoint does not**, and the two dates are not
 //! interchangeable. §4.10: the window *"closes at this receiver's acceptance of a
 //! complete `HAND_INIT(k+1)`"*. §4.9: the checkpoint-8 `STATE_ACK` stage *"is not
 //! closed by that window"* (`N6`) and the `Boundary` is retained past it. So
 //! [`Boundaries::cross_boundary`] shuts every window it holds and prunes
-//! nothing, and a `Boundary` with a closed window is the ordinary state of the
-//! one hand still being acknowledged.
+//! neither.
 //!
 //! **What the window does, and the short list is the point.** A `PLAYER_SIT_IN`
 //! makes its sender an **accepted** emitter of the next `HAND_INIT` this
@@ -102,14 +114,6 @@ pub struct Boundary {
     /// `P(k)`, snapshot at `TERMINAL(k)`. The required set of both stages, and
     /// the set §4.4 draws hand `k+1`'s `dealt_in` from.
     participants: Vec<SeatIdx>,
-    /// Every **occupied** seat of the table: the `STATE_HASH` stage's accepted
-    /// set, and §4.10's *"any occupied seat"*.
-    ///
-    /// Kept beside the stage that already has it because the boundary window
-    /// asks the same question of a seat that never contributed to either stage,
-    /// and reaching into a `Collective` for a set it holds for its own purposes
-    /// is how two readers come to disagree about what the set is for.
-    roster: Vec<SeatIdx>,
     /// This peer's own `state_hash`, repeated in its acknowledgement.
     own: Hash,
     /// This peer's own `STATE_HASH` **event**, kept whole.
@@ -141,7 +145,26 @@ pub struct Boundary {
     /// completion would produce a second ack and read as equivocation to
     /// everybody else.
     ack_sent: bool,
-    /// §4.10's hand boundary window: what each seat said at this boundary.
+}
+
+
+/// §4.10's **hand boundary window** for one hand, and nothing else.
+///
+/// Its own type and its own store, because it opens on **both** terminal paths
+/// while §4.9's checkpoint is built on one — see the module doc. It holds no
+/// stage: §4.10 says the window *"has no `stage_hash`"*, nothing chains from it,
+/// and it is *"a fan and not a chain"*.
+#[derive(Debug, Clone)]
+pub struct Window {
+    hand_id: u64,
+    /// `TERMINAL(k)`, the one parent every event of this window carries.
+    terminal: Hash,
+    /// `P(k)` at `TERMINAL(k)`. Only `PLAYER_SIT_IN` reads it, to refuse a copy
+    /// from a seat that is already inside.
+    participants: Vec<SeatIdx>,
+    /// Every **occupied** seat of the table — §4.10's *"any occupied seat"*.
+    roster: Vec<SeatIdx>,
+    /// What each seat said here.
     ///
     /// **One entry per seat and the type is what it says.** §4.10: *"A seat may
     /// emit at most one boundary event for hand `k`; a second, of any type, is a
@@ -153,10 +176,71 @@ pub struct Boundary {
     /// A `BTreeMap`, so reading it back is §4.10's total order — *"ascending
     /// seat index, which the `sequence` rule already fixes"* — without a
     /// tie-break anywhere.
-    window: BTreeMap<SeatIdx, EventType>,
-    /// Whether the window still admits events. Closed at T47; see the module
-    /// doc for why this is not the checkpoint's own lifetime.
-    window_open: bool,
+    said: BTreeMap<SeatIdx, EventType>,
+    /// Whether it still admits events. Closed at T47.
+    open: bool,
+}
+
+impl Window {
+    pub fn hand_id(&self) -> u64 {
+        self.hand_id
+    }
+    /// `TERMINAL(k)`: what every event of this window must chain from.
+    pub fn terminal(&self) -> Hash {
+        self.terminal
+    }
+    /// Whether §4.10's hand boundary window still admits events here.
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+    /// What each seat said at this boundary, in §4.10's total order.
+    pub fn said(&self) -> Vec<(SeatIdx, EventType)> {
+        self.said.iter().map(|(s, k)| (*s, *k)).collect()
+    }
+    /// One event of §4.10's hand boundary window, already opened and verified
+    /// by the caller against this boundary's `terminal` and the seat's own slot.
+    ///
+    /// **What this decides and what it does not.** It decides the two rules that
+    /// are this store's — the window is open, and one event per seat per
+    /// boundary — and §4.10's one type-specific legality condition, that a
+    /// `PLAYER_SIT_IN` from a seat already in `P(k)` *"decides nothing"*. The
+    /// envelope rules are the caller's, because they are decided from the
+    /// event's own bytes and this type never sees them.
+    ///
+    /// **Two clauses of §4.10 are deliberately not enforced anywhere, and
+    /// saying so is better than a check that looks like one.**
+    ///
+    /// * *"with a non-zero stack"*. This store holds no stacks, and admitting a
+    ///   busted seat costs nothing that can be measured: `A` widens the
+    ///   **accepted** set of `HAND_INIT(k+1)` and never the required one, a seat
+    ///   in it completes no stage, and `Hand::next_hand` filters `required` and
+    ///   `dealt_in` through its own `alive` before either reaches a genesis. The
+    ///   clause is a legality nicety here and not a safety property.
+    /// * *"and has not been removed under D-014"*. **No such set exists in this
+    ///   tree.** `security/validation.rs` adjudicates a tier-1 or tier-2 finding
+    ///   and nothing retains the verdict against a seat, so there is nothing to
+    ///   consult. Enforcing it needs the removal set first, which is D-014's own
+    ///   work and not this row's.
+    pub fn take_boundary_event(&mut self, seat: SeatIdx, kind: EventType) -> WindowTook {
+        if !self.open {
+            return WindowTook::Closed;
+        }
+        if !self.roster.contains(&seat) {
+            return WindowTook::NotASeat;
+        }
+        // **Before the type test, because a second event is a violation
+        // whichever type it is.** A seat that sat out and then asked to sit in
+        // at one boundary has said two things about one hand, and §4.10 answers
+        // that with a stage violation rather than with the later of the two.
+        if self.said.contains_key(&seat) {
+            return WindowTook::AlreadySpoke;
+        }
+        if kind == EventType::PlayerSitIn && self.participants.contains(&seat) {
+            return WindowTook::DecidesNothing;
+        }
+        self.said.insert(seat, kind);
+        WindowTook::Took(kind)
+    }
 }
 
 /// What became of one event of §4.10's hand boundary window.
@@ -196,58 +280,6 @@ impl Boundary {
     /// `P(k)`.
     pub fn participants(&self) -> &[SeatIdx] {
         &self.participants
-    }
-    /// Whether §4.10's hand boundary window still admits events here.
-    pub fn window_is_open(&self) -> bool {
-        self.window_open
-    }
-    /// What each seat said at this boundary, in §4.10's total order.
-    pub fn window(&self) -> Vec<(SeatIdx, EventType)> {
-        self.window.iter().map(|(s, k)| (*s, *k)).collect()
-    }
-    /// One event of §4.10's hand boundary window, already opened and verified
-    /// by the caller against this boundary's `terminal` and the seat's own slot.
-    ///
-    /// **What this decides and what it does not.** It decides the two rules that
-    /// are this store's — the window is open, and one event per seat per
-    /// boundary — and §4.10's one type-specific legality condition, that a
-    /// `PLAYER_SIT_IN` from a seat already in `P(k)` *"decides nothing"*. The
-    /// envelope rules are the caller's, because they are decided from the
-    /// event's own bytes and this type never sees them.
-    ///
-    /// **Two clauses of §4.10 are deliberately not enforced anywhere, and
-    /// saying so is better than a check that looks like one.**
-    ///
-    /// * *"with a non-zero stack"*. This store holds no stacks, and admitting a
-    ///   busted seat costs nothing that can be measured: `A` widens the
-    ///   **accepted** set of `HAND_INIT(k+1)` and never the required one, a seat
-    ///   in it completes no stage, and `Hand::next_hand` filters `required` and
-    ///   `dealt_in` through its own `alive` before either reaches a genesis. The
-    ///   clause is a legality nicety here and not a safety property.
-    /// * *"and has not been removed under D-014"*. **No such set exists in this
-    ///   tree.** `security/validation.rs` adjudicates a tier-1 or tier-2 finding
-    ///   and nothing retains the verdict against a seat, so there is nothing to
-    ///   consult. Enforcing it needs the removal set first, which is D-014's own
-    ///   work and not this row's.
-    pub fn take_boundary_event(&mut self, seat: SeatIdx, kind: EventType) -> WindowTook {
-        if !self.window_open {
-            return WindowTook::Closed;
-        }
-        if !self.roster.contains(&seat) {
-            return WindowTook::NotASeat;
-        }
-        // **Before the type test, because a second event is a violation
-        // whichever type it is.** A seat that sat out and then asked to sit in
-        // at one boundary has said two things about one hand, and §4.10 answers
-        // that with a stage violation rather than with the later of the two.
-        if self.window.contains_key(&seat) {
-            return WindowTook::AlreadySpoke;
-        }
-        if kind == EventType::PlayerSitIn && self.participants.contains(&seat) {
-            return WindowTook::DecidesNothing;
-        }
-        self.window.insert(seat, kind);
-        WindowTook::Took(kind)
     }
     /// The `stage_hash` of the `STATE_HASH` stage, once it is complete. This is
     /// `STATE_ACK`'s `checkpoint_hash`.
@@ -463,6 +495,9 @@ pub enum Took {
 pub struct Boundaries {
     store: CheckpointStore,
     open: BTreeMap<u64, Boundary>,
+    /// §4.10's windows, by hand. **Separate from `open`**, because a window is
+    /// opened on the abort path where no checkpoint is (see the module doc).
+    windows: BTreeMap<u64, Window>,
 }
 
 impl Default for Boundaries {
@@ -476,6 +511,7 @@ impl Boundaries {
         Boundaries {
             store: CheckpointStore::new(),
             open: BTreeMap::new(),
+            windows: BTreeMap::new(),
         }
     }
 
@@ -533,13 +569,13 @@ impl Boundaries {
                 hash_stage,
                 ack_stage,
                 ack_sent: false,
-                roster: roster.to_vec(),
-                // §4.10's window opens at the same instant this checkpoint
-                // does, because both open at `TERMINAL(k)`.
-                window: BTreeMap::new(),
-                window_open: true,
             },
         );
+        // §4.10's window opens at the same instant, because both open at
+        // `TERMINAL(k)` — through the same call here, and through
+        // [`Boundaries::open_window`] on the abort path, where this one is
+        // never reached.
+        self.open_window(hand_id, terminal, participants, roster);
         self.prune();
         self.open.get(&hand_id)
     }
@@ -551,6 +587,55 @@ impl Boundaries {
     /// `N6`, *"the checkpoint-8 `STATE_ACK` stage is not closed by that
     /// window"* — and what the window bounds is the admission of a `STATE_HASH`,
     /// because that is the only checkpoint-8 event that can grow `P(k)`.
+    /// Open §4.10's hand boundary window for hand `k`, with no checkpoint.
+    ///
+    /// **The abort path's entry point, and the reason this store is separate.**
+    /// §6.2 row 8's aborted-path checkpoint is `S1-R` and is not built, so
+    /// [`Boundaries::open`] is unreachable after an abort — and §4.10 places the
+    /// window on **both** terminal paths, with `ABORT_TERMINAL(k)` as the
+    /// parent. Idempotent: a second call for a hand already held changes
+    /// nothing, so the settled path calling both is safe.
+    pub fn open_window(
+        &mut self,
+        hand_id: u64,
+        terminal: Hash,
+        participants: &[SeatIdx],
+        roster: &[SeatIdx],
+    ) {
+        if self.windows.contains_key(&hand_id) {
+            return;
+        }
+        self.windows.insert(
+            hand_id,
+            Window {
+                hand_id,
+                terminal,
+                participants: participants.to_vec(),
+                roster: roster.to_vec(),
+                said: BTreeMap::new(),
+                open: true,
+            },
+        );
+        // Two hands' worth, which is one more than §4.10 can have open at once:
+        // a window closes at `HAND_INIT(k+1)` and the next opens at
+        // `TERMINAL(k+1)`, so the extra slot is for the one just closed and
+        // still worth reading.
+        while self.windows.len() > 2 {
+            let oldest = *self.windows.keys().next().expect("non-empty");
+            self.windows.remove(&oldest);
+        }
+    }
+
+    /// The window for hand `k`, open or closed, while this peer still holds one.
+    pub fn window(&self, hand_id: u64) -> Option<&Window> {
+        self.windows.get(&hand_id)
+    }
+
+    /// Whether §4.10's window for hand `k` is open here.
+    pub fn window_is_open(&self, hand_id: u64) -> bool {
+        self.windows.get(&hand_id).is_some_and(|w| w.is_open())
+    }
+
     pub fn cross_boundary(&mut self) {
         self.store.cross_boundary();
         // **§4.10's window closes here and the checkpoint does not.** T47 *is*
@@ -559,8 +644,8 @@ impl Boundaries {
         // `N6`. Every window held is shut rather than the newest one, because a
         // window for a hand older than the one crossing was already closed by
         // the crossing before it and shutting it twice is free.
-        for b in self.open.values_mut() {
-            b.window_open = false;
+        for w in self.windows.values_mut() {
+            w.open = false;
         }
         self.prune();
     }
@@ -578,8 +663,8 @@ impl Boundaries {
         seat: SeatIdx,
         kind: EventType,
     ) -> WindowTook {
-        match self.open.get_mut(&hand_id) {
-            Some(b) => b.take_boundary_event(seat, kind),
+        match self.windows.get_mut(&hand_id) {
+            Some(w) => w.take_boundary_event(seat, kind),
             None => WindowTook::Closed,
         }
     }
@@ -1329,12 +1414,12 @@ mod the_boundary_window {
     #[test]
     fn the_window_opens_with_the_checkpoint_and_takes_a_sit_in_from_outside_p() {
         let mut b = open_one();
-        assert!(b.get(4).expect("held").window_is_open());
+        assert!(b.window_is_open(4));
         assert_eq!(
             b.on_boundary_event(4, 2, EventType::PlayerSitIn),
             WindowTook::Took(EventType::PlayerSitIn)
         );
-        assert_eq!(b.get(4).expect("held").window(), vec![(2, EventType::PlayerSitIn)]);
+        assert_eq!(b.window(4).expect("held").said(), vec![(2, EventType::PlayerSitIn)]);
     }
 
     /// §4.10: *"A copy from a seat already in `P(k)` decides nothing and is
@@ -1347,7 +1432,7 @@ mod the_boundary_window {
             WindowTook::DecidesNothing
         );
         assert!(
-            b.get(4).expect("held").window().is_empty(),
+            b.window(4).expect("held").said().is_empty(),
             "a refused event must not occupy the seat's slot, or one refusal \
              would cost the seat its whole boundary"
         );
@@ -1389,7 +1474,7 @@ mod the_boundary_window {
             b.on_boundary_event(4, 2, EventType::PlayerSitOut),
             WindowTook::AlreadySpoke
         );
-        assert_eq!(b.get(4).expect("held").window(), vec![(2, EventType::PlayerSitOut)]);
+        assert_eq!(b.window(4).expect("held").said(), vec![(2, EventType::PlayerSitOut)]);
     }
 
     #[test]
@@ -1407,10 +1492,15 @@ mod the_boundary_window {
     fn t47_closes_the_window_and_leaves_the_checkpoint_open() {
         let mut b = open_one();
         b.cross_boundary();
-        let held = b.get(4).expect("the checkpoint is retained past T47");
-        assert!(!held.window_is_open(), "the window must close at T47");
+        assert!(!b.window_is_open(4), "the window must close at T47");
         assert!(
-            !held.ack_stage_complete(),
+            b.window(4).is_some(),
+            "and it is still readable: closed is not gone"
+        );
+        assert!(
+            !b.get(4)
+                .expect("the checkpoint is retained past T47")
+                .ack_stage_complete(),
             "and the STATE_ACK stage must still be open (N6)"
         );
         assert_eq!(
@@ -1447,7 +1537,8 @@ mod the_boundary_window {
                 WindowTook::Took(_)
             ));
         }
-        let seats: Vec<SeatIdx> = b.get(4).expect("held").window().iter().map(|(s, _)| *s).collect();
+        let seats: Vec<SeatIdx> =
+            b.window(4).expect("held").said().iter().map(|(s, _)| *s).collect();
         assert_eq!(seats, vec![0, 1, 2, 3]);
     }
 
@@ -1472,5 +1563,62 @@ mod the_boundary_window {
             ),
             "a seat that spoke at hand 4's boundary may speak again at hand 5's"
         );
+    }
+
+    /// **The hole this store exists to close.** §4.10 puts the window on both
+    /// terminal paths; §6.2 row 8's aborted checkpoint is `S1-R` and is not
+    /// built, so `Boundaries::open` is unreachable after an abort. A window
+    /// folded into the checkpoint was therefore settled-path only — and the
+    /// abort path is the one a seat goes quiet on, which is the entire
+    /// population §4.10's window serves.
+    ///
+    /// The break that must make this fail: delete the `open_window` call on the
+    /// abort path in `run.rs`, or make this test open through `open` instead.
+    #[test]
+    fn a_hand_that_aborted_still_opens_a_window() {
+        let mut b = Boundaries::new();
+        // No checkpoint anywhere: this is exactly what an aborted hand has.
+        b.open_window(4, TERMINAL, &[0, 1], &[0, 1, 2, 3]);
+        assert!(b.get(4).is_none(), "an abort builds no checkpoint (S1-R)");
+        assert!(b.window_is_open(4), "and it must still build a window");
+        assert_eq!(
+            b.on_boundary_event(4, 2, EventType::PlayerSitIn),
+            WindowTook::Took(EventType::PlayerSitIn),
+            "a seat outside P(k) may ask to sit in at an ABORTED boundary, \
+             which is the boundary it went quiet at"
+        );
+        assert_eq!(b.window(4).expect("held").terminal(), TERMINAL);
+    }
+
+    /// Opening the same window twice — which the settled path does, once
+    /// through `open` and once directly — must not wipe what it holds.
+    #[test]
+    fn opening_a_window_twice_keeps_what_it_has() {
+        let mut b = Boundaries::new();
+        b.open_window(4, TERMINAL, &[0, 1], &[0, 1, 2, 3]);
+        assert!(matches!(
+            b.on_boundary_event(4, 2, EventType::PlayerLeave),
+            WindowTook::Took(_)
+        ));
+        b.open_window(4, [1u8; 32], &[0], &[0, 1]);
+        assert_eq!(
+            b.window(4).expect("held").said(),
+            vec![(2, EventType::PlayerLeave)],
+            "the second call is idempotent, or the settled path would erase the \
+             window it just filled"
+        );
+        assert_eq!(b.window(4).expect("held").terminal(), TERMINAL);
+    }
+
+    /// Two windows at once is the ordinary state; a third is not, and an
+    /// unbounded map is a way to be attacked.
+    #[test]
+    fn the_window_store_keeps_two_and_no_more() {
+        let mut b = Boundaries::new();
+        for hand in 1..=4u64 {
+            b.open_window(hand, TERMINAL, &[0, 1], &[0, 1]);
+        }
+        assert!(b.window(1).is_none() && b.window(2).is_none());
+        assert!(b.window(3).is_some() && b.window(4).is_some());
     }
 }

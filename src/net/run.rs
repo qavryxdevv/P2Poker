@@ -4535,6 +4535,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // door back for a seat that missed this hand: §4.9's
                 // readmission set is written by exactly this event agreeing.
                 if let Some(h) = hand.as_ref() {
+                    // **§4.10's window, on BOTH terminal paths, and this is
+                    // separate from the checkpoint below for exactly that
+                    // reason** (`S1-BZ`). The block that follows is gated on
+                    // `checkpoint8()`, which is `None` after an abort — §6.2
+                    // row 8's aborted checkpoint is `S1-R` and is not built —
+                    // so a window opened inside it existed on the settled path
+                    // alone. **The abort path is the one a seat goes quiet on**,
+                    // which is the whole population §4.10's window is for, so
+                    // the half that was missing was the half that mattered.
+                    //
+                    // `Hand::terminal` answers §3.1's question on both paths and
+                    // needs nothing the aborted checkpoint needs:
+                    // `ABORT_TERMINAL(k)` is a function of `GENESIS(k)` alone.
+                    if let Some(terminal) = h.terminal() {
+                        let roster: Vec<u8> = table
+                            .as_ref()
+                            .map(|f| f.roster().seats().iter().map(|e| e.seat).collect())
+                            .unwrap_or_default();
+                        boundaries.open_window(
+                            h.hand_id(),
+                            terminal,
+                            &h.participants(),
+                            &roster,
+                        );
+                    }
                     if let Some((state, terminal)) = h.checkpoint8() {
                         // The stage, opened at the moment `TERMINAL(k)` is
                         // fixed. `P(k)` is a **snapshot** taken here and not a
@@ -7557,7 +7582,11 @@ async fn boundary_event(
     // §4.10 disposes of both the same way and the seat re-emits at the next
     // boundary. Consumed rather than passed on: the hand would answer a
     // boundary type with `WrongType`, which is the whole of `S1-BZ`.
-    if !boundaries.holds(hand_id) {
+    //
+    // **The WINDOW store, not the checkpoint's.** They were one store and the
+    // checkpoint's is opened on the settled path alone, so asking it here made
+    // the window settled-path only too.
+    if boundaries.window(hand_id).is_none() {
         return true;
     }
     let Ok(opened) = crate::net::chained::open_in_hand(
@@ -7600,7 +7629,7 @@ async fn boundary_event(
     let Some(seat) = h.seat_of_key(&opened.sender) else {
         return true;
     };
-    let Some(terminal) = boundaries.get(hand_id).map(|b| b.terminal()) else {
+    let Some(terminal) = boundaries.window(hand_id).map(|w| w.terminal()) else {
         return true;
     };
     match window_position(seat, sequence, &opened.envelope.previous_event_hash, &terminal) {

@@ -4201,6 +4201,38 @@ impl Hand {
         self.checkpoint8
     }
 
+    /// `TERMINAL(k)` — **on both terminal paths**, which is the whole reason
+    /// this exists beside [`Hand::checkpoint8`].
+    ///
+    /// §3.1: the terminal is the `HAND_COMPLETE` stage hash on the decided path
+    /// and `ABORT_TERMINAL(k)` on the abort path, *"and both are agreed by every
+    /// peer by construction"*. `checkpoint8` answers only the first, because
+    /// §6.2 row 8's aborted-path checkpoint is `S1-R` and is not built — and
+    /// **a caller that needed the terminal and reached for `checkpoint8` got
+    /// nothing after an abort.** §4.10's hand boundary window was opened
+    /// through exactly that call, so it existed only on the settled path
+    /// (`S1-BZ`): the window whose one purpose is a seat's route back was
+    /// missing on the path a seat goes quiet on.
+    ///
+    /// This asks the question §3.1 asks and nothing more. It does not build the
+    /// aborted checkpoint and does not touch `Q-10`: `ABORT_TERMINAL(k)` is a
+    /// function of `GENESIS(k)` alone, so it needs no stage and no agreement
+    /// about the middle of the hand.
+    ///
+    /// `None` while the hand is still live, on either path.
+    pub fn terminal(&self) -> Option<Hash> {
+        if let Some((_, parent)) = self.checkpoint8 {
+            return Some(parent);
+        }
+        self.aborted().map(|_| {
+            crate::protocol::transcript::abort_terminal(
+                &self.open.table_id,
+                self.open.hand_id,
+                &self.open.genesis,
+            )
+        })
+    }
+
     /// This client's copy of the boundary checkpoint's `STATE_HASH` (§4.9).
     ///
     /// **Why the hand emits this at all, and it is not only about divergence.**
@@ -9196,6 +9228,38 @@ mod tests {
         );
         assert!(!a.may_abandon(NOW + 89_999), "the round still has air");
         assert!(a.may_abandon(NOW + 90_000), "and the ceiling ends it");
+    }
+
+    /// `TERMINAL(k)` on **both** paths, which is what `checkpoint8` could not
+    /// answer and what §4.10's window is opened from (`S1-BZ`).
+    ///
+    /// The hole this closes: `Boundaries::open` is reached only through
+    /// `checkpoint8()`, which is `None` after an abort, so a window opened
+    /// there existed on the settled path alone — and the abort path is the one
+    /// a seat goes quiet on.
+    ///
+    /// The break that must make this fail: return `None` from `terminal()` on
+    /// the aborted arm, or chain it from anything but `GENESIS(k)`.
+    #[test]
+    fn the_terminal_is_answered_on_the_aborted_path_too() {
+        let (mut a, _b, _c, keys) = three_at_the_deck_stage();
+        assert_eq!(a.terminal(), None, "a live hand has no terminal");
+        let _ = a.abort_now(Abort::Deadline, &keys[0], NOW + 600_000).unwrap();
+        assert!(a.aborted().is_some());
+        assert_eq!(
+            a.checkpoint8(),
+            None,
+            "§6.2 row 8's aborted checkpoint is S1-R and is not built"
+        );
+        assert_eq!(
+            a.terminal(),
+            Some(crate::protocol::transcript::abort_terminal(
+                &a.table_id(),
+                a.hand_id(),
+                &a.genesis()
+            )),
+            "and ABORT_TERMINAL(k) is a function of GENESIS(k) alone, so it              needs neither a stage nor agreement about the middle of the hand"
+        );
     }
 
     /// `S1-BB`'s discriminator, and this test is the whole of what makes it one.
