@@ -193,6 +193,9 @@ $patched = @(
     @{ File   = 'toxcore/TCP_connection.c'
        Marker = 'a TCP relay is being killed and %u connection(s) lose a slot'
        Why    = '0019: the one-way door, counted where it swings. do_tcp_conns kills a relay that never reached TCP_CONN_CONNECTED instead of reconnecting it, and kill_tcp_relay_connection then zeroes that slot on EVERY con_to -- and nothing in the group code puts one back, because every caller of add_tcp_relay_connection there needs something FROM the peer. It is the only irreversible step in S1-AA''s chain and nothing said when it fires. The count must be taken before the removals, since afterwards it is always zero' },
+    @{ File   = 'toxcore/TCP_connection.c'
+       Marker = '(%u online, %u registered, %u neither)'
+       Why    = '0020: 0019 counts rm_tcp_connection_from_conn returning >= 0, and that matches the relay number at ANY status -- so "7 connections lose a slot" cannot tell seven working out-of-band paths from seven attempts that never registered, and those two readings say opposite things about whether the kill narrowed anybody transport. Same defect 0018 fixed elsewhere: a counter conditioned on something other than the fact it is read for' },
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'no TCP relay carried it either'
        Why    = '0018: the send is its own oracle. gconn->tcp_relays_count has one write in the tree and no decrement, while the slots it describes are zeroed whenever a relay that never connected is killed, so both gates read the record the send does not use: the warning could never fire once any relay had been saved, and the send was skipped whenever the count was zero even if slots existed' },

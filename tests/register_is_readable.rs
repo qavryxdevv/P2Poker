@@ -24,6 +24,23 @@
 //! `S1-AQ` had been rendering as four columns with **no sources column at all**
 //! for long enough that nobody noticed. Escaping is the fix; this test is what
 //! makes the next one impossible to miss.
+//!
+//! # The third check, and this one the first two could not see
+//!
+//! Every row is edited by anchoring on a substring and replacing it. On
+//! 2026-09-02 an anchor ending in a section number's full stop matched inside
+//! `6.1`, so an inserted correction landed **in the middle of a token**: `S1-V`
+//! read *"which is a 6."* and the rest of that sentence -- *"1 wire change and
+//! pre-empts..."* -- ended up four hundred words later, glued to *"belongs to
+//! the owner."*. The row still had three columns and balanced pipes, so both
+//! checks above passed it for five days.
+//!
+//! The tell is a full stop with a letter before it and a digit after:
+//! `owner.1`. This register's prose does not produce that -- a section
+//! reference has a digit before the stop and a version has a digit on both
+//! sides -- so it is a cheap and specific signature of a splice landing
+//! mid-token. Zero occurrences in the register as it stands, which is what
+//! makes it usable as a rule rather than as a warning.
 
 use std::fs;
 
@@ -105,6 +122,35 @@ fn every_finding_row_declares_its_status() {
     assert!(
         missing.is_empty(),
         "rows whose last column does not open with one of {TOKENS:?}: {missing:?}"
+    );
+}
+
+/// A splice that landed inside a token, which the two checks above cannot see.
+///
+/// See the module note: an anchor ending in a section number's full stop
+/// matched inside `6.1` and cut a sentence in half, leaving
+/// `owner.1 wire change ...` stranded elsewhere in the row.
+///
+/// **To make this fail**: put `owner.1 wire` back into `S1-V`. It was run.
+#[test]
+fn no_row_carries_a_splice_that_landed_inside_a_token() {
+    let mut bad: Vec<String> = Vec::new();
+    for r in rows() {
+        let c = cells(&r);
+        let key = c.get(1).map(|s| s.trim().to_owned()).unwrap_or_default();
+        let chars: Vec<char> = r.chars().collect();
+        for w in chars.windows(3) {
+            if w[0].is_ascii_alphabetic() && w[1] == '.' && w[2].is_ascii_digit() {
+                let at: String = w.iter().collect();
+                bad.push(format!("{key} ({at})"));
+                break;
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "rows with a full stop between a letter and a digit, which is what an \
+         edit anchored inside a token looks like: {bad:?}"
     );
 }
 

@@ -1,0 +1,84 @@
+# 0020 - say WHICH slots the kill took, not just how many.
+#
+# 0019 counts rm_tcp_connection_from_conn returning >= 0, and that function
+# matches on the relay number at ANY status. So "7 connection(s) lose a slot"
+# cannot tell seven working out-of-band paths from seven attempts that had
+# never registered -- and those two readings say opposite things about whether
+# the kill narrowed anybody's transport.
+#
+# That is the same defect 0018 fixed elsewhere: a counter conditioned on
+# something other than the fact it is read for. One extra field each for
+# ONLINE, REGISTERED and everything else, read before the slot is zeroed.
+#
+# The scan is duplicated -- rm_tcp_connection_from_conn does its own -- and
+# that is deliberate: this is a kill path that runs a few times a minute, and
+# changing a function four other callers share to return one more value is a
+# worse trade than reading six array entries twice.
+
+diff --git a/vendor/c-toxcore/toxcore/TCP_connection.c b/vendor/c-toxcore/toxcore/TCP_connection.c
+index 4063190..b11cd63 100644
+--- a/vendor/c-toxcore/toxcore/TCP_connection.c
++++ b/vendor/c-toxcore/toxcore/TCP_connection.c
+@@ -960,17 +960,42 @@ int kill_tcp_relay_connection(TCP_Connections *tcp_c, int tcp_connections_number
+     }
+ 
+     /* p2p-poker: count the slots BEFORE they are removed, because afterwards
+-     * the answer is always zero. `rm_tcp_connection_from_conn` already returns
+-     * the slot index or -1, so this costs one comparison and no extra scan. */
++     * the answer is always zero -- and count them BY STATUS, because the
++     * total alone cannot tell a working path from an attempt that never
++     * registered, and those two readings say opposite things about whether
++     * this kill narrowed anybody's transport.
++     *
++     * The scan below duplicates the one inside `rm_tcp_connection_from_conn`.
++     * That is deliberate: this is a kill path that runs a few times a minute,
++     * and changing a function four other callers share to return one more
++     * value is a worse trade than reading six array entries twice. */
+     uint32_t slots_lost = 0;
++    uint32_t lost_online = 0;
++    uint32_t lost_registered = 0;
+ 
+     for (uint32_t i = 0; i < tcp_c->connections_length; ++i) {
+         TCP_Connection_to *con_to = get_connection(tcp_c, i);
+ 
+-        if (con_to != nullptr) {
+-            if (rm_tcp_connection_from_conn(con_to, tcp_connections_number) >= 0) {
+-                ++slots_lost;
++        if (con_to == nullptr) {
++            continue;
++        }
++
++        for (uint32_t j = 0; j < MAX_FRIEND_TCP_CONNECTIONS; ++j) {
++            if (con_to->connections[j].tcp_connection != (uint32_t)(tcp_connections_number + 1)) {
++                continue;
+             }
++
++            if (con_to->connections[j].status == TCP_CONNECTIONS_STATUS_ONLINE) {
++                ++lost_online;
++            } else if (con_to->connections[j].status == TCP_CONNECTIONS_STATUS_REGISTERED) {
++                ++lost_registered;
++            }
++
++            break;
++        }
++
++        if (rm_tcp_connection_from_conn(con_to, tcp_connections_number) >= 0) {
++            ++slots_lost;
+         }
+     }
+ 
+@@ -989,9 +1014,12 @@ int kill_tcp_relay_connection(TCP_Connections *tcp_c, int tcp_connections_number
+      * relay that never connected. */
+     if (slots_lost > 0) {
+         LOGGER_WARNING(tcp_c->logger,
+-                       "p2p-poker: a TCP relay is being killed and %u connection(s) lose a slot. "
++                       "p2p-poker: a TCP relay is being killed and %u connection(s) lose a slot "
++                       "(%u online, %u registered, %u neither). "
+                        "Relay %d, status %u, onion %d, lock_count %u, sleep_count %u",
+-                       slots_lost, tcp_connections_number, (unsigned int)tcp_con->status,
++                       slots_lost, lost_online, lost_registered,
++                       slots_lost - lost_online - lost_registered,
++                       tcp_connections_number, (unsigned int)tcp_con->status,
+                        tcp_con->onion ? 1 : 0, tcp_con->lock_count, tcp_con->sleep_count);
+     }
+ 
