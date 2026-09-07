@@ -1,0 +1,56 @@
+# The tools, and what question each one answers
+
+This index exists because of `S1-BR`. That row's stopping rule is a fold over
+the instrument's own log line, and the row said in as many words that it
+*"should be re-run against any future stall rather than re-derived"* — while
+naming no file, because there was none. It was re-derived four times, and each
+time had to rediscover the same correction. A tool that cannot be found is a
+tool that gets rewritten, so every fold now lives here and is named from the
+row it serves.
+
+Nothing below is a build step. `cargo build` and `cargo test` are the build;
+`build-tox.ps1` is the one exception and it says so.
+
+## Taking a measurement
+
+| tool | the question |
+| --- | --- |
+| `table-run.ps1` | Play N seats on **this** machine and say what a hand costs. |
+| `table-run-split.ps1` | Play one table with its seats split across two machines, so *ten seats* and *ten instances on one box* stop being the same experiment. Carries every fault knob: `-Stall`, `-MuteAt`/`-MuteFor`, `-LinkDown*`, `-DelayCerts*`, `-Deaf*`, `-Think`. **PowerShell 7 only, and refusing is the point.** |
+| `two-network-tox.ps1` | Does a Tox group carry traffic between two machines on two networks? The measurement `D-019` rests on. |
+| `two-network-ssh.ps1` | One node here, one over SSH, and what actually crossed between them. |
+| `two-network-test.ps1` | The same across a Hyper-V VM on a different subnet. |
+
+**`runs/<name>/run.txt` is the archive's own record**, written before the seats
+start and appended to when they finish: the knobs the run was given and the
+per-node outcome it reached. It describes the **binary**, probed, and not the
+build the command line asked for — see `S1-BB` for why those are different and
+what it cost.
+
+## Reading a corpus of runs
+
+Each fold takes run names or, with no arguments, every run under `runs/`.
+
+| tool | the question | the row |
+| --- | --- | --- |
+| `fold-vote-state.py` | Was a timeout vote ever **owed, eligible, past twice the stage budget, and not cast**? Every per-seat entry falls in one of five buckets and only `UNMET` is the fault. Prints each bucket's longest wait *against the budget that stage actually carried*. | `S1-BR` |
+| `fold-forks.py` | How many hands forked, and did **two** branches ever pass stage 0? Carries `--count-aborts-as-advanced` so the trap it dodges stays demonstrable. | `S1-CE`, `S1-CG` |
+| `fold-relay-kills.py` | Which relays were killed with a group's slots still on them, by which of the two kill paths, and **what those slots were** — `ONLINE`, `REGISTERED`, or neither. | `S1-AA` |
+| `classify-run.ps1` | Read a kept run directory and say what shape of failure, if any, it holds. | — |
+
+**A fold that prints nothing is not a fold that measured zero.** Each of these
+says which it is: a run taken before the patch that added its instrument has no
+instrument, and the tool prints that rather than a zero. The distinction is not
+pedantry — reading an absent instrument as an absence of the thing is a trap
+this register has fallen into three times (`S1-AA`'s `no relay carried`, its
+`0 online`, and `S1-CG`'s fabricated forks).
+
+## Building and shipping
+
+| tool | the question |
+| --- | --- |
+| `build-tox.ps1` | Build what `--features tox` needs from the vendored source, and **verify every patch marker is still in the tree** — 30 of them, checked case-sensitively. A tree that was reverted, half-merged or restored from an unpatched copy would otherwise build and run and be wrong. |
+| `check-portable.ps1` | Is the built client actually portable? By measurement, not by reading the build configuration. |
+| `deploy.ps1` | Build and put the client where it is played from, without copying the profile. |
+| `clean.ps1` | Sweep `target/` of what cargo never deletes. |
+| `msvc-shim/` | Toolchain shim; not run by hand. |
