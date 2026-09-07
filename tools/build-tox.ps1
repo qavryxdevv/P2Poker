@@ -197,6 +197,9 @@ $patched = @(
        Marker = '(%u online, %u registered, %u neither)'
        Why    = '0020: 0019 counts rm_tcp_connection_from_conn returning >= 0, and that matches the relay number at ANY status -- so "7 connections lose a slot" cannot tell seven working out-of-band paths from seven attempts that never registered, and those two readings say opposite things about whether the kill narrowed anybody transport. Same defect 0018 fixed elsewhere: a counter conditioned on something other than the fact it is read for' },
     @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker: deleting group peer'
+       Why    = '0021: a group peer entry disappeared in silence, and that silence is S1-AA''s remaining question. The stalled far seat in split150251-9 holds group 0 seen/0 confirmed at all thirteen samples and emits zero handshake packets, so it has no peer entry to send one to -- and nothing on disk could tell "the entry was created and reaped at the 12 s unconfirmed timeout" from "it was never created", which are different bugs at different layers. do_peer_delete is the one site every deletion passes through and the only one that already holds the logger' },
+    @{ File   = 'toxcore/group_chats.c'
        Marker = 'no TCP relay carried it either'
        Why    = '0018: the send is its own oracle. gconn->tcp_relays_count has one write in the tree and no decrement, while the slots it describes are zeroed whenever a relay that never connected is killed, so both gates read the record the send does not use: the warning could never fire once any relay had been saved, and the send was skipped whenever the count was zero even if slots existed' },
     @{ File   = 'toxcore/group_chats.c'

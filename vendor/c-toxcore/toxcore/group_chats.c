@@ -7297,6 +7297,36 @@ static void do_peer_delete(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat,
 
         const GC_Exit_Info *exit_info = &gconn->exit_info;
 
+        /* p2p-poker: a peer entry used to disappear in silence, and that
+         * silence is the whole of S1-AA's remaining question.
+         *
+         * A seat that never enters the group holds no peer entry, and nothing
+         * on disk could tell "the entry was created and then reaped" from "it
+         * was never created" -- different bugs at different layers. Measured
+         * in runs/split150251-9: the stalled far seat reports `group 0 seen/0
+         * confirmed` at all thirteen samples and emits no handshake packets at
+         * all, so the founder's transport story is one half of a conversation.
+         *
+         * `confirmed` and `handshaked` say how far the entry got; `exit_type`
+         * says who ended it; `handshake_attempts` says how hard this node
+         * tried; and `last_received_packet_time == 0` says the peer was never
+         * heard from once, which is the discriminator the two hypotheses need.
+         * This is the only site every deletion passes through and it already
+         * holds the logger, which `gcc_mark_for_deletion` does not. */
+        {
+            const uint64_t now = mono_time_get(chat->mono_time);
+            const bool ever_heard = gconn->last_received_packet_time > 0;
+            LOGGER_WARNING(chat->log,
+                           "p2p-poker: deleting group peer %u, exit type %d, confirmed %d, handshaked %d, "
+                           "handshake attempts %u, tcp_connection_num %d, peer hash %u, oob handshake %d, "
+                           "ever heard from %d, last packet %llu s ago, %u peer(s) before this one",
+                           i, (int)exit_info->exit_type, gconn->confirmed ? 1 : 0, gconn->handshaked ? 1 : 0,
+                           (unsigned int)gconn->handshake_attempts, gconn->tcp_connection_num,
+                           gconn->public_key_hash, gconn->is_oob_handshake ? 1 : 0, ever_heard ? 1 : 0,
+                           (unsigned long long)(ever_heard ? now - gconn->last_received_packet_time : 0),
+                           chat->numpeers);
+        }
+
         if (exit_info->exit_type == GC_EXIT_TYPE_TIMEOUT && gconn->confirmed) {
             add_gc_peer_timeout_list(chat, gconn);
         }
