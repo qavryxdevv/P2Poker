@@ -1,0 +1,64 @@
+# 0022 - say whether the joiner ever got the invite confirmation.
+#
+# gc_accept_invite creates an address-less peer entry for the inviter and sends
+# the acceptance, and sets NO pending_handshake_type. That is set only in
+# handle_gc_invite_confirmed_packet, when the founder confirmation comes back.
+# So a joiner that has accepted holds an entry, no pending handshake and
+# handshake_attempts 0, and waits -- while peer_timed_out reaps an unconfirmed
+# peer twelve seconds after the last packet from it.
+#
+# Measured: the stalled seat whole group activity in 420 s is eight lines --
+# four do_self_connection and four do_peer_delete, every deletion confirmed 0,
+# handshaked 0, handshake attempts 0. Four join attempts, four entries, four
+# reaps, no handshake ever armed.
+#
+# What was still inferred is the one thing that matters:
+# handle_gc_invite_confirmed_packet writes no log line on success and only one
+# of its five exits logs anything, so nothing on disk said whether it ran.
+# "ever heard from 1" in 0021 line means the founder was heard, not that the
+# confirmation was -- last_received_packet_time moves on any packet.
+#
+# Two lines, one at the arming and one at the silent -3 refusal, separate "the
+# confirmation never arrived" from "it arrived and something after it failed".
+
+diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
+index 868b842..9c0cabd 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.c
++++ b/vendor/c-toxcore/toxcore/group_chats.c
+@@ -8393,6 +8393,14 @@ int handle_gc_invite_confirmed_packet(const GC_Session *c, int friend_number, co
+     GC_Connection *gconn = get_gc_connection(chat, peer_number);
+ 
+     if (gconn == nullptr) {
++        /* p2p-poker: the confirmation arrived for a peer this joiner no longer
++         * has, which is what the twelve-second unconfirmed reaper leaves
++         * behind. Silent until now, and it is one of the two hypotheses
++         * S1-AA is down to. */
++        LOGGER_WARNING(chat->log,
++                       "p2p-poker: invite confirmation arrived but the peer entry is gone "
++                       "(peer number %d, friend %d) - reaped before the handshake could be armed",
++                       peer_number, friend_number);
+         return -3;
+     }
+ 
+@@ -8420,6 +8428,21 @@ int handle_gc_invite_confirmed_packet(const GC_Session *c, int friend_number, co
+         return -5;
+     }
+ 
++    /* p2p-poker: THE ONE MOMENT A JOINER BECOMES ABLE TO HANDSHAKE, and it was
++     * silent (`S1-AA`).
++     *
++     * `gc_accept_invite` creates the inviter's entry with no address and sets
++     * no handshake type; this line is where one is armed. A joiner whose
++     * confirmation never arrives therefore sits at `handshake_attempts 0`
++     * until the twelve-second unconfirmed reaper takes the entry -- which is
++     * exactly what the stalled seat measures, four times over a run, and
++     * nothing on disk could say whether this function had run at all. */
++    LOGGER_WARNING(chat->log,
++                   "p2p-poker: invite confirmation accepted, handshake armed for peer %u "
++                   "(friend %d, %d relay(s) offered, %u added, address %d)",
++                   gconn->public_key_hash, friend_number, num_nodes, tcp_relays_added,
++                   has_ip_port ? 1 : 0);
++
+     gconn->pending_handshake_type = HS_INVITE_REQUEST;
+ 
+     return 0;

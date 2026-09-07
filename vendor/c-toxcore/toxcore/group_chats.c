@@ -8393,6 +8393,14 @@ int handle_gc_invite_confirmed_packet(const GC_Session *c, int friend_number, co
     GC_Connection *gconn = get_gc_connection(chat, peer_number);
 
     if (gconn == nullptr) {
+        /* p2p-poker: the confirmation arrived for a peer this joiner no longer
+         * has, which is what the twelve-second unconfirmed reaper leaves
+         * behind. Silent until now, and it is one of the two hypotheses
+         * S1-AA is down to. */
+        LOGGER_WARNING(chat->log,
+                       "p2p-poker: invite confirmation arrived but the peer entry is gone "
+                       "(peer number %d, friend %d) - reaped before the handshake could be armed",
+                       peer_number, friend_number);
         return -3;
     }
 
@@ -8419,6 +8427,21 @@ int handle_gc_invite_confirmed_packet(const GC_Session *c, int friend_number, co
         LOGGER_ERROR(chat->log, "Got invalid connection info from peer");
         return -5;
     }
+
+    /* p2p-poker: THE ONE MOMENT A JOINER BECOMES ABLE TO HANDSHAKE, and it was
+     * silent (`S1-AA`).
+     *
+     * `gc_accept_invite` creates the inviter's entry with no address and sets
+     * no handshake type; this line is where one is armed. A joiner whose
+     * confirmation never arrives therefore sits at `handshake_attempts 0`
+     * until the twelve-second unconfirmed reaper takes the entry -- which is
+     * exactly what the stalled seat measures, four times over a run, and
+     * nothing on disk could say whether this function had run at all. */
+    LOGGER_WARNING(chat->log,
+                   "p2p-poker: invite confirmation accepted, handshake armed for peer %u "
+                   "(friend %d, %d relay(s) offered, %u added, address %d)",
+                   gconn->public_key_hash, friend_number, num_nodes, tcp_relays_added,
+                   has_ip_port ? 1 : 0);
 
     gconn->pending_handshake_type = HS_INVITE_REQUEST;
 
