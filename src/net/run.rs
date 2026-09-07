@@ -9157,6 +9157,88 @@ mod the_boundary_window_at_the_wire {
         );
     }
 
+    /// **§4.10 enforces its parent and §4.9 does not, and both are specified
+    /// in the same words** (`S1-CK`).
+    ///
+    /// The test above is §4.10's half. §4.9's is *"**Parent.**
+    /// `previous_event_hash = TERMINAL(k)`, for every emitter and whatever the
+    /// order of arrival"* — and there is no code behind it. A checkpoint-8
+    /// frame is opened with [`crate::net::chained::open_in_hand`], which passes
+    /// `position: None`, so `open_inner`'s sequence and parent comparisons are
+    /// both skipped; and no caller compares the parent afterwards. A `grep` for
+    /// `previous_event_hash` over this file finds `window_position`'s check and
+    /// no other.
+    ///
+    /// **This asserts what the tree does, and it is a non-conformance rather
+    /// than a design.** The value is not decorative: §4.9 makes the parent the
+    /// one thing every emitter must agree on before the comparison starts, so
+    /// an unchecked one lets a peer chain its checkpoint from a stage it
+    /// invented — exactly the fault the sibling test above calls out for the
+    /// boundary window.
+    ///
+    /// It is left unfixed on purpose. A gate here has a measured regression
+    /// waiting for it: `STATE_ACK` chains from the checkpoint's own
+    /// `stage_hash` and **not** from the terminal (`Boundary::state_ack_event`
+    /// says so in its doc), so a check scoped by sequence alone refuses every
+    /// acknowledgement, including a peer's own re-fed copy, and 672 measured
+    /// *the boundary checkpoint of hand N agreed* lines are what it would
+    /// regress. The scope has to be `round == 0` **and** the hash half.
+    ///
+    /// **To make this fail**: add that gate. This test going red is the
+    /// notification that `S1-CK` is closed.
+    #[test]
+    fn the_checkpoint_parent_is_specified_and_unchecked() {
+        use crate::protocol::messages::EventType;
+
+        const TABLE: crate::poker::state::Hash = [3u8; 32];
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let body = crate::table::checkwire::StateHash {
+            checkpoint: crate::table::checkwire::BOUNDARY_CHECKPOINT,
+            state_hash: [1u8; 32],
+            transcript_head: TERMINAL,
+        };
+        // A parent that is not TERMINAL(k), and not even a stage of this hand.
+        let slot = crate::net::chained::Slot {
+            table_id: TABLE,
+            hand_id: 4,
+            sequence: crate::table::checkwire::hash_sequence(0).expect("round 0"),
+            previous_event_hash: OTHER,
+        };
+        let bytes = crate::net::chained::seal(
+            EventType::StateHash,
+            &slot,
+            &body,
+            &key,
+            1,
+            0,
+            512,
+        )
+        .expect("a checkpoint frame seals at any parent");
+
+        let opened = crate::net::chained::open_in_hand(
+            &bytes,
+            512,
+            EventType::StateHash,
+            &TABLE,
+            4,
+        )
+        .expect(
+            "and it OPENS at any parent: this is the non-conformance, not an \
+             accident of the test",
+        );
+        assert_eq!(
+            opened.envelope.previous_event_hash, OTHER,
+            "the frame carries a parent that is not TERMINAL(k) and was admitted"
+        );
+
+        // The contrast, in one line: the boundary window refuses exactly this.
+        assert_eq!(
+            window_position(3, BOUNDARY_SEQUENCE_BASE + 3, &OTHER, &TERMINAL),
+            WindowPosition::NotTheTerminal,
+            "sec 4.10 refuses the same parent that sec 4.9 admits"
+        );
+    }
+
     /// The slot is checked **before** the parent, and a wrong slot is reported
     /// as a wrong slot: the two refusals have different meanings to whoever
     /// reads the log, and a seat at somebody else's slot with a correct parent
