@@ -66,10 +66,10 @@ index cbc5db9..23c4a80 100644
  }
  
 diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
-index adbbe26..6f6c5b4 100644
+index adbbe26..37b5e0f 100644
 --- a/vendor/c-toxcore/toxcore/group_chats.c
 +++ b/vendor/c-toxcore/toxcore/group_chats.c
-@@ -5711,7 +5711,16 @@ static bool send_gc_handshake_packet(const GC_Chat *chat, GC_Connection *gconn,
+@@ -5711,7 +5711,17 @@ static bool send_gc_handshake_packet(const GC_Chat *chat, GC_Connection *gconn,
      // Send a TCP handshake if UDP fails, or if UDP succeeded last time but we never got a response
      if (gconn->tcp_relays_count > 0 && (ret != length || try_tcp_fallback)) {
          if (send_packet_tcp_connection(chat->tcp_conn, gconn->tcp_connection_num, packet, (uint16_t)length) == -1) {
@@ -81,9 +81,10 @@ index adbbe26..6f6c5b4 100644
 +             * apart is the whole of S1-AA's next obstacle. */
 +            LOGGER_DEBUG(chat->log,
 +                         "Send handshake packet failed. Type 0x%02x, peer %u, tcp_connection_num %d, "
-+                         "tcp_relays_count %u, udp ret %d, udp skipped %d",
++                         "tcp_relays_count %u, udp ret %d, udp skipped %d, direct possible %d",
 +                         request_type, gconn->public_key_hash, gconn->tcp_connection_num,
-+                         gconn->tcp_relays_count, ret, try_tcp_fallback ? 1 : 0);
++                         gconn->tcp_relays_count, ret, try_tcp_fallback ? 1 : 0,
++                         gcc_direct_conn_is_possible(chat, gconn) ? 1 : 0);
              return false;
          }
      }
