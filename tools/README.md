@@ -16,7 +16,7 @@ Nothing below is a build step. `cargo build` and `cargo test` are the build;
 | tool | the question |
 | --- | --- |
 | `table-run.ps1` | Play N seats on **this** machine and say what a hand costs. |
-| `table-run-split.ps1` | Play one table with its seats split across two machines, so *ten seats* and *ten instances on one box* stop being the same experiment. Carries every fault knob: `-Stall`, `-MuteAt`/`-MuteFor`, `-LinkDown*`, `-DelayCerts*`, `-Deaf*`, `-Think`. **PowerShell 7 only, and refusing is the point.** |
+| `table-run-split.ps1` | Play one table with its seats split across two machines, so *ten seats* and *ten instances on one box* stop being the same experiment. Carries every fault knob: `-DropConfirm`, `-Stall`, `-MuteAt`/`-MuteFor`, `-LinkDown*`, `-DelayCerts*`, `-Deaf*`, `-Think`. **`-Stall` freezes a joiner's event loop and models a frozen process, not a slow network** -- with it firing once, the client's own recovery works (`runs/split182313-9`), so no `-Stall` run is evidence about a healthy-but-unjoined seat. `-DropConfirm` is the knob for that: the founder withholds its first invite confirmations while every loop keeps running. **PowerShell 7 only, and refusing is the point.** |
 | `two-network-tox.ps1` | Does a Tox group carry traffic between two machines on two networks? The measurement `D-019` rests on. |
 | `two-network-ssh.ps1` | One node here, one over SSH, and what actually crossed between them. |
 | `two-network-test.ps1` | The same across a Hyper-V VM on a different subnet. |
