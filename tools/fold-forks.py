@@ -21,6 +21,13 @@ Measured: `split092359-10/far-n1.log` prints them 3 ms apart. So a branch counts
 as ADVANCED only if `has begun` is not followed by `is over` for the same hand
 within one second.
 
+**The filter stays after the fix, and that is deliberate.** `S1-CG` is fixed in
+the tree -- `dealt()` is a latch set at the one exit from `Phase::Init` that is
+not an abort -- so a run taken from 2026-09-07 on will not print *has begun*
+for a hand that died at stage 0. Every run already on disk was taken before
+that, and the corpus is the thing this tool reads. Removing the filter would
+silently re-date every number it prints.
+
 Usage:
     python tools/fold-forks.py            # every run on disk
     python tools/fold-forks.py split165440-9
