@@ -7581,6 +7581,36 @@ impl Hand {
             return None;
         }
 
+        // **`S1-CF`'s invariant, written down where it is produced.**
+        //
+        // `open_with` filters `dealt_in` by `grace[s] > 0` **on the indices of
+        // `required`**, and `GENESIS(k+1)` commits `required` and the stacks and
+        // **not** `grace` — so if `grace` could vary for a required seat, two
+        // honest peers could agree on the genesis and disagree about who is
+        // playing, which is a hard refusal at stage 0 that no genesis-based
+        // detector can see.
+        //
+        // It cannot vary, and the reason is four steps: the two limbs that
+        // LOWER `grace` are `saturating_sub(1)`, which is the `else` of the very
+        // `took_part` this function filters `required` by, and the
+        // `MAX_CONSECUTIVE_AUTO_ACTIONS` gate, which needs `strikes[s] >= 1`,
+        // which is only ever written beside a `certified.push` of the same seat
+        // — and `certified` makes `took_part` false in the branch where a
+        // certificate can exist at all. So every seat this loop can lower
+        // `grace` for is a seat the filter below removes.
+        //
+        // **Asserted rather than trusted**, because the invariant is what keeps
+        // the unhashed term inert, nothing else states it, and the day
+        // `S1-BM`'s return certificate puts a seat back INTO `required` it
+        // arrives carrying whatever `grace` it accrued while it was out.
+        debug_assert!(
+            required
+                .iter()
+                .all(|s| grace.get(usize::from(*s)).copied().unwrap_or(0) == GRACE_HANDS),
+            "S1-CF: a required seat with grace below GRACE_HANDS makes dealt_in \
+             diverge under one genesis. required {required:?} grace {grace:?}"
+        );
+
         // **After `required`, because the genesis commits to it.** Two peers
         // that derive different participation must derive different hands, or
         // they play different tables under one hash and nothing refuses
@@ -9332,6 +9362,56 @@ mod tests {
         assert!(a.may_abandon(NOW + 90_000), "and the ceiling ends it");
     }
 
+    /// **`S1-CF`, the half that decides whether it is a fault: the state is
+    /// UNREACHABLE, and this drives the real derivation to say so.**
+    ///
+    /// The test below hand-builds an `Opening`. This one certifies a seat out
+    /// through the actual machinery and asks `next_hand` what it produces:
+    /// every seat in the derived `required` carries `GRACE_HANDS`, and the seat
+    /// whose `grace` moved is exactly the one the filter removed. That is the
+    /// invariant that keeps `dealt_in`'s unhashed `grace` term inert, and it is
+    /// what `S1-BM`'s return certificate would break in one hand.
+    ///
+    /// The break that must make this fail: delete the `certified` test from
+    /// `took_part`, so a certified seat stays in `required` carrying the grace
+    /// the gate took off it.
+    #[test]
+    fn every_required_seat_carries_a_full_grace() {
+        let (mut a, mut b, _c, keys) = three_at_the_deck_stage();
+        let t2 = NOW + 60_000;
+        let va = a.vote_on_timeouts(&keys[0], t2, 0).unwrap();
+        let vb = b.vote_on_timeouts(&keys[1], t2, 0).unwrap();
+        let Send::Broadcast(va) = &va[0];
+        let Send::Broadcast(vb) = &vb[0];
+        let t3 = NOW + 70_000;
+        let ca = a.on_event(vb, &keys[0], t3).unwrap();
+        let cb = b.on_event(va, &keys[1], t3).unwrap();
+        assert!(!ca.is_empty() && !cb.is_empty(), "each voter seals a copy");
+        let Send::Broadcast(ca) = &ca[0];
+        let Send::Broadcast(cb) = &cb[0];
+        assert!(a.on_event(cb, &keys[0], t3).is_ok());
+        assert!(b.on_event(ca, &keys[1], t3).is_ok());
+        assert!(!a.took_part(2), "seat 2 is certified out");
+
+        let next = a.next_hand().expect("an aborted hand has a successor");
+        assert!(!next.required.contains(&2), "{:?}", next.required);
+        for s in &next.required {
+            assert_eq!(
+                next.grace.get(usize::from(*s)).copied(),
+                Some(GRACE_HANDS),
+                "seat {s} is required and its grace is not full: {:?}",
+                next.grace
+            );
+        }
+        // And the seat whose grace DID move is the one that left, which is the
+        // whole of why the divergence cannot reach `dealt_in`.
+        assert!(
+            next.grace[2] < GRACE_HANDS,
+            "the gate is real, it just fires where dealt_in never looks: {:?}",
+            next.grace
+        );
+    }
+
     /// **`S1-CF`: two peers at one genesis with two `dealt_in` sets, and the
     /// client can say so.**
     ///
@@ -10549,11 +10629,23 @@ mod tests {
 
     /// Three certificates and the seat sits out: it keeps its stack, posts
     /// dead money, takes no cards and drains. The tournament's dead seat.
+    ///
+    /// **The state below is hand-built, and `next_hand` cannot produce it —
+    /// `S1-CF`.** This comment used to read *"the state a seat reaches after
+    /// three certificates against it"* and that is false: three certificates
+    /// put the seat in `certified`, `took_part` is `!certified.contains`
+    /// wherever a certificate can exist, and the seat is therefore filtered out
+    /// of `required` before `grace` is ever consulted. So `PROTOCOL.md` §8.3's
+    /// *sits out at three strikes* is enforced today by the certified exclusion
+    /// and **not** by the allowance, and this test pins `open_with`'s reading of
+    /// a `grace` of zero rather than any state the table reaches.
+    ///
+    /// It is kept because the reading is still the one §8.3 wants, and it is
+    /// what `S1-BM`'s return certificate would make reachable in one hand.
     #[test]
     fn three_strikes_and_the_seat_takes_no_more_cards() {
         let mut o = opening3(0);
-        // The state a seat reaches after three certificates against it, which
-        // `apply_certificate` produces one at a time.
+        // Hand-built; see the note above.
         o.grace = vec![GRACE_HANDS, GRACE_HANDS, 0];
         let (h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
         assert_eq!(
