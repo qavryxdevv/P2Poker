@@ -61,7 +61,7 @@ use crate::mental_poker::reveal::RevealStage;
 
 use super::dealing::{self, Dealing, Identity, Refused, Share};
 use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, BoardReveal,
-    DealPrivate, DeckCommit, DeckInit, HandAbort, HandComplete, HandInit, NotOurs, PotAward,
+    DealPrivate, DeckCommit, DeckInit, Field, HandAbort, HandComplete, HandInit, NotOurs, PotAward,
     Refund, RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep, TimeoutCert,
     TimeoutVote};
 use super::stage::{Collective, Heard};
@@ -1275,6 +1275,30 @@ pub struct Hand {
     /// Diagnostic: what two engines disagreed about when a settlement did not
     /// match.
     settle_note: Option<String>,
+    /// `S1-CF`: a `HAND_INIT` refused on `dealt_in` **at a genesis this client
+    /// agrees with**, said once per hand.
+    ///
+    /// `GENESIS(k+1)` commits `participants` and not `grace`, and `dealt_in` is
+    /// derived from `grace` — so two peers can agree on the genesis and refuse
+    /// each other's opening. Neither the fork detector nor §6.3's freeze can see
+    /// it: the first compares genesis values, which match, and the second wants
+    /// a checkpoint-8 `state_hash`, which a hand stalled at stage 0 never
+    /// reaches. The stage simply never completes and the hand dies at
+    /// `hand_deadline_ms` with nothing said.
+    ///
+    /// This does not repair it — the repair is a corpus decision, `S1-CF` — and
+    /// it costs one comparison on a path that is already refusing the event.
+    dealt_note: Option<String>,
+    /// Whether `dealt_note` has ever been written this hand.
+    ///
+    /// **Separate from the note, because `take_dealt_note` empties the note.**
+    /// Guarding on `dealt_note.is_none()` means *at most one PENDING*, not *at
+    /// most one per hand* — and the difference is the whole point here: a
+    /// stage 0 that will never complete is re-broadcast every five seconds for
+    /// the life of the hand, and the disagreement check sits above the phase
+    /// test, so every copy reaches it. The test caught this the moment it
+    /// delivered a second copy.
+    dealt_said: bool,
     /// Diagnostic: what the certificate path last decided.
     cert_note: Vec<String>,
     /// Seat → the genesis its sequence-0 `HAND_INIT` of this hand named, when
@@ -1608,6 +1632,8 @@ impl Hand {
                 bank_left_ms: o.time_bank_ms,
                 shuffle_note: None,
                 settle_note: None,
+                dealt_note: None,
+                dealt_said: false,
                 cert_note: Vec::new(),
                 foreign_genesis: BTreeMap::new(),
                 genesis_note: None,
@@ -1861,9 +1887,40 @@ impl Hand {
         theirs
             .self_consistent(self.open.max_players)
             .map_err(|what| Failed::Disagrees { seat, what })?;
-        self.mine
-            .disagreement(&theirs)
-            .map_err(|what| Failed::Disagrees { seat, what })?;
+        if let Err(what) = self.mine.disagreement(&theirs) {
+            // **`S1-CF`, and the guard below is a tautology today — which is
+            // the finding rather than a flaw in the guard.** `opened()` runs
+            // `chained::open` against `self.slot`, so a `HAND_INIT` chained
+            // from any other parent comes back `Failed::NotYet` long before
+            // this line. **Every `dealt_in` disagreement a client can ever
+            // reach here is therefore one at its own genesis** — two peers who
+            // agree about the hand and disagree about its players — and that is
+            // exactly the shape no genesis-based detector can see. The
+            // comparison is kept because it states the precondition the note
+            // asserts, costs one equality on a path that is already refusing
+            // the event, and stops being a tautology the day `opened()`'s
+            // contract changes.
+            if what == NotOurs::Differs(Field::DealtIn)
+                && opened.envelope.previous_event_hash == self.open.genesis
+                && !self.dealt_said
+            {
+                self.dealt_said = true;
+                let short = |h: &Hash| -> String {
+                    h.iter().take(4).map(|b| format!("{b:02x}")).collect()
+                };
+                self.dealt_note = Some(format!(
+                    "seat {seat} opened hand #{} at THIS client's own genesis {} and named a \
+                     different dealt_in: {:?} against this client's {:?}. The genesis commits \
+                     the roster and not `grace`, so nothing downstream can see this: stage 0 \
+                     will not complete and the hand will die at its deadline (S1-CF)",
+                    self.open.hand_id,
+                    short(&self.open.genesis),
+                    theirs.dealt_in,
+                    self.mine.dealt_in
+                ));
+            }
+            return Err(Failed::Disagrees { seat, what });
+        }
 
         let Phase::Init(stage) = &mut self.phase else {
             return Err(Failed::NothingFurther);
@@ -4219,18 +4276,46 @@ impl Hand {
     /// function of `GENESIS(k)` alone, so it needs no stage and no agreement
     /// about the middle of the hand.
     ///
-    /// `None` while the hand is still live, on either path.
+    /// **Three arms, not two, and the third is the one that bites.**
+    /// `checkpoint8` is written only inside `close_settlement_if_done`, which
+    /// `give_up` makes unreachable by replacing the phase — so a peer that gave
+    /// up and *then* closed a **late** settlement holds `TERMINAL(k)` = the
+    /// `HAND_COMPLETE` stage hash with `checkpoint8` still `None`. A two-armed
+    /// version fell through to the aborted arm and answered
+    /// `ABORT_TERMINAL(k)`, which is not that peer's terminal at all: §4.10 says
+    /// `HAND_COMPLETE` wins over an abort. `S1-BM` banked the same correction in
+    /// words — *"the settled-path condition must be the chain fact `TERMINAL(k)`
+    /// is the `HAND_COMPLETE` stage hash and not `checkpoint8.is_some()`, which
+    /// comes apart on §4.10's abort-settle race"* — and this is that sentence in
+    /// code.
+    ///
+    /// **`next_hand` reads this rather than repeating it**, so the terminal the
+    /// window opens at and the terminal the next hand chains from cannot come
+    /// apart. They did for twenty minutes, which is how this comment came to be
+    /// written.
+    ///
+    /// `None` while the hand is still live, on every path.
     pub fn terminal(&self) -> Option<Hash> {
-        if let Some((_, parent)) = self.checkpoint8 {
-            return Some(parent);
-        }
-        self.aborted().map(|_| {
-            crate::protocol::transcript::abort_terminal(
+        match &self.phase {
+            // The settlement closed here: `TERMINAL(k)` is the `HAND_COMPLETE`
+            // stage hash, which is the slot's parent now that the stage closed.
+            Phase::Playing { play, .. } if matches!(play.step, Step::Ended) => {
+                Some(self.slot.previous_event_hash)
+            }
+            // A settlement that arrived after this client gave up. §4.10:
+            // `HAND_COMPLETE` wins over an abort.
+            Phase::Aborted(_) if self.late.as_ref().is_some_and(|l| l.closed.is_some()) => {
+                self.late.as_ref().and_then(|l| l.closed.as_ref()).map(|(h, _)| *h)
+            }
+            // A function of `GENESIS(k)` and nothing else, which is exactly why
+            // an abort's terminal cannot fork.
+            Phase::Aborted(_) => Some(crate::protocol::transcript::abort_terminal(
                 &self.open.table_id,
                 self.open.hand_id,
                 &self.open.genesis,
-            )
-        })
+            )),
+            _ => None,
+        }
     }
 
     /// This client's copy of the boundary checkpoint's `STATE_HASH` (§4.9).
@@ -6672,6 +6757,11 @@ impl Hand {
         self.certs.len()
     }
 
+    /// `S1-CF`'s note, taken rather than read: the node says it once.
+    pub fn take_dealt_note(&mut self) -> Option<String> {
+        self.dealt_note.take()
+    }
+
     pub fn take_settle_note(&mut self) -> Option<String> {
         self.settle_note.take()
     }
@@ -7314,42 +7404,32 @@ impl Hand {
     /// parent is `TERMINAL(k)`, and the required emitter set is `P(k)` — the
     /// seats this client accepted an event from this hand.
     pub fn next_hand(&self) -> Option<Opening> {
-        // Two roads to a terminal, and they differ in both quantities that go
-        // into hand `k+1`: what everybody holds, and what `TERMINAL(k)` is.
-        let (stacks, terminal): (Vec<Chips>, Hash) = match &self.phase {
-            Phase::Playing { play, .. } if matches!(play.step, Step::Ended) => (
-                // The settlement has been applied, so this is what everybody
-                // holds; and `TERMINAL(k)` is the `HAND_COMPLETE` stage hash,
-                // which is the slot's parent now that the stage closed.
-                play.round.stack.clone(),
-                self.slot.previous_event_hash,
-            ),
-            // A settlement that arrived after this client gave up. §4.10:
-            // `HAND_COMPLETE` wins over an abort, so the terminal and the
-            // stacks are the settlement's and not the abort's.
-            Phase::Aborted(_) if self.late.as_ref().is_some_and(|l| l.closed.is_some()) => {
-                let (hash, stacks) = self
-                    .late
-                    .as_ref()
-                    .and_then(|l| l.closed.clone())
-                    .expect("checked in the guard");
-                (stacks, hash)
+        // **`TERMINAL(k)` comes from one place**, [`Hand::terminal`], which
+        // §4.10's boundary window also opens at. The two used to derive it
+        // separately and came apart on the abort-settle race; the match below
+        // now answers only *what everybody holds*.
+        let terminal = self.terminal()?;
+        let stacks: Vec<Chips> = match &self.phase {
+            // The settlement has been applied, so this is what everybody holds.
+            Phase::Playing { play, .. } if matches!(play.step, Step::Ended) => {
+                play.round.stack.clone()
             }
-            Phase::Aborted(_) => (
-                // An abort moves no chips: every seat ends the hand with what
-                // it started it with (D-010, I27), and those are the values
-                // already bound into `roster_hash(k)`.
-                self.mine.stacks.clone(),
-                // A function of `GENESIS(k)` and nothing else, which is exactly
-                // why an abort's terminal cannot fork: the peers could not
-                // agree about the middle of the hand, so the terminal must not
-                // depend on the middle of the hand.
-                crate::protocol::transcript::abort_terminal(
-                    &self.open.table_id,
-                    self.open.hand_id,
-                    &self.open.genesis,
-                ),
-            ),
+            // A settlement that arrived after this client gave up. §4.10:
+            // `HAND_COMPLETE` wins over an abort, so the stacks are the
+            // settlement's and not the abort's.
+            Phase::Aborted(_) if self.late.as_ref().is_some_and(|l| l.closed.is_some()) => self
+                .late
+                .as_ref()
+                .and_then(|l| l.closed.clone())
+                .expect("checked in the guard")
+                .1,
+            // An abort moves no chips: every seat ends the hand with what it
+            // started it with (D-010, I27), and those are the values already
+            // bound into `roster_hash(k)`.
+            Phase::Aborted(_) => self.mine.stacks.clone(),
+            // Unreachable: `terminal()` above returns `None` on every other
+            // phase and this function has already left. Kept so the match is
+            // exhaustive without a wildcard that could swallow a new phase.
             _ => return None,
         };
         let stacks = &stacks;
@@ -8751,6 +8831,28 @@ mod tests {
                     settled_next.genesis, abort_next.genesis,
                     "the late stage never closed, so the abort terminal still stands"
                 );
+                // **`S1-BZ`: `TERMINAL(k)` on this path is the settlement's, and
+                // §4.10's boundary window is opened at it.** `checkpoint8` is
+                // `None` here — its only write is inside
+                // `close_settlement_if_done`, which `give_up` made unreachable
+                // by replacing the phase — so a `terminal()` that asked
+                // `checkpoint8` and then fell through to the aborted arm would
+                // answer `ABORT_TERMINAL(k)` and open the window at a parent no
+                // boundary event of this hand carries. It did, for twenty
+                // minutes on 2026-09-07.
+                //
+                // The break that must make this fail: delete `terminal()`'s
+                // late-settlement arm.
+                assert!(b.checkpoint8().is_none(), "give_up left no checkpoint here");
+                assert_ne!(
+                    b.terminal(),
+                    Some(crate::protocol::transcript::abort_terminal(
+                        &b.table_id(),
+                        b.hand_id(),
+                        &b.genesis()
+                    )),
+                    "§4.10: HAND_COMPLETE wins over an abort, so the terminal is                      the settlement's"
+                );
                 continue;
             }
             if let Some((from, sends)) = queue.pop() {
@@ -9228,6 +9330,79 @@ mod tests {
         );
         assert!(!a.may_abandon(NOW + 89_999), "the round still has air");
         assert!(a.may_abandon(NOW + 90_000), "and the ceiling ends it");
+    }
+
+    /// **`S1-CF`: two peers at one genesis with two `dealt_in` sets, and the
+    /// client can say so.**
+    ///
+    /// `genesis_hand` commits `participants` and **not** `grace`, and
+    /// `open_with` derives `dealt_in` from `grace` — so two peers whose `grace`
+    /// differs for any reason derive the **same** `GENESIS(k+1)` and refuse each
+    /// other's opening with `Differs(DealtIn)`, which is a hard refusal. Nothing
+    /// downstream can see it: the fork detector compares genesis values, which
+    /// match, and §6.3's freeze wants a checkpoint-8 `state_hash` that a hand
+    /// stalled at stage 0 never reaches.
+    ///
+    /// This test is the mechanism and not only the note: it sets one seat's
+    /// `grace` to zero on **one side only**, which is what a `strikes`
+    /// disagreement produces in the field, and shows the opening refused.
+    ///
+    /// **What it pins and what it does not.** The fixture *assigns* the genesis
+    /// rather than deriving it, so this pins the consequence — one `grace`
+    /// difference at one genesis is a hard refusal — and not the premise. The
+    /// premise needs no test: `genesis_hand`'s signature takes `table_id`,
+    /// `hand_id`, `session_id`, `roster_hash`, `previous_terminal` and
+    /// `required`, so *`grace` is not an input to the genesis* is enforced by
+    /// the compiler.
+    ///
+    /// The break that must make this fail: drop the note, or widen its guard.
+    #[test]
+    fn one_genesis_and_two_dealt_in_sets_is_named_rather_than_silent() {
+        let mut mine = opening(0);
+        let mut theirs = opening(1);
+        mine.required = vec![0, 1, 2];
+        theirs.required = vec![0, 1, 2];
+        mine.seats.push((2, key(12).verifying_key().to_bytes(), 10_000));
+        theirs.seats.push((2, key(12).verifying_key().to_bytes(), 10_000));
+        mine.max_players = 3;
+        theirs.max_players = 3;
+        // The one difference, and it is under no hash: seat 2 has spent its
+        // allowance here and not there.
+        mine.grace[2] = 0;
+        assert_eq!(
+            mine.genesis, theirs.genesis,
+            "the fixture must differ ONLY in grace, or this proves nothing"
+        );
+
+        let (mut a, _from_a) = Hand::open(mine, &key(10), NOW, 30_000).unwrap();
+        let (_b, from_b) = Hand::open(theirs, &key(11), NOW, 30_000).unwrap();
+        let Send::Broadcast(bytes) = &from_b[0];
+        let refused = a.on_event(bytes, &key(10), NOW);
+        assert!(
+            matches!(
+                refused,
+                Err(Failed::Disagrees {
+                    seat: 1,
+                    what: NotOurs::Differs(Field::DealtIn)
+                })
+            ),
+            "one grace difference must refuse the opening: {refused:?}"
+        );
+        let note = a.take_dealt_note().expect("and the client must say so");
+        assert!(
+            note.contains("THIS client's own genesis") && note.contains("S1-CF"),
+            "{note}"
+        );
+        // **Said once per hand, and the re-send is what makes that matter.** A
+        // stage 0 that will never complete is re-broadcast every five seconds
+        // for the life of the hand, and the disagreement check sits above the
+        // phase test, so every copy reaches it. Without the guard the log
+        // fills with one line per re-send.
+        assert!(a.on_event(bytes, &key(10), NOW).is_err(), "the second copy is refused too");
+        assert!(
+            a.take_dealt_note().is_none(),
+            "said once per hand, or a stalled stage 0 repeats it every re-send"
+        );
     }
 
     /// `TERMINAL(k)` on **both** paths, which is what `checkpoint8` could not

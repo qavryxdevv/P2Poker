@@ -1455,6 +1455,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .send(NodeEvent::Warning(n))
                                         .await;
                                 }
+                                // `S1-CF`: two peers at one genesis with two
+                                // dealt_in sets. Said before the refusal it
+                                // explains, because "hand: seat 3: dealt_in
+                                // differs" on its own reads as an ordinary
+                                // stale frame and this is not one.
+                                if let Some(n) = $h.take_dealt_note() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(n))
+                                        .await;
+                                }
                                 let _ = events
                                     .send(NodeEvent::Warning(format!("hand: {e}")))
                                     .await;
