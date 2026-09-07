@@ -1250,6 +1250,123 @@ mod tests {
         );
     }
 
+    /// **A round driven by the real emitter cannot resolve, and that makes
+    /// every §6.3 freeze terminal.**
+    ///
+    /// `a_round_resolves_on_one_value_and_faults_on_two` above proves the
+    /// arithmetic of [`Boundaries::on_round_hash`] by hand-feeding values, and
+    /// its resolving half passes `STATE` for seat 1 — a value seat 1 never
+    /// held, since at the checkpoint it published `[1u8; 32]`. So that test
+    /// says nothing about what a peer would actually publish, and its
+    /// `Resolved` branch is reachable only because the test chose the number.
+    ///
+    /// Here both sides emit through [`Boundary::round_hash_event`] and the
+    /// value is read back off the **sealed frame**, so the loop closes through
+    /// the real emitter and the real wire format. The emitter republishes
+    /// `self.own`, because with no transcript exchange built (`S1-Q`) there is
+    /// nothing else to derive it from — so the round carries the same two
+    /// values the checkpoint did and `RoundTook::Unresolved` is the only
+    /// outcome available.
+    ///
+    /// **What that means beyond this file** (`S1-R`): §6.3's division of labour
+    /// is *"checkpoint 8 is the route that heals a table where the two peers
+    /// agree; the freeze is the route that stops one where they do not"* — and
+    /// the healing route cannot run. A genuine divergence therefore reaches
+    /// §6.4 and the table deals no further hand; a contradictor that stays
+    /// silent never closes the stage at all. **Every freeze is terminal, so any
+    /// NEW freeze trigger is a table-killer**, which is the ground the aborted
+    /// path's checkpoint designs died on. The corpus has never exercised it:
+    /// zero freeze lines in 108 run directories.
+    ///
+    /// **To make this fail**: give `round_hash_event` something to re-derive
+    /// from — which is what `S1-Q`'s transcript exchange would be — and the
+    /// values stop being equal to the published ones. That is the intended
+    /// future, and this test is what will notice it arriving.
+    #[test]
+    fn a_round_driven_by_the_real_emitter_cannot_resolve() {
+        use ed25519_dalek::SigningKey;
+
+        const OTHER: Hash = [1u8; 32];
+        let key_a = SigningKey::from_bytes(&[10u8; 32]);
+        let key_b = SigningKey::from_bytes(&[11u8; 32]);
+
+        // Two peers, each holding its OWN end-of-hand value, each hearing the
+        // other's. This is the divergence §6.3 opens a round for.
+        let mut a = Boundaries::new();
+        let mut b = Boundaries::new();
+        a.open(4, TABLE, TERMINAL, STATE, &[0, 1], &[0, 1]).expect("opens");
+        b.open(4, TABLE, TERMINAL, OTHER, &[0, 1], &[0, 1]).expect("opens");
+        a.on_state_hash(4, 0, ev(0), STATE);
+        assert_eq!(
+            a.on_state_hash(4, 1, ev(1), OTHER),
+            Took::Diverged { solitary_contradicted: false },
+            "A hears B and they differ"
+        );
+        b.on_state_hash(4, 1, ev(1), OTHER);
+        assert_eq!(
+            b.on_state_hash(4, 0, ev(0), STATE),
+            Took::Diverged { solitary_contradicted: false },
+            "and B hears A"
+        );
+
+        a.open_round(4, 1, &[0, 1]).expect("the floor is met");
+        b.open_round(4, 1, &[0, 1]).expect("the floor is met");
+
+        // What each side actually puts on the wire for the round.
+        let said = |who: &Boundaries, key: &SigningKey| -> Hash {
+            let bytes = who
+                .get(4)
+                .expect("held")
+                .round_hash_event(1, key, 1)
+                .expect("the checkpoint stage closed, so there is a round frame");
+            let opened = crate::net::chained::open_in_hand(
+                &bytes,
+                512,
+                EventType::StateHash,
+                &TABLE,
+                4,
+            )
+            .expect("a well-formed chained STATE_HASH of hand 4");
+            assert_eq!(
+                opened.envelope.sequence,
+                checkwire::hash_sequence(1).expect("round 1 has a sequence"),
+                "the round frame sits at the round's own sequence"
+            );
+            let body: checkwire::StateHash =
+                crate::net::chained::payload(&opened, 512).expect("the body decodes");
+            body.state_hash
+        };
+
+        let a_said = said(&a, &key_a);
+        let b_said = said(&b, &key_b);
+
+        // The crux, and it is a property of the emitter rather than of the round.
+        assert_eq!(a_said, STATE, "A republishes its own value");
+        assert_eq!(b_said, OTHER, "B republishes its own value");
+        assert_ne!(
+            a_said, b_said,
+            "so the round carries the same two values the checkpoint carried"
+        );
+
+        // Now drive both rounds with exactly those, and nothing else.
+        assert_eq!(
+            a.on_round_hash(4, 1, 0, ev(20), a_said),
+            RoundTook::Counted,
+            "one seat is not the stage"
+        );
+        assert_eq!(
+            a.on_round_hash(4, 1, 1, ev(21), b_said),
+            RoundTook::Unresolved,
+            "A cannot resolve: the re-derivation is what it already published"
+        );
+        assert_eq!(b.on_round_hash(4, 1, 1, ev(21), b_said), RoundTook::Counted);
+        assert_eq!(
+            b.on_round_hash(4, 1, 0, ev(20), a_said),
+            RoundTook::Unresolved,
+            "and neither can B, so the fault is symmetric and terminal"
+        );
+    }
+
     /// The three things §6.4's divergence report reads off a faulted boundary
     /// are all still there at the moment it is written.
     ///
