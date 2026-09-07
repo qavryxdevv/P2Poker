@@ -376,6 +376,16 @@ int send_packet_tcp_connection(const TCP_Connections *tcp_c, int connections_num
             }
             if (send_oob_packet(tcp_c->logger, tcp_con->connection, con_to->public_key, packet, length) == 1) {
                 sent_any = true;
+                /* p2p-poker: the counters below live inside `if (!sent_any)`, so
+                 * a REGISTERED slot that DOES carry a packet was invisible and
+                 * "out-of-band never works" could not be told from "out-of-band
+                 * works and is never logged". It is the only path a first group
+                 * handshake can take, so which of the two it is decides whether
+                 * the gate above may ever be narrowed. Consecutive duplicates
+                 * are folded by the Rust log callback. */
+                LOGGER_DEBUG(tcp_c->logger,
+                             "p2p-poker: an out-of-band REGISTERED relay carried this packet for connection %d",
+                             connections_number);
             }
         }
     }

@@ -1,0 +1,110 @@
+# 0018 - let the send be its own oracle, and make the out-of-band path visible.
+#
+# `gconn->tcp_relays_count` has ONE write in the whole tree, the ++ in
+# gcc_save_tcp_relay, and no decrement -- while the slots it is meant to
+# describe are zeroed by rm_tcp_connection_from_conn whenever a relay that
+# never connected is killed. The two records diverge permanently in one
+# direction, and both gates in send_gc_handshake_packet read the one the send
+# does not use: the "no TCP relays to fall back on" warning could never fire
+# once any relay had ever been saved, and the send was skipped whenever the
+# count happened to be zero even if slots existed.
+#
+# Measured: "tcp_relays_count 3" against "0 online, 0 registered, 3 other" and
+# 1899 readings of "0 online, 0 registered, 0 other" (runs/split120422-9,
+# split122952-9, split115004-9, each run.txt naming its knobs).
+#
+# A NARROWER gate was proposed first and refused by four independent readings:
+# counting only ONLINE slots would have suppressed the out-of-band path, and
+# OOB is the only path a FIRST group handshake can take, because ONLINE needs
+# mutual routing that a peer we have never handshaked with has no reason to
+# have done. The attempt set here is strictly WIDER than before, so nothing
+# that is attempted today stops being attempted.
+#
+# The second hunk is the precondition the same readings named: 0017 counters
+# live inside if (!sent_any), so a REGISTERED slot that DOES carry a packet was
+# invisible, and "out-of-band never works" could not be told from "out-of-band
+# works and is never logged".
+
+diff --git a/vendor/c-toxcore/toxcore/TCP_connection.c b/vendor/c-toxcore/toxcore/TCP_connection.c
+index 23c4a80..9206d0a 100644
+--- a/vendor/c-toxcore/toxcore/TCP_connection.c
++++ b/vendor/c-toxcore/toxcore/TCP_connection.c
+@@ -376,6 +376,16 @@ int send_packet_tcp_connection(const TCP_Connections *tcp_c, int connections_num
+             }
+             if (send_oob_packet(tcp_c->logger, tcp_con->connection, con_to->public_key, packet, length) == 1) {
+                 sent_any = true;
++                /* p2p-poker: the counters below live inside `if (!sent_any)`, so
++                 * a REGISTERED slot that DOES carry a packet was invisible and
++                 * "out-of-band never works" could not be told from "out-of-band
++                 * works and is never logged". It is the only path a first group
++                 * handshake can take, so which of the two it is decides whether
++                 * the gate above may ever be narrowed. Consecutive duplicates
++                 * are folded by the Rust log callback. */
++                LOGGER_DEBUG(tcp_c->logger,
++                             "p2p-poker: an out-of-band REGISTERED relay carried this packet for connection %d",
++                             connections_number);
+             }
+         }
+     }
+diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
+index 37b5e0f..175b10e 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.c
++++ b/vendor/c-toxcore/toxcore/group_chats.c
+@@ -5701,27 +5701,37 @@ static bool send_gc_handshake_packet(const GC_Chat *chat, GC_Connection *gconn,
+         ret = sendpacket(chat->net, &gconn->addr.ip_port, packet, (uint16_t)length);
+     }
+ 
+-    if (ret != length && gconn->tcp_relays_count == 0) {
+-        Ip_Ntoa ip_str;
+-        LOGGER_WARNING(chat->log, "UDP handshake failed and no TCP relays to fall back on. ret: %d, target: %s:%u",
+-                       ret, net_ip_ntoa(&gconn->addr.ip_port.ip, &ip_str), net_ntohs(gconn->addr.ip_port.port));
+-        return false;
+-    }
+-
+-    // Send a TCP handshake if UDP fails, or if UDP succeeded last time but we never got a response
+-    if (gconn->tcp_relays_count > 0 && (ret != length || try_tcp_fallback)) {
++    /* p2p-poker: `gconn->tcp_relays_count` is kept OUT of the send decision,
++     * because it is not the fact the decision needs.
++     *
++     * It has one write in the whole tree, the ++ in `gcc_save_tcp_relay`, and
++     * no decrement -- while the slots it is meant to describe are zeroed by
++     * `rm_tcp_connection_from_conn` whenever a relay that never connected is
++     * killed. So the two records diverge permanently in one direction, and both
++     * gates here used to read the one the send does not use: the warning could
++     * never fire once any relay had ever been saved, and the send was skipped
++     * whenever the count happened to be zero even if slots existed.
++     *
++     * The send already reports the exact fact the warning wants -- `-1` is
++     * "neither the ONLINE loop nor the out-of-band REGISTERED loop carried
++     * it" -- so it is its own oracle. The attempt set is now strictly WIDER
++     * than before: nothing that is attempted today stops being attempted.
++     *
++     * A narrower gate was tried first and refused: counting only ONLINE slots
++     * would have suppressed the out-of-band path, and OOB is the only path a
++     * FIRST group handshake can take, because ONLINE needs mutual routing that
++     * a peer we have never handshaked with has no reason to have done. */
++    if (ret != length || try_tcp_fallback) {
+         if (send_packet_tcp_connection(chat->tcp_conn, gconn->tcp_connection_num, packet, (uint16_t)length) == -1) {
+-            /* p2p-poker: name the peer and the two counts, or four failures are
+-             * four identical lines. `tcp_relays_count` is what GATED this branch
+-             * and is only ever incremented; `tcp_connection_num` is what the
+-             * send actually used. They are different records, and telling them
+-             * apart is the whole of S1-AA's next obstacle. */
+-            LOGGER_DEBUG(chat->log,
+-                         "Send handshake packet failed. Type 0x%02x, peer %u, tcp_connection_num %d, "
+-                         "tcp_relays_count %u, udp ret %d, udp skipped %d, direct possible %d",
+-                         request_type, gconn->public_key_hash, gconn->tcp_connection_num,
+-                         gconn->tcp_relays_count, ret, try_tcp_fallback ? 1 : 0,
+-                         gcc_direct_conn_is_possible(chat, gconn) ? 1 : 0);
++            Ip_Ntoa ip_str;
++            LOGGER_WARNING(chat->log,
++                           "UDP handshake failed and no TCP relay carried it either. Type 0x%02x, peer %u, "
++                           "tcp_connection_num %d, tcp_relays_count %u, udp ret %d, udp skipped %d, "
++                           "direct possible %d, target: %s:%u",
++                           request_type, gconn->public_key_hash, gconn->tcp_connection_num,
++                           gconn->tcp_relays_count, ret, try_tcp_fallback ? 1 : 0,
++                           gcc_direct_conn_is_possible(chat, gconn) ? 1 : 0,
++                           net_ip_ntoa(&gconn->addr.ip_port.ip, &ip_str), net_ntohs(gconn->addr.ip_port.port));
+             return false;
+         }
+     }
