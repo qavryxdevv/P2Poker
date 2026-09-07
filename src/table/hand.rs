@@ -1409,6 +1409,20 @@ pub struct Hand {
     /// The slot of the stage now open.
     slot: Slot,
     phase: Phase,
+    /// Whether stage 0 **completed** here, as opposed to merely ending.
+    ///
+    /// **`Phase` cannot answer this and that is not an oversight.** A hand that
+    /// deals and then aborts is `Phase::Aborted` exactly like one that aborted
+    /// at stage 0, so by the time anyone asks, `Init` is gone either way and
+    /// the two are indistinguishable from the phase alone. The fact has to be
+    /// remembered at the moment it becomes true, and there is exactly one such
+    /// moment: the `Phase::Deck` assignment in `on_hand_init`, which is the
+    /// only exit from `Init` that is not an abort.
+    ///
+    /// It is a latch and never clears: a hand is constructed once per hand id
+    /// (`open_with` is the only site that writes `Phase::Init`), so nothing
+    /// re-enters stage 0 in place.
+    stage_zero_done: bool,
     params: std::sync::Arc<DeckParams>,
     /// Events for a stage this client has not reached. Held rather than
     /// refused, because GossipSub does not order two messages and a peer that
@@ -1657,6 +1671,7 @@ impl Hand {
                 mine,
                 slot,
                 phase: Phase::Init(stage),
+                stage_zero_done: false,
                 params: DeckParams::new(),
                 early: VecDeque::new(),
                 foreign_outside: std::collections::BTreeSet::new(),
@@ -2025,6 +2040,8 @@ impl Hand {
                 *slot = Some(own);
             }
         }
+        // **The one exit from stage 0 that is not an abort.** `S1-CG`.
+        self.stage_zero_done = true;
         self.phase = Phase::Deck {
             stage,
             by_seat,
@@ -7244,10 +7261,25 @@ impl Hand {
 
     /// Whether stage 0 is complete: every required seat heard and agreed.
     ///
-    /// The name is the player's word for it. What it means underneath is that
-    /// the hand has left `HAND_INIT` behind.
+    /// The name is the player's word for it, and it is now true.
+    ///
+    /// **It used to read `!matches!(self.phase, Phase::Init(_))`, which is a
+    /// different question** -- *has the hand left `Init` by any route* -- and
+    /// one of those routes is `Phase::Aborted`. So a hand that died at stage 0
+    /// answered yes, and both readers of this function believe the sentence
+    /// above rather than the code: the player was told *hand #8 has begun*
+    /// three milliseconds before *hand #8 is over*
+    /// (`split092359-10/far-n1.log`), and `cross_boundary_at_t47` quotes this
+    /// comment as T47's condition before shutting every 4.10 window, so hand
+    /// `k`'s window closed when hand `k+1` **aborted**.
+    ///
+    /// It was not cosmetic: a corpus fold that reads *has begun* as *this
+    /// branch left stage 0* finds seven forks in which two branches both
+    /// advanced -- the exact state `S1-CE`'s theorem says cannot exist -- out
+    /// of hands that never dealt a card. `tools/fold-forks.py` keeps
+    /// `--count-aborts-as-advanced` so that stays demonstrable.
     pub fn dealt(&self) -> bool {
-        !matches!(self.phase, Phase::Init(_))
+        self.stage_zero_done
     }
 
     /// Whether every seat's deck key is verified and the deck exists.
@@ -8299,6 +8331,45 @@ mod tests {
             }
         }
         out
+    }
+
+    /// `S1-CG`: a hand that ABORTED at stage 0 has not been dealt, and a hand
+    /// that dealt and then aborted has.
+    ///
+    /// Both halves matter and the second is why the phase alone cannot answer
+    /// it: `Phase::Aborted` is the same variant either way, so the old
+    /// `!matches!(self.phase, Phase::Init(_))` could tell them apart in
+    /// neither direction -- it said *dealt* to both.
+    ///
+    /// **To make this fail**: delete `self.stage_zero_done = true;` above the
+    /// `Phase::Deck` assignment in `on_hand_init` and the second half goes red;
+    /// restore `dealt` to `!matches!(self.phase, Phase::Init(_))` and the first
+    /// half goes red. Both were run.
+    #[test]
+    fn an_abort_at_stage_zero_is_not_a_dealt_hand() {
+        let (mut a, _from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        assert!(!a.dealt(), "nobody has been heard yet");
+        let _ = a
+            .abort_now(Abort::Deadline, &key(10), NOW + 600_000)
+            .unwrap();
+        assert!(
+            !a.dealt(),
+            "the hand died at stage 0 and no card was dealt: `HAND_BEGAN` must \
+             not be reported for it, and 4.10's T47 must not be crossed on it"
+        );
+
+        let (_b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+        let (mut c, _from_c) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+        let _ = deliver(&mut c, &from_b, &key(10));
+        assert!(c.dealt(), "stage 0 completed here");
+        let _ = c
+            .abort_now(Abort::Deadline, &key(10), NOW + 600_000)
+            .unwrap();
+        assert!(
+            c.dealt(),
+            "an abort AFTER the deal does not un-deal the hand, and this is the \
+             half a phase test cannot get right"
+        );
     }
 
     /// The whole milestone, with no network: two independent states, each
