@@ -67,6 +67,14 @@ use crate::tox::{Event, Tox};
 /// group reaper while the friend connections, which time out far later,
 /// survive. That is the closer model and it is what to reach for.
 ///
+/// **It fires ONCE per process, and that is a 2026-09-07 correction.** The
+/// sleep sits in the invite-accept arm and this function caches its variable, so
+/// every acceptance used to sleep -- including the ones the driver's own
+/// `MAX_REJOINS` recovery makes. A run reporting *"group join restarted 3
+/// time(s)"* was reporting three re-stalls, and the harness was guaranteeing
+/// that the recovery it exists to test could not work. Reading that as three
+/// failed recoveries is exactly the mistake the arrangement invited.
+///
 /// **Why a knob and not a wait.** The failure appeared in seven runs of 134 and
 /// nothing makes it happen. `-DivergeAt` exists for the same reason and the row
 /// that added it says why: so §6.3's answer *“can be measured rather than
@@ -692,6 +700,19 @@ fn run(
     let mut accepted_at: Option<Instant> = None;
     let mut self_joined = false;
     let mut rejoins = 0u32;
+    // **The stall fires once per process, and the reason is a measurement.**
+    //
+    // `stall_join_secs` caches the variable, and this sleep sits in the
+    // invite-accept arm, so before 2026-09-07 EVERY acceptance slept -- the
+    // ones this loop's own `MAX_REJOINS` recovery made included. A run's
+    // *"group join restarted 3 time(s)"* was three re-stalls, and the harness
+    // was guaranteeing that the lever it exists to test could not work.
+    //
+    // It cost a reading: `runs/split165852-9` against `runs/split164628-9` was
+    // read as a dose-response across `GC_UNCONFIRMED_PEER_TIMEOUT` when it is
+    // *stall shorter than the reaper* against *stall longer than it*, which is
+    // a fact about the knob rather than about the client.
+    let mut stalled_once = false;
     // Whether this client could be invited at the previous sweep. See the
     // budget rule in the sweep below.
     let mut was_reachable = false;
@@ -897,7 +918,8 @@ fn run(
                                     // holds a group, which is exactly what the
                                     // seven measured victims believed.
                                     let stall = stall_join_secs();
-                                    if stall > 0 {
+                                    if stall > 0 && !stalled_once {
+                                        stalled_once = true;
                                         std::thread::sleep(Duration::from_secs(stall));
                                     }
                                 }
