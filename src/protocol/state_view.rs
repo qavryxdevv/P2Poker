@@ -238,10 +238,17 @@ mod tests {
     }
 
     #[test]
-    fn it_encodes_as_an_array_of_twenty_nine_elements() {
+    fn it_encodes_as_an_array_of_twenty_eight_elements() {
         let bytes = to_canonical(&sample()).unwrap();
         // CBOR major type 4. A length above 23 does not fit the header byte, so
-        // 29 elements encode as 0x98 (array, one-byte length) then 0x1D.
+        // 28 elements encode as 0x98 (array, one-byte length) then 0x1C.
+        //
+        // **It said twenty-nine until 2026-09-07 and asserted twenty-eight.**
+        // `signed_this_hand` was field 28 and was deleted on 2026-09-04
+        // (041c39e); the assertion followed FIELD_COUNT and the name and the
+        // comment did not. A test whose name states a different number from
+        // the one it checks is a test a reader has to distrust, and this file
+        // is where somebody counting fields would look first.
         assert_eq!(bytes[0], 0x98, "a definite-length array with a one-byte count");
         assert_eq!(
             bytes[1],
