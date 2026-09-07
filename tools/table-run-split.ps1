@@ -279,6 +279,47 @@ if ($newest -and $newest.LastWriteTime -gt $exeTime) {
            "this run would have been about a build that predates the change. " +
            "Drop -NoBuild, or build by hand.")
 }
+# **What the binary IS, not what the run would have built.**
+#
+# `-Quiet` decides whether `cargo` is given `--features fault-harness`, and the
+# header used to read `-Quiet`. With `-NoBuild` nothing acts on it, so the
+# header described an intention. Measured on `runs/split130525-9`: the header
+# said *tox log OFF - toxcore writes nothing* over a run whose logs carry 135
+# toxcore lines, because `-NoBuild` left a fault-harness binary in place.
+#
+# The harmless direction is that one. The costly direction is the mirror:
+# `-NoBuild` over a binary built WITHOUT the feature and no `-Quiet` on the
+# command line gives a header that states `stall ... (fault-harness)` as fact
+# while `P2P_POKER_STALL_JOIN` is read by nothing at all. The knob would be
+# inert, the run would look clean, and `run.txt` -- the file added so that a
+# fold over the corpus need not guess -- would be the thing doing the lying.
+#
+# `P2P_POKER_STALL_JOIN` appears in the binary only from the `#[cfg(feature =
+# "fault-harness")]` arm in `src/tox/table.rs`; the `not(...)` arm beside it
+# names nothing, and a doc comment is not compiled. So its presence is the
+# feature's presence.
+$faultHarness = [System.Text.Encoding]::ASCII.GetString(
+    [System.IO.File]::ReadAllBytes($Exe)).Contains('P2P_POKER_STALL_JOIN')
+
+# **A knob the binary cannot honour refuses the run.** `-Deaf` is not in this
+# list on purpose: it lives in the vendored C (patch 0016) and works in every
+# build. `--no-mdns` is a command-line flag, not a harness env var, and is not
+# in it either -- both were checked rather than assumed.
+if (-not $faultHarness) {
+    $needy = @()
+    if ($Stall -gt 0)       { $needy += '-Stall' }
+    if ($MuteFor -gt 0)     { $needy += '-MuteFor' }
+    if ($LinkDownFor -gt 0) { $needy += '-LinkDownFor' }
+    if ($DelayCerts -gt 0)  { $needy += '-DelayCerts' }
+    if ($needy.Count -gt 0) {
+        throw ("$($needy -join ', ') need the fault harness and $Exe was built " +
+               "without it: the environment variables behind those knobs are read " +
+               "by nothing, so the run would be a CLEAN run wearing a header that " +
+               "says otherwise. Drop -Quiet, or drop -NoBuild, or pass -Exe a " +
+               "binary built with --features fault-harness.")
+    }
+}
+
 if (-not (Test-Path $KeyPath)) { throw "no key at $KeyPath. Plug the USB volume in or pass -KeyPath." }
 
 # **Where the logs go, and it is not the temp directory (2026-09-06).**
@@ -312,7 +353,7 @@ $header = @(
     "seats  $seats  ($Here here, $There on $Target)"
     "for    $Seconds s"
     "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
-    "tox    $(if ($Quiet) { 'log OFF - toxcore writes nothing; do not read a zero as an absence' } else { 'log on (fault-harness)' })"
+    "tox    $(if ($faultHarness) { 'log on - the BINARY carries the fault harness' } else { 'log OFF - the binary has no fault harness; toxcore writes nothing, so do not read a zero as an absence' })"
     "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on $(if ($DelayCertsHere -ge 0) { "local seat $DelayCertsHere" } else { "far seat $DelayCertsSeat" })$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
     "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
     "think  $(if ($Think -gt 0) { "every seat waits ${Think} ms before it acts - a SLOW table, not comparable with the rest of the corpus" } else { 'no delay: seats act at once' })"
