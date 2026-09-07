@@ -363,7 +363,16 @@ $header = @(
     # applied to a FAR seat at line ~506 and had no line here, so `run.txt`
     # would have called a stalled run clean -- the exact reading the file was
     # added to make possible. Caught by looking at the first file it wrote.
-    "stall  $(if ($Stall -gt 0) { "far seat $StallSeat starves its group handshake for $Stall s after accepting the invitation (fault-harness; S1-AA shape (i) on demand)" } else { 'no forced handshake stall' })"
+    # **A long stall models the knob and not the failure, and the tree said so
+    # first.** `src/tox/table.rs`'s own doc: not iterating stops EVERYTHING,
+    # not only the handshake, so a 30 s stall leaves a seat with its
+    # friendships half down and proves the recovery runs rather than that it
+    # cures anything. Thirteen to fifteen seconds trips the twelve-second group
+    # reaper (`GC_UNCONFIRMED_PEER_TIMEOUT`) while the friend connections,
+    # which time out far later, survive. That is the closer model. It was
+    # written down before any of the 2026-09-07 runs and read after them, which
+    # is why it is in the header now instead of only in a doc comment.
+    "stall  $(if ($Stall -gt 0) { "far seat $StallSeat starves its group handshake for $Stall s after accepting the invitation (fault-harness; S1-AA shape (i) on demand)$(if ($Stall -gt 15) { ' - WARNING: over 15 s stops the seat iterating toxcore at all, so this models the KNOB and not shape (i); 13-15 s trips the 12 s group reaper while the friend connections survive' })" } else { 'no forced handshake stall' })"
     "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
     "work   $work"
 )
