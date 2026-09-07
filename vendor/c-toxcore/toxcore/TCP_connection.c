@@ -380,6 +380,37 @@ int send_packet_tcp_connection(const TCP_Connections *tcp_c, int connections_num
         }
     }
 
+    /* p2p-poker: the -1 that matters was silent, and five different states
+     * produce it. Nothing here changes what is sent; it says what was there to
+     * send through. `ONLINE` slots carry routed data, `REGISTERED` ones carry
+     * out-of-band, and a slot that is neither is invisible to both loops above.
+     */
+    if (!sent_any) {
+        uint32_t online = 0;
+        uint32_t registered = 0;
+        uint32_t other = 0;
+
+        for (uint32_t i = 0; i < MAX_FRIEND_TCP_CONNECTIONS; ++i) {
+            if (con_to->connections[i].tcp_connection == 0) {
+                continue;
+            }
+
+            if (con_to->connections[i].status == TCP_CONNECTIONS_STATUS_ONLINE) {
+                ++online;
+            } else if (con_to->connections[i].status == TCP_CONNECTIONS_STATUS_REGISTERED) {
+                ++registered;
+            } else {
+                ++other;
+            }
+        }
+
+        LOGGER_DEBUG(tcp_c->logger,
+                     "p2p-poker: no relay carried this packet for connection %d: %u online, %u registered, "
+                     "%u other, %u slots, limit_reached %d",
+                     connections_number, online, registered, other,
+                     (uint32_t)MAX_FRIEND_TCP_CONNECTIONS, limit_reached ? 1 : 0);
+    }
+
     return sent_any ? 0 : -1;
 }
 

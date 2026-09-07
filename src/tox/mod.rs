@@ -185,7 +185,16 @@ unsafe extern "C" fn on_tox_log(
         }
     };
     let file = s(file);
-    if !file.contains("group") {
+    // **`group` alone dropped the file the answer is in.** `S1-AA`'s next
+    // obstacle is `send_packet_tcp_connection` returning -1, which lives in
+    // `TCP_connection.c` -- so patch 0017's line, added precisely to say why,
+    // would have been filtered out before anybody read it. The transport files
+    // are quiet in a healthy run; they are loud only when a relay cannot carry
+    // a packet, which is the case this exists for.
+    if !file.contains("group")
+        && !file.contains("TCP_connection")
+        && !file.contains("TCP_client")
+    {
         return;
     }
     eprintln!("toxcore[{level}] {file}:{line} {} — {}", s(func), s(message));

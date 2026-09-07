@@ -5711,7 +5711,16 @@ static bool send_gc_handshake_packet(const GC_Chat *chat, GC_Connection *gconn, 
     // Send a TCP handshake if UDP fails, or if UDP succeeded last time but we never got a response
     if (gconn->tcp_relays_count > 0 && (ret != length || try_tcp_fallback)) {
         if (send_packet_tcp_connection(chat->tcp_conn, gconn->tcp_connection_num, packet, (uint16_t)length) == -1) {
-            LOGGER_DEBUG(chat->log, "Send handshake packet failed. Type 0x%02x", request_type);
+            /* p2p-poker: name the peer and the two counts, or four failures are
+             * four identical lines. `tcp_relays_count` is what GATED this branch
+             * and is only ever incremented; `tcp_connection_num` is what the
+             * send actually used. They are different records, and telling them
+             * apart is the whole of S1-AA's next obstacle. */
+            LOGGER_DEBUG(chat->log,
+                         "Send handshake packet failed. Type 0x%02x, peer %u, tcp_connection_num %d, "
+                         "tcp_relays_count %u, udp ret %d",
+                         request_type, gconn->public_key_hash, gconn->tcp_connection_num,
+                         gconn->tcp_relays_count, ret);
             return false;
         }
     }
