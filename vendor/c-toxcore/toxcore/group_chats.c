@@ -8530,6 +8530,50 @@ bool handle_gc_invite_accepted_packet(const GC_Session *c, int friend_number, co
         len += nodes_len;
     }
 
+#ifdef P2P_POKER_FAULT_HARNESS
+    /* p2p-poker (patch 0023): hold back the confirmation, loop still running.
+     *
+     * `-Stall` freezes the joiner's event loop and every reading built on it
+     * was about a frozen process. What has never been modelled is the thing
+     * `S1-AA` is about: a joiner that IS iterating and whose confirmation is
+     * slow. Dropping it here rather than at the receiver is deliberate -- the
+     * friend connection is lossless, so a confirmation dropped on arrival
+     * never comes again, and holding and replaying the bytes would be a
+     * buffer this instrument does not need.
+     *
+     * The prediction is booked before the run: the joiner reaps at
+     * GC_UNCONFIRMED_PEER_TIMEOUT with handshake_attempts about four, because
+     * do_handshakes is sending the whole time. Zero would mean the 2026-09-07
+     * retraction is itself wrong. */
+    {
+        static int drop_state = 0;         /* 0 unread, 1 armed, -1 off */
+        static unsigned long drop_left = 0;
+
+        if (drop_state == 0) {
+            const char *n = getenv("P2P_POKER_DROP_CONFIRM");
+            drop_state = -1;
+
+            if (n != nullptr) {
+                drop_left = strtoul(n, nullptr, 10);
+
+                if (drop_left > 0) {
+                    drop_state = 1;
+                }
+            }
+        }
+
+        if (drop_state == 1 && drop_left > 0) {
+            --drop_left;
+            LOGGER_WARNING(chat->log,
+                           "p2p-poker: NOT sending the invite confirmation to friend %u "
+                           "(fault harness, %lu drop(s) left) - the joiner keeps iterating "
+                           "and its peer entry ages",
+                           friend_number, drop_left);
+            return true;
+        }
+    }
+#endif
+
     return send_gc_invite_confirmed_packet(m, chat, friend_number, out_data, len);
 }
 

@@ -87,6 +87,24 @@ param(
     # Anything above `GC_UNCONFIRMED_PEER_TIMEOUT` = 12 s reproduces it.
     #
     # Needs binaries built with `--features fault-harness` at both ends.
+    # **`-DropConfirm <n>` makes the FOUNDER not send the first `n` invite
+    # confirmations, while every loop keeps running.** It is the instrument
+    # `-Stall` never was.
+    #
+    # `-Stall` freezes the joiner's event loop, and every reading built on it
+    # turned out to be about a frozen process: with the stall firing once the
+    # client's own recovery works -- one restart, seventeen hands on nine seats
+    # (`runs/split182313-9`). What has never been modelled is what `S1-AA` is
+    # actually about, a joiner that IS iterating whose confirmation is slow.
+    #
+    # It drops at the INVITER on purpose. The friend connection is lossless, so
+    # a confirmation dropped on arrival never comes again, and holding and
+    # replaying the bytes would be a buffer the measurement does not need.
+    #
+    # The prediction is booked in `S1-AA` before any run: the joiner reaps at
+    # `GC_UNCONFIRMED_PEER_TIMEOUT` with `handshake_attempts` about four rather
+    # than zero, because `do_handshakes` is sending the whole time.
+    [ValidateRange(0, 64)][int]$DropConfirm = 0,
     [ValidateRange(0, 300)][int]$Stall = 0,
     [ValidateRange(0, 8)][int]$StallSeat = 0,
     # Skip the build. The staleness check below still runs, so this only saves
@@ -373,6 +391,7 @@ $header = @(
     # written down before any of the 2026-09-07 runs and read after them, which
     # is why it is in the header now instead of only in a doc comment.
     "stall  $(if ($Stall -gt 0) { "far seat $StallSeat starves its group handshake for $Stall s after accepting the invitation (fault-harness; S1-AA shape (i) on demand)$(if ($Stall -gt 15) { ' - WARNING: over 15 s stops the seat iterating toxcore at all, so this models the KNOB and not shape (i); 13-15 s trips the 12 s group reaper while the friend connections survive' })" } else { 'no forced handshake stall' })"
+    "drop   $(if ($DropConfirm -gt 0) { "the founder does not send its first $DropConfirm invite confirmation(s); every loop keeps running (fault-harness; the instrument -Stall never was)" } else { 'every invite confirmation is sent' })"
     "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
     "work   $work"
 )
@@ -645,6 +664,11 @@ for (`$i = 0; `$i -lt $There; `$i++) {
             $knobs['P2P_POKER_MUTE_AT'] = "$MuteAt"
             $knobs['P2P_POKER_MUTE_FOR'] = "$MuteFor"
             if ($MuteOnTurn) { $knobs['P2P_POKER_MUTE_ON_TURN'] = '1' }
+        }
+        # The founder is the inviter, so this knob is seat 0's and nobody
+        # else's. Naming a seat would invite a run that drops nothing.
+        if ($DropConfirm -gt 0 -and $i -eq 0) {
+            $knobs['P2P_POKER_DROP_CONFIRM'] = "$DropConfirm"
         }
         if ($DeafFor -gt 0 -and $i -eq $DeafSeat) {
             $knobs['P2P_POKER_DEAF_AT'] = "$DeafAt"
