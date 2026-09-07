@@ -755,21 +755,33 @@ for (`$i = 0; `$i -lt $There; `$i++) {
     for ($i = 0; $i -lt $Here; $i++) { $nodes += Read-Node (Join-Path $work "n$i.log") "here-n$i" }
     for ($i = 0; $i -lt $There; $i++) { $nodes += Read-Node (Join-Path $work "far-n$i.log") "far-n$i" }
 
-    Write-Host ''
-    Write-Host '--- per node ---'
-    Write-Host ('{0,-9} {1,7} {2,10} {3,7} {4,9}' -f 'node', 'seated', 'in group', 'opened', 'finished')
-    foreach ($n in $nodes) {
-        $g = if ($null -eq $n.Group) { 'never' } else { $n.Group.ToString('F1', $inv) + ' s' }
-        Write-Host ('{0,-9} {1,7} {2,10} {3,7} {4,9}' -f $n.Node, $n.Seated, $g, $n.Opens, $n.Overs)
-    }
-
+    # **The outcome goes to the archive as well as to the terminal, for the
+    # reason the header does.** `run.txt` used to record what a run was ASKED
+    # to do and stop there, so a run directory read later could not say whether
+    # the table played twenty-six hands or none -- and comparing a knobbed run
+    # against a clean one meant re-deriving both outcomes from eighteen logs.
+    # Built as one array, printed and written, so the two cannot disagree.
     $full = @($nodes | Where-Object { $_.Seated -ge $seats }).Count
     $inGroup = @($nodes | Where-Object { $null -ne $_.Group }).Count
     $played = @($nodes | Where-Object { $_.Overs -gt 0 }).Count
-    Write-Host ''
-    Write-Host "seats that saw the whole roster : $full of $seats"
-    Write-Host "seats that entered the group    : $inGroup of $seats"
-    Write-Host "seats that finished a hand      : $played of $seats"
+
+    $report = @('', '--- per node ---')
+    $report += ('{0,-9} {1,7} {2,10} {3,7} {4,9}' -f 'node', 'seated', 'in group', 'opened', 'finished')
+    foreach ($n in $nodes) {
+        $g = if ($null -eq $n.Group) { 'never' } else { $n.Group.ToString('F1', $inv) + ' s' }
+        $report += ('{0,-9} {1,7} {2,10} {3,7} {4,9}' -f $n.Node, $n.Seated, $g, $n.Opens, $n.Overs)
+    }
+    $report += ''
+    $report += "seats that saw the whole roster : $full of $seats"
+    $report += "seats that entered the group    : $inGroup of $seats"
+    $report += "seats that finished a hand      : $played of $seats"
+
+    $report | ForEach-Object { Write-Host $_ }
+    # Appended rather than rewritten: the header was written before the seats
+    # started so that a run which died half way still says what it was, and
+    # that property is worth more than a tidy single write.
+    $report | Out-File -FilePath (Join-Path $work 'run.txt') -Encoding utf8 -Append
+
     Write-Host ''
     Write-Host "logs: $work"
 }
