@@ -197,7 +197,40 @@ unsafe extern "C" fn on_tox_log(
     {
         return;
     }
-    eprintln!("toxcore[{level}] {file}:{line} {} — {}", s(func), s(message));
+    let out = format!("toxcore[{level}] {file}:{line} {} — {}", s(func), s(message));
+
+    // **Consecutive duplicates are collapsed, with the count.**
+    //
+    // A transport line fires once per packet, so one unreachable peer produced
+    // **1 578 identical lines in 42 seconds** — a third of that node's whole
+    // log, saying one thing. The state it reports changes rarely and the
+    // repetition carries nothing, but the count does: *how long* a peer had no
+    // relay is exactly what a reader wants next.
+    //
+    // Nothing is dropped. The run is closed by the next different line, which
+    // prints how many were folded into it, so a log can still be counted.
+    //
+    // Process-wide is per seat here: every seat is its own `p2p-poker.exe`.
+    static LAST: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        eprintln!("{out}");
+        return;
+    };
+    match last.as_mut() {
+        Some((prev, n)) if *prev == out => {
+            *n += 1;
+            return;
+        }
+        Some((prev, n)) => {
+            if *n > 0 {
+                eprintln!("toxcore: the line above repeated {n} more time(s)");
+            }
+            *prev = out.clone();
+            *n = 0;
+        }
+        None => *last = Some((out.clone(), 0)),
+    }
+    eprintln!("{out}");
 }
 
 /// A peer became confirmed. See [`Event::GroupPeerJoin`].

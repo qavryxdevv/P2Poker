@@ -5718,9 +5718,9 @@ static bool send_gc_handshake_packet(const GC_Chat *chat, GC_Connection *gconn, 
              * apart is the whole of S1-AA's next obstacle. */
             LOGGER_DEBUG(chat->log,
                          "Send handshake packet failed. Type 0x%02x, peer %u, tcp_connection_num %d, "
-                         "tcp_relays_count %u, udp ret %d",
+                         "tcp_relays_count %u, udp ret %d, udp skipped %d",
                          request_type, gconn->public_key_hash, gconn->tcp_connection_num,
-                         gconn->tcp_relays_count, ret);
+                         gconn->tcp_relays_count, ret, try_tcp_fallback ? 1 : 0);
             return false;
         }
     }

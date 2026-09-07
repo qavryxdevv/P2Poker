@@ -12,71 +12,31 @@
 # limit reached, or no slot at all. None of them can be told from any run,
 # current or future, without this.
 #
+# The answer, in split115004-9 at 23.2 s: "0 online, 0 registered, 0 other,
+# 6 slots" while the group side says "tcp_relays_count 3". The two records
+# disagree, and only the group side was ever filled.
+#
+# "udp skipped" is the discriminator the first shape lacked: ret is initialised
+# to -1 and sendpacket returns -1, so "udp ret -1" alone cannot tell an attempt
+# that failed from one that never happened. try_tcp_fallback decides that, and
+# it is true on every odd attempt while tcp_relays_count > 0.
+#
 # OBSERVATIONAL ONLY. Nothing changes what is sent, nothing reaches the wire,
-# and a stock toxcore peer cannot tell the difference. Measured against
-# split111706-9, where the four failures land at 42.8, 73.1, 121.7 and 151.9 s.
+# and a stock toxcore peer cannot tell the difference.
 
-diff --git a/vendor/c-toxcore/toxcore/TCP_connection.c b/vendor/c-toxcore/toxcore/TCP_connection.c
-index cbc5db9..23c4a80 100644
---- a/vendor/c-toxcore/toxcore/TCP_connection.c
-+++ b/vendor/c-toxcore/toxcore/TCP_connection.c
-@@ -380,6 +380,37 @@ int send_packet_tcp_connection(const TCP_Connections *tcp_c, int connections_num
-         }
-     }
- 
-+    /* p2p-poker: the -1 that matters was silent, and five different states
-+     * produce it. Nothing here changes what is sent; it says what was there to
-+     * send through. `ONLINE` slots carry routed data, `REGISTERED` ones carry
-+     * out-of-band, and a slot that is neither is invisible to both loops above.
-+     */
-+    if (!sent_any) {
-+        uint32_t online = 0;
-+        uint32_t registered = 0;
-+        uint32_t other = 0;
-+
-+        for (uint32_t i = 0; i < MAX_FRIEND_TCP_CONNECTIONS; ++i) {
-+            if (con_to->connections[i].tcp_connection == 0) {
-+                continue;
-+            }
-+
-+            if (con_to->connections[i].status == TCP_CONNECTIONS_STATUS_ONLINE) {
-+                ++online;
-+            } else if (con_to->connections[i].status == TCP_CONNECTIONS_STATUS_REGISTERED) {
-+                ++registered;
-+            } else {
-+                ++other;
-+            }
-+        }
-+
-+        LOGGER_DEBUG(tcp_c->logger,
-+                     "p2p-poker: no relay carried this packet for connection %d: %u online, %u registered, "
-+                     "%u other, %u slots, limit_reached %d",
-+                     connections_number, online, registered, other,
-+                     (uint32_t)MAX_FRIEND_TCP_CONNECTIONS, limit_reached ? 1 : 0);
-+    }
-+
-     return sent_any ? 0 : -1;
- }
- 
 diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
-index adbbe26..2e6aa5e 100644
+index 2e6aa5e..6f6c5b4 100644
 --- a/vendor/c-toxcore/toxcore/group_chats.c
 +++ b/vendor/c-toxcore/toxcore/group_chats.c
-@@ -5711,7 +5711,16 @@ static bool send_gc_handshake_packet(const GC_Chat *chat, GC_Connection *gconn,
-     // Send a TCP handshake if UDP fails, or if UDP succeeded last time but we never got a response
-     if (gconn->tcp_relays_count > 0 && (ret != length || try_tcp_fallback)) {
-         if (send_packet_tcp_connection(chat->tcp_conn, gconn->tcp_connection_num, packet, (uint16_t)length) == -1) {
--            LOGGER_DEBUG(chat->log, "Send handshake packet failed. Type 0x%02x", request_type);
-+            /* p2p-poker: name the peer and the two counts, or four failures are
-+             * four identical lines. `tcp_relays_count` is what GATED this branch
-+             * and is only ever incremented; `tcp_connection_num` is what the
-+             * send actually used. They are different records, and telling them
-+             * apart is the whole of S1-AA's next obstacle. */
-+            LOGGER_DEBUG(chat->log,
-+                         "Send handshake packet failed. Type 0x%02x, peer %u, tcp_connection_num %d, "
-+                         "tcp_relays_count %u, udp ret %d",
-+                         request_type, gconn->public_key_hash, gconn->tcp_connection_num,
-+                         gconn->tcp_relays_count, ret);
+@@ -5718,9 +5718,9 @@ static bool send_gc_handshake_packet(const GC_Chat *chat, GC_Connection *gconn,
+              * apart is the whole of S1-AA's next obstacle. */
+             LOGGER_DEBUG(chat->log,
+                          "Send handshake packet failed. Type 0x%02x, peer %u, tcp_connection_num %d, "
+-                         "tcp_relays_count %u, udp ret %d",
++                         "tcp_relays_count %u, udp ret %d, udp skipped %d",
+                          request_type, gconn->public_key_hash, gconn->tcp_connection_num,
+-                         gconn->tcp_relays_count, ret);
++                         gconn->tcp_relays_count, ret, try_tcp_fallback ? 1 : 0);
              return false;
          }
      }
