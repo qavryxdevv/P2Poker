@@ -190,6 +190,9 @@ $patched = @(
     @{ File   = 'toxcore/TCP_connection.c'
        Marker = 'an out-of-band REGISTERED relay carried this packet'
        Why    = '0018: without it a REGISTERED slot that DOES carry a packet is invisible -- 0017''s counters live inside if (!sent_any) -- so "out-of-band never works" cannot be told from "out-of-band works and is never logged", and out-of-band is the only path a FIRST group handshake can take' },
+    @{ File   = 'toxcore/TCP_connection.c'
+       Marker = 'a TCP relay is being killed and %u connection(s) lose a slot'
+       Why    = '0019: the one-way door, counted where it swings. do_tcp_conns kills a relay that never reached TCP_CONN_CONNECTED instead of reconnecting it, and kill_tcp_relay_connection then zeroes that slot on EVERY con_to -- and nothing in the group code puts one back, because every caller of add_tcp_relay_connection there needs something FROM the peer. It is the only irreversible step in S1-AA''s chain and nothing said when it fires. The count must be taken before the removals, since afterwards it is always zero' },
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'no TCP relay carried it either'
        Why    = '0018: the send is its own oracle. gconn->tcp_relays_count has one write in the tree and no decrement, while the slots it describes are zeroed whenever a relay that never connected is killed, so both gates read the record the send does not use: the warning could never fire once any relay had been saved, and the send was skipped whenever the count was zero even if slots existed' },
@@ -205,7 +208,13 @@ Step 'checking the patches are in the vendored source'
 foreach ($p in $patched) {
     $path = Join-Path $tox $p.File
     if (-not (Test-Path $path)) { Fail "$($p.File) is missing from the vendored tree" }
-    if (-not (Select-String -Path $path -SimpleMatch -Pattern $p.Marker -Quiet)) {
+    # **`-CaseSensitive`, and it is not pedantry.** `Select-String` matches
+    # case-insensitively by default, so a marker survived being changed from
+    # `lose a slot` to `lose a SLOT` -- found by trying to falsify a new marker
+    # on 2026-09-07 and failing to. A marker is a literal from a C source file
+    # and C string literals are case-sensitive, so the gate must be too:
+    # otherwise it certifies as present a line the binary does not contain.
+    if (-not (Select-String -Path $path -SimpleMatch -CaseSensitive -Pattern $p.Marker -Quiet)) {
         Fail "$($p.File) does not contain the patch marker '$($p.Marker)'. $($p.Why). Restore the tree with 'git checkout -- vendor/c-toxcore', or re-apply patches/ if you are moving to a new upstream."
     }
     Note "  $($p.File): patched"

@@ -959,12 +959,40 @@ int kill_tcp_relay_connection(TCP_Connections *tcp_c, int tcp_connections_number
         return -1;
     }
 
+    /* p2p-poker: count the slots BEFORE they are removed, because afterwards
+     * the answer is always zero. `rm_tcp_connection_from_conn` already returns
+     * the slot index or -1, so this costs one comparison and no extra scan. */
+    uint32_t slots_lost = 0;
+
     for (uint32_t i = 0; i < tcp_c->connections_length; ++i) {
         TCP_Connection_to *con_to = get_connection(tcp_c, i);
 
         if (con_to != nullptr) {
-            rm_tcp_connection_from_conn(con_to, tcp_connections_number);
+            if (rm_tcp_connection_from_conn(con_to, tcp_connections_number) >= 0) {
+                ++slots_lost;
+            }
         }
+    }
+
+    /* p2p-poker: THE ONE-WAY DOOR, said where it swings (`S1-AA`).
+     *
+     * `do_tcp_conns` kills a relay that never reached `TCP_CONN_CONNECTED`
+     * instead of reconnecting it, and every `con_to` that held a slot on it
+     * loses that slot here. Nothing in the group code puts one back: every
+     * caller of `add_tcp_relay_connection` there needs something FROM the peer,
+     * which is the chicken-and-egg shape (i) is made of.
+     *
+     * Silent when nothing was attached, so an ordinary relay rotation does not
+     * fill the log; loud exactly when a peer's transport got narrower. Which of
+     * the four callers this is, is what `status` says: `TCP_CONN_CONNECTED`
+     * here is `kill_nonused_tcp`'s announce timeout, and anything else is the
+     * relay that never connected. */
+    if (slots_lost > 0) {
+        LOGGER_WARNING(tcp_c->logger,
+                       "p2p-poker: a TCP relay is being killed and %u connection(s) lose a slot. "
+                       "Relay %d, status %u, onion %d, lock_count %u, sleep_count %u",
+                       slots_lost, tcp_connections_number, (unsigned int)tcp_con->status,
+                       tcp_con->onion ? 1 : 0, tcp_con->lock_count, tcp_con->sleep_count);
     }
 
     if (tcp_con->onion) {
