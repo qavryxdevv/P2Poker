@@ -36,6 +36,7 @@ Each fold takes run names or, with no arguments, every run under `runs/`.
 | `fold-vote-state.py` | Was a timeout vote ever **owed, eligible, past twice the stage budget, and not cast**? Every per-seat entry falls in one of five buckets and only `UNMET` is the fault. Prints each bucket's longest wait *against the budget that stage actually carried*. | `S1-BR` |
 | `fold-forks.py` | How many hands forked, and did **two** branches ever pass stage 0? Carries `--count-aborts-as-advanced` so the trap it dodges stays demonstrable. | `S1-CE`, `S1-CG` |
 | `fold-relay-kills.py` | Which relays were killed with a group's slots still on them, by which of the two kill paths, and **what those slots were** — `ONLINE`, `REGISTERED`, or neither. | `S1-AA` |
+| `fold-peer-deaths.py` | Which group peer entries were **deleted**, by which exit type, how far each had got, and how many **distinct peers** were lost. Separates the orderly shutdown from the rest first, so it cannot pad a fault count. | `S1-AA` |
 | `classify-run.ps1` | Read a kept run directory and say what shape of failure, if any, it holds. | — |
 
 **A fold that prints nothing is not a fold that measured zero.** Each of these
