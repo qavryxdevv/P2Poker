@@ -6140,16 +6140,38 @@ impl Hand {
         // settlement's — the fork the `HAND_COMPLETE`-wins rule exists to
         // prevent, produced by the check meant to guard it.
         //
-        // **Hearing it cannot move a chip, on either road here.** When this
-        // client gave up while settling, `give_up` carried its own stage and
-        // its own body across, so `late.body` is this client's OWN settlement
-        // and `late.closed` applies those stacks and no other seat's. When it
-        // gave up before settling, `late.body` is whichever peer spoke first —
-        // and that stage can never complete: `Collective::complete` needs every
-        // seat of the required set, this client is in that set, and it never
-        // published a `HAND_COMPLETE` for this stage to hear. So a peer-seeded
-        // body reaches neither `next_hand` nor `GENESIS(k+1)`, and D-012 is
-        // not in question.
+        // **Whose body this is, and the second half of this used to be wrong**
+        // (`S1-CL`). When this client gave up **while settling**, `give_up`
+        // carried its own stage and its own body across, so `late.body` is this
+        // client's OWN settlement and `late.closed` applies those stacks and no
+        // other seat's. That half is sound.
+        //
+        // When it gave up **before** settling, `late.body` is whichever peer
+        // spoke first. This comment used to argue that such a body reaches
+        // neither `next_hand` nor `GENESIS(k+1)`, because the stage needs every
+        // seat of the required set and *"this client is in that set, and it
+        // never published a `HAND_COMPLETE` for this stage to hear"*.
+        //
+        // **That clause is false for a readmitted seat, and `open_with` makes
+        // it so deliberately**: the membership test there is
+        // `accepted.contains(&o.my_seat)` over `required ∪ readmitted`, which
+        // is §4.9's readmission route. Such a seat holds a hand whose `my_seat`
+        // is outside `required`, the stage closes on the required peers alone,
+        // and `next_hand`'s `Phase::Aborted` arm does read `late.closed`'s
+        // stacks — into `roster_hash(k+1)` and so into `GENESIS(k+1)`. Pinned
+        // by `a_readmitted_seat_is_outside_the_set_the_late_stage_requires`.
+        //
+        // **What is actually true is narrower and is why this is not changed
+        // here.** When the required peers agree — the ordinary case — every
+        // body is identical, arrival order decides nothing, and following the
+        // settlement is exactly what keeps a readmitted seat with the table.
+        // The exposure is confined to a settlement the required peers
+        // **disagree** about, which `S1-BD` made audible on purpose and which
+        // `S1-CI` shows §6.3 cannot then heal. Gating this arm on
+        // `required.contains(my_seat)` would send a readmitted seat to the
+        // abort's stacks while everyone else took the settlement's, which forks
+        // it away from a table it currently follows — a worse answer than the
+        // one being defended.
         let note = if theirs == late.body {
             None
         } else {
@@ -8877,6 +8899,77 @@ mod tests {
         assert!(
             h.participants().contains(&2),
             "and it is counted into P(k+1), which is what makes it dealable at k+2"
+        );
+    }
+
+    /// **`on_late_settlement`'s justification does not hold for a readmitted
+    /// seat, and this pins the half that fails** (`S1-CL`).
+    ///
+    /// That function builds its stage over `self.open.required` and defends
+    /// adopting a peer's settlement body with: *"this client is in that set,
+    /// and it never published a `HAND_COMPLETE` for this stage to hear. So a
+    /// peer-seeded body reaches neither `next_hand` nor `GENESIS(k+1)`, and
+    /// D-012 is not in question."*
+    ///
+    /// **The first clause is false and `Hand::open_with` makes it so on
+    /// purpose.** The membership test there is
+    /// `accepted.contains(&o.my_seat)`, where `accepted = required ∪
+    /// readmitted` — §4.9's readmission route, and the sibling test above
+    /// pins that a readmitted seat is *accepted at stage zero and never
+    /// required*. So a readmitted seat holds a hand whose `my_seat` is
+    /// **outside** the very set the late stage requires, the stage can close
+    /// on the required peers alone, and `late.closed` is set from whichever
+    /// body arrived first.
+    ///
+    /// **And `next_hand` does read those stacks**: its `Phase::Aborted` arm
+    /// takes `late.closed`'s second element when it is `Some`, so they become
+    /// hand `k+1`'s `stack_at_hand_start`, enter `roster_hash` and enter
+    /// `GENESIS(k+1)`. The route the comment says does not exist, exists.
+    ///
+    /// **What this test does NOT claim.** It does not claim a divergence. When
+    /// the required peers agree — the ordinary case — every body is identical
+    /// and arrival order decides nothing, and following the settlement is what
+    /// keeps a readmitted seat with the table. The exposure is confined to a
+    /// settlement the required peers **disagree** about, which `S1-BD` made
+    /// audible on purpose and which `S1-CI` shows §6.3 cannot then heal. It is
+    /// the justification that is wrong, not necessarily the behaviour, and
+    /// changing the behaviour here would fork a readmitted seat away from a
+    /// table it currently follows.
+    ///
+    /// **To make this fail**: make `open_with` gate on `required` instead of
+    /// `accepted`, which is the change
+    /// `a_readmitted_seat_is_accepted_at_stage_zero_and_never_required` exists
+    /// to prevent. It was run.
+    #[test]
+    fn a_readmitted_seat_is_outside_the_set_the_late_stage_requires() {
+        let mut o = opening3(2);
+        o.required = vec![0, 1];
+        o.readmitted = vec![2];
+        let (h, _) = Hand::open(o, &key(12), NOW, 30_000).unwrap();
+
+        assert_eq!(h.open.my_seat, 2);
+        assert!(
+            !h.open.required.contains(&h.open.my_seat),
+            "the hand exists and its own seat is NOT in the required set: this is \
+             the clause on_late_settlement's comment relies on"
+        );
+
+        // And a stage over that required set closes without this seat, which is
+        // the other half: nothing this client withholds can hold it open.
+        let mut stage = Collective::closed(
+            9,
+            EventType::HandComplete.code(),
+            &h.open.required,
+        )
+        .expect("a stage over R(k)");
+        assert!(!stage.complete());
+        stage.hear(0, [1u8; 32]);
+        assert!(!stage.complete(), "one of the two required seats is not the stage");
+        stage.hear(1, [2u8; 32]);
+        assert!(
+            stage.complete(),
+            "and with both required seats heard it is complete, with seat 2 \
+             having published nothing"
         );
     }
 
