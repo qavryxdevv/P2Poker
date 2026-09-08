@@ -770,7 +770,22 @@ pub const EARLY_BYTES: usize = 2 * NEXT_EARLY_BYTES;
 struct Late {
     stage: Collective,
     body: HandComplete,
-    /// Set once every seat of the required set has published the same body.
+    /// Whether `body` is this client's OWN settlement, carried across by
+    /// `give_up` from a `Step::Settling` it was already in — as opposed to the
+    /// first peer's, adopted because this client never settled.
+    ///
+    /// The two are closed differently and the difference is `S1-CL`: an own
+    /// body is applied whatever the peers say, exactly as a peer that settled
+    /// normally applies `mine.final_stacks`; a borrowed one is applied only if
+    /// every peer said the same thing, because otherwise this client would be
+    /// choosing a side by arrival order.
+    own: bool,
+    /// Whether any later body differed from `body`. Read only when `own` is
+    /// false, where it is the one thing that stops the stage closing.
+    disagreed: bool,
+    /// Set once every seat of the required set has published, and — for a
+    /// borrowed body — published the same thing. The second clause was in
+    /// this sentence before it was in the code (`S1-CL`).
     closed: Option<(Hash, Vec<Chips>)>,
 }
 
@@ -6071,6 +6086,8 @@ impl Hand {
                     self.late = Some(Late {
                         stage: stage.clone(),
                         body: (**mine).clone(),
+                        own: true,
+                        disagreed: false,
                         closed: None,
                     });
                 }
@@ -6115,6 +6132,8 @@ impl Hand {
             self.late = Some(Late {
                 stage,
                 body: theirs.clone(),
+                own: false,
+                disagreed: false,
                 closed: None,
             });
         }
@@ -6175,6 +6194,7 @@ impl Hand {
         let note = if theirs == late.body {
             None
         } else {
+            late.disagreed = true;
             let what = late.body.disagreement(&theirs);
             Some(if what.is_empty() {
                 format!(
@@ -6207,9 +6227,27 @@ impl Hand {
             Heard::Uninvited => return Err(Failed::NotYet),
         }
         if late.stage.complete() {
-            let hash = late.stage.hash().ok_or(Failed::NotInThisStage)?;
-            let stacks = late.body.final_stacks.clone();
-            late.closed = Some((hash, stacks));
+            if late.own || !late.disagreed {
+                let hash = late.stage.hash().ok_or(Failed::NotInThisStage)?;
+                let stacks = late.body.final_stacks.clone();
+                late.closed = Some((hash, stacks));
+            } else {
+                // **A borrowed body under disagreement is not adopted** — that
+                // would be choosing a side by arrival order, which is a
+                // per-receiver quantity, into `GENESIS(k+1)` (D-012, `S1-CL`).
+                // This client has no settlement of its own to prefer, so it
+                // keeps the abort's terminal and stacks and says why. The
+                // required peers, who are the ones disagreeing, are meanwhile
+                // freezing the table at checkpoint 8, so no hand `k+1` is
+                // being dealt for this client to have missed.
+                self.settle_note = Some(format!(
+                    "the late settlement of hand #{} is complete but its emitters disagree, and \
+                     this client never settled the hand itself, so it adopts none of them: the \
+                     abort's terminal stands here",
+                    self.open.hand_id
+                ));
+                return Ok(Vec::new());
+            }
         }
         if note.is_some() {
             self.settle_note = note;
@@ -8970,6 +9008,118 @@ mod tests {
             stage.complete(),
             "and with both required seats heard it is complete, with seat 2 \
              having published nothing"
+        );
+    }
+
+    /// **A readmitted seat adopts a peer's settlement only if the peers agree**
+    /// (`S1-CL`, the fix).
+    ///
+    /// The sibling test above pins that such a seat is outside the set its
+    /// late stage requires, so the stage closes on the required peers alone
+    /// and `late.body` is whichever of them spoke first. Adopting that body
+    /// when the peers **disagree** would be choosing a side by arrival order —
+    /// a per-receiver quantity — into `GENESIS(k+1)`, which is D-012's shape.
+    ///
+    /// So a borrowed body closes the stage only when every later body equals
+    /// the first. In the agreed case nothing changes and the seat follows the
+    /// settlement, which is what keeps it with the table. In the disagreed
+    /// case it adopts none of them, says so, and keeps the abort's terminal —
+    /// while the peers, who are the ones disagreeing, are freezing the table
+    /// at checkpoint 8 anyway.
+    ///
+    /// An OWN body — `give_up` from `Step::Settling` — is not gated: a peer
+    /// that settled normally applies `mine.final_stacks` whatever the others
+    /// say, and `a_disagreeing_late_settlement_is_heard_and_the_settlement_wins`
+    /// below pins that side.
+    ///
+    /// **To make this fail**: close on `late.stage.complete()` alone, which is
+    /// what the code did before this test existed. It was run.
+    #[test]
+    fn a_borrowed_late_settlement_closes_only_when_the_peers_agree() {
+        use crate::table::handwire::HandComplete;
+
+        // The two settlement bodies the required peers might publish.
+        let body = |stacks: Vec<u64>| HandComplete {
+            pots: Vec::new(),
+            refunds: Vec::new(),
+            deltas: vec![0, 0, 0],
+            final_stacks: stacks,
+            busted: Vec::new(),
+            state_hash: [0u8; 32],
+        };
+        let sealed = |seat_key: &SigningKey, b: &HandComplete| -> Vec<u8> {
+            let slot = Slot {
+                table_id: [1; 32],
+                hand_id: 1,
+                sequence: 40,
+                previous_event_hash: [5u8; 32],
+            };
+            chained::seal(
+                EventType::HandComplete,
+                &slot,
+                b,
+                seat_key,
+                NOW,
+                0,
+                HAND_COMPLETE_CAP,
+            )
+            .expect("a settlement seals")
+        };
+
+        // A readmitted seat: accepted, never required, and it never settled.
+        let fresh = || {
+            let mut o = opening3(2);
+            o.required = vec![0, 1];
+            o.readmitted = vec![2];
+            let (mut h, _) = Hand::open(o, &key(12), NOW, 30_000).unwrap();
+            let _ = h.abort_now(Abort::Deadline, &key(12), NOW + 600_000).unwrap();
+            assert!(h.aborted().is_some());
+            h
+        };
+
+        // (i) The peers DISAGREE: seat 0 says one thing, seat 1 another.
+        let mut h = fresh();
+        let a = body(vec![12_000, 8_000, 10_000]);
+        let b = body(vec![8_000, 12_000, 10_000]);
+        assert_eq!(h.on_event(&sealed(&key(10), &a), &key(12), NOW), Ok(Vec::new()));
+        assert_eq!(h.on_event(&sealed(&key(11), &b), &key(12), NOW), Ok(Vec::new()));
+        let late = h.late.as_ref().expect("a late stage was built from seat 0's body");
+        assert!(!late.own, "the body is borrowed, this seat never settled");
+        assert!(late.disagreed, "and seat 1 disagreed with it");
+        assert!(late.stage.complete(), "the required set is heard in full");
+        assert!(
+            late.closed.is_none(),
+            "so the stage is complete and NOT closed: adopting either body would be \
+             choosing a side by arrival order"
+        );
+        let note = h.take_settle_note().expect("and it says so");
+        assert!(note.contains("emitters disagree"), "{note}");
+        assert_eq!(
+            h.terminal(),
+            Some(crate::protocol::transcript::abort_terminal(
+                &h.table_id(),
+                h.hand_id(),
+                &h.genesis()
+            )),
+            "the abort's terminal stands"
+        );
+
+        // (ii) The peers AGREE: the same body twice, and the seat follows it.
+        let mut h = fresh();
+        assert_eq!(h.on_event(&sealed(&key(10), &a), &key(12), NOW), Ok(Vec::new()));
+        assert_eq!(h.on_event(&sealed(&key(11), &a), &key(12), NOW), Ok(Vec::new()));
+        let late = h.late.as_ref().expect("held");
+        assert!(!late.disagreed);
+        let (_, stacks) = late.closed.as_ref().expect("closed on agreement");
+        assert_eq!(stacks, &vec![12_000, 8_000, 10_000], "with the settlement's stacks");
+        assert_ne!(
+            h.terminal(),
+            Some(crate::protocol::transcript::abort_terminal(
+                &h.table_id(),
+                h.hand_id(),
+                &h.genesis()
+            )),
+            "and the settlement wins over the abort, exactly as before"
         );
     }
 
