@@ -6231,6 +6231,28 @@ impl Hand {
                 let hash = late.stage.hash().ok_or(Failed::NotInThisStage)?;
                 let stacks = late.body.final_stacks.clone();
                 late.closed = Some((hash, stacks));
+                // The agreed branch used to close in silence, so a run could
+                // show the refusal below and never the adoption, and the
+                // corpus could not say how often this path fires at all.
+                // Same channel as the refusal, so one grep finds both.
+                //
+                // **Folded behind a pending disagreement, never over it.** The
+                // channel is one slot, and an own body closing in the same call
+                // that a dissenting copy arrived produced two facts for it. The
+                // first draft kept the second and lost the first, and the
+                // `S1-BP` test -- which asserts the disagreement is REPORTED --
+                // is what caught it.
+                let closed = format!(
+                    "the late settlement of hand #{} closed: {} body, every required seat heard{}",
+                    self.open.hand_id,
+                    if late.own { "this client's own" } else { "a peer's" },
+                    if late.disagreed { ", not all agreeing" } else { "" }
+                );
+                self.settle_note = Some(match note {
+                    Some(n) => format!("{n}; and {closed}"),
+                    None => closed,
+                });
+                return Ok(Vec::new());
             } else {
                 // **A borrowed body under disagreement is not adopted** — that
                 // would be choosing a side by arrival order, which is a
@@ -6240,12 +6262,18 @@ impl Hand {
                 // required peers, who are the ones disagreeing, are meanwhile
                 // freezing the table at checkpoint 8, so no hand `k+1` is
                 // being dealt for this client to have missed.
-                self.settle_note = Some(format!(
+                let refused = format!(
                     "the late settlement of hand #{} is complete but its emitters disagree, and \
                      this client never settled the hand itself, so it adopts none of them: the \
                      abort's terminal stands here",
                     self.open.hand_id
-                ));
+                );
+                // Same rule as the closed branch: the disagreement that got us
+                // here is kept in front of the refusal it caused.
+                self.settle_note = Some(match note {
+                    Some(n) => format!("{n}; and {refused}"),
+                    None => refused,
+                });
                 return Ok(Vec::new());
             }
         }
@@ -9112,6 +9140,14 @@ mod tests {
         assert!(!late.disagreed);
         let (_, stacks) = late.closed.as_ref().expect("closed on agreement");
         assert_eq!(stacks, &vec![12_000, 8_000, 10_000], "with the settlement's stacks");
+        // The agreed branch says so, on the same channel as the refusal, so a
+        // field run can show the fix adopting and not only refusing. Asserted,
+        // because an unasserted log line can vanish with every test green.
+        let note = h.take_settle_note().expect("the close is reported");
+        assert!(
+            note.contains("closed: a peer's body") && !note.contains("not all agreeing"),
+            "{note}"
+        );
         assert_ne!(
             h.terminal(),
             Some(crate::protocol::transcript::abort_terminal(
