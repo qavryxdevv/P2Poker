@@ -7726,6 +7726,43 @@ async fn boundary_event(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Whether §4.9's parent rule applies to this frame, and whether it holds.
+///
+/// The mirror of [`window_position`] for §4.9, and deliberately the same shape:
+/// the two sections state the same rule in the same words, and for a while only
+/// §4.10 enforced it (`S1-CK`).
+///
+/// **Only round 0's hash half chains from `TERMINAL(k)`.** `state_ack_event`
+/// chains from the checkpoint's own `stage_hash` and says so in its doc;
+/// `round_hash_event` does the same for a reconciliation round. A rule scoped by
+/// sequence alone would refuse every acknowledgement and every round, which is
+/// what makes `NotInScope` a distinct answer rather than a `true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointPosition {
+    /// Round 0's hash half, chained from `TERMINAL(k)` as §4.9 requires.
+    Right,
+    /// Round 0's hash half, chained from something else.
+    NotTheTerminal,
+    /// An acknowledgement or a reconciliation round: §4.9's parent rule is not
+    /// about these, and they chain from the checkpoint's own `stage_hash`.
+    NotInScope,
+}
+
+fn checkpoint_position(
+    round: u16,
+    half: crate::table::checkwire::Kind,
+    parent: &crate::poker::state::Hash,
+    terminal: &crate::poker::state::Hash,
+) -> CheckpointPosition {
+    if round != 0 || half != crate::table::checkwire::Kind::Hash {
+        return CheckpointPosition::NotInScope;
+    }
+    if parent != terminal {
+        return CheckpointPosition::NotTheTerminal;
+    }
+    CheckpointPosition::Right
+}
+
 async fn checkpoint_event(
     bytes: &[u8],
     h: &crate::table::hand::Hand,
@@ -7799,6 +7836,54 @@ async fn checkpoint_event(
     let Some(seat) = h.seat_of_key(&opened.sender) else {
         return Some(Vec::new());
     };
+
+    // **§4.9's parent, enforced** (`S1-CK`). *"**Parent.**
+    // `previous_event_hash = TERMINAL(k)`, for every emitter and whatever the
+    // order of arrival"* — the one thing every emitter must agree on before the
+    // comparison starts. `open_in_hand` passes `position: None`, which is
+    // §4.0 step 10a's exemption and relaxes **both** positional comparisons, so
+    // without this the sender could chain its checkpoint from a stage it
+    // invented. §4.10's window has had the same check since it was built
+    // (`window_position`); this is the half that did not.
+    //
+    // **The scope is exact and the rest of the band must not move.** Only
+    // round 0's HASH half chains from the terminal. `state_ack_event` chains
+    // from the checkpoint's own `stage_hash` and says so in its doc, and
+    // `round_hash_event` does the same for a reconciliation round — a gate
+    // scoped by sequence alone would refuse every acknowledgement and every
+    // round, which is 699 measured *the boundary checkpoint of hand N agreed*
+    // lines regressed.
+    //
+    // **It cannot hide the divergence it sits next to.** `TERMINAL(k)` is a
+    // `stage_hash` over the settlement's **event hashes**, while the value
+    // checkpoint 8 compares is `state_hash` **inside** those events. Two peers
+    // that settled the same hand heard the same frames and hold the same
+    // terminal even when their `state_hash` differs, so this checks the
+    // position and leaves the value to `on_state_hash` — which is the division
+    // §4.9 itself draws. And a peer that aborted never arrives here at all:
+    // `boundaries.open` is gated on `checkpoint8()`, `None` after an abort, so
+    // it holds no boundary and the `holds` test above already returned.
+    //
+    // **Refused loudly.** A checkpoint frame that vanishes silently is the
+    // shape of defect this register keeps filing, and a peer chaining from a
+    // stage nobody else holds is precisely what §4.9 wants known.
+    let Some(terminal) = boundaries.get(hand_id).map(|b| b.terminal()) else {
+        // The `holds` test above passed, so this is unreachable; taking it as a
+        // refusal rather than a panic keeps a receiver from dying on a race.
+        return Some(Vec::new());
+    };
+    if checkpoint_position(round, half, &opened.envelope.previous_event_hash, &terminal)
+        == CheckpointPosition::NotTheTerminal
+    {
+        let _ = events
+            .send(NodeEvent::Warning(format!(
+                "seat {seat}'s boundary checkpoint for hand {hand_id} is chained from a stage \
+                 this client does not hold, so section 4.9's parent rule refuses it: it is not \
+                 TERMINAL(k) here"
+            )))
+            .await;
+        return Some(Vec::new());
+    }
 
     // §6.3 step 3's re-derivation, in the round's own stage. Its `STATE_ACK`
     // half is not built: §6.3 reads the outcome off the **hash** stage — one
@@ -9157,39 +9242,70 @@ mod the_boundary_window_at_the_wire {
         );
     }
 
-    /// **§4.10 enforces its parent and §4.9 does not, and both are specified
-    /// in the same words** (`S1-CK`).
+    /// **§4.9's parent rule, which §4.10 has enforced all along and §4.9 did
+    /// not** (`S1-CK`).
     ///
-    /// The test above is §4.10's half. §4.9's is *"**Parent.**
-    /// `previous_event_hash = TERMINAL(k)`, for every emitter and whatever the
-    /// order of arrival"* — and there is no code behind it. A checkpoint-8
-    /// frame is opened with [`crate::net::chained::open_in_hand`], which passes
-    /// `position: None`, so `open_inner`'s sequence and parent comparisons are
-    /// both skipped; and no caller compares the parent afterwards. A `grep` for
-    /// `previous_event_hash` over this file finds `window_position`'s check and
-    /// no other.
+    /// Both sections say the same thing in the same words — §4.10:
+    /// *"`previous_event_hash == TERMINAL(k)` for every event of the window
+    /// whichever seat emits"*; §4.9: *"**Parent.** `previous_event_hash =
+    /// TERMINAL(k)`, for every emitter and whatever the order of arrival"* —
+    /// and for a while only the first had code behind it.
     ///
-    /// **This asserts what the tree does, and it is a non-conformance rather
-    /// than a design.** The value is not decorative: §4.9 makes the parent the
-    /// one thing every emitter must agree on before the comparison starts, so
-    /// an unchecked one lets a peer chain its checkpoint from a stage it
-    /// invented — exactly the fault the sibling test above calls out for the
-    /// boundary window.
+    /// **The scope is the whole difficulty and is asserted here first.** Only
+    /// round 0's hash half chains from the terminal. An acknowledgement chains
+    /// from the checkpoint's own `stage_hash` (`Boundary::state_ack_event`
+    /// says so and a test pins it), and so does a reconciliation round
+    /// (`round_hash_event`). A rule scoped by sequence alone would refuse both
+    /// and regress the 699 measured *the boundary checkpoint of hand N agreed*
+    /// lines in the corpus — which is why `NotInScope` is a distinct answer
+    /// rather than a `true`.
     ///
-    /// It is left unfixed on purpose. A gate here has a measured regression
-    /// waiting for it: `STATE_ACK` chains from the checkpoint's own
-    /// `stage_hash` and **not** from the terminal (`Boundary::state_ack_event`
-    /// says so in its doc), so a check scoped by sequence alone refuses every
-    /// acknowledgement, including a peer's own re-fed copy, and 672 measured
-    /// *the boundary checkpoint of hand N agreed* lines are what it would
-    /// regress. The scope has to be `round == 0` **and** the hash half.
+    /// **Why it cannot hide the divergence it sits beside**, asserted at the
+    /// end: `TERMINAL(k)` is a `stage_hash` over the settlement's **event
+    /// hashes**, while the value checkpoint 8 compares is `state_hash`
+    /// **inside** those events. Two peers that settled the same hand heard the
+    /// same frames, so they hold the same terminal even when their `state_hash`
+    /// differs — the position and the value are independent, which is the
+    /// division §4.9 draws.
     ///
-    /// **To make this fail**: add that gate. This test going red is the
-    /// notification that `S1-CK` is closed.
+    /// **To make this fail**: drop the `round != 0` half of the scope and the
+    /// acknowledgement case goes red; drop the parent comparison and the first
+    /// case does. Both were run.
     #[test]
-    fn the_checkpoint_parent_is_specified_and_unchecked() {
-        use crate::protocol::messages::EventType;
+    fn the_checkpoint_parent_is_the_terminal_and_only_at_round_zero() {
+        use crate::table::checkwire::Kind;
 
+        assert_eq!(
+            checkpoint_position(0, Kind::Hash, &TERMINAL, &TERMINAL),
+            CheckpointPosition::Right
+        );
+        assert_eq!(
+            checkpoint_position(0, Kind::Hash, &OTHER, &TERMINAL),
+            CheckpointPosition::NotTheTerminal,
+            "a checkpoint chained from a stage this client does not hold"
+        );
+        assert_eq!(
+            checkpoint_position(0, Kind::Hash, &[0u8; 32], &TERMINAL),
+            CheckpointPosition::NotTheTerminal,
+            "the zero hash is not a wildcard, exactly as in the window"
+        );
+
+        // The two halves the rule is NOT about, and refusing them is the
+        // regression this scope exists to avoid.
+        assert_eq!(
+            checkpoint_position(0, Kind::Ack, &OTHER, &TERMINAL),
+            CheckpointPosition::NotInScope,
+            "an acknowledgement chains from the checkpoint's own stage_hash"
+        );
+        assert_eq!(
+            checkpoint_position(1, Kind::Hash, &OTHER, &TERMINAL),
+            CheckpointPosition::NotInScope,
+            "and so does a reconciliation round"
+        );
+
+        // `open_in_hand` still admits any parent, and that is correct: §4.0
+        // step 10a's exemption is what lets a late checkpoint be compared at
+        // all. The check belongs above it, which is where it now is.
         const TABLE: crate::poker::state::Hash = [3u8; 32];
         let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let body = crate::table::checkwire::StateHash {
@@ -9197,7 +9313,6 @@ mod the_boundary_window_at_the_wire {
             state_hash: [1u8; 32],
             transcript_head: TERMINAL,
         };
-        // A parent that is not TERMINAL(k), and not even a stage of this hand.
         let slot = crate::net::chained::Slot {
             table_id: TABLE,
             hand_id: 4,
@@ -9205,7 +9320,7 @@ mod the_boundary_window_at_the_wire {
             previous_event_hash: OTHER,
         };
         let bytes = crate::net::chained::seal(
-            EventType::StateHash,
+            crate::protocol::messages::EventType::StateHash,
             &slot,
             &body,
             &key,
@@ -9213,29 +9328,19 @@ mod the_boundary_window_at_the_wire {
             0,
             512,
         )
-        .expect("a checkpoint frame seals at any parent");
-
+        .expect("seals");
         let opened = crate::net::chained::open_in_hand(
             &bytes,
             512,
-            EventType::StateHash,
+            crate::protocol::messages::EventType::StateHash,
             &TABLE,
             4,
         )
-        .expect(
-            "and it OPENS at any parent: this is the non-conformance, not an \
-             accident of the test",
-        );
+        .expect("and opens: the decoder is not where the rule lives");
         assert_eq!(
-            opened.envelope.previous_event_hash, OTHER,
-            "the frame carries a parent that is not TERMINAL(k) and was admitted"
-        );
-
-        // The contrast, in one line: the boundary window refuses exactly this.
-        assert_eq!(
-            window_position(3, BOUNDARY_SEQUENCE_BASE + 3, &OTHER, &TERMINAL),
-            WindowPosition::NotTheTerminal,
-            "sec 4.10 refuses the same parent that sec 4.9 admits"
+            checkpoint_position(0, Kind::Hash, &opened.envelope.previous_event_hash, &TERMINAL),
+            CheckpointPosition::NotTheTerminal,
+            "the frame the decoder admits is the frame this rule refuses"
         );
     }
 
