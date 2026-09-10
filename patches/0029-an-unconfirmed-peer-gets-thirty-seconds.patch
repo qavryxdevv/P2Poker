@@ -37,6 +37,21 @@
 # lever. Fix (a) is named and not built: send TCP on every attempt when
 # the peer has never been heard directly, so the first attempt is not a
 # UDP packet to a LAN address on another network.
+#
+# THE FIRST RUN (runs/split141942-9): the first clause held, the second
+# could not be tested. The far seat reaped nothing in 240 s -- against 6,
+# 4, 6 and 3 reaps in four of the six runs before the patch -- and
+# handshaked with every seat that was there within seconds of its
+# arrival: the founder at 32.8 s, two seats five seconds after its
+# requests, each later arrival on the TCP response attempt two to three
+# seconds after the UDP one failed. It read 7/7/7 at 91.8 s and 8/8/8 at
+# 181.8, because the ninth seat entered the group only at 160.7 s: its
+# own line at 150 s says "Tox is offline; of 20 known nodes, 20
+# bootstrapped and 20 TCP relays were accepted" -- a node whose Tox had
+# no DHT for 150 s, so no friend connection and no invite. A bootstrap
+# wait the client already names, not the handshake cycle. The reap census
+# with the patch stands at 0 of 1; one run is one run, and every 8+1 run
+# from here reads itself.
 
 diff --git a/vendor/c-toxcore/toxcore/group_chats.h b/vendor/c-toxcore/toxcore/group_chats.h
 index c9a0f84..a481216 100644
