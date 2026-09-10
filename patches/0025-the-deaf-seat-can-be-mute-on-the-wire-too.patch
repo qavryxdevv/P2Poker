@@ -24,26 +24,35 @@
 # without the fault harness, because the comment that said 0016 "works in
 # every build" was wrong: it sits inside #ifdef P2P_POKER_FAULT_HARNESS.
 #
-# THE PREDICTION IS BOOKED BEFORE THE RUN, -DeafSeat 3 -DeafAt 240
-# -DeafFor 20 -DeafBothWays on the 8+1 rig, and it is the one this
-# instrument exists to test. Downlink: repaired within two seconds of the
-# window's end, as in split120908-9. Uplink: the seat's frames sent inside
-# the window are stuck; the peers' probes draw ONE id per two seconds
-# because they know of no gap, and the seat's blind schedule reaches an
-# entry added early in the window only at +32 s. So the prediction splits:
-# if the seat has something NEW to send right after the window -- its next
-# action, a heartbeat, a re-send from the application's own arm -- the peers
-# see a newer id, know the gap, and burst it closed within a second, and
-# the run shows no certificate and the seat level with the others. If it
-# has nothing new to say, because the table is waiting for exactly the
-# frame that is stuck, the drain is one id per two seconds, a multi-chunk
-# shuffle takes eight to twenty seconds, and the table's thirty-second
-# clock -- running since the peers began waiting, inside the window -- runs
-# out: a certificate about n3, and the peers' logs showing "Re-sent
-# requested packet" answered BY n3 one id every two seconds. The second
-# outcome is the one to expect for a shuffle stuck in the window, and it
-# would name the sender-side half of S1-CO's defect: nothing pushes an
-# unacked backlog when a quiet peer is heard again.
+# THE PREDICTION WAS BOOKED BEFORE THE RUN, -DeafSeat 3 -DeafAt 240
+# -DeafFor 20 -DeafBothWays on the 8+1 rig, and it split on one fact.
+# Downlink: repaired within two seconds of the window's end, as in
+# split120908-9. Uplink: the seat's frames sent inside the window are
+# stuck; if the seat has something NEW to send right after the window,
+# the peers see a newer id, know the gap, and burst it closed within a
+# second -- no certificate, the seat level with the others. If it has
+# nothing new to say, the peers' probes draw ONE id per two seconds and a
+# stuck multi-chunk shuffle runs the thirty-second clock out: a certificate
+# about n3, and "Re-sent requested packet" answered BY n3 one id every two
+# seconds. The second outcome would have named the sender-side half of
+# S1-CO's defect: nothing pushes an unacked backlog when a quiet peer is
+# heard again.
+#
+# TAKEN TWICE, 2026-09-10, AND THE FIRST BRANCH HELD FOR THE LOCAL MESH BOTH
+# TIMES. runs/split123725-9: the six local peers and the deaf seat repaired
+# both directions within a second of the window's end -- the peers sized
+# the seat's gap from its first new packet and burst it closed, n3
+# answering seventeen consecutive ids in one second. runs/split125153-9:
+# the seat had the missed shuffles and sealed the deck 3.7 s after its
+# window. The sender-side push is not needed and is not built. What the
+# runs found instead was the far seat, the one with no direct route: in
+# the first run it lost n3 alone (58 s of silence each way, both timed the
+# other out, the re-handshake failed after four attempts), in the second it
+# lost six of the eight local peers at once, each logging two thousand
+# "no relay carried this packet" in the minute after the window -- while
+# n3, the seat that was actually deaf, kept its far path. That is the relay
+# layer, not this instrument's transport half; it is S1-CQ, and patch 0026
+# is its instrument.
 
 diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
 index 67f3d44..5646d63 100644

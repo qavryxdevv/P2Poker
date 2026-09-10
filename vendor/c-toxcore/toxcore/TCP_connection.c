@@ -826,6 +826,10 @@ int set_tcp_connection_to_status(const TCP_Connections *tcp_c, int connections_n
             }
         }
 
+        /* p2p-poker (patch 0026): a connection-to wakes when its peer is no
+         * longer direct (do_gc_tcp); its ONLINE slots stop counting as asleep
+         * only when the status callback next runs. */
+        LOGGER_DEBUG(tcp_c->logger, "p2p-poker: connection-to %d wakes (peer not direct)", connections_number);
         con_to->status = TCP_CONN_VALID;
         return 0;
     }
@@ -850,6 +854,10 @@ int set_tcp_connection_to_status(const TCP_Connections *tcp_c, int connections_n
         }
     }
 
+    /* p2p-poker (patch 0026): a connection-to sleeps when its peer is direct
+     * again; every relay it is ONLINE on gains a sleeper, and a relay whose
+     * sleepers equal its locks is put to sleep by do_tcp_conns. */
+    LOGGER_DEBUG(tcp_c->logger, "p2p-poker: connection-to %d sleeps (peer direct)", connections_number);
     con_to->status = TCP_CONN_SLEEPING;
     return 0;
 }
@@ -1082,6 +1090,43 @@ static int reconnect_tcp_relay_connection(TCP_Connections *_Nonnull tcp_c, int t
     return 0;
 }
 
+/* p2p-poker (patch 0026): what a relay connection carries, by slot status and
+ * by whether the connection-to that holds the slot is awake. A REGISTERED
+ * slot of an AWAKE connection-to is an out-of-band path in use -- the only
+ * path a peer with no direct route has -- and it locks nothing, so the sleep
+ * rule below cannot see it. This says what the rule is about to take. */
+static void p2p_poker_count_relay_users(const TCP_Connections *_Nonnull tcp_c, unsigned int tcp_connections_number,
+                                        uint32_t *_Nonnull online, uint32_t *_Nonnull registered,
+                                        uint32_t *_Nonnull registered_awake)
+{
+    *online = 0;
+    *registered = 0;
+    *registered_awake = 0;
+
+    for (uint32_t i = 0; i < tcp_c->connections_length; ++i) {
+        const TCP_Connection_to *con_to = get_connection(tcp_c, i);
+
+        if (con_to == nullptr) {
+            continue;
+        }
+
+        for (uint32_t j = 0; j < MAX_FRIEND_TCP_CONNECTIONS; ++j) {
+            if (con_to->connections[j].tcp_connection != tcp_connections_number + 1) {
+                continue;
+            }
+
+            if (con_to->connections[j].status == TCP_CONNECTIONS_STATUS_ONLINE) {
+                ++*online;
+            } else if (con_to->connections[j].status == TCP_CONNECTIONS_STATUS_REGISTERED) {
+                ++*registered;
+
+                if (con_to->status == TCP_CONN_VALID) {
+                    ++*registered_awake;
+                }
+            }
+        }
+    }
+}
 static int sleep_tcp_relay_connection(TCP_Connections *_Nonnull tcp_c, int tcp_connections_number)
 {
     TCP_con *tcp_con = get_tcp_connection(tcp_c, tcp_connections_number);
@@ -1102,6 +1147,25 @@ static int sleep_tcp_relay_connection(TCP_Connections *_Nonnull tcp_c, int tcp_c
         LOGGER_ERROR(tcp_c->logger, "TCP connection is null for tcp_con");
         return -1;
     }
+    /* p2p-poker (patch 0026): a relay going to sleep sets every slot on it to
+     * NONE, and a slot that is neither ONLINE nor REGISTERED carries nothing
+     * (patch 0018). The rule that put it to sleep counts locks, and only
+     * ONLINE slots lock, so an out-of-band path of an awake connection-to
+     * goes with the relay and nothing says so. Measured 2026-09-10,
+     * runs/split123725-9: the far seat's connection at n3 read "0 online,
+     * 0 registered, 4 other" from the second a 20 s symmetric outage ended,
+     * 1 034 sends found no relay, and both ends timed the other out. */
+    {
+        uint32_t online = 0;
+        uint32_t registered = 0;
+        uint32_t registered_awake = 0;
+        p2p_poker_count_relay_users(tcp_c, (unsigned int)tcp_connections_number, &online, &registered, &registered_awake);
+        LOGGER_DEBUG(tcp_c->logger,
+                     "p2p-poker: relay %d goes to sleep (lock_count %u == sleep_count %u): %u online slot(s), %u registered, "
+                     "%u of them out-of-band paths of an AWAKE connection-to, all set to NONE",
+                     tcp_connections_number, tcp_con->lock_count, tcp_con->sleep_count, online, registered, registered_awake);
+    }
+
     tcp_con->ip_port = tcp_con_ip_port(tcp_con->connection);
     memcpy(tcp_con->relay_pk, tcp_con_public_key(tcp_con->connection), CRYPTO_PUBLIC_KEY_SIZE);
 
@@ -1141,6 +1205,10 @@ static int unsleep_tcp_relay_connection(TCP_Connections *_Nonnull tcp_c, int tcp
     if (tcp_con->status != TCP_CONN_SLEEPING) {
         return -1;
     }
+
+    /* p2p-poker (patch 0026): the other half of the sleep line above. */
+    LOGGER_DEBUG(tcp_c->logger, "p2p-poker: relay %d wakes up; its slots start over at NONE and are re-registered when it is online",
+                 tcp_connections_number);
 
     tcp_con->connection = new_tcp_connection(
                               tcp_c->logger, tcp_c->mem, tcp_c->mono_time, tcp_c->rng, tcp_c->ns, &tcp_con->ip_port,
@@ -1216,6 +1284,10 @@ static int tcp_response_callback(void *_Nonnull object, uint8_t connection_id, c
         return -1;
     }
 
+    /* p2p-poker (patch 0026): the relay answered the routing request. */
+    LOGGER_DEBUG(tcp_c->logger, "p2p-poker: connection-to %d is REGISTERED on relay %u (routing id %u)",
+                 connections_number, tcp_connections_number, connection_id);
+
     if (tcp_con->connection == nullptr) {
         LOGGER_ERROR(tcp_c->logger, "TCP connection is null for tcp_con");
         return -1;
@@ -1248,6 +1320,11 @@ static int tcp_status_callback(void *_Nonnull object, uint32_t number, uint8_t c
         if (con_to->status == TCP_CONN_SLEEPING) {
             --tcp_con->sleep_count;
         }
+
+        /* p2p-poker (patch 0026): the peer left this relay; the slot is back to
+         * REGISTERED and locks nothing. */
+        LOGGER_DEBUG(tcp_c->logger, "p2p-poker: connection-to %u is back to REGISTERED on relay %u (peer left the relay); lock_count %u, sleep_count %u",
+                     number, tcp_connections_number, tcp_con->lock_count, tcp_con->sleep_count);
     } else if (status == 2) {
         if (set_tcp_connection_status(con_to, tcp_connections_number, TCP_CONNECTIONS_STATUS_ONLINE, connection_id) == -1) {
             return -1;
@@ -1258,6 +1335,10 @@ static int tcp_status_callback(void *_Nonnull object, uint32_t number, uint8_t c
         if (con_to->status == TCP_CONN_SLEEPING) {
             ++tcp_con->sleep_count;
         }
+
+        /* p2p-poker (patch 0026): the peer is on this relay; the slot locks it. */
+        LOGGER_DEBUG(tcp_c->logger, "p2p-poker: connection-to %u is ONLINE on relay %u; lock_count %u, sleep_count %u",
+                     number, tcp_connections_number, tcp_con->lock_count, tcp_con->sleep_count);
     }
 
     return 0;

@@ -223,6 +223,9 @@ $patched = @(
     @{ File   = 'toxcore/group_connection.c'
        Marker = 'p2p-poker (patch 0025): the wire is cut for this node'
        Why    = '0025: the uplink half of an outage. Patch 0016 drops what arrives and the seat keeps sending, so every deaf run measured only the downlink; with P2P_POKER_DEAF_UPLINK=1 gcc_send_packet also drops this node own lossless and lossy group packets during the window, after the ring took them, and reports success as a cut wire would. Handshakes pass. The window and its anchor are 0016 own (group_chats.c).' }
+    @{ File   = 'toxcore/TCP_connection.c'
+       Marker = 'p2p-poker: relay %d goes to sleep'
+       Why    = '0026: the relay-slot lifecycle was silent. A relay going to sleep sets every slot on it to NONE, and only ONLINE slots lock a relay, so the out-of-band path of a peer with no direct route -- REGISTERED, never ONLINE -- goes with the relay and nothing said so (runs/split123725-9: the far seat at n3 read 0 online, 0 registered, 4 other from the second a symmetric outage ended). Sleep, wake, the connection-to transitions and both callbacks now say what they do, with the counts that decide the sleep rule.' }
 )
 
 Step 'checking the patches are in the vendored source'

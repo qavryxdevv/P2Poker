@@ -126,6 +126,27 @@ def main():
                 print('  %-10s %s' % (f, '  '.join('%+.1f:%d' % a for a in answers[:12])))
         print('  A run of consecutive ids at the same offset is a burst; ids one apart at offsets one or more apart is the one-per-second drain.')
 
+        # The uplink half (patch 0025, -DeafBothWays): what the deaf node itself
+        # re-sent on request once its line was back is the mirror image -- the
+        # peers drawing its stuck backlog. The line is the deaf node's own.
+        mute = [s for _, s, m in own if 'the wire is mute' in m]
+        answers = []
+        for wall, s, msg in own:
+            m = re.search(r'Re-sent requested packet (\d+)', msg)
+            if m:
+                dt = wall_seconds(wall) - w1_wall
+                if -0.5 <= dt <= 25:
+                    answers.append((dt, int(m.group(1))))
+        if mute:
+            print("\n=== the wire was mute too (patch 0025, first line at %.1f s); %s's own answers to its peers' requests from the window's end on, first twenty" % (mute[0], node))
+            if answers:
+                print('  ' + '  '.join('%+.1f:%d' % a for a in answers[:20]))
+                print('  Ids one apart at offsets two seconds apart is the peers drawing the backlog one probe at a time; a run at one offset is a burst they could size.')
+            else:
+                print('  none -- either nothing was stuck in the uplink or the backlog left by the blind schedule alone')
+        else:
+            print('\n=== the wire was not mute in this run (downlink half only); %s answered %d request(s) in the 25 s after the window' % (node, len(answers)))
+
 
 if __name__ == '__main__':
     main()
