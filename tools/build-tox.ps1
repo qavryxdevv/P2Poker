@@ -232,6 +232,9 @@ $patched = @(
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker: handshake %s attempt %u to peer %u left by %s'
        Why    = '0028: S1-AA join phase. A reaped peer showed attempts 4 with both ends relay-registered within seconds, and neither which attempts left nor why the ones that arrived were dropped was said anywhere -- a routed TCP send prints nothing on success and five receive-side exits were silent. One line per attempt with its door, and one per silent drop with its reason.' }
+    @{ File   = 'toxcore/group_chats.h'
+       Marker = 'p2p-poker (patch 0029): an unconfirmed peer gets thirty seconds, not twelve.'
+       Why    = '0029: S1-AA join phase. Twelve seconds hold four handshake attempts, two of them by TCP, and a peer on another network needs the TCP ones; the far seat reaped three seats at +12 s while their own requests were in flight and then answered them on deleted entries (runs/split140414-9). Thirty seconds hold five TCP attempts; a dead entry lingers eighteen seconds longer, which nothing depends on.' }
 )
 
 Step 'checking the patches are in the vendored source'

@@ -1,0 +1,69 @@
+# 0029 - an unconfirmed peer gets thirty seconds, not twelve.
+#
+# S1-AA's join-phase shape, read to the line with patch 0028 in
+# runs/split140414-9 (2026-09-10). The far seat -- the relay-only one --
+# handshaked with the founder at 76.1 s and at 76.7 sent handshake request
+# attempt 1 to the seven other seats BY UDP, to the LAN addresses the
+# founder's peer list carries, which its network cannot route. Attempt 2
+# at 79.0 went by TCP (try_tcp_fallback alternates: attempts % 2 == 1),
+# attempt 3 by UDP, attempt 4 by TCP at 85.0. Four seats answered the TCP
+# attempt within three seconds. Three (n2, n5, n7) never saw any of the
+# four: their own first attempts toward the far seat were "carried by
+# nothing" at 79.9-85.4 s -- they were not yet on a relay the far seat
+# could reach them through, so its out-of-band requests had nowhere to
+# land -- and the twelve-second reaper took the three entries at 88.0 s.
+# Their own TCP requests then arrived, the far seat answered by UDP to the
+# request's source address (which routes), and they printed "handshaked
+# with" at 85.2, 87.6 and 90.6 -- on entries the far seat had just
+# deleted. It re-added them at 88.8-90.3 and read 7 seen/5 confirmed/8
+# wanted at 91.1 s. Every attempt was carried at both ends and no
+# receive-side drop line printed anywhere: the packets die between the
+# ends, half of them by design.
+#
+# So the twelve-second budget holds exactly two TCP attempts, the first
+# of which lands only if the target already sits on a shared relay. This
+# patch makes it thirty seconds: five TCP attempts. A dead entry lingers
+# eighteen seconds longer, and nothing depends on an unconfirmed entry
+# going away quickly. Local behaviour; nothing on the wire changes; the
+# constant is also the base of LOAD_PEERS_TIMEOUT, which moves from 22 to
+# 40 s and is the interval at which an empty peer list is re-seeded from
+# the saved one -- a wait that a group with peers never takes.
+#
+# THE PREDICTION IS BOOKED BEFORE THE RUN, a plain 8+1 run: the far seat
+# reaps NOTHING before 100 s and reads 8/8 confirmed within twenty seconds
+# of its founder handshake. The falsifier is a reap with "attempts 8-10,
+# last packet 30 s ago" -- the same shape, only later -- which would mean
+# the target's relay path is the whole story and the timeout was never the
+# lever. Fix (a) is named and not built: send TCP on every attempt when
+# the peer has never been heard directly, so the first attempt is not a
+# UDP packet to a LAN address on another network.
+
+diff --git a/vendor/c-toxcore/toxcore/group_chats.h b/vendor/c-toxcore/toxcore/group_chats.h
+index c9a0f84..a481216 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.h
++++ b/vendor/c-toxcore/toxcore/group_chats.h
+@@ -32,7 +32,23 @@ extern "C" {
+ #define GC_PING_TIMEOUT 12
+ #define GC_SEND_IP_PORT_INTERVAL (GC_PING_TIMEOUT * 5)
+ #define GC_CONFIRMED_PEER_TIMEOUT (GC_PING_TIMEOUT * 4 + 10)
+-#define GC_UNCONFIRMED_PEER_TIMEOUT GC_PING_TIMEOUT
++/* p2p-poker (patch 0029): an unconfirmed peer gets thirty seconds, not twelve.
++ *
++ * Upstream reaps a peer that has not confirmed twelve seconds after its
++ * last packet -- GC_PING_TIMEOUT -- and a handshake attempt goes out every
++ * GC_SEND_HANDSHAKE_INTERVAL = 3 s, alternating UDP and TCP, so the budget
++ * holds four attempts and only two of them by TCP. For a peer on another
++ * network that is the whole budget: its UDP attempts go to the LAN
++ * addresses the peer list carries, which its network cannot route, and
++ * its TCP attempts land only once the target sits on a relay it shares.
++ * Read to the line on 2026-09-10 (S1-AA, runs/split140414-9): the far
++ * seat handshaked with four of seven seats on its TCP attempt at +2.3 s,
++ * reaped the other three at +12 s while their own requests were still
++ * on the way, then answered those requests on entries it had just
++ * deleted, and started over. Thirty seconds holds five TCP attempts. A
++ * dead entry lingers eighteen seconds longer, which nothing depends on.
++ * Local behaviour: nothing on the wire changes. */
++#define GC_UNCONFIRMED_PEER_TIMEOUT 30
+ 
+ #define GC_JOIN_DATA_LENGTH (ENC_PUBLIC_KEY_SIZE + CHAT_ID_SIZE)
+ 

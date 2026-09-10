@@ -87,7 +87,9 @@ def main():
                 any_instrument = True
                 continue
             m = FULL.search(msg)
-            if m and full is None and m.group(1) == m.group(3) and m.group(2) == m.group(3):
+            # "group 0 seen/0 confirmed/0 wanted" is a node still waiting to be
+            # invited, not a full table: wanted must be above zero.
+            if m and full is None and int(m.group(3)) > 0 and m.group(1) == m.group(3) and m.group(2) == m.group(3):
                 full = s
         per[n] = dict(reaps=reaps, attempts=attempts, nothing=nothing, drops=drops, done=done, full=full)
 

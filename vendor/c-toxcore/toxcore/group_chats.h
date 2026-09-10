@@ -32,7 +32,23 @@ extern "C" {
 #define GC_PING_TIMEOUT 12
 #define GC_SEND_IP_PORT_INTERVAL (GC_PING_TIMEOUT * 5)
 #define GC_CONFIRMED_PEER_TIMEOUT (GC_PING_TIMEOUT * 4 + 10)
-#define GC_UNCONFIRMED_PEER_TIMEOUT GC_PING_TIMEOUT
+/* p2p-poker (patch 0029): an unconfirmed peer gets thirty seconds, not twelve.
+ *
+ * Upstream reaps a peer that has not confirmed twelve seconds after its
+ * last packet -- GC_PING_TIMEOUT -- and a handshake attempt goes out every
+ * GC_SEND_HANDSHAKE_INTERVAL = 3 s, alternating UDP and TCP, so the budget
+ * holds four attempts and only two of them by TCP. For a peer on another
+ * network that is the whole budget: its UDP attempts go to the LAN
+ * addresses the peer list carries, which its network cannot route, and
+ * its TCP attempts land only once the target sits on a relay it shares.
+ * Read to the line on 2026-09-10 (S1-AA, runs/split140414-9): the far
+ * seat handshaked with four of seven seats on its TCP attempt at +2.3 s,
+ * reaped the other three at +12 s while their own requests were still
+ * on the way, then answered those requests on entries it had just
+ * deleted, and started over. Thirty seconds holds five TCP attempts. A
+ * dead entry lingers eighteen seconds longer, which nothing depends on.
+ * Local behaviour: nothing on the wire changes. */
+#define GC_UNCONFIRMED_PEER_TIMEOUT 30
 
 #define GC_JOIN_DATA_LENGTH (ENC_PUBLIC_KEY_SIZE + CHAT_ID_SIZE)
 
