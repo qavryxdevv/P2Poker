@@ -34,7 +34,9 @@ Usage:
 from __future__ import print_function
 import io, os, re, sys
 
-STAMP = re.compile(r'^(\d\d:\d\d:\d\d\.\d\d\d)\s+([0-9.]+)\s+(.*)$')
+# The split harness stamps `HH:MM:SS.mmm  elapsed  text`; the one-machine harness
+# only `elapsed  text`. Both are read.
+STAMP = re.compile(r'^(?:(\d\d:\d\d:\d\d\.\d\d\d)\s+)?\s*([0-9.]+)\s+(.*)$')
 # "hand #5 opens at genesis c41cdc63 with seats [0, 1, 2], ..." and the S1-BS
 # re-open "hand #9 re-opens at genesis ... with seats [...] (was ...)"; the later
 # line wins, so the table shows the roster the node ended up on.

@@ -7163,8 +7163,10 @@ supersede D-006 and there is no auto-action event of any kind.
 > banked yet -- because a certificate that lands after `HAND_INIT(k+1)` has
 > left stage 0 can no longer move `R(k+1)`, and a heads-up hand leaves stage 0
 > in a tenth of a second (`run164337-3`: nine requests, no return, before the
-> hold). A client liveness parameter, not a wire rule: past it the table
-> deals on and the seat asks again at the next boundary.
+> hold; `run170442-3` with it: certified out in hand 4, dealt back into hand 6
+> at one genesis on every client). A client liveness parameter, not a wire
+> rule: past it the table deals on and the seat asks again at the next
+> boundary.
 >
 > **Guard.** `src/table/hand.rs`'s `return_voters` is scanned by its own test
 > for the two forbidden words; the whole road is

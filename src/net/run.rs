@@ -575,6 +575,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // The hold for a return in flight: the hand it is about, when it began,
     // and whether it has been given up on.
     let mut return_hold: Option<(u64, tokio::time::Instant, bool)> = None;
+    // The hand whose boundary phase 1 -- window, checkpoint, sit-in request --
+    // has run. Once per boundary: the arm fires at the terminal and again at
+    // `deal_at`, and on every re-arm the repair, the freeze and the boundary
+    // wait make, while `state_hash_event` seals afresh each call with a new
+    // timestamp and so a new event hash. Every receiver in `run170442-3`
+    // logged *put two different events in one checkpoint stage* at every
+    // boundary -- an equivocation by an honest peer, which D-009 rule 1
+    // forbids -- and `boundaries.open` re-inserted the stage and dropped the
+    // copies it had already heard. Keyed by hand id, so a re-opened hand
+    // (`S1-BS`) does not run its predecessor's boundary again either.
+    let mut boundary_done_for: Option<u64> = None;
     // Arm the boundary: fire now for phase 1, deal after the pause.
     macro_rules! arm_boundary {
         ($pause:expr) => {{
@@ -1655,6 +1666,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             next_hand_at = None;
             deal_at = None;
             return_hold = None;
+            boundary_done_for = None;
             act_by = None;
             // Keyed by hand id, and the next table starts again at 1.
             boundaries = crate::table::boundary::Boundaries::new();
@@ -4685,7 +4697,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // the value every other seat compares against, and it is the
                 // door back for a seat that missed this hand: §4.9's
                 // readmission set is written by exactly this event agreeing.
-                if let Some(h) = hand.as_ref() {
+                let phase1 = hand
+                    .as_ref()
+                    .is_some_and(|h| boundary_done_for != Some(h.hand_id()));
+                if let Some(h) = hand.as_ref().filter(|_| phase1) {
                     // **§4.10's window, on BOTH terminal paths, and this is
                     // separate from the checkpoint below for exactly that
                     // reason** (`S1-BZ`). The block that follows is gated on
@@ -4874,7 +4889,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // Published and heard like the checkpoint: this client's own
                 // window records that its seat spoke, and `A` gets the seat the
                 // way it gets any other.
-                if !stay_out {
+                if !stay_out && phase1 {
                     let asked = match hand.as_mut() {
                         Some(h) => h.sit_in_request(&app_key, super::node::now_unix_ms()),
                         None => Ok(None),
@@ -4915,6 +4930,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                         }
                     }
+                }
+
+                if phase1 {
+                    boundary_done_for = hand.as_ref().map(|h| h.hand_id());
                 }
 
                 // `S1-BM`: phase 2 is not due yet. The terminal fired this arm so
