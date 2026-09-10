@@ -229,6 +229,9 @@ $patched = @(
     @{ File   = 'toxcore/TCP_connection.c'
        Marker = 'p2p-poker (patch 0027): a waking connection-to takes its sleepers back.'
        Why    = '0027: set_tcp_connection_to_status(true) never returned the sleepers that sleeping added, so every sleep-wake-sleep cycle of a direct peer left a phantom sleeper on its relays, lock_count == sleep_count held with an awake peer still ONLINE, and do_tcp_conns slept the relay under it -- six of eight local peers lost the far seat in one second when a 20 s outage of one seat ended (S1-CQ, runs/split130548-9). The wake now mirrors the sleep, and a REGISTERED slot of an awake connection-to counts as a use in the sleep rule and the reaper. Local behaviour only.' }
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker: handshake %s attempt %u to peer %u left by %s'
+       Why    = '0028: S1-AA join phase. A reaped peer showed attempts 4 with both ends relay-registered within seconds, and neither which attempts left nor why the ones that arrived were dropped was said anywhere -- a routed TCP send prints nothing on success and five receive-side exits were silent. One line per attempt with its door, and one per silent drop with its reason.' }
 )
 
 Step 'checking the patches are in the vendored source'

@@ -5736,6 +5736,19 @@ static bool send_gc_handshake_packet(const GC_Chat *chat, GC_Connection *gconn, 
         }
     }
 
+    /* p2p-poker (patch 0028): every attempt says which path carried it. Until
+     * now only the attempt that NOTHING carried printed (patch 0017), and a
+     * routed TCP send prints nothing on success, so "attempts 4" on a reaped
+     * peer could not be told apart into four that left and four that did
+     * not. S1-AA, join phase: the far seat reaps a peer twelve seconds after
+     * its last packet with four or five attempts on the counter, and both
+     * ends have relay slots up within seconds -- so which attempts left, by
+     * which door, is the question. */
+    LOGGER_DEBUG(chat->log, "p2p-poker: handshake %s attempt %u to peer %u left by %s (request type %u, tcp_connection_num %d)",
+                 handshake_type == GH_REQUEST ? "request" : "response", gconn->handshake_attempts, gconn->public_key_hash,
+                 ret == length ? "UDP" : (try_tcp_fallback ? "TCP (fallback turn)" : "TCP (after a UDP failure)"),
+                 request_type, gconn->tcp_connection_num);
+
     if (gconn->is_pending_handshake_response) {
         gcc_set_send_message_id(gconn, 3);  // handshake response is always second packet
     }  else {
@@ -5795,12 +5808,17 @@ static int handle_gc_handshake_response(const GC_Chat *_Nonnull chat, const IP_P
     const int peer_number = get_peer_number_of_enc_pk(chat, sender_pk, false);
 
     if (peer_number == -1) {
+        /* p2p-poker (patch 0028): a response from a peer this group does not
+         * hold -- reaped between our request and its answer, or never added. */
+        LOGGER_DEBUG(chat->log, "p2p-poker: handshake response dropped: no peer entry for %u",
+                     jenkins_one_at_a_time_hash(sender_pk, ENC_PUBLIC_KEY_SIZE));
         return -1;
     }
 
     GC_Connection *gconn = get_gc_connection(chat, peer_number);
 
     if (gconn == nullptr) {
+        LOGGER_DEBUG(chat->log, "p2p-poker: handshake response dropped: peer %d has no connection", peer_number);
         return -1;
     }
 
@@ -5834,6 +5852,8 @@ static int handle_gc_handshake_response(const GC_Chat *_Nonnull chat, const IP_P
     switch (request_type) {
         case HS_INVITE_REQUEST: {
             if (!send_gc_invite_request(chat, gconn)) {
+                LOGGER_DEBUG(chat->log, "p2p-poker: handshake response from peer %u accepted but the invite request could not be sent",
+                             gconn->public_key_hash);
                 return -1;
             }
 
@@ -5842,6 +5862,8 @@ static int handle_gc_handshake_response(const GC_Chat *_Nonnull chat, const IP_P
 
         case HS_PEER_INFO_EXCHANGE: {
             if (!send_gc_peer_exchange(chat, gconn)) {
+                LOGGER_DEBUG(chat->log, "p2p-poker: handshake response from peer %u accepted but the peer exchange could not be sent",
+                             gconn->public_key_hash);
                 return -1;
             }
 
@@ -5849,9 +5871,14 @@ static int handle_gc_handshake_response(const GC_Chat *_Nonnull chat, const IP_P
         }
 
         default: {
+            LOGGER_DEBUG(chat->log, "p2p-poker: handshake response from peer %u carried an unknown request type %u",
+                         gconn->public_key_hash, request_type);
             return -1;
         }
     }
+
+    /* p2p-poker (patch 0028): the one line every successful handshake prints. */
+    LOGGER_DEBUG(chat->log, "p2p-poker: handshaked with peer %u (request type %u)", gconn->public_key_hash, request_type);
 
     return peer_number;
 }
@@ -5968,6 +5995,12 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
         if (is_new_peer) {
             LOGGER_WARNING(chat->log, "Broken tcp relay for new peer");
             gcc_mark_for_deletion(gconn, chat->tcp_conn, GC_EXIT_TYPE_DISCONNECTED, nullptr, 0);
+        } else {
+            /* p2p-poker (patch 0028): a request from a peer we already hold, carrying
+             * no relay and arriving with no address -- dropped, and the peer is
+             * left as it was. */
+            LOGGER_DEBUG(chat->log, "p2p-poker: handshake request from known peer %u dropped: no relay in it and no address",
+                         gconn->public_key_hash);
         }
 
         return -1;
@@ -6069,6 +6102,7 @@ static int handle_gc_handshake_packet(GC_Chat *_Nonnull chat, const uint8_t *_No
     } else if (handshake_type == GH_RESPONSE) {
         peer_number = handle_gc_handshake_response(chat, ipp, sender_pk, real_data, real_len);
     } else {
+        LOGGER_DEBUG(chat->log, "p2p-poker: handshake packet dropped: unknown handshake type %u", handshake_type);
         mem_delete(chat->mem, data);
         return -1;
     }
@@ -6778,12 +6812,17 @@ static int handle_gc_tcp_oob_packet(void *_Nonnull object, const uint8_t *_Nonnu
     }
 
     if (!group_can_handle_packets(chat)) {
+        /* p2p-poker (patch 0028): a handshake arrived out-of-band while this group
+         * cannot handle packets (state %u), and was dropped. */
+        LOGGER_DEBUG(m->log, "p2p-poker: out-of-band packet dropped: the group cannot handle packets yet (state %u)",
+                     (unsigned int)chat->connection_state);
         return -1;
     }
 
     const uint8_t packet_type = packet[0];
 
     if (packet_type != NET_PACKET_GC_HANDSHAKE) {
+        LOGGER_DEBUG(m->log, "p2p-poker: out-of-band packet dropped: type 0x%02x is not a handshake", packet_type);
         return -1;
     }
 
@@ -6797,6 +6836,10 @@ static int handle_gc_tcp_oob_packet(void *_Nonnull object, const uint8_t *_Nonnu
     }
 
     if (handle_gc_handshake_packet(chat, sender_pk, nullptr, payload, payload_len, false, userdata) == -1) {
+        /* p2p-poker (patch 0028): the handler refused it; the handler says why
+         * on every path that used to be silent. */
+        LOGGER_DEBUG(m->log, "p2p-poker: out-of-band handshake from peer %u refused by the handler",
+                     jenkins_one_at_a_time_hash(sender_pk, ENC_PUBLIC_KEY_SIZE));
         return -1;
     }
 
