@@ -244,6 +244,9 @@ pub struct Seat {
     /// and `playing()` is where that judgement is made once.
     pub heard: Option<u16>,
     pub silent_since: Option<u64>,
+    /// `S1-CS`: how many other seats the carrier wants to hear before the
+    /// table can deal, from the same reading as `heard`.
+    pub group_want: Option<u16>,
     /// The table's name and shape, from the node rather than from the lobby.
     pub name: String,
     pub seats: u8,
@@ -626,6 +629,7 @@ impl AppState {
                 let now = self.last_sweep_ms;
                 if let Some(s) = self.seated.as_mut() {
                     s.heard = Some(seen);
+                    s.group_want = Some(want);
                     if seen > 0 || want == 0 {
                         s.silent_since = None;
                     } else if s.silent_since.is_none() {

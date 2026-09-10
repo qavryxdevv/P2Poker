@@ -118,7 +118,18 @@ impl AppState {
             min_raise,
             max_raise,
             preview: false,
-            note: Some(note(hand, seat.session.is_some(), &self.waiting_for, seated, needed)),
+            note: Some(note(
+                hand,
+                seat.session.is_some(),
+                &self.waiting_for,
+                seated,
+                needed,
+                // The carrier's own `want` grows as it invites; the roster's
+                // other seats are what the player counts, so the larger.
+                seat.heard.zip(seat.group_want).map(|(seen, want)| {
+                    (seen, want.max(u16::try_from(seat.roster.len().saturating_sub(1)).unwrap_or(u16::MAX)))
+                }),
+            )),
             improve,
             improve_total,
             improve_by,
@@ -198,6 +209,7 @@ fn note(
     waiting_for: &[u8],
     seated: usize,
     needed: u8,
+    group: Option<(u16, u16)>,
 ) -> String {
     match (hand, real) {
         (Some(h), _) if h.over => format!("hand #{} is over", h.hand_id),
@@ -216,6 +228,16 @@ fn note(
         (None, true) if !waiting_for.is_empty() => {
             let who: Vec<String> = waiting_for.iter().map(|s| s.to_string()).collect();
             format!("waiting for seat {} to open the hand", who.join(", "))
+        }
+        // `S1-CS`, the owner's word: between the roster and the first hand
+        // the players are joining the table's group, and the felt says so
+        // with the count, because that wait is the one a player cannot see.
+        (None, true) if group.is_some_and(|(seen, want)| want > 0 && seen < want) => {
+            let (seen, want) = group.unwrap_or((0, 0));
+            format!(
+                "the table is set; the players are joining its group ({} of {} in) — the first hand deals when everybody is",
+                seen, want
+            )
         }
         (None, true) => "everybody has ratified the roster; the table is set".into(),
         (None, false) => format!("waiting for players — {seated} of {needed}"),
@@ -530,5 +552,23 @@ mod tests {
         assert_eq!(v.chat[0].seat, 2);
         s.muted.remove(&1);
         assert_eq!(s.table_view().chat.len(), 2, "and is heard again once unmuted, history included");
+    }
+
+    /// `S1-CS`: between the roster and the first hand the felt says the
+    /// players are joining the table's group, with the count, and stops
+    /// saying it once everybody is in.
+    #[test]
+    fn the_felt_says_the_players_are_joining_the_group() {
+        let mut s = seated(0);
+        s.apply(NodeEvent::Carrier { seen: 0, want: 2 });
+        let n = s.table_view().note.unwrap();
+        assert!(n.contains("joining its group") && n.contains("0 of 2"), "{n}");
+        s.apply(NodeEvent::Carrier { seen: 1, want: 2 });
+        assert!(s.table_view().note.unwrap().contains("1 of 2"));
+        s.apply(NodeEvent::Carrier { seen: 2, want: 2 });
+        let n = s.table_view().note.unwrap();
+        assert!(!n.contains("joining") && n.contains("the table is set"), "{n}");
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        assert!(!s.table_view().note.unwrap().contains("joining"), "a hand on the felt says the hand");
     }
 }

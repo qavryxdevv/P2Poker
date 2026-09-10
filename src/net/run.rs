@@ -854,6 +854,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut ratification_asked_said = false;
     // `S1-CS`: one line per two seconds per seat of table chat.
     let mut chat_limits = super::tabletalk::SeatLimiter::default();
+    // `S1-CS`: the group count the window was last told, so the felt can
+    // say *the players are joining the group* as they do and not on the
+    // thirty-second status line.
+    let mut carrier_reported: Option<(u64, u64)> = None;
     if let Some(r) = resume.as_ref() {
         let _ = events
             .send(NodeEvent::UnfinishedSession {
@@ -4664,6 +4668,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                             previous = hand.take();
                         }
+                    }
+                }
+                // `S1-CS`: the group count, the moment it changes.
+                if table.is_some() {
+                    let group = tox_sink.group_seen();
+                    if carrier_reported != Some(group) {
+                        carrier_reported = Some(group);
+                        let _ = events
+                            .send(NodeEvent::Carrier {
+                                seen: u16::try_from(group.0).unwrap_or(u16::MAX),
+                                want: u16::try_from(group.1).unwrap_or(u16::MAX),
+                            })
+                            .await;
                     }
                 }
                 // `S1-CR`: the recorded ratification did not fit the roster the
