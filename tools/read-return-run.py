@@ -73,6 +73,35 @@ What refutes it: *ratified 1/3* past a minute in the group (the echo did not
 fire or did not arrive), a table waiting on seat 1 to the hand deadline (the
 stop did not land on a turn), or any of the first prediction's refuters.
 
+What the second run (`run202634-3`) did: 1 and 2 held -- n1 stopped at its
+turn at 62 s, the table certified its seat out and played on heads-up, both
+members answered the ratification over the group -- and 3 failed in a new way:
+n1-again settled on session `ed73f924` while the table's was `9718345e`,
+because it ratified ANEW (a new timestamp, a new event hash) instead of saying
+its original ratification again; every deck key of the hand it adopted was
+refused, the key's ownership proof being bound to the session id. The record's
+first write on the rejoin also replaced hand #4 / stack 10200 with hand #0 /
+the buy-in.
+
+The prediction booked for the third S1-CR run (2026-09-10 20:41, after the
+record carries the client's own TABLE_READY verbatim and a resume says it
+again; same harness line as the second run):
+
+  1. as 1 and 2 of the second run's prediction;
+  2. every *the table is set: session* line of the run names ONE value, the
+     n1-again lines included -- the same session at every node;
+  3. n1-again prints *resumed at hand #k as a bystander (seat 1)* and NO
+     *a held frame was refused by the adopted hand* line: the deck keys
+     verify, the adopted hand follows to its settlement;
+  4. and 4 and 5 of the second run's prediction: the return certificate, the
+     three-seat hand at one genesis everywhere, *back in the roster*;
+  5. the record is not written on the rejoin before the first boundary (no
+     *session record: hand #0* line in n1-again).
+
+What refutes it: two session values among the *the table is set* lines, a
+*recorded ratification did not fit* line, a refused held frame in the adopted
+hand, or any earlier refuter.
+
 Prints, per node, the roster of every hand it opened, then the return road's
 own lines in time order across every node, then the per-hand roster
 agreement table. The harness numbers NODES and the table numbers SEATS: the
@@ -100,7 +129,9 @@ ROAD = re.compile(
     # S1-CR: the rejoin road of a restarted client
     r'resuming the unfinished|unfinished session|rejoining |resumed at hand|cannot be adopted|would not open|'
     r'still outside the roster|back in the roster|session record|forgotten|gave up|already holds a seat|'
-    r'stopping at my turn|ratification copy arrived|saying my ratification again|hand deadline')
+    r'stopping at my turn|ratification copy arrived|saying my ratification again|hand deadline|'
+    # the session every node settled on: a value that differs is the run202634-3 defect
+    r'the table is set: session|recorded ratification')
 
 
 def lines(path):

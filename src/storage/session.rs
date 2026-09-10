@@ -37,7 +37,7 @@ use crate::protocol::constants::RESUME_GIVE_UP_MS;
 
 /// The record's own version, so a later shape can refuse an older one rather
 /// than misread it.
-pub const RECORD_VERSION: u8 = 1;
+pub const RECORD_VERSION: u8 = 2;
 
 /// An unfinished session, as the node last knew it.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -73,6 +73,12 @@ pub struct Record {
     pub advert: Vec<u8>,
     #[cbor(n(12), with = "minicbor::bytes")]
     pub advert_hash: [u8; 32],
+    /// This client's own `TABLE_READY`, verbatim, so that a rejoin says it
+    /// again rather than ratifying anew: the ratification's `event_hash` is
+    /// inside the `session_id`, and a new one is a session nobody else has
+    /// (`run202634-3`). Version 2 of the record.
+    #[n(13)]
+    pub ratification: Vec<u8>,
 }
 
 pub fn session_path(dir: &Path) -> PathBuf {
@@ -164,6 +170,7 @@ mod tests {
             written_unix_ms: 1_700_000_000_000,
             advert: vec![0xAA; 300],
             advert_hash: [8; 32],
+            ratification: vec![0xBB; 210],
         }
     }
 

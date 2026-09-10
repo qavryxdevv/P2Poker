@@ -225,6 +225,18 @@ pub struct Formation {
     /// Bounded by the number of seats a table can have. Formation is short and
     /// there is exactly one ratification per seat per serial.
     early: VecDeque<Vec<u8>>,
+    /// `S1-CR`: the ratification this client made before it restarted, from
+    /// its session record, to be said again **verbatim** when the founder's
+    /// re-said roster fits it. A ratification's `event_hash` is inside the
+    /// `session_id`, so a seat that ratified anew after a restart -- a new
+    /// timestamp, a new hash -- computed a session nobody else had
+    /// (`run202634-3`: `ed73f924` against the table's `9718345e`), and every
+    /// deck key of the hand it adopted was refused, the key's ownership
+    /// proof being bound to the session id.
+    recorded_ready: Option<Vec<u8>>,
+    /// The recorded ratification did not fit the roster the founder said
+    /// again, and this client ratified anew; the node says so.
+    recorded_refused: bool,
 }
 
 /// What this client may need to say again.
@@ -288,6 +300,8 @@ impl Formation {
             capabilities: vec![DECK_CAPABILITY.to_vec()],
             said: Said::default(),
             early: VecDeque::new(),
+            recorded_ready: None,
+            recorded_refused: false,
         })
     }
 
@@ -363,6 +377,8 @@ impl Formation {
                 capabilities: vec![DECK_CAPABILITY.to_vec()],
                 said: Said::default(),
                 early: VecDeque::new(),
+                recorded_ready: None,
+                recorded_refused: false,
             },
             bytes,
         ))
@@ -1032,6 +1048,24 @@ impl Formation {
             return Ok(vec![]);
         }
 
+        // `S1-CR`: a seat that restarted says the ratification it recorded,
+        // verbatim, when the roster the founder said again is the one it
+        // ratified -- the same serial, the same seats. A new ratification
+        // would be a new `event_hash` and so a session identity nobody else
+        // computes. One that does not fit is refused here, this client
+        // ratifies anew below, and the node is told.
+        if let Some(bytes) = self.recorded_ready.take() {
+            match self.take_ratification(&bytes) {
+                Ok(()) if self.ratified.contains_key(&seat) => {
+                    self.sent_ready = true;
+                    self.said.ready = Some(bytes.clone());
+                    self.replay_early();
+                    return Ok(vec![Send::Broadcast(bytes)]);
+                }
+                _ => self.recorded_refused = true,
+            }
+        }
+
         let ready = TableReady {
             roster_hash: self.roster.hash_at_zero(),
             list_serial: self.serial,
@@ -1058,6 +1092,25 @@ impl Formation {
         // Whatever arrived before this roster did.
         self.replay_early();
         Ok(vec![Send::Broadcast(bytes)])
+    }
+
+    /// `S1-CR`: give a formation built for a resume the ratification this
+    /// client recorded, to be said again verbatim when the roster fits.
+    pub fn with_recorded_ratification(mut self, bytes: Vec<u8>) -> Self {
+        self.recorded_ready = Some(bytes);
+        self
+    }
+
+    /// This client's own `TABLE_READY`, as sent; what the session record
+    /// keeps (`S1-CR`).
+    pub fn my_ratification(&self) -> Option<&[u8]> {
+        self.said.ready.as_deref()
+    }
+
+    /// Whether the recorded ratification did not fit the roster the founder
+    /// said again, so that this client ratified anew (`S1-CR`).
+    pub fn recorded_ratification_refused(&self) -> bool {
+        self.recorded_refused
     }
 
     /// Somebody else's ratification.
@@ -2484,5 +2537,165 @@ mod tests {
             None,
             "the founder still holds a session from the smaller roster"
         );
+    }
+
+    /// A table of three, formed as `three_clients_form_one_table` forms it.
+    fn form_three() -> (Table, TableAd, Hash) {
+        let (mut t, _event, a, hash) = found(6, 3);
+        let table_id = t.founder.table_id();
+        for (n, seed) in [(2u8, 2u8), (3, 3)] {
+            let (mut j, request) = Formation::join(
+                key(seed),
+                a.clone(),
+                hash,
+                table_id,
+                peer(n),
+                format!("player {n}"),
+                1_000,
+                None,
+                None,
+                [seed; 32],
+                NOW,
+                None,
+            )
+            .expect("the request builds");
+            let out = t
+                .founder
+                .on_join_request(&request, &peer(n), false, NOW)
+                .expect("the founder seats an honest joiner");
+            let mut list_bytes = None;
+            let mut ready_from_founder = vec![];
+            for s in out {
+                match s {
+                    Send::Reply(bytes) => {
+                        j.on_join_answer(&bytes, NOW).expect("the acceptance holds");
+                    }
+                    Send::Broadcast(bytes) => {
+                        if joinwire::receive_player_list(&bytes).is_ok() {
+                            list_bytes = Some(bytes);
+                        } else {
+                            ready_from_founder.push(bytes);
+                        }
+                    }
+                }
+            }
+            let list = list_bytes.expect("a roster change is announced");
+            let mut new_readies = vec![];
+            for other in t.joiners.iter_mut() {
+                for s in other.on_player_list(&list, NOW).expect("the list holds") {
+                    if let Send::Broadcast(b) = s {
+                        new_readies.push(b);
+                    }
+                }
+            }
+            for s in j.on_player_list(&list, NOW).expect("the list holds") {
+                if let Send::Broadcast(b) = s {
+                    new_readies.push(b);
+                }
+            }
+            new_readies.extend(ready_from_founder);
+            let mut everyone: Vec<&mut Formation> = vec![&mut t.founder];
+            everyone.extend(t.joiners.iter_mut());
+            everyone.push(&mut j);
+            for bytes in &new_readies {
+                let (r, sender, _) =
+                    joinwire::receive_table_ready(bytes, &table_id, &everyone[0].genesis()).unwrap();
+                for who in everyone.iter_mut() {
+                    if who.roster().seat_of(&sender) == Some(r.my_seat) && who.my_seat() != Some(r.my_seat) {
+                        who.on_table_ready(bytes).expect("a ratification holds");
+                    }
+                }
+            }
+            t.joiners.push(j);
+        }
+        (t, a, hash)
+    }
+
+    /// `S1-CR`: a seat that restarts says the ratification it recorded,
+    /// **verbatim**, and computes the table's own session identity.
+    ///
+    /// `run202634-3`: the returning seat ratified anew -- a new timestamp, a
+    /// new event hash -- and settled on a session nobody else had (`ed73f924`
+    /// against the table's `9718345e`); every deck key of the hand it adopted
+    /// was then refused, because the key's ownership proof is bound to the
+    /// session id. The members held its original ratification all along. The
+    /// second half is that measurement: a formation given nothing ratifies
+    /// anew and lands on another session.
+    #[test]
+    fn a_seat_that_restarts_ratifies_with_the_bytes_it_recorded() {
+        let (mut t, a, hash) = form_three();
+        let table_id = t.founder.table_id();
+        let session = t.founder.session().expect("the table settled");
+        let gone = t.joiners.remove(0);
+        let seat = gone.my_seat().expect("seated");
+        let recorded = gone
+            .my_ratification()
+            .expect("a settled seat holds its own ratification")
+            .to_vec();
+        drop(gone);
+        let later = NOW + 60_000;
+
+        // The table has dealt. The seat's process is new and asks again from
+        // its record, which is the node's `ResumeSession` road; the founder
+        // answers *already seated* and says the roster again.
+        let (j, again) = Formation::join(
+            key(2), a.clone(), hash, table_id, peer(2), "player 2".into(), 1_000, None, None, [9u8; 32], later, None,
+        )
+        .unwrap();
+        let mut j = j.with_recorded_ratification(recorded.clone());
+        let out = t
+            .founder
+            .on_join_request(&again, &peer(2), true, later)
+            .expect("a seated peer is answered");
+        let list = out
+            .into_iter()
+            .find_map(|s| match s {
+                Send::Broadcast(b) if joinwire::receive_player_list(&b).is_ok() => Some(b),
+                _ => None,
+            })
+            .expect("the founder says the roster again");
+        let said = j.on_player_list(&list, later).expect("the list holds");
+        assert_eq!(
+            said,
+            vec![Send::Broadcast(recorded.clone())],
+            "what it says is the recorded ratification, byte for byte, not a new one"
+        );
+        assert_eq!(j.my_seat(), Some(seat));
+        assert!(!j.recorded_ratification_refused());
+        // The members' answer is everything they hold (`say_again`), the
+        // seat's own original among it -- a byte-identical repeat, not a
+        // second ratification.
+        for b in t.founder.say_again(later) {
+            if joinwire::receive_table_ready(&b, &table_id, &j.genesis()).is_ok() {
+                j.on_table_ready(&b).expect("a ratification the table settled on holds");
+            }
+        }
+        assert_eq!(j.session(), Some(session), "the same session identity as the table's");
+
+        // With nothing recorded it is what the run measured: a new
+        // ratification, the original refused as a second one, another session.
+        let (mut fresh, again) = Formation::join(
+            key(2), a.clone(), hash, table_id, peer(2), "player 2".into(), 1_000, None, None, [10u8; 32], later + 1, None,
+        )
+        .unwrap();
+        let out = t
+            .founder
+            .on_join_request(&again, &peer(2), true, later + 1)
+            .expect("answered");
+        let list = out
+            .into_iter()
+            .find_map(|s| match s {
+                Send::Broadcast(b) if joinwire::receive_player_list(&b).is_ok() => Some(b),
+                _ => None,
+            })
+            .expect("the roster again");
+        let said = fresh.on_player_list(&list, later + 1).expect("the list holds");
+        assert_ne!(said, vec![Send::Broadcast(recorded.clone())], "a fresh formation ratifies anew");
+        for b in t.founder.say_again(later + 1) {
+            if joinwire::receive_table_ready(&b, &table_id, &fresh.genesis()).is_ok() {
+                let _ = fresh.on_table_ready(&b);
+            }
+        }
+        assert_ne!(fresh.session(), Some(session), "and that is a session nobody else has -- the run's ed73f924");
     }
 }

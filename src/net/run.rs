@@ -841,7 +841,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut joined_key: Option<[u8; 32]> = None;
     let mut joined_ad: Option<super::lobby::TableAd> = None;
     let mut joined_advert_hash: Option<[u8; 32]> = None;
-    let mut session_recorded = false;
+    // `S1-CR`: the session the record on disk names, so the record is written
+    // when the table is set and again whenever the session changes under it
+    // (a roster change before the first deal settles the table again).
+    let mut recorded_session: Option<[u8; 32]> = None;
+    let mut recorded_refused_said = false;
     // `S1-CR`: when this client last said its ratification again over the
     // group -- in answer to a copy after the table was set, or asking for
     // the others' while it holds a roster and no session.
@@ -883,6 +887,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         written_unix_ms: super::node::now_unix_ms(),
                         advert,
                         advert_hash,
+                        ratification: f.my_ratification().map(<[u8]>::to_vec).unwrap_or_default(),
                     };
                     match crate::storage::session::save(&profile_dir, &record) {
                         Ok(()) => {
@@ -899,7 +904,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                         }
                     }
-                    session_recorded = true;
+                    recorded_session = f.session();
                 }
             }
         }};
@@ -1793,7 +1798,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             sit_ins = SitIns::default();
             resume_inits.clear();
             resume_early.clear();
-            session_recorded = false;
+            recorded_session = None;
             hand_one_held_since = None;
             hand_one_progress = None;
             hand_one_forced_said = false;
@@ -3796,6 +3801,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             my_tox_key,
                         ) {
                             Ok((f, request)) => {
+                                // `S1-CR`: a seat that restarted ratifies with the
+                                // bytes it recorded, verbatim; a new ratification is
+                                // a new `event_hash` and so a session identity nobody
+                                // else computes (`run202634-3`).
+                                let f = match resume.as_ref().filter(|r| resuming && !r.ratification.is_empty()) {
+                                    Some(r) => f.with_recorded_ratification(r.ratification.clone()),
+                                    None => f,
+                                };
                                 let topic = joinrpc::table_topic(&key);
                                 let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
                                 table_topic = Some(topic);
@@ -4499,10 +4512,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                // `S1-CR`: the record's first write, once the table is set.
-                if !session_recorded && joined_key.is_some() {
+                // `S1-CR`: the record's first write, once the table is set, and
+                // again if the session changes under it. Not while resuming:
+                // the record on disk is the one this client came back from,
+                // and this write replaced its hand and stack with hand #0 and
+                // the buy-in (`run202634-3`); the next boundary writes it.
+                if joined_key.is_some() && !resuming {
                     if let Some(f) = table.as_ref() {
-                        if f.session().is_some() {
+                        if f.session().is_some() && f.session() != recorded_session {
                             let stack = f
                                 .my_seat()
                                 .and_then(|s| f.roster().seats().iter().find(|e| e.seat == s).map(|e| e.buyin))
@@ -4533,6 +4550,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                             previous = hand.take();
                         }
+                    }
+                }
+                // `S1-CR`: the recorded ratification did not fit the roster the
+                // founder said again; this client ratified anew, and the session
+                // it computes is then its own. Said once, so the log can tell
+                // this from the members' answer never arriving.
+                if resuming && !recorded_refused_said {
+                    if let Some(f) = table.as_ref().filter(|f| f.recorded_ratification_refused()) {
+                        recorded_refused_said = true;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "the recorded ratification did not fit the roster the founder said again (serial {}); ratified anew, and the session this client computes may not be the table's",
+                                f.serial()
+                            )))
+                            .await;
                     }
                 }
                 // `S1-CR`: a resuming client in the group with a roster and no
