@@ -13637,4 +13637,50 @@ mod tests {
         assert_eq!(late.checkpoint8(), hands2[0].checkpoint8(), "and holds the members' checkpoint");
     }
 
+
+    /// `S1-CW`: three seats open hand k and seat 2 never says its
+    /// `HAND_INIT`. Seats 0 and 1 wait at stage 0, vote at the budget, seal,
+    /// exchange the copies -- and the hand ends with seat 2 named at both,
+    /// with one `GENESIS(k+1)` that leaves seat 2 out. Measured twice on the
+    /// `S1-CR` bed (`run195623-3`, `run190228-3`): both survivors sealed
+    /// (*the table has certified seat 1's timeout, unanimously among [0, 2]*)
+    /// and then printed *waiting for seats* with an empty list, and nothing
+    /// ended the hand for the rest of the run.
+    #[test]
+    fn a_seat_silent_at_stage_zero_is_certified_out_and_the_hand_ends() {
+        let (mut a, from_a) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
+        let keys = [key(10), key(11), key(12)];
+        let _ = deliver(&mut b, &from_a, &keys[1]);
+        let _ = deliver(&mut a, &from_b, &keys[0]);
+        assert_eq!(a.waiting_for(), vec![2], "stage 0 waiting on seat 2");
+        assert_eq!(a.slot().sequence, 0, "still at stage 0");
+
+        let t1 = NOW + 30_000;
+        let va = a.vote_on_timeouts(&keys[0], t1, 0).unwrap();
+        let vb = b.vote_on_timeouts(&keys[1], t1, 0).unwrap();
+        assert!(!va.is_empty() && !vb.is_empty(), "both voters vote at the budget");
+        let Send::Broadcast(va) = &va[0];
+        let Send::Broadcast(vb) = &vb[0];
+        let t2 = NOW + 31_000;
+        let ca = a.on_event(vb, &keys[0], t2).unwrap();
+        let cb = b.on_event(va, &keys[1], t2).unwrap();
+        assert!(!ca.is_empty() && !cb.is_empty(), "each voter seals a copy");
+        let Send::Broadcast(ca) = &ca[0];
+        let Send::Broadcast(cb) = &cb[0];
+        a.on_event(cb, &keys[0], t2).expect("the peer's certificate holds at seat 0");
+        b.on_event(ca, &keys[1], t2).expect("the peer's certificate holds at seat 1");
+        assert_eq!(
+            a.aborted(),
+            Some(Abort::Told { cause: 1 }),
+            "ended by the certificate at seat 0, with the seat named; waiting for {:?}",
+            a.waiting_for()
+        );
+        assert_eq!(b.aborted(), Some(Abort::Told { cause: 1 }), "and at seat 1");
+        assert!(!a.took_part(2), "seat 2 leaves the roster");
+        let na = a.next_hand().expect("an aborted hand has a successor");
+        let nb = b.next_hand().expect("on both");
+        assert!(!na.required.contains(&2), "{:?}", na.required);
+        assert_eq!(na.genesis, nb.genesis, "one GENESIS(k+1)");
+    }
 }

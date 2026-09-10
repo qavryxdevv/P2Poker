@@ -2726,6 +2726,29 @@ the disposition of J2, and the clause it replaces is deleted (D-013):**
 > required set, so a seat readmitted through `A` is dealt in at hand `k+1` rather
 > than at hand `k` — one hand of latency, which §4.9 states as the cost.
 
+> **Adopting a hand — normative, D-029 (`S1-CR`).** A receiver that holds the
+> table's roster and session and **no hand of it** — a client that restarted,
+> rejoined the group and holds nothing, or one that sat down at a table already
+> playing — may open hand `k` from the members' own `HAND_INIT(k)` copies rather
+> than derive it: copies from a **strict majority of the occupied seats**, each a
+> chain-`k` stage-0 event of this table signed by a roster key, grouped by
+> `(previous_event_hash, body)` and byte-identical within the group; the parent
+> is taken as `GENESIS(k)`, the body's `n(9) stacks`, `n(1) button_position`,
+> `n(4) level` and blinds as the opening's, and the seats that signed as `R(k)`.
+> The body's stacks must hash to its `n(10) roster_hash` and its blinds must be
+> §7.2's for hand `k`, so a majority cannot name a table that does not exist.
+> **Nothing here enters a genesis**: the receiver adopts what the table derived
+> and derives nothing itself until it is dealt in — at each boundary it adopts
+> the next hand from the copies again, because the set that signed is `R(k)`
+> only when every required seat's copy arrived, and a derivation from a smaller
+> set is a genesis nobody shares. It is a bystander in the adopted hand: it
+> signs nothing, follows every stage, and at a settled boundary asks to sit in
+> (§4.10). The boundary checkpoint decides whether it followed, and an agreeing
+> checkpoint is the evidence a `RETURN_CERT` needs (§8.3.1) — that certificate
+> is what makes it a deriving member again, and it also says the adopted set
+> was exact. A majority at one genesis is followed whatever a minority signed;
+> a table with no majority at one genesis is one this receiver waits at.
+>
 The deleted clause read *"every seat that will be `dealt_in`, plus every occupied
 seat that is absent or sitting out and therefore posts dead money"*. It defined the
 table's liveness gate on a seat's **status**, and **no status ever removed a seat
@@ -7998,6 +8021,11 @@ RETURN_GRACE_MS                 = 6 000         (client liveness, §8.3.1: how
   long the next deal is held at a boundary while a return is in flight; not a
   wire rule, and two clients that disagree about it disagree about nothing on
   the wire.)
+RESUME_GIVE_UP_MS               = 600 000       (client liveness, D-029: how long
+  a client keeps trying to rejoin an unfinished session once the table's
+  advertisement is gone and no peer of the session has answered; while the
+  advert is up the attempt never ends on a timer, and a finished session is
+  learned from the founder's refusal.)
 MAX_RETAINED_HAND_RECORDS       = 4 096         (§5.3's retained hand record, the
   per-hand (hand_id, was_solitary, p, checkpoint8_state_hash) tuple §4.0 step 10b
   evaluates a stale-hand event against, where p is P(hand_id - 1) and was_solitary
