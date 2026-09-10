@@ -147,6 +147,41 @@ def main():
         else:
             print('\n=== the wire was not mute in this run (downlink half only); %s answered %d request(s) in the 25 s after the window' % (node, len(answers)))
 
+    # The relay layer (patch 0026, S1-CQ): what every node's relays did around the
+    # window, and who lost whom. A "goes to sleep" line whose out-of-band count is
+    # above zero is a relay-only peer's path being taken; "no relay carried" in
+    # the minute after is the loss; "deleting group peer ... exit type 1" is the
+    # 58 s timeout that follows.
+    print('\n=== the relay layer around the window (patch 0026 lines; absent in runs before it)')
+    lo, hi = w0 - 5, w1 + 40
+    for f in logs:
+        n = f[:-4]
+        sleeps, wakes, to_sleep, to_wake, failed, timeouts = [], [], 0, 0, 0, []
+        for wall, s, msg in lines(os.path.join(d, f)):
+            if 'goes to sleep' in msg and lo <= s <= hi:
+                m = re.search(r'relay (\d+) goes to sleep \(lock_count (\d+) == sleep_count (\d+)\): (\d+) online slot\(s\), (\d+) registered, (\d+) of them', msg)
+                if m:
+                    sleeps.append('%.1f:relay %s lock %s online %s reg %s oob-awake %s' % (s, m.group(1), m.group(2), m.group(4), m.group(5), m.group(6)))
+            elif 'wakes up' in msg and lo <= s <= hi:
+                m = re.search(r'relay (\d+) wakes up', msg)
+                if m:
+                    wakes.append('%.1f:relay %s' % (s, m.group(1)))
+            elif 'connection-to' in msg and 'sleeps (peer direct)' in msg and lo <= s <= hi:
+                to_sleep += 1
+            elif 'connection-to' in msg and 'wakes (peer not direct)' in msg and lo <= s <= hi:
+                to_wake += 1
+            elif 'no relay carried' in msg and w1 <= s <= w1 + 60:
+                failed += 1
+            elif 'deleting group peer' in msg and 'exit type 1' in msg and s > w0:
+                m = re.search(r'deleting group peer (\d+)', msg)
+                timeouts.append('%.1f:peer %s' % (s, m.group(1) if m else '?'))
+        if not (sleeps or wakes or to_sleep or to_wake or failed or timeouts):
+            continue
+        print('  %-8s connection-to woke %d, slept %d; relay sleeps: %s; wakes: %s; failed sends in the minute after: %d; timeouts: %s'
+              % (n, to_wake, to_sleep, '  '.join(sleeps) or 'none', '  '.join(wakes) or 'none', failed,
+                 '  '.join(timeouts) or 'none'))
+    print('  The booked prediction (S1-CQ): the peers that lose the far seat are exactly those with a sleep line whose oob-awake count is above zero.')
+
 
 if __name__ == '__main__':
     main()

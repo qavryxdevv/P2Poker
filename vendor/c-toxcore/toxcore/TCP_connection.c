@@ -823,6 +823,23 @@ int set_tcp_connection_to_status(const TCP_Connections *tcp_c, int connections_n
                 if (tcp_con->status == TCP_CONN_SLEEPING) {
                     tcp_con->unsleep = true;
                 }
+
+                /* p2p-poker (patch 0027): a waking connection-to takes its sleepers back.
+                 *
+                 * Going to sleep, below, adds one sleeper to every relay this
+                 * connection-to is ONLINE on; waking never took them away, so every
+                 * sleep-wake-sleep cycle left a phantom sleeper behind, and once
+                 * lock_count == sleep_count held with an AWAKE connection-to still
+                 * ONLINE on the relay, do_tcp_conns put the relay to sleep under it.
+                 * Measured 2026-09-10, runs/split130548-9 (S1-CQ): a 20 s outage of
+                 * one seat made every neighbour's connection-to for it wake and sleep
+                 * once, each relay then read "lock_count 8 == sleep_count 8" with the
+                 * far seat -- awake, ONLINE, and with no other route -- among the
+                 * eight, and six of eight peers lost the far seat in the same second.
+                 * The mirror of the ++ in the sleep branch is all this is. */
+                if (con_to->connections[i].status == TCP_CONNECTIONS_STATUS_ONLINE && tcp_con->sleep_count > 0) {
+                    --tcp_con->sleep_count;
+                }
             }
         }
 
@@ -1126,6 +1143,26 @@ static void p2p_poker_count_relay_users(const TCP_Connections *_Nonnull tcp_c, u
             }
         }
     }
+}
+/* p2p-poker (patch 0027): a relay that carries an out-of-band path of an
+ * AWAKE connection-to is in use, whatever its lock_count says.
+ *
+ * A peer with no direct route may live on REGISTERED slots -- the relay
+ * answered the routing request, the peer is not routed there, out-of-band
+ * delivery works -- and a REGISTERED slot locks nothing: only ONLINE slots
+ * ++lock_count. So the sleep rule in do_tcp_conns and the reaper in
+ * kill_nonused_tcp both read such a relay as unused, and sleeping or killing
+ * it sets every slot on it to NONE. Seen at n3 in runs/split130548-9:
+ * "relay 2 goes to sleep ... 1 registered, 1 of them out-of-band paths of an
+ * AWAKE connection-to". Local behaviour only -- which relays this client
+ * keeps connected -- so nothing on the wire changes. */
+static bool p2p_poker_relay_carries_awake_oob(const TCP_Connections *_Nonnull tcp_c, unsigned int tcp_connections_number)
+{
+    uint32_t online = 0;
+    uint32_t registered = 0;
+    uint32_t registered_awake = 0;
+    p2p_poker_count_relay_users(tcp_c, tcp_connections_number, &online, &registered, &registered_awake);
+    return registered_awake > 0;
 }
 static int sleep_tcp_relay_connection(TCP_Connections *_Nonnull tcp_c, int tcp_connections_number)
 {
@@ -1872,9 +1909,11 @@ static void do_tcp_conns(const Logger *_Nonnull logger, TCP_Connections *_Nonnul
                 tcp_relay_on_online(tcp_c, i);
             }
 
+            /* p2p-poker (patch 0027): and it carries no awake peer's out-of-band path. */
             if (tcp_con->status == TCP_CONN_CONNECTED
                     && !tcp_con->onion && tcp_con->lock_count > 0
                     && tcp_con->lock_count == tcp_con->sleep_count
+                    && !p2p_poker_relay_carries_awake_oob(tcp_c, i)
                     && mono_time_is_timeout(tcp_c->mono_time, tcp_con->connected_time, TCP_CONNECTION_ANNOUNCE_TIMEOUT)) {
                 sleep_tcp_relay_connection(tcp_c, i);
             }
@@ -1913,7 +1952,9 @@ static void kill_nonused_tcp(TCP_Connections *_Nullable tcp_c)
         }
 
         if (tcp_con->status == TCP_CONN_CONNECTED) {
-            if (tcp_con->onion || tcp_con->lock_count > 0) {  // connection is in use so we skip it
+            /* p2p-poker (patch 0027): an awake peer's out-of-band path is a use too;
+             * S1-AA measured this reaper taking REGISTERED slots 37 times of 37. */
+            if (tcp_con->onion || tcp_con->lock_count > 0 || p2p_poker_relay_carries_awake_oob(tcp_c, i)) {  // connection is in use so we skip it
                 continue;
             }
 

@@ -1,0 +1,138 @@
+# 0027 - a waking connection-to takes its sleepers back, and a relay carrying
+#        an awake peer's out-of-band path is in use.
+#
+# S1-CQ: a 20 s symmetric outage of ONE local seat (patch 0025) cost the far
+# seat -- the one with no direct route -- its paths to the rest of the
+# table, twice in two runs (runs/split123725-9: n3 alone; split125153-9:
+# six of eight local peers at once). Patch 0026 instrumented the relay-slot
+# lifecycle and runs/split130548-9 read the chain to the line:
+#
+#   at every local peer, in the second its connection-to for the deaf seat
+#   went back to sleep ("peer direct" again), its relays logged
+#   "goes to sleep (lock_count 8 == sleep_count 8): 8 online slot(s)",
+#   and every slot on them went to NONE -- the far seat's ONLINE slot on an
+#   AWAKE connection-to among them. n0: relays 0, 1, 2 at 284.7 s, then
+#   "no relay carried this packet for connection 0: 0 online, 0
+#   registered, 3 other" 3 602 times in the next minute, the far seat timed
+#   out at 342 s. n6 kept the far seat only because its far slot sat on a
+#   relay that did not sleep.
+#
+# WHY lock_count == sleep_count HELD WITH AN AWAKE PEER ONLINE. sleep_count
+# is meant to be the number of ONLINE slots whose connection-to is asleep.
+# Going to sleep adds one per ONLINE slot (set_tcp_connection_to_status,
+# the sleep branch); waking never took them away -- the wake branch only
+# sets unsleep on sleeping relays. So each sleep-wake-sleep cycle of a
+# direct peer's connection-to left one phantom sleeper on every relay it
+# was ONLINE on. The outage is exactly one such cycle at every neighbour
+# (not direct at +16 s, direct again at the end), and with eight peers
+# ONLINE and seven of them asleep, one phantom made lock 8 == sleep 8 and
+# covered the awake far seat's lock. The reaper (kill_nonused_tcp) spares
+# lock_count > 0 and was never the killer here; the sleep rule was.
+#
+# THE BOOKED PREDICTION FOR THE INSTRUMENT (S1-CQ) WAS HALF RIGHT. The
+# sleep at the window's end: confirmed at every node. The clause "the
+# peers that lose the far seat are exactly those with a sleep line whose
+# out-of-band-of-an-awake count is above zero": refuted -- the losses came
+# with the far slot ONLINE, not REGISTERED, and the count was zero at all
+# five losers; only n3's relay 2 showed the out-of-band case ("1
+# registered, 1 of them out-of-band paths of an AWAKE connection-to").
+# Both cases are real; the fix takes both.
+#
+# (A) THE ROOT: the wake branch decrements sleep_count for each ONLINE slot
+# of the waking connection-to, the mirror of the sleep branch's increment.
+# With it, a relay that an awake peer is ONLINE on reads lock > sleep and
+# does not sleep. (B) THE OUT-OF-BAND CASE: a REGISTERED slot of an awake
+# connection-to counts as a use in the sleep rule of do_tcp_conns and in
+# the reaper of kill_nonused_tcp (p2p_poker_relay_carries_awake_oob, on
+# 0026's counting helper). Both are local behaviour -- which relays this
+# client keeps connected -- so nothing on the wire changes and an unpatched
+# peer sees nothing. (A) is an upstream defect and should go upstream.
+#
+# THE PREDICTION FOR THE FIXED RUN IS BOOKED BEFORE IT IS TAKEN, same
+# recipe (-DeafSeat 3 -DeafAt 240 -DeafFor 20 -DeafBothWays, 8+1): at the
+# window's end the neighbours' relays do NOT go to sleep -- any "goes to
+# sleep" line in that minute reads lock_count above sleep_count is absent,
+# i.e. no sleep line at all on a relay with an awake ONLINE slot -- there
+# is no "no relay carried" storm, nobody times the far seat out and the
+# far seat times nobody out, the hand the window fell into completes, and
+# every seat finishes level. The falsifier is a sleep line with lock ==
+# sleep at the window's end again, or the far seat lost by anyone.
+
+diff --git a/vendor/c-toxcore/toxcore/TCP_connection.c b/vendor/c-toxcore/toxcore/TCP_connection.c
+index eb45a9c..84df5f3 100644
+--- a/vendor/c-toxcore/toxcore/TCP_connection.c
++++ b/vendor/c-toxcore/toxcore/TCP_connection.c
+@@ -823,6 +823,23 @@ int set_tcp_connection_to_status(const TCP_Connections *tcp_c, int connections_n
+                 if (tcp_con->status == TCP_CONN_SLEEPING) {
+                     tcp_con->unsleep = true;
+                 }
++
++                /* p2p-poker (patch 0027): a waking connection-to takes its sleepers back.
++                 *
++                 * Going to sleep, below, adds one sleeper to every relay this
++                 * connection-to is ONLINE on; waking never took them away, so every
++                 * sleep-wake-sleep cycle left a phantom sleeper behind, and once
++                 * lock_count == sleep_count held with an AWAKE connection-to still
++                 * ONLINE on the relay, do_tcp_conns put the relay to sleep under it.
++                 * Measured 2026-09-10, runs/split130548-9 (S1-CQ): a 20 s outage of
++                 * one seat made every neighbour's connection-to for it wake and sleep
++                 * once, each relay then read "lock_count 8 == sleep_count 8" with the
++                 * far seat -- awake, ONLINE, and with no other route -- among the
++                 * eight, and six of eight peers lost the far seat in the same second.
++                 * The mirror of the ++ in the sleep branch is all this is. */
++                if (con_to->connections[i].status == TCP_CONNECTIONS_STATUS_ONLINE && tcp_con->sleep_count > 0) {
++                    --tcp_con->sleep_count;
++                }
+             }
+         }
+ 
+@@ -1127,6 +1144,26 @@ static void p2p_poker_count_relay_users(const TCP_Connections *_Nonnull tcp_c, u
+         }
+     }
+ }
++/* p2p-poker (patch 0027): a relay that carries an out-of-band path of an
++ * AWAKE connection-to is in use, whatever its lock_count says.
++ *
++ * A peer with no direct route may live on REGISTERED slots -- the relay
++ * answered the routing request, the peer is not routed there, out-of-band
++ * delivery works -- and a REGISTERED slot locks nothing: only ONLINE slots
++ * ++lock_count. So the sleep rule in do_tcp_conns and the reaper in
++ * kill_nonused_tcp both read such a relay as unused, and sleeping or killing
++ * it sets every slot on it to NONE. Seen at n3 in runs/split130548-9:
++ * "relay 2 goes to sleep ... 1 registered, 1 of them out-of-band paths of an
++ * AWAKE connection-to". Local behaviour only -- which relays this client
++ * keeps connected -- so nothing on the wire changes. */
++static bool p2p_poker_relay_carries_awake_oob(const TCP_Connections *_Nonnull tcp_c, unsigned int tcp_connections_number)
++{
++    uint32_t online = 0;
++    uint32_t registered = 0;
++    uint32_t registered_awake = 0;
++    p2p_poker_count_relay_users(tcp_c, tcp_connections_number, &online, &registered, &registered_awake);
++    return registered_awake > 0;
++}
+ static int sleep_tcp_relay_connection(TCP_Connections *_Nonnull tcp_c, int tcp_connections_number)
+ {
+     TCP_con *tcp_con = get_tcp_connection(tcp_c, tcp_connections_number);
+@@ -1872,9 +1909,11 @@ static void do_tcp_conns(const Logger *_Nonnull logger, TCP_Connections *_Nonnul
+                 tcp_relay_on_online(tcp_c, i);
+             }
+ 
++            /* p2p-poker (patch 0027): and it carries no awake peer's out-of-band path. */
+             if (tcp_con->status == TCP_CONN_CONNECTED
+                     && !tcp_con->onion && tcp_con->lock_count > 0
+                     && tcp_con->lock_count == tcp_con->sleep_count
++                    && !p2p_poker_relay_carries_awake_oob(tcp_c, i)
+                     && mono_time_is_timeout(tcp_c->mono_time, tcp_con->connected_time, TCP_CONNECTION_ANNOUNCE_TIMEOUT)) {
+                 sleep_tcp_relay_connection(tcp_c, i);
+             }
+@@ -1913,7 +1952,9 @@ static void kill_nonused_tcp(TCP_Connections *_Nullable tcp_c)
+         }
+ 
+         if (tcp_con->status == TCP_CONN_CONNECTED) {
+-            if (tcp_con->onion || tcp_con->lock_count > 0) {  // connection is in use so we skip it
++            /* p2p-poker (patch 0027): an awake peer's out-of-band path is a use too;
++             * S1-AA measured this reaper taking REGISTERED slots 37 times of 37. */
++            if (tcp_con->onion || tcp_con->lock_count > 0 || p2p_poker_relay_carries_awake_oob(tcp_c, i)) {  // connection is in use so we skip it
+                 continue;
+             }
+ 
