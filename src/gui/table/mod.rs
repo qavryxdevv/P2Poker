@@ -161,16 +161,17 @@ pub mod bar {
     /// buttons one above the other. Wide enough for "Raise to 10000" at the
     /// body size, and no wider.
     pub const BUTTON_W: f32 = 132.0;
-    pub const BUTTON_H: f32 = 26.0;
+    pub const BUTTON_H: f32 = 24.0;
     /// All-in, at the top, at about half the height of the others.
-    pub const ALL_IN_H: f32 = 16.0;
-    pub const PRESET_W: f32 = 29.0;
+    pub const ALL_IN_H: f32 = 14.0;
+    pub const PRESET_W: f32 = 36.0;
     pub const PRESET_H: f32 = 22.0;
-    pub const SLIDER_H: f32 = 18.0;
+    /// The slider, in the same row as the presets, to their right.
+    pub const SLIDER_W: f32 = 100.0;
     /// Between the presets, tighter than egui's default so four fit the column.
     pub const PRESET_GAP: f32 = 5.0;
     /// Between the rows of the column.
-    pub const ROW_GAP: f32 = 4.0;
+    pub const ROW_GAP: f32 = 3.0;
     /// What egui puts between two widgets, and the panel's own margins.
     pub const GAP: f32 = 10.0;
     pub const MARGINS: f32 = 2.0 * 10.0 + 2.0 * 8.0;
@@ -178,13 +179,14 @@ pub mod bar {
     /// gaps counted below; measured on the first photograph of the final
     /// bar, where the right block ran past the window by about this much.
     pub const SLACK: f32 = 40.0;
-    /// The bar's height: the column, top to bottom.
-    pub const HEIGHT: f32 =
-        PRESET_H + ROW_GAP + SLIDER_H + ROW_GAP + ALL_IN_H + ROW_GAP + 3.0 * BUTTON_H + 2.0 * ROW_GAP;
+    /// The bar's height: the column, top to bottom -- the presets' row,
+    /// All-in, and the three buttons.
+    pub const HEIGHT: f32 = PRESET_H + ROW_GAP + ALL_IN_H + ROW_GAP + 3.0 * BUTTON_H + 2.0 * ROW_GAP;
 
-    /// The middle block is the one column.
+    /// The middle block: as wide as the presets and the slider in a row;
+    /// the buttons are centred in it.
     pub const fn middle_block() -> f32 {
-        BUTTON_W
+        presets_row() + PRESET_GAP + SLIDER_W
     }
 
     /// The presets row inside the column.
@@ -502,7 +504,7 @@ fn felt_and_people(
             p,
             egui::pos2(slot.plate.center().x, slot.plate.top() + h * 0.32),
             &seat.name,
-            h * 0.34,
+            h * 0.36,
             if dim { theme::TEXT_DIM } else { theme::TEXT },
         );
         // The stack stays on the plate whatever the seat is doing: a
@@ -514,7 +516,7 @@ fn felt_and_people(
             p,
             egui::pos2(slot.plate.center().x, slot.plate.top() + h * 0.72),
             &seat.stack.to_string(),
-            h * 0.32,
+            h * 0.34,
             if dim { theme::TEXT_DIM } else { theme::STACK },
         );
         if dim {
@@ -604,7 +606,7 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
         // half height, Raise, Call or Check, and Fold at the bottom.
         ui.allocate_ui_with_layout(
             egui::vec2(bar::middle_block(), bar::HEIGHT),
-            egui::Layout::top_down(egui::Align::Min),
+            egui::Layout::top_down(egui::Align::Center),
             |ui| {
                 ui.spacing_mut().item_spacing.y = bar::ROW_GAP;
                 let raise_to = if view.can_act { raise_default(state, view) } else { 0 };
@@ -626,7 +628,7 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
                         ] {
                             let preset = ui.add_sized(
                                 egui::vec2(bar::PRESET_W, bar::PRESET_H),
-                                egui::Button::new(RichText::new(label).size(13.0)),
+                                egui::Button::new(RichText::new(label).size(15.0)),
                             );
                             if preset.clicked() {
                                 let want = (view.pot as f64 * part) as Chips;
@@ -634,9 +636,16 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
                             }
                             preset.on_hover_text(says);
                         }
+                        if view.max_raise > view.min_raise {
+                            ui.add_sized(
+                                egui::vec2(bar::SLIDER_W, bar::PRESET_H),
+                                egui::Slider::new(&mut state.raise, view.min_raise..=view.max_raise)
+                                    .show_value(false),
+                            );
+                        }
                     } else {
                         ui.allocate_ui_with_layout(
-                            egui::vec2(bar::BUTTON_W, bar::PRESET_H),
+                            egui::vec2(bar::middle_block(), bar::PRESET_H),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.label(
@@ -652,14 +661,6 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
                         );
                     }
                 });
-                if view.can_act && view.max_raise > view.min_raise {
-                    ui.add_sized(
-                        egui::vec2(bar::BUTTON_W, bar::SLIDER_H),
-                        egui::Slider::new(&mut state.raise, view.min_raise..=view.max_raise).show_value(false),
-                    );
-                } else {
-                    ui.add_space(bar::SLIDER_H);
-                }
                 if ui
                     .add_enabled(
                         all_in,
@@ -1086,7 +1087,7 @@ mod tests {
     #[test]
     fn the_action_bar_fits_the_smallest_window() {
         let room = MIN_WINDOW[0] - bar::MARGINS;
-        assert!(bar::presets_row() <= bar::BUTTON_W, "the presets need {} of {}", bar::presets_row(), bar::BUTTON_W);
+        assert!(bar::BUTTON_W <= bar::middle_block(), "a button needs {} of {}", bar::BUTTON_W, bar::middle_block());
         assert!(
             bar::fixed() + bar::CHAT_MIN_W <= room,
             "the two fixed blocks and the narrowest chat need {} of {room}",

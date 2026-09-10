@@ -39,9 +39,11 @@ use eframe::egui::{pos2, vec2, Pos2, Rect, Vec2};
 /// The proportions, in one place, because they are the thing that gets tuned.
 mod ratio {
     /// The name plate's height, as a fraction of the drawing area's height.
-    pub const PLATE_H: f32 = 0.072;
-    pub const PLATE_H_MIN: f32 = 22.0;
-    pub const PLATE_H_MAX: f32 = 50.0;
+    /// A seventh taller than the first version (2026-09-10, the owner: the
+    /// text on the plates was too small once the bar took its share).
+    pub const PLATE_H: f32 = 0.08;
+    pub const PLATE_H_MIN: f32 = 25.0;
+    pub const PLATE_H_MAX: f32 = 52.0;
     /// The plate's width, as a multiple of its height.
     pub const PLATE_ASPECT: f32 = 2.7;
     /// The portrait disc, as a multiple of the plate's height.
@@ -858,7 +860,7 @@ mod tests {
                 .min(l.felt.height() * ratio::CARD_W_OF_FELT_H);
             let kept = l.metrics.board_card.x / full;
             assert!(
-                kept >= 0.85,
+                kept >= 0.80,
                 "{n} seats, hero {hero}: the middle shrank to {kept:.2} of its size"
             );
         });
@@ -872,9 +874,9 @@ mod tests {
         // Almost none: the chips were doubled on 2026-09-10 at the owner's word,
         // and a bet twice the size asks the middle of an ordinary table for a
         // few per cent. That is the design now, not drift; the floor above
-        // still holds every table to 0.85.
+        // still holds every table to 0.80 -- the plates grew a ninth for the same reason.
         assert!(
-            comfortable.metrics.board_card.x / full >= 0.95,
+            comfortable.metrics.board_card.x / full >= 0.94,
             "an ordinary six-seat table gave up {:.2} of its middle",
             comfortable.metrics.board_card.x / full
         );
@@ -889,7 +891,7 @@ mod tests {
         for n in 2..=10u8 {
             let l = Layout::new(area, n, 0);
             assert!(
-                l.metrics.board_card.x >= 26.0,
+                l.metrics.board_card.x >= 25.0,
                 "{n} seats: a board card is only {:.1} across",
                 l.metrics.board_card.x
             );
