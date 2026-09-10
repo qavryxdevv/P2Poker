@@ -160,8 +160,14 @@ pub struct Window {
     hand_id: u64,
     /// `TERMINAL(k)`, the one parent every event of this window carries.
     terminal: Hash,
-    /// `P(k)` at `TERMINAL(k)`. Only `PLAYER_SIT_IN` reads it, to refuse a copy
-    /// from a seat that is already inside.
+    /// The seats a `PLAYER_SIT_IN` decides nothing for: **`R(k)`, the roster of
+    /// hand `k`, since D-028** -- a seat that is dealt in has nothing to ask.
+    /// It was `P(k)` while the two coincided; a bystander in section 4.9's `A`
+    /// signs stage 0 of hand `k` and is in `P(k)` without being in `R(k)`, and
+    /// its request is what the return certificate is about
+    /// (`split174002-9`: refused as deciding nothing by all eight voters). The
+    /// caller passes the set; the abort path and the settled path both pass
+    /// `Hand::required`.
     participants: Vec<SeatIdx>,
     /// Every **occupied** seat of the table — §4.10's *"any occupied seat"*.
     roster: Vec<SeatIdx>,
@@ -204,7 +210,8 @@ impl Window {
     /// **What this decides and what it does not.** It decides the two rules that
     /// are this store's — the window is open, and one event per seat per
     /// boundary — and §4.10's one type-specific legality condition, that a
-    /// `PLAYER_SIT_IN` from a seat already in `P(k)` *"decides nothing"*. The
+    /// `PLAYER_SIT_IN` from a seat inside the roster *"decides nothing"* (`R(k)`
+    /// under D-028, see the field). The
     /// envelope rules are the caller's, because they are decided from the
     /// event's own bytes and this type never sees them.
     ///
@@ -263,9 +270,9 @@ pub enum WindowTook {
     Closed,
     /// This seat has already spoken at this boundary.
     AlreadySpoke,
-    /// A `PLAYER_SIT_IN` from a seat already in `P(k)`. §4.10: *"A copy from a
-    /// seat already in `P(k)` decides nothing and is rejected as an out-of-stage
-    /// chained event under §4.0."*
+    /// A `PLAYER_SIT_IN` from a seat inside the roster of hand `k`. §4.10: *"A
+    /// copy from a seat inside `R(k)` decides nothing and is rejected as an
+    /// out-of-stage chained event under §4.0."* (`R(k)`, not `P(k)`: D-028.)
     DecidesNothing,
     /// Not an occupied seat of this table.
     NotASeat,
@@ -1540,10 +1547,11 @@ mod the_boundary_window {
         assert_eq!(b.window(4).expect("held").said(), vec![(2, EventType::PlayerSitIn)]);
     }
 
-    /// §4.10: *"A copy from a seat already in `P(k)` decides nothing and is
-    /// rejected as an out-of-stage chained event under §4.0."*
+    /// §4.10: *"A copy from a seat inside `R(k)` decides nothing and is
+    /// rejected as an out-of-stage chained event under §4.0."* The set the
+    /// fixture opens the window with is the roster of the hand (D-028).
     #[test]
-    fn a_sit_in_from_inside_p_decides_nothing() {
+    fn a_sit_in_from_inside_the_roster_decides_nothing() {
         let mut b = open_one();
         assert_eq!(
             b.on_boundary_event(4, 1, EventType::PlayerSitIn),

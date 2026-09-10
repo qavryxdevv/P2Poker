@@ -4729,10 +4729,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .as_ref()
                             .map(|f| f.roster().seats().iter().map(|e| e.seat).collect())
                             .unwrap_or_default();
+                        // **The window's set is `R(k)`, the roster of hand k, and
+                        // not `P(k)`** (D-028). Only `PLAYER_SIT_IN` reads it, to
+                        // refuse a request from a seat that is already dealt in --
+                        // and a bystander in section 4.9's `A` signs stage 0 of
+                        // hand k, so it is in `P(k)` without being in `R(k)`, and
+                        // its request is exactly what a return certificate is
+                        // about. `split174002-9`: eight voters refused it as
+                        // deciding nothing. Opened here first, so the checkpoint's
+                        // `open` below, which carries `P(k)`, finds it already open.
                         boundaries.open_window(
                             h.hand_id(),
                             terminal,
-                            &h.participants(),
+                            h.required(),
                             &roster,
                         );
                         // `S1-BM`: the boundary events that arrived before this

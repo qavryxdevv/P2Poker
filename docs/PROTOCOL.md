@@ -4625,10 +4625,15 @@ reads:
 
 > Legal from **any occupied seat with a non-zero stack that is not a required
 > emitter of the next hand and has not been removed under D-014** — that is, any
-> occupied seat outside `P(k)` (§3.2), whether it is outside because it sat itself
-> out with `PLAYER_SIT_OUT` or because it went silent for a hand. A copy from a
-> seat already in `P(k)` decides nothing and is rejected as an out-of-stage chained
-> event under §4.0.
+> occupied seat outside **`R(k)`**, the roster of hand `k` (D-028; it read `P(k)`,
+> §3.2, while the two coincided), whether it is outside because it sat itself out
+> with `PLAYER_SIT_OUT` or because it was certified out. A copy from a seat inside
+> `R(k)` decides nothing and is rejected as an out-of-stage chained event under
+> §4.0. **`R(k)` and not `P(k)`, and the difference is the whole return road:** a
+> bystander in §4.9's readmission set `A` signs stage 0 of hand `k`, so it is in
+> `P(k)` without being in `R(k)`, and its `PLAYER_SIT_IN` at hand `k`'s boundary
+> is exactly the request a `RETURN_CERT` (§8.3.1) is about — `split174002-9`,
+> where eight voters refused it as deciding nothing.
 >
 > **The D-014 clause is the one-way half of that decision and this is where a
 > receiver enforces it** (§4.9). A seat removed for a provably illegal message is
