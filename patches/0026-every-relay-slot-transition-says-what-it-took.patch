@@ -49,6 +49,22 @@
 # relay sleep (with the counts that decided it and what it takes), the
 # wake, the connection-to sleep and wake, the routing response, and both
 # arms of the status callback.
+#
+# READ, 2026-09-10, runs/split130548-9: the event was as predicted and the
+# slot was not. At every local peer, in the second its connection-to for
+# the deaf seat slept again, its relays logged "goes to sleep (lock_count
+# 8 == sleep_count 8): 8 online slot(s), 0 registered, 0 of them
+# out-of-band paths of an AWAKE connection-to" -- and five peers lost the
+# far seat in that second, n0 with 3 602 failed sends and a timeout at
+# 342 s. So the far seat's slot at the losers was ONLINE on an awake
+# connection-to, not REGISTERED; the out-of-band count was zero; only n3's
+# relay 2 showed the out-of-band case. The question the instrument was
+# built to answer -- how lock_count == sleep_count could hold with an awake
+# peer ONLINE -- is answered one function deeper: set_tcp_connection_to_
+# status adds a sleeper per ONLINE slot when a connection-to sleeps and
+# never takes it back when it wakes, so every sleep-wake-sleep cycle
+# leaves a phantom, and the outage is one such cycle at every neighbour.
+# Patch 0027 is the fix, and its run confirmed it.
 
 diff --git a/vendor/c-toxcore/toxcore/TCP_connection.c b/vendor/c-toxcore/toxcore/TCP_connection.c
 index b11cd63..eb45a9c 100644

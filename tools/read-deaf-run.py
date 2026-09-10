@@ -180,7 +180,10 @@ def main():
         print('  %-8s connection-to woke %d, slept %d; relay sleeps: %s; wakes: %s; failed sends in the minute after: %d; timeouts: %s'
               % (n, to_wake, to_sleep, '  '.join(sleeps) or 'none', '  '.join(wakes) or 'none', failed,
                  '  '.join(timeouts) or 'none'))
-    print('  The booked prediction (S1-CQ): the peers that lose the far seat are exactly those with a sleep line whose oob-awake count is above zero.')
+    print('  How to read it (S1-CQ): before patch 0027 a sleep with lock == sleep could sit on top of an AWAKE peer that was ONLINE')
+    print('  (a phantom sleeper the wake path never returned) and every slot on that relay went to NONE -- the failed sends and the')
+    print('  timeouts in the columns after it are that. With 0027 in the binary, lock == sleep means every ONLINE user is asleep,')
+    print('  the relay may sleep, and the columns after it should read 0 and none.')
 
 
 if __name__ == '__main__':

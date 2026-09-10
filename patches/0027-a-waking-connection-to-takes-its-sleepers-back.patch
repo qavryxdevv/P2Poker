@@ -57,6 +57,25 @@
 # far seat times nobody out, the hand the window fell into completes, and
 # every seat finishes level. The falsifier is a sleep line with lock ==
 # sleep at the window's end again, or the far seat lost by anyone.
+#
+# CONFIRMED, 2026-09-10, runs/split132427-9, on every observable that
+# matters and with one clause of the wording corrected. Nobody lost the
+# far seat: zero "no relay carried" at every local node in the minute
+# after the window and at the far seat after 90 s, zero timeouts after the
+# window anywhere (the far seat's six exit-type-1 deletions and n4's one
+# are all at 57-73 s, the join-phase shape S1-AA already knows), zero
+# certificates and zero aborts in the run, hand 11 -- the one the window
+# fell into -- over at 298.8 s, and every one of the nine seats opened 20
+# hands and finished 19. The uplink burst worked as before (n3 answered
+# 1574..1589 in one second). Relays DID still go to sleep at the window's
+# end -- nine lines across six nodes, e.g. n4 "relay 0 goes to sleep
+# (lock_count 7 == sleep_count 7): 7 online slot(s)" -- and with (A) in
+# place that equality now means what it was always meant to mean: every
+# connection-to ONLINE on the relay is asleep, no awake peer is on it, and
+# it may sleep. The far seat's slot was on none of them, which the zero
+# failed sends prove. So "no sleep line with lock == sleep" was too strong
+# a paraphrase of the prediction; "no relay sleeps under an awake ONLINE
+# slot" is the clause, and it held.
 
 diff --git a/vendor/c-toxcore/toxcore/TCP_connection.c b/vendor/c-toxcore/toxcore/TCP_connection.c
 index eb45a9c..84df5f3 100644
