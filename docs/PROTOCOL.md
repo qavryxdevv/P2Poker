@@ -7156,7 +7156,15 @@ supersede D-006 and there is no auto-action event of any kind.
 > belongs to the client**: it sends the request at every settled boundary where
 > its seat is outside the roster with chips, so the player clicks nothing and
 > sees *sitting in at the next hand*; `--stay-out` withholds it, which is how a
-> seat watches a table it has chips at without being dealt in.
+> seat watches a table it has chips at without being dealt in. **And the
+> client publishes its checkpoint and its request at the terminal, then holds
+> the next deal for up to `RETURN_GRACE_MS = 6 000` ms while a return is in
+> flight** -- a request seen in the window, or its own, with no certificate
+> banked yet -- because a certificate that lands after `HAND_INIT(k+1)` has
+> left stage 0 can no longer move `R(k+1)`, and a heads-up hand leaves stage 0
+> in a tenth of a second (`run164337-3`: nine requests, no return, before the
+> hold). A client liveness parameter, not a wire rule: past it the table
+> deals on and the seat asks again at the next boundary.
 >
 > **Guard.** `src/table/hand.rs`'s `return_voters` is scanned by its own test
 > for the two forbidden words; the whole road is
@@ -7979,6 +7987,10 @@ RETURN_SEQUENCE_BASE            = 8 224         (§4.8's return band, D-028; a
   values 8 224 .. 8 233, above the last reconciliation ack at 8 207 with room
   to spare. The three boundary bands never meet; `returnwire::tests` holds
   that.)
+RETURN_GRACE_MS                 = 6 000         (client liveness, §8.3.1: how
+  long the next deal is held at a boundary while a return is in flight; not a
+  wire rule, and two clients that disagree about it disagree about nothing on
+  the wire.)
 MAX_RETAINED_HAND_RECORDS       = 4 096         (§5.3's retained hand record, the
   per-hand (hand_id, was_solitary, p, checkpoint8_state_hash) tuple §4.0 step 10b
   evaluates a stale-hand event against, where p is P(hand_id - 1) and was_solitary

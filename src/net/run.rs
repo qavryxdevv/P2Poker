@@ -72,6 +72,7 @@ use super::swarm::{CONNECTION_CEILING, MAX_CONNECTIONS, MIN_CONNECTIONS};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
 use super::joinwire::DISPLAY_NAME_MAX;
 use crate::protocol::constants::{
+    RETURN_GRACE_MS,
     AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX, MAX_SEATS,
 };
 
@@ -564,6 +565,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // When the next hand may start. D-020's hold, and the only timer in this
     // loop that is about a person rather than about the network.
     let mut next_hand_at: Option<tokio::time::Instant> = None;
+    // `S1-BM`: the boundary tick is two-phase. The timer fires at the
+    // terminal -- phase 1: the window, the checkpoint, this seat's sit-in
+    // request -- and the next hand is dealt from `deal_at` on, D-020's pause
+    // later, so a returning seat's request and checkpoint are on the wire for
+    // the whole pause instead of going out in the tick that deals over them
+    // (`run164337-3`: nine requests, no return).
+    let mut deal_at: Option<tokio::time::Instant> = None;
+    // The hold for a return in flight: the hand it is about, when it began,
+    // and whether it has been given up on.
+    let mut return_hold: Option<(u64, tokio::time::Instant, bool)> = None;
+    // Arm the boundary: fire now for phase 1, deal after the pause.
+    macro_rules! arm_boundary {
+        ($pause:expr) => {{
+            let now = tokio::time::Instant::now();
+            next_hand_at = Some(now);
+            deal_at = Some(now + $pause);
+        }};
+    }
     // When this client stops waiting for its own player and acts for them.
     //
     // Version 1's whole answer to a stalled betting stage (D-015): there is no
@@ -1259,17 +1278,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         let _ = events
                                             .send(NodeEvent::Warning(said))
                                             .await;
-                                        next_hand_at = Some(
-                                            tokio::time::Instant::now()
-                                                + std::time::Duration::from_millis(800),
-                                        );
+                                        arm_boundary!(std::time::Duration::from_millis(800));
                                     }
                                     let report =
                                         report_hand($h, &events, &mut turn_reported).await;
                                     if let Some(end) = report.ended {
-                                        next_hand_at = Some(
-                                            tokio::time::Instant::now() + end.pause(),
-                                        );
+                                        arm_boundary!(end.pause());
                                     }
                                     act_by = hurry(report.clock.apply(act_by, $h.action_deadline()), autoplay);
                                     if let Some(cards) = $h.cards().filter(|_| !cards_reported) {
@@ -1639,6 +1653,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             turn_reported = None;
             said.clear();
             next_hand_at = None;
+            deal_at = None;
+            return_hold = None;
             act_by = None;
             // Keyed by hand id, and the next table starts again at 1.
             boundaries = crate::table::boundary::Boundaries::new();
@@ -3726,8 +3742,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let report =
                                     report_hand(h, &events, &mut turn_reported).await;
                                 if let Some(end) = report.ended {
-                                    next_hand_at =
-                                        Some(tokio::time::Instant::now() + end.pause());
+                                    arm_boundary!(end.pause());
                                 }
                                 act_by = hurry(report.clock.apply(act_by, h.action_deadline()), autoplay);
                             }
@@ -4285,6 +4300,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // A timer armed about the old hand must not fire
                             // about the new one.
                             next_hand_at = None;
+                            deal_at = None;
                             act_by = None;
                             hand_reported = false;
                             deck_reported = None;
@@ -4521,9 +4537,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                         // Straight on: an abort has nothing to look at, so
                         // D-020's hold has nothing to hold.
-                        next_hand_at = Some(
-                            tokio::time::Instant::now() + std::time::Duration::from_millis(800),
-                        );
+                        arm_boundary!(std::time::Duration::from_millis(800));
                     }
                     Err(e) => {
                         let _ = events
@@ -4575,7 +4589,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                         let report = report_hand(h, &events, &mut turn_reported).await;
                         if let Some(end) = report.ended {
-                            next_hand_at = Some(tokio::time::Instant::now() + end.pause());
+                            arm_boundary!(end.pause());
                         }
                         act_by = hurry(report.clock.apply(act_by, h.action_deadline()), autoplay);
                     }
@@ -4902,6 +4916,65 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+
+                // `S1-BM`: phase 2 is not due yet. The terminal fired this arm so
+                // that the window, the checkpoint and the sit-in request above
+                // went out at once; the deal itself waits for D-020's pause.
+                if let Some(at) = deal_at {
+                    if tokio::time::Instant::now() < at {
+                        next_hand_at = Some(at);
+                        continue;
+                    }
+                }
+                // `S1-BM`: votes cast here as well as at the stall tick, so a
+                // hold below is over as soon as the evidence is, not a tick later.
+                if let Some(h) = hand.as_mut() {
+                    vote_on_returns!(h);
+                }
+                // `S1-BM`: a return is in flight at this boundary -- a seat outside
+                // the roster asked to sit in (this client, or one whose request
+                // the window took) and no certificate about it has banked here --
+                // so the next deal is held, up to `RETURN_GRACE_MS`. Dealt now,
+                // hand k+1 would open at a genesis without the seat, and the
+                // certificate a moment later could only re-open a stage 0 that a
+                // heads-up hand leaves in a tenth of a second (`run164337-3`: nine
+                // requests at nine boundaries, no return).
+                if let Some(h) = hand.as_ref() {
+                    let waiting_for = returning_seats(h, &sit_ins);
+                    if !waiting_for.is_empty() {
+                        let hid = h.hand_id();
+                        let (since, gave_up) = match return_hold {
+                            Some((id, s, g)) if id == hid => (s, g),
+                            _ => {
+                                let s = tokio::time::Instant::now();
+                                return_hold = Some((hid, s, false));
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "hand #{hid}: holding the next deal for up to {} s while seat(s) {waiting_for:?} return; a certificate is owed first",
+                                        RETURN_GRACE_MS / 1000
+                                    )))
+                                    .await;
+                                (s, false)
+                            }
+                        };
+                        if !gave_up {
+                            if since.elapsed() < std::time::Duration::from_millis(RETURN_GRACE_MS) {
+                                next_hand_at = Some(
+                                    tokio::time::Instant::now() + std::time::Duration::from_millis(250),
+                                );
+                                continue;
+                            }
+                            return_hold = Some((hid, since, true));
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "hand #{hid}: no return certificate within {} s for seat(s) {waiting_for:?}; dealing on, and the seat asks again at the next boundary",
+                                    RETURN_GRACE_MS / 1000
+                                )))
+                                .await;
+                        }
+                    }
+                }
+                deal_at = None;
 
                 // **This client is on a branch nobody shares.** It cannot
                 // catch up and it must not deal on: a private tournament is
@@ -6387,10 +6460,34 @@ impl SitIns {
             .unwrap_or_default()
     }
 
+    /// Every seat that asked to sit in at this boundary, whether or not its
+    /// checkpoint has arrived.
+    fn requested(&self, hand_id: u64) -> Vec<u8> {
+        self.by_hand
+            .get(&hand_id)
+            .map(|m| m.iter().filter(|(_, (r, _))| r.is_some()).map(|(s, _)| *s).collect())
+            .unwrap_or_default()
+    }
+
     /// Boundaries below `keep` are over for good.
     fn release_below(&mut self, keep: u64) {
         self.by_hand.retain(|k, _| *k >= keep);
     }
+}
+
+/// `S1-BM`: the seats whose return is in flight at this hand's boundary --
+/// they asked to sit in (this client, or a seat whose request the window
+/// took), they are outside the roster, and no certificate about them has
+/// banked here. Empty means there is nothing to hold the deal for.
+fn returning_seats(h: &crate::table::hand::Hand, sit_ins: &SitIns) -> Vec<u8> {
+    let mut v = sit_ins.requested(h.hand_id());
+    if h.asked_to_sit_in() {
+        v.push(h.my_seat());
+    }
+    v.sort_unstable();
+    v.dedup();
+    v.retain(|s| !h.returned().contains(s) && !h.required().contains(s));
+    v
 }
 
 /// `Quiet` when at least `FOREIGN_GENESIS_FLOOR` roster seats have already
@@ -9523,6 +9620,10 @@ mod late_roster_tests {
         s.release_below(9);
         assert!(!s.by_hand.contains_key(&8));
         assert!(s.by_hand.contains_key(&9));
+        // A request alone is enough to hold the deal for; a checkpoint alone is not.
+        assert_eq!(s.requested(9), vec![5]);
+        s.checkpoint(9, 6, b"chk");
+        assert_eq!(s.requested(9), vec![5], "seat 6 sent no request");
     }
 }
 

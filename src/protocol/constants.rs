@@ -65,6 +65,15 @@ pub const BOUNDARY_CHECKPOINT_BASE: u64 = 8_192;
 /// three boundary bands -- the seat window, the checkpoint rounds and this
 /// -- never meet; `returnwire::tests` holds that.
 pub const RETURN_SEQUENCE_BASE: u64 = 8_224;
+/// How long a client holds the next deal at a boundary while a return is in
+/// flight (`S1-BM`, D-028): a seat outside the roster asked to sit in -- this
+/// client, or one whose request the window took -- and no certificate about
+/// it has banked here yet. A client liveness parameter, not a wire rule: past
+/// it the table deals on and the seat asks again at the next boundary.
+/// Measured `run164337-3`: without it the request went out in the very tick
+/// the voters dealt hand k+1, and a heads-up hand leaves stage 0 in a tenth
+/// of a second, so the late-roster repair had nothing left to re-open.
+pub const RETURN_GRACE_MS: u64 = 6_000;
 
 /// How many reconciliation rounds the checkpoint band has room for.
 ///

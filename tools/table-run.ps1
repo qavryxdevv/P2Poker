@@ -138,6 +138,21 @@ param(
     # Needs a binary built with `--features fault-harness`.
     [ValidateRange(0, 300)][int]$StallJoin = 0,
     [ValidateRange(0, 32)][int]$StallJoinNode = 1,
+    # `-MuteAt <s> -MuteFor <s> -MuteNode <n>` makes one node drop every HAND
+    # message it would SEND for that long while it hears everything -- the
+    # split harness's `-MuteSeat`, on one machine. `-MuteOnTurn` measures the
+    # window from the node's first ACTION at or after `-MuteAt` instead of
+    # from the wall clock, so the seat goes quiet at a decision and the table
+    # certifies it out (`-MuteFor` above the 30 s decision deadline). The node
+    # keeps following every hand, which is what `S1-BM`'s return needs: a seat
+    # outside the roster that holds the settled terminal and its checkpoint
+    # asks to sit in at that boundary and is dealt into the hand after.
+    #
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateRange(0, 3600)][int]$MuteAt = 0,
+    [ValidateRange(0, 3600)][int]$MuteFor = 0,
+    [ValidateRange(0, 32)][int]$MuteNode = 1,
+    [switch]$MuteOnTurn,
     [ValidateRange(0, 3600)][int]$DropAt = 0,
     [ValidateRange(0, 600)][int]$DropFor = 20,
     # A seat slower than this to enter the Tox group keeps the logs, however
@@ -238,8 +253,12 @@ for ($i = 0; $i -lt $Seats; $i++) {
     # names -- and two concurrent runs on this machine would collide on a
     # seat index. This harness starts one table at a time.
     $seatKeys = Join-Path $env:LOCALAPPDATA 'p2p-poker-test-seats'
-    $seed = Join-Path $seatKeys "local-n$i.key"
-    if (-not (Test-Path $seed)) {
+    # `$seedKey`, not `$seed`: `$seed` is the shared-cache flag set above, and
+    # reusing its name here made `if ($seed)` below always true, so a run on a
+    # machine without the cache died copying a file that was not there
+    # (2026-09-10, `run163537-3`).
+    $seedKey = Join-Path $seatKeys "local-n$i.key"
+    if (-not (Test-Path $seedKey)) {
         New-Item -ItemType Directory -Force -Path $seatKeys | Out-Null
         $b = New-Object byte[] 32
         # `::Fill` is .NET Core only; Windows PowerShell 5.1 runs on .NET
@@ -247,9 +266,9 @@ for ($i = 0; $i -lt $Seats; $i++) {
         # with *does not contain a method named 'Fill'*.
         $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
         try { $rng.GetBytes($b) } finally { $rng.Dispose() }
-        [System.IO.File]::WriteAllBytes($seed, $b)
+        [System.IO.File]::WriteAllBytes($seedKey, $b)
     }
-    Copy-Item $seed (Join-Path $profileDir 'identity.key') -Force
+    Copy-Item $seedKey (Join-Path $profileDir 'identity.key') -Force
     if ($seed) { Copy-Item $shared (Join-Path $profileDir 'tox-nodes.json') -Force }
     $log = Join-Path $work "n$i.log"
 
@@ -275,14 +294,20 @@ for ($i = 0; $i -lt $Seats; $i++) {
     $diverge = if ($DivergeAt -gt 0 -and $i -eq $DivergeNode) { $DivergeAt } else { 0 }
     $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
     $stall = if ($StallJoin -gt 0 -and $i -eq $StallJoinNode) { $StallJoin } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall)
+    $mute = if ($MuteFor -gt 0 -and $i -eq $MuteNode) { $MuteFor } else { 0 }
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn)
         if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
         if ($downAt -gt 0) {
             $env:P2P_POKER_LINK_DOWN_AT = "$downAt"
             $env:P2P_POKER_LINK_DOWN_FOR = "$downFor"
         }
         if ($stall -gt 0) { $env:P2P_POKER_STALL_JOIN = "$stall" }
+        if ($mute -gt 0) {
+            $env:P2P_POKER_MUTE_AT = "$muteAt"
+            $env:P2P_POKER_MUTE_FOR = "$mute"
+            if ($muteOnTurn) { $env:P2P_POKER_MUTE_ON_TURN = '1' }
+        }
         $start = Get-Date
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
         & $exe @nodeArgs 2>&1 | ForEach-Object {
@@ -342,6 +367,11 @@ if ($StallJoin -gt 0) {
 if ($LinkDownAt -gt 0) {
     Write-Host "==> n$LinkDownNode loses its LINE at $LinkDownAt s for $LinkDownFor s; the process lives on"
     Write-Host "    (needs a binary built with --features fault-harness)"
+}
+if ($MuteFor -gt 0) {
+    Write-Host "==> n$MuteNode sends no hand message for $MuteFor s $(if ($MuteOnTurn) { "from its first action at or after $MuteAt s" } else { "from $MuteAt s" }) and hears everything"
+    if ($MuteFor -le 30) { Write-Host "    WARNING: under the 30 s decision deadline, so the table will not vote it out" }
+    Write-Host "    (S1-BM: expect the seat certified out, then asking to sit in at the next settled boundary, then dealt in; needs --features fault-harness)"
 }
 if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
     Write-Host "==> n1 drops at $DropAt s and returns $DropFor s later, same profile"
@@ -583,6 +613,12 @@ if ((Test-Path $fetched) -and (-not $seed)) {
 }
 
 # A stalled run is the one whose logs are wanted.
+# **Every run's logs are kept (2026-09-10).** The branch below used to delete
+# the work directory of a formed run unless `-KeepLogs` was given, and the
+# first S1-BM measurement -- 28 hands, one genesis, the whole return road --
+# was deleted the moment it finished. A run is evidence; disk is cheap; the
+# switch is kept so old command lines still parse.
+$KeepLogs = $true
 if ($KeepLogs -or -not $formed) {
     Write-Host ''
     Write-Host "logs kept: $work"

@@ -8363,6 +8363,11 @@ impl Hand {
         &self.returned
     }
 
+    /// Whether this client has asked to sit in at this boundary.
+    pub fn asked_to_sit_in(&self) -> bool {
+        self.sit_in_asked
+    }
+
     /// The seats this hand deals cards to. Exposed for the tests that pin
     /// what a returned seat is at hand `k+1`: required AND dealt in.
     pub fn dealt_in(&self) -> &[SeatIdx] {
