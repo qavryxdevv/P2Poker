@@ -7522,6 +7522,12 @@ impl Hand {
         self.early.len()
     }
 
+    /// The oldest frame held, for a node that wants to say what it is
+    /// waiting on (`S1-CR`: an adopted hand that held everything).
+    pub fn first_held(&self) -> Option<&[u8]> {
+        self.early.front().map(|b| b.as_slice())
+    }
+
     /// Whether stage 0 is complete: every required seat heard and agreed.
     ///
     /// The name is the player's word for it, and it is now true.
@@ -13564,6 +13570,59 @@ mod tests {
         // And its own derivation of hand 3 is the members' -- the required set
         // it adopted was exact, which the agreeing checkpoint already said.
         assert_eq!(committed(&hands2[3].next_hand().unwrap()), committed(&hands2[0].next_hand().unwrap()));
+    }
+
+
+    /// The node's road, exactly: the adopter opens from the copies, and then
+    /// receives the whole hand -- every frame the members sent, in order -- as
+    /// one batch through `hold` and `replay_early`, the way frames stashed
+    /// before the adoption are replayed. `run191001-3`: the adopter held every
+    /// frame of hand 6 as `NotYet` and never left stage 1.
+    #[test]
+    fn an_adopted_hand_replays_a_batch_of_held_frames_to_the_settlement() {
+        let (hands, keys) = a_table_after_hand_one();
+        let (copies, members) = hand_two_copies(&hands, &keys);
+        // The members play hand 2 among themselves; every frame is kept.
+        let mut hands2: Vec<Hand> = members;
+        let first: Vec<(usize, Vec<Send>)> = copies
+            .iter()
+            .enumerate()
+            .map(|(m, c)| (m, vec![Send::Broadcast(c.clone())]))
+            .collect();
+        let frames = play_out(&mut hands2, &keys, &[0, 1, 2], first);
+        assert!(hands2[0].betting_over());
+        // A late adopter: the copies first, then the batch.
+        let adopted = Opening::adopt(adopter_base(), &copies).unwrap();
+        let (mut late, _) = Hand::open(adopted, &keys[3], NOW, 30_000).unwrap();
+        for c in &copies {
+            late.on_event(c, &keys[3], NOW).expect("a copy of the stage this hand opened at");
+        }
+        assert_eq!(late.slot().sequence, 1, "stage 0 closed on the copies");
+        // The members' stage-0 hash is the parent every stage-1 frame carries.
+        let table_id = hands2[0].table_id();
+        let members_stage0 = frames
+            .iter()
+            .find_map(|b| {
+                let (kind, _, seq) = chained::peek(b, FRAME_CAP).ok()?;
+                if seq != 1 {
+                    return None;
+                }
+                chained::open_in_hand(b, FRAME_CAP, kind, &table_id, 2).ok().map(|o| o.envelope.previous_event_hash)
+            })
+            .expect("a stage-1 frame among the members' own");
+        assert_eq!(late.slot().previous_event_hash, members_stage0, "the adopter's stage-0 hash is the members' own");
+        let mut kept = 0usize;
+        for b in &frames {
+            if !copies.contains(b) && matches!(late.hold(b.clone()), Holding::Kept) {
+                kept += 1;
+            }
+        }
+        assert!(kept > 10, "the hand's frames are held: {kept}");
+        let (_, failures) = late.replay_early(&keys[3], NOW);
+        assert!(failures.is_empty(), "no frame refused on replay: {failures:?}");
+        assert_eq!(late.held(), 0, "nothing left held after the replay; waiting for {:?} at sequence {}", late.waiting_for(), late.slot().sequence);
+        assert!(late.betting_over(), "the adopter settled from the batch");
+        assert_eq!(late.checkpoint8(), hands2[0].checkpoint8(), "and holds the members' checkpoint");
     }
 
 }

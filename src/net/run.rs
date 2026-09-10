@@ -1432,6 +1432,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // intermediary a peer one hand ahead
                                     // needs — it is simply not kept.
                                     Holding::AnotherHand { hand_id, seat } => {
+                                        // `S1-CR`: a resumed bystander keeps a newer hand's
+                                        // frames too, so a hand it adopted and cannot follow
+                                        // is abandoned for the next one at the stall tick.
+                                        if resuming && hand_id > $h.hand_id() {
+                                            let _ = stash_for_resume($bytes, &mut resume_inits, &mut resume_early);
+                                        }
                                         note_a_hand_ahead(
                                             $h,
                                             hand_id,
@@ -4457,6 +4463,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // `S1-CR`: a resumed bystander whose adopted hand did not follow --
+                // the table has moved on to a hand it holds a majority of copies
+                // for -- abandons it and adopts again; the hand it had was never
+                // one it could act in, and nothing of the table's rests on it.
+                if resuming {
+                    let stuck = hand.as_ref().and_then(|h| {
+                        let me = h.my_seat();
+                        (!h.required().contains(&me) && !h.returned().contains(&me)).then_some(h.hand_id())
+                    });
+                    if let (Some(current), Some(f)) = (stuck, table.as_ref()) {
+                        let occupied = f.roster().len();
+                        let newer = resume_inits
+                            .iter()
+                            .any(|(hid, copies)| *hid > current && copies.len() * 2 > occupied);
+                        if newer {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "adopted hand #{current} did not follow the table, which has dealt on; abandoning it for the next hand's copies"
+                                )))
+                                .await;
+                            previous = hand.take();
+                        }
+                    }
+                }
                 // `S1-CR`: a resumed client with no hand adopts the running one
                 // from the members' own copies -- a strict majority of the
                 // occupied seats at one genesis, and stage 0 closed elsewhere
@@ -4487,7 +4517,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             match crate::table::hand::Hand::open(o, &app_key, now, deadline) {
                                                 Ok((mut h, _)) => {
                                                     for c in &copies {
-                                                        let _ = h.on_event(c, &app_key, now);
+                                                        if let Err(e) = h.on_event(c, &app_key, now) {
+                                                            let _ = events
+                                                                .send(NodeEvent::Warning(format!("the adopted hand #{hid} refused one of its copies: {e}")))
+                                                                .await;
+                                                        }
                                                     }
                                                     let carried: Vec<Vec<u8>> = resume_early
                                                         .iter()
@@ -4498,8 +4532,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     for b in carried {
                                                         let _ = h.hold(b);
                                                     }
-                                                    let (more, _) = h.replay_early(&app_key, now);
+                                                    let (more, failures) = h.replay_early(&app_key, now);
                                                     publish_hand(more, &mut swarm, &mut said, &tox_sink);
+                                                    for e in failures {
+                                                        let _ = events
+                                                            .send(NodeEvent::Warning(format!("a held frame was refused by the adopted hand #{hid}: {e}")))
+                                                            .await;
+                                                    }
+                                                    let first = h.first_held().and_then(|b| {
+                                                        let (kind, _, seq) = crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok()?;
+                                                        let o = crate::net::chained::open_in_hand(b, crate::table::hand::FRAME_CAP, kind, &h.table_id(), hid).ok()?;
+                                                        Some(format!("{:?} at sequence {seq} chained from {}", kind, short_hash(&o.envelope.previous_event_hash)))
+                                                    });
+                                                    let _ = events
+                                                        .send(NodeEvent::Warning(format!(
+                                                            "adopted hand #{hid} is at sequence {} chained from {}, waiting for {:?} with {} frame(s) still held; the oldest held is {}",
+                                                            h.slot().sequence,
+                                                            short_hash(&h.slot().previous_event_hash),
+                                                            h.waiting_for(),
+                                                            h.held(),
+                                                            first.unwrap_or_else(|| "none".into())
+                                                        )))
+                                                        .await;
                                                     let _ = events
                                                         .send(NodeEvent::Warning(format!(
                                                             "resumed at hand #{hid} as a bystander (seat {seat}) from {} copies, {n} frame(s) replayed; it asks to sit in at this hand's boundary",

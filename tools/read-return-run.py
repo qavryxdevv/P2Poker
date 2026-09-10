@@ -23,6 +23,29 @@ others (a fork through IN(k)); a certificate that completes at some nodes and
 not at others without a "held" line explaining it; a return at a boundary any
 node ended by an abort.
 
+The prediction booked for the first S1-CR run (2026-09-10, after commit 21f2683;
+`tools/table-run.ps1 -Seats 3 -Seconds 300 -DropAt 60 -DropFor 20`, which
+kills n1 at 60 s and starts it again at 80 s with the same profile and
+`--resume`):
+
+  1. the returning n1 prints *resuming the unfinished session at <table>* and
+     *rejoining ... from the session record*; the founder answers *already
+     holds a seat* and the roster; n1 enters the group and learns the session;
+  2. the table certified n1's seat out while it was away (a TIMEOUT_CERT names
+     its seat) and plays on heads-up at one genesis;
+  3. n1 prints *resumed at hand #k as a bystander (seat S) from 2 copies* for
+     the first hand whose copies it holds after the session is set, and
+     follows it to the settlement;
+  4. at that boundary n1 asks to sit in, both others vote, the certificate
+     banks everywhere, and the hand after opens on all three clients with
+     three seats at one genesis, n1 shuffling in it; n1 prints *back in the
+     roster ... deriving hands again*;
+  5. no fork: one genesis per hand on every client, before and after.
+
+What refutes it: n1 without a hand for the rest of the run (*cannot be
+adopted*, or no *resumed at hand* line), a roster row with two values, or the
+founder refusing the rejoin.
+
 Prints, per node, the roster of every hand it opened, then the return road's
 own lines in time order across every node, then the per-hand roster
 agreement table. The harness numbers NODES and the table numbers SEATS: the
@@ -46,7 +69,10 @@ ROAD = re.compile(
     r'asked to sit in|sit-in request|sit in at the next hand|return: |certified back in|'
     r'certified seat .* return|RETURN_|a return vote|re-opens|re-derived|'
     r'has certified seat|certified out|cert: about seat|banked|fault-harness: .*mute|muted|'
-    r'holding the next deal|no return certificate|dealing on|no longer held')
+    r'holding the next deal|no return certificate|dealing on|no longer held|'
+    # S1-CR: the rejoin road of a restarted client
+    r'resuming the unfinished|unfinished session|rejoining |resumed at hand|cannot be adopted|would not open|'
+    r'still outside the roster|back in the roster|session record|forgotten|gave up|already holds a seat')
 
 
 def lines(path):
