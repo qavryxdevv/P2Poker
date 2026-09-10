@@ -6391,6 +6391,13 @@ static bool handle_gc_lossless_packet(const GC_Session *_Nonnull c, GC_Chat *_No
         return false;
     }
 
+    /* p2p-poker (patch 0024): remember the highest id this peer has ever shown
+     * us, whatever becomes of the packet. An out-of-order fragment is refused
+     * further down and stored nowhere, so without this the receiver could not
+     * know how far behind it was. */
+    if (message_id > gconn->p2p_poker_highest_seen) {
+        gconn->p2p_poker_highest_seen = message_id;
+    }
     if (!gconn->handshaked && (packet_type != GP_HS_RESPONSE_ACK && packet_type != GP_INVITE_REQUEST)) {
         LOGGER_DEBUG(chat->log, "Got lossless packet type 0x%02x from unconfirmed peer", packet_type);
         mem_delete(chat->mem, data);
@@ -7196,6 +7203,101 @@ static bool send_pending_handshake(const GC_Chat *_Nonnull chat, GC_Connection *
 }
 
 #define GC_TCP_RELAY_SEND_INTERVAL (60 * 3)
+/* p2p-poker (patch 0024): the receiver asks for everything it is missing,
+ * every second, instead of one message per second when something newer
+ * happens to arrive.
+ *
+ * The lossless channel repairs a gap in two ways and both need a packet to
+ * arrive first: the receiver asks (GR_ACK_REQ) for ONE id -- the head of the
+ * gap -- when a later packet from that peer shows it the gap, at most once a
+ * second (gc_send_message_ack); and the sender re-sends each unacked entry
+ * blind at 2, 4, 8, 16 and 32 s after it was added, then never again before
+ * it times the peer out at 58 s. So a receiver that missed N messages gets
+ * them back one per request, a request per second, each request waiting on
+ * some later packet to trigger it -- and a fragmented message, whose chunks
+ * must arrive strictly in order, is drained chunk by chunk the same way.
+ *
+ * Measured in runs/split162916-9, node n3 deaf for 20 s (patch 0016): the
+ * far seat's shuffle it missed came back at +12 s after the window, its
+ * neighbour n1 answering requests for 2167, 2168, 2169, 2170, 2171, 2172 at
+ * 14:35:24.5, 25.5, 27.5, 29.5, 30.5, 33.5 -- one id per request, one to
+ * three seconds apart -- while the table's 30 s clock on the seat ran out
+ * at 349.6 s. Certified out, hand voided, 16 hands against 20. A second run
+ * with only a silence probe added (the first form of this patch) is
+ * recorded in DECISIONS.md S1-CO.
+ *
+ * So, once a second per handshaked peer: if the peer has shown this node an
+ * id beyond the one it is waiting for, ask for every id from the head of
+ * the gap to the highest seen, P2P_POKER_GAP_BURST at a time; if it has
+ * shown nothing but has been quiet for P2P_POKER_SILENCE_PROBE_S seconds,
+ * ask for the head alone. Every request is the standard GR_ACK_REQ: a
+ * sender that holds the id re-sends it, one that does not finds no entry
+ * and does nothing (handle_gc_message_ack compares the id first), so an
+ * unpatched peer on the public network is unaffected. Nine bytes per id
+ * asked for is the whole cost. */
+#define P2P_POKER_SILENCE_PROBE_S 2
+#define P2P_POKER_GAP_BURST 16
+
+static void p2p_poker_ask_for_what_is_missing(const GC_Chat *_Nonnull chat, GC_Connection *_Nonnull gconn, uint32_t peer_number)
+{
+    if (!gconn->handshaked || gconn->pending_delete || gconn->recv_array == nullptr) {
+        return;
+    }
+
+    const uint64_t tm = mono_time_get(chat->mono_time);
+
+    if (tm == gconn->p2p_poker_last_burst) {
+        return;
+    }
+
+    const uint64_t head = gconn->received_message_id + 1;
+    const bool gap = gconn->p2p_poker_highest_seen >= head;
+    uint64_t last = head;
+
+    if (gap) {
+        last = gconn->p2p_poker_highest_seen;
+
+        if (last - head + 1 > P2P_POKER_GAP_BURST) {
+            last = head + P2P_POKER_GAP_BURST - 1;
+        }
+    } else {
+        /* nothing known to be missing: probe a quiet peer for its head alone */
+        if (!mono_time_is_timeout(chat->mono_time, gconn->last_received_packet_time, P2P_POKER_SILENCE_PROBE_S)
+                || tm - gconn->p2p_poker_last_burst < P2P_POKER_SILENCE_PROBE_S) {
+            return;
+        }
+    }
+
+    gconn->p2p_poker_last_burst = tm;
+    gconn->last_requested_packet_time = tm;
+
+    uint8_t data[GC_LOSSLESS_ACK_PACKET_SIZE];
+    data[0] = (uint8_t) GR_ACK_REQ;
+    uint32_t sent = 0;
+
+    for (uint64_t id = head; id <= last; ++id) {
+        const GC_Message_Array_Entry *held = &gconn->recv_array[gcc_get_array_index(id)];
+
+        /* already here, waiting on what is in front of it */
+        if (held->time_added != 0 && held->message_id == id) {
+            continue;
+        }
+
+        net_pack_u64(data + 1, id);
+
+        if (send_lossy_group_packet(chat, gconn, data, GC_LOSSLESS_ACK_PACKET_SIZE, GP_MESSAGE_ACK)) {
+            ++sent;
+        }
+    }
+
+    if (gap || tm - gconn->last_received_packet_time == P2P_POKER_SILENCE_PROBE_S) {
+        LOGGER_DEBUG(chat->log, "p2p-poker: asking peer %u for messages %llu..%llu (%u sent, highest seen %llu, quiet for %llu s)",
+                     peer_number, (unsigned long long)head, (unsigned long long)last, sent,
+                     (unsigned long long)gconn->p2p_poker_highest_seen,
+                     (unsigned long long)(tm - gconn->last_received_packet_time));
+    }
+}
+
 static void do_peer_connections(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat, void *_Nullable userdata)
 {
     for (uint32_t i = 1; i < chat->numpeers; ++i) {
@@ -7212,6 +7314,9 @@ static void do_peer_connections(const GC_Session *_Nonnull c, GC_Chat *_Nonnull 
         }
 
         gcc_resend_packets(chat, gconn);
+
+        /* p2p-poker (patch 0024): see p2p_poker_ask_for_what_is_missing above. */
+        p2p_poker_ask_for_what_is_missing(chat, gconn, i);
 
         if (gconn->tcp_relays_count > 0 &&
                 mono_time_is_timeout(chat->mono_time, gconn->last_sent_tcp_relays_time, GC_TCP_RELAY_SEND_INTERVAL)) {

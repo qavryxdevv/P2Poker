@@ -130,6 +130,8 @@ typedef struct GC_Connection {
 
     uint64_t    last_received_packet_time;  /* The last time we successfully processed any packet from this peer */
     uint64_t    last_requested_packet_time;  /* The last time we requested a missing packet from this peer */
+    uint64_t    p2p_poker_highest_seen;  /* p2p-poker (patch 0024): the highest message id ever unwrapped from this peer, so a gap behind it is known without a buffered entry */
+    uint64_t    p2p_poker_last_burst;    /* p2p-poker (patch 0024): the second in which this node last asked this peer for what it is missing */
     uint64_t    last_sent_ping_time;
     uint64_t    last_sync_response;  /* the last time we sent this peer a sync response */
     uint8_t     oob_relay_pk[CRYPTO_PUBLIC_KEY_SIZE];

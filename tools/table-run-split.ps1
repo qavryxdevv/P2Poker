@@ -180,8 +180,12 @@ param(
     # time it out while it times them out -- the asymmetric timeout that is the
     # only trigger for the in-place re-handshake patch 0015 clears up after.
     #
-    # **-DeafFor must exceed 58 s** (GC_CONFIRMED_PEER_TIMEOUT) or nothing is
-    # timed out and the knob does nothing at all.
+    # **-DeafFor must exceed 58 s** (GC_CONFIRMED_PEER_TIMEOUT) for anybody to be
+    # timed out. **Under it the knob is a different instrument, not an idle
+    # one** (S1-CM): the packets it drops are dropped before the lossless ring
+    # sees them, so the senders keep re-sending and the seat receives every
+    # frame it missed, late and in order, when the window ends -- which is what
+    # a brief real outage does on the downlink, and what -LinkDown does not.
     [ValidateRange(0, 3600)][int]$DeafAt = 0,
     [ValidateRange(0, 3600)][int]$DeafFor = 0,
     [ValidateRange(0, 8)][int]$DeafSeat = 0,
@@ -373,7 +377,7 @@ $header = @(
     "mdns   $(if ($NoMdns) { 'off - every seat finds every other through the public lobby' } else { 'on' })"
     "tox    $(if ($faultHarness) { 'log on - the BINARY carries the fault harness' } else { 'log OFF - the binary has no fault harness; toxcore writes nothing, so do not read a zero as an absence' })"
     "delay  $(if ($DelayCerts -gt 0) { "TIMEOUT_VOTE and TIMEOUT_CERT frames parked $DelayCerts ms on $(if ($DelayCertsHere -ge 0) { "local seat $DelayCertsHere" } else { "far seat $DelayCertsSeat" })$(if ($DelayCertsUntil -gt 0) { " for frames arriving before $DelayCertsUntil s" }) (fault-harness)" } else { 'none' })"
-    "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness)" } else { 'no forced outage' })"
+    "link   $(if ($LinkDownFor -gt 0) { "local seat $LinkDownSeat drops every table message from $LinkDownAt s for $LinkDownFor s (fault-harness; a frame the transport delivered inside the window is discarded, which a real outage under 58 s does not do - S1-CM)" } else { 'no forced outage' })"
     "think  $(if ($Think -gt 0) { "every seat waits ${Think} ms before it acts - a SLOW table, not comparable with the rest of the corpus" } else { 'no delay: seats act at once' })"
     "mute   $(if ($MuteFor -gt 0) { "local seat $MuteSeat sends no hand message for $MuteFor s $(if ($MuteOnTurn) { "from its first action at or after $MuteAt s" } else { "from $MuteAt s" }) and hears everything (fault-harness)$(if ($MuteFor -le 30) { ' - WARNING: under the 30 s decision deadline, so the table will not vote it out' })" } else { 'nobody is muted' })"
     # **`-Stall` was missing from this header, and it was missing on the very
@@ -392,7 +396,7 @@ $header = @(
     # is why it is in the header now instead of only in a doc comment.
     "stall  $(if ($Stall -gt 0) { "far seat $StallSeat starves its group handshake for $Stall s after accepting the invitation (fault-harness; S1-AA shape (i) on demand)$(if ($Stall -gt 15) { ' - WARNING: over 15 s stops the seat iterating toxcore at all, so this models the KNOB and not shape (i); 13-15 s trips the 12 s group reaper while the friend connections survive' })" } else { 'no forced handshake stall' })"
     "drop   $(if ($DropConfirm -gt 0) { "the founder does not send its first $DropConfirm invite confirmation(s); every loop keeps running (fault-harness; the instrument -Stall never was)" } else { 'every invite confirmation is sent' })"
-    "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - WARNING: under the 58 s peer timeout, so nothing will be timed out' })" } else { 'nobody is deaf' })"
+    "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - under the 58 s peer timeout: nobody is timed out and every packet missed is replayed by the ring when the window ends, the brief-outage model (S1-CM)' })" } else { 'nobody is deaf' })"
     "work   $work"
 )
 $header | ForEach-Object { Write-Host $_ }

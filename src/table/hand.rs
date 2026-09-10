@@ -5475,6 +5475,14 @@ impl Hand {
         }
     }
 
+    /// Whether a settlement that arrived after this client's own abort closed
+    /// the late stage (`S1-BP`, `S1-CL`), so that `next_hand` derives hand k+1
+    /// from the settlement's stacks rather than the abort's. `false` for a hand
+    /// that was not aborted at all.
+    pub fn late_settled(&self) -> bool {
+        self.late.as_ref().is_some_and(|l| l.closed.is_some())
+    }
+
     // ---------------------------------------------------------------------
     // The decision clock that is not this client's own word for it
     // ---------------------------------------------------------------------

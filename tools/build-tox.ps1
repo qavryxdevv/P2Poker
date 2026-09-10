@@ -217,6 +217,9 @@ $patched = @(
     @{ File   = 'toxcore/group_connection.c'
        Marker = 'p2p-poker: read the id BEFORE the entry is wiped'
        Why    = '0010: without it process_recv_array_entry acks every drained message with id 0, because clear_array_entry zeroes the struct before array_entry->message_id is read - so the senders slot is never cleared, its time_added never moves, and gcc_resend_packets drops the peer at 58 s unless a later blind duplicate happens to ack it correctly' }
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker: asking peer %u for messages %llu..%llu'
+       Why    = '0024: the lossless channel gives a receiver back ONE missed message per request, one request per second, each waiting on some later packet to trigger it - so a 20 s downlink outage drained for 12 s more and cost the seat its place (runs/split162916-9, S1-CO). The receiver now asks every second for everything it is missing, up to sixteen ids at a time, and probes a quiet peer for its head: standard GR_ACK_REQ packets an unpatched sender answers or ignores.' }
 )
 
 Step 'checking the patches are in the vendored source'

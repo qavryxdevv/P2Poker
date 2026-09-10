@@ -661,6 +661,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // The hand whose "a certificate about the previous hand arrived too late
     // to be kept" line has been said.
     let mut late_cert_said: Option<u64> = None;
+    // `S1-CN`: the hand during which "a settlement of the previous hand arrived
+    // after the late path closed" has been said.
+    let mut late_settle_said: Option<u64> = None;
+    // `S1-CN`: the hand this client last ended by an abort that no late
+    // settlement closed, kept past the retained hand's own lifetime so a
+    // settlement of it arriving after retention ended is still counted as one
+    // the late path missed.
+    let mut unsettled_abort_here: Option<u64> = None;
     // `S1-BS`: hand k, retained until hand k+1 leaves stage 0, so a
     // certificate about it arriving late still banks its roster half and
     // re-derives hand k+1.
@@ -1386,6 +1394,38 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         let _ = events.send(NodeEvent::Warning(line)).await;
                                                     }
                                                 }
+                                            }
+                                        } else if hand_id.saturating_add(1) == $h.hand_id()
+                                            && kind == Some(crate::protocol::messages::EventType::HandComplete)
+                                        {
+                                            // **`S1-CN`: a settlement of the hand just finished, arriving
+                                            // during the next one, and it is applied to nothing.** §4.10 says
+                                            // `HAND_COMPLETE` wins over an abort because it is collective, and
+                                            // `on_late_settlement` honours that for exactly as long as hand k
+                                            // is this client's `hand` -- after a deadline abort, the 800 ms
+                                            // `next_hand_at` below. The retained hand takes certificates only,
+                                            // so from here on the copy is relayed and read by nobody, and hand
+                                            // k+1 here stands on the abort's stacks while the emitters' stands
+                                            // on the settlement's: a fork, and this seat is the one that
+                                            // forked. Said once per hand, and only when hand k ended here by an
+                                            // abort that no settlement closed -- a copy of a settlement this
+                                            // client reached itself is the emitters' ordinary re-send of their
+                                            // terminal and costs nothing.
+                                            let unsettled_abort = match previous.as_ref() {
+                                                Some(p) if p.hand_id() == hand_id => {
+                                                    p.aborted().is_some() && !p.late_settled()
+                                                }
+                                                _ => unsettled_abort_here == Some(hand_id),
+                                            };
+                                            if unsettled_abort && late_settle_said != Some($h.hand_id()) {
+                                                late_settle_said = Some($h.hand_id());
+                                                let _ = events
+                                                    .send(NodeEvent::Warning(format!(
+                                                        "a settlement of hand #{hand_id} from seat {seat:?} arrived during hand #{}: not applied, because the late path closes 800 ms after an abort and hand #{hand_id} ended here by one; hand #{} was derived from the abort, which is a branch the settlement's emitters do not share",
+                                                        $h.hand_id(),
+                                                        $h.hand_id()
+                                                    )))
+                                                    .await;
                                             }
                                         } else if seat.is_some() {
                                             // The next hand's events, kept for it: they arrive
@@ -4389,7 +4429,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap_or_default();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "the hand ran out of time{which}; every stack is                                  restored{why}"
+                                "the hand ran out of time{which}; every stack is restored{why}"
                             )))
                             .await;
                         // Straight on: an abort has nothing to look at, so
@@ -4814,6 +4854,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             )))
                             .await;
                     }
+                }
+                // `S1-CN`: remembered past retention, so a settlement of this
+                // hand arriving after the retained copy is gone is still
+                // counted as one the late path missed.
+                if let Some(h) = hand.as_ref() {
+                    unsettled_abort_here =
+                        (h.aborted().is_some() && !h.late_settled()).then_some(h.hand_id());
                 }
                 // Retained, not dropped: a certificate about this hand that
                 // arrives during the next one still banks here (`S1-BS`).
@@ -6510,14 +6557,32 @@ const TABLE_FRAME_PEEK: usize = crate::protocol::constants::HAND_ABORT_MAX;
 /// table message this client would send and every one it would receive, for that
 /// window, measured from the first call — which is the node loop starting.
 ///
-/// **What it simulates, exactly, and the limit is the point of it.** The
-/// application's messages stop in both directions while the process, the `Hand`,
-/// the `Opening`, the chain position, the keys and the transport all survive —
-/// which is what a brief outage does to a client and is emphatically *not* what
-/// killing the process does. libp2p's own pings keep answering, deliberately:
-/// that separates **did the hand recover** from **did the transport reconnect**,
-/// and the second question already has an instrument (`-DropAt`) while the first
-/// has never had one.
+/// **What it simulates, and what it does not -- the second half is `S1-CM`.**
+/// The application's messages stop in both directions while the process, the
+/// `Hand`, the `Opening`, the chain position, the keys and the transport all
+/// survive, which is what a brief outage does to a client and is emphatically
+/// *not* what killing the process does. libp2p's own pings keep answering,
+/// deliberately: that separates **did the hand recover** from **did the
+/// transport reconnect**, and the second question already has an instrument
+/// (`-DropAt`).
+///
+/// **But the receive half discards what the transport has already delivered**,
+/// and a real outage on the carrier the hand rides does not. Under D-019 a hand
+/// event is a lossless group packet, and toxcore's ring holds one unacked for
+/// `GC_CONFIRMED_PEER_TIMEOUT` = 58 s: the sender re-sends at 2, 4, 8, 16 and
+/// 32 s (`gcc_resend_packets`), the receiver asks for the head of any gap with
+/// `GR_ACK_REQ`, and only a head entry 58 s old drops the peer. So a seat whose
+/// line is cut for less than that receives every frame it missed, late and in
+/// order, the moment the line returns -- whereas this knob's receive side
+/// `continue`s past a frame the ring has already acked, so the frame is gone
+/// for good. The send half is closer: `publish_hand` parks what could not leave
+/// in `said`, and the re-send arm puts it out once `nothing_leaves()` is false.
+/// What this knob models is therefore a peer whose transport forgets what it
+/// received while the line was down -- GossipSub's semantics, which has no
+/// history -- and not the group's. The instrument for the group's semantics on
+/// the receive side is patch 0016's `-Deaf`, which drops the packet before the
+/// ring sees it: **did the hand recover** from a brief outage is measured with
+/// that, under 58 s, and had not been measured at all until `S1-CM`.
 ///
 /// No argument, so no caller has to thread a clock through six signatures to ask
 /// it. Two locks, and the outer one is a compile-time absence: without
