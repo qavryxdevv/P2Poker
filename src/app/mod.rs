@@ -22,6 +22,9 @@ use crate::gui::lobby::{LobbyView, NetworkStatus, RelayStatus};
 use crate::net::lobby::LobbyStore;
 use crate::net::node::NodeEvent;
 
+/// `S1-CS`: the table window's view, derived here so it can be tested.
+mod table;
+
 /// The founder's reason codes, §4.3, in the words a player can act on.
 ///
 /// Two of the eight are never sent by this client because nothing in the corpus
@@ -90,6 +93,16 @@ pub struct HandInProgress {
     pub shown: Vec<Option<[u8; 2]>>,
     /// Whether the hand is over.
     pub over: bool,
+    /// `S1-CS`: what the engine has after every action -- behind, in
+    /// front, the pot, the street, who folded. Empty until the first
+    /// `TableState` of the hand.
+    pub stacks_now: Vec<u64>,
+    pub bets: Vec<u64>,
+    pub folded: Vec<bool>,
+    pub pot: u64,
+    pub street: Option<u16>,
+    /// What each seat gained at the settlement, by seat.
+    pub won: Vec<u64>,
 }
 
 /// What this client may do on its own turn.
@@ -153,6 +166,15 @@ pub struct AppState {
     /// the two stores must agree about which adverts are alive, and a client
     /// whose clock ran fast would expire tables the node still held.
     pub newest_seen: u64,
+    /// `S1-CS`: the last stacks the engine or a settlement named, kept
+    /// across the boundary so the next hand opens on them.
+    pub last_stacks: Vec<u64>,
+    /// `S1-CS`: how many times it has been this client's turn, so the raise
+    /// control can tell a new turn from the one it is in.
+    pub turns: u64,
+    /// `S1-CS`: the hero's hand in words and odds, once both the cards and
+    /// the board are known.
+    pub strength: Option<crate::poker::strength::Strength>,
 }
 
 impl Seat {
@@ -372,7 +394,14 @@ impl AppState {
                     stacks: Vec::new(),
                     shown: Vec::new(),
                     over: false,
+                    stacks_now: Vec::new(),
+                    bets: Vec::new(),
+                    folded: Vec::new(),
+                    pot: 0,
+                    street: None,
+                    won: Vec::new(),
                 });
+                self.strength = None;
                 self.waiting_for.clear();
                 self.note(format!("hand #{hand_id} has begun"));
             }
@@ -390,6 +419,27 @@ impl AppState {
                     (Some(s), _) => format!("hand #{hand_id}: seat {s} is shuffling"),
                     (None, false) => format!("hand #{hand_id}: the deck is being prepared"),
                 });
+            }
+            NodeEvent::TableState {
+                hand_id,
+                street,
+                pot,
+                to_act,
+                stacks,
+                bets,
+                folded,
+            } => {
+                if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
+                    h.stacks_now = stacks.clone();
+                    h.bets = bets;
+                    h.folded = folded;
+                    h.pot = pot;
+                    h.street = Some(street);
+                    if h.turn.is_none() {
+                        h.waiting_on = to_act;
+                    }
+                }
+                self.last_stacks = stacks;
             }
             NodeEvent::YourTurn {
                 hand_id,
@@ -417,6 +467,7 @@ impl AppState {
                     });
                     h.waiting_on = None;
                 }
+                self.turns = self.turns.saturating_add(1);
                 self.note(if to_call > 0 {
                     format!("hand #{hand_id}: your turn — {to_call} to call")
                 } else {
@@ -446,6 +497,7 @@ impl AppState {
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
                     h.board = cards;
                 }
+                self.refresh_strength();
                 if !named.is_empty() {
                     self.log
                         .push_back(format!("hand #{hand_id}: board {}", named.join(" ")));
@@ -457,12 +509,27 @@ impl AppState {
                 shown,
             } => {
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
-                    h.stacks = stacks;
+                    // `S1-CS`: what each seat gained is the settlement's figure
+                    // over the engine's last one -- what the chips fly with.
+                    let before: &[u64] = if h.stacks_now.is_empty() {
+                        &self.last_stacks
+                    } else {
+                        &h.stacks_now
+                    };
+                    let won: Vec<u64> = stacks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| s.saturating_sub(before.get(i).copied().unwrap_or(*s)))
+                        .collect();
+                    h.won = won;
+                    h.stacks = stacks.clone();
                     h.shown = shown;
                     h.over = true;
                     h.turn = None;
                     h.waiting_on = None;
+                    h.bets = vec![0; h.bets.len()];
                 }
+                self.last_stacks = stacks;
                 self.note(format!("hand #{hand_id} is over"));
             }
             NodeEvent::CardsDealt { hand_id, seats } => {
@@ -474,6 +541,7 @@ impl AppState {
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
                     h.cards = Some(cards);
                 }
+                self.refresh_strength();
                 self.log
                     .push_back(format!("hand #{hand_id}: your cards are dealt"));
             }
@@ -602,6 +670,7 @@ impl AppState {
                 self.note(format!("{how} opened port {external}"));
             }
             NodeEvent::Hosting { key } => {
+                self.forget_the_table();
                 self.seated = Some(Seat {
                     key,
                     seat: Some(0),
@@ -642,10 +711,12 @@ impl AppState {
                 // The founder's claim, said as a claim. A rejection is never
                 // proof of anything: §4.3 puts it plainly, and the founder may
                 // simply not want this player.
+                self.forget_the_table();
                 self.seated = None;
                 self.note(format!("the founder says no: {}", refusal(reason)));
             }
             NodeEvent::LeftTable { why } => {
+                self.forget_the_table();
                 self.seated = None;
                 self.note(why);
             }
@@ -668,6 +739,8 @@ impl AppState {
         match &self.seated {
             Some(s) if s.key == key => {}
             _ => {
+                // `S1-CS`: a hand from another table is not this table's.
+                self.forget_the_table();
                 self.seated = Some(Seat {
                     key,
                     ..Default::default()
@@ -700,6 +773,28 @@ impl AppState {
         // how a table that was playing perfectly well looked like a stalled one
         // for three runs of the two-process test.
         self.emitted = self.emitted.saturating_add(1);
+    }
+
+    /// `S1-CS`: nothing of a hand outlives the table it was played at. The
+    /// window reopened used to show the last game's cards at the next
+    /// table, because the hand was never cleared.
+    fn forget_the_table(&mut self) {
+        self.hand = None;
+        self.waiting_for.clear();
+        self.last_stacks.clear();
+        self.strength = None;
+    }
+
+    /// The hero's hand in words and odds, from the cards this client opened
+    /// and the board it verified; `None` until the cards are known.
+    fn refresh_strength(&mut self) {
+        use crate::poker::state::Card;
+        self.strength = self.hand.as_ref().and_then(|h| {
+            let cards = h.cards?;
+            let hole = [Card::from_index(cards[0]).ok()?, Card::from_index(cards[1]).ok()?];
+            let board: Vec<Card> = h.board.iter().filter_map(|i| Card::from_index(*i).ok()).collect();
+            Some(crate::poker::strength::strength(hole, &board))
+        });
     }
 
     /// The snapshot the panes read.
@@ -1079,5 +1174,36 @@ mod tests {
             dropped: 0,
         });
         assert_ne!(s.log, other.log);
+    }
+
+    /// `S1-CS`: the table window reopened showed the last game. A hand that
+    /// was in progress when the player left the table -- or was refused a
+    /// seat, or sat down somewhere else -- is nobody's hand any more, and a
+    /// window drawn from it shows cards from a table this client is not at.
+    #[test]
+    fn the_hand_does_not_follow_the_player_to_the_next_table() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::HandBegan { hand_id: 4, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::CardsDealt { hand_id: 4, seats: vec![0, 1] });
+        s.apply(NodeEvent::HoleCards { hand_id: 4, cards: [12, 13] });
+        s.apply(NodeEvent::HandWaiting { hand_id: 4, seats: vec![0] });
+        assert!(s.hand.is_some(), "a hand is in progress");
+
+        s.apply(NodeEvent::LeftTable { why: "left the table".into() });
+        assert!(s.hand.is_none(), "the hand left with the table");
+        assert!(s.waiting_for.is_empty(), "and so did the seats it was waiting for");
+
+        // Sitting down somewhere else, with a hand still on record from
+        // before, is the same thing from the other side.
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
+        s.apply(NodeEvent::HandBegan { hand_id: 5, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::Seated { key: [8u8; 32], seat: 3 });
+        assert!(s.hand.is_none(), "a hand from another table is not this table's");
+
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 3] });
+        s.apply(NodeEvent::JoinRefused { reason: 1 });
+        assert!(s.hand.is_none(), "a refused seat has no hand");
     }
 }

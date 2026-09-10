@@ -7632,6 +7632,14 @@ impl Hand {
         }
     }
 
+    /// What each seat has in front of it this street, by seat (`S1-CS`).
+    pub fn bets(&self) -> Vec<Chips> {
+        match &self.phase {
+            Phase::Playing { play, .. } => play.round.committed.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Which seats have folded, by seat.
     pub fn folded(&self) -> Vec<bool> {
         match &self.phase {

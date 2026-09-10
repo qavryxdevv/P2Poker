@@ -337,8 +337,12 @@ impl Layout {
         );
 
         // A poker table is wider than it is deep. Without this a tall window
-        // produces a circle, which is not what anyone has played on.
-        let max_h = felt.width() / 1.7;
+        // produces a circle, which is not what anyone has played on -- and
+        // at 1.7 the ordinary window still did (`S1-CS`: *the table is round
+        // where it should be an oval*). Two to one is the proportion of the
+        // reference photograph, and the felt keeps it at every window size,
+        // following the width.
+        let max_h = felt.width() / 2.0;
         if felt.height() > max_h {
             felt = Rect::from_center_size(felt.center(), vec2(felt.width(), max_h));
         }
@@ -808,16 +812,21 @@ mod tests {
         }
     }
 
-    /// A tall window must not produce a circular table.
+    /// A tall window must not produce a circular table, and neither may an
+    /// ordinary one. `S1-CS`: the owner called the table round. A poker
+    /// table is about twice as wide as it is deep, and the felt follows the
+    /// window's width at that proportion rather than filling its height.
     #[test]
     fn a_tall_window_still_gives_a_poker_table() {
-        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 1400.0));
-        let l = Layout::new(area, 6, 0);
-        assert!(
-            l.felt.width() / l.felt.height() >= 1.69,
-            "the felt is {:?}, which is a pond",
-            l.felt
-        );
+        for (w, h) in [(1000.0, 1400.0), (1000.0, 620.0), (1180.0, 640.0), (760.0, 460.0)] {
+            let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(w, h));
+            let l = Layout::new(area, 6, 0);
+            assert!(
+                l.felt.width() / l.felt.height() >= 1.95,
+                "at {w}x{h} the felt is {:?}, which is a pond",
+                l.felt
+            );
+        }
     }
 
     /// The layout scales rather than snapping: doubling the window roughly

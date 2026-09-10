@@ -22,6 +22,7 @@
 //! saying so, and a test holds the banner to it.
 
 pub mod layout;
+pub mod motion;
 pub mod paint;
 
 use eframe::egui::{self, Color32, RichText, Stroke};
@@ -93,6 +94,9 @@ pub struct SeatView {
     pub sitting_out: bool,
     /// How much of this seat's clock is left, if it is their turn.
     pub clock: Option<f32>,
+    /// What this seat gained at the settlement (`S1-CS`): the chips that
+    /// fly from the pot to it.
+    pub won: Chips,
 }
 
 /// The whole table, as a snapshot.
@@ -123,6 +127,16 @@ pub struct TableView {
     pub preview: bool,
     /// Why the table is not playable, when it is not.
     pub note: Option<String>,
+    /// `S1-CS`: the chance of each better category, by name, best last;
+    /// their sum; and what the odds count to ("by the river").
+    pub improve: Vec<(String, f32)>,
+    pub improve_total: f32,
+    pub improve_by: Option<&'static str>,
+    /// Which of this client's turns this is, so the raise control can
+    /// start a new turn at the minimum.
+    pub turn_id: u64,
+    /// The hand is settled: the pot has gone to whoever won it.
+    pub hand_over: bool,
 }
 
 /// What the player did this frame.
@@ -136,10 +150,58 @@ pub enum TableAction {
     BackToLobby,
 }
 
-/// What the player is holding in the action bar between frames.
+/// What the player is holding in the action bar between frames, and the
+/// chips in the air.
 #[derive(Debug, Clone, Default)]
 pub struct TableUi {
     pub raise: Chips,
+    /// The turn `raise` was set for (`S1-CS`): a new turn starts again at
+    /// the minimum raise instead of where the slider was left.
+    pub for_turn: Option<u64>,
+    pub motion: motion::Motion,
+}
+
+/// The raise the control offers this frame.
+///
+/// `S1-CS`: the minimum raise on a new turn, the player's own setting for
+/// the rest of that turn, and never outside what is legal.
+pub fn raise_default(state: &mut TableUi, view: &TableView) -> Chips {
+    if state.for_turn != Some(view.turn_id) {
+        state.for_turn = Some(view.turn_id);
+        state.raise = view.min_raise;
+    }
+    state.raise = state.raise.clamp(view.min_raise, view.max_raise.max(view.min_raise));
+    state.raise
+}
+
+/// The sentence about the table, when the felt is the place for it.
+///
+/// Only while nothing is on the felt: a pot, a board or a card there means
+/// a hand is being played, and the note goes to the header instead of
+/// across the pot (`S1-CS`: *elements overlap*).
+pub fn felt_note(view: &TableView) -> Option<&str> {
+    let in_use = view.pot > 0
+        || view.board.iter().any(|f| !matches!(f, Facing::Empty))
+        || view
+            .seats
+            .iter()
+            .any(|s| s.bet > 0 || s.cards.iter().any(|c| !matches!(c, Facing::Empty)));
+    if in_use {
+        None
+    } else {
+        view.note.as_deref()
+    }
+}
+
+/// A probability as a player reads it: whole per cent, and *under 1%*
+/// rather than a zero for a chance that is there.
+pub fn pct(p: f32) -> String {
+    let v = p * 100.0;
+    if v > 0.0 && v < 1.0 {
+        "<1%".to_string()
+    } else {
+        format!("{v:.0}%")
+    }
 }
 
 /// Draw the table, and say what was pressed.
@@ -167,6 +229,14 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
                     RichText::new(format!("hand #{} · {}", view.hand, view.street))
                         .color(theme::TEXT_DIM),
                 );
+                // `S1-CS`: the sentence about the table, here whenever the
+                // felt has a hand on it and cannot carry it.
+                if felt_note(view).is_none() {
+                    if let Some(note) = &view.note {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(note).color(theme::WARN));
+                    }
+                }
                 if view.preview {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Said plainly, because a sample hand that looks like a
@@ -198,13 +268,20 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
             let area = ui.available_rect_before_wrap();
             let seats = view.max_seats.max(view.seats.len() as u8);
             let l = Layout::new(area, seats, view.hero);
-            felt_and_people(ui, &l, view);
+            // `S1-CS`: the chips in the air are a picture of the change
+            // since the last frame, and a frame is owed while they fly.
+            let now = ui.input(|i| i.time);
+            state.motion.observe(view, now);
+            felt_and_people(ui, &l, view, &state.motion, now);
+            if state.motion.active(now) {
+                ui.ctx().request_repaint();
+            }
         });
 
     action
 }
 
-fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView) {
+fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView, motion: &motion::Motion, now: f64) {
     let p = ui.painter();
     paint::table(p, l, &view.name);
 
@@ -319,7 +396,24 @@ fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView) {
         }
     }
 
-    if let Some(note) = &view.note {
+    // `S1-CS`: chips on their way -- a street's bets into the pot, the pot
+    // to the winner -- drawn where they are now, over everything.
+    for f in motion.in_flight(now) {
+        let at = |n: motion::Node| match n {
+            motion::Node::Pot => Some(l.pot.center()),
+            motion::Node::Seat(s) => l.seat(s).map(|slot| slot.bet.center()),
+        };
+        if let (Some(from), Some(to)) = (at(f.from), at(f.to)) {
+            let pos = from + (to - from) * f.progress(now);
+            paint::chips(
+                p,
+                egui::Rect::from_center_size(pos, l.metrics.bet),
+                &f.amount.to_string(),
+            );
+        }
+    }
+
+    if let Some(note) = felt_note(view) {
         // Where the pot sits, because a table with no pot has nothing there and
         // it is the one band of felt the layout guarantees is empty. The first
         // version put it near the bottom edge, where it landed across the hero's
@@ -334,103 +428,138 @@ fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView) {
     }
 }
 
-/// Fold, check or call, raise — and nothing enabled that cannot be done.
+/// The hero's hand on the left, the choices on the right, and nothing
+/// enabled that cannot be done.
+///
+/// `S1-CS`: the buttons sit against the right edge -- Raise outermost, then
+/// Call or Check, then Fold -- with the raise amount and its presets beside
+/// them; the hand's name and its odds take the left. The two halves are laid
+/// out from their own edges, so a narrow window shortens the gap between them
+/// rather than drawing one over the other.
 fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Option<TableAction> {
     let mut action = None;
-
-    if let Some(hand) = &view.hero_hand {
-        ui.label(RichText::new(hand).color(theme::OK).strong());
-        ui.add_space(4.0);
-    }
-
-    if !view.can_act {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(match view.to_act {
-                    Some(s) if s == view.hero => "your turn".to_string(),
-                    Some(s) => format!("waiting for seat {s}"),
-                    None => "no hand in progress".to_string(),
-                })
-                .color(theme::TEXT_DIM),
-            );
-        });
-        return action;
-    }
-
-    if state.raise < view.min_raise {
-        state.raise = view.min_raise;
-    }
-
     ui.horizontal(|ui| {
-        // The presets first, because they are what gets used, and the slider
-        // after — the reverse of the order they were built in and the same order
-        // the reference puts them in.
-        for (label, part) in [("33%", 0.33), ("50%", 0.50), ("75%", 0.75), ("100%", 1.0)] {
-            if ui.button(label).clicked() {
-                let want = (view.pot as f64 * part) as Chips;
-                state.raise = want.clamp(view.min_raise, view.max_raise.max(view.min_raise));
+        ui.allocate_ui_with_layout(
+            egui::vec2(300.0, 76.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| strength_panel(ui, view),
+        );
+        ui.separator();
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !view.can_act {
+                ui.label(
+                    RichText::new(match view.to_act {
+                        Some(s) if s == view.hero => "your turn".to_string(),
+                        Some(s) => format!("waiting for seat {s}"),
+                        None => "no hand in progress".to_string(),
+                    })
+                    .color(theme::TEXT_DIM),
+                );
+                return;
+            }
+            let raise_to = raise_default(state, view);
+            let wide = egui::vec2(150.0, 40.0);
+
+            let can_raise = view.max_raise >= view.min_raise && view.min_raise > 0;
+            let raise = ui.add_enabled(
+                can_raise,
+                egui::Button::new(
+                    RichText::new(format!("Raise to {raise_to}"))
+                        .color(Color32::from_rgb(6, 20, 12))
+                        .strong(),
+                )
+                .fill(theme::OK)
+                .min_size(wide),
+            );
+            if raise.clicked() {
+                action = Some(TableAction::Raise(raise_to));
+            }
+            if !can_raise {
+                raise.on_hover_text("there is nothing left to raise with");
+            }
+
+            let (label, what) = if view.to_call == 0 {
+                ("Check".to_string(), TableAction::Check)
+            } else {
+                (format!("Call {}", view.to_call), TableAction::Call)
+            };
+            if ui
+                .add_sized(
+                    wide,
+                    egui::Button::new(RichText::new(label).color(theme::TEXT).strong())
+                        .fill(theme::PANEL_LIGHT),
+                )
+                .clicked()
+            {
+                action = Some(what);
+            }
+            if ui
+                .add_sized(
+                    wide,
+                    egui::Button::new(RichText::new("Fold").color(theme::TEXT).strong())
+                        .fill(theme::DANGER),
+                )
+                .clicked()
+            {
+                action = Some(TableAction::Fold);
+            }
+
+            ui.add_space(18.0);
+            // The amount, and the presets to its left -- listed from the right,
+            // so they read 33% to 100% on the screen.
+            if view.max_raise > view.min_raise {
+                ui.add(
+                    egui::Slider::new(&mut state.raise, view.min_raise..=view.max_raise)
+                        .show_value(false),
+                );
+            }
+            for (label, part) in [("100%", 1.0), ("75%", 0.75), ("50%", 0.50), ("33%", 0.33)] {
+                if ui.button(label).clicked() {
+                    let want = (view.pot as f64 * part) as Chips;
+                    state.raise = want.clamp(view.min_raise, view.max_raise.max(view.min_raise));
+                }
+            }
+        });
+    });
+    action
+}
+
+/// The hand's name and its odds, on the left of the action bar (`S1-CS`).
+fn strength_panel(ui: &mut egui::Ui, view: &TableView) {
+    ui.label(RichText::new("Your hand").color(theme::TEXT_DIM).size(13.0));
+    match &view.hero_hand {
+        Some(name) => {
+            ui.label(RichText::new(name).color(theme::OK).strong());
+            match (view.improve_by, view.improve.is_empty()) {
+                (Some(by), false) => {
+                    ui.label(
+                        RichText::new(format!("improves {by}: {}", pct(view.improve_total)))
+                            .color(theme::TEXT)
+                            .size(13.0),
+                    );
+                    let parts: Vec<String> = view
+                        .improve
+                        .iter()
+                        .rev()
+                        .take(4)
+                        .map(|(n, p)| format!("{n} {}", pct(*p)))
+                        .collect();
+                    ui.label(RichText::new(parts.join(" · ")).color(theme::TEXT_DIM).size(13.0));
+                }
+                (Some(_), true) => {
+                    ui.label(
+                        RichText::new("nothing to improve to")
+                            .color(theme::TEXT_DIM)
+                            .size(13.0),
+                    );
+                }
+                (None, _) => {}
             }
         }
-        ui.add_space(10.0);
-        if view.max_raise > view.min_raise {
-            ui.add(
-                egui::Slider::new(&mut state.raise, view.min_raise..=view.max_raise)
-                    .show_value(true),
-            );
+        None => {
+            ui.label(RichText::new("no cards yet").color(theme::TEXT_DIM).size(13.0));
         }
-    });
-
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        let wide = egui::vec2((ui.available_width() - 24.0) / 3.0, 40.0);
-
-        if ui
-            .add_sized(
-                wide,
-                egui::Button::new(RichText::new("Fold").color(theme::TEXT).strong())
-                    .fill(theme::DANGER),
-            )
-            .clicked()
-        {
-            action = Some(TableAction::Fold);
-        }
-
-        let (label, what) = if view.to_call == 0 {
-            ("Check".to_string(), TableAction::Check)
-        } else {
-            (format!("Call {}", view.to_call), TableAction::Call)
-        };
-        if ui
-            .add_sized(
-                wide,
-                egui::Button::new(RichText::new(label).color(theme::TEXT).strong())
-                    .fill(theme::PANEL_LIGHT),
-            )
-            .clicked()
-        {
-            action = Some(what);
-        }
-
-        let can_raise = view.max_raise >= view.min_raise && view.min_raise > 0;
-        let raise = ui.add_enabled(
-            can_raise,
-            egui::Button::new(
-                RichText::new(format!("Raise to {}", state.raise))
-                    .color(Color32::from_rgb(6, 20, 12))
-                    .strong(),
-            )
-            .fill(theme::OK)
-            .min_size(wide),
-        );
-        if raise.clicked() {
-            action = Some(TableAction::Raise(state.raise));
-        }
-        if !can_raise {
-            raise.on_hover_text("there is nothing left to raise with");
-        }
-    });
-
-    action
+    }
 }
 
 impl TableView {
@@ -526,6 +655,11 @@ impl TableView {
             max_raise: 2_240,
             preview: true,
             note: None,
+            improve: Vec::new(),
+            improve_total: 0.0,
+            improve_by: None,
+            turn_id: 0,
+            hand_over: false,
         }
     }
 }
@@ -620,5 +754,55 @@ mod tests {
                 assert_eq!(up, 0, "seat {} is showing its hand", s.seat);
             }
         }
+    }
+
+    /// `S1-CS`, the seventh item: the raise control starts every turn at the
+    /// minimum raise, keeps what the player set within the turn, and never
+    /// offers more than the seat has.
+    #[test]
+    fn the_raise_starts_at_the_minimum_each_turn() {
+        let mut ui = TableUi::default();
+        let mut v = TableView {
+            turn_id: 1,
+            min_raise: 200,
+            max_raise: 1_000,
+            can_act: true,
+            ..Default::default()
+        };
+        assert_eq!(raise_default(&mut ui, &v), 200);
+        ui.raise = 600;
+        assert_eq!(raise_default(&mut ui, &v), 600, "the player's own choice stands within the turn");
+        v.turn_id = 2;
+        v.min_raise = 300;
+        assert_eq!(raise_default(&mut ui, &v), 300, "a new turn starts again at the minimum");
+        ui.raise = 5_000;
+        assert_eq!(raise_default(&mut ui, &v), 1_000, "and never above what the seat has");
+    }
+
+    /// The note is on the felt only while the felt is empty; with a pot, a
+    /// bet, a board or a card on it, the header carries the sentence.
+    #[test]
+    fn the_felt_note_gives_way_to_the_hand() {
+        let mut v = TableView {
+            note: Some("waiting for players".into()),
+            ..Default::default()
+        };
+        assert_eq!(felt_note(&v), Some("waiting for players"));
+        v.pot = 150;
+        assert_eq!(felt_note(&v), None);
+        v.pot = 0;
+        v.seats.push(SeatView { bet: 50, ..Default::default() });
+        assert_eq!(felt_note(&v), None);
+        v.seats.clear();
+        v.board[0] = Facing::Down;
+        assert_eq!(felt_note(&v), None);
+    }
+
+    #[test]
+    fn a_percentage_is_said_the_way_a_player_reads_it() {
+        assert_eq!(pct(0.3497), "35%");
+        assert_eq!(pct(0.0009), "<1%");
+        assert_eq!(pct(0.0), "0%");
+        assert_eq!(pct(1.0), "100%");
     }
 }

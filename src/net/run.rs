@@ -561,7 +561,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut inbox_dropped_said: u64 = 0;
     // The last turn told to the interface, so a stage per action does not
     // become a redraw per action.
-    let mut turn_reported: Option<(Option<u8>, u64, u64, bool)> = None;
+    let mut turn_reported: Option<HandReport> = None;
     // When the next hand may start. D-020's hold, and the only timer in this
     // loop that is about a person rather than about the network.
     let mut next_hand_at: Option<tokio::time::Instant> = None;
@@ -9322,10 +9322,15 @@ async fn hand_one_may_open(
 /// sites - an event arriving and this client acting - must say the same thing.
 /// The comparison against the last report is what keeps a stage per action from
 /// becoming a redraw per action.
+/// Everything `report_hand` has told the window about a hand, as one key:
+/// whose turn, the pot, the board's length, whether the hand is over, and
+/// (`S1-CS`) every stack and every bet.
+type HandReport = (Option<u8>, u64, u64, bool, Vec<u64>, Vec<u64>);
+
 async fn report_hand(
     h: &crate::table::hand::Hand,
     events: &Events,
-    last: &mut Option<(Option<u8>, u64, u64, bool)>,
+    last: &mut Option<HandReport>,
 ) -> Report {
     let hand_id = h.hand_id();
     let turn = h.turn();
@@ -9342,14 +9347,18 @@ async fn report_hand(
         // key that could not tell the two apart would report the abort as
         // "nothing changed" and never send `HandEnded`.
         h.over(),
+        // `S1-CS`: and every stack and every bet, so the window is told
+        // after every action and not only when the turn changes.
+        h.stacks(),
+        h.bets(),
     );
-    if *last == Some(now) {
+    if last.as_ref() == Some(&now) {
         // Nothing new. In particular the clock is **not** re-armed: a mesh
         // redelivers, and a duplicate that reset the deadline every time would
         // be a clock that never runs out.
         return Report::default();
     }
-    let board_changed = last.map(|(_, _, b, _)| b) != Some(now.2);
+    let board_changed = last.as_ref().map(|k| k.2) != Some(now.2);
     *last = Some(now);
 
     if board_changed {
@@ -9357,6 +9366,21 @@ async fn report_hand(
             .send(NodeEvent::Board {
                 hand_id,
                 cards: h.board().iter().map(|c| c.index()).collect(),
+            })
+            .await;
+    }
+
+    // `S1-CS`: the table as the engine has it, before the turn is announced.
+    if let Some(street) = h.street() {
+        let _ = events
+            .send(NodeEvent::TableState {
+                hand_id,
+                street: street as u16,
+                pot: h.pot(),
+                to_act: turn.as_ref().map(|t| t.seat),
+                stacks: h.stacks(),
+                bets: h.bets(),
+                folded: h.folded(),
             })
             .await;
     }

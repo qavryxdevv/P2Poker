@@ -197,6 +197,20 @@ pub enum NodeEvent {
         shuffling: Option<u8>,
         ready: bool,
     },
+    /// `S1-CS`: the table as the engine has it after every action -- what
+    /// each seat has behind and in front of it, the pot, the street, who
+    /// has folded and whose turn it is. Sent whenever any of it changes,
+    /// before the turn is announced, so the window never draws a turn on
+    /// a table it has not been told about.
+    TableState {
+        hand_id: u64,
+        street: u16,
+        pot: u64,
+        to_act: Option<u8>,
+        stacks: Vec<u64>,
+        bets: Vec<u64>,
+        folded: Vec<bool>,
+    },
     /// It is this client's turn, and this is what it may do.
     ///
     /// Sent when the answer changes and not on every event: the betting is a
@@ -444,6 +458,7 @@ impl NodeEvent {
             | Self::Roster { .. }
             | Self::TableReal { .. }
             | Self::HandBegan { .. }
+            | Self::TableState { .. }
             | Self::HandWaiting { .. }
             | Self::DeckProgress { .. }
             | Self::HoleCards { .. }
