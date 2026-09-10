@@ -152,36 +152,45 @@ pub struct TableView {
 pub const MIN_WINDOW: [f32; 2] = [760.0, 560.0];
 
 /// The action bar's fixed widths, in one place so the fit can be asserted.
+///
+/// The bar sets its own button padding: the lobby's (16 by 9) made every
+/// 22-pixel button 32 high, which is what made the bar tall and the felt
+/// short. Every size here is the box the widget actually gets.
 pub mod bar {
-    /// The hand's name and odds, on the right.
-    pub const STRENGTH_W: f32 = 188.0;
-    /// The narrowest the chat on the left may be.
-    pub const CHAT_MIN_W: f32 = 110.0;
-    /// The middle column: the presets and the slider above the buttons, the
-    /// buttons one above the other. Wide enough for "Raise to 10000" at the
-    /// body size, and no wider.
+    /// The narrowest either side block -- the chat on the left, the hand on
+    /// the right -- may be. The two share what the middle leaves, equally,
+    /// which is what puts the buttons in the middle of the window.
+    pub const SIDE_MIN_W: f32 = 110.0;
+    /// The buttons, one above the other, centred in the middle block.
     pub const BUTTON_W: f32 = 132.0;
-    pub const BUTTON_H: f32 = 24.0;
+    pub const BUTTON_H: f32 = 22.0;
     /// All-in, at the top, at about half the height of the others.
-    pub const ALL_IN_H: f32 = 14.0;
-    pub const PRESET_W: f32 = 36.0;
+    pub const ALL_IN_H: f32 = 13.0;
+    /// The presets and the slider, one row above the buttons.
+    pub const PRESET_W: f32 = 40.0;
     pub const PRESET_H: f32 = 22.0;
-    /// The slider, in the same row as the presets, to their right.
-    pub const SLIDER_W: f32 = 100.0;
-    /// Between the presets, tighter than egui's default so four fit the column.
-    pub const PRESET_GAP: f32 = 5.0;
+    pub const SLIDER_W: f32 = 96.0;
+    pub const PRESET_GAP: f32 = 4.0;
     /// Between the rows of the column.
-    pub const ROW_GAP: f32 = 3.0;
+    pub const ROW_GAP: f32 = 2.0;
+    /// The padding inside every button of the bar, instead of the lobby's.
+    pub const PADDING: [f32; 2] = [8.0, 3.0];
     /// What egui puts between two widgets, and the panel's own margins.
     pub const GAP: f32 = 10.0;
-    pub const MARGINS: f32 = 2.0 * 10.0 + 2.0 * 8.0;
+    pub const MARGIN: f32 = 6.0;
+    pub const MARGINS: f32 = 2.0 * MARGIN + 2.0 * 8.0;
     /// What egui adds around three blocks and two separators beyond the
-    /// gaps counted below; measured on the first photograph of the final
-    /// bar, where the right block ran past the window by about this much.
+    /// gaps counted below; measured on a photograph of the bar, where the
+    /// right block ran past the window by about this much.
     pub const SLACK: f32 = 40.0;
     /// The bar's height: the column, top to bottom -- the presets' row,
     /// All-in, and the three buttons.
     pub const HEIGHT: f32 = PRESET_H + ROW_GAP + ALL_IN_H + ROW_GAP + 3.0 * BUTTON_H + 2.0 * ROW_GAP;
+
+    /// The presets row inside the column.
+    pub const fn presets_row() -> f32 {
+        4.0 * PRESET_W + 3.0 * PRESET_GAP
+    }
 
     /// The middle block: as wide as the presets and the slider in a row;
     /// the buttons are centred in it.
@@ -189,15 +198,10 @@ pub mod bar {
         presets_row() + PRESET_GAP + SLIDER_W
     }
 
-    /// The presets row inside the column.
-    pub const fn presets_row() -> f32 {
-        4.0 * PRESET_W + 3.0 * PRESET_GAP
-    }
-
-    /// Everything but the chat: the middle block, the right block, the two
-    /// separators, their gaps and the slack.
+    /// Everything but the two side blocks: the middle, the two separators,
+    /// their gaps and the slack.
     pub const fn fixed() -> f32 {
-        middle_block() + 2.0 * (GAP + 8.0 + GAP) + STRENGTH_W + SLACK
+        middle_block() + 2.0 * (GAP + 8.0 + GAP) + SLACK
     }
 }
 
@@ -341,7 +345,7 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
         .frame(
             egui::Frame::new()
                 .fill(theme::PANEL)
-                .inner_margin(10.0)
+                .inner_margin(bar::MARGIN)
                 .stroke(Stroke::new(1.0, theme::LINE)),
         )
         .show(ui, |ui| {
@@ -399,7 +403,7 @@ fn felt_and_people(
             // A floor, because the plaque scales with a felt that a taller
             // action bar makes shorter, and the pot is the one figure on
             // the table nobody may have to squint at.
-            (l.pot.height() * 0.62).max(13.0),
+            (l.pot.height() * 0.62).max(14.0),
             theme::MONEY,
         );
     }
@@ -573,7 +577,9 @@ fn felt_and_people(
             p,
             l.pot.center(),
             note,
-            l.metrics.board_card.x * 0.30,
+            // A floor, because the owner could not read it at the size the
+            // board's card gives it on a squeezed table.
+            (l.metrics.board_card.x * 0.30).max(17.0),
             theme::WARN,
         );
     }
@@ -581,29 +587,33 @@ fn felt_and_people(
 }
 
 /// The chat on the left, the choices in the middle stacked the way PokerTH
-/// stacks them -- Fold, Check or Call, Raise, All-in -- with the raise amount
-/// beside them, and the hero's hand on the right.
+/// stacks them -- the presets and the slider, then All-in at half height,
+/// Raise, Call or Check, and Fold at the bottom -- and the hero's hand on
+/// the right.
 ///
-/// `S1-CS`, as the owner arranged it on the night. Every width but the
-/// chat's is fixed and asserted to fit the smallest window, and the bar keeps
-/// one height whether or not it is the hero's turn, so the felt never moves.
+/// `S1-CS`, as the owner arranged it at the screen. The two side blocks
+/// share the width the middle leaves, so the buttons are in the middle of
+/// the window; every width is fixed or asserted to fit the smallest window;
+/// the bar keeps one height whether or not it is the hero's turn, so the
+/// felt never moves; and the bar's own button padding keeps it short.
 fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Option<TableAction> {
     let mut action = None;
+    ui.spacing_mut().button_padding = egui::vec2(bar::PADDING[0], bar::PADDING[1]);
+    let side = ((ui.available_width() - bar::fixed()) / 2.0).max(bar::SIDE_MIN_W);
     ui.horizontal(|ui| {
-        // Left: the chat, taking what the two fixed blocks leave.
-        let chat_w = (ui.available_width() - bar::fixed()).max(bar::CHAT_MIN_W);
+        // Left: the chat.
         ui.allocate_ui_with_layout(
-            egui::vec2(chat_w, bar::HEIGHT),
+            egui::vec2(side, bar::HEIGHT),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
+                ui.set_max_width(side);
                 if let Some(line) = chat_panel(ui, view, state) {
                     action = Some(TableAction::Say(line));
                 }
             },
         );
         ui.separator();
-        // Middle: one column -- the presets and the slider, then All-in at
-        // half height, Raise, Call or Check, and Fold at the bottom.
+        // Middle: one column, centred.
         ui.allocate_ui_with_layout(
             egui::vec2(bar::middle_block(), bar::HEIGHT),
             egui::Layout::top_down(egui::Align::Center),
@@ -615,52 +625,61 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
                 // engine reports the whole stack as the largest legal total.
                 let all_in = view.can_act && view.max_raise > view.to_call && view.min_raise > 0;
 
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = bar::PRESET_GAP;
-                    if view.can_act {
-                        // A third, a half, three quarters and the whole of
-                        // the pot; short, because the column is narrow.
-                        for (label, part, says) in [
-                            ("⅓", 0.33, "a third of the pot"),
-                            ("½", 0.50, "half the pot"),
-                            ("¾", 0.75, "three quarters of the pot"),
-                            ("pot", 1.0, "the whole pot"),
-                        ] {
-                            let preset = ui.add_sized(
-                                egui::vec2(bar::PRESET_W, bar::PRESET_H),
-                                egui::Button::new(RichText::new(label).size(15.0)),
-                            );
-                            if preset.clicked() {
-                                let want = (view.pot as f64 * part) as Chips;
-                                state.raise = want.clamp(view.min_raise, view.max_raise.max(view.min_raise));
-                            }
-                            preset.on_hover_text(says);
+                // One row placed by hand: each box gets its rectangle from the
+                // row's own, so nothing a layout does can stagger them. Two
+                // versions laid out by egui stood in a staircase, a few pixels
+                // a box, whatever the labels were: a left-to-right layout
+                // centres each box in a row the previous box has just made
+                // taller.
+                let (row, _) = ui.allocate_exact_size(
+                    egui::vec2(bar::middle_block(), bar::PRESET_H),
+                    egui::Sense::hover(),
+                );
+                if view.can_act {
+                    for (i, (label, part, says)) in [
+                        ("1/3", 0.33, "a third of the pot"),
+                        ("1/2", 0.50, "half the pot"),
+                        ("3/4", 0.75, "three quarters of the pot"),
+                        ("pot", 1.0, "the whole pot"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let cell = egui::Rect::from_min_size(
+                            egui::pos2(row.left() + i as f32 * (bar::PRESET_W + bar::PRESET_GAP), row.top()),
+                            egui::vec2(bar::PRESET_W, bar::PRESET_H),
+                        );
+                        let preset = ui.put(cell, egui::Button::new(RichText::new(label).size(13.5)));
+                        if preset.clicked() {
+                            let want = (view.pot as f64 * part) as Chips;
+                            state.raise = want.clamp(view.min_raise, view.max_raise.max(view.min_raise));
                         }
-                        if view.max_raise > view.min_raise {
-                            ui.add_sized(
-                                egui::vec2(bar::SLIDER_W, bar::PRESET_H),
-                                egui::Slider::new(&mut state.raise, view.min_raise..=view.max_raise)
-                                    .show_value(false),
-                            );
-                        }
-                    } else {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(bar::middle_block(), bar::PRESET_H),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(match view.to_act {
-                                        Some(s) if s == view.hero => "your turn".to_string(),
-                                        Some(s) => format!("waiting for seat {s}"),
-                                        None => "no hand in progress".to_string(),
-                                    })
-                                    .color(theme::TEXT_DIM)
-                                    .size(13.0),
-                                );
-                            },
+                        preset.on_hover_text(says);
+                    }
+                    if view.max_raise > view.min_raise {
+                        let cell = egui::Rect::from_min_size(
+                            egui::pos2(row.left() + bar::presets_row() + bar::PRESET_GAP, row.top()),
+                            egui::vec2(bar::SLIDER_W, bar::PRESET_H),
+                        );
+                        ui.put(
+                            cell,
+                            egui::Slider::new(&mut state.raise, view.min_raise..=view.max_raise).show_value(false),
                         );
                     }
-                });
+                } else {
+                    ui.put(
+                        row,
+                        egui::Label::new(
+                            RichText::new(match view.to_act {
+                                Some(s) if s == view.hero => "your turn".to_string(),
+                                Some(s) => format!("waiting for seat {s}"),
+                                None => "no hand in progress".to_string(),
+                            })
+                            .color(theme::TEXT_DIM)
+                            .size(13.0),
+                        ),
+                    );
+                }
                 if ui
                     .add_enabled(
                         all_in,
@@ -671,7 +690,7 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
                                 "All-in".to_string()
                             })
                             .color(Color32::from_rgb(26, 16, 4))
-                            .size(12.5)
+                            .size(11.5)
                             .strong(),
                         )
                         .fill(theme::WARN)
@@ -691,7 +710,7 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
                             "Raise".to_string()
                         })
                         .color(Color32::from_rgb(6, 20, 12))
-                        .size(15.0)
+                        .size(14.5)
                         .strong(),
                     )
                     .fill(theme::OK)
@@ -711,7 +730,7 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
                 if ui
                     .add_enabled(
                         view.can_act,
-                        egui::Button::new(RichText::new(label).color(theme::TEXT).size(15.0).strong())
+                        egui::Button::new(RichText::new(label).color(theme::TEXT).size(14.5).strong())
                             .fill(theme::PANEL_LIGHT)
                             .min_size(wide),
                     )
@@ -722,7 +741,7 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
                 if ui
                     .add_enabled(
                         view.can_act,
-                        egui::Button::new(RichText::new("Fold").color(theme::TEXT).size(15.0).strong())
+                        egui::Button::new(RichText::new("Fold").color(theme::TEXT).size(14.5).strong())
                             .fill(theme::DANGER)
                             .min_size(wide),
                     )
@@ -733,12 +752,12 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
             },
         );
         ui.separator();
-        // Right: the hand.
+        // Right: the hand, in the same width as the chat.
         ui.allocate_ui_with_layout(
-            egui::vec2(bar::STRENGTH_W, bar::HEIGHT),
+            egui::vec2(side, bar::HEIGHT),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
-                ui.set_max_width(bar::STRENGTH_W);
+                ui.set_max_width(side);
                 strength_panel(ui, view)
             },
         );
@@ -750,7 +769,7 @@ fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Optio
 /// something. Enter sends and keeps the cursor where it was.
 fn chat_panel(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Option<String> {
     let mut said = None;
-    let line_height = 30.0;
+    let line_height = 24.0;
     let history = (bar::HEIGHT - line_height - 4.0).max(0.0);
     ui.allocate_ui(egui::vec2(ui.available_width(), history), |ui| {
         egui::ScrollArea::vertical()
@@ -1089,9 +1108,17 @@ mod tests {
         let room = MIN_WINDOW[0] - bar::MARGINS;
         assert!(bar::BUTTON_W <= bar::middle_block(), "a button needs {} of {}", bar::BUTTON_W, bar::middle_block());
         assert!(
-            bar::fixed() + bar::CHAT_MIN_W <= room,
-            "the two fixed blocks and the narrowest chat need {} of {room}",
-            bar::fixed() + bar::CHAT_MIN_W
+            bar::fixed() + 2.0 * bar::SIDE_MIN_W <= room,
+            "the middle and the two narrowest sides need {} of {room}",
+            bar::fixed() + 2.0 * bar::SIDE_MIN_W
+        );
+        // Short enough that the smallest window keeps three quarters of its
+        // height for the felt: the bar and its margins take a quarter at most.
+        assert!(
+            bar::HEIGHT + bar::MARGINS <= 0.25 * MIN_WINDOW[1],
+            "the bar and its margins are {} of {} high",
+            bar::HEIGHT + bar::MARGINS,
+            MIN_WINDOW[1]
         );
     }
 
