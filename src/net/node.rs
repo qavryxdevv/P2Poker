@@ -87,6 +87,12 @@ pub enum NodeCommand {
     /// Stop hosting or stop waiting. Formation only; leaving a table that has
     /// started is a `PLAYER_LEAVE` and is not this.
     LeaveTable,
+    /// `S1-CR`: rejoin the unfinished session on record -- the node puts the
+    /// recorded advert back on offer and says `TableSeen`; the caller then
+    /// sits down at it with `JoinTable` like at any other table.
+    ResumeSession,
+    /// `S1-CR`: the unfinished session on record is not wanted; forget it.
+    ForgetSession,
 }
 
 /// What the loop reports upwards, for the GUI and the log.
@@ -343,6 +349,21 @@ pub enum NodeEvent {
     /// steady state and not an error — upstream allows three attempts and then
     /// stops.
     StillRelayed(PeerId),
+    /// `S1-CR`: a session record was found at start. The window asks the
+    /// player; a headless client answers with `ResumeSession` under
+    /// `--resume` and otherwise says the record is there.
+    UnfinishedSession {
+        key: [u8; 32],
+        table_name: String,
+        seat: u8,
+        stack: u64,
+        hand_id: u64,
+    },
+    /// `S1-CR`: the rejoin opened a hand of the running table from the
+    /// members' copies and follows it.
+    SessionResumed { hand_id: u64 },
+    /// `S1-CR`: the rejoin stopped and the record is gone.
+    SessionGaveUp { why: String },
 }
 
 impl NodeEvent {
@@ -444,7 +465,11 @@ impl NodeEvent {
             // Both change a pane a player is looking at, and a line of chat
             // that arrived three seconds ago is a line nobody answers.
             | Self::LobbyHere { .. }
-            | Self::LobbySaid { .. } => true,
+            | Self::LobbySaid { .. }
+            // `S1-CR`: the question about an unfinished game, and its answer.
+            | Self::UnfinishedSession { .. }
+            | Self::SessionResumed { .. }
+            | Self::SessionGaveUp { .. } => true,
 
             // Log only. Chatty, repetitive, and worth a second's delay.
             //

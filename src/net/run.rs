@@ -819,6 +819,75 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // and `checkpoint_event` (its agreeing checkpoint-8 `STATE_HASH`), read
     // by `vote_on_returns!` at the stall tick, released at the hand-over.
     let mut sit_ins = SitIns::default();
+    // `S1-CR`: the unfinished session on record, if any, said once at start
+    // so the window can ask and a headless client can answer. `resuming` is
+    // set by `ResumeSession` and cleared when this seat is dealt in again,
+    // when the session is forgotten, or when the rejoin gives up.
+    let mut resume: Option<crate::storage::session::Record> =
+        crate::storage::session::load(&profile_dir);
+    let mut resuming = false;
+    let mut resume_since_ms: u64 = 0;
+    let mut resume_last_peer_ms: Option<u64> = None;
+    // The members' `HAND_INIT` copies of the running table's hands, and the
+    // rest of that traffic, kept while this client holds no hand of it:
+    // `Opening::adopt` reads the first, the adopted hand replays the second.
+    let mut resume_inits: std::collections::BTreeMap<u64, Vec<Vec<u8>>> =
+        std::collections::BTreeMap::new();
+    let mut resume_early: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut resume_said: Option<u64> = None;
+    // What this client joined by, for the record: the table key of the
+    // advert, the advert itself and its hash. `None` for a founder, whose
+    // table does not survive its own restart and gets no record.
+    let mut joined_key: Option<[u8; 32]> = None;
+    let mut joined_ad: Option<super::lobby::TableAd> = None;
+    let mut joined_advert_hash: Option<[u8; 32]> = None;
+    let mut session_recorded = false;
+    if let Some(r) = resume.as_ref() {
+        let _ = events
+            .send(NodeEvent::UnfinishedSession {
+                key: r.table_key,
+                table_name: r.table_name.clone(),
+                seat: r.my_seat,
+                stack: r.my_stack,
+                hand_id: r.hand_id,
+            })
+            .await;
+    }
+    // Write the session record: the table as joined, this seat, the boundary
+    // reached. A no-op for a founder.
+    macro_rules! remember_session {
+        ($hand_id:expr, $terminal:expr, $stack:expr) => {{
+            if let (Some(key), Some(ad), Some(advert_hash), Some(f)) =
+                (joined_key, joined_ad.as_ref(), joined_advert_hash, table.as_ref())
+            {
+                if let (Some(session), Some(my_seat), Ok(advert)) =
+                    (f.session(), f.my_seat(), super::advert::to_body_bytes(ad))
+                {
+                    let record = crate::storage::session::Record {
+                        version: crate::storage::session::RECORD_VERSION,
+                        table_id: f.table_id(),
+                        session_id: session,
+                        table_key: key,
+                        founder_peer_id: ad.founder_peer_id.clone(),
+                        table_name: ad.table_name.clone(),
+                        my_seat,
+                        hand_id: $hand_id,
+                        terminal: $terminal,
+                        my_stack: $stack,
+                        written_unix_ms: super::node::now_unix_ms(),
+                        advert,
+                        advert_hash,
+                    };
+                    if let Err(e) = crate::storage::session::save(&profile_dir, &record) {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!("the session record would not save: {e}")))
+                            .await;
+                    }
+                    session_recorded = true;
+                }
+            }
+        }};
+    }
     let mut hand_one_held_since: Option<std::time::Instant> = None;
     // How many seats the group held when it last grew, and when that was. The
     // wait is on progress rather than on a deadline; see `hand_one_may_open`.
@@ -1700,6 +1769,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             roster_seats.clear();
             readmitted.clear();
             sit_ins = SitIns::default();
+            resume_inits.clear();
+            resume_early.clear();
+            session_recorded = false;
             hand_one_held_since = None;
             hand_one_progress = None;
             hand_one_forced_said = false;
@@ -1967,7 +2039,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // the table formed and one seat's
                                             // HAND_INIT never came.
                                             if !ever_dealt
-                                                && hand_one_may_open(
+                                                && !resuming && hand_one_may_open(
                                                     &tox_sink,
                                                     &mut hand_one_held_since,
                                                     &mut hand_one_progress,
@@ -2112,6 +2184,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         let _ = events
                                             .send(NodeEvent::JoinRefused { reason })
                                             .await;
+                                        // `S1-CR`: the founder answered, and not with *already
+                                        // seated*: the session this record names is gone.
+                                        if resuming
+                                            && reason != crate::table::join::RejectReason::AlreadySeated.code()
+                                        {
+                                            let _ = crate::storage::session::forget(&profile_dir);
+                                            resume = None;
+                                            resuming = false;
+                                            let _ = events
+                                                .send(NodeEvent::SessionGaveUp {
+                                                    why: format!("the founder refused the rejoin (reason {reason})"),
+                                                })
+                                                .await;
+                                        }
                                     }
                                     Err(e) => {
                                         table = None;
@@ -2328,6 +2414,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if link_is_down() {
                             continue;
                         }
+                        if resuming && hand.is_none() {
+                            let _ = stash_for_resume(&message.data, &mut resume_inits, &mut resume_early);
+                        }
                         let Some(f) = table.as_mut() else { continue };
                         let now = super::node::now_unix_ms();
                         let result = if joinwire::receive_player_list(&message.data).is_ok() {
@@ -2363,7 +2452,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // on every later table message.
                                     // See the note at the other road in.
                                     if !ever_dealt
-                                        && hand_one_may_open(
+                                        && !resuming && hand_one_may_open(
                                             &tox_sink,
                                             &mut hand_one_held_since,
                                             &mut hand_one_progress,
@@ -3593,6 +3682,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 "that table is no longer advertised".into())).await;
                             continue;
                         };
+                        joined_key = Some(key);
+                        joined_ad = Some(held.ad.clone());
+                        joined_advert_hash = Some(held.advert_hash);
                         // The founder's PeerId comes from the advert, which was
                         // signed by the table key. Dialling anything else would
                         // be taking routing advice from whoever spoke last.
@@ -3733,6 +3825,58 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    NodeCommand::ResumeSession => {
+                        let Some(r) = resume.as_ref() else {
+                            let _ = events.send(NodeEvent::Warning("no unfinished session is on record".into())).await;
+                            continue;
+                        };
+                        if table.is_some() {
+                            let _ = events.send(NodeEvent::Warning("already at a table; leave it before rejoining another".into())).await;
+                            continue;
+                        }
+                        // The recorded advert, back on offer under the hash a
+                        // `JOIN_REQUEST` names, stale by construction: a table
+                        // that has started is not advertised. `JoinTable` then
+                        // finds it like any other and the ordinary road follows --
+                        // *already seated*, the roster, the group, the ratification.
+                        match super::advert::from_body_bytes(&r.advert) {
+                            Ok(ad) => {
+                                let now = super::node::now_unix_ms();
+                                let params = super::advert::table_params_hash(&ad);
+                                let _ = state.lobby.offer(r.table_key, ad.clone(), params, r.advert_hash, now);
+                                resuming = true;
+                                resume_since_ms = now;
+                                resume_last_peer_ms = None;
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "rejoining {} (seat {}, stack {}, last at hand #{}) from the session record",
+                                        ad.table_name, r.my_seat, r.my_stack, r.hand_id
+                                    )))
+                                    .await;
+                                let _ = events
+                                    .send(NodeEvent::TableSeen {
+                                        key: r.table_key,
+                                        ad: Box::new(ad),
+                                        params_hash: params,
+                                        advert_hash: r.advert_hash,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = crate::storage::session::forget(&profile_dir);
+                                resume = None;
+                                let _ = events
+                                    .send(NodeEvent::SessionGaveUp { why: format!("the recorded advert does not read: {e:?}") })
+                                    .await;
+                            }
+                        }
+                    }
+                    NodeCommand::ForgetSession => {
+                        let _ = crate::storage::session::forget(&profile_dir);
+                        resume = None;
+                        resuming = false;
+                        let _ = events.send(NodeEvent::Warning("the unfinished session is forgotten".into())).await;
+                    }
                     NodeCommand::SetNickname(name) => {
                         // Bounded here as well as where it is chosen. §4.3's
                         // limit is on what a roster will take, and the roster is
@@ -3793,6 +3937,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         table = None;
                         leave_the_table!();
                         dht_effort(&mut swarm, false);
+                        // `S1-CR`: a seat that leaves by its own choice has no session to come back to.
+                        let _ = crate::storage::session::forget(&profile_dir);
+                        resume = None;
+                        resuming = false;
                         let _ = events.send(NodeEvent::LeftTable {
                             why: "left the table".into(),
                         }).await;
@@ -3865,6 +4013,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // party's missing copy. A seat that never enters the group at
                 // all is `S1-AA` shape (i) and is untouched by this.
                 if hand.is_none() {
+                    // `S1-CR`: the running table's hand traffic, kept for the
+                    // adoption at the stall tick. The formation handler below
+                    // refuses it quietly either way.
+                    if resuming {
+                        let _ = stash_for_resume(&item.bytes, &mut resume_inits, &mut resume_early);
+                    }
                     if let Some(f) = table.as_mut() {
                         let now = super::node::now_unix_ms();
                         let took = if joinwire::receive_player_list(&item.bytes).is_ok() {
@@ -4103,7 +4257,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `ever_dealt`.
                 if !ever_dealt {
                     if let Some(f) = table.as_ref() {
-                        if hand_one_may_open(
+                        if !resuming && hand_one_may_open(
                             &tox_sink,
                             &mut hand_one_held_since,
                             &mut hand_one_progress,
@@ -4258,6 +4412,134 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         releasing_certs = false;
+                    }
+                }
+                // `S1-CR`: the rejoin's clock. With no table in hand, a fresh
+                // advert of the recorded key (a hash the record does not hold)
+                // means the table exists; a Tox peer of the session answering
+                // means it may; ten minutes of neither and the record is dropped.
+                // Meanwhile the recorded advert is kept on offer, because the
+                // lobby's sweep expires it as the stale thing it is.
+                if resuming && table.is_none() {
+                    if let Some(r) = resume.as_ref() {
+                        let now = super::node::now_unix_ms();
+                        if tox_sink.is_on_tox() || tox_sink.group_seen().0 > 0 {
+                            resume_last_peer_ms = Some(now);
+                        }
+                        let advert_seen = state
+                            .lobby
+                            .get(&r.table_key)
+                            .is_some_and(|h| h.advert_hash != r.advert_hash && h.received_at_ms >= resume_since_ms);
+                        if crate::storage::session::give_up(now, advert_seen, resume_last_peer_ms, resume_since_ms) {
+                            let _ = crate::storage::session::forget(&profile_dir);
+                            resume = None;
+                            resuming = false;
+                            let _ = events
+                                .send(NodeEvent::SessionGaveUp {
+                                    why: "no advertisement and no peer of the session for ten minutes".into(),
+                                })
+                                .await;
+                        } else if let Ok(ad) = super::advert::from_body_bytes(&r.advert) {
+                            let params = super::advert::table_params_hash(&ad);
+                            let _ = state.lobby.offer(r.table_key, ad, params, r.advert_hash, now);
+                        }
+                    }
+                }
+                // `S1-CR`: the record's first write, once the table is set.
+                if !session_recorded && joined_key.is_some() {
+                    if let Some(f) = table.as_ref() {
+                        if f.session().is_some() {
+                            let stack = f
+                                .my_seat()
+                                .and_then(|s| f.roster().seats().iter().find(|e| e.seat == s).map(|e| e.buyin))
+                                .unwrap_or(0);
+                            remember_session!(0, [0; 32], stack);
+                        }
+                    }
+                }
+                // `S1-CR`: a resumed client with no hand adopts the running one
+                // from the members' own copies -- a strict majority of the
+                // occupied seats at one genesis, and stage 0 closed elsewhere
+                // (every seat's copy in, or a later stage of that hand seen), so
+                // the set that signed is the required set. Then it follows the
+                // hand as a bystander; at its settled boundary it asks to sit in
+                // (`S1-BM`).
+                if resuming && hand.is_none() {
+                    if let Some(f) = table.as_ref() {
+                        if f.session().is_some() {
+                            let occupied = f.roster().len();
+                            let pick = resume_inits
+                                .iter()
+                                .rev()
+                                .find(|(hid, copies)| {
+                                    copies.len() * 2 > occupied
+                                        && (copies.len() >= occupied
+                                            || resume_early.iter().any(|(h, _)| h == *hid))
+                                })
+                                .map(|(h, c)| (*h, c.clone()));
+                            if let Some((hid, copies)) = pick {
+                                if let Some(base) = crate::table::hand::Opening::from_formation(f, hid) {
+                                    let now = super::node::now_unix_ms();
+                                    match crate::table::hand::Opening::adopt(base, &copies) {
+                                        Ok(o) => {
+                                            let deadline = o.crypto_step_timeout_ms;
+                                            let seat = o.my_seat;
+                                            match crate::table::hand::Hand::open(o, &app_key, now, deadline) {
+                                                Ok((mut h, _)) => {
+                                                    for c in &copies {
+                                                        let _ = h.on_event(c, &app_key, now);
+                                                    }
+                                                    let carried: Vec<Vec<u8>> = resume_early
+                                                        .iter()
+                                                        .filter(|(x, _)| *x == hid)
+                                                        .map(|(_, b)| b.clone())
+                                                        .collect();
+                                                    let n = carried.len();
+                                                    for b in carried {
+                                                        let _ = h.hold(b);
+                                                    }
+                                                    let (more, _) = h.replay_early(&app_key, now);
+                                                    publish_hand(more, &mut swarm, &mut said, &tox_sink);
+                                                    let _ = events
+                                                        .send(NodeEvent::Warning(format!(
+                                                            "resumed at hand #{hid} as a bystander (seat {seat}) from {} copies, {n} frame(s) replayed; it asks to sit in at this hand's boundary",
+                                                            copies.len()
+                                                        )))
+                                                        .await;
+                                                    let _ = events.send(NodeEvent::SessionResumed { hand_id: hid }).await;
+                                                    hand = Some(h);
+                                                    resume_inits.retain(|k, _| *k > hid);
+                                                    resume_early.retain(|(k, _)| *k > hid);
+                                                    hand_reported = false;
+                                                    deck_reported = None;
+                                                    cards_reported = false;
+                                                    turn_reported = None;
+                                                    abort_reported = false;
+                                                    resume_said = None;
+                                                }
+                                                Err(e) => {
+                                                    if resume_said != Some(hid) {
+                                                        resume_said = Some(hid);
+                                                        let _ = events
+                                                            .send(NodeEvent::Warning(format!("the adopted hand #{hid} would not open: {e}")))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(crate::table::hand::Failed::NotYet) => {}
+                                        Err(e) => {
+                                            if resume_said != Some(hid) {
+                                                resume_said = Some(hid);
+                                                let _ = events
+                                                    .send(NodeEvent::Warning(format!("hand #{hid} cannot be adopted from the copies held: {e}")))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // `S1-BM`: return votes, cast on the evidence the boundary
@@ -5140,6 +5422,47 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                         }
+                    }
+                }
+                // `S1-CR`: the boundary reached, on record; a busted seat has
+                // nothing to come back to.
+                if let Some(h) = hand.as_ref() {
+                    let me = h.my_seat();
+                    let stack = h.stacks().get(usize::from(me)).copied().unwrap_or(0);
+                    if stack == 0 {
+                        let _ = crate::storage::session::forget(&profile_dir);
+                        resume = None;
+                    } else {
+                        remember_session!(h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);
+                    }
+                }
+                // `S1-CR`: a resumed client still outside the roster derives
+                // nothing. Its `required` is the set that signed the copies it
+                // adopted, exact when every copy came and not otherwise, and a
+                // derivation from an inexact set is a genesis nobody shares; the
+                // table's own copies of the next hand are the safe source until
+                // a return certificate has put this seat back, when the
+                // checkpoint that earned it has already said the set was exact.
+                if resuming {
+                    if let Some(h) = hand.as_ref() {
+                        let me = h.my_seat();
+                        if !h.required().contains(&me) && !h.returned().contains(&me) {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "hand #{}: still outside the roster at the boundary; the next hand is adopted from the table's copies, not derived",
+                                    h.hand_id()
+                                )))
+                                .await;
+                            previous = hand.take();
+                            continue;
+                        }
+                        resuming = false;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "back in the roster from hand #{} on; deriving hands again",
+                                h.hand_id().saturating_add(1)
+                            )))
+                            .await;
                     }
                 }
                 let next = hand.as_ref().and_then(|h| h.next_hand());
@@ -6580,6 +6903,54 @@ fn returning_seats(h: &crate::table::hand::Hand, sit_ins: &SitIns) -> Vec<u8> {
     v.dedup();
     v.retain(|s| !h.returned().contains(s) && !h.required().contains(s));
     v
+}
+
+/// `S1-CR`: keep one frame of the running table for a client that holds no
+/// hand of it -- a `HAND_INIT` under its hand id, anything else of a hand
+/// beside it -- under two bounds: two hand ids of inits with one copy per
+/// seat each, and `RESUME_EARLY_CAP` other frames, oldest out. Returns
+/// whether the frame was a hand frame at all.
+const RESUME_EARLY_CAP: usize = 128;
+
+fn stash_for_resume(
+    bytes: &[u8],
+    inits: &mut std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
+    early: &mut Vec<(u64, Vec<u8>)>,
+) -> bool {
+    use crate::protocol::messages::EventType;
+    let Ok((kind, hand_id, _)) = crate::net::chained::peek(bytes, TABLE_FRAME_PEEK) else {
+        return false;
+    };
+    if hand_id == 0 {
+        return false;
+    }
+    if kind == EventType::HandInit {
+        if !inits.contains_key(&hand_id) {
+            while inits.len() >= 2 {
+                let lowest = *inits.keys().next().expect("non-empty");
+                if lowest > hand_id {
+                    return true;
+                }
+                inits.remove(&lowest);
+                early.retain(|(h, _)| *h != lowest);
+            }
+        }
+        let slot = inits.entry(hand_id).or_default();
+        if slot.len() < usize::from(crate::protocol::constants::MAX_SEATS)
+            && !slot.iter().any(|b| b[..] == bytes[..])
+        {
+            slot.push(bytes.to_vec());
+        }
+        return true;
+    }
+    if early.iter().any(|(h, b)| *h == hand_id && b[..] == bytes[..]) {
+        return true;
+    }
+    if early.len() >= RESUME_EARLY_CAP {
+        early.remove(0);
+    }
+    early.push((hand_id, bytes.to_vec()));
+    true
 }
 
 /// `Quiet` when at least `FOREIGN_GENESIS_FLOOR` roster seats have already
@@ -9753,6 +10124,41 @@ mod late_roster_tests {
         assert_eq!(s.requested(9), vec![5]);
         s.checkpoint(9, 6, b"chk");
         assert_eq!(s.requested(9), vec![5], "seat 6 sent no request");
+    }
+
+    /// `S1-CR`: what a client with no hand keeps of the running table, and
+    /// the two bounds on it.
+    #[test]
+    fn a_resuming_client_keeps_inits_by_hand_and_the_rest_bounded() {
+        use crate::protocol::messages::EventType;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let seal = |kind: EventType, hand_id: u64, tag: u8| -> Vec<u8> {
+            let slot = crate::net::chained::Slot {
+                table_id: [1; 32],
+                hand_id,
+                sequence: 0,
+                previous_event_hash: [2; 32],
+            };
+            crate::net::chained::seal(kind, &slot, &tag, &key, 1_000, 30_000, 4096).unwrap()
+        };
+        let mut inits = std::collections::BTreeMap::new();
+        let mut early = Vec::new();
+        assert!(!stash_for_resume(b"not a frame", &mut inits, &mut early));
+        assert!(stash_for_resume(&seal(EventType::HandInit, 5, 0), &mut inits, &mut early));
+        assert!(stash_for_resume(&seal(EventType::HandInit, 5, 0), &mut inits, &mut early), "a duplicate is taken and not kept twice");
+        assert_eq!(inits[&5].len(), 1);
+        assert!(stash_for_resume(&seal(EventType::DeckInit, 5, 1), &mut inits, &mut early));
+        assert_eq!(early.len(), 1);
+        assert!(stash_for_resume(&seal(EventType::HandInit, 6, 0), &mut inits, &mut early));
+        assert!(stash_for_resume(&seal(EventType::HandInit, 7, 0), &mut inits, &mut early));
+        assert_eq!(inits.keys().copied().collect::<Vec<_>>(), vec![6, 7], "two hand ids, the lowest out");
+        assert!(early.is_empty(), "and hand 5's other frames went with it");
+        assert!(stash_for_resume(&seal(EventType::HandInit, 4, 0), &mut inits, &mut early));
+        assert!(!inits.contains_key(&4), "a hand below the two held is not kept");
+        for i in 0..(RESUME_EARLY_CAP as u8).saturating_add(10) {
+            let _ = stash_for_resume(&seal(EventType::DeckInit, 7, i), &mut inits, &mut early);
+        }
+        assert_eq!(early.len(), RESUME_EARLY_CAP, "bounded, oldest out");
     }
 }
 

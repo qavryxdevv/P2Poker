@@ -351,6 +351,8 @@ pub struct LobbyView {
     pub seated: Vec<String>,
     /// What has happened, newest last. A local view and never canonical state.
     pub log: Vec<String>,
+    /// `S1-CR`: an unfinished game on record, for the window to ask about.
+    pub unfinished: Option<crate::app::Unfinished>,
 }
 
 /// One line of lobby chat.
@@ -373,6 +375,7 @@ impl LobbyView {
             chat: Vec::new(),
             seated: Vec::new(),
             log: Vec::new(),
+            unfinished: None,
         }
     }
 

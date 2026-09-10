@@ -387,7 +387,9 @@ if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
         $left = $seconds - $dropAt - $dropFor
         if ($left -lt 30) { $left = 30 }
-        & $exe --headless --autoplay --for "$left" --profile $p --join $table 2>&1 |
+        # `--resume` (S1-CR): the returning process rejoins from its own session record;
+        # `--join` stays as the name it would otherwise look for.
+        & $exe --headless --autoplay --for "$left" --profile $p --join $table --resume 2>&1 |
             ForEach-Object { ((((Get-Date) - $start).TotalSeconds).ToString('F1', $inv)).PadLeft(7) + '  ' + $_ } |
             Out-File -FilePath $log -Encoding utf8
     }

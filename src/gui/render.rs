@@ -67,6 +67,12 @@ pub enum LobbyAction {
     },
     OpenTableWindow,
     LeaveTable,
+    /// `S1-CR`: rejoin the unfinished game on record, buying in with the
+    /// stack the record holds (the founder answers *already seated* and the
+    /// figure is not read).
+    Resume { key: [u8; 32], stack: u64 },
+    /// `S1-CR`: forget the unfinished game on record.
+    Forget,
 }
 
 /// What the create dialog collects.
@@ -264,6 +270,31 @@ fn group<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R
 /// Draw the lobby, and say what was pressed.
 pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyAction {
     let mut action = LobbyAction::None;
+
+    // `S1-CR`: an unfinished game on record is asked about before anything
+    // else, in the middle of the window, and the two answers are the two
+    // things the node can do with the record.
+    if let Some(u) = view.unfinished.as_ref() {
+        egui::Window::new(RichText::new("Unfinished game").size(19.0).strong())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "You left a game unfinished at {} -- seat {}, stack {}, last at hand #{}.",
+                    u.table_name, u.seat, u.stack, u.hand_id
+                ));
+                ui.label("Rejoin it? The table deals you back in at the next hand boundary.");
+                ui.horizontal(|ui| {
+                    if ui.button("Rejoin").clicked() {
+                        action = LobbyAction::Resume { key: u.key, stack: u.stack };
+                    }
+                    if ui.button("Forget it").clicked() {
+                        action = LobbyAction::Forget;
+                    }
+                });
+            });
+    }
     // The chat box is in the middle column and the columns are drawn inside
     // closures, so what it produced is carried out here rather than assigned
     // through a borrow the closure does not have.

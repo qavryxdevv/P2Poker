@@ -22,6 +22,8 @@
 //!                                 that plays for you, for timing a hand
 //! p2p-poker --stay-out            never ask to be dealt back in after being
 //!                                 certified out of a table
+//! p2p-poker --headless --resume   rejoin the unfinished session on record,
+//!                                 if there is one; the window asks instead
 //! ```
 //!
 //! `--renderer` is there to be overridden, not to be typed. The client draws
@@ -274,6 +276,9 @@ fn main() {
     // seat with chips without being dealt in, and what a measurement run
     // uses to hold a seat out on purpose.
     let stay_out = has("--stay-out");
+    // `--resume`: a headless client rejoins the unfinished session on record
+    // without being asked (`S1-CR`); the window asks the player.
+    let resume = has("--resume");
 
     // Multicast discovery, on unless refused. `--no-mdns` exists to prove the
     // other path: with it on, two clients on one wire find each other in under
@@ -325,6 +330,7 @@ fn main() {
         port,
         autoplay,
         stay_out,
+        resume,
     };
 
     if has("--headless") {
@@ -464,7 +470,7 @@ fn again_in_software(args: &[String]) -> i32 {
 }
 
 /// The node, printing what happens. No window.
-fn headless(player: Player, run: Run, join: Option<String>) {
+fn headless(player: Player, run: Run, mut join: Option<String>) {
     let Player {
         identity,
         app_key,
@@ -478,6 +484,7 @@ fn headless(player: Player, run: Run, join: Option<String>) {
         port,
         autoplay,
         stay_out,
+        resume,
         ..
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
@@ -587,6 +594,17 @@ fn headless(player: Player, run: Run, join: Option<String>) {
                     // that was playing hand after hand looked, for three runs
                     // of the two-process test, like one that had stalled after
                     // the deal.
+                    // `S1-CR`: the record's table becomes the join target, and
+                    // the node is told to put its advert back on offer.
+                    if let NodeEvent::UnfinishedSession { table_name, .. } = &event {
+                        if resume {
+                            println!("resuming the unfinished session at {table_name}");
+                            join = Some(table_name.clone());
+                            let _ = commands.send(NodeCommand::ResumeSession).await;
+                        } else {
+                            println!("an unfinished session at {table_name} is on record; start with --resume to rejoin it");
+                        }
+                    }
                     let before = state.emitted;
                     state.apply(event);
                     let fresh = usize::try_from(state.emitted - before).unwrap_or(0);
@@ -727,6 +745,8 @@ struct Run {
     autoplay: Option<std::time::Duration>,
     /// `--stay-out`: never ask to be dealt back in (`S1-BM`).
     stay_out: bool,
+    /// `--resume`: rejoin the unfinished session on record, headless (`S1-CR`).
+    resume: bool,
 }
 
 fn windowed(player: Player, run: Run) -> Started {
@@ -745,6 +765,7 @@ fn windowed(player: Player, run: Run) -> Started {
         port,
         autoplay,
         stay_out,
+        resume: _,
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     // The same headroom as the headless path, for the same reason.
@@ -1443,6 +1464,16 @@ impl eframe::App for Client {
                         password,
                     }),
                     render::LobbyAction::LeaveTable => self.tell(NodeCommand::LeaveTable),
+                    render::LobbyAction::Resume { key, stack } => {
+                        self.tell(NodeCommand::ResumeSession);
+                        self.tell(NodeCommand::JoinTable {
+                            key,
+                            buyin: stack,
+                            seat: None,
+                            password: None,
+                        });
+                    }
+                    render::LobbyAction::Forget => self.tell(NodeCommand::ForgetSession),
                     render::LobbyAction::Say(text) => self.tell(NodeCommand::SayInLobby(text)),
                     render::LobbyAction::Save(mut settings) => {
                         settings.repair(&self.app_key);

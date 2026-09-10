@@ -144,6 +144,9 @@ pub struct AppState {
     pub waiting_for: Vec<u8>,
     /// The last clock this client was told about, so presence can be aged.
     pub last_sweep_ms: u64,
+    /// `S1-CR`: an unfinished session the node found on record at start, until
+    /// the player answers or it resolves.
+    pub unfinished: Option<Unfinished>,
     /// The latest advertisement timestamp this client has seen.
     ///
     /// Used as the clock for this store's own expiry. Not this machine's clock:
@@ -211,6 +214,16 @@ pub struct Seat {
     pub needed: u8,
     pub small_blind: u64,
     pub big_blind: u64,
+}
+
+/// `S1-CR`: what the window asks about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfinished {
+    pub key: [u8; 32],
+    pub table_name: String,
+    pub seat: u8,
+    pub stack: u64,
+    pub hand_id: u64,
 }
 
 impl AppState {
@@ -289,6 +302,20 @@ impl AppState {
             }
             NodeEvent::HolePunched(p) => self.note(format!("{p} is now a direct connection")),
             NodeEvent::StillRelayed(p) => self.note(format!("{p} stays relayed")),
+            NodeEvent::UnfinishedSession { key, table_name, seat, stack, hand_id } => {
+                self.note(format!(
+                    "an unfinished game is on record: {table_name}, seat {seat}, stack {stack}, last at hand #{hand_id}"
+                ));
+                self.unfinished = Some(Unfinished { key, table_name, seat, stack, hand_id });
+            }
+            NodeEvent::SessionResumed { hand_id } => {
+                self.unfinished = None;
+                self.note(format!("back at the table: following hand #{hand_id}"));
+            }
+            NodeEvent::SessionGaveUp { why } => {
+                self.unfinished = None;
+                self.note(format!("the unfinished game is gone: {why}"));
+            }
             NodeEvent::LocalPeer(p) => self.note(format!("found {p} on this network")),
             NodeEvent::LobbyPeer(p) => self.note(format!("found {p} in the public lobby")),
             NodeEvent::LobbyHere { who, nickname } => {
@@ -681,6 +708,7 @@ impl AppState {
         v.selected = self.selected;
         v.log = self.log.iter().cloned().collect();
         v.me = self.me.clone();
+        v.unfinished = self.unfinished.clone();
         v.chat = self.chat.iter().cloned().collect();
         // Name and key together, because a name is decoration. Sorted by name
         // so the pane does not reshuffle every time somebody says they are

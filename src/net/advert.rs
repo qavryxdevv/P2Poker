@@ -513,6 +513,22 @@ pub fn receive(
 /// envelope catalogue, the unchained sentinel, `verify_strict` under the key in
 /// the envelope, and a canonical body. It returns the advert and its
 /// `event_hash`, which is what §4.3's comparison against `advert_hash` needs.
+/// The advert's body as canonical bytes, for the session record (`S1-CR`):
+/// a restarted client rebuilds its `JOIN_REQUEST` from the advert it joined
+/// by, and a table that has started is not advertised any more.
+pub fn to_body_bytes(ad: &TableAd) -> Result<Vec<u8>, &'static str> {
+    to_canonical(&AdBody::from(ad)).map_err(|_| "the advert does not encode")
+}
+
+/// The inverse, with the body's own consistency rules and none of the
+/// lobby's freshness rules: the record is this client's own file, and the
+/// advert in it is stale by construction.
+pub fn from_body_bytes(bytes: &[u8]) -> Result<TableAd, NotAccepted> {
+    let body: AdBody = from_canonical(bytes, TABLE_AD_MAX)
+        .map_err(|_| NotAccepted::Malformed("not a canonical advert body"))?;
+    body.try_into()
+}
+
 pub fn verify_echoed(bytes: &[u8]) -> Result<(TableAd, [u8; 32]), NotAccepted> {
     let signed: SignedEvent = from_canonical(bytes, LOBBY_MSG_MAX)
         .map_err(|_| NotAccepted::Malformed("not a canonical signed event"))?;

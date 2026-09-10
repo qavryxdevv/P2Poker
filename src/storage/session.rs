@@ -8,7 +8,8 @@
 //! **What it holds, and why each field.** The table and the session it was
 //! playing (`table_id`, `session_id`, `table_key`), the founder's peer id and
 //! the advertisement as it was received — the signed `LOBBY_TABLE_AD` frame —
-//! because a `JOIN_REQUEST` cannot be built without the advert and its hash
+//! (as its body's bytes and the hash a request names) because a
+//! `JOIN_REQUEST` cannot be built without the advert and its hash
 //! (§4.3 `n(0) advert_hash`), and a table that has started is not advertised
 //! any more; this client's seat; the last boundary it reached (`hand_id` and
 //! `TERMINAL(k)`, so the record can say how far it got and a rejoin can tell a
@@ -65,10 +66,13 @@ pub struct Record {
     pub my_stack: u64,
     #[n(10)]
     pub written_unix_ms: u64,
-    /// The signed `LOBBY_TABLE_AD` frame, as received. A rejoin rebuilds its
-    /// `JOIN_REQUEST` from it; nothing else about the table survives a restart.
+    /// The advert's body, as canonical bytes (`advert::to_body_bytes`), and
+    /// the hash a `JOIN_REQUEST` names for it. A rejoin puts the advert back
+    /// on offer from these; nothing else about the table survives a restart.
     #[n(11)]
     pub advert: Vec<u8>,
+    #[cbor(n(12), with = "minicbor::bytes")]
+    pub advert_hash: [u8; 32],
 }
 
 pub fn session_path(dir: &Path) -> PathBuf {
@@ -159,6 +163,7 @@ mod tests {
             my_stack: 12_350,
             written_unix_ms: 1_700_000_000_000,
             advert: vec![0xAA; 300],
+            advert_hash: [8; 32],
         }
     }
 
