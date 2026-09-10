@@ -36,6 +36,20 @@
 # falsifier is every attempt carried at both ends and no drop line at
 # either: then the packets die in the relay between them, and the next
 # instrument belongs in TCP_client.c.
+#
+# TWO PLAIN RUNS LATER, NOTHING TO READ. runs/split135112-9 and
+# runs/split135613-9 (240 s each): zero reaps at any of the nine nodes in
+# either run. The shape that took three of the five knobbed runs of the
+# morning stayed away from both clean ones; it is not caused by the knobs
+# and not reproducible on demand. What the instrument read instead is the
+# clean join from the far seat's side, for the first time: its handshake
+# requests to the eight local seats left by UDP at 21.1 s, the completed-
+# handshake line printed for five of them at 26.4-27.1 s -- five to six
+# seconds for a cross-network round trip, half the twelve-second reaper's
+# budget -- and every one of the 63 attempts at the nine nodes left by UDP
+# with zero drop lines anywhere. The instrument stays in every 8+1 binary
+# from here on; tools/read-join-phase.py folds it, and the next run that
+# reaps reads itself.
 
 diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
 index 5646d63..d2b4025 100644
