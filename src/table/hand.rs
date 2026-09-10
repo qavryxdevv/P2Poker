@@ -8576,6 +8576,12 @@ impl Hand {
                 .or_default()
                 .insert(self.open.my_seat, bytes.clone());
             out.push(Send::Broadcast(bytes));
+            // The tally, so a run can show who voted and who is owed.
+            let held = self.return_votes.get(&digest).map_or(0, |m| m.len());
+            self.cert_note.push(format!(
+                "return: vote {held}/{} about seat {seat}'s return (mine)",
+                self.return_voters().len()
+            ));
             out.append(&mut self.certify_returns_if_unanimous(key, now_ms)?);
         }
         Ok(out)
@@ -8653,6 +8659,12 @@ impl Hand {
             .entry(digest)
             .or_default()
             .insert(voter, bytes.to_vec());
+        let held = self.return_votes.get(&digest).map_or(0, |m| m.len());
+        self.cert_note.push(format!(
+            "return: vote {held}/{} about seat {}'s return (from seat {voter})",
+            self.return_voters().len(),
+            body.subject_seat
+        ));
         self.certify_returns_if_unanimous(key, now_ms)
     }
 

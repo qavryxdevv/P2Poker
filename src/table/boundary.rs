@@ -204,6 +204,12 @@ impl Window {
     pub fn said(&self) -> Vec<(SeatIdx, EventType)> {
         self.said.iter().map(|(s, k)| (*s, *k)).collect()
     }
+    /// `R(k)`, the roster of the hand this window belongs to (D-028): the
+    /// set a `PLAYER_SIT_IN` decides nothing for, and the set a return's
+    /// evidence is taken from outside of.
+    pub fn required(&self) -> &[SeatIdx] {
+        &self.participants
+    }
     /// One event of §4.10's hand boundary window, already opened and verified
     /// by the caller against this boundary's `terminal` and the seat's own slot.
     ///

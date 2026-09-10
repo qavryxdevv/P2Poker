@@ -8431,12 +8431,14 @@ async fn checkpoint_event(
         return Some(Vec::new());
     }
 
+    let mut hash_value: Option<crate::poker::state::Hash> = None;
     let took = match half {
         checkwire::Kind::Hash => {
             let Ok(body) = crate::net::chained::payload::<checkwire::StateHash>(&opened, 512)
             else {
                 return Some(Vec::new());
             };
+            hash_value = Some(body.state_hash);
             boundaries.on_state_hash(hand_id, seat, opened.event_hash, body.state_hash)
         }
         checkwire::Kind::Ack => {
@@ -8446,6 +8448,25 @@ async fn checkpoint_event(
             boundaries.on_state_ack(hand_id, seat, opened.event_hash, body.checkpoint_hash)
         }
     };
+    // `S1-BM`: the second half of a return's evidence -- the subject's own
+    // signed checkpoint, whose value agrees here -- from ANY seat outside
+    // `R(k)`, whether or not the checkpoint stage counted it. The `Bystander`
+    // arm below sees only a seat outside `P(k)`, and a returning seat is
+    // inside `P(k)`: it is in section 4.9's `A`, so it signed stage 0 of the
+    // hand, which is what `A` is for. `split175316-9`: all eight voters took
+    // its request and held the deal, and none could vote, because its copy
+    // was `Counted` and the evidence never had its second half.
+    if let Some(v) = hash_value {
+        let outside = boundaries
+            .window(hand_id)
+            .is_some_and(|w| !w.required().contains(&seat));
+        if outside
+            && boundaries.own_value(hand_id) == Some(v)
+            && !matches!(took, Took::Diverged { .. } | Took::Equivocation { .. } | Took::Uninvited)
+        {
+            sit_ins.checkpoint(hand_id, seat, bytes);
+        }
+    }
 
     match took {
         // §4.9's readmission set, written by exactly this: a copy from a seat
