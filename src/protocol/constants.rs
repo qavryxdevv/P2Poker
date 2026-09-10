@@ -59,6 +59,12 @@ pub const BOUNDARY_SEQUENCE_BASE: u64 = 4_096;
 
 /// The boundary checkpoint's own sequence base (§4.9).
 pub const BOUNDARY_CHECKPOINT_BASE: u64 = 8_192;
+/// The return band (`S1-BM`): a `RETURN_VOTE` and a `RETURN_CERT` about seat
+/// `s` are sealed at `RETURN_SEQUENCE_BASE + s`, parented on `TERMINAL(k)`.
+/// Above the last reconciliation ack (8 207) with room to spare, so the
+/// three boundary bands -- the seat window, the checkpoint rounds and this
+/// -- never meet; `returnwire::tests` holds that.
+pub const RETURN_SEQUENCE_BASE: u64 = 8_224;
 
 /// How many reconciliation rounds the checkpoint band has room for.
 ///

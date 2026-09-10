@@ -401,6 +401,12 @@ pub struct Run {
     pub profile_dir: std::path::PathBuf,
     /// Seat this node plays itself, deciding after this long. `None` is a human.
     pub autoplay: Option<std::time::Duration>,
+    /// `S1-BM`: never ask to be dealt back in. The client asks at every
+    /// boundary where its seat is outside the roster with chips, on the
+    /// player's behalf; this withholds the request, which is how a seat
+    /// watches a table it has chips at without being dealt in, and how a
+    /// measurement run holds a seat out on purpose.
+    pub stay_out: bool,
 }
 
 pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
@@ -413,6 +419,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         port,
         profile_dir,
         autoplay,
+        stay_out,
     } = cfg;
     // Advisory events are offered, not waited for. See `Events`.
     let events = Events::new(events);
@@ -770,6 +777,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // pairing per peer per run; see `signer_of`.
     let mut taught: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut readmitted: Vec<u8> = Vec::new();
+    // `S1-BM`: the evidence a return vote is cast on, by boundary and by
+    // subject. Written by `boundary_event` (the subject's `PLAYER_SIT_IN`)
+    // and `checkpoint_event` (its agreeing checkpoint-8 `STATE_HASH`), read
+    // by `vote_on_returns!` at the stall tick, released at the hand-over.
+    let mut sit_ins = SitIns::default();
     let mut hand_one_held_since: Option<std::time::Instant> = None;
     // How many seats the group held when it last grew, and when that was. The
     // wait is on progress rather than on a deadline; see `hand_one_may_open`.
@@ -1339,8 +1351,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         let kind = crate::net::chained::peek($bytes, TABLE_FRAME_PEEK)
                                             .ok()
                                             .map(|(k, _, _)| k);
+                                        // `S1-BM`: the return pair about hand k
+                                        // takes the same road as a late
+                                        // certificate -- it is about hand k's
+                                        // boundary, the retained hand judges it,
+                                        // and a bank there re-derives this one.
+                                        let what = match kind {
+                                            Some(crate::protocol::messages::EventType::ReturnCert) => "RETURN_CERT",
+                                            Some(crate::protocol::messages::EventType::ReturnVote) => "RETURN_VOTE",
+                                            _ => "certificate",
+                                        };
                                         if hand_id.saturating_add(1) == $h.hand_id()
-                                            && kind == Some(crate::protocol::messages::EventType::TimeoutCert)
+                                            && matches!(
+                                                kind,
+                                                Some(
+                                                    crate::protocol::messages::EventType::TimeoutCert
+                                                        | crate::protocol::messages::EventType::ReturnCert
+                                                        | crate::protocol::messages::EventType::ReturnVote
+                                                )
+                                            )
                                         {
                                             match previous.as_mut() {
                                                 // The hand it is about is still held: it
@@ -1353,12 +1382,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     // (a voter-set shortfall, D-024
                                                     // point 5) is re-judged by its
                                                     // replay once another banks.
-                                                    if let Err(Failed::NotYet) =
-                                                        p.on_event($bytes, &app_key, now)
-                                                    {
-                                                        let _ = p.hold($bytes.to_vec());
+                                                    match p.on_event($bytes, &app_key, now) {
+                                                        Err(Failed::NotYet) => {
+                                                            let _ = p.hold($bytes.to_vec());
+                                                        }
+                                                        // `S1-BM`: the last return vote
+                                                        // completes this client's own
+                                                        // certificate, sealed by the
+                                                        // retained hand; it still goes out.
+                                                        Ok(sends) => {
+                                                            publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                                                        }
+                                                        Err(_) => {}
                                                     }
-                                                    let _ = p.replay_early(&app_key, now);
+                                                    let (more, _) = p.replay_early(&app_key, now);
+                                                    publish_hand(more, &mut swarm, &mut said, &tox_sink);
                                                     if let Some(n) = p.take_cert_note() {
                                                         let _ = events
                                                             .send(NodeEvent::Warning(format!(
@@ -1382,12 +1420,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         // clause `S1-BV` was opened for.
                                                         let line = if late_banked_for == Some(hand_id) {
                                                             format!(
-                                                                "a certificate about hand #{hand_id} from seat {seat:?} arrived during hand #{}; hand #{hand_id} is no longer held here, and a certificate about it did bank here before retention ended",
+                                                                "a {what} about hand #{hand_id} from seat {seat:?} arrived during hand #{}; hand #{hand_id} is no longer held here, and a certificate about it did bank here before retention ended",
                                                                 $h.hand_id()
                                                             )
                                                         } else {
                                                             format!(
-                                                                "a certificate about hand #{hand_id} from seat {seat:?} arrived during hand #{}: hand #{hand_id} is no longer held here, so it cannot repair anything",
+                                                                "a {what} about hand #{hand_id} from seat {seat:?} arrived during hand #{}: hand #{hand_id} is no longer held here, so it cannot repair anything",
                                                                 $h.hand_id()
                                                             )
                                                         };
@@ -1552,6 +1590,35 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // forgot nothing. `table` itself is not in here — two of the four sites have
     // already cleared it and one has never set it — and neither is `tox_sink`,
     // whose teardown must run before this and joins a thread.
+    // `S1-BM`: cast this client's return votes on one hand's boundary, from
+    // the evidence the node gathered for it, and publish what that seals.
+    // The hand decides everything -- whether the boundary settled, whether
+    // it holds a value of its own, whether each subject's evidence opens and
+    // agrees -- and answers with nothing when there is nothing to say.
+    macro_rules! vote_on_returns {
+        ($h:expr) => {{
+            let evidence = sit_ins.complete($h.hand_id());
+            if !evidence.is_empty() {
+                match $h.vote_on_returns(&evidence, &app_key, super::node::now_unix_ms()) {
+                    Ok(sends) => {
+                        if !sends.is_empty() {
+                            publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                        }
+                        if let Some(n) = $h.take_cert_note() {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("hand #{}: {n}", $h.hand_id())))
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!("a return vote would not seal: {e}")))
+                            .await;
+                    }
+                }
+            }
+        }};
+    }
     macro_rules! leave_the_table {
         () => {{
             table_closed = false;
@@ -1596,6 +1663,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // Per table by their own meaning.
             roster_seats.clear();
             readmitted.clear();
+            sit_ins = SitIns::default();
             hand_one_held_since = None;
             hand_one_progress = None;
             hand_one_forced_said = false;
@@ -2113,6 +2181,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     h,
                                     &mut boundaries,
                                     &mut readmitted,
+                                    &mut sit_ins,
                                     &app_key,
                                     &mut checkpoint_said,
                                     &mut frozen,
@@ -2169,6 +2238,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         h,
                                         &mut boundaries,
                                         &mut readmitted,
+                                        &mut sit_ins,
                                         &events,
                                     )
                                     .await =>
@@ -2183,6 +2253,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 h,
                                                 &mut boundaries,
                                                 &mut readmitted,
+                                                &mut sit_ins,
                                                 &app_key,
                                                 &mut checkpoint_said,
                                                 &mut frozen,
@@ -3804,6 +3875,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         h,
                         &mut boundaries,
                         &mut readmitted,
+                        &mut sit_ins,
                         &app_key,
                         &mut checkpoint_said,
                         &mut frozen,
@@ -3840,6 +3912,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     h,
                                     &mut boundaries,
                                     &mut readmitted,
+                                    &mut sit_ins,
                                     &events,
                                 )
                                 .await
@@ -3854,6 +3927,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 h,
                                 &mut boundaries,
                                 &mut readmitted,
+                                &mut sit_ins,
                                 &app_key,
                                 &mut checkpoint_said,
                                 &mut frozen,
@@ -4148,6 +4222,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         releasing_certs = false;
                     }
+                }
+                // `S1-BM`: return votes, cast on the evidence the boundary
+                // gathered by the hand the boundary belongs to -- the live hand
+                // while it is still hand k, the retained one once k+1 has
+                // opened. A certificate that completes here banks its subject;
+                // on the retained hand `take_late_roster` below then re-derives
+                // hand k+1, which is READMISSION.md section 4's settled-path
+                // late-roster repair, on `S1-BS`'s road.
+                if let Some(h) = hand.as_mut() {
+                    vote_on_returns!(h);
+                }
+                if let Some(p) = previous.as_mut() {
+                    vote_on_returns!(p);
                 }
                 // `S1-BS`: the retained hand replays what it holds, and a
                 // certificate that banked there re-derives the running hand.
@@ -4675,6 +4762,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 h,
                                 &mut boundaries,
                                 &mut readmitted,
+                                &mut sit_ins,
                                 &app_key,
                                 &mut checkpoint_said,
                                 &mut frozen,
@@ -4692,6 +4780,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         h,
                                         &mut boundaries,
                                         &mut readmitted,
+                                        &mut sit_ins,
                                         &app_key,
                                         &mut checkpoint_said,
                                         &mut frozen,
@@ -4736,6 +4825,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     h,
                                     &mut boundaries,
                                     &mut readmitted,
+                                    &mut sit_ins,
                                     &app_key,
                                     &mut checkpoint_said,
                                     &mut frozen,
@@ -4758,6 +4848,57 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     )))
                                     .await;
                             }
+                        }
+                    }
+                }
+
+                // `S1-BM`: this seat's own request to be dealt back in -- when
+                // the hand settled and this seat is outside `R(k)` with chips,
+                // once per boundary, at its own window slot on `TERMINAL(k)`.
+                // Sent by the client on the player's behalf so nobody clicks
+                // anything (READMISSION.md section 3), withheld by `--stay-out`.
+                // Published and heard like the checkpoint: this client's own
+                // window records that its seat spoke, and `A` gets the seat the
+                // way it gets any other.
+                if !stay_out {
+                    let asked = match hand.as_mut() {
+                        Some(h) => h.sit_in_request(&app_key, super::node::now_unix_ms()),
+                        None => Ok(None),
+                    };
+                    match asked {
+                        Ok(Some(bytes)) => {
+                            publish_hand(
+                                vec![crate::table::hand::Send::Broadcast(bytes.clone())],
+                                &mut swarm,
+                                &mut said,
+                                &tox_sink,
+                            );
+                            if let Some(h) = hand.as_ref() {
+                                let _ = boundary_event(
+                                    &bytes,
+                                    h,
+                                    &mut boundaries,
+                                    &mut readmitted,
+                                    &mut sit_ins,
+                                    &events,
+                                )
+                                .await;
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "hand #{}: seat {} (mine) is outside the roster with chips, so I asked to sit in at the next hand",
+                                        h.hand_id(),
+                                        h.my_seat()
+                                    )))
+                                    .await;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "the sit-in request would not seal: {e}"
+                                )))
+                                .await;
                         }
                     }
                 }
@@ -4843,6 +4984,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 let next = hand.as_ref().and_then(|h| h.next_hand());
+                // The derivation just made holds every certificate banked so
+                // far, of either direction (`S1-BM`), so the late-roster flag a
+                // bank on the live hand raised is spent here: re-derived from
+                // the retained copy it would name the genesis this client
+                // already holds and be refused as such, one log line later.
+                if let Some(h) = hand.as_mut() {
+                    let _ = h.take_late_roster();
+                }
                 if let (Some(h), Some(o)) = (hand.as_ref(), next.as_ref()) {
                     if o.required != h.required_now() {
                         let _ = events
@@ -4901,7 +5050,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             Ok((EventType::HandComplete | EventType::HandAbort, _, _)) => {
                                 terminal = Some(b)
                             }
-                            Ok((EventType::StateHash | EventType::StateAck, _, _)) => {
+                            // `S1-BM`: and this seat's own sit-in request, which
+                            // the window at every peer takes until `HAND_INIT(k+1)`
+                            // completes there.
+                            Ok((
+                                EventType::StateHash | EventType::StateAck | EventType::PlayerSitIn,
+                                _,
+                                _,
+                            )) => {
                                 checkpoint.push(b)
                             }
                             _ => {}
@@ -4916,6 +5072,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `A`'s life** (§4.9). A set read anywhere else is a set
                         // two peers can come to disagree about.
                         opening.readmitted = std::mem::take(&mut readmitted);
+                        // `S1-BM`: the boundary before the retained hand's is over
+                        // for good; hand k's evidence stays while `previous` does.
+                        sit_ins.release_below(opening.hand_id.saturating_sub(1));
                         // **Said about other seats, and never about this
                         // one.** The `Bystander` arm writes `A` for any roster
                         // seat the checkpoint stage did not count, and this
@@ -6151,6 +6310,10 @@ fn keep_for_next_hand(
         | Some(EventType::HandAbort)
         | Some(EventType::TimeoutVote)
         | Some(EventType::TimeoutCert) => Keep::No,
+        // `S1-BM`: the return pair is about the boundary of the hand that
+        // ended, never about the hand opening, and it has the late-certificate
+        // arm for the copy that arrives during the next hand.
+        Some(EventType::ReturnVote) | Some(EventType::ReturnCert) => Keep::No,
         // **§4.10's boundary window is not a stage of the hand and must not be
         // replayed into one.** The reachable case is narrow — a boundary event
         // carries the id of the hand that **ended**, so this arm is reached only
@@ -6163,6 +6326,70 @@ fn keep_for_next_hand(
         Some(k) if k.is_boundary() => Keep::No,
         Some(_) => Keep::Early,
         None => Keep::No,
+    }
+}
+
+/// `S1-BM`: the evidence a return vote is cast on, gathered by the node because
+/// its two halves arrive by two roads -- `boundary_event` takes the subject's
+/// `PLAYER_SIT_IN` and `checkpoint_event` its checkpoint-8 `STATE_HASH` -- and
+/// neither reaches a `Hand`. By the hand whose boundary it is, by subject. The
+/// first copy of either half is the one kept, so a subject cannot swap its
+/// evidence under a vote already cast; two boundaries at most, the retained
+/// hand's and the live one's, and older ones go at the hand-over.
+#[derive(Default)]
+struct SitIns {
+    by_hand: std::collections::BTreeMap<
+        u64,
+        std::collections::BTreeMap<u8, (Option<Vec<u8>>, Option<Vec<u8>>)>,
+    >,
+}
+
+impl SitIns {
+    fn slot(&mut self, hand_id: u64, seat: u8) -> &mut (Option<Vec<u8>>, Option<Vec<u8>>) {
+        // Bounded before the entry is made: a third boundary evicts the oldest.
+        if !self.by_hand.contains_key(&hand_id) && self.by_hand.len() >= 2 {
+            if let Some(oldest) = self.by_hand.keys().next().copied() {
+                self.by_hand.remove(&oldest);
+            }
+        }
+        self.by_hand.entry(hand_id).or_default().entry(seat).or_default()
+    }
+
+    fn request(&mut self, hand_id: u64, seat: u8, bytes: &[u8]) {
+        let e = self.slot(hand_id, seat);
+        if e.0.is_none() {
+            e.0 = Some(bytes.to_vec());
+        }
+    }
+
+    fn checkpoint(&mut self, hand_id: u64, seat: u8, bytes: &[u8]) {
+        let e = self.slot(hand_id, seat);
+        if e.1.is_none() {
+            e.1 = Some(bytes.to_vec());
+        }
+    }
+
+    /// Every subject of this boundary with both halves in hand.
+    fn complete(&self, hand_id: u64) -> Vec<crate::table::hand::ReturnEvidence> {
+        self.by_hand
+            .get(&hand_id)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(seat, (r, c))| {
+                        Some(crate::table::hand::ReturnEvidence {
+                            seat: *seat,
+                            request: r.clone()?,
+                            checkpoint: c.clone()?,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Boundaries below `keep` are over for good.
+    fn release_below(&mut self, keep: u64) {
+        self.by_hand.retain(|k, _| *k >= keep);
     }
 }
 
@@ -7163,6 +7390,7 @@ async fn publish_and_hear(
     h: &crate::table::hand::Hand,
     boundaries: &mut crate::table::boundary::Boundaries,
     readmitted: &mut Vec<u8>,
+    sit_ins: &mut SitIns,
     app_key: &ed25519_dalek::SigningKey,
     checkpoint_said: &mut bool,
     frozen: &mut Option<(u64, u64)>,
@@ -7192,6 +7420,7 @@ async fn publish_and_hear(
             h,
             boundaries,
             readmitted,
+            sit_ins,
             app_key,
             checkpoint_said,
             frozen,
@@ -7632,6 +7861,7 @@ async fn boundary_event(
     h: &crate::table::hand::Hand,
     boundaries: &mut crate::table::boundary::Boundaries,
     readmitted: &mut Vec<u8>,
+    sit_ins: &mut SitIns,
     events: &Events,
 ) -> bool {
     use crate::protocol::messages::EventType;
@@ -7742,12 +7972,15 @@ async fn boundary_event(
             // **`A` is `accepted` and never `required`** (`P2`, §4.9). The seat
             // may sign stage 0 of the next hand; it does not thereby re-enter
             // the roster, because `next_hand` filters `self.open.required` in
-            // both branches and `R(k+1) ⊆ R(k)` (`D-024`). The door back into
-            // the roster is `S1-BM`'s return certificate and it is not built.
+            // both branches (`D-024`). The door back into the roster is
+            // `S1-BM`'s return certificate, and this request is the first half
+            // of the evidence it carries: kept here, beside the subject's
+            // agreeing checkpoint from `checkpoint_event`, for the votes.
             if !readmitted.contains(&seat) {
                 readmitted.push(seat);
                 readmitted.sort_unstable();
             }
+            sit_ins.request(hand_id, seat, bytes);
             let _ = events
                 .send(NodeEvent::Warning(format!(
                     "seat {seat} asked to sit in at the boundary of hand {hand_id}; it may sign \
@@ -7833,6 +8066,7 @@ async fn checkpoint_event(
     h: &crate::table::hand::Hand,
     boundaries: &mut crate::table::boundary::Boundaries,
     readmitted: &mut Vec<u8>,
+    sit_ins: &mut SitIns,
     app_key: &ed25519_dalek::SigningKey,
     checkpoint_said: &mut bool,
     frozen: &mut Option<(u64, u64)>,
@@ -8018,6 +8252,9 @@ async fn checkpoint_event(
                 readmitted.push(seat);
                 readmitted.sort_unstable();
             }
+            // `S1-BM`: the second half of a return's evidence -- the
+            // subject's own signed checkpoint, whose value agreed here.
+            sit_ins.checkpoint(hand_id, seat, bytes);
         }
         // The stage closed and every value in it agreed. One copy per seat, and
         // `Boundaries` returns this once.
@@ -9008,6 +9245,8 @@ mod the_pre_open_buffer {
             // too — which is a roster fault, not a buffering one.
             (EventType::TimeoutVote, crate::table::hand::TIMEOUT_VOTE_CAP),
             (EventType::TimeoutCert, crate::table::hand::TIMEOUT_CERT_CAP),
+            (EventType::ReturnVote, crate::table::returnwire::RETURN_VOTE_CAP),
+            (EventType::ReturnCert, crate::table::returnwire::RETURN_CERT_CAP),
             (EventType::HandComplete, crate::table::hand::HAND_COMPLETE_CAP),
             (EventType::StateHash, 512),
         ] {
@@ -9235,6 +9474,12 @@ mod late_roster_tests {
             "and a certificate has the late-certificate arm"
         );
         assert_eq!(
+            keep_for_next_hand(Some(EventType::ReturnCert), 8, 7),
+            Keep::No,
+            "the return pair is the boundary's, not the next hand's (S1-BM)"
+        );
+        assert_eq!(keep_for_next_hand(Some(EventType::ReturnVote), 8, 7), Keep::No);
+        assert_eq!(
             keep_for_next_hand(Some(EventType::DeckInit), 9, 7),
             Keep::No,
             "two hands ahead is not the hand this client is about to open"
@@ -9255,6 +9500,29 @@ mod late_roster_tests {
         assert_eq!(reopen_voice(false, Voice::Muted), Voice::Muted);
         assert_eq!(reopen_voice(false, Voice::Quiet), Voice::Speak);
         assert_eq!(reopen_voice(false, Voice::Speak), Voice::Speak, "a non-member that never signed");
+    }
+
+    /// `S1-BM`: a return's evidence is two halves by two roads, the first copy
+    /// of each is the one kept, and a boundary is released whole.
+    #[test]
+    fn return_evidence_needs_both_halves_and_keeps_the_first_copy() {
+        let mut s = SitIns::default();
+        s.request(7, 3, b"req-a");
+        assert!(s.complete(7).is_empty(), "a request alone is not evidence");
+        s.checkpoint(7, 3, b"chk-a");
+        s.request(7, 3, b"req-b");
+        s.checkpoint(7, 3, b"chk-b");
+        let ev = s.complete(7);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].seat, 3);
+        assert_eq!(ev[0].request, b"req-a".to_vec(), "the first copy is kept");
+        assert_eq!(ev[0].checkpoint, b"chk-a".to_vec());
+        s.checkpoint(8, 5, b"chk");
+        s.request(9, 5, b"req");
+        assert!(s.complete(7).is_empty(), "a third boundary evicted the oldest");
+        s.release_below(9);
+        assert!(!s.by_hand.contains_key(&8));
+        assert!(s.by_hand.contains_key(&9));
     }
 }
 

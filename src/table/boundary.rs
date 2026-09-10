@@ -87,7 +87,8 @@
 //! and a `PLAYER_LEAVE` are recorded and read by nobody yet: a leave *"removes
 //! no seat from `roster_hash` and counts into no `P`"* (§3.1, §3.2), and the
 //! seat's chips leave through `HAND_INIT`'s `n(11) ledger_delta` inside a
-//! collective body, which is `S1-BM`'s and is not built.
+//! collective body, which is still not built: `S1-BM`'s return certificate
+//! (D-028) moves the roster and not the ledger.
 
 use crate::protocol::checkpoint::{
     CheckpointState, CheckpointStore, StateAckEvent, StateAckOutcome, StateHashEvent,

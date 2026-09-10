@@ -17,6 +17,7 @@ pub mod checkwire;
 /// `PLAYER_SIT_OUT`, `PLAYER_SIT_IN` and `PLAYER_LEAVE` on the wire, and the
 /// sequence band they occupy (`PROTOCOL.md` §4.10's hand boundary window).
 pub mod seatwire;
+pub mod returnwire;
 pub mod dispute;
 /// Carrying a message over a transport whose packets are smaller than it
 /// (D-019: every Tox channel caps at about 1372 bytes).

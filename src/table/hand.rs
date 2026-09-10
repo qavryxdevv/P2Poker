@@ -65,6 +65,7 @@ use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, B
     Refund, RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep, TimeoutCert,
     TimeoutVote};
 use super::stage::{Collective, Heard};
+use crate::table::returnwire::{ReturnCert, ReturnVote, RETURN_CERT_CAP, RETURN_VOTE_CAP};
 
 /// What a step wants sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,11 +229,13 @@ pub struct Opening {
     /// is counted into `P(k+1)` by its own `HAND_INIT` and *"is required and
     /// dealable at `k+2` — one hand later"*. It is not: `next_hand` builds
     /// `required` by filtering `self.open.required` in **both** branches, so
-    /// `R(k+1) ⊆ R(k)` and a seat outside `R` cannot re-enter by being heard
-    /// from — measured over a whole run in `S1-BV`, where seven clients
-    /// announced a readmission six times each and dealt nobody in. Widening
-    /// the accepted set lets the seat *sign* stage 0. The door back into the
-    /// roster is `S1-BM`'s return certificate and it is not built.
+    /// a seat outside `R` cannot re-enter by being heard from — measured over
+    /// a whole run in `S1-BV`, where seven clients announced a readmission
+    /// six times each and dealt nobody in. Widening the accepted set lets the
+    /// seat *sign* stage 0. The door back into the roster is `S1-BM`'s return
+    /// certificate (D-028): a seat outside `R(k)` with chips asks at a settled
+    /// boundary, and `R(k+1)` gains it on a unanimous `RETURN_CERT` and by
+    /// nothing else.
     pub readmitted: Vec<SeatIdx>,
     /// Seat, public key and starting stack, ascending by seat.
     pub seats: Vec<(SeatIdx, [u8; 32], u64)>,
@@ -488,6 +491,9 @@ pub fn frame_ceiling(kind: EventType) -> usize {
         | EventType::ActionFold => ACTION_CAP,
         EventType::TimeoutVote => TIMEOUT_VOTE_CAP,
         EventType::TimeoutCert => TIMEOUT_CERT_CAP,
+        // `S1-BM`: the return pair, sealed in the boundary band.
+        EventType::ReturnVote => crate::table::returnwire::RETURN_VOTE_CAP,
+        EventType::ReturnCert => crate::table::returnwire::RETURN_CERT_CAP,
         EventType::HandComplete => HAND_COMPLETE_CAP,
         EventType::HandAbort => HAND_ABORT_CAP,
         EventType::StateHash => STATE_HASH_CAP,
@@ -1438,6 +1444,25 @@ pub struct Hand {
     /// (`open_with` is the only site that writes `Phase::Init`), so nothing
     /// re-enters stage 0 in place.
     stage_zero_done: bool,
+    /// `S1-BM`: `IN(k)`, the subjects of complete return certificates banked
+    /// at this boundary, ascending.
+    returned: Vec<SeatIdx>,
+    /// Return votes by subject digest, by voter.
+    return_votes: BTreeMap<Hash, BTreeMap<SeatIdx, Vec<u8>>>,
+    /// The subject each return digest is about.
+    return_subjects: BTreeMap<Hash, ReturnVote>,
+    /// Return subjects this client has voted about.
+    return_voted: BTreeSet<Hash>,
+    /// Return subjects this client has banked.
+    return_banked: BTreeSet<Hash>,
+    /// Return subjects this client has sealed its own certificate for.
+    return_sealed: BTreeSet<Hash>,
+    /// The evidence this client voted on, kept to seal with.
+    return_evidence: BTreeMap<Hash, (Vec<u8>, Vec<u8>)>,
+    /// The certificate stages open at this boundary, by subject digest.
+    returning: BTreeMap<Hash, Collective>,
+    /// Whether this client has asked to sit in at this boundary.
+    sit_in_asked: bool,
     params: std::sync::Arc<DeckParams>,
     /// Events for a stage this client has not reached. Held rather than
     /// refused, because GossipSub does not order two messages and a peer that
@@ -1668,6 +1693,15 @@ impl Hand {
                 genesis_note: None,
                 genesis_said: false,
                 late_roster: false,
+            returned: Vec::new(),
+            return_votes: BTreeMap::new(),
+            return_subjects: BTreeMap::new(),
+            return_voted: BTreeSet::new(),
+            return_banked: BTreeSet::new(),
+            return_sealed: BTreeSet::new(),
+            return_evidence: BTreeMap::new(),
+            returning: BTreeMap::new(),
+            sit_in_asked: false,
                 voice,
                 own_init,
                 abort_hold_said: None,
@@ -1734,6 +1768,8 @@ impl Hand {
                 | EventType::HandAbort
                 | EventType::TimeoutVote
                 | EventType::TimeoutCert
+                | EventType::ReturnVote
+                | EventType::ReturnCert
         ) {
             return Err(Failed::Wire(WireError::WrongType));
         }
@@ -1763,6 +1799,14 @@ impl Hand {
         }
         if kind == EventType::TimeoutCert {
             return self.on_timeout_cert(bytes, key, now_ms);
+        }
+        // `S1-BM`: the return pair lives in the boundary band, above every stage
+        // of the hand, so it is answered before the sequence gate below.
+        if kind == EventType::ReturnCert {
+            return self.on_return_cert(bytes, key, now_ms);
+        }
+        if kind == EventType::ReturnVote {
+            return self.on_return_vote(bytes, key, now_ms);
         }
         // A vote stays below the guards. `on_timeout_vote` rebuilds the subject
         // from this client's own position, which a passed-stage receiver cannot
@@ -7687,8 +7731,10 @@ impl Hand {
             //   hand 4 [0, 1]    -> ...
             //
             // A seat certified absent came back every other hand and was
-            // certified out again, for ever. `R(k+1) ⊆ R(k)` closes it: the
-            // roster is monotone, whichever branch derives it.
+            // certified out again, for ever. Filtering `R(k)` in both branches
+            // closes it: the roster is monotone between certificates, whichever
+            // branch derives it, and grows only by `S1-BM`'s return certificate
+            // below (D-028), which is unanimous and carries its own evidence.
             //
             // The cost is stated rather than hidden: D-013 says one silent seat
             // costs one hand and not the table, and under this a seat dropped
@@ -7705,6 +7751,27 @@ impl Hand {
                 })
                 .collect()
         };
+        // **`S1-BM`: `∪ IN(k)`.** The subjects of complete return certificates
+        // banked at this boundary join the roster here and nowhere else, each
+        // with its allowance refilled: `open_with` deals in `required` filtered
+        // by `grace > 0`, and a seat back in `R(k+1)` with a spent allowance
+        // would be required and not dealt in -- correction 4 of READMISSION.md.
+        // `∩ ALIVE` applies to them as to everybody.
+        let mut required = required;
+        for seat in &self.returned {
+            let s = usize::from(*seat);
+            if alive.get(s).copied().unwrap_or(false) && !required.contains(seat) {
+                required.push(*seat);
+                if let Some(g) = grace.get_mut(s) {
+                    *g = GRACE_HANDS;
+                }
+                if let Some(p) = present_run.get_mut(s) {
+                    *p = 0;
+                }
+            }
+        }
+        required.sort_unstable();
+        required.dedup();
         if required.len() < 2 {
             return None;
         }
@@ -8232,6 +8299,682 @@ fn step_failure(seat: SeatIdx, e: StepError) -> Failed {
             seat,
             why: "the argument does not hold for this pair of decks",
         },
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// `S1-BM`: the return certificate -- the grow side of the roster
+// ---------------------------------------------------------------------------
+
+/// What the node hands the hand about a seat that asked to sit in at this
+/// boundary: the subject's own two signed events. The hand opens both itself
+/// and believes neither until it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReturnEvidence {
+    pub seat: SeatIdx,
+    /// The subject's signed `PLAYER_SIT_IN`, sealed in §4.10's window at the
+    /// subject's own slot, parented on `TERMINAL(k)`.
+    pub request: Vec<u8>,
+    /// The subject's signed checkpoint-8 `STATE_HASH` of hand `k`.
+    pub checkpoint: Vec<u8>,
+}
+
+/// A return certificate this client verified, vote by vote and evidence by
+/// evidence.
+struct VerifiedReturn {
+    event_hash: Hash,
+    emitter: SeatIdx,
+    subject: ReturnVote,
+    voters: BTreeSet<SeatIdx>,
+}
+
+impl Hand {
+    /// `R(k) \ OUT(k)`: the seats that would have to wait for a returning one,
+    /// which is who a return certificate needs.
+    ///
+    /// **Written fresh, and it reads neither `dealt_in` nor `grace`**
+    /// (`READMISSION.md` §5 correction 1 and §6's first trap). `voters()`
+    /// reads `dealt_in`, which reads `grace`, which is a private per-receiver
+    /// accumulator; imported here it would decide `participants` and so the
+    /// genesis, pass every unit test because `grace` is uniform on a healthy
+    /// table, and fork the first run where one seat spent a unit the others
+    /// did not see it spend. `return_voters_is_written_without_dealt_in_or_grace`
+    /// reads this function's own text.
+    ///
+    /// And it is taken **before** any return is added, so two seats returning
+    /// at one boundary have one voter set and neither depends on the other.
+    pub fn return_voters(&self) -> Vec<SeatIdx> {
+        let mut v: Vec<SeatIdx> = self
+            .open
+            .required
+            .iter()
+            .copied()
+            .filter(|s| !self.certified.contains(s))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// `IN(k)`: the subjects of complete return certificates banked at this
+    /// boundary, ascending.
+    pub fn returned(&self) -> &[SeatIdx] {
+        &self.returned
+    }
+
+    /// The seats this hand deals cards to. Exposed for the tests that pin
+    /// what a returned seat is at hand `k+1`: required AND dealt in.
+    pub fn dealt_in(&self) -> &[SeatIdx] {
+        &self.mine.dealt_in
+    }
+
+    /// The chain fact a return rests on: `TERMINAL(k)` is the `HAND_COMPLETE`
+    /// stage hash. **Not** `checkpoint8.is_some()` -- correction 2: a peer that
+    /// reached the settlement by the late road holds the settlement's terminal
+    /// and no checkpoint of its own, and refusing it would be the permanent
+    /// fork with no dissent and no attacker.
+    fn settled_terminal(&self) -> Option<Hash> {
+        if self.settled() {
+            self.terminal()
+        } else {
+            None
+        }
+    }
+
+    /// The stacks at this boundary, which are what `next_hand` opens `k+1` on.
+    fn boundary_stacks(&self) -> Vec<Chips> {
+        match &self.phase {
+            Phase::Playing { play, .. } if matches!(play.step, Step::Ended) => {
+                play.round.stack.clone()
+            }
+            Phase::Aborted(_) => self
+                .late
+                .as_ref()
+                .and_then(|l| l.closed.as_ref())
+                .map(|(_, s)| s.clone())
+                .unwrap_or_else(|| self.mine.stacks.clone()),
+            _ => self.mine.stacks.clone(),
+        }
+    }
+
+    fn boundary_stack_of(&self, seat: SeatIdx) -> Chips {
+        self.boundary_stacks().get(usize::from(seat)).copied().unwrap_or(0)
+    }
+
+    fn occupies_a_seat(&self, seat: SeatIdx) -> bool {
+        self.open.seats.iter().any(|(s, _, _)| *s == seat)
+    }
+
+    /// Whether this client should ask to be dealt back in at this boundary:
+    /// it sits at the table with chips, is outside `R(k)`, and the table
+    /// settled -- there is no return at a boundary the table aborted
+    /// (correction 5). The automation belongs here, in the client
+    /// (`READMISSION.md` §3): the request is still the player's own signed
+    /// event, sent at every boundary where this holds, so the player clicks
+    /// nothing and sees *sitting in at the next hand*. A client told to stay
+    /// out simply does not call `sit_in_request`.
+    pub fn may_ask_to_sit_in(&self) -> bool {
+        self.settled_terminal().is_some()
+            && !self.open.required.contains(&self.open.my_seat)
+            && self.occupies_a_seat(self.open.my_seat)
+            && self.boundary_stack_of(self.open.my_seat) > 0
+            && !self.returned.contains(&self.open.my_seat)
+    }
+
+    /// The player's own signed request, once per boundary: `PLAYER_SIT_IN` at
+    /// this seat's window slot, parented on `TERMINAL(k)`, carrying the
+    /// canonical empty payload. `None` when there is nothing to ask.
+    pub fn sit_in_request(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, Failed> {
+        if self.sit_in_asked || !self.may_ask_to_sit_in() {
+            return Ok(None);
+        }
+        let terminal = self.settled_terminal().ok_or(Failed::NothingFurther)?;
+        let sequence = crate::table::seatwire::window_sequence(self.open.my_seat)
+            .ok_or(Failed::NotAtThisTable)?;
+        let slot = self.slot().at(sequence, terminal);
+        let bytes = chained::seal(
+            EventType::PlayerSitIn,
+            &slot,
+            &Vec::<u16>::new(),
+            key,
+            now_ms,
+            self.next_deadline_for(EventType::PlayerSitIn),
+            crate::table::seatwire::BOUNDARY_EVENT_CAP,
+        )
+        .map_err(Failed::Wire)?;
+        self.sit_in_asked = true;
+        Ok(Some(bytes))
+    }
+
+    /// Open the subject's two signed events against this boundary, as this
+    /// client itself: the request at the subject's window slot on `terminal`
+    /// with the canonical payload, the checkpoint at round 0's hash slot on
+    /// the same terminal, both signed by the key the roster holds for the
+    /// seat. `None` when either is not what it claims. Returns the request's
+    /// event hash and the checkpoint's value.
+    fn open_return_evidence(
+        &self,
+        seat: SeatIdx,
+        request: &[u8],
+        checkpoint: &[u8],
+        terminal: &Hash,
+    ) -> Option<(Hash, Hash)> {
+        let key = self
+            .open
+            .seats
+            .iter()
+            .find(|(s, _, _)| *s == seat)
+            .map(|(_, k, _)| *k)?;
+        let sequence = crate::table::seatwire::window_sequence(seat)?;
+        let slot = self.slot().at(sequence, *terminal);
+        // The frame cap on the signed event, the body cap on the payload.
+        let req = chained::open(request, FRAME_CAP, EventType::PlayerSitIn, &slot).ok()?;
+        if req.sender != key
+            || req.envelope.payload != crate::table::seatwire::SIT_IN_PAYLOAD.to_vec()
+        {
+            return None;
+        }
+        let cslot = self
+            .slot()
+            .at(crate::table::checkwire::hash_sequence(0)?, *terminal);
+        let chk = chained::open(checkpoint, FRAME_CAP, EventType::StateHash, &cslot).ok()?;
+        if chk.sender != key {
+            return None;
+        }
+        let body: crate::table::checkwire::StateHash =
+            chained::payload(&chk, STATE_HASH_CAP).ok()?;
+        if body.checkpoint != crate::table::checkwire::BOUNDARY_CHECKPOINT
+            || body.transcript_head != *terminal
+        {
+            return None;
+        }
+        Some((req.event_hash, body.state_hash))
+    }
+
+    /// Vote for every seat whose evidence the node handed over and holds up:
+    /// the subject is at the table with chips and outside `R(k)`, its request
+    /// and checkpoint open as the subject's own at this boundary, and its
+    /// checkpoint value **is this client's own**. Then seal whatever set that
+    /// completes. A vote does nothing alone.
+    pub fn vote_on_returns(
+        &mut self,
+        evidence: &[ReturnEvidence],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let Some(terminal) = self.settled_terminal() else {
+            return Ok(Vec::new());
+        };
+        // A voter vouches for agreement; without a value of its own it has
+        // nothing to vouch with. That is a liveness cost -- the return waits
+        // for the next boundary -- never a safety one.
+        let Some((own_value, _)) = self.checkpoint8 else {
+            return Ok(Vec::new());
+        };
+        let voters = self.return_voters();
+        if voters.len() < 2 || !voters.contains(&self.open.my_seat) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for ev in evidence {
+            let seat = ev.seat;
+            if seat == self.open.my_seat
+                || self.open.required.contains(&seat)
+                || !self.occupies_a_seat(seat)
+                || self.boundary_stack_of(seat) == 0
+            {
+                continue;
+            }
+            let Some((request_hash, state_hash)) =
+                self.open_return_evidence(seat, &ev.request, &ev.checkpoint, &terminal)
+            else {
+                continue;
+            };
+            if state_hash != own_value {
+                continue;
+            }
+            let subject = ReturnVote {
+                subject_seat: seat,
+                terminal,
+                request_hash,
+                state_hash,
+            };
+            let digest = subject.subject_digest();
+            if self.return_voted.contains(&digest) {
+                continue;
+            }
+            let Some(sequence) = crate::table::returnwire::return_sequence(seat) else {
+                continue;
+            };
+            let slot = self.slot().at(sequence, terminal);
+            let bytes = chained::seal(
+                EventType::ReturnVote,
+                &slot,
+                &subject,
+                key,
+                now_ms,
+                self.next_deadline_for(EventType::ReturnVote),
+                RETURN_VOTE_CAP,
+            )
+            .map_err(Failed::Wire)?;
+            self.return_voted.insert(digest);
+            self.return_subjects.insert(digest, subject);
+            self.return_evidence
+                .insert(digest, (ev.request.clone(), ev.checkpoint.clone()));
+            self.return_votes
+                .entry(digest)
+                .or_default()
+                .insert(self.open.my_seat, bytes.clone());
+            out.push(Send::Broadcast(bytes));
+            out.append(&mut self.certify_returns_if_unanimous(key, now_ms)?);
+        }
+        Ok(out)
+    }
+
+    /// A return vote from a peer.
+    fn on_return_vote(
+        &mut self,
+        bytes: &[u8],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let opened = chained::open_in_hand(
+            bytes,
+            FRAME_CAP,
+            EventType::ReturnVote,
+            &self.open.table_id,
+            self.open.hand_id,
+        )
+        .map_err(Failed::Wire)?;
+        let voter = self.seat_of(&opened.sender)?;
+        let body: ReturnVote = chained::payload(&opened, RETURN_VOTE_CAP).map_err(Failed::Wire)?;
+        if body.subject_seat == voter {
+            return Err(Failed::Elsewhere {
+                seat: voter,
+                what: "it were not the subject of its own return vote",
+            });
+        }
+        let Some(sequence) = crate::table::returnwire::return_sequence(body.subject_seat) else {
+            return Err(Failed::Elsewhere {
+                seat: voter,
+                what: "a return were about a seat of this table",
+            });
+        };
+        // **The anti-replay binding, and the voter signed it.** A vote sealed
+        // anywhere but the subject's slot on the terminal it names is not a
+        // vote about this boundary, for any receiver.
+        if opened.envelope.sequence != sequence
+            || opened.envelope.previous_event_hash != body.terminal
+        {
+            return Err(Failed::Elsewhere {
+                seat: voter,
+                what: "each return vote were sealed at its subject's slot on the terminal it names",
+            });
+        }
+        // Held until this client has a terminal to compare with; refused when
+        // that terminal is an abort's -- there is no return at a boundary the
+        // table aborted.
+        let Some(terminal) = self.terminal() else {
+            return Err(Failed::NotYet);
+        };
+        if !self.settled() {
+            return Err(Failed::Elsewhere {
+                seat: voter,
+                what: "no return at a boundary this client's table aborted",
+            });
+        }
+        if body.terminal != terminal {
+            // One step away, not a fault: a peer that settled differently is
+            // the boundary checkpoint's business, not this vote's.
+            return Err(Failed::NotYet);
+        }
+        if self.open.required.contains(&body.subject_seat) {
+            return Err(Failed::Elsewhere {
+                seat: voter,
+                what: "the subject were outside the roster",
+            });
+        }
+        if !self.return_voters().contains(&voter) {
+            return Err(Failed::NotInThisStage);
+        }
+        let digest = body.subject_digest();
+        self.return_subjects.entry(digest).or_insert(body);
+        self.return_votes
+            .entry(digest)
+            .or_default()
+            .insert(voter, bytes.to_vec());
+        self.certify_returns_if_unanimous(key, now_ms)
+    }
+
+    /// Seal a certificate for every subject this client holds a complete set
+    /// for -- every voter, no quorum, no reduction -- and bank it. Its own
+    /// copy is its own word: it seals only from votes it holds, never from a
+    /// peer's certificate.
+    fn certify_returns_if_unanimous(
+        &mut self,
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let voters = self.return_voters();
+        if voters.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let digests: Vec<Hash> = self.return_votes.keys().copied().collect();
+        for digest in digests {
+            if self.return_sealed.contains(&digest) {
+                continue;
+            }
+            let held: BTreeSet<SeatIdx> = self
+                .return_votes
+                .get(&digest)
+                .map(|m| m.keys().copied().collect())
+                .unwrap_or_default();
+            if !voters.iter().all(|v| held.contains(v)) {
+                continue;
+            }
+            // Sealing carries the subject's evidence, which this client holds
+            // only if it voted on it. A voter that did not vote cannot seal.
+            let Some((request, checkpoint)) = self.return_evidence.get(&digest).cloned() else {
+                continue;
+            };
+            let Some(subject) = self.return_subjects.get(&digest).copied() else {
+                continue;
+            };
+            // Ascending by voter seat, which the wire requires and which is
+            // what makes one set of votes one byte string.
+            let votes: Vec<Vec<u8>> = self
+                .return_votes
+                .get(&digest)
+                .map(|m| m.values().cloned().collect())
+                .unwrap_or_default();
+            let body = ReturnCert {
+                subject_digest: digest,
+                votes,
+                request,
+                checkpoint,
+            };
+            let sequence = crate::table::returnwire::return_sequence(subject.subject_seat)
+                .ok_or(Failed::NotInThisStage)?;
+            let slot = self.slot().at(sequence, subject.terminal);
+            let bytes = chained::seal(
+                EventType::ReturnCert,
+                &slot,
+                &body,
+                key,
+                now_ms,
+                self.next_deadline_for(EventType::ReturnCert),
+                RETURN_CERT_CAP,
+            )
+            .map_err(Failed::Wire)?;
+            let hash = chained::open(&bytes, FRAME_CAP, EventType::ReturnCert, &slot)
+                .map_err(Failed::Wire)?
+                .event_hash;
+            self.return_sealed.insert(digest);
+            // Both roads bank: a complete unanimous set IS the certificate.
+            self.bank_return(&subject, digest);
+            if !self.returning.contains_key(&digest) {
+                let stage = Collective::closed(sequence, EventType::ReturnCert.code(), &voters)
+                    .ok_or(Failed::NotInThisStage)?;
+                self.returning.insert(digest, stage);
+            }
+            if let Some(stage) = self.returning.get_mut(&digest) {
+                stage.hear(self.open.my_seat, hash);
+            }
+            self.cert_note.push(format!(
+                "the table has certified seat {}'s return, unanimously among {:?}",
+                subject.subject_seat, voters
+            ));
+            out.push(Send::Broadcast(bytes));
+        }
+        Ok(out)
+    }
+
+    /// The roster half of a return: a set insert, keyed on the subject digest
+    /// so a redelivery counts once. The hand is over by definition at a
+    /// boundary, so a bank always says the roster moved: where the node has
+    /// already derived hand `k+1` from this hand, that is the settled-path
+    /// late-roster repair (`READMISSION.md` §4), the same road `S1-BS` built
+    /// for the abort path.
+    fn bank_return(&mut self, subject: &ReturnVote, digest: Hash) -> bool {
+        if !self.return_banked.insert(digest) {
+            return false;
+        }
+        if !self.returned.contains(&subject.subject_seat) {
+            self.returned.push(subject.subject_seat);
+            self.returned.sort_unstable();
+        }
+        self.late_roster = true;
+        self.cert_note.push(format!(
+            "return: seat {} banked at the boundary; the roster of hand #{} is re-derived",
+            subject.subject_seat,
+            self.open.hand_id.saturating_add(1)
+        ));
+        true
+    }
+
+    /// Open a return certificate vote by vote, then the subject's own two
+    /// events inside it. Nothing here reads what this client may already
+    /// believe about the subject: a receiver that never heard the subject
+    /// must be able to decide, which is what makes the artefact admissible.
+    fn verify_return_certificate(&self, raw: &[u8]) -> Result<VerifiedReturn, Failed> {
+        let opened = chained::open_in_hand(
+            raw,
+            FRAME_CAP,
+            EventType::ReturnCert,
+            &self.open.table_id,
+            self.open.hand_id,
+        )
+        .map_err(Failed::Wire)?;
+        let body: ReturnCert = chained::payload(&opened, RETURN_CERT_CAP).map_err(Failed::Wire)?;
+        let max_voters = usize::from(crate::protocol::constants::MAX_SEATS) - 1;
+        if body.votes.len() < 2 || body.votes.len() > max_voters {
+            return Err(Failed::Elsewhere {
+                seat: self.open.my_seat,
+                what: "a voter set inside the protocol's bounds",
+            });
+        }
+        let emitter = self.seat_of(&opened.sender)?;
+        let mut voters: BTreeSet<SeatIdx> = BTreeSet::new();
+        let mut subject: Option<ReturnVote> = None;
+        for vote in &body.votes {
+            let v = chained::open_in_hand(
+                vote,
+                FRAME_CAP,
+                EventType::ReturnVote,
+                &self.open.table_id,
+                self.open.hand_id,
+            )
+            .map_err(Failed::Wire)?;
+            let voter = self.seat_of(&v.sender)?;
+            if !voters.insert(voter) {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "no seat had voted twice",
+                });
+            }
+            let named: ReturnVote = chained::payload(&v, RETURN_VOTE_CAP).map_err(Failed::Wire)?;
+            match &subject {
+                None => subject = Some(named),
+                Some(first) => {
+                    if !named.same_subject(first) {
+                        return Err(Failed::Elsewhere {
+                            seat: emitter,
+                            what: "every carried vote were about one subject",
+                        });
+                    }
+                }
+            }
+            if voter == named.subject_seat {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "the subject were not a voter about itself",
+                });
+            }
+            let Some(sequence) = crate::table::returnwire::return_sequence(named.subject_seat) else {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "a return were about a seat of this table",
+                });
+            };
+            if v.envelope.sequence != sequence || v.envelope.previous_event_hash != named.terminal {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "each vote were sealed at the subject's slot on the terminal it names",
+                });
+            }
+        }
+        let Some(subject) = subject else {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "a certificate carried the votes it is made of",
+            });
+        };
+        let sequence = crate::table::returnwire::return_sequence(subject.subject_seat)
+            .ok_or(Failed::NotInThisStage)?;
+        if opened.envelope.sequence != sequence
+            || opened.envelope.previous_event_hash != subject.terminal
+        {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "the certificate were sealed at the slot its votes name",
+            });
+        }
+        if subject.subject_digest() != body.subject_digest {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "the digest were the one its own votes hash to",
+            });
+        }
+        // The subject's own evidence, opened by this receiver itself.
+        let Some((request_hash, state_hash)) = self.open_return_evidence(
+            subject.subject_seat,
+            &body.request,
+            &body.checkpoint,
+            &subject.terminal,
+        ) else {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "the subject's own signed request and checkpoint were carried",
+            });
+        };
+        if request_hash != subject.request_hash || state_hash != subject.state_hash {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "the votes named the evidence the certificate carries",
+            });
+        }
+        if !voters.contains(&emitter) {
+            return Err(Failed::NotInThisStage);
+        }
+        Ok(VerifiedReturn {
+            event_hash: opened.event_hash,
+            emitter,
+            subject,
+            voters,
+        })
+    }
+
+    /// A return certificate from a peer, or this client's own coming back.
+    fn on_return_cert(
+        &mut self,
+        bytes: &[u8],
+        key: &SigningKey,
+        now_ms: u64,
+    ) -> Result<Vec<Send>, Failed> {
+        let c = self.verify_return_certificate(bytes)?;
+        let seat = c.emitter;
+        // The chain fact, at THIS receiver: held while it has no terminal at
+        // all, refused when its terminal is an abort's (correction 5), and
+        // held when its settlement is another (the checkpoint's business).
+        let Some(terminal) = self.terminal() else {
+            return Err(Failed::NotYet);
+        };
+        if !self.settled() {
+            return Err(Failed::Elsewhere {
+                seat,
+                what: "no return at a boundary this client's table aborted",
+            });
+        }
+        if c.subject.terminal != terminal {
+            return Err(Failed::NotYet);
+        }
+        if self.open.required.contains(&c.subject.subject_seat) {
+            return Err(Failed::Elsewhere {
+                seat,
+                what: "the subject were outside the roster",
+            });
+        }
+        if !self.occupies_a_seat(c.subject.subject_seat)
+            || self.boundary_stack_of(c.subject.subject_seat) == 0
+        {
+            return Err(Failed::Elsewhere {
+                seat,
+                what: "the subject sat at this table with chips",
+            });
+        }
+        // Correction 2: a value of its own is compared when this client has
+        // one, and the voters' unanimous word is enough when it has none.
+        if let Some((own, _)) = self.checkpoint8 {
+            if own != c.subject.state_hash {
+                return Err(Failed::Elsewhere {
+                    seat,
+                    what: "the subject's checkpoint agreed with this client's",
+                });
+            }
+        }
+        let nominal: BTreeSet<SeatIdx> = self.return_voters().into_iter().collect();
+        if nominal.len() < 2 || c.voters.len() < 2 {
+            return Ok(Vec::new());
+        }
+        if !c.voters.is_subset(&nominal) {
+            return Err(Failed::Elsewhere {
+                seat,
+                what: "every voter were in the roster less the certified",
+            });
+        }
+        // Checked in the direction that can only tighten: a receiver whose own
+        // `certified` is shorter derives a larger voter set, which is its own
+        // incompleteness talking, and is held rather than refused.
+        if !nominal.is_subset(&c.voters) {
+            return Err(Failed::NotYet);
+        }
+        let digest = c.subject.subject_digest();
+        let banked = self.bank_return(&c.subject, digest);
+        self.return_subjects.entry(digest).or_insert(c.subject);
+        let voters: Vec<SeatIdx> = c.voters.iter().copied().collect();
+        let sequence = crate::table::returnwire::return_sequence(c.subject.subject_seat)
+            .ok_or(Failed::NotInThisStage)?;
+        if !self.returning.contains_key(&digest) {
+            let stage = Collective::closed(sequence, EventType::ReturnCert.code(), &voters)
+                .ok_or(Failed::NotInThisStage)?;
+            self.returning.insert(digest, stage);
+        }
+        let Some(stage) = self.returning.get_mut(&digest) else {
+            unreachable!("just inserted")
+        };
+        if stage.heard(seat) == Some(c.event_hash) {
+            return Ok(Vec::new());
+        }
+        match stage.hear(seat, c.event_hash) {
+            Heard::Counted | Heard::Bystander | Heard::Again => {}
+            Heard::Equivocation { .. } => return Err(Failed::Equivocation { seat }),
+            Heard::Uninvited => return Err(Failed::NotYet),
+        }
+        if banked {
+            self.cert_note.push(format!(
+                "return: seat {} certified back in, unanimously among {:?} (copy from seat {seat})",
+                c.subject.subject_seat, voters
+            ));
+        }
+        // A voter that has not sealed its own copy may owe one; it seals only
+        // from a complete set of its own.
+        self.certify_returns_if_unanimous(key, now_ms)
     }
 }
 
@@ -11983,4 +12726,508 @@ mod tests {
         assert_eq!(sends.len(), 1, "and completing stage 0 offers a deck key");
         assert!(a.dealt());
     }
+
+    // -----------------------------------------------------------------------
+    // `S1-BM`: the return certificate. Tests first, per `docs/research/READMISSION.md`.
+    // -----------------------------------------------------------------------
+
+    /// Seats 0 and 1 are the roster; seat 2 sits at the table with chips,
+    /// **outside `R(k)`** -- the shape a certified-out seat has one boundary
+    /// later -- and follows the hand as a bystander: it says nothing, is dealt
+    /// nothing, and computes the same settlement everybody else does. Returns
+    /// the three hands settled.
+    fn a_settled_hand_with_a_bystander() -> (Vec<Hand>, [SigningKey; 3]) {
+        let (hands, keys, _, _) = a_settled_hand_with_a_bystander_and_its_settlement();
+        (hands, keys)
+    }
+
+    /// The same, also returning the two required seats' signed `HAND_COMPLETE`
+    /// frames, for a client that has to reach the settlement by the late road.
+    fn a_settled_hand_with_a_bystander_and_its_settlement() -> (Vec<Hand>, [SigningKey; 3], Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        a_settled_hand_with_a_bystander_holding(10_000)
+    }
+
+    /// The same with the bystander's stack chosen: zero is a busted seat.
+    fn a_settled_hand_with_a_bystander_holding(chips: Chips) -> (Vec<Hand>, [SigningKey; 3], Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let keys = [key(10), key(11), key(12)];
+        let mut hands: Vec<Hand> = Vec::new();
+        let mut inits: Vec<Vec<Send>> = Vec::new();
+        for seat in 0..3u8 {
+            let mut o = opening3(seat);
+            o.required = vec![0, 1];
+            o.seats[2].2 = chips;
+            let (h, sends) = Hand::open(o, &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(sends);
+        }
+        assert!(inits[2].is_empty(), "a bystander says nothing at stage 0");
+        let table_id = hands[0].table_id();
+        let mut settlements: Vec<Vec<u8>> = Vec::new();
+        let mut queue: std::collections::VecDeque<(usize, Vec<Send>)> = std::collections::VecDeque::from(vec![(0, inits[0].clone()), (1, inits[1].clone())]);
+        for _ in 0..1024 {
+            if let Some((from, sends)) = queue.pop_front() {
+                if sends.is_empty() {
+                    continue;
+                }
+                for b in bytes_of(&sends) {
+                    if chained::open_in_hand(&b, FRAME_CAP, EventType::HandComplete, &table_id, 1).is_ok() {
+                        settlements.push(b);
+                    }
+                }
+                for to in 0..3usize {
+                    if to == from {
+                        continue;
+                    }
+                    let out = deliver(&mut hands[to], &sends, &keys[to]);
+                    if !out.is_empty() {
+                        queue.push_back((to, out));
+                    }
+                }
+                continue;
+            }
+            if hands[0].betting_over() && hands[1].betting_over() {
+                break;
+            }
+            let Some(turn) = hands[0].turn().or_else(|| hands[1].turn()) else {
+                panic!("nothing in flight, nobody to act, and the hand is not over");
+            };
+            let seat = usize::from(turn.seat);
+            let turn = hands[seat].turn().expect("that hand agrees it is to act");
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let out = hands[seat].act(action, &keys[seat], NOW).unwrap();
+            queue.push_back((seat, out));
+        }
+        for (i, h) in hands.iter().enumerate() {
+            assert!(h.betting_over(), "seat {i} settled");
+            assert!(h.checkpoint8().is_some(), "seat {i} holds the boundary checkpoint");
+            assert!(h.terminal().is_some(), "seat {i} holds TERMINAL(k)");
+        }
+        assert_eq!(hands[0].checkpoint8(), hands[2].checkpoint8(), "the bystander agrees");
+        assert_eq!(settlements.len(), 2, "one settlement frame from each required seat");
+        let init_frames: Vec<Vec<u8>> = bytes_of(&inits[0]).into_iter().chain(bytes_of(&inits[1])).collect();
+        (hands, keys, settlements, init_frames)
+    }
+
+    /// Four seats: 0 and 1 the roster, 2 and 3 bystanders with chips.
+    fn opening4(my_seat: SeatIdx) -> Opening {
+        let mut o = opening3(my_seat);
+        o.seats.push((3, key(13).verifying_key().to_bytes(), 10_000));
+        o.max_players = 4;
+        o.grace = vec![GRACE_HANDS; 4];
+        o.present_run = vec![0; 4];
+        o
+    }
+
+    /// The subject's two signed events, which the node would hand the voters.
+    fn evidence_of(subject: &mut Hand, key: &SigningKey, seat: SeatIdx) -> ReturnEvidence {
+        let checkpoint = subject.state_hash_event(key, NOW).unwrap().expect("a settled bystander has a checkpoint");
+        let request = subject.sit_in_request(key, NOW).unwrap().expect("a bystander with chips asks");
+        ReturnEvidence { seat, request, checkpoint }
+    }
+
+    fn bytes_of(sends: &[Send]) -> Vec<Vec<u8>> {
+        sends.iter().map(|Send::Broadcast(b)| b.clone()).collect()
+    }
+
+    fn certs_in(sends: &[Send], table_id: &Hash, hand_id: u64) -> Vec<Vec<u8>> {
+        bytes_of(sends)
+            .into_iter()
+            .filter(|b| chained::open_in_hand(b, FRAME_CAP, EventType::ReturnCert, table_id, hand_id).is_ok())
+            .collect()
+    }
+
+    /// Correction 1 of `READMISSION.md` §5, and §6's first trap: the voter set
+    /// is `R(k) \ OUT(k)`, written fresh, and it reads neither `dealt_in` nor
+    /// `grace`. Seat 1's grace is spent, so it is required and NOT dealt in --
+    /// `voters()` would drop it, `return_voters()` must not.
+    #[test]
+    fn the_return_voter_set_is_the_roster_less_the_certified_and_reads_no_dealt_in() {
+        let mut o = opening3(0);
+        o.required = vec![0, 1];
+        o.grace = vec![GRACE_HANDS, 0, GRACE_HANDS];
+        let (h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
+        assert_eq!(h.dealt_in(), &[0], "seat 1 is required and not dealt in");
+        assert_eq!(h.return_voters(), vec![0, 1], "and it still votes on a return");
+    }
+
+    /// The structural half of the same rule: the function's own text names
+    /// neither field. A faithful generalisation of `voters()` would.
+    #[test]
+    fn return_voters_is_written_without_dealt_in_or_grace() {
+        let src = include_str!("hand.rs");
+        let start = src.find("pub fn return_voters(").expect("the function exists");
+        let body = &src[start..];
+        let end = body[1..].find("\n    pub fn ").or_else(|| body[1..].find("\n    fn ")).expect("a next function");
+        let body = &body[..end];
+        assert!(!body.contains("dealt_in"), "return_voters reads dealt_in:\n{body}");
+        assert!(!body.contains("grace"), "return_voters reads grace:\n{body}");
+    }
+
+    /// The whole road on three hands: the bystander asks and proves, the two
+    /// voters vote, the set is unanimous, both seal, both bank, the bystander
+    /// receives a copy and banks it too -- and every one of the three derives
+    /// hand k+1 with seat 2 REQUIRED, at one genesis, with its grace full.
+    #[test]
+    fn a_return_certificate_puts_the_seat_back_into_the_roster_at_one_genesis() {
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        let ev = evidence_of(&mut hands[2], &keys[2], 2);
+        let table_id = hands[0].table_id();
+        let va = hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap();
+        let vb = hands[1].vote_on_returns(std::slice::from_ref(&ev), &keys[1], NOW).unwrap();
+        assert_eq!(va.len(), 1, "one vote, no certificate yet");
+        assert_eq!(vb.len(), 1);
+        assert!(hands[0].returned().is_empty(), "one vote moves nothing");
+        let from_a = hands[1].on_event(&bytes_of(&va)[0], &keys[1], NOW).unwrap();
+        let from_b = hands[0].on_event(&bytes_of(&vb)[0], &keys[0], NOW).unwrap();
+        let cert_a = certs_in(&from_b, &table_id, 1);
+        let cert_b = certs_in(&from_a, &table_id, 1);
+        assert_eq!(cert_a.len(), 1, "the second vote seals seat 0's copy");
+        assert_eq!(cert_b.len(), 1, "and seat 1's");
+        assert_eq!(hands[0].returned(), &[2], "sealing banks");
+        assert_eq!(hands[1].returned(), &[2]);
+        assert!(hands[0].on_event(&cert_b[0], &keys[0], NOW).is_ok());
+        assert!(hands[1].on_event(&cert_a[0], &keys[1], NOW).is_ok());
+        // The subject never voted and holds no vote; a copy is all it needs.
+        assert!(hands[2].on_event(&cert_a[0], &keys[2], NOW).is_ok());
+        assert_eq!(hands[2].returned(), &[2]);
+        let next: Vec<Opening> = hands.iter().map(|h| h.next_hand().expect("a successor")).collect();
+        for (i, n) in next.iter().enumerate() {
+            assert_eq!(n.required, vec![0, 1, 2], "seat {i}: R(k+1) = R(k) ∪ IN(k)");
+            assert_eq!(n.grace[2], GRACE_HANDS, "seat {i}: a returned seat carries a full grace");
+            assert_eq!(n.genesis, next[0].genesis, "seat {i}: one genesis");
+        }
+        // And the returned seat is dealt in at k+1, not merely required.
+        let (h2, sends) = Hand::open(next[2].clone(), &keys[2], NOW, 30_000).unwrap();
+        assert!(h2.dealt_in().contains(&2), "dealt in at the next hand");
+        assert_eq!(sends.len(), 1, "and it signs stage 0 as a member");
+    }
+
+    /// Correction 2: the condition is the chain fact -- `TERMINAL(k)` is the
+    /// `HAND_COMPLETE` stage hash -- and correction 5: there is no return at a
+    /// boundary the table aborted. A hand that ABORTED refuses the certificate
+    /// its settled neighbours sealed, and votes about nothing.
+    #[test]
+    fn a_return_needs_a_settled_terminal_and_an_abort_has_none() {
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        let ev = evidence_of(&mut hands[2], &keys[2], 2);
+        let table_id = hands[0].table_id();
+        let va = hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap();
+        let vb = hands[1].vote_on_returns(std::slice::from_ref(&ev), &keys[1], NOW).unwrap();
+        let from_b = hands[0].on_event(&bytes_of(&vb)[0], &keys[0], NOW).unwrap();
+        let _ = hands[1].on_event(&bytes_of(&va)[0], &keys[1], NOW).unwrap();
+        let cert = certs_in(&from_b, &table_id, 1).remove(0);
+        // A fourth client, seat 1's twin, that gave the hand up at stage 0.
+        let mut o = opening3(1);
+        o.required = vec![0, 1];
+        let (mut aborted, _) = Hand::open(o, &keys[1], NOW, 30_000).unwrap();
+        let aborted_sends = aborted.abort_now(Abort::Deadline, &keys[1], NOW).unwrap();
+        assert!(aborted.terminal().is_some(), "an abort has a terminal");
+        assert!(!aborted.may_ask_to_sit_in(), "nobody asks at an aborted boundary");
+        assert!(aborted.vote_on_returns(std::slice::from_ref(&ev), &keys[1], NOW).unwrap().is_empty());
+        let refused = aborted.on_event(&cert, &keys[1], NOW);
+        assert!(
+            matches!(refused, Err(Failed::Elsewhere { .. })),
+            "a certificate at an aborted boundary is refused, not held: {refused:?}"
+        );
+        assert!(aborted.returned().is_empty(), "nothing banked at an aborted boundary");
+        // And the BYSTANDER's twin at an aborted boundary of its own: outside
+        // R(k), with chips, holding a terminal -- and it asks nothing, for the
+        // one reason that the terminal is an abort's.
+        let mut o = opening3(2);
+        o.required = vec![0, 1];
+        let (mut bys, _) = Hand::open(o, &keys[2], NOW, 30_000).unwrap();
+        let late_now = NOW + 120_000;
+        let _ = bys.on_event(&bytes_of(&aborted_sends)[0], &keys[2], late_now);
+        let _ = bys.replay_early(&keys[2], late_now);
+        if bys.aborted().is_none() {
+            let _ = bys.abort_now(Abort::Deadline, &keys[2], late_now);
+        }
+        assert!(bys.aborted().is_some(), "the bystander's twin ended on an abort");
+        assert!(bys.terminal().is_some(), "and holds a terminal");
+        assert!(!bys.may_ask_to_sit_in(), "a bystander asks nothing at an aborted boundary");
+        assert!(bys.sit_in_request(&keys[2], late_now).unwrap().is_none());
+        // A hand aborted at stage 0 has no successor of its own to derive; that
+        // is `next_hand`'s existing answer and not the return's business.
+    }
+
+    /// Correction 2, the other half: a receiver that reached the settlement by
+    /// the LATE road holds no checkpoint value of its own. It must not refuse
+    /// the certificate -- that is the permanent fork with no dissent -- but
+    /// accept it on the voters' unanimous word.
+    #[test]
+    fn a_receiver_without_a_checkpoint_of_its_own_accepts_on_the_voters_word() {
+        let (mut hands, keys, settlements, inits) = a_settled_hand_with_a_bystander_and_its_settlement();
+        let ev = evidence_of(&mut hands[2], &keys[2], 2);
+        let table_id = hands[0].table_id();
+        let va = hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap();
+        let vb = hands[1].vote_on_returns(std::slice::from_ref(&ev), &keys[1], NOW).unwrap();
+        let from_b = hands[0].on_event(&bytes_of(&vb)[0], &keys[0], NOW).unwrap();
+        let _ = hands[1].on_event(&bytes_of(&va)[0], &keys[1], NOW).unwrap();
+        let cert = certs_in(&from_b, &table_id, 1).remove(0);
+        let terminal = hands[0].terminal().unwrap();
+        // A fourth client, seat 1's twin, that gave the hand up at stage 0 and
+        // then heard both settlement frames: §4.10's late road. Its terminal is
+        // the settlement's and it computed no checkpoint of its own.
+        let mut o = opening3(1);
+        o.required = vec![0, 1];
+        let (mut late, _) = Hand::open(o, &keys[1], NOW, 30_000).unwrap();
+        // It heard stage 0 -- both seats are in its P(k) -- and then gave up.
+        for i in &inits {
+            let _ = late.on_event(i, &keys[1], NOW);
+        }
+        let _ = late.abort_now(Abort::Deadline, &keys[1], NOW).unwrap();
+        for s in &settlements {
+            let _ = late.on_event(s, &keys[1], NOW);
+        }
+        assert_eq!(late.terminal(), Some(terminal), "the settlement won over the abort");
+        assert!(late.checkpoint8().is_none(), "and it holds no checkpoint of its own");
+        assert!(late.on_event(&cert, &keys[1], NOW).is_ok(), "accepted on the voters' word");
+        assert_eq!(late.returned(), &[2]);
+        assert_eq!(late.next_hand().unwrap().required, vec![0, 1, 2]);
+    }
+
+    /// Correction 3: the two-voter floor does not exclude heads-up, because the
+    /// subject is outside `R(k)` and removing it removes nothing. The fixture
+    /// IS heads-up -- `R(k) = [0, 1]` -- and the certificate above sealed.
+    #[test]
+    fn heads_up_can_certify_a_return() {
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        assert_eq!(hands[0].return_voters(), vec![0, 1]);
+        let ev = evidence_of(&mut hands[2], &keys[2], 2);
+        assert_eq!(hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap().len(), 1);
+    }
+
+    /// Only on the subject's own signed request, never automatically: a
+    /// certificate whose carried request is somebody else's signature, or is
+    /// sealed at another seat's slot, is refused.
+    #[test]
+    fn a_return_needs_the_subjects_own_signed_request() {
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        let ev = evidence_of(&mut hands[2], &keys[2], 2);
+        // Seat 1 forges a request "from" seat 2 with its own key.
+        let terminal = hands[0].terminal().unwrap();
+        let slot = hands[0].slot().at(crate::table::seatwire::window_sequence(2).unwrap(), terminal);
+        let forged = chained::seal(EventType::PlayerSitIn, &slot, &Vec::<u16>::new(), &keys[1], NOW, 30_000, crate::table::seatwire::BOUNDARY_EVENT_CAP).unwrap();
+        let mut bad = ev.clone();
+        bad.request = forged;
+        assert!(hands[0].vote_on_returns(std::slice::from_ref(&bad), &keys[0], NOW).unwrap().is_empty(), "a voter does not vote on a forged request");
+        assert!(hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap().len() == 1, "and votes on the real one");
+    }
+
+    /// The subject's checkpoint must agree with the voter's own; a voter that
+    /// holds a different value does not vote, and a receiver whose own value
+    /// differs refuses the certificate.
+    #[test]
+    fn a_return_needs_the_subjects_agreeing_checkpoint() {
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        let mut ev = evidence_of(&mut hands[2], &keys[2], 2);
+        // The subject signs a checkpoint that names a value nobody holds.
+        let terminal = hands[2].terminal().unwrap();
+        let body = crate::table::checkwire::StateHash {
+            checkpoint: crate::table::checkwire::BOUNDARY_CHECKPOINT,
+            state_hash: [0xAB; 32],
+            transcript_head: terminal,
+        };
+        let slot = hands[2].slot().at(crate::table::checkwire::hash_sequence(0).unwrap(), terminal);
+        ev.checkpoint = chained::seal(EventType::StateHash, &slot, &body, &keys[2], NOW, 30_000, STATE_HASH_CAP).unwrap();
+        assert!(hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap().is_empty(), "a disagreeing value earns no vote");
+    }
+
+    /// A seat inside `R(k)` cannot be a return subject: it decides nothing.
+    #[test]
+    fn a_seat_inside_the_roster_cannot_be_a_return_subject() {
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        assert!(!hands[1].may_ask_to_sit_in(), "a required seat has nothing to ask");
+        assert!(hands[1].sit_in_request(&keys[1], NOW).unwrap().is_none());
+        // Seat 1's own evidence -- a genuine request at its own slot and its
+        // genuine checkpoint, which opens and agrees -- earns no vote, for the
+        // one reason that seat 1 is in R(k).
+        let terminal = hands[0].terminal().unwrap();
+        let checkpoint = hands[1].state_hash_event(&keys[1], NOW).unwrap().expect("a required seat has a checkpoint");
+        let slot = hands[1].slot().at(crate::table::seatwire::window_sequence(1).unwrap(), terminal);
+        let request = chained::seal(EventType::PlayerSitIn, &slot, &Vec::<u16>::new(), &keys[1], NOW, 30_000, crate::table::seatwire::BOUNDARY_EVENT_CAP).unwrap();
+        let inside = ReturnEvidence { seat: 1, request, checkpoint };
+        assert!(hands[0].vote_on_returns(std::slice::from_ref(&inside), &keys[0], NOW).unwrap().is_empty(), "a seat in R(k) earns no vote on its own evidence");
+        // Seat 2's evidence relabelled as seat 1's is refused earlier, on the
+        // signature, before the roster is consulted.
+        let ev = evidence_of(&mut hands[2], &keys[2], 2);
+        let mut relabelled = ev.clone();
+        relabelled.seat = 1;
+        assert!(hands[0].vote_on_returns(std::slice::from_ref(&relabelled), &keys[0], NOW).unwrap().is_empty());
+        // And a well-formed vote from seat 1 about seat 0 -- a required seat --
+        // is refused by the receiver, whatever the voter claims.
+        let terminal = hands[0].terminal().unwrap();
+        let state_hash = hands[0].checkpoint8().unwrap().0;
+        let body = crate::table::returnwire::ReturnVote { subject_seat: 0, terminal, request_hash: [5; 32], state_hash };
+        let slot = hands[1].slot().at(crate::table::returnwire::return_sequence(0).unwrap(), terminal);
+        let bytes = chained::seal(EventType::ReturnVote, &slot, &body, &keys[1], NOW, 30_000, crate::table::returnwire::RETURN_VOTE_CAP).unwrap();
+        let out = hands[0].on_event(&bytes, &keys[0], NOW);
+        assert!(matches!(out, Err(Failed::Elsewhere { seat: 1, .. })), "{out:?}");
+    }
+
+    /// A busted seat cannot return: the roster is `∩ ALIVE(k+1)`.
+    #[test]
+    fn a_busted_seat_cannot_return() {
+        let (mut hands, keys, _, _) = a_settled_hand_with_a_bystander_holding(0);
+        assert!(!hands[2].may_ask_to_sit_in(), "no chips, no request");
+        assert!(hands[2].sit_in_request(&keys[2], NOW).unwrap().is_none());
+        // Its client would not ask, so the evidence is forged by hand: a
+        // well-formed request at its own slot, and its genuine checkpoint.
+        let terminal = hands[0].terminal().unwrap();
+        let checkpoint = hands[2].state_hash_event(&keys[2], NOW).unwrap().expect("a settled bystander has a checkpoint, busted or not");
+        let slot = hands[2].slot().at(crate::table::seatwire::window_sequence(2).unwrap(), terminal);
+        let request = chained::seal(EventType::PlayerSitIn, &slot, &Vec::<u16>::new(), &keys[2], NOW, 30_000, crate::table::seatwire::BOUNDARY_EVENT_CAP).unwrap();
+        let ev = ReturnEvidence { seat: 2, request: request.clone(), checkpoint: checkpoint.clone() };
+        assert!(hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap().is_empty(), "no vote for a busted seat");
+        // And a certificate about it, assembled by hand from two votes that
+        // are well-formed in every other respect, is refused by a receiver.
+        let table_id = hands[0].table_id();
+        let request_hash = chained::open_in_hand(&request, FRAME_CAP, EventType::PlayerSitIn, &table_id, 1).unwrap().event_hash;
+        let state_hash = hands[0].checkpoint8().unwrap().0;
+        let subject = crate::table::returnwire::ReturnVote { subject_seat: 2, terminal, request_hash, state_hash };
+        let seq = crate::table::returnwire::return_sequence(2).unwrap();
+        let votes: Vec<Vec<u8>> = [0usize, 1]
+            .iter()
+            .map(|v| {
+                let slot = hands[*v].slot().at(seq, terminal);
+                chained::seal(EventType::ReturnVote, &slot, &subject, &keys[*v], NOW, 30_000, crate::table::returnwire::RETURN_VOTE_CAP).unwrap()
+            })
+            .collect();
+        let cert = crate::table::returnwire::ReturnCert { subject_digest: subject.subject_digest(), votes, request, checkpoint };
+        let slot = hands[1].slot().at(seq, terminal);
+        let bytes = chained::seal(EventType::ReturnCert, &slot, &cert, &keys[1], NOW, 30_000, crate::table::returnwire::RETURN_CERT_CAP).unwrap();
+        let out = hands[0].on_event(&bytes, &keys[0], NOW);
+        assert!(matches!(out, Err(Failed::Elsewhere { seat: 1, .. })), "{out:?}");
+        assert!(hands[0].returned().is_empty());
+    }
+
+    /// Correction 1's consequence: two seats returning at one boundary have
+    /// the same voter set -- neither is a voter about the other -- and the two
+    /// certificates applied in either order derive one `R(k+1)`.
+    #[test]
+    fn two_returns_at_one_boundary_do_not_depend_on_each_other() {
+        let keys: Vec<SigningKey> = (10..14).map(key).collect();
+        let mut hands: Vec<Hand> = Vec::new();
+        let mut inits: Vec<Vec<Send>> = Vec::new();
+        for seat in 0..4u8 {
+            let mut o = opening4(seat);
+            o.required = vec![0, 1];
+            let (h, sends) = Hand::open(o, &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            inits.push(sends);
+        }
+        let mut queue: std::collections::VecDeque<(usize, Vec<Send>)> = std::collections::VecDeque::from(vec![(0, inits[0].clone()), (1, inits[1].clone())]);
+        for _ in 0..1024 {
+            if let Some((from, sends)) = queue.pop_front() {
+                if sends.is_empty() {
+                    continue;
+                }
+                for to in 0..4usize {
+                    if to != from {
+                        let out = deliver(&mut hands[to], &sends, &keys[to]);
+                        if !out.is_empty() {
+                            queue.push_back((to, out));
+                        }
+                    }
+                }
+                continue;
+            }
+            if hands[0].betting_over() && hands[1].betting_over() {
+                break;
+            }
+            let Some(turn) = hands[0].turn().or_else(|| hands[1].turn()) else { panic!("stuck") };
+            let seat = usize::from(turn.seat);
+            let turn = hands[seat].turn().expect("agrees");
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let out = hands[seat].act(action, &keys[seat], NOW).unwrap();
+            queue.push_back((seat, out));
+        }
+        assert!(hands[2].betting_over() && hands[3].betting_over(), "both bystanders settled");
+        assert_eq!(hands[0].return_voters(), vec![0, 1]);
+        let ev2 = evidence_of(&mut hands[2], &keys[2], 2);
+        let ev3 = evidence_of(&mut hands[3], &keys[3], 3);
+        let table_id = hands[0].table_id();
+        // Seat 0 votes on both, seat 1 on both, in opposite orders.
+        let va = hands[0].vote_on_returns(&[ev2.clone(), ev3.clone()], &keys[0], NOW).unwrap();
+        let vb = hands[1].vote_on_returns(&[ev3.clone(), ev2.clone()], &keys[1], NOW).unwrap();
+        assert_eq!(va.len(), 2);
+        assert_eq!(vb.len(), 2);
+        let mut certs_a = Vec::new();
+        for b in bytes_of(&vb) {
+            certs_a.extend(certs_in(&hands[0].on_event(&b, &keys[0], NOW).unwrap(), &table_id, 1));
+        }
+        let mut certs_b = Vec::new();
+        for b in bytes_of(&va) {
+            certs_b.extend(certs_in(&hands[1].on_event(&b, &keys[1], NOW).unwrap(), &table_id, 1));
+        }
+        assert_eq!(certs_a.len(), 2, "two subjects, two certificates at seat 0");
+        assert_eq!(certs_b.len(), 2);
+        assert_eq!(hands[0].returned(), &[2, 3]);
+        assert_eq!(hands[1].returned(), &[2, 3], "the same set, derived in the opposite order");
+        let na = hands[0].next_hand().unwrap();
+        let nb = hands[1].next_hand().unwrap();
+        assert_eq!(na.required, vec![0, 1, 2, 3]);
+        assert_eq!(na.genesis, nb.genesis, "one genesis from two orders");
+    }
+
+    /// The anti-replay binding: a vote sealed anywhere but the subject's own
+    /// return slot, parented on `TERMINAL(k)`, is refused.
+    #[test]
+    fn a_return_vote_must_be_sealed_at_the_subjects_slot_on_the_terminal() {
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        let ev = evidence_of(&mut hands[2], &keys[2], 2);
+        let terminal = hands[0].terminal().unwrap();
+        let req_hash = chained::open_in_hand(&ev.request, FRAME_CAP, EventType::PlayerSitIn, &hands[0].table_id(), 1).unwrap().event_hash;
+        let state_hash = hands[2].checkpoint8().unwrap().0;
+        let body = crate::table::returnwire::ReturnVote { subject_seat: 2, terminal, request_hash: req_hash, state_hash };
+        // Seat 1 seals a vote at the WRONG sequence (seat 3's slot).
+        let wrong = hands[1].slot().at(crate::table::returnwire::return_sequence(3).unwrap(), terminal);
+        let bytes = chained::seal(EventType::ReturnVote, &wrong, &body, &keys[1], NOW, 30_000, crate::table::returnwire::RETURN_VOTE_CAP).unwrap();
+        let out = hands[0].on_event(&bytes, &keys[0], NOW);
+        assert!(matches!(out, Err(Failed::Elsewhere { seat: 1, .. })), "{out:?}");
+        // And at the right slot but parented on something else.
+        let elsewhere = hands[1].slot().at(crate::table::returnwire::return_sequence(2).unwrap(), [7; 32]);
+        let bytes = chained::seal(EventType::ReturnVote, &elsewhere, &body, &keys[1], NOW, 30_000, crate::table::returnwire::RETURN_VOTE_CAP).unwrap();
+        let out = hands[0].on_event(&bytes, &keys[0], NOW);
+        assert!(matches!(out, Err(Failed::Elsewhere { seat: 1, .. })), "{out:?}");
+    }
+
+    /// The settled-path late-roster road (`READMISSION.md` §4): a certificate
+    /// banked on a hand that is over says so, and `next_hand` re-derived from
+    /// it carries the seat -- the same road `S1-BS` built for the abort path.
+    #[test]
+    fn a_return_certificate_banked_after_the_hand_re_derives_the_next_hand() {
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        let ev = evidence_of(&mut hands[2], &keys[2], 2);
+        let table_id = hands[0].table_id();
+        let before = hands[1].next_hand().unwrap();
+        assert_eq!(before.required, vec![0, 1], "before the certificate, the roster stands");
+        let va = hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap();
+        let vb = hands[1].vote_on_returns(std::slice::from_ref(&ev), &keys[1], NOW).unwrap();
+        let from_b = hands[0].on_event(&bytes_of(&vb)[0], &keys[0], NOW).unwrap();
+        let cert = certs_in(&from_b, &table_id, 1).remove(0);
+        assert!(hands[0].take_late_roster(), "sealing on an ended hand says the roster moved");
+        // A receiver that never voted (the subject) banks and says so too.
+        assert!(hands[2].on_event(&cert, &keys[2], NOW).is_ok());
+        assert!(hands[2].take_late_roster());
+        assert_eq!(hands[2].next_hand().unwrap().required, vec![0, 1, 2]);
+        let _ = va;
+    }
+
+    /// The emitter's predicate: a bystander with chips asks exactly once per
+    /// boundary, at its own window slot, parented on `TERMINAL(k)`, with the
+    /// canonical empty payload.
+    #[test]
+    fn a_bystander_with_chips_asks_once_at_its_own_slot() {
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        assert!(hands[2].may_ask_to_sit_in());
+        let first = hands[2].sit_in_request(&keys[2], NOW).unwrap().expect("asks");
+        assert!(hands[2].sit_in_request(&keys[2], NOW).unwrap().is_none(), "once");
+        let terminal = hands[2].terminal().unwrap();
+        let slot = hands[2].slot().at(crate::table::seatwire::window_sequence(2).unwrap(), terminal);
+        let opened = chained::open(&first, FRAME_CAP, EventType::PlayerSitIn, &slot).expect("at seat 2's slot on the terminal");
+        assert_eq!(opened.sender, keys[2].verifying_key().to_bytes());
+        assert_eq!(opened.envelope.payload, crate::table::seatwire::SIT_IN_PAYLOAD.to_vec());
+    }
+
 }

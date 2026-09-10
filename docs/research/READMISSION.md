@@ -1,6 +1,8 @@
 # Readmission — the answer to `Q-10`, and what has to exist before it can be built
 
-**Status:** design, not built. Produced 2026-09-05 by four independent designs,
+**Status:** built as D-028 on 2026-09-10 (`S1-BM`), tests first, with the five
+corrections of §5 in the code and fifteen mutations seen red; the measured run
+is owed. Produced 2026-09-05 by four independent designs,
 three judges and two adversarial passes, at the project owner's request, after
 `S1-BV` measured the door standing open and leading nowhere. Register row
 `S1-BM`. Not normative: `PROTOCOL.md` owns the wire and `DECISIONS.md` owns the

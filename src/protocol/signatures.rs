@@ -79,6 +79,9 @@ pub enum Domain {
     Advert,
     /// The certificate subject digest (§8.3).
     TimeoutCert,
+    /// A return vote's subject digest (`S1-BM`), so it can never collide
+    /// with a timeout subject's.
+    ReturnCert,
 }
 
 impl Domain {
@@ -101,11 +104,12 @@ impl Domain {
             Domain::TableId => "p2p-poker v1 table-id",
             Domain::Advert => "p2p-poker v1 advert",
             Domain::TimeoutCert => "p2p-poker v1 timeout-cert",
+            Domain::ReturnCert => "p2p-poker v1 return-cert",
         }
     }
 
     /// Every variant, so tests and audits can enumerate the register.
-    pub const ALL: [Domain; 16] = [
+    pub const ALL: [Domain; 17] = [
         Domain::Transcript,
         Domain::Stage,
         Domain::Genesis,
@@ -122,6 +126,7 @@ impl Domain {
         Domain::TableId,
         Domain::Advert,
         Domain::TimeoutCert,
+        Domain::ReturnCert,
     ];
 }
 

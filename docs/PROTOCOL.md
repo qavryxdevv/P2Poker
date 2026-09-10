@@ -1958,7 +1958,7 @@ before the signature so two encodings of one event cannot both be accepted.
 | 9 | `verify_strict(sender_public_key, TO_BE_SIGNED, signature)` | **protocol violation**, attributable |
 | 10 | `chain_scope` matches the `event_type`'s entry in §4.11, and if `chain_scope == 0` the envelope carries the sentinels of §2.3 exactly | drop |
 | 10a | **NOT IMPLEMENTED IN VERSION 1 — see §5.2.5 for the checks that run in its place, and §5.2.1's header for why this one does not.** As specified: for a chained event, look up **`slot(E)` exactly as §5.2.1 defines it** — this step reproduces no part of that tuple and reads it whole; for an unchained event, the per-type rule in §5.2.1's box. **For a chained event whose `hand_id` names a hand this receiver has completed, this step is *skipped* and step 10b is the whole of its anti-replay rule — normative, and this is the disposition of `N2`.** §5.3's `event_class == 0` store is one map per table per hand and is dropped when the hand ends, so there is no slot to look such an event up in and **none is created**: no `hand_id` a sender chooses causes an allocation of any kind, here or anywhere in the pipeline. **One exception, and it is the only structure that outlives its hand:** the checkpoint-8 `STATE_ACK` band of §4.9, whose slots §5.3 retains until `TERMINAL(k+1)`; an event landing there is looked up here exactly as a live one is. Skipping the step gives up nothing a stale event could use, because step 10b applies none of them, enters none in a `stage_hash` and counts none into a `P` of an initialised hand — so there is no effect for a duplicate to repeat. §5.3 states the bound and the one capability the skip does give up | violation or duplicate-drop |
-| 10b | **Stale hand — normative, and this is the disposition of `L4`.** If the envelope's `hand_id` names a hand this receiver has **completed**, a chained event is *not* dropped for arriving late. Step 10a has been skipped for it (above) and this step is its whole anti-replay rule. It is evaluated against that hand's **retained record** (§5.3): if the record says this receiver **was** in the solitary regime for that hand (§3.2, past tense) and `sender_seat` is outside the recorded **`P(hand_id - 1)`** — the required emitter set *of the hand the event names*, never `P(hand_id)`; §3.2's rule and step 12 both say `P(k-1)` and this step now says the same thing, which is `N7` — and the type is neither of the two exempt cases, it routes to step 12a; if it is a checkpoint-8 `STATE_HASH` (§4.9) it is compared against the retained `checkpoint8_state_hash`, and a **mismatch** enters §6.3 at step 1 and, where the record says the hand was solitary, routes to step 12a with it (`N1`), while a **match** from a seat outside the recorded set adds its sender to §4.9's readmission set, as a `0x0804 PLAYER_SIT_IN` of that hand's boundary window does (`N5`); otherwise it is dropped as out of stage, exactly as before. It is **never applied**, never enters a `stage_hash`, **counts into no `P` of a hand this receiver has already initialised**, and **enlarges no required emitter set of any hand — `P2`**: §4.9's readmission set is read once, at the next hand init, where it widens that stage's *accepted* emitter set and not its required one, which is the entire exception and is the reason a replay of this event is inert. **One more disposition, and it is the shrink-side twin of readmission (§4.9's late-roster-repair box):** a `TIMEOUT_CERT` of a hand this receiver ended by an **abort**, verified against that hand's own roster, banks its roster half — position-free, D-024 point 1 — for as long as `HAND_INIT(hand_id + 1)` has not completed at this receiver; a bank that changes `R(hand_id + 1)` re-derives that hand's opening and re-opens it at the corrected genesis. Nothing is applied, nothing is chained, and a settled hand banks nothing. It never reaches step 13 | freeze, compare, readmit, repair, or drop |
+| 10b | **Stale hand — normative, and this is the disposition of `L4`.** If the envelope's `hand_id` names a hand this receiver has **completed**, a chained event is *not* dropped for arriving late. Step 10a has been skipped for it (above) and this step is its whole anti-replay rule. It is evaluated against that hand's **retained record** (§5.3): if the record says this receiver **was** in the solitary regime for that hand (§3.2, past tense) and `sender_seat` is outside the recorded **`P(hand_id - 1)`** — the required emitter set *of the hand the event names*, never `P(hand_id)`; §3.2's rule and step 12 both say `P(k-1)` and this step now says the same thing, which is `N7` — and the type is neither of the two exempt cases, it routes to step 12a; if it is a checkpoint-8 `STATE_HASH` (§4.9) it is compared against the retained `checkpoint8_state_hash`, and a **mismatch** enters §6.3 at step 1 and, where the record says the hand was solitary, routes to step 12a with it (`N1`), while a **match** from a seat outside the recorded set adds its sender to §4.9's readmission set, as a `0x0804 PLAYER_SIT_IN` of that hand's boundary window does (`N5`); otherwise it is dropped as out of stage, exactly as before. It is **never applied**, never enters a `stage_hash`, **counts into no `P` of a hand this receiver has already initialised**, and **enlarges no required emitter set of any hand — `P2`**: §4.9's readmission set is read once, at the next hand init, where it widens that stage's *accepted* emitter set and not its required one, which is the entire exception and is the reason a replay of this event is inert. **One more disposition, and it is the shrink-side twin of readmission (§4.9's late-roster-repair box):** a `TIMEOUT_CERT` of a hand this receiver ended by an **abort**, verified against that hand's own roster, banks its roster half — position-free, D-024 point 1 — for as long as `HAND_INIT(hand_id + 1)` has not completed at this receiver; a bank that changes `R(hand_id + 1)` re-derives that hand's opening and re-opens it at the corrected genesis. Nothing is applied, nothing is chained, and a settled hand banks no timeout certificate. **Its grow-side twin (D-028, §8.3.1):** a `RETURN_CERT` of a hand this receiver has **settled**, verified against that hand's own roster and against the evidence it carries, banks its subject into `IN(hand_id)` under the same retention, and a bank that changes `R(hand_id + 1)` re-derives that hand's opening the same way. It never reaches step 13 | freeze, compare, readmit, repair, or drop |
 | 11 | Decode the payload struct, canonicality gate, per-field range checks | violation |
 | 12 | Stage legality: is this `event_type` from this seat expected at this `sequence`? **And the stage-contribution rule: a seat that has already contributed to a stage may not contribute to it again under a different `event_type`** — the one exception is the terminal `HAND_ABORT` of §4.10, which by construction lands at a stage its emitter has usually already contributed to, and which is also one of the two events exempt from step 10a's chain-position rule (§4.10; the other is a boundary event, whose parent is `TERMINAL(k)`). **And the solitary-stage rule (§3.2): if this receiver was in the solitary regime for the hand this event names and the sender is outside `P(k-1)`, the event is a state divergence and not a rejection — see step 12a.** And **an out-of-set checkpoint-8 `STATE_HASH` is not an out-of-stage event**: §4.9's box widens the accepted set at that one stage and this step must not reject it | violation |
 | 12a | **Solitary-regime divergence (§3.2, K1).** Reached when step 12 says so, **and when step 10b says so for a hand already finished** — the second route is what makes the rule able to fire at all (`L4`). The event is *not* rejected, *not* applied, and *not* counted into any `P`: the receiver enters §6.3 step 1 and freezes, and the freeze is **latched** — released by §6.3 step 3's reconciliation stage alone, which §4.9 requires of at least two seats, and by nothing else. **Two cases are exempt from reaching this step on arrival** and fall through to ordinary handling: `0x0804 PLAYER_SIT_IN` (§4.10), the one message a seat outside `P` exists to be able to send, and a **checkpoint-8 `STATE_HASH`** (§4.9), which is compared instead. **The second exemption is from arrival and not from disagreement (`N1`):** a checkpoint-8 `STATE_HASH` whose value differs from this receiver's own, on a hand the retained record says was solitary, reaches this step with the same finding and the same latch (§4.9, §6.3 step 1) | **freeze; §6.3** |
@@ -3424,6 +3424,73 @@ one. That rule put a wall-clock read back inside the chain-building rule, which
 D-006 and §8.2 forbid; `CERT_SETTLE_MS` is deleted from §13, and Q-04 is closed
 by this ruling (§12).
 
+**`0x0603 RETURN_VOTE`** — *the grow side of the roster (D-028, `S1-BM`)*
+
+*Direction:* single-writer, one per voter per subject. The voters are
+`R(k) \ OUT(k)` — the roster of hand `k` less the subjects of complete
+`TIMEOUT_CERT`s of hand `k` — taken **before** any return is added
+(`READMISSION.md` §5, correction 1), and written without `dealt_in` or `grace`,
+which are per-receiver.
+*Legal:* only at the boundary of a hand that **settled**: `TERMINAL(k)` is the
+`HAND_COMPLETE` stage hash (correction 2 — a receiver that reached the
+settlement by §4.10's late road holds no checkpoint of its own and is a party to
+this all the same); only about a seat **outside** `R(k)` that occupies a seat of
+the table with chips; only when the voter holds the subject's signed
+`PLAYER_SIT_IN` of this boundary and the subject's signed checkpoint-8
+`STATE_HASH` whose value is the voter's own. A vote does nothing alone.
+*Envelope:* `chain_scope = 1`, `event_class = 1`, `hand_id = k`,
+**`sequence = RETURN_SEQUENCE_BASE + subject_seat`** and
+**`previous_event_hash = TERMINAL(k)`** — the subject's slot on the terminal,
+for every voter, so a vote sealed anywhere else is not a vote about this
+boundary at any receiver. The band `8 224 … 8 233` is disjoint from the stages,
+from §4.10's window and from §4.9's checkpoint band (§13).
+
+| Field | Type | Limit / rule |
+|---|---|---|
+| `n(0) subject_seat` | `u8` | `< MAX_SEATS`, outside `R(k)`, not the voter |
+| `n(1) terminal` | `bytes[32]` | `TERMINAL(k)`, equal to the envelope's parent |
+| `n(2) request_hash` | `bytes[32]` | `event_hash` of the subject's `PLAYER_SIT_IN` at this boundary |
+| `n(3) state_hash` | `bytes[32]` | the subject's checkpoint-8 value, which the voter attests is its own |
+
+*Receiver must validate:* the envelope binding above; `subject_seat` is not the
+sender's seat; the sender is in `R(k) \ OUT(k)`; the subject is outside `R(k)`;
+`terminal` is this receiver's **settled** terminal — held while this receiver
+has no terminal yet or a different settlement, refused when its terminal is an
+abort's. Payload cap `RETURN_VOTE_CAP = 160`.
+
+**`0x0604 RETURN_CERT`** — *collective, the shape of `0x0602` (D-028)*
+
+*Direction:* **collective stage**; the required emitter set is the voter set
+above, each voter emitting its own copy from the votes it holds — never from a
+peer's certificate.
+*Legal:* only when a `RETURN_VOTE` about one subject has been collected from
+**every** voter, and `|voters| >= 2`. The floor is met heads-up: the subject is
+outside `R(k)`, so removing it removes nothing (correction 3).
+*Envelope:* `chain_scope = 1`, **`event_class = 2`**, the same `sequence` and
+parent as the votes it carries.
+
+| Field | Type | Limit / rule |
+|---|---|---|
+| `n(0) subject_digest` | `bytes[32]` | `h("p2p-poker v1 return-cert", [u8(subject_seat), terminal, request_hash, state_hash])` |
+| `n(1) votes` | `Vec<bytes>` | 2 … `MAX_SEATS - 1` entries, each a complete `SignedEvent` of a `RETURN_VOTE`, ascending by voter seat, all about one subject |
+| `n(2) request` | `bytes` | the subject's complete signed `PLAYER_SIT_IN` of this boundary |
+| `n(3) checkpoint` | `bytes` | the subject's complete signed checkpoint-8 `STATE_HASH` of hand `k` |
+
+*Receiver must validate:* every carried vote independently, as above; one
+subject; no voter twice; the certificate sealed at the slot its votes name;
+`subject_digest` recomputes; **the carried evidence opens as the subject's
+own** — the request at the subject's window slot on `terminal` with the
+canonical empty payload, the checkpoint at round 0's hash slot on `terminal`
+naming checkpoint 8 with `transcript_head = terminal`, both signed by the key
+the roster holds for the seat — and it is what the votes name; the emitter is a
+voter; the voter set is exactly `R(k) \ OUT(k)` as this receiver derives it, a
+strict subset refused and a superset held; and where this receiver holds a
+checkpoint-8 value of its own it equals `state_hash`, while a receiver with
+none accepts the voters' unanimous word (correction 2). Payload cap
+`RETURN_CERT_CAP = 8 192`. **Effect:** the subject enters `IN(k)`, and
+`R(k+1) = ((R(k) \ OUT(k)) ∪ IN(k)) ∩ ALIVE(k+1)` (§8.3.1). Banked once per
+subject digest; a redelivery is inert.
+
 ### 4.9 Group 7 — synchronisation and disputes
 
 Codes `0x0700`–`0x07FF`. Semantics in §6.
@@ -4534,7 +4601,11 @@ until it busts.
 **`0x0804 PLAYER_SIT_IN`** — single-writer stage in the boundary window defined
 above: `hand_id = k`, `sequence = BOUNDARY_SEQUENCE_BASE + seat`, parent
 `TERMINAL(k)`. No fields beyond the envelope. Takes effect from the next
-`HAND_INIT`, never mid-hand.
+`HAND_INIT`, never mid-hand. **Two effects by two roads (D-028):** at a
+receiver whose window is open it writes §4.9's readmission set `A`, which
+widens the accepted set of `HAND_INIT(k+1)` and moves no roster; and it is
+the first half of the evidence a `RETURN_CERT` carries (§4.8, §8.3.1),
+which is the one road by which a seat re-enters `R(k+1)`.
 
 **It is one of the two cases exempt from §3.2's solitary-stage rule**, and the
 exemption is not incidental: a solitary peer that treated it as a contradiction
@@ -4667,6 +4738,8 @@ means it does not and never can be.
 | `0x0505` | `ACTION_FOLD` | table mesh | 1 | single | `player_to_act` |
 | `0x0601` | `TIMEOUT_VOTE` | table mesh | 1 (`event_class = 1`, keyed also on `subject_seat`) | — | **none in version 1 (D-015)** — defined emitter is the required voters |
 | `0x0602` | `TIMEOUT_CERT` | table mesh | 1 (`event_class = 2`, keyed also on `subject_digest`) | collective | **none in version 1 (D-015)** — defined emitter is the required voters |
+| `0x0603` | `RETURN_VOTE` | table mesh | 1 (`event_class = 1`, keyed also on `subject_seat`) | — | `R(k) \ OUT(k)`, the voters of hand `k`'s boundary (§4.8, D-028) |
+| `0x0604` | `RETURN_CERT` | table mesh | 1 (`event_class = 2`, keyed also on `subject_digest`) | collective | the same voters, each its own copy (§4.8, §8.3.1) |
 | `0x0701` | `STATE_HASH` | table mesh | 1 | collective | required of `P(k-1)` at checkpoints 2–7; `P(0)` at checkpoint 1; **`P(k)` at checkpoint 8, and there accepted and compared from any occupied seat, in-set or not**; in a **reconciliation round**, `R(c) ∪ W` — never fewer than two seats — §4.9 |
 | `0x0702` | `STATE_ACK` | table mesh | 1 | collective | the set of the `STATE_HASH` stage it confirms, at every checkpoint including 8 and in every reconciliation round; **at checkpoint 8 it is accepted until `TERMINAL(k+1)` and not only until `HAND_INIT(k+1)`** — §4.9 |
 | `0x0703` | `DISPUTE` | table mesh | **0** | out-of-stage | any participant |
@@ -4676,15 +4749,15 @@ means it does not and never can be.
 | `0x0804` | `PLAYER_SIT_IN` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; the one type a seat outside `P(k)` may emit |
 | `0x0805` | `PLAYER_LEAVE` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; counts into no `P` (§3.2) |
 
-39 message types. Lobby chat is on `/p2p-poker/lobby-chat/1` and not on the lobby
+41 message types. Lobby chat is on `/p2p-poker/lobby-chat/1` and not on the lobby
 topic, so §1.4's "a message on the wrong channel is dropped" rule covers it like
 any other.
 
-**Two of the 39 rows have no emitter in version 1, and the count stays 39
+**Two of the 41 rows have no emitter in version 1, and the count stays 41
 (D-015).** `0x0601` and `0x0602` keep their rows, their codes, their
 `chain_scope`, their `event_class` and their stage kinds, so the table remains
 the complete register of the wire and a later version adds an emitter rather
-than a row. **The remaining 37 are the whole of the traffic this version
+than a row. **The remaining 39 are the whole of the traffic this version
 produces**, and the two exceptions are marked in the `Emitter` column rather
 than deleted from the table, because a deleted row is how a code point gets
 reused. The interleaving table below keeps its rows 31 and 32 for the same
@@ -7025,6 +7098,73 @@ D-006 point 2 are satisfied and nothing is signed on an absent player's behalf.
 This resolution applies where `|V| >= 2` only; below the floor D-007 and D-008
 supersede D-006 and there is no auto-action event of any kind.
 
+### 8.3.1 The return certificate — the grow side of the roster (D-028, `S1-BM`)
+
+> **Normative.** The roster of hand `k+1` is
+>
+> ```text
+> R(k+1) = ((R(k) \ OUT(k)) ∪ IN(k)) ∩ ALIVE(k+1)
+> ```
+>
+> where `OUT(k)` is the subject set of complete `TIMEOUT_CERT`s of hand `k` and
+> `IN(k)` the subject set of complete `RETURN_CERT`s of hand `k` (§4.8). Both
+> directions are certificate-gated: neither `P(k)` nor §4.9's per-receiver
+> readmission set `A` ever reaches a required emitter set, which is what D-012
+> demands of anything that enters `GENESIS(k+1)`. `A` keeps its one effect — it
+> widens the **accepted** set of `HAND_INIT(k+1)` — and gains none. The
+> `TIMEOUT_CERT` rules of §8.3 are unchanged.
+>
+> **The rules, in the order a receiver applies them.**
+>
+> 1. **Settled boundaries only.** A return is voted on and certified only where
+>    `TERMINAL(k)` is the `HAND_COMPLETE` stage hash. The condition is that chain
+>    fact and not *this receiver holds a checkpoint*: a receiver that reached the
+>    settlement by §4.10's late road holds the settlement's terminal and no
+>    checkpoint of its own, and it accepts a certificate it cannot compare on the
+>    voters' unanimous word rather than refusing it — refusing would be the
+>    permanent fork with no dissent and no attacker. There is no return at a
+>    boundary the table aborted.
+> 2. **The voter set is `R(k) \ OUT(k)`, before any return is added**, written
+>    without `dealt_in` or `grace`, both per-receiver. Two seats returning at one
+>    boundary share one voter set, and their two certificates applied in either
+>    order derive one `R(k+1)`.
+> 3. **Only on the subject's own signed request** — a `PLAYER_SIT_IN` sealed in
+>    §4.10's window at the subject's slot on `TERMINAL(k)` — and only with the
+>    subject's own signed checkpoint-8 `STATE_HASH`, whose value each voter
+>    attests is its own. The certificate carries both, so a receiver that never
+>    heard the subject verifies the whole claim itself: D-024's *the artefact
+>    proves its own position*, applied to the subject.
+> 4. **The subject is outside `R(k)`, occupies a seat, and has chips.** A seat
+>    inside the roster decides nothing by asking; a busted seat is
+>    `∩ ALIVE(k+1)`'s business and is refused at the vote and at the certificate
+>    alike.
+> 5. **Unanimous, floor two, byte-identical.** Every voter seals its own copy
+>    from the votes it holds, never from a peer's certificate; the floor is met
+>    heads-up.
+> 6. **Banked once per subject digest, position-free.** A bank on a hand this
+>    receiver has already derived `k+1` from re-derives `Opening(k+1)` through the
+>    one derivation every seat runs and re-opens it from a sequence 0 this
+>    receiver never left — D-027's road, now on the settled path. A returned
+>    seat's allowance is refilled at the derivation, so it is required **and
+>    dealt in** at `k+1` (correction 4: `grace` is not left as an unowned gate
+>    between the roster growing and the player playing).
+>
+> **What it costs.** A return costs two hands: a seat certified out at the
+> boundary of hand `j` plays no part in `j+1`, asks at `j+1`'s settled boundary,
+> and is dealt into `j+2`. On a carrier that aborts most hands the wait is
+> unbounded and this rule does not bound it (correction 5). **The automation
+> belongs to the client**: it sends the request at every settled boundary where
+> its seat is outside the roster with chips, so the player clicks nothing and
+> sees *sitting in at the next hand*; `--stay-out` withholds it, which is how a
+> seat watches a table it has chips at without being dealt in.
+>
+> **Guard.** `src/table/hand.rs`'s `return_voters` is scanned by its own test
+> for the two forbidden words; the whole road is
+> `a_return_certificate_puts_the_seat_back_into_the_roster_at_one_genesis`, the
+> late road `a_receiver_without_a_checkpoint_of_its_own_accepts_on_the_voters_word`,
+> and each rule above was broken on purpose and seen red before this section
+> was written — `S1-BM`'s row lists the fifteen mutations.
+
 ### 8.4 Simultaneous failures
 
 > **D-015 dissolves this section's problem rather than answering it.** No
@@ -7833,6 +7973,12 @@ BOUNDARY_CHECKPOINT_BASE        = 8 192         (§4.9's checkpoint-8 box;
   so the band is the sixteen values 8 192 .. 8 207. It sits ABOVE the boundary
   window because a reconciliation round extends upwards and must never reach the
   window's reserved per-seat slots.)
+RETURN_SEQUENCE_BASE            = 8 224         (§4.8's return band, D-028; a
+  RETURN_VOTE and a RETURN_CERT about seat s of chain k are sealed at
+  RETURN_SEQUENCE_BASE + s, parented on TERMINAL(k), so the band is the ten
+  values 8 224 .. 8 233, above the last reconciliation ack at 8 207 with room
+  to spare. The three boundary bands never meet; `returnwire::tests` holds
+  that.)
 MAX_RETAINED_HAND_RECORDS       = 4 096         (§5.3's retained hand record, the
   per-hand (hand_id, was_solitary, p, checkpoint8_state_hash) tuple §4.0 step 10b
   evaluates a stale-hand event against, where p is P(hand_id - 1) and was_solitary

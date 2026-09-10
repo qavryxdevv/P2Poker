@@ -20,6 +20,8 @@
 //! p2p-poker --port 4242           listen on a fixed port, to forward on a router
 //! p2p-poker --autoplay [ms]       act at once (or after ms): a measurement mode
 //!                                 that plays for you, for timing a hand
+//! p2p-poker --stay-out            never ask to be dealt back in after being
+//!                                 certified out of a table
 //! ```
 //!
 //! `--renderer` is there to be overridden, not to be typed. The client draws
@@ -266,6 +268,13 @@ fn main() {
         None
     };
 
+    // `--stay-out`: a seat certified out of the roster does not ask to be
+    // dealt back in (`S1-BM`). The client asks at every boundary by default,
+    // on the player's behalf; this is the one way to watch a table from a
+    // seat with chips without being dealt in, and what a measurement run
+    // uses to hold a seat out on purpose.
+    let stay_out = has("--stay-out");
+
     // Multicast discovery, on unless refused. `--no-mdns` exists to prove the
     // other path: with it on, two clients on one wire find each other in under
     // a second whatever the DHT does, so a run that means to test the DHT has
@@ -315,6 +324,7 @@ fn main() {
         local_discovery,
         port,
         autoplay,
+        stay_out,
     };
 
     if has("--headless") {
@@ -467,6 +477,7 @@ fn headless(player: Player, run: Run, join: Option<String>) {
         local_discovery,
         port,
         autoplay,
+        stay_out,
         ..
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
@@ -491,6 +502,7 @@ fn headless(player: Player, run: Run, join: Option<String>) {
                 port,
                 profile_dir,
                 autoplay,
+                stay_out,
             };
             if let Err(e) = p2p_poker::net::run::run(cfg).await {
                 eprintln!("node stopped: {e}");
@@ -713,6 +725,8 @@ struct Run {
     /// `--autoplay`: act at once, or after this long. A measurement mode that
     /// plays for its owner; see where it is parsed.
     autoplay: Option<std::time::Duration>,
+    /// `--stay-out`: never ask to be dealt back in (`S1-BM`).
+    stay_out: bool,
 }
 
 fn windowed(player: Player, run: Run) -> Started {
@@ -730,6 +744,7 @@ fn windowed(player: Player, run: Run) -> Started {
         local_discovery,
         port,
         autoplay,
+        stay_out,
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     // The same headroom as the headless path, for the same reason.
@@ -764,6 +779,7 @@ fn windowed(player: Player, run: Run) -> Started {
             port,
             profile_dir: node_dir,
             autoplay,
+            stay_out,
         };
         if let Err(e) = p2p_poker::net::run::run(cfg).await {
             eprintln!("node stopped: {e}");
