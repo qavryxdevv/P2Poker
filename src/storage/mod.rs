@@ -2,3 +2,4 @@
 //! Nothing outside this directory, no registry, no installer.
 pub mod profile;
 pub mod settings;
+pub mod session;

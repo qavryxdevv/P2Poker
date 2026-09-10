@@ -362,6 +362,129 @@ impl Opening {
         })
     }
 
+    /// `S1-CR`: the opening of a hand this client did not derive, adopted from
+    /// the members' own signed `HAND_INIT` copies -- a client that restarted,
+    /// rejoined the group and holds no hand, or one that sat down at a table
+    /// already playing.
+    ///
+    /// **What is trusted and what is checked.** Every copy is opened as a
+    /// chain-`hand_id` stage-0 event of this table, signed by a key the roster
+    /// holds; copies are grouped by `(parent, body bytes)` -- the parent of a
+    /// stage-0 event is `GENESIS(k)` and the body is the derivation's whole
+    /// output -- and the group with the most distinct seats is taken only when
+    /// it holds a **strict majority of the occupied seats**, so a minority fork
+    /// is never followed. The body's stacks must hash to the roster hash it
+    /// names (§4.4 `n(10)`), and its blinds must be the schedule's for this
+    /// hand, so a majority cannot name stacks or blinds the table does not
+    /// have. What the group signed becomes the opening: the genesis, the
+    /// stacks, the button, the level and blinds, and `required` -- the seats
+    /// that signed, which is `R(k)` exactly when every required seat's copy is
+    /// in the group, and the checkpoint at the end of the hand says whether it
+    /// was (a different set is a different stage-0 hash, and a different
+    /// checkpoint earns no return; the client adopts again at the next
+    /// boundary). `readmitted`, `grace` and `present_run` are this receiver's
+    /// own and start fresh.
+    ///
+    /// `base` carries what the copies do not: the table, the session, the
+    /// roster's keys, this client's seat, and the advertised parameters.
+    pub fn adopt(base: Opening, copies: &[Vec<u8>]) -> Result<Opening, Failed> {
+        use std::collections::BTreeMap;
+        let occupied: Vec<SeatIdx> = base.seats.iter().map(|(s, _, _)| *s).collect();
+        // (parent, body bytes) -> (seats that signed exactly this, the body)
+        let mut groups: BTreeMap<(Hash, Vec<u8>), (BTreeSet<SeatIdx>, HandInit)> = BTreeMap::new();
+        for raw in copies {
+            let Ok(opened) = chained::open_in_hand(
+                raw,
+                FRAME_CAP,
+                EventType::HandInit,
+                &base.table_id,
+                base.hand_id,
+            ) else {
+                continue;
+            };
+            if opened.envelope.sequence != 0 {
+                continue;
+            }
+            let Some(seat) = base
+                .seats
+                .iter()
+                .find(|(_, k, _)| *k == opened.sender)
+                .map(|(s, _, _)| *s)
+            else {
+                continue;
+            };
+            let Ok(body) = chained::payload::<HandInit>(&opened, HAND_INIT_CAP) else {
+                continue;
+            };
+            if body.hand_id != base.hand_id || body.self_consistent(base.max_players).is_err() {
+                continue;
+            }
+            let entry = groups
+                .entry((opened.envelope.previous_event_hash, opened.envelope.payload.clone()))
+                .or_insert_with(|| (BTreeSet::new(), body));
+            entry.0.insert(seat);
+        }
+        let Some(((genesis, _), (signers, body))) = groups.into_iter().max_by_key(|(_, (s, _))| s.len())
+        else {
+            return Err(Failed::NotYet);
+        };
+        if signers.len() * 2 <= occupied.len() {
+            return Err(Failed::NotYet);
+        }
+        if body.stacks.len() != base.seats.len() {
+            return Err(Failed::Elsewhere {
+                seat: base.my_seat,
+                what: "the copies carried one stack per occupied seat",
+            });
+        }
+        let seats: Vec<(SeatIdx, [u8; 32], u64)> = base
+            .seats
+            .iter()
+            .zip(body.stacks.iter())
+            .map(|((s, k, _), stack)| (*s, *k, *stack))
+            .collect();
+        let roster: Vec<crate::protocol::transcript::RosterSeat> = seats
+            .iter()
+            .map(|(seat, key, stack)| crate::protocol::transcript::RosterSeat {
+                seat: *seat,
+                app_public_key: *key,
+                stack_at_hand_start: *stack,
+            })
+            .collect();
+        if crate::protocol::transcript::roster_hash(&roster) != body.roster_hash {
+            return Err(Failed::Elsewhere {
+                seat: base.my_seat,
+                what: "the copies' stacks hashed to the roster hash they name",
+            });
+        }
+        let small_blind = crate::poker::tournament::small_blind_at(
+            u32::try_from(base.hand_id).unwrap_or(u32::MAX),
+            u32::from(base.every_n_hands),
+            base.first_small_blind,
+            base.small_blind_cap,
+        );
+        if body.small_blind != small_blind || body.big_blind != small_blind.saturating_mul(2) {
+            return Err(Failed::Elsewhere {
+                seat: base.my_seat,
+                what: "the copies' blinds were the schedule's for this hand",
+            });
+        }
+        Ok(Opening {
+            genesis,
+            required: signers.into_iter().collect(),
+            readmitted: Vec::new(),
+            seats,
+            small_blind: body.small_blind,
+            big_blind: body.big_blind,
+            level: body.level,
+            button: Some(body.button_position),
+            roster_hash: body.roster_hash,
+            grace: vec![GRACE_HANDS; usize::from(base.max_players)],
+            present_run: vec![0; usize::from(base.max_players)],
+            ..base
+        })
+    }
+
     /// Why `from_formation` would decline, or `None` if it would not.
     ///
     /// `from_formation` has four `?`s and no voice. It is the **only** road into
@@ -13245,6 +13368,202 @@ mod tests {
         let opened = chained::open(&first, FRAME_CAP, EventType::PlayerSitIn, &slot).expect("at seat 2's slot on the terminal");
         assert_eq!(opened.sender, keys[2].verifying_key().to_bytes());
         assert_eq!(opened.envelope.payload, crate::table::seatwire::SIT_IN_PAYLOAD.to_vec());
+    }
+
+
+    // ------------------------------------------------------------------ S1-CR
+
+    /// Play one hand among `members` (indices into `hands`, which may also hold
+    /// bystanders that follow), delivering every send to every other hand in
+    /// FIFO order and acting for whoever is to act, until every member has
+    /// settled. Returns every frame that went out, in order.
+    fn play_out(
+        hands: &mut Vec<Hand>,
+        keys: &[SigningKey],
+        members: &[usize],
+        first: Vec<(usize, Vec<Send>)>,
+    ) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        let mut queue: std::collections::VecDeque<(usize, Vec<Send>)> = std::collections::VecDeque::from(first);
+        for _ in 0..4096 {
+            if let Some((from, sends)) = queue.pop_front() {
+                if sends.is_empty() {
+                    continue;
+                }
+                frames.extend(bytes_of(&sends));
+                for to in 0..hands.len() {
+                    if to == from {
+                        continue;
+                    }
+                    let out = deliver(&mut hands[to], &sends, &keys[to]);
+                    if !out.is_empty() {
+                        queue.push_back((to, out));
+                    }
+                }
+                continue;
+            }
+            if members.iter().all(|m| hands[*m].betting_over()) {
+                break;
+            }
+            let Some(seat) = members.iter().find_map(|m| hands[*m].turn().map(|t| usize::from(t.seat))) else {
+                panic!("nothing in flight, nobody to act, and the hand is not over");
+            };
+            let turn = hands[seat].turn().expect("that hand agrees it is to act");
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let out = hands[seat].act(action, &keys[seat], NOW).unwrap();
+            queue.push_back((seat, out));
+        }
+        frames
+    }
+
+    /// Four seats, three of them the roster, hand 1 played to settlement at
+    /// all four (seat 3 follows as a bystander and is the control: its own
+    /// `next_hand` is what an adopter must arrive at without having followed).
+    fn a_table_after_hand_one() -> (Vec<Hand>, Vec<SigningKey>) {
+        let keys: Vec<SigningKey> = (10..14).map(key).collect();
+        let mut hands = Vec::new();
+        let mut first = Vec::new();
+        for seat in 0..4u8 {
+            let mut o = opening4(seat);
+            o.required = vec![0, 1, 2];
+            let (h, sends) = Hand::open(o, &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            first.push((usize::from(seat), sends));
+        }
+        play_out(&mut hands, &keys, &[0, 1, 2], first);
+        for h in &hands {
+            assert!(h.betting_over() && h.checkpoint8().is_some(), "hand 1 settled everywhere");
+        }
+        (hands, keys)
+    }
+
+    /// The members' signed `HAND_INIT(2)` copies, and their hands of hand 2.
+    fn hand_two_copies(hands: &[Hand], keys: &[SigningKey]) -> (Vec<Vec<u8>>, Vec<Hand>) {
+        let mut copies = Vec::new();
+        let mut opened = Vec::new();
+        for m in 0..3usize {
+            let o = hands[m].next_hand().expect("a member derives hand 2");
+            let (h, sends) = Hand::open(o, &keys[m], NOW, 30_000).unwrap();
+            let mut b = bytes_of(&sends);
+            assert_eq!(b.len(), 1, "one HAND_INIT from a member");
+            copies.push(b.remove(0));
+            opened.push(h);
+        }
+        (copies, opened)
+    }
+
+    /// The fresh client's `base`: what it knows without having followed --
+    /// the table, the session, the roster's keys, its seat, the advertised
+    /// parameters -- with placeholders where the copies decide.
+    fn adopter_base() -> Opening {
+        let mut o = opening4(3);
+        o.hand_id = 2;
+        o.required = Vec::new();
+        o.genesis = [0; 32];
+        o.roster_hash = [0; 32];
+        o
+    }
+
+    /// The fields a genesis commits to, or that every member derived alike.
+    fn committed(o: &Opening) -> (Hash, u64, Hash, Hash, Hash, Vec<SeatIdx>, Vec<(SeatIdx, [u8; 32], u64)>, u8, u64, u64, u16, Option<SeatIdx>) {
+        (o.table_id, o.hand_id, o.session_id, o.roster_hash, o.genesis, o.required.clone(), o.seats.clone(), o.max_players, o.small_blind, o.big_blind, o.level, o.button)
+    }
+
+    /// The adopted opening is the members' own -- and the control's, seat 3's
+    /// derivation after following hand 1 -- in every committed field, though
+    /// the adopter followed nothing.
+    #[test]
+    fn an_adopted_opening_is_the_members_own_field_by_field() {
+        let (hands, keys) = a_table_after_hand_one();
+        let control = hands[3].next_hand().expect("the control derives hand 2");
+        let (copies, _) = hand_two_copies(&hands, &keys);
+        let adopted = Opening::adopt(adopter_base(), &copies).expect("three of four occupied seats agree");
+        assert_eq!(committed(&adopted), committed(&control));
+        assert_eq!(adopted.my_seat, 3);
+        assert!(adopted.readmitted.is_empty());
+        assert_eq!(adopted.required, vec![0, 1, 2]);
+        assert_eq!(adopted.grace, vec![GRACE_HANDS; 4], "per-receiver accumulators start fresh");
+    }
+
+    /// A strict majority of the occupied seats, at one genesis: two of four
+    /// is not one, a fork among the copies leaves no majority, and a copy
+    /// signed by a key the roster does not hold counts for nothing.
+    #[test]
+    fn adoption_needs_a_strict_majority_of_the_roster_at_one_genesis() {
+        let (hands, keys) = a_table_after_hand_one();
+        let (copies, _) = hand_two_copies(&hands, &keys);
+        assert!(matches!(Opening::adopt(adopter_base(), &copies[..2]), Err(Failed::NotYet)), "two of four is not a majority");
+        assert!(matches!(Opening::adopt(adopter_base(), &[]), Err(Failed::NotYet)));
+        // A member that derived another genesis signs a copy nobody else holds.
+        let mut astray = hands[1].next_hand().unwrap();
+        astray.genesis = [9; 32];
+        let (_, sends) = Hand::open(astray, &keys[1], NOW, 30_000).unwrap();
+        let forked = vec![copies[0].clone(), bytes_of(&sends).remove(0), copies[2].clone()];
+        assert!(matches!(Opening::adopt(adopter_base(), &forked), Err(Failed::NotYet)), "two at one genesis, one at another: no majority of four");
+        // A stranger's copy, well-formed and signed, is not a roster seat's.
+        let table_id = hands[0].table_id();
+        let opened = chained::open_in_hand(&copies[0], FRAME_CAP, EventType::HandInit, &table_id, 2).unwrap();
+        let body: HandInit = chained::payload(&opened, HAND_INIT_CAP).unwrap();
+        let slot = Slot { table_id, hand_id: 2, sequence: 0, previous_event_hash: opened.envelope.previous_event_hash };
+        let stranger = chained::seal(EventType::HandInit, &slot, &body, &key(99), NOW, 30_000, HAND_INIT_CAP).unwrap();
+        assert!(matches!(Opening::adopt(adopter_base(), &[copies[0].clone(), copies[1].clone(), stranger.clone()]), Err(Failed::NotYet)));
+        let with_stranger = vec![copies[0].clone(), copies[1].clone(), copies[2].clone(), stranger];
+        assert!(Opening::adopt(adopter_base(), &with_stranger).is_ok(), "the three roster copies still carry it");
+    }
+
+    /// A majority that names stacks its own roster hash does not cover, or
+    /// blinds that are not the schedule's for this hand, is refused rather
+    /// than followed.
+    #[test]
+    fn adoption_refuses_a_majority_whose_stacks_or_blinds_do_not_add_up() {
+        let (hands, keys) = a_table_after_hand_one();
+        let (copies, _) = hand_two_copies(&hands, &keys);
+        let table_id = hands[0].table_id();
+        let opened = chained::open_in_hand(&copies[0], FRAME_CAP, EventType::HandInit, &table_id, 2).unwrap();
+        let body: HandInit = chained::payload(&opened, HAND_INIT_CAP).unwrap();
+        let slot = Slot { table_id, hand_id: 2, sequence: 0, previous_event_hash: opened.envelope.previous_event_hash };
+        let mut fat = body.clone();
+        fat.stacks[0] += 1;
+        let cooked: Vec<Vec<u8>> = (0..3usize)
+            .map(|m| chained::seal(EventType::HandInit, &slot, &fat, &keys[m], NOW, 30_000, HAND_INIT_CAP).unwrap())
+            .collect();
+        assert!(matches!(Opening::adopt(adopter_base(), &cooked), Err(Failed::Elsewhere { .. })), "stacks that do not hash to the roster hash");
+        let mut rich = body.clone();
+        rich.small_blind *= 2;
+        rich.big_blind *= 2;
+        let cooked: Vec<Vec<u8>> = (0..3usize)
+            .map(|m| chained::seal(EventType::HandInit, &slot, &rich, &keys[m], NOW, 30_000, HAND_INIT_CAP).unwrap())
+            .collect();
+        assert!(matches!(Opening::adopt(adopter_base(), &cooked), Err(Failed::Elsewhere { .. })), "blinds off the schedule");
+    }
+
+    /// The decisive test: the adopter opens hand 2 from the copies, follows
+    /// it as a bystander to the settlement, and holds the members' checkpoint
+    /// and terminal -- so `S1-BM`'s return can take it back at this boundary.
+    #[test]
+    fn an_adopted_hand_is_followed_to_the_members_own_checkpoint() {
+        let (hands, keys) = a_table_after_hand_one();
+        let (copies, members) = hand_two_copies(&hands, &keys);
+        let adopted = Opening::adopt(adopter_base(), &copies).unwrap();
+        let (adopter, sends) = Hand::open(adopted, &keys[3], NOW, 30_000).unwrap();
+        assert!(sends.is_empty(), "a bystander says nothing at stage 0");
+        let mut hands2: Vec<Hand> = members;
+        hands2.push(adopter);
+        let first: Vec<(usize, Vec<Send>)> = copies
+            .iter()
+            .enumerate()
+            .map(|(m, c)| (m, vec![Send::Broadcast(c.clone())]))
+            .collect();
+        play_out(&mut hands2, &keys, &[0, 1, 2], first);
+        assert!(hands2[3].betting_over(), "the adopter settled with the table");
+        assert!(hands2[0].checkpoint8().is_some() && hands2[0].terminal().is_some(), "the members hold a checkpoint and a terminal");
+        assert!(hands2[3].checkpoint8().is_some(), "and so does the adopter, of its own computing");
+        assert_eq!(hands2[3].terminal(), hands2[0].terminal(), "one TERMINAL(2)");
+        assert_eq!(hands2[3].checkpoint8(), hands2[0].checkpoint8(), "one end-of-hand state");
+        assert!(hands2[3].may_ask_to_sit_in(), "outside the roster with chips at a settled boundary: it asks");
+        // And its own derivation of hand 3 is the members' -- the required set
+        // it adopted was exact, which the agreeing checkpoint already said.
+        assert_eq!(committed(&hands2[3].next_hand().unwrap()), committed(&hands2[0].next_hand().unwrap()));
     }
 
 }

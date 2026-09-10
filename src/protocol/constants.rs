@@ -74,6 +74,13 @@ pub const RETURN_SEQUENCE_BASE: u64 = 8_224;
 /// the voters dealt hand k+1, and a heads-up hand leaves stage 0 in a tenth
 /// of a second, so the late-roster repair had nothing left to re-open.
 pub const RETURN_GRACE_MS: u64 = 6_000;
+/// How long a client keeps trying to rejoin an unfinished session (`S1-CR`)
+/// once the table's advertisement is gone and no peer of the session has
+/// answered: ten minutes, counted from the later of the last peer seen and
+/// the start of the attempt. While the advert is up the attempt never ends on
+/// a timer; a finished session is learned from the founder's refusal. A client
+/// liveness parameter, not a wire rule.
+pub const RESUME_GIVE_UP_MS: u64 = 600_000;
 
 /// How many reconciliation rounds the checkpoint band has room for.
 ///
