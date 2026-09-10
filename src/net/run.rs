@@ -842,6 +842,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut joined_ad: Option<super::lobby::TableAd> = None;
     let mut joined_advert_hash: Option<[u8; 32]> = None;
     let mut session_recorded = false;
+    // `S1-CR`: when this client last said its ratification again over the
+    // group -- in answer to a copy after the table was set, or asking for
+    // the others' while it holds a roster and no session.
+    let mut ratification_echo_ms: u64 = 0;
+    let mut ratification_asked_ms: u64 = 0;
+    let mut ratification_asked_said = false;
     if let Some(r) = resume.as_ref() {
         let _ = events
             .send(NodeEvent::UnfinishedSession {
@@ -4004,6 +4010,38 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 if link_is_down() {
                     continue;
                 }
+                // `S1-CR`: a ratification copy arriving after this client's
+                // session is set is a seat that lacks the others' -- a restarted
+                // client, whose gossipsub copy of ours is a Duplicate for two
+                // minutes and whose Tox copy went out before it was in the group
+                // (`run195623-3`: *ratified 1/3* for the rest of the run). Say
+                // ours again over the group, at most once in five seconds.
+                // `ever_dealt`: before the first deal every seat repeats its
+                // ratification on the housekeeping tick anyway, and answering
+                // those would be every seat echoing every seat.
+                if let Some(f) = table.as_ref().filter(|_| ever_dealt) {
+                    if f.session().is_some()
+                        && matches!(
+                            crate::net::chained::peek(&item.bytes, TABLE_FRAME_PEEK),
+                            Ok((crate::protocol::messages::EventType::TableReady, _, _))
+                        )
+                    {
+                        let now = super::node::now_unix_ms();
+                        if now.saturating_sub(ratification_echo_ms) >= 5_000 {
+                            ratification_echo_ms = now;
+                            let mut n = 0usize;
+                            for bytes in f.say_again(now) {
+                                tox_sink.try_broadcast(&bytes);
+                                n += 1;
+                            }
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "a ratification copy arrived after the table was set; said {n} message(s) again over the group"
+                                )))
+                                .await;
+                        }
+                    }
+                }
                 // **Formation traffic over the group, before there is a hand.**
                 //
                 // `S1-P`. Everything below this block is gated on a live `Hand`,
@@ -4497,6 +4535,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // `S1-CR`: a resuming client in the group with a roster and no
+                // session asks for the ratifications the way the protocol allows
+                // -- by saying its own again -- and a member answers with its own.
+                if resuming && hand.is_none() {
+                    if let Some(f) = table.as_ref() {
+                        if f.session().is_none() && f.my_seat().is_some() && tox_sink.is_on_tox() {
+                            let now = super::node::now_unix_ms();
+                            if now.saturating_sub(ratification_asked_ms) >= 5_000 {
+                                ratification_asked_ms = now;
+                                for bytes in f.say_again(now) {
+                                    tox_sink.try_broadcast(&bytes);
+                                }
+                                if !ratification_asked_said {
+                                    ratification_asked_said = true;
+                                    let _ = events
+                                        .send(NodeEvent::Warning(
+                                            "in the group with the roster and no session yet; saying my ratification again every five seconds until the others' come".into(),
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
                 // `S1-CR`: a resumed client with no hand adopts the running one
                 // from the members' own copies -- a strict majority of the
                 // occupied seats at one genesis, and stage 0 closed elsewhere
@@ -4925,6 +4987,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 act_by = None;
                 let Some(h) = hand.as_mut() else { continue };
                 let Some(turn) = h.turn().filter(|t| t.mine) else { continue };
+                // fault-harness: `P2P_POKER_STOP_ON_TURN_AFTER=<s>` stops this process
+                // at its first own turn at or after that second -- a client that
+                // dies while the table waits on it, which a TIMEOUT_CERT with a
+                // fold effect lets the table play past. A death mid-shuffle stalls
+                // the table to the hand deadline (D-015), which is why `S1-CR`'s
+                // measurement asks for this one.
+                if stop_on_turn_due(delay_since) {
+                    println!("fault-harness: stopping at my turn, as P2P_POKER_STOP_ON_TURN_AFTER asked");
+                    std::process::exit(0);
+                }
                 // Check when it is free, fold when it is not. Never call and
                 // never raise: a client that put its owner's chips in while
                 // they were away would be playing for them, and this is only
@@ -6973,6 +7045,24 @@ fn returning_seats(h: &crate::table::hand::Hand, sit_ins: &SitIns) -> Vec<u8> {
     v.dedup();
     v.retain(|s| !h.returned().contains(s) && !h.required().contains(s));
     v
+}
+
+/// fault-harness: whether `P2P_POKER_STOP_ON_TURN_AFTER` names a second this
+/// loop has reached. Read once; `false` in every build without the feature.
+fn stop_on_turn_due(since: tokio::time::Instant) -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let after = AFTER.get_or_init(|| {
+        std::env::var("P2P_POKER_STOP_ON_TURN_AFTER")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    match after {
+        Some(s) => since.elapsed().as_secs() >= *s,
+        None => false,
+    }
 }
 
 /// `S1-CR`: keep one frame of the running table for a client that holds no

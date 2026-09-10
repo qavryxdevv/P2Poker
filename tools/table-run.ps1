@@ -154,6 +154,12 @@ param(
     [ValidateRange(0, 32)][int]$MuteNode = 1,
     [switch]$MuteOnTurn,
     [ValidateRange(0, 3600)][int]$DropAt = 0,
+    # `-DropOnTurn`: the dropper stops at its first own turn at or after `-DropAt`
+    # rather than at the second itself, so the table plays past the death by a
+    # fold-effect certificate; a death mid-shuffle stalls the table to the hand
+    # deadline (D-015), which is longer than a run. The return waits for the stop.
+    # Needs a binary built with `--features fault-harness`.
+    [switch]$DropOnTurn,
     [ValidateRange(0, 600)][int]$DropFor = 20,
     # A seat slower than this to enter the Tox group keeps the logs, however
     # well the rest of the run went. Sixty seconds is far outside the ordinary
@@ -283,7 +289,8 @@ for ($i = 0; $i -lt $Seats; $i++) {
     # The dropper stops at `-DropAt` and is started again below. Its own `--for`
     # is cut to the outage's start; the second half gets the rest of the run.
     $dropping = ($DropAt -gt 0 -and $i -eq 1 -and -not $leaving)
-    if ($dropping) { $mine = $DropAt }
+    if ($dropping) { $mine = if ($DropOnTurn) { $DropAt + 150 } else { $DropAt } }
+    $stopOnTurn = if ($dropping -and $DropOnTurn) { $DropAt } else { 0 }
     $nodeArgs = @('--headless', '--autoplay', '--for', "$mine", '--profile', $profileDir)
     if ($i -eq 0) {
         $nodeArgs += @('--host', $table, '--seats', "$Seats")
@@ -295,14 +302,15 @@ for ($i = 0; $i -lt $Seats; $i++) {
     $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
     $stall = if ($StallJoin -gt 0 -and $i -eq $StallJoinNode) { $StallJoin } else { 0 }
     $mute = if ($MuteFor -gt 0 -and $i -eq $MuteNode) { $MuteFor } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn)
         if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
         if ($downAt -gt 0) {
             $env:P2P_POKER_LINK_DOWN_AT = "$downAt"
             $env:P2P_POKER_LINK_DOWN_FOR = "$downFor"
         }
         if ($stall -gt 0) { $env:P2P_POKER_STALL_JOIN = "$stall" }
+        if ($stopOnTurn -gt 0) { $env:P2P_POKER_STOP_ON_TURN_AFTER = "$stopOnTurn" }
         if ($mute -gt 0) {
             $env:P2P_POKER_MUTE_AT = "$muteAt"
             $env:P2P_POKER_MUTE_FOR = "$mute"
@@ -374,10 +382,23 @@ if ($MuteFor -gt 0) {
     Write-Host "    (S1-BM: expect the seat certified out, then asking to sit in at the next settled boundary, then dealt in; needs --features fault-harness)"
 }
 if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
-    Write-Host "==> n1 drops at $DropAt s and returns $DropFor s later, same profile"
-    $return = Start-Job -ArgumentList $Exe, $work, $table, $Seconds, $DropAt, $DropFor -ScriptBlock {
-        param($exe, $work, $table, $seconds, $dropAt, $dropFor)
-        Start-Sleep -Seconds ($dropAt + $dropFor)
+    if ($DropOnTurn) {
+        Write-Host "==> n1 stops at its first turn at or after $DropAt s and returns $DropFor s after that, same profile"
+        # The main thread has nothing else to do until the run ends, so it waits
+        # for the dropper's process here and starts the return when it is gone.
+        $null = Wait-Job -Job $jobs[1] -Timeout ($DropAt + 200)
+        $stoppedAt = [int](((Get-Date) - $t0).TotalSeconds)
+        Write-Host "==> n1 stopped at $stoppedAt s; back in $DropFor s"
+        $delay = $DropFor
+        $spent = $stoppedAt + $DropFor
+    } else {
+        Write-Host "==> n1 drops at $DropAt s and returns $DropFor s later, same profile"
+        $delay = $DropAt + $DropFor
+        $spent = $DropAt + $DropFor
+    }
+    $return = Start-Job -ArgumentList $Exe, $work, $table, $Seconds, $delay, $spent -ScriptBlock {
+        param($exe, $work, $table, $seconds, $delay, $spent)
+        Start-Sleep -Seconds $delay
         # **The same profile, deliberately.** It carries the identity and the
         # application key, so this is the seat coming back rather than a new
         # player taking one.
@@ -385,7 +406,7 @@ if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
         $log = Join-Path $work 'n1-again.log'
         $start = Get-Date
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
-        $left = $seconds - $dropAt - $dropFor
+        $left = $seconds - $spent
         if ($left -lt 30) { $left = 30 }
         # `--resume` (S1-CR): the returning process rejoins from its own session record;
         # `--join` stays as the name it would otherwise look for.

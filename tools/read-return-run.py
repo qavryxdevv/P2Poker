@@ -46,6 +46,33 @@ What refutes it: n1 without a hand for the rest of the run (*cannot be
 adopted*, or no *resumed at hand* line), a roster row with two values, or the
 founder refusing the rejoin.
 
+The prediction booked for the second S1-CR run (2026-09-10 20:26, after the
+ratification echo and the kill-at-turn knob; `tools/table-run.ps1 -Seats 3
+-Seconds 960 -DropAt 60 -DropFor 20 -DropOnTurn`). The first run of this shape,
+`run195623-3`, rejoined and then sat at *ratified 1/3* for the rest of the run
+because nobody sent the ratifications again, and its table stalled to the hand
+deadline because the seat died mid-shuffle (D-015):
+
+  1. n1 prints *fault-harness: stopping at my turn* at its first own turn at
+     or after 60 s; the table certifies its seat out on that action (a
+     TIMEOUT_CERT with a fold effect) and plays on heads-up at one genesis --
+     no *hand deadline* stall;
+  2. n1-again rejoins from the record, enters the group, prints *in the group
+     with the roster and no session yet; saying my ratification again*, and
+     both members print *a ratification copy arrived after the table was set;
+     said N message(s) again over the group*; n1-again's status line reaches
+     *ratified 3/3* within a minute of entering the group;
+  3. n1-again prints *resumed at hand #k as a bystander (seat 1) from 2
+     copies* and follows that hand to its settlement;
+  4. at that boundary it asks to sit in, the certificate banks everywhere,
+     the next hand opens at all three clients with three seats at one genesis,
+     and n1-again prints *back in the roster from hand #b on*;
+  5. no fork, no give-up, no forgotten record before the return.
+
+What refutes it: *ratified 1/3* past a minute in the group (the echo did not
+fire or did not arrive), a table waiting on seat 1 to the hand deadline (the
+stop did not land on a turn), or any of the first prediction's refuters.
+
 Prints, per node, the roster of every hand it opened, then the return road's
 own lines in time order across every node, then the per-hand roster
 agreement table. The harness numbers NODES and the table numbers SEATS: the
@@ -72,7 +99,8 @@ ROAD = re.compile(
     r'holding the next deal|no return certificate|dealing on|no longer held|'
     # S1-CR: the rejoin road of a restarted client
     r'resuming the unfinished|unfinished session|rejoining |resumed at hand|cannot be adopted|would not open|'
-    r'still outside the roster|back in the roster|session record|forgotten|gave up|already holds a seat')
+    r'still outside the roster|back in the roster|session record|forgotten|gave up|already holds a seat|'
+    r'stopping at my turn|ratification copy arrived|saying my ratification again|hand deadline')
 
 
 def lines(path):
