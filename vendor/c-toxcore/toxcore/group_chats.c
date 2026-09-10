@@ -6293,52 +6293,103 @@ static bool handle_gc_packet_fragment(const GC_Session *_Nonnull c, GC_Chat *_No
  * HANDSHAKES ARE NOT DROPPED, only the two packet kinds that feed the timer.
  * A node that could not handshake could never come back, and coming back is
  * the whole point. */
-static bool p2p_poker_deaf_to(const GC_Chat *_Nonnull chat, uint32_t peer_number)
+/* p2p-poker (patch 0025): the window's state is shared with the wire, below. */
+static int p2p_poker_deaf_state = 0;          /* 0 unread, 1 armed, -1 off */
+static uint32_t p2p_poker_deaf_only_peer = UINT32_MAX;
+static uint64_t p2p_poker_deaf_at_s = 0;
+static uint64_t p2p_poker_deaf_for_s = 0;
+static uint64_t p2p_poker_deaf_anchor = 0;
+static bool p2p_poker_deaf_uplink = false;
+
+static void p2p_poker_deaf_read_env(void)
 {
-    static int state = 0;          /* 0 unread, 1 armed, -1 off */
-    static uint32_t only_peer = UINT32_MAX;
-    static uint64_t at_s = 0;
-    static uint64_t for_s = 0;
-    static uint64_t anchor = 0;
-
-    if (state == 0) {
-        const char *at = getenv("P2P_POKER_DEAF_AT");
-        const char *dur = getenv("P2P_POKER_DEAF_FOR");
-        const char *who = getenv("P2P_POKER_DEAF_PEER");
-
-        state = -1;
-
-        if (at != nullptr && dur != nullptr) {
-            at_s = (uint64_t)strtoull(at, nullptr, 10);
-            for_s = (uint64_t)strtoull(dur, nullptr, 10);
-
-            if (for_s > 0) {
-                if (who != nullptr) {
-                    only_peer = (uint32_t)strtoul(who, nullptr, 10);
-                }
-
-                state = 1;
-            }
-        }
+    if (p2p_poker_deaf_state != 0) {
+        return;
     }
 
-    if (state != 1) {
+    const char *at = getenv("P2P_POKER_DEAF_AT");
+    const char *dur = getenv("P2P_POKER_DEAF_FOR");
+    const char *who = getenv("P2P_POKER_DEAF_PEER");
+    const char *up = getenv("P2P_POKER_DEAF_UPLINK");
+    p2p_poker_deaf_state = -1;
+
+    if (at != nullptr && dur != nullptr) {
+        p2p_poker_deaf_at_s = (uint64_t)strtoull(at, nullptr, 10);
+        p2p_poker_deaf_for_s = (uint64_t)strtoull(dur, nullptr, 10);
+
+        if (p2p_poker_deaf_for_s > 0) {
+            if (who != nullptr) {
+                p2p_poker_deaf_only_peer = (uint32_t)strtoul(who, nullptr, 10);
+            }
+
+            p2p_poker_deaf_uplink = up != nullptr && up[0] == '1';
+            p2p_poker_deaf_state = 1;
+        }
+    }
+}
+
+static bool p2p_poker_deaf_to(const GC_Chat *_Nonnull chat, uint32_t peer_number)
+{
+    p2p_poker_deaf_read_env();
+
+    if (p2p_poker_deaf_state != 1) {
         return false;
     }
 
     const uint64_t now = mono_time_get(chat->mono_time);
 
-    if (anchor == 0) {
-        anchor = now;
+    if (p2p_poker_deaf_anchor == 0) {
+        p2p_poker_deaf_anchor = now;
     }
 
-    if (only_peer != UINT32_MAX && peer_number != only_peer) {
+    if (p2p_poker_deaf_only_peer != UINT32_MAX && peer_number != p2p_poker_deaf_only_peer) {
         return false;
     }
 
-    const uint64_t age = now - anchor;
+    const uint64_t age = now - p2p_poker_deaf_anchor;
+    return age >= p2p_poker_deaf_at_s && age < p2p_poker_deaf_at_s + p2p_poker_deaf_for_s;
+}
 
-    return age >= at_s && age < at_s + for_s;
+/* p2p-poker (patch 0025): the deaf seat can be mute on the wire too.
+ *
+ * Patch 0016 drops what arrives, before the ring sees it, and the seat
+ * keeps sending: an asymmetric outage, the downlink half. S1-CO measured
+ * that half and fixed the ring's repair of it. A real outage cuts both
+ * ways, and the uplink half has never been modelled: the seat's own
+ * frames stay in its send arrays unacked, its blind schedule has nothing
+ * between 16 and 32 s, and what its peers can ask for is only what they
+ * know is missing.
+ *
+ * P2P_POKER_DEAF_UPLINK=1 beside the 0016 variables makes gcc_send_packet
+ * drop this node's own lossless and lossy group packets during the same
+ * window -- AFTER the ring took them, so the entries, ids and re-send
+ * schedule are exactly what a cut wire leaves behind. The send reports
+ * success, because a cut wire does not report. Handshake packets pass,
+ * as 0016 lets them pass on the way in: a seat that could not handshake
+ * could never come back. The window is 0016's, anchored where 0016
+ * anchors it (the first group packet this node handled); before that
+ * anchor exists nothing is muted, so the anchor is not moved by a send.
+ * One line at the first dropped send. */
+bool p2p_poker_wire_is_mute(const GC_Chat *_Nonnull chat)
+{
+    static bool said = false;
+
+    p2p_poker_deaf_read_env();
+
+    if (p2p_poker_deaf_state != 1 || !p2p_poker_deaf_uplink || p2p_poker_deaf_anchor == 0) {
+        return false;
+    }
+
+    const uint64_t age = mono_time_get(chat->mono_time) - p2p_poker_deaf_anchor;
+    const bool mute = age >= p2p_poker_deaf_at_s && age < p2p_poker_deaf_at_s + p2p_poker_deaf_for_s;
+
+    if (mute && !said) {
+        said = true;
+        LOGGER_DEBUG(chat->log, "p2p-poker: the wire is mute: this node's own group packets are dropped after the ring took them, from %llu s for %llu s (patch 0025)",
+                     (unsigned long long)p2p_poker_deaf_at_s, (unsigned long long)p2p_poker_deaf_for_s);
+    }
+
+    return mute;
 }
 #endif
 

@@ -769,6 +769,18 @@ bool gcc_send_packet(const GC_Chat *chat, GC_Connection *gconn, const uint8_t *p
         return false;
     }
 
+#ifdef P2P_POKER_FAULT_HARNESS
+    /* p2p-poker (patch 0025): the wire is cut for this node's own group
+     * packets during the -Deaf window when P2P_POKER_DEAF_UPLINK=1. The
+     * ring has already taken the entry; only the bytes go nowhere, and the
+     * caller is told they went, as a cut wire would tell it. Handshakes
+     * pass. See p2p_poker_wire_is_mute in group_chats.c. */
+    if ((packet[0] == NET_PACKET_GC_LOSSLESS || packet[0] == NET_PACKET_GC_LOSSY) && p2p_poker_wire_is_mute(chat)) {
+        return true;
+    }
+
+#endif
+
     bool direct_send_attempt = false;
 
     /* p2p-poker: a connection flipped between direct and relayed.

@@ -220,6 +220,9 @@ $patched = @(
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker: asking peer %u for messages %llu..%llu'
        Why    = '0024: the lossless channel gives a receiver back ONE missed message per request, one request per second, each waiting on some later packet to trigger it - so a 20 s downlink outage drained for 12 s more and cost the seat its place (runs/split162916-9, S1-CO). The receiver now asks every second for everything it is missing, up to sixteen ids at a time, and probes a quiet peer for its head: standard GR_ACK_REQ packets an unpatched sender answers or ignores.' }
+    @{ File   = 'toxcore/group_connection.c'
+       Marker = 'p2p-poker (patch 0025): the wire is cut for this node'
+       Why    = '0025: the uplink half of an outage. Patch 0016 drops what arrives and the seat keeps sending, so every deaf run measured only the downlink; with P2P_POKER_DEAF_UPLINK=1 gcc_send_packet also drops this node own lossless and lossy group packets during the window, after the ring took them, and reports success as a cut wire would. Handshakes pass. The window and its anchor are 0016 own (group_chats.c).' }
 )
 
 Step 'checking the patches are in the vendored source'

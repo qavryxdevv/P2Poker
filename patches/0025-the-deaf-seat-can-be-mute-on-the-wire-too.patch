@@ -1,0 +1,222 @@
+# 0025 - the deaf seat can be mute on the wire too.
+#
+# S1-Q put one case in scope: a seated player whose link drops for seconds
+# and returns. Patch 0016 (-Deaf) drops what arrives, before the ring sees
+# it, and the seat keeps sending -- so every deaf run (S1-CM, S1-CO)
+# measured the DOWNLINK half of that case and nothing else. The ring's
+# one-message-per-second drain was found and fixed there (patch 0024). A
+# real outage cuts both ways, and the uplink half has never been modelled:
+# the seat's own frames stay in its send arrays unacked; its blind schedule
+# re-sends at 2, 4, 8, 16 and 32 s and has nothing between 16 and 32; and
+# what its peers can ask for is only what they know is missing, which is
+# one id -- the head -- until the seat shows them a newer one.
+#
+# WHAT THIS IS. A test instrument, fault harness only. With
+# P2P_POKER_DEAF_UPLINK=1 beside the 0016 variables, gcc_send_packet drops
+# this node's own lossless and lossy group packets during the same window,
+# AFTER the ring took them, so entries, ids and the re-send schedule are
+# exactly what a cut wire leaves behind; the send reports success, as a cut
+# wire does. Handshakes pass, as 0016 lets them pass on the way in. The
+# window and its anchor are 0016's, hoisted to file scope so both halves
+# read one clock; a send before the anchor exists is not muted, so the
+# anchor is not moved by a send. The harness switch is -DeafBothWays, and
+# the same commit puts -DeafFor into the list of knobs that refuse a binary
+# without the fault harness, because the comment that said 0016 "works in
+# every build" was wrong: it sits inside #ifdef P2P_POKER_FAULT_HARNESS.
+#
+# THE PREDICTION IS BOOKED BEFORE THE RUN, -DeafSeat 3 -DeafAt 240
+# -DeafFor 20 -DeafBothWays on the 8+1 rig, and it is the one this
+# instrument exists to test. Downlink: repaired within two seconds of the
+# window's end, as in split120908-9. Uplink: the seat's frames sent inside
+# the window are stuck; the peers' probes draw ONE id per two seconds
+# because they know of no gap, and the seat's blind schedule reaches an
+# entry added early in the window only at +32 s. So the prediction splits:
+# if the seat has something NEW to send right after the window -- its next
+# action, a heartbeat, a re-send from the application's own arm -- the peers
+# see a newer id, know the gap, and burst it closed within a second, and
+# the run shows no certificate and the seat level with the others. If it
+# has nothing new to say, because the table is waiting for exactly the
+# frame that is stuck, the drain is one id per two seconds, a multi-chunk
+# shuffle takes eight to twenty seconds, and the table's thirty-second
+# clock -- running since the peers began waiting, inside the window -- runs
+# out: a certificate about n3, and the peers' logs showing "Re-sent
+# requested packet" answered BY n3 one id every two seconds. The second
+# outcome is the one to expect for a shuffle stuck in the window, and it
+# would name the sender-side half of S1-CO's defect: nothing pushes an
+# unacked backlog when a quiet peer is heard again.
+
+diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
+index 67f3d44..5646d63 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.c
++++ b/vendor/c-toxcore/toxcore/group_chats.c
+@@ -6293,52 +6293,103 @@ static bool handle_gc_packet_fragment(const GC_Session *_Nonnull c, GC_Chat *_No
+  * HANDSHAKES ARE NOT DROPPED, only the two packet kinds that feed the timer.
+  * A node that could not handshake could never come back, and coming back is
+  * the whole point. */
+-static bool p2p_poker_deaf_to(const GC_Chat *_Nonnull chat, uint32_t peer_number)
+-{
+-    static int state = 0;          /* 0 unread, 1 armed, -1 off */
+-    static uint32_t only_peer = UINT32_MAX;
+-    static uint64_t at_s = 0;
+-    static uint64_t for_s = 0;
+-    static uint64_t anchor = 0;
+-
+-    if (state == 0) {
+-        const char *at = getenv("P2P_POKER_DEAF_AT");
+-        const char *dur = getenv("P2P_POKER_DEAF_FOR");
+-        const char *who = getenv("P2P_POKER_DEAF_PEER");
++/* p2p-poker (patch 0025): the window's state is shared with the wire, below. */
++static int p2p_poker_deaf_state = 0;          /* 0 unread, 1 armed, -1 off */
++static uint32_t p2p_poker_deaf_only_peer = UINT32_MAX;
++static uint64_t p2p_poker_deaf_at_s = 0;
++static uint64_t p2p_poker_deaf_for_s = 0;
++static uint64_t p2p_poker_deaf_anchor = 0;
++static bool p2p_poker_deaf_uplink = false;
+ 
+-        state = -1;
++static void p2p_poker_deaf_read_env(void)
++{
++    if (p2p_poker_deaf_state != 0) {
++        return;
++    }
+ 
+-        if (at != nullptr && dur != nullptr) {
+-            at_s = (uint64_t)strtoull(at, nullptr, 10);
+-            for_s = (uint64_t)strtoull(dur, nullptr, 10);
++    const char *at = getenv("P2P_POKER_DEAF_AT");
++    const char *dur = getenv("P2P_POKER_DEAF_FOR");
++    const char *who = getenv("P2P_POKER_DEAF_PEER");
++    const char *up = getenv("P2P_POKER_DEAF_UPLINK");
++    p2p_poker_deaf_state = -1;
+ 
+-            if (for_s > 0) {
+-                if (who != nullptr) {
+-                    only_peer = (uint32_t)strtoul(who, nullptr, 10);
+-                }
++    if (at != nullptr && dur != nullptr) {
++        p2p_poker_deaf_at_s = (uint64_t)strtoull(at, nullptr, 10);
++        p2p_poker_deaf_for_s = (uint64_t)strtoull(dur, nullptr, 10);
+ 
+-                state = 1;
++        if (p2p_poker_deaf_for_s > 0) {
++            if (who != nullptr) {
++                p2p_poker_deaf_only_peer = (uint32_t)strtoul(who, nullptr, 10);
+             }
++
++            p2p_poker_deaf_uplink = up != nullptr && up[0] == '1';
++            p2p_poker_deaf_state = 1;
+         }
+     }
++}
++
++static bool p2p_poker_deaf_to(const GC_Chat *_Nonnull chat, uint32_t peer_number)
++{
++    p2p_poker_deaf_read_env();
+ 
+-    if (state != 1) {
++    if (p2p_poker_deaf_state != 1) {
+         return false;
+     }
+ 
+     const uint64_t now = mono_time_get(chat->mono_time);
+ 
+-    if (anchor == 0) {
+-        anchor = now;
++    if (p2p_poker_deaf_anchor == 0) {
++        p2p_poker_deaf_anchor = now;
+     }
+ 
+-    if (only_peer != UINT32_MAX && peer_number != only_peer) {
++    if (p2p_poker_deaf_only_peer != UINT32_MAX && peer_number != p2p_poker_deaf_only_peer) {
+         return false;
+     }
+ 
+-    const uint64_t age = now - anchor;
++    const uint64_t age = now - p2p_poker_deaf_anchor;
++    return age >= p2p_poker_deaf_at_s && age < p2p_poker_deaf_at_s + p2p_poker_deaf_for_s;
++}
++
++/* p2p-poker (patch 0025): the deaf seat can be mute on the wire too.
++ *
++ * Patch 0016 drops what arrives, before the ring sees it, and the seat
++ * keeps sending: an asymmetric outage, the downlink half. S1-CO measured
++ * that half and fixed the ring's repair of it. A real outage cuts both
++ * ways, and the uplink half has never been modelled: the seat's own
++ * frames stay in its send arrays unacked, its blind schedule has nothing
++ * between 16 and 32 s, and what its peers can ask for is only what they
++ * know is missing.
++ *
++ * P2P_POKER_DEAF_UPLINK=1 beside the 0016 variables makes gcc_send_packet
++ * drop this node's own lossless and lossy group packets during the same
++ * window -- AFTER the ring took them, so the entries, ids and re-send
++ * schedule are exactly what a cut wire leaves behind. The send reports
++ * success, because a cut wire does not report. Handshake packets pass,
++ * as 0016 lets them pass on the way in: a seat that could not handshake
++ * could never come back. The window is 0016's, anchored where 0016
++ * anchors it (the first group packet this node handled); before that
++ * anchor exists nothing is muted, so the anchor is not moved by a send.
++ * One line at the first dropped send. */
++bool p2p_poker_wire_is_mute(const GC_Chat *_Nonnull chat)
++{
++    static bool said = false;
++
++    p2p_poker_deaf_read_env();
++
++    if (p2p_poker_deaf_state != 1 || !p2p_poker_deaf_uplink || p2p_poker_deaf_anchor == 0) {
++        return false;
++    }
++
++    const uint64_t age = mono_time_get(chat->mono_time) - p2p_poker_deaf_anchor;
++    const bool mute = age >= p2p_poker_deaf_at_s && age < p2p_poker_deaf_at_s + p2p_poker_deaf_for_s;
++
++    if (mute && !said) {
++        said = true;
++        LOGGER_DEBUG(chat->log, "p2p-poker: the wire is mute: this node's own group packets are dropped after the ring took them, from %llu s for %llu s (patch 0025)",
++                     (unsigned long long)p2p_poker_deaf_at_s, (unsigned long long)p2p_poker_deaf_for_s);
++    }
+ 
+-    return age >= at_s && age < at_s + for_s;
++    return mute;
+ }
+ #endif
+ 
+diff --git a/vendor/c-toxcore/toxcore/group_chats.h b/vendor/c-toxcore/toxcore/group_chats.h
+index 940e11d..c9a0f84 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.h
++++ b/vendor/c-toxcore/toxcore/group_chats.h
+@@ -724,6 +724,12 @@ GC_Chat *_Nullable gc_get_group_by_public_key(const GC_Session *_Nonnull c, cons
+  */
+ int gc_add_peers_from_announces(GC_Chat *_Nonnull chat, const GC_Announce *_Nonnull announces, uint8_t gc_announces_count);
+ 
++#ifdef P2P_POKER_FAULT_HARNESS
++/** @brief p2p-poker (patch 0025): true while this node's own group packets are
++ * to be dropped on the wire -- the uplink half of the -Deaf window. */
++bool p2p_poker_wire_is_mute(const GC_Chat *_Nonnull chat);
++#endif
++
+ #ifdef __cplusplus
+ } /* extern "C" */
+ #endif
+diff --git a/vendor/c-toxcore/toxcore/group_connection.c b/vendor/c-toxcore/toxcore/group_connection.c
+index 6b42714..8b63d17 100644
+--- a/vendor/c-toxcore/toxcore/group_connection.c
++++ b/vendor/c-toxcore/toxcore/group_connection.c
+@@ -769,6 +769,18 @@ bool gcc_send_packet(const GC_Chat *chat, GC_Connection *gconn, const uint8_t *p
+         return false;
+     }
+ 
++#ifdef P2P_POKER_FAULT_HARNESS
++    /* p2p-poker (patch 0025): the wire is cut for this node's own group
++     * packets during the -Deaf window when P2P_POKER_DEAF_UPLINK=1. The
++     * ring has already taken the entry; only the bytes go nowhere, and the
++     * caller is told they went, as a cut wire would tell it. Handshakes
++     * pass. See p2p_poker_wire_is_mute in group_chats.c. */
++    if ((packet[0] == NET_PACKET_GC_LOSSLESS || packet[0] == NET_PACKET_GC_LOSSY) && p2p_poker_wire_is_mute(chat)) {
++        return true;
++    }
++
++#endif
++
+     bool direct_send_attempt = false;
+ 
+     /* p2p-poker: a connection flipped between direct and relayed.

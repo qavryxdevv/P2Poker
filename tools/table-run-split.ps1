@@ -189,6 +189,13 @@ param(
     [ValidateRange(0, 3600)][int]$DeafAt = 0,
     [ValidateRange(0, 3600)][int]$DeafFor = 0,
     [ValidateRange(0, 8)][int]$DeafSeat = 0,
+    # -DeafBothWays (patch 0025) cuts the deaf seat's UPLINK for the same
+    # window: its own lossless and lossy group packets are dropped on the
+    # wire after the ring took them, handshakes pass. With it the window is a
+    # symmetric outage -- the seat neither hears nor is heard -- which is
+    # what S1-Q put in scope and what neither -Deaf alone nor -LinkDown
+    # models (S1-CM, S1-CO). Needs the fault harness, like -Deaf itself.
+    [switch]$DeafBothWays,
     [switch]$NoBuild,
     # **Build without `fault-harness`, and therefore without toxcore's log.**
     #
@@ -323,16 +330,23 @@ if ($newest -and $newest.LastWriteTime -gt $exeTime) {
 $faultHarness = [System.Text.Encoding]::ASCII.GetString(
     [System.IO.File]::ReadAllBytes($Exe)).Contains('P2P_POKER_STALL_JOIN')
 
-# **A knob the binary cannot honour refuses the run.** `-Deaf` is not in this
-# list on purpose: it lives in the vendored C (patch 0016) and works in every
-# build. `--no-mdns` is a command-line flag, not a harness env var, and is not
-# in it either -- both were checked rather than assumed.
+# **A knob the binary cannot honour refuses the run.** `-Deaf` IS in this
+# list, since 2026-09-10: an earlier version of this comment said it "lives in
+# the vendored C (patch 0016) and works in every build", and that was wrong --
+# patch 0016 sits inside `#ifdef P2P_POKER_FAULT_HARNESS`, which `build.rs`
+# defines only under `--features fault-harness`, so a clean binary reads
+# P2P_POKER_DEAF_AT with nothing and a -NoBuild run would have been a clean
+# run wearing a deaf header. The C half and the Rust half are one feature,
+# and the probe above is the feature's presence for both. `--no-mdns` is a
+# command-line flag, not a harness env var, and is not in the list.
 if (-not $faultHarness) {
     $needy = @()
     if ($Stall -gt 0)       { $needy += '-Stall' }
     if ($MuteFor -gt 0)     { $needy += '-MuteFor' }
     if ($LinkDownFor -gt 0) { $needy += '-LinkDownFor' }
     if ($DelayCerts -gt 0)  { $needy += '-DelayCerts' }
+    if ($DeafFor -gt 0)     { $needy += '-DeafFor' }
+    if ($DeafBothWays)      { $needy += '-DeafBothWays' }
     if ($needy.Count -gt 0) {
         throw ("$($needy -join ', ') need the fault harness and $Exe was built " +
                "without it: the environment variables behind those knobs are read " +
@@ -396,7 +410,7 @@ $header = @(
     # is why it is in the header now instead of only in a doc comment.
     "stall  $(if ($Stall -gt 0) { "far seat $StallSeat starves its group handshake for $Stall s after accepting the invitation (fault-harness; S1-AA shape (i) on demand)$(if ($Stall -gt 15) { ' - WARNING: over 15 s stops the seat iterating toxcore at all, so this models the KNOB and not shape (i); 13-15 s trips the 12 s group reaper while the friend connections survive' })" } else { 'no forced handshake stall' })"
     "drop   $(if ($DropConfirm -gt 0) { "the founder does not send its first $DropConfirm invite confirmation(s); every loop keeps running (fault-harness; the instrument -Stall never was)" } else { 'every invite confirmation is sent' })"
-    "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, still sending (patch 0016)$(if ($DeafFor -le 58) { ' - under the 58 s peer timeout: nobody is timed out and every packet missed is replayed by the ring when the window ends, the brief-outage model (S1-CM)' })" } else { 'nobody is deaf' })"
+    "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, $(if ($DeafBothWays) { 'AND drops its own on the wire after the ring took them (patch 0025): a symmetric outage' } else { 'still sending (patch 0016): the downlink half only' })$(if ($DeafFor -le 58) { ' - under the 58 s peer timeout: nobody is timed out and every packet missed is replayed by the ring when the window ends, the brief-outage model (S1-CM, S1-CO)' })" } else { 'nobody is deaf' })"
     "work   $work"
 )
 $header | ForEach-Object { Write-Host $_ }
@@ -677,6 +691,7 @@ for (`$i = 0; `$i -lt $There; `$i++) {
         if ($DeafFor -gt 0 -and $i -eq $DeafSeat) {
             $knobs['P2P_POKER_DEAF_AT'] = "$DeafAt"
             $knobs['P2P_POKER_DEAF_FOR'] = "$DeafFor"
+            if ($DeafBothWays) { $knobs['P2P_POKER_DEAF_UPLINK'] = '1' }
         }
         $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $knobs -ScriptBlock {
             param($exe, $nodeArgs, $log, $knobs)

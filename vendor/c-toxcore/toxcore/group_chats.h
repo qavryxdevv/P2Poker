@@ -724,6 +724,12 @@ GC_Chat *_Nullable gc_get_group_by_public_key(const GC_Session *_Nonnull c, cons
  */
 int gc_add_peers_from_announces(GC_Chat *_Nonnull chat, const GC_Announce *_Nonnull announces, uint8_t gc_announces_count);
 
+#ifdef P2P_POKER_FAULT_HARNESS
+/** @brief p2p-poker (patch 0025): true while this node's own group packets are
+ * to be dropped on the wire -- the uplink half of the -Deaf window. */
+bool p2p_poker_wire_is_mute(const GC_Chat *_Nonnull chat);
+#endif
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
