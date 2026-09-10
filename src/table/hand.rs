@@ -8532,6 +8532,16 @@ impl Hand {
         }
     }
 
+    /// A seat's stack at this boundary, on both terminal paths: the settled
+    /// stacks after a settlement, the start-of-hand stacks after an abort
+    /// (every stack restored, D-010). `stacks()` answers only while a hand is
+    /// being played, and reading it at an aborted boundary read zero -- which
+    /// `S1-CR`'s record took for a bust and forgot the session on
+    /// (`run193358-3`).
+    pub fn stack_at_boundary(&self, seat: SeatIdx) -> Chips {
+        self.boundary_stack_of(seat)
+    }
+
     fn boundary_stack_of(&self, seat: SeatIdx) -> Chips {
         self.boundary_stacks().get(usize::from(seat)).copied().unwrap_or(0)
     }
@@ -13068,6 +13078,8 @@ mod tests {
         let (mut aborted, _) = Hand::open(o, &keys[1], NOW, 30_000).unwrap();
         let aborted_sends = aborted.abort_now(Abort::Deadline, &keys[1], NOW).unwrap();
         assert!(aborted.terminal().is_some(), "an abort has a terminal");
+        assert_eq!(aborted.stack_at_boundary(1), 10_000, "an abort restores every stack, and the boundary stack says so");
+        assert!(aborted.stacks().is_empty(), "while stacks() has nothing to say outside play -- the trap S1-CR fell into");
         assert!(!aborted.may_ask_to_sit_in(), "nobody asks at an aborted boundary");
         assert!(aborted.vote_on_returns(std::slice::from_ref(&ev), &keys[1], NOW).unwrap().is_empty());
         let refused = aborted.on_event(&cert, &keys[1], NOW);

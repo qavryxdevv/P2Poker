@@ -878,10 +878,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         advert,
                         advert_hash,
                     };
-                    if let Err(e) = crate::storage::session::save(&profile_dir, &record) {
-                        let _ = events
-                            .send(NodeEvent::Warning(format!("the session record would not save: {e}")))
-                            .await;
+                    match crate::storage::session::save(&profile_dir, &record) {
+                        Ok(()) => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "session record: hand #{}, seat {my_seat}, stack {}",
+                                    $hand_id, $stack
+                                )))
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("the session record would not save: {e}")))
+                                .await;
+                        }
                     }
                     session_recorded = true;
                 }
@@ -5482,10 +5492,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // nothing to come back to.
                 if let Some(h) = hand.as_ref() {
                     let me = h.my_seat();
-                    let stack = h.stacks().get(usize::from(me)).copied().unwrap_or(0);
-                    if stack == 0 {
+                    // The boundary stack, on both terminal paths. `stacks()` is empty
+                    // after an abort, and reading it here forgot the session at every
+                    // aborted boundary (`run193358-3`).
+                    let stack = h.stack_at_boundary(me);
+                    if stack == 0 && h.checkpoint8().is_some() {
                         let _ = crate::storage::session::forget(&profile_dir);
                         resume = None;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!("hand #{}: seat {me} busted; the session record is forgotten", h.hand_id())))
+                            .await;
                     } else {
                         remember_session!(h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);
                     }
