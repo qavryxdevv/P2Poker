@@ -75,13 +75,16 @@ def main():
     for _, s, m in own:
         if 'seats on the line:' in m:
             roll = m.split('seats on the line:')[1].split(';')[0].strip()
-            present = set(int(x) for x in re.findall(r'(?:^|, )(\d+) (?:\d+ms|silent)', roll))
-            missing = sorted(set(range(9)) - present)
+            present = set(int(x) for x in re.findall(r'(?:^|, )(\d+) (?:\d+ms|silent|never)', roll))
+            missing = sorted(set(range(len(present) + 1)) - present)
             if len(missing) == 1:
                 seat = missing[0]
-            break
-    print('\n=== %s joined the group at %.1f s; the window is %.1f..%.1f s (anchor + %g, %g s); it holds seat %s'
+                break
+    print('\n=== %s joined the group at %.1f s; the window is about %.1f..%.1f s (anchor + %g, %g s); it holds seat %s'
           % (node, anchor, w0, w1, deaf_at, deaf_for, seat if seat is not None else '?'))
+    print('    The C measures the window from the first group packet it handled, which precedes the join line above by')
+    print('    up to several seconds (4 s in split120908-9); take the true edges from the last frame before the gap and')
+    print("    the senders' burst offsets below, not from this arithmetic.")
 
     lo, hi = w0 - 25, w1 + 40
     print('\n=== %s between %.0f and %.0f s (noise removed)' % (node, lo, hi))

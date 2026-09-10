@@ -48,13 +48,25 @@
 # peer on the public network sees nine-byte packets it either answers or
 # ignores, and compatibility is kept.
 #
-# THE PREDICTION FOR THE BURST RUN IS BOOKED BEFORE IT IS TAKEN, same
+# THE PREDICTION FOR THE BURST RUN WAS BOOKED BEFORE IT WAS TAKEN, same
 # recipe: the first missed frame arrives within three seconds of the
 # window's end; the sender's log shows consecutive ids re-sent within one
 # second right after it; no certificate about n3, no abort, n3 finishes as
-# many hands as the others. The falsifier is the drain still taking ten
-# seconds or more, which would mean the bottleneck is not the request side
-# and the next place to look is the sender's answer path.
+# many hands as the others. The falsifier was the drain still taking ten
+# seconds or more, which would have meant the bottleneck is not the request
+# side and the next place to look is the sender's answer path.
+#
+# CONFIRMED, 2026-09-10, runs/split120908-9, every clause. The window fell
+# into hand 16's shuffle round: n3 (seat 8, the last shuffler) had seats
+# 0-4 by 290.9 s and then nothing; its first burst after the window went out
+# at 311.6 s ("asking peer 1 for messages 2691..2706 (16 sent, highest seen
+# 2879)"), the senders answered in bursts at one offset -- far-n0 2306..2317,
+# n0 2778..2788, n1 2163..2174 -- and n3 sealed the deck at 313.0 s, under
+# two seconds after the window's end. The peers had waited for seat 8 for
+# about 21 s, inside the 30 s clock: no tally, no certificate, no abort
+# anywhere in the run, and every one of the nine seats opened 22 hands and
+# finished 21. The same outage that cost a seat its place twice cost it
+# nothing.
 
 diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
 index 7966e36..67f3d44 100644
