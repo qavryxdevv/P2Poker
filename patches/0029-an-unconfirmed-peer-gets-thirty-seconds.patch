@@ -49,9 +49,13 @@
 # own line at 150 s says "Tox is offline; of 20 known nodes, 20
 # bootstrapped and 20 TCP relays were accepted" -- a node whose Tox had
 # no DHT for 150 s, so no friend connection and no invite. A bootstrap
-# wait the client already names, not the handshake cycle. The reap census
-# with the patch stands at 0 of 1; one run is one run, and every 8+1 run
-# from here reads itself.
+# wait the client already names, not the handshake cycle. The second run
+# (runs/split142606-9) was an ordinary table -- nine seats in the group by
+# 70 s, every seat 9 hands opened and 8 finished -- and the far seat
+# reaped nobody: 7/7/7 at 61.8 s, 8/8/8 at 92.3 with the last local seat
+# arriving at 70.1. Against 4 of 6 runs reaping before the patch, 0 of 2
+# after it; two runs are two runs, and every 8+1 run from here reads
+# itself.
 
 diff --git a/vendor/c-toxcore/toxcore/group_chats.h b/vendor/c-toxcore/toxcore/group_chats.h
 index c9a0f84..a481216 100644
