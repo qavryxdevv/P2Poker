@@ -97,6 +97,11 @@ pub struct SeatView {
     /// What this seat gained at the settlement (`S1-CS`): the chips that
     /// fly from the pot to it.
     pub won: Chips,
+    /// `S1-CS`: this player does not hear the seat.
+    pub muted: bool,
+    /// `S1-CS`: the seat's connection, as the last ping said; `None` before
+    /// any reading.
+    pub link: Option<Link>,
 }
 
 /// The whole table, as a snapshot.
@@ -137,10 +142,65 @@ pub struct TableView {
     pub turn_id: u64,
     /// The hand is settled: the pot has gone to whoever won it.
     pub hand_over: bool,
+    /// `S1-CS`: what the seats have said, the muted ones left out.
+    pub chat: Vec<TableChatLine>,
+}
+
+/// The smallest table window the client allows, which every row of the
+/// action bar must fit (`S1-CS`: a row that does not fit is drawn over the
+/// row beside it). `main.rs` opens the window with these.
+pub const MIN_WINDOW: [f32; 2] = [760.0, 560.0];
+
+/// The action bar's fixed widths, in one place so the fit can be asserted.
+pub mod bar {
+    /// The hand's name and odds, on the right.
+    pub const STRENGTH_W: f32 = 188.0;
+    /// The narrowest the chat on the left may be.
+    pub const CHAT_MIN_W: f32 = 110.0;
+    /// The middle column: the presets and the slider above the buttons, the
+    /// buttons one above the other. Wide enough for "Raise to 10000" at the
+    /// body size, and no wider.
+    pub const BUTTON_W: f32 = 132.0;
+    pub const BUTTON_H: f32 = 26.0;
+    /// All-in, at the top, at about half the height of the others.
+    pub const ALL_IN_H: f32 = 16.0;
+    pub const PRESET_W: f32 = 29.0;
+    pub const PRESET_H: f32 = 22.0;
+    pub const SLIDER_H: f32 = 18.0;
+    /// Between the presets, tighter than egui's default so four fit the column.
+    pub const PRESET_GAP: f32 = 5.0;
+    /// Between the rows of the column.
+    pub const ROW_GAP: f32 = 4.0;
+    /// What egui puts between two widgets, and the panel's own margins.
+    pub const GAP: f32 = 10.0;
+    pub const MARGINS: f32 = 2.0 * 10.0 + 2.0 * 8.0;
+    /// What egui adds around three blocks and two separators beyond the
+    /// gaps counted below; measured on the first photograph of the final
+    /// bar, where the right block ran past the window by about this much.
+    pub const SLACK: f32 = 40.0;
+    /// The bar's height: the column, top to bottom.
+    pub const HEIGHT: f32 =
+        PRESET_H + ROW_GAP + SLIDER_H + ROW_GAP + ALL_IN_H + ROW_GAP + 3.0 * BUTTON_H + 2.0 * ROW_GAP;
+
+    /// The middle block is the one column.
+    pub const fn middle_block() -> f32 {
+        BUTTON_W
+    }
+
+    /// The presets row inside the column.
+    pub const fn presets_row() -> f32 {
+        4.0 * PRESET_W + 3.0 * PRESET_GAP
+    }
+
+    /// Everything but the chat: the middle block, the right block, the two
+    /// separators, their gaps and the slack.
+    pub const fn fixed() -> f32 {
+        middle_block() + 2.0 * (GAP + 8.0 + GAP) + STRENGTH_W + SLACK
+    }
 }
 
 /// What the player did this frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableAction {
     None,
     Fold,
@@ -148,6 +208,28 @@ pub enum TableAction {
     Call,
     Raise(Chips),
     BackToLobby,
+    /// `S1-CS`: a line for the seats of this table.
+    Say(String),
+    /// `S1-CS`: stop hearing this seat, or hear it again. Local.
+    Mute(SeatIdx),
+    Unmute(SeatIdx),
+}
+
+/// `S1-CS`: a line of table chat as the window shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TableChatLine {
+    pub seat: SeatIdx,
+    pub who: String,
+    pub said: String,
+}
+
+/// `S1-CS`: how a seat's connection is doing, as the last ping said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Link {
+    /// The round trip of the last ping; `None` once the connection closed.
+    pub rtt_ms: Option<u64>,
+    /// The reading is old enough to doubt.
+    pub stale: bool,
 }
 
 /// What the player is holding in the action bar between frames, and the
@@ -159,6 +241,8 @@ pub struct TableUi {
     /// the minimum raise instead of where the slider was left.
     pub for_turn: Option<u64>,
     pub motion: motion::Motion,
+    /// `S1-CS`: what the player is typing to the table, not yet sent.
+    pub chat_draft: String,
 }
 
 /// The raise the control offers this frame.
@@ -259,7 +343,9 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
                 .stroke(Stroke::new(1.0, theme::LINE)),
         )
         .show(ui, |ui| {
-            action = action_bar(ui, view, state).unwrap_or(action);
+            if let Some(a) = action_bar(ui, view, state) {
+                action = a;
+            }
         });
 
     egui::CentralPanel::default()
@@ -272,16 +358,29 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
             // since the last frame, and a frame is owed while they fly.
             let now = ui.input(|i| i.time);
             state.motion.observe(view, now);
-            felt_and_people(ui, &l, view, &state.motion, now);
+            if let Some(a) = felt_and_people(ui, &l, view, &state.motion, now) {
+                action = a;
+            }
             if state.motion.active(now) {
                 ui.ctx().request_repaint();
+            }
+            // And a frame every tenth of a second while a clock runs.
+            if view.seats.iter().any(|s| s.clock.is_some()) {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             }
         });
 
     action
 }
 
-fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView, motion: &motion::Motion, now: f64) {
+fn felt_and_people(
+    ui: &egui::Ui,
+    l: &Layout,
+    view: &TableView,
+    motion: &motion::Motion,
+    now: f64,
+) -> Option<TableAction> {
+    let mut action = None;
     let p = ui.painter();
     paint::table(p, l, &view.name);
 
@@ -295,7 +394,10 @@ fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView, motion: &motion:
             p,
             l.pot.center(),
             &format!("Total pot: {}", view.pot),
-            l.pot.height() * 0.62,
+            // A floor, because the plaque scales with a felt that a taller
+            // action bar makes shorter, and the pot is the one figure on
+            // the table nobody may have to squint at.
+            (l.pot.height() * 0.62).max(13.0),
             theme::MONEY,
         );
     }
@@ -354,15 +456,44 @@ fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView, motion: &motion:
         if let Some(left) = seat.clock {
             paint::clock(p, slot.avatar, left);
         }
+        if let Some(link) = seat.link.as_ref() {
+            paint::link(p, slot.avatar, slot.plate, link);
+        }
+        // `S1-CS`: a right-click on another seat offers to mute it, or to
+        // hear it again. Local: nothing about it reaches the wire.
+        if seat.seat != view.hero {
+            let hit = ui.interact(
+                slot.plate.union(slot.avatar),
+                ui.id().with(("seat", seat.seat)),
+                egui::Sense::click(),
+            );
+            hit.context_menu(|ui| {
+                let label = if seat.muted {
+                    format!("Unmute {}", seat.name)
+                } else {
+                    format!("Mute {}", seat.name)
+                };
+                if ui.button(label).clicked() {
+                    action = Some(if seat.muted {
+                        TableAction::Unmute(seat.seat)
+                    } else {
+                        TableAction::Mute(seat.seat)
+                    });
+                    ui.close();
+                }
+            });
+        }
 
         let dim = seat.folded || seat.sitting_out;
+        // `S1-CS`: the seat on the clock wears the time it has left as its
+        // plate's colour, green to amber to red, and the ring of dots.
         paint::plaque(
             p,
             slot.plate,
-            if acting {
-                theme::SELECTED
-            } else {
-                Color32::from_black_alpha(170)
+            match seat.clock {
+                Some(left) => paint::clock_plate(left),
+                None if acting => theme::SELECTED,
+                None => Color32::from_black_alpha(170),
             },
             if acting { theme::ACCENT } else { theme::FELT_KEYLINE },
         );
@@ -374,22 +505,40 @@ fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView, motion: &motion:
             h * 0.34,
             if dim { theme::TEXT_DIM } else { theme::TEXT },
         );
+        // The stack stays on the plate whatever the seat is doing: a
+        // player who folded still has chips, and the second photograph
+        // of the screen had hidden them behind the word *folded*. The
+        // state is said where the cards were, which a folded seat has
+        // given up.
         paint::centred(
             p,
             egui::pos2(slot.plate.center().x, slot.plate.top() + h * 0.72),
-            &if seat.sitting_out {
-                "sitting out".to_string()
-            } else if seat.folded {
-                "folded".to_string()
-            } else {
-                seat.stack.to_string()
-            },
+            &seat.stack.to_string(),
             h * 0.32,
             if dim { theme::TEXT_DIM } else { theme::STACK },
         );
+        if dim {
+            let where_the_cards_were = slot.cards[0].union(slot.cards[1]);
+            paint::centred(
+                p,
+                where_the_cards_were.center(),
+                if seat.sitting_out { "sitting out" } else { "folded" },
+                (where_the_cards_were.height() * 0.30).clamp(10.0, 16.0),
+                theme::TEXT_DIM,
+            );
+        }
 
         if seat.seat == view.button {
             paint::dealer_button(p, slot.button);
+        }
+        if seat.muted {
+            paint::centred(
+                p,
+                egui::pos2(slot.plate.right() - h * 0.55, slot.plate.top() + h * 0.30),
+                "muted",
+                (h * 0.26).clamp(9.0, 13.0),
+                theme::WARN,
+            );
         }
         if seat.bet > 0 {
             paint::chips(p, slot.bet, &seat.bet.to_string());
@@ -426,108 +575,227 @@ fn felt_and_people(ui: &egui::Ui, l: &Layout, view: &TableView, motion: &motion:
             theme::WARN,
         );
     }
+    action
 }
 
-/// The hero's hand on the left, the choices on the right, and nothing
-/// enabled that cannot be done.
+/// The chat on the left, the choices in the middle stacked the way PokerTH
+/// stacks them -- Fold, Check or Call, Raise, All-in -- with the raise amount
+/// beside them, and the hero's hand on the right.
 ///
-/// `S1-CS`: the buttons sit against the right edge -- Raise outermost, then
-/// Call or Check, then Fold -- with the raise amount and its presets beside
-/// them; the hand's name and its odds take the left. The two halves are laid
-/// out from their own edges, so a narrow window shortens the gap between them
-/// rather than drawing one over the other.
+/// `S1-CS`, as the owner arranged it on the night. Every width but the
+/// chat's is fixed and asserted to fit the smallest window, and the bar keeps
+/// one height whether or not it is the hero's turn, so the felt never moves.
 fn action_bar(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Option<TableAction> {
     let mut action = None;
     ui.horizontal(|ui| {
+        // Left: the chat, taking what the two fixed blocks leave.
+        let chat_w = (ui.available_width() - bar::fixed()).max(bar::CHAT_MIN_W);
         ui.allocate_ui_with_layout(
-            egui::vec2(300.0, 76.0),
+            egui::vec2(chat_w, bar::HEIGHT),
             egui::Layout::top_down(egui::Align::Min),
-            |ui| strength_panel(ui, view),
+            |ui| {
+                if let Some(line) = chat_panel(ui, view, state) {
+                    action = Some(TableAction::Say(line));
+                }
+            },
         );
         ui.separator();
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if !view.can_act {
-                ui.label(
-                    RichText::new(match view.to_act {
-                        Some(s) if s == view.hero => "your turn".to_string(),
-                        Some(s) => format!("waiting for seat {s}"),
-                        None => "no hand in progress".to_string(),
-                    })
-                    .color(theme::TEXT_DIM),
-                );
-                return;
-            }
-            let raise_to = raise_default(state, view);
-            let wide = egui::vec2(150.0, 40.0);
+        // Middle: one column -- the presets and the slider, then All-in at
+        // half height, Raise, Call or Check, and Fold at the bottom.
+        ui.allocate_ui_with_layout(
+            egui::vec2(bar::middle_block(), bar::HEIGHT),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = bar::ROW_GAP;
+                let raise_to = if view.can_act { raise_default(state, view) } else { 0 };
+                let can_raise = view.can_act && view.max_raise >= view.min_raise && view.min_raise > 0;
+                // Everything the seat has, when that is more than a call: the
+                // engine reports the whole stack as the largest legal total.
+                let all_in = view.can_act && view.max_raise > view.to_call && view.min_raise > 0;
 
-            let can_raise = view.max_raise >= view.min_raise && view.min_raise > 0;
-            let raise = ui.add_enabled(
-                can_raise,
-                egui::Button::new(
-                    RichText::new(format!("Raise to {raise_to}"))
-                        .color(Color32::from_rgb(6, 20, 12))
-                        .strong(),
-                )
-                .fill(theme::OK)
-                .min_size(wide),
-            );
-            if raise.clicked() {
-                action = Some(TableAction::Raise(raise_to));
-            }
-            if !can_raise {
-                raise.on_hover_text("there is nothing left to raise with");
-            }
-
-            let (label, what) = if view.to_call == 0 {
-                ("Check".to_string(), TableAction::Check)
-            } else {
-                (format!("Call {}", view.to_call), TableAction::Call)
-            };
-            if ui
-                .add_sized(
-                    wide,
-                    egui::Button::new(RichText::new(label).color(theme::TEXT).strong())
-                        .fill(theme::PANEL_LIGHT),
-                )
-                .clicked()
-            {
-                action = Some(what);
-            }
-            if ui
-                .add_sized(
-                    wide,
-                    egui::Button::new(RichText::new("Fold").color(theme::TEXT).strong())
-                        .fill(theme::DANGER),
-                )
-                .clicked()
-            {
-                action = Some(TableAction::Fold);
-            }
-
-            ui.add_space(18.0);
-            // The amount, and the presets to its left -- listed from the right,
-            // so they read 33% to 100% on the screen.
-            if view.max_raise > view.min_raise {
-                ui.add(
-                    egui::Slider::new(&mut state.raise, view.min_raise..=view.max_raise)
-                        .show_value(false),
-                );
-            }
-            for (label, part) in [("100%", 1.0), ("75%", 0.75), ("50%", 0.50), ("33%", 0.33)] {
-                if ui.button(label).clicked() {
-                    let want = (view.pot as f64 * part) as Chips;
-                    state.raise = want.clamp(view.min_raise, view.max_raise.max(view.min_raise));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = bar::PRESET_GAP;
+                    if view.can_act {
+                        // A third, a half, three quarters and the whole of
+                        // the pot; short, because the column is narrow.
+                        for (label, part, says) in [
+                            ("⅓", 0.33, "a third of the pot"),
+                            ("½", 0.50, "half the pot"),
+                            ("¾", 0.75, "three quarters of the pot"),
+                            ("pot", 1.0, "the whole pot"),
+                        ] {
+                            let preset = ui.add_sized(
+                                egui::vec2(bar::PRESET_W, bar::PRESET_H),
+                                egui::Button::new(RichText::new(label).size(13.0)),
+                            );
+                            if preset.clicked() {
+                                let want = (view.pot as f64 * part) as Chips;
+                                state.raise = want.clamp(view.min_raise, view.max_raise.max(view.min_raise));
+                            }
+                            preset.on_hover_text(says);
+                        }
+                    } else {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(bar::BUTTON_W, bar::PRESET_H),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(match view.to_act {
+                                        Some(s) if s == view.hero => "your turn".to_string(),
+                                        Some(s) => format!("waiting for seat {s}"),
+                                        None => "no hand in progress".to_string(),
+                                    })
+                                    .color(theme::TEXT_DIM)
+                                    .size(13.0),
+                                );
+                            },
+                        );
+                    }
+                });
+                if view.can_act && view.max_raise > view.min_raise {
+                    ui.add_sized(
+                        egui::vec2(bar::BUTTON_W, bar::SLIDER_H),
+                        egui::Slider::new(&mut state.raise, view.min_raise..=view.max_raise).show_value(false),
+                    );
+                } else {
+                    ui.add_space(bar::SLIDER_H);
                 }
-            }
-        });
+                if ui
+                    .add_enabled(
+                        all_in,
+                        egui::Button::new(
+                            RichText::new(if all_in {
+                                format!("All-in {}", view.max_raise)
+                            } else {
+                                "All-in".to_string()
+                            })
+                            .color(Color32::from_rgb(26, 16, 4))
+                            .size(12.5)
+                            .strong(),
+                        )
+                        .fill(theme::WARN)
+                        .min_size(egui::vec2(bar::BUTTON_W, bar::ALL_IN_H)),
+                    )
+                    .clicked()
+                {
+                    action = Some(TableAction::Raise(view.max_raise));
+                }
+                let wide = egui::vec2(bar::BUTTON_W, bar::BUTTON_H);
+                let raise = ui.add_enabled(
+                    can_raise,
+                    egui::Button::new(
+                        RichText::new(if view.can_act {
+                            format!("Raise to {raise_to}")
+                        } else {
+                            "Raise".to_string()
+                        })
+                        .color(Color32::from_rgb(6, 20, 12))
+                        .size(15.0)
+                        .strong(),
+                    )
+                    .fill(theme::OK)
+                    .min_size(wide),
+                );
+                if raise.clicked() {
+                    action = Some(TableAction::Raise(raise_to));
+                }
+                if view.can_act && !can_raise {
+                    raise.on_hover_text("there is nothing left to raise with");
+                }
+                let (label, what) = if view.to_call == 0 {
+                    ("Check".to_string(), TableAction::Check)
+                } else {
+                    (format!("Call {}", view.to_call), TableAction::Call)
+                };
+                if ui
+                    .add_enabled(
+                        view.can_act,
+                        egui::Button::new(RichText::new(label).color(theme::TEXT).size(15.0).strong())
+                            .fill(theme::PANEL_LIGHT)
+                            .min_size(wide),
+                    )
+                    .clicked()
+                {
+                    action = Some(what);
+                }
+                if ui
+                    .add_enabled(
+                        view.can_act,
+                        egui::Button::new(RichText::new("Fold").color(theme::TEXT).size(15.0).strong())
+                            .fill(theme::DANGER)
+                            .min_size(wide),
+                    )
+                    .clicked()
+                {
+                    action = Some(TableAction::Fold);
+                }
+            },
+        );
+        ui.separator();
+        // Right: the hand.
+        ui.allocate_ui_with_layout(
+            egui::vec2(bar::STRENGTH_W, bar::HEIGHT),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_max_width(bar::STRENGTH_W);
+                strength_panel(ui, view)
+            },
+        );
     });
     action
 }
 
-/// The hand's name and its odds, on the left of the action bar (`S1-CS`).
+/// The seats' chat: what was said, newest at the bottom, and a line to say
+/// something. Enter sends and keeps the cursor where it was.
+fn chat_panel(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Option<String> {
+    let mut said = None;
+    let line_height = 30.0;
+    let history = (bar::HEIGHT - line_height - 4.0).max(0.0);
+    ui.allocate_ui(egui::vec2(ui.available_width(), history), |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("table-chat")
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in &view.chat {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("{}:", line.who)).color(theme::ACCENT).size(13.0).strong());
+                        // Untrusted display data, rendered as data.
+                        ui.label(RichText::new(&line.said).color(theme::TEXT).size(13.0));
+                    });
+                }
+                if view.chat.is_empty() {
+                    ui.label(RichText::new("the table is quiet").color(theme::TEXT_DIM).size(13.0).italics());
+                }
+            });
+    });
+    let box_id = ui.id().with("table-chat-draft");
+    let field = ui.add(
+        egui::TextEdit::singleline(&mut state.chat_draft)
+            .id(box_id)
+            .hint_text("say something to the table…")
+            .desired_width(f32::INFINITY),
+    );
+    let sent = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if sent && !state.chat_draft.trim().is_empty() {
+        said = Some(std::mem::take(&mut state.chat_draft));
+        ui.memory_mut(|m| m.request_focus(box_id));
+    }
+    said
+}
+
+/// The hand's name and its odds, on the right of the action bar (`S1-CS`).
+///
+/// The likeliest improvements first: a player wants to know about the pair
+/// they will make half the time before the straight flush they will make
+/// once in a thousand hands.
 fn strength_panel(ui: &mut egui::Ui, view: &TableView) {
     ui.label(RichText::new("Your hand").color(theme::TEXT_DIM).size(13.0));
+    let folded = view.seats.iter().any(|s| s.seat == view.hero && s.folded);
     match &view.hero_hand {
+        Some(name) if folded => {
+            ui.label(RichText::new(format!("{name} — folded")).color(theme::TEXT_DIM).strong());
+        }
         Some(name) => {
             ui.label(RichText::new(name).color(theme::OK).strong());
             match (view.improve_by, view.improve.is_empty()) {
@@ -537,12 +805,9 @@ fn strength_panel(ui: &mut egui::Ui, view: &TableView) {
                             .color(theme::TEXT)
                             .size(13.0),
                     );
-                    let parts: Vec<String> = view
-                        .improve
-                        .iter()
-                        .rev()
-                        .take(4)
-                        .map(|(n, p)| format!("{n} {}", pct(*p)))
+                    let parts: Vec<String> = likeliest(&view.improve, 4)
+                        .into_iter()
+                        .map(|(n, p)| format!("{n} {}", pct(p)))
                         .collect();
                     ui.label(RichText::new(parts.join(" · ")).color(theme::TEXT_DIM).size(13.0));
                 }
@@ -560,6 +825,14 @@ fn strength_panel(ui: &mut egui::Ui, view: &TableView) {
             ui.label(RichText::new("no cards yet").color(theme::TEXT_DIM).size(13.0));
         }
     }
+}
+
+/// The `n` likeliest improvements, likeliest first.
+pub fn likeliest(improve: &[(String, f32)], n: usize) -> Vec<(String, f32)> {
+    let mut v: Vec<(String, f32)> = improve.to_vec();
+    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    v.truncate(n);
+    v
 }
 
 impl TableView {
@@ -660,6 +933,7 @@ impl TableView {
             improve_by: None,
             turn_id: 0,
             hand_over: false,
+            chat: Vec::new(),
         }
     }
 }
@@ -804,5 +1078,34 @@ mod tests {
         assert_eq!(pct(0.0009), "<1%");
         assert_eq!(pct(0.0), "0%");
         assert_eq!(pct(1.0), "100%");
+    }
+
+    /// `S1-CS`: both rows of the action bar fit the smallest window the
+    /// client allows, so nothing is drawn over the row beside it. The first
+    /// photograph of the bar had the presets across the hand's name.
+    #[test]
+    fn the_action_bar_fits_the_smallest_window() {
+        let room = MIN_WINDOW[0] - bar::MARGINS;
+        assert!(bar::presets_row() <= bar::BUTTON_W, "the presets need {} of {}", bar::presets_row(), bar::BUTTON_W);
+        assert!(
+            bar::fixed() + bar::CHAT_MIN_W <= room,
+            "the two fixed blocks and the narrowest chat need {} of {room}",
+            bar::fixed() + bar::CHAT_MIN_W
+        );
+    }
+
+    /// The odds a player reads first are the likeliest ones, not the best
+    /// category.
+    #[test]
+    fn the_likeliest_improvements_come_first() {
+        let all = vec![
+            ("a pair".to_string(), 0.49),
+            ("two pair".to_string(), 0.08),
+            ("three of a kind".to_string(), 0.01),
+            ("a straight".to_string(), 0.04),
+            ("a flush".to_string(), 0.02),
+        ];
+        let top: Vec<String> = likeliest(&all, 4).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(top, vec!["a pair", "two pair", "a straight", "a flush"]);
     }
 }

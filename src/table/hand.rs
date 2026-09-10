@@ -639,6 +639,7 @@ pub fn frame_ceiling(kind: EventType) -> usize {
         | EventType::LobbySnapshotRequest
         | EventType::LobbySnapshotResponse
         | EventType::LobbyChat
+        | EventType::TableChat
         | EventType::JoinRequest
         | EventType::JoinAccept
         | EventType::JoinReject

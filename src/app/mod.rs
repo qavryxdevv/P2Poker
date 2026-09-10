@@ -175,6 +175,20 @@ pub struct AppState {
     /// `S1-CS`: the hero's hand in words and odds, once both the cards and
     /// the board are known.
     pub strength: Option<crate::poker::strength::Strength>,
+    /// `S1-CS`: whose decision clock is running, and since when on this
+    /// machine's clock. A local view like everything else here; the
+    /// window draws the fraction left from it and nothing is sent per
+    /// frame.
+    pub turn_seat: Option<u8>,
+    pub turn_since: Option<std::time::Instant>,
+    /// `S1-CS`: what the seats have said, newest last; capped like the lobby's.
+    pub table_chat: VecDeque<TableLine>,
+    /// `S1-CS`: seats this player does not want to hear. Local, never sent.
+    pub muted: std::collections::BTreeSet<u8>,
+    /// `S1-CS`: each seat's last link reading and when it arrived.
+    pub links: std::collections::BTreeMap<u8, (Option<u64>, std::time::Instant)>,
+    /// `S1-CS`: the join in progress, if one is.
+    pub joining: Option<Joining>,
 }
 
 impl Seat {
@@ -236,7 +250,38 @@ pub struct Seat {
     pub needed: u8,
     pub small_blind: u64,
     pub big_blind: u64,
+    /// `S1-CS`: how long a seat has to decide, from the table's params.
+    pub action_ms: u64,
 }
+
+/// `S1-CS`: a line said at the table, filed under the seat that said it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableLine {
+    pub seat: u8,
+    pub who: String,
+    pub said: String,
+}
+
+/// `S1-CS`: a join this client asked for and has not heard the end of.
+///
+/// Kept here so the window can say *connecting* with a clock on it, and
+/// so the reason it ended -- a seat, a refusal, the founder not answering,
+/// or nothing at all inside [`JOIN_WAIT_MS`] -- reaches the player.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Joining {
+    pub key: [u8; 32],
+    pub name: String,
+    pub buyin: u64,
+    pub password: Option<Vec<u8>>,
+    pub since: std::time::Instant,
+    /// Why it failed, once it has.
+    pub failed: Option<String>,
+}
+
+/// How long a join may go unanswered before the window calls it failed.
+/// Longer than the node's own request timeout plus the time a founder has
+/// been measured to take to become dialable.
+pub const JOIN_WAIT_MS: u64 = 90_000;
 
 /// `S1-CR`: what the window asks about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +417,19 @@ impl AppState {
                     said: text,
                 });
             }
+            NodeEvent::TableSaid { seat, nickname, text } => {
+                if self.table_chat.len() >= MAX_CHAT_LINES {
+                    self.table_chat.pop_front();
+                }
+                self.table_chat.push_back(TableLine {
+                    seat,
+                    who: format!("{nickname} (seat {seat})"),
+                    said: text,
+                });
+            }
+            NodeEvent::SeatLink { seat, rtt_ms } => {
+                self.links.insert(seat, (rtt_ms, std::time::Instant::now()));
+            }
             NodeEvent::HandBegan {
                 hand_id,
                 button,
@@ -440,6 +498,7 @@ impl AppState {
                     }
                 }
                 self.last_stacks = stacks;
+                self.clock_for(to_act);
             }
             NodeEvent::YourTurn {
                 hand_id,
@@ -468,6 +527,8 @@ impl AppState {
                     h.waiting_on = None;
                 }
                 self.turns = self.turns.saturating_add(1);
+                let me = self.seated.as_ref().and_then(|s| s.seat);
+                self.clock_for(me);
                 self.note(if to_call > 0 {
                     format!("hand #{hand_id}: your turn — {to_call} to call")
                 } else {
@@ -479,6 +540,7 @@ impl AppState {
                     h.turn = None;
                     h.waiting_on = seat;
                 }
+                self.clock_for(seat);
                 // Logged, because "whose turn is it" is the question a player
                 // asks of a table that appears to be doing nothing — and a
                 // table that is doing nothing because it is waiting for
@@ -530,6 +592,7 @@ impl AppState {
                     h.bets = vec![0; h.bets.len()];
                 }
                 self.last_stacks = stacks;
+                self.clock_for(None);
                 self.note(format!("hand #{hand_id} is over"));
             }
             NodeEvent::CardsDealt { hand_id, seats } => {
@@ -680,6 +743,10 @@ impl AppState {
                 self.note(format!("hosting {}", short(&key)));
             }
             NodeEvent::Seated { key, seat } => {
+                // `S1-CS`: a seat is the end of the join that asked for it.
+                if self.joining.as_ref().is_some_and(|j| j.key == key) {
+                    self.joining = None;
+                }
                 self.table(key).seat = Some(seat);
                 self.note(format!("seat {seat} at {}", short(&key)));
             }
@@ -695,6 +762,7 @@ impl AppState {
                 needed,
                 small_blind,
                 big_blind,
+                action_ms,
             } => {
                 let t = self.table(key);
                 t.name = name;
@@ -702,6 +770,7 @@ impl AppState {
                 t.needed = needed;
                 t.small_blind = small_blind;
                 t.big_blind = big_blind;
+                t.action_ms = action_ms;
             }
             NodeEvent::TableReal { key, session } => {
                 self.table(key).session = Some(session);
@@ -713,11 +782,17 @@ impl AppState {
                 // simply not want this player.
                 self.forget_the_table();
                 self.seated = None;
+                if let Some(j) = self.joining.as_mut() {
+                    j.failed = Some(format!("the founder says no: {}", refusal(reason)));
+                }
                 self.note(format!("the founder says no: {}", refusal(reason)));
             }
             NodeEvent::LeftTable { why } => {
                 self.forget_the_table();
                 self.seated = None;
+                if let Some(j) = self.joining.as_mut() {
+                    j.failed = Some(why.clone());
+                }
                 self.note(why);
             }
         }
@@ -779,10 +854,58 @@ impl AppState {
     /// window reopened used to show the last game's cards at the next
     /// table, because the hand was never cleared.
     fn forget_the_table(&mut self) {
+        self.clock_for(None);
+        self.table_chat.clear();
+        self.muted.clear();
+        self.links.clear();
         self.hand = None;
         self.waiting_for.clear();
         self.last_stacks.clear();
         self.strength = None;
+    }
+
+    /// `S1-CS`: the window asked to sit down; the small window says so until
+    /// a seat comes, a refusal comes, or the wait runs out.
+    pub fn begin_join(&mut self, key: [u8; 32], name: String, buyin: u64, password: Option<Vec<u8>>) {
+        self.joining = Some(Joining {
+            key,
+            name,
+            buyin,
+            password,
+            since: std::time::Instant::now(),
+            failed: None,
+        });
+    }
+
+    /// The join is tried again, from now.
+    pub fn retry_join(&mut self) {
+        if let Some(j) = self.joining.as_mut() {
+            j.since = std::time::Instant::now();
+            j.failed = None;
+        }
+    }
+
+    /// Called every frame: a join nobody has answered inside `JOIN_WAIT_MS`
+    /// is called failed, once.
+    pub fn tick_join(&mut self) {
+        if let Some(j) = self.joining.as_mut() {
+            if j.failed.is_none() && j.since.elapsed().as_millis() as u64 >= JOIN_WAIT_MS {
+                j.failed = Some(format!(
+                    "no answer from the table in {} s; it may be gone, or its host may be unreachable from here",
+                    JOIN_WAIT_MS / 1_000
+                ));
+            }
+        }
+    }
+
+    /// `S1-CS`: the decision clock runs for the seat to act, from the moment
+    /// this client learned it was that seat's turn; a seat that was already
+    /// on the clock keeps its start.
+    fn clock_for(&mut self, seat: Option<u8>) {
+        if seat != self.turn_seat {
+            self.turn_seat = seat;
+            self.turn_since = seat.map(|_| std::time::Instant::now());
+        }
     }
 
     /// The hero's hand in words and odds, from the cards this client opened
@@ -804,6 +927,11 @@ impl AppState {
         v.log = self.log.iter().cloned().collect();
         v.me = self.me.clone();
         v.unfinished = self.unfinished.clone();
+        v.joining = self.joining.as_ref().map(|j| crate::gui::lobby::JoiningView {
+            name: j.name.clone(),
+            elapsed_s: j.since.elapsed().as_secs(),
+            failed: j.failed.clone(),
+        });
         v.chat = self.chat.iter().cloned().collect();
         // Name and key together, because a name is decoration. Sorted by name
         // so the pane does not reshuffle every time somebody says they are
@@ -1205,5 +1333,80 @@ mod tests {
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 3] });
         s.apply(NodeEvent::JoinRefused { reason: 1 });
         assert!(s.hand.is_none(), "a refused seat has no hand");
+    }
+
+    /// `S1-CS`: the decision clock runs for the seat to act and for nobody
+    /// else, restarts when the turn moves, and stops with the hand.
+    #[test]
+    fn the_clock_runs_for_the_seat_to_act() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        assert_eq!(s.turn_seat, None);
+        s.apply(NodeEvent::TableState {
+            hand_id: 1, street: 0, pot: 30, to_act: Some(2), stacks: vec![1_000; 3], bets: vec![0, 10, 20], folded: vec![false; 3],
+        });
+        assert_eq!(s.turn_seat, Some(2));
+        let started = s.turn_since.expect("a clock is running");
+        s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(2) });
+        assert_eq!(s.turn_since, Some(started), "the same seat keeps its start");
+        s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(1) });
+        assert_eq!(s.turn_seat, Some(1));
+        assert!(s.turn_since.is_some());
+        s.apply(NodeEvent::YourTurn {
+            hand_id: 1, street: 0, to_call: 20, pot: 50, can_check: false, can_call: true, can_bet: false, can_raise: true, min_raise_to: 40, max_raise_to: 1_000,
+        });
+        assert_eq!(s.turn_seat, Some(0), "our own turn is our own clock");
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3] });
+        assert_eq!(s.turn_seat, None);
+        assert_eq!(s.turn_since, None);
+    }
+
+    /// `S1-CS`: what the seats say reaches the pane under their seat, is
+    /// bounded like the lobby's, and leaves with the table.
+    #[test]
+    fn table_lines_are_filed_under_the_seat_and_bounded() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        for i in 0..(MAX_CHAT_LINES + 5) {
+            s.apply(NodeEvent::TableSaid { seat: 2, nickname: "Carol".into(), text: format!("line {i}") });
+        }
+        assert_eq!(s.table_chat.len(), MAX_CHAT_LINES);
+        let last = s.table_chat.back().unwrap();
+        assert_eq!(last.seat, 2);
+        assert!(last.who.contains("Carol") && last.who.contains("seat 2"));
+        assert_eq!(last.said, format!("line {}", MAX_CHAT_LINES + 4));
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: Some(120) });
+        assert_eq!(s.links.get(&2).map(|(r, _)| *r), Some(Some(120)));
+        s.apply(NodeEvent::LeftTable { why: "left the table".into() });
+        assert!(s.table_chat.is_empty() && s.links.is_empty(), "the chat and the links went with the table");
+    }
+
+    /// `S1-CS`: a join ends with a seat, or with the reason it did not.
+    #[test]
+    fn a_join_ends_with_a_seat_or_a_reason() {
+        let mut s = AppState::new();
+        s.begin_join([7u8; 32], "Riverside".into(), 1_000, None);
+        assert!(s.view().joining.as_ref().is_some_and(|j| j.failed.is_none() && j.name == "Riverside"));
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 3 });
+        assert!(s.joining.is_none(), "a seat is the end of the join");
+
+        s.begin_join([8u8; 32], "Elsewhere".into(), 1_000, None);
+        s.apply(NodeEvent::JoinRefused { reason: 1 });
+        assert!(s.joining.as_ref().unwrap().failed.as_deref().unwrap().contains("the table is full"));
+
+        s.retry_join();
+        assert!(s.joining.as_ref().unwrap().failed.is_none());
+        s.apply(NodeEvent::LeftTable { why: "the founder did not answer".into() });
+        assert!(s.joining.as_ref().unwrap().failed.as_deref().unwrap().contains("did not answer"));
+
+        // And a join nobody answers at all fails on the clock.
+        s.retry_join();
+        s.joining.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(JOIN_WAIT_MS + 1);
+        s.tick_join();
+        assert!(s.joining.as_ref().unwrap().failed.as_deref().unwrap().contains("no answer"));
+        s.joining = None;
+        assert!(s.view().joining.is_none());
     }
 }

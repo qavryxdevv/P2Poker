@@ -336,6 +336,14 @@ impl NetworkStatus {
     }
 }
 
+/// `S1-CS`: what the connecting window says.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JoiningView {
+    pub name: String,
+    pub elapsed_s: u64,
+    pub failed: Option<String>,
+}
+
 /// Everything the pane draws, prepared away from the paint loop.
 ///
 /// `SPEC_CS.md` §33: cryptography never blocks the GUI event loop, and this is
@@ -353,6 +361,8 @@ pub struct LobbyView {
     pub log: Vec<String>,
     /// `S1-CR`: an unfinished game on record, for the window to ask about.
     pub unfinished: Option<crate::app::Unfinished>,
+    /// `S1-CS`: a join in progress, for the small window that says so.
+    pub joining: Option<JoiningView>,
 }
 
 /// One line of lobby chat.
@@ -376,6 +386,7 @@ impl LobbyView {
             seated: Vec::new(),
             log: Vec::new(),
             unfinished: None,
+            joining: None,
         }
     }
 

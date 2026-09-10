@@ -58,6 +58,9 @@ pub enum NodeCommand {
     /// The text is whatever was typed. It is trimmed and capped where it is
     /// sealed, not here: one place decides what fits on the wire.
     SayInLobby(String),
+    /// `S1-CS`: say something to the seats of this client's table, over
+    /// the table's own group and nowhere else.
+    SayAtTable(String),
     /// Found a table and advertise it.
     CreateTable {
         /// Which game. A Sit-and-Go reads `seats` and `name` and nothing else
@@ -162,6 +165,10 @@ pub enum NodeEvent {
         needed: u8,
         small_blind: u64,
         big_blind: u64,
+        /// `S1-CS`: how long a seat has to decide, as the player sees it --
+        /// the advert's `action_timeout_ms`; the grace and the time bank run
+        /// on beyond it.
+        action_ms: u64,
     },
     /// This client has a seat at a table being formed.
     Seated { key: [u8; 32], seat: u8 },
@@ -320,6 +327,16 @@ pub enum NodeEvent {
         nickname: String,
         text: String,
     },
+    /// `S1-CS`: a seat of this client's table said something. `seat` is
+    /// what the window files it under and what a mute names.
+    TableSaid {
+        seat: u8,
+        nickname: String,
+        text: String,
+    },
+    /// `S1-CS`: how a seat's connection is doing -- the last ping's
+    /// round trip, or `None` when its last connection closed.
+    SeatLink { seat: u8, rtt_ms: Option<u64> },
     /// A peer was found in the public lobby, through the DHT.
     ///
     /// Separate from [`LocalPeer`](NodeEvent::LocalPeer) on purpose. The two
@@ -481,6 +498,8 @@ impl NodeEvent {
             // that arrived three seconds ago is a line nobody answers.
             | Self::LobbyHere { .. }
             | Self::LobbySaid { .. }
+            | Self::TableSaid { .. }
+            | Self::SeatLink { .. }
             // `S1-CR`: the question about an unfinished game, and its answer.
             | Self::UnfinishedSession { .. }
             | Self::SessionResumed { .. }

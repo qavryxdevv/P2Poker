@@ -62,8 +62,10 @@ mod ratio {
     pub const HERO_CARD: f32 = 1.12;
     pub const SEAT_CARD: f32 = 0.56;
     /// A bet marker: a chip and its amount beside it.
-    pub const BET_W: f32 = 1.15;
-    pub const BET_H: f32 = 0.34;
+    /// Doubled on 2026-09-10 at the owner's word: the chips and the figure
+    /// beside them were too small to read across the table.
+    pub const BET_W: f32 = 2.0;
+    pub const BET_H: f32 = 0.62;
     /// The dealer button, as a multiple of the plate's height.
     pub const BUTTON: f32 = 0.55;
     /// The breathing space between two things that must not touch.
@@ -867,9 +869,14 @@ mod tests {
         );
         let full = (comfortable.felt.width() * ratio::CARD_W_OF_FELT_W)
             .min(comfortable.felt.height() * ratio::CARD_W_OF_FELT_H);
+        // Almost none: the chips were doubled on 2026-09-10 at the owner's word,
+        // and a bet twice the size asks the middle of an ordinary table for a
+        // few per cent. That is the design now, not drift; the floor above
+        // still holds every table to 0.85.
         assert!(
-            (comfortable.metrics.board_card.x - full).abs() < 0.01,
-            "an ordinary six-seat table should need no squeeze at all"
+            comfortable.metrics.board_card.x / full >= 0.95,
+            "an ordinary six-seat table gave up {:.2} of its middle",
+            comfortable.metrics.board_card.x / full
         );
     }
 

@@ -1142,7 +1142,7 @@ impl Client {
                 .with_title(title)
                 .with_icon(window_icon())
                 .with_inner_size([1_000.0, 720.0])
-                .with_min_inner_size([760.0, 560.0]),
+                .with_min_inner_size(p2p_poker::gui::table::MIN_WINDOW),
             |ctx, _class| {
                 // `EmbeddedWindow` means the platform gave us a panel inside the
                 // lobby rather than a window of its own. The table is drawn
@@ -1159,7 +1159,7 @@ impl Client {
             },
         );
 
-        if closed || action == p2p_poker::gui::table::TableAction::BackToLobby {
+        if closed || matches!(action, p2p_poker::gui::table::TableAction::BackToLobby) {
             self.screen = Screen::Lobby;
             self.table_closed = true;
         }
@@ -1183,6 +1183,19 @@ impl Client {
                 Some(t) if t.can_bet => Action::Bet(total),
                 _ => Action::Raise(total),
             }),
+            // `S1-CS`: a line to the table's group, and the local mutes.
+            Ta::Say(text) => {
+                self.tell(NodeCommand::SayAtTable(text));
+                None
+            }
+            Ta::Mute(seat) => {
+                self.state.muted.insert(seat);
+                None
+            }
+            Ta::Unmute(seat) => {
+                self.state.muted.remove(&seat);
+                None
+            }
             Ta::None | Ta::BackToLobby => None,
         };
         if let Some(a) = played {
@@ -1224,6 +1237,9 @@ impl eframe::App for Client {
         if !self.drain() {
             ctx.request_repaint();
         }
+
+        // `S1-CS`: a join nobody answers is called failed on the clock.
+        self.state.tick_join();
 
         if let Some(secs) = self.bounded {
             if self.started.elapsed() >= Duration::from_secs(secs) {
@@ -1273,14 +1289,49 @@ impl eframe::App for Client {
                         key,
                         buyin,
                         password,
-                    } => self.tell(NodeCommand::JoinTable {
-                        key,
-                        buyin,
-                        seat: None,
-                        password,
-                    }),
+                    } => {
+                        // `S1-CS`: the small window says the join is in
+                        // progress until a seat or a reason comes.
+                        let name = view
+                            .tables
+                            .iter()
+                            .find(|r| r.key == key)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_else(|| short_key(&key));
+                        self.state.begin_join(key, name, buyin, password.clone());
+                        self.tell(NodeCommand::JoinTable {
+                            key,
+                            buyin,
+                            seat: None,
+                            password,
+                        });
+                    }
+                    render::LobbyAction::RetryJoin => {
+                        if let Some(j) = self.state.joining.clone() {
+                            self.state.retry_join();
+                            self.tell(NodeCommand::JoinTable {
+                                key: j.key,
+                                buyin: j.buyin,
+                                seat: None,
+                                password: j.password,
+                            });
+                        }
+                    }
+                    render::LobbyAction::CancelJoin => {
+                        self.state.joining = None;
+                        if self.state.seated.is_some() {
+                            self.tell(NodeCommand::LeaveTable);
+                        }
+                    }
                     render::LobbyAction::LeaveTable => self.tell(NodeCommand::LeaveTable),
                     render::LobbyAction::Resume { key, stack } => {
+                        let name = self
+                            .state
+                            .unfinished
+                            .as_ref()
+                            .map(|u| u.table_name.clone())
+                            .unwrap_or_else(|| short_key(&key));
+                        self.state.begin_join(key, name, stack, None);
                         self.tell(NodeCommand::ResumeSession);
                         self.tell(NodeCommand::JoinTable {
                             key,

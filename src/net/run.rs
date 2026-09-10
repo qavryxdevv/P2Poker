@@ -852,6 +852,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut ratification_echo_ms: u64 = 0;
     let mut ratification_asked_ms: u64 = 0;
     let mut ratification_asked_said = false;
+    // `S1-CS`: one line per two seconds per seat of table chat.
+    let mut chat_limits = super::tabletalk::SeatLimiter::default();
     if let Some(r) = resume.as_ref() {
         let _ = events
             .send(NodeEvent::UnfinishedSession {
@@ -1905,6 +1907,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         ..
                     })) => {
                         alive.insert(peer, (std::time::Instant::now(), Some(rtt)));
+                        // `S1-CS`: the window shows each seat's link.
+                        if let Some(seat) = seat_of_peer(table.as_ref(), &peer) {
+                            let _ = events
+                                .send(NodeEvent::SeatLink {
+                                    seat,
+                                    rtt_ms: Some(u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX)),
+                                })
+                                .await;
+                        }
                     }
                     SwarmEvent::ConnectionClosed {
                         peer_id,
@@ -1930,6 +1941,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         state_peers = state_peers.saturating_sub(1);
                         let _ = events.send(NodeEvent::PeerDisconnected(peer_id)).await;
+                        // `S1-CS`: a seat whose last connection closed is shown so.
+                        if num_established == 0 {
+                            if let Some(seat) = seat_of_peer(table.as_ref(), &peer_id) {
+                                let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None }).await;
+                            }
+                        }
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::RelayClient(
                         libp2p::relay::client::Event::ReservationReqAccepted {
@@ -2302,6 +2319,44 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &propagation_source,
                                     gossipsub::MessageAcceptance::Ignore,
                                 );
+                            continue;
+                        }
+                        // `S1-CS`: a line of table chat, from a seated key, to the
+                        // window and nowhere else. Accepted for the mesh when it
+                        // verified, ignored when the seat's budget is spent, refused
+                        // when it is no seat's or another table's.
+                        if let Ok((crate::protocol::messages::EventType::TableChat, _, _)) =
+                            crate::net::chained::peek(&message.data, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
+                        {
+                            let now = super::node::now_unix_ms();
+                            let verdict = match table.as_ref() {
+                                Some(f) => match super::tabletalk::receive(
+                                    &message.data,
+                                    &f.table_id(),
+                                    |k| f.roster().seat_of(k),
+                                    now,
+                                    &mut chat_limits,
+                                ) {
+                                    Ok(said) => {
+                                        let _ = events
+                                            .send(NodeEvent::TableSaid {
+                                                seat: said.seat,
+                                                nickname: said.nickname,
+                                                text: said.text,
+                                            })
+                                            .await;
+                                        gossipsub::MessageAcceptance::Accept
+                                    }
+                                    Err(super::tabletalk::NotHeard::TooMuch) => gossipsub::MessageAcceptance::Ignore,
+                                    Err(_) => gossipsub::MessageAcceptance::Reject,
+                                },
+                                None => gossipsub::MessageAcceptance::Ignore,
+                            };
+                            let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                                &message_id,
+                                &propagation_source,
+                                verdict,
+                            );
                             continue;
                         }
                         // The hand first, if there is one. A `HAND_INIT`
@@ -3454,6 +3509,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             Some(command) = commands.recv() => {
                 let now = super::node::now_unix_ms();
                 match command {
+                    NodeCommand::SayAtTable(text) => {
+                        // `S1-CS`: to the table's group, which is the closed set of
+                        // its seats; the table's GossipSub topic only where the
+                        // table has no group. Said to this client's own window
+                        // directly, as the lobby's line is.
+                        let Some(f) = table.as_ref() else {
+                            let _ = events.send(NodeEvent::Warning("not at a table".into())).await;
+                            continue;
+                        };
+                        let Some(seat) = f.my_seat() else {
+                            let _ = events.send(NodeEvent::Warning("no seat to speak from yet".into())).await;
+                            continue;
+                        };
+                        let now = super::node::now_unix_ms();
+                        match super::tabletalk::say(&app_key, &f.table_id(), &nickname, &text, now) {
+                            Ok(bytes) => {
+                                if tox_sink.is_on_tox() {
+                                    tox_sink.try_broadcast(&bytes);
+                                } else if let Some(topic) = table_topic.as_ref() {
+                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes);
+                                }
+                                let _ = events
+                                    .send(NodeEvent::TableSaid {
+                                        seat,
+                                        nickname: nickname.clone(),
+                                        text: super::tabletalk::clip_line(&text),
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = events.send(NodeEvent::Warning(format!("not said: {e}"))).await;
+                            }
+                        }
+                    }
                     NodeCommand::SayInLobby(text) => {
                         let now = super::node::now_unix_ms();
                         match super::lobbytalk::say(&app_key, &nickname, &text, now) {
@@ -4054,6 +4143,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                         }
                     }
+                }
+                // `S1-CS`: a line of table chat over the group -- the closed set
+                // of the table's seats -- from a seated key, to the window.
+                if let Ok((crate::protocol::messages::EventType::TableChat, _, _)) =
+                    crate::net::chained::peek(&item.bytes, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
+                {
+                    if let Some(f) = table.as_ref() {
+                        let now = super::node::now_unix_ms();
+                        if let Ok(said) = super::tabletalk::receive(
+                            &item.bytes,
+                            &f.table_id(),
+                            |k| f.roster().seat_of(k),
+                            now,
+                            &mut chat_limits,
+                        ) {
+                            let _ = events
+                                .send(NodeEvent::TableSaid {
+                                    seat: said.seat,
+                                    nickname: said.nickname,
+                                    text: said.text,
+                                })
+                                .await;
+                        }
+                    }
+                    continue;
                 }
                 // **Formation traffic over the group, before there is a hand.**
                 //
@@ -6429,6 +6543,7 @@ async fn report_params(events: &Events, f: &Formation) {
             needed: ad.min_players_to_start,
             small_blind: ad.small_blind,
             big_blind: ad.big_blind,
+            action_ms: u64::from(ad.action_timeout_ms),
         })
         .await;
 }
@@ -7077,6 +7192,12 @@ fn returning_seats(h: &crate::table::hand::Hand, sit_ins: &SitIns) -> Vec<u8> {
     v.dedup();
     v.retain(|s| !h.returned().contains(s) && !h.required().contains(s));
     v
+}
+
+/// `S1-CS`: the seat a peer holds at this client's table, if any.
+fn seat_of_peer(f: Option<&Formation>, peer: &PeerId) -> Option<u8> {
+    let bytes = peer.to_bytes();
+    f?.roster().seats().iter().find(|e| e.peer_id == bytes).map(|e| e.seat)
 }
 
 /// fault-harness: whether `P2P_POKER_STOP_ON_TURN_AFTER` names a second this

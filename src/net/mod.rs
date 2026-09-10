@@ -8,6 +8,7 @@ pub mod joinrpc;
 pub mod joinwire;
 pub mod lobby;
 pub mod lobbytalk;
+pub mod tabletalk;
 pub mod node;
 pub mod peerbook;
 pub mod portmap;

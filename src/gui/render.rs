@@ -73,6 +73,10 @@ pub enum LobbyAction {
     Resume { key: [u8; 32], stack: u64 },
     /// `S1-CR`: forget the unfinished game on record.
     Forget,
+    /// `S1-CS`: try the join in progress again.
+    RetryJoin,
+    /// `S1-CS`: give the join in progress up.
+    CancelJoin,
 }
 
 /// What the create dialog collects.
@@ -295,6 +299,13 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
                 });
             });
     }
+    // `S1-CS`: the small window that says a join is in progress, with a
+    // clock on it, and says why when it ends badly.
+    if let Some(j) = view.joining.as_ref() {
+        if let Some(what) = joining_window(ui.ctx(), j) {
+            action = what;
+        }
+    }
     // The chat box is in the middle column and the columns are drawn inside
     // closures, so what it produced is carried out here rather than assigned
     // through a borrow the closure does not have.
@@ -375,6 +386,48 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
         action = what;
     }
 
+    action
+}
+
+/// `S1-CS`: connecting to a table -- a spinner and the seconds so far while
+/// the join is open, the reason and two buttons once it has failed. The
+/// window closes by itself when the seat comes: the view then carries no
+/// join, and nothing is drawn.
+pub fn joining_window(ctx: &egui::Context, j: &super::lobby::JoiningView) -> Option<LobbyAction> {
+    let mut action = None;
+    egui::Window::new(RichText::new("Connecting").size(19.0).strong())
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.set_min_width(320.0);
+            match &j.failed {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("connecting to {}… {} s", j.name, j.elapsed_s));
+                    });
+                    // A frame every few hundred milliseconds keeps the spinner
+                    // turning and the seconds honest.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                    if ui.button("Cancel").clicked() {
+                        action = Some(LobbyAction::CancelJoin);
+                    }
+                }
+                Some(why) => {
+                    ui.label(RichText::new(format!("could not join {}", j.name)).color(theme::DANGER).strong());
+                    ui.label(RichText::new(why).color(theme::TEXT));
+                    ui.horizontal(|ui| {
+                        if ui.button("Try again").clicked() {
+                            action = Some(LobbyAction::RetryJoin);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            action = Some(LobbyAction::CancelJoin);
+                        }
+                    });
+                }
+            }
+        });
     action
 }
 

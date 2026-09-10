@@ -341,6 +341,7 @@ per message code.
 | `HELLO`, `CAPABILITIES` | table mesh (`/p2p-poker/table/1`), before anything else on that stream |
 | `LOBBY_TABLE_AD`, `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE` | lobby broadcast |
 | `LOBBY_CHAT` | lobby chat broadcast |
+| `TABLE_CHAT` | table mesh: the table's group, or its topic where there is no group (§7.8) |
 | `LOBBY_SNAPSHOT_REQUEST`, `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC |
 | `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT` | join RPC |
 | everything else (`PLAYER_LIST`, `TABLE_READY`, and all of groups 3–8) | table mesh |
@@ -506,8 +507,8 @@ anything else in those four fields.
 Unchained message types, exhaustively: `HELLO`, `CAPABILITIES`, `JOIN_REQUEST`,
 `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST`, `LOBBY_TABLE_AD`,
 `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE`, `LOBBY_SNAPSHOT_REQUEST`,
-`LOBBY_SNAPSHOT_RESPONSE`, `LOBBY_CHAT`, **`DISPUTE`**. Everything else is
-chained.
+`LOBBY_SNAPSHOT_RESPONSE`, `LOBBY_CHAT`, `TABLE_CHAT`, **`DISPUTE`**. Everything
+else is chained.
 
 `DISPUTE` is on this list and it is the only table-mesh message that is, which is
 worth one sentence because an earlier draft had it chained. `chain_scope = 1`
@@ -4743,6 +4744,7 @@ means it does not and never can be.
 | `0x0104` | `LOBBY_SNAPSHOT_REQUEST` | lobby RPC | 0 | — | any peer |
 | `0x0105` | `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC | 0 | — | any peer |
 | `0x0106` | `LOBBY_CHAT` | lobby chat broadcast | 0 | — | any peer |
+| `0x0107` | `TABLE_CHAT` | table mesh (the table's group; its topic where there is no group) | 0 | — | a seated application key (§7.8) |
 | `0x0201` | `JOIN_REQUEST` | join RPC | 0 | — | joiner |
 | `0x0202` | `JOIN_ACCEPT` | join RPC | 0 | — | table key |
 | `0x0203` | `JOIN_REJECT` | join RPC | 0 | — | table key |
@@ -4777,7 +4779,7 @@ means it does not and never can be.
 | `0x0804` | `PLAYER_SIT_IN` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; the one type a seat outside `P(k)` may emit |
 | `0x0805` | `PLAYER_LEAVE` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; counts into no `P` (§3.2) |
 
-41 message types. Lobby chat is on `/p2p-poker/lobby-chat/1` and not on the lobby
+42 message types. Lobby chat is on `/p2p-poker/lobby-chat/1` and not on the lobby
 topic, so §1.4's "a message on the wrong channel is dropped" rule covers it like
 any other.
 
@@ -6567,6 +6569,32 @@ Chat carries **no security claim of any kind**. It is authenticated as coming fr
 an application key and nothing more; impersonation by display name is trivial and
 expected, and a client must never present a chat line as evidence about who a
 player is.
+
+### 7.8 `0x0107 TABLE_CHAT`
+
+`SPEC_CS.md` §22's table screen carries a chat among the seats of one table
+(`S1-CS`, 2026-09-10), and the message type exists here for the reason §7.7's
+does.
+
+*Channel:* the table's own group (D-019), which is the closed set of its
+seats; the table's GossipSub topic only at a table that has no group. Never
+the lobby's chat topic: a line at a table is for the seats at it.
+*Signed by:* the sender's application key, which must hold a seat in the
+receiver's roster for the table the line names; a line from any other key is
+refused, and a line naming another table is dropped.
+*Envelope:* unchained, per the rule at the head of §7 (`chain_scope = 0`).
+
+| Field | Type | Limit / rule |
+|---|---|---|
+| `n(0) display_name` | `bytes` | ≤ 32 B UTF-8, §9.4 string rules |
+| `n(1) text` | `bytes` | ≤ 256 B UTF-8, §9.4 string rules |
+| `n(2) table_id` | `bytes(32)` | the table the line is said at |
+
+Payload cap `LOBBY_CHAT_MAX = 2 048 B`, shared with §7.7. A receiver admits at
+most one line per two seconds per seat and ignores the rest without
+forwarding them. Everything §7.7 says of the two strings and of the absence
+of any security claim holds here unchanged. Muting a seat is the receiver's
+own affair -- it stops showing that seat's lines -- and is never on the wire.
 
 ---
 

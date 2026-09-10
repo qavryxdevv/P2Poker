@@ -301,6 +301,50 @@ pub fn dealer_button(p: &Painter, rect: Rect) {
     );
 }
 
+/// The colour of the time a seat has left: green with all of it, amber at
+/// half, red with none -- one blend, so the plate and the ring agree.
+pub fn clock_colour(left: f32) -> Color32 {
+    let left = left.clamp(0.0, 1.0);
+    if left >= 0.5 {
+        mix(theme::WARN, theme::OK, (left - 0.5) * 2.0)
+    } else {
+        mix(theme::DANGER, theme::WARN, left * 2.0)
+    }
+}
+
+/// The plate's background while its seat is on the clock (`S1-CS`): the
+/// clock's colour, darkened so the name and the stack stay legible, and
+/// it moves from green to red as the time goes.
+pub fn clock_plate(left: f32) -> Color32 {
+    mix(Color32::from_rgb(14, 22, 28), clock_colour(left), 0.55)
+}
+
+/// `S1-CS`: a seat's link -- a dot by the portrait in the colour of the last
+/// round trip, and the figure on the plate's edge. Grey once the reading
+/// is stale, red once the connection closed.
+pub fn link(p: &Painter, avatar: Rect, plate: Rect, link: &super::Link) {
+    let (colour, text) = match (link.rtt_ms, link.stale) {
+        (None, _) => (theme::DANGER, "offline".to_string()),
+        (Some(_), true) => (theme::TEXT_DIM, "no ping".to_string()),
+        (Some(ms), false) if ms <= 150 => (theme::OK, format!("{ms} ms")),
+        (Some(ms), false) if ms <= 500 => (theme::WARN, format!("{ms} ms")),
+        (Some(ms), false) => (theme::DANGER, format!("{ms} ms")),
+    };
+    let r = (avatar.width() * 0.13).clamp(3.0, 6.0);
+    let at = pos2(avatar.left() + r + 1.0, avatar.top() + r + 1.0);
+    p.circle_filled(at, r, colour);
+    p.circle_stroke(at, r, Stroke::new(1.0, theme::RAIL_TOP));
+    // Beside the portrait, on the felt, where nothing else is drawn; the
+    // plate's corner is where the first version put it and cut it.
+    p.text(
+        pos2(avatar.right() + 4.0, avatar.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional((plate.height() * 0.26).clamp(9.0, 12.0)),
+        colour,
+    );
+}
+
 /// The ring of time a seat has left to act, drawn round the portrait.
 ///
 /// An arc would be better; egui has no arc primitive, so it is a run of dots,
@@ -308,13 +352,7 @@ pub fn dealer_button(p: &Painter, rect: Rect) {
 pub fn clock(p: &Painter, rect: Rect, left: f32) {
     let c = rect.center();
     let r = rect.width() * 0.5 + 3.0;
-    let colour = if left < 0.25 {
-        theme::DANGER
-    } else if left < 0.5 {
-        theme::WARN
-    } else {
-        theme::OK
-    };
+    let colour = clock_colour(left);
     let dots = 24;
     let lit = (left.clamp(0.0, 1.0) * dots as f32).round() as usize;
     for i in 0..lit {
@@ -370,5 +408,21 @@ mod tests {
             mix(theme::RAIL_TOP, theme::RAIL_BOTTOM, 9.0),
             theme::RAIL_BOTTOM
         );
+    }
+
+    /// The clock's colour reaches the palette's own three at its three
+    /// marks, and the plate stays legible at every point between.
+    #[test]
+    fn the_clock_runs_from_green_through_amber_to_red() {
+        assert_eq!(clock_colour(1.0), theme::OK);
+        assert_eq!(clock_colour(0.5), theme::WARN);
+        assert_eq!(clock_colour(0.0), theme::DANGER);
+        for i in 0..=10 {
+            let left = i as f32 / 10.0;
+            assert!(
+                theme::separation(clock_plate(left), theme::TEXT) >= 150,
+                "the name is not legible on the plate at {left}"
+            );
+        }
     }
 }

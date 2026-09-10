@@ -12,7 +12,7 @@
 //! [`Facing::up`] with a verdict, and the verdict is that the card was opened
 //! here from a complete set of verified shares.
 
-use crate::gui::table::{Facing, SeatView, TableView};
+use crate::gui::table::{Facing, Link, SeatView, TableChatLine, TableView};
 use crate::poker::strength::{category_name, Horizon};
 
 use super::{AppState, HandInProgress};
@@ -56,8 +56,18 @@ impl AppState {
                     cards: hole_cards(hand, *n, hero),
                     folded: hand.and_then(|h| h.folded.get(i).copied()).unwrap_or(false),
                     sitting_out: false,
-                    clock: None,
+                    clock: (self.turn_seat == Some(*n) && !hand.is_some_and(|h| h.over)).then(|| {
+                        clock_fraction(
+                            self.turn_since.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0),
+                            seat.action_ms,
+                        )
+                    }),
                     won: hand.and_then(|h| h.won.get(i).copied()).unwrap_or(0),
+                    muted: self.muted.contains(n),
+                    link: self.links.get(n).map(|(rtt, at)| Link {
+                        rtt_ms: *rtt,
+                        stale: at.elapsed().as_millis() as u64 > LINK_STALE_MS,
+                    }),
                 }
             })
             .collect::<Vec<_>>();
@@ -114,6 +124,16 @@ impl AppState {
             improve_by,
             turn_id: self.turns,
             hand_over: hand.map(|h| h.over).unwrap_or(false),
+            chat: self
+                .table_chat
+                .iter()
+                .filter(|l| !self.muted.contains(&l.seat))
+                .map(|l| TableChatLine {
+                    seat: l.seat,
+                    who: l.who.clone(),
+                    said: l.said.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -134,6 +154,19 @@ impl AppState {
         }
         self.last_stacks.get(i).copied().unwrap_or(buyin)
     }
+}
+
+/// A link reading older than this is shown as stale: two ping intervals
+/// and a bit, so one missed ping is not a verdict.
+pub const LINK_STALE_MS: u64 = 40_000;
+
+/// How much of a decision budget is left, in `0..=1`; all of it when the
+/// table names no budget.
+pub fn clock_fraction(elapsed_ms: u64, budget_ms: u64) -> f32 {
+    if budget_ms == 0 {
+        return 1.0;
+    }
+    (1.0 - elapsed_ms as f32 / budget_ms as f32).clamp(0.0, 1.0)
 }
 
 /// The street, as the header names it.
@@ -279,6 +312,7 @@ mod tests {
             needed: 3,
             small_blind: 50,
             big_blind: 100,
+            action_ms: 30_000,
         });
         s.apply(NodeEvent::TableReal { key: KEY, session: [9u8; 32] });
         s
@@ -449,5 +483,52 @@ mod tests {
         assert!(s.table_view().note.unwrap().contains("preparing the deck"));
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3] });
         assert!(s.table_view().note.unwrap().contains("is over"));
+    }
+
+    /// `S1-CS`: the seat to act carries a clock, full at the moment the turn
+    /// arrived and nobody else's; the fraction itself is pure arithmetic.
+    #[test]
+    fn the_seat_to_act_carries_the_clock() {
+        assert_eq!(clock_fraction(0, 30_000), 1.0);
+        assert_eq!(clock_fraction(15_000, 30_000), 0.5);
+        assert_eq!(clock_fraction(40_000, 30_000), 0.0);
+        assert_eq!(clock_fraction(5, 0), 1.0, "no budget is no clock to run out");
+
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(state(1, 0, 30, Some(2), &[1_000; 3], &[0, 10, 20], &[false; 3]));
+        let v = s.table_view();
+        let clocks: Vec<Option<f32>> = v.seats.iter().map(|x| x.clock).collect();
+        assert!(clocks[2].is_some_and(|c| c > 0.95), "{clocks:?}");
+        assert!(clocks[0].is_none() && clocks[1].is_none(), "{clocks:?}");
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3] });
+        assert!(s.table_view().seats.iter().all(|x| x.clock.is_none()), "no clock once the hand is over");
+    }
+
+    /// `S1-CS`: the chat reaches the window under the seats that spoke, a
+    /// muted seat is not heard until it is unmuted, and a seat's link is
+    /// shown as the last ping said.
+    #[test]
+    fn the_chat_the_mutes_and_the_links_reach_the_window() {
+        let mut s = seated(0);
+        s.apply(NodeEvent::TableSaid { seat: 1, nickname: "Bob".into(), text: "hi".into() });
+        s.apply(NodeEvent::TableSaid { seat: 2, nickname: "Carol".into(), text: "hello".into() });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(80) });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None });
+        let v = s.table_view();
+        assert_eq!(v.chat.len(), 2);
+        assert_eq!(v.chat[0].seat, 1);
+        assert!(v.chat[1].who.contains("Carol"));
+        assert_eq!(v.seats[1].link, Some(Link { rtt_ms: Some(80), stale: false }));
+        assert_eq!(v.seats[2].link, Some(Link { rtt_ms: None, stale: false }));
+        assert_eq!(v.seats[0].link, None, "nobody pings themselves");
+
+        s.muted.insert(1);
+        let v = s.table_view();
+        assert!(v.seats[1].muted);
+        assert_eq!(v.chat.len(), 1, "a muted seat is not heard");
+        assert_eq!(v.chat[0].seat, 2);
+        s.muted.remove(&1);
+        assert_eq!(s.table_view().chat.len(), 2, "and is heard again once unmuted, history included");
     }
 }
