@@ -792,6 +792,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // belongs to a boundary the store has already released anyway.
     let mut early_checkpoints: std::collections::HashMap<u64, Vec<Vec<u8>>> =
         std::collections::HashMap::new();
+    // `S1-BM`: the same for section 4.10's boundary events. A sit-in request
+    // from a seat that ended hand k before this client did arrives before this
+    // client's window for k exists, and `boundary_event` used to consume it
+    // with no line (`split172616-9`: seat 3 asked, none of eight voters took
+    // it). Held under the same two bounds, admitted at phase 1.
+    let mut early_boundary: std::collections::HashMap<u64, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
     // **The number nobody has: how many private addresses the real Amino DHT
     // hands this client.** `S1-AC`'s filter counts what it refuses, so the
     // figure arrives as a byproduct of the defence instead of needing a second
@@ -1671,6 +1678,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // Keyed by hand id, and the next table starts again at 1.
             boundaries = crate::table::boundary::Boundaries::new();
             early_checkpoints.clear();
+            early_boundary.clear();
             crossed_for = None;
             checkpoint_said = false;
             frozen = None;
@@ -2267,6 +2275,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         &mut boundaries,
                                         &mut readmitted,
                                         &mut sit_ins,
+                                        &mut early_boundary,
                                         &events,
                                     )
                                     .await =>
@@ -3940,6 +3949,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &mut boundaries,
                                     &mut readmitted,
                                     &mut sit_ins,
+                                    &mut early_boundary,
                                     &events,
                                 )
                                 .await
@@ -4725,6 +4735,35 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             &h.participants(),
                             &roster,
                         );
+                        // `S1-BM`: the boundary events that arrived before this
+                        // window existed, admitted now -- the way early checkpoints
+                        // are below. Through `boundary_event` itself, the one
+                        // admission path, and before anything of this boundary is
+                        // published, so a request already here is taken before
+                        // the deal is decided.
+                        let waiting = early_boundary.remove(&h.hand_id()).unwrap_or_default();
+                        early_boundary.retain(|k, _| *k > h.hand_id());
+                        if !waiting.is_empty() {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "hand #{}: {} boundary event(s) arrived before the window opened here and are admitted now",
+                                    h.hand_id(),
+                                    waiting.len()
+                                )))
+                                .await;
+                        }
+                        for b in waiting {
+                            let _ = boundary_event(
+                                &b,
+                                h,
+                                &mut boundaries,
+                                &mut readmitted,
+                                &mut sit_ins,
+                                &mut early_boundary,
+                                &events,
+                            )
+                            .await;
+                        }
                     }
                     if let Some((state, terminal)) = h.checkpoint8() {
                         // The stage, opened at the moment `TERMINAL(k)` is
@@ -4909,6 +4948,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &mut boundaries,
                                     &mut readmitted,
                                     &mut sit_ins,
+                                    &mut early_boundary,
                                     &events,
                                 )
                                 .await;
@@ -4977,19 +5017,37 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
                         if !gave_up {
-                            if since.elapsed() < std::time::Duration::from_millis(RETURN_GRACE_MS) {
+                            // **A peer has dealt hand k+1 already -- its `HAND_INIT` is
+                            // here -- so the boundary is over whatever this client
+                            // thinks of it.** The hold ends and hand k+1 is followed from
+                            // its first frame; a certificate that lands later still
+                            // banks on the retained hand and re-derives k+1 from a stage
+                            // 0 nobody has left. Without this the muted seat of
+                            // `split172616-9` held six seconds after the table had dealt,
+                            // opened hand #3 sixty-four buffered frames late, reached
+                            // stage 37 and sat there for the rest of the run (`S1-BW`).
+                            let peers_dealt = !next_inits.is_empty();
+                            if !peers_dealt
+                                && since.elapsed() < std::time::Duration::from_millis(RETURN_GRACE_MS)
+                            {
                                 next_hand_at = Some(
                                     tokio::time::Instant::now() + std::time::Duration::from_millis(250),
                                 );
                                 continue;
                             }
                             return_hold = Some((hid, since, true));
-                            let _ = events
-                                .send(NodeEvent::Warning(format!(
+                            let line = if peers_dealt {
+                                format!(
+                                    "hand #{hid}: a peer has dealt hand #{} while seat(s) {waiting_for:?} were returning; following it, and the seat asks again at the next boundary",
+                                    hid.saturating_add(1)
+                                )
+                            } else {
+                                format!(
                                     "hand #{hid}: no return certificate within {} s for seat(s) {waiting_for:?}; dealing on, and the seat asks again at the next boundary",
                                     RETURN_GRACE_MS / 1000
-                                )))
-                                .await;
+                                )
+                            };
+                            let _ = events.send(NodeEvent::Warning(line)).await;
                         }
                     }
                 }
@@ -6499,6 +6557,12 @@ impl SitIns {
 /// took), they are outside the roster, and no certificate about them has
 /// banked here. Empty means there is nothing to hold the deal for.
 fn returning_seats(h: &crate::table::hand::Hand, sit_ins: &SitIns) -> Vec<u8> {
+    // A boundary this client holds no checkpoint value of its own for -- an
+    // abort's, or the late road's -- is one it cannot vote at, so there is
+    // nothing to hold the deal for; the seat asks again at the next.
+    if h.checkpoint8().is_none() {
+        return Vec::new();
+    }
     let mut v = sit_ins.requested(h.hand_id());
     if h.asked_to_sit_in() {
         v.push(h.my_seat());
@@ -7978,6 +8042,7 @@ async fn boundary_event(
     boundaries: &mut crate::table::boundary::Boundaries,
     readmitted: &mut Vec<u8>,
     sit_ins: &mut SitIns,
+    early: &mut std::collections::HashMap<u64, Vec<Vec<u8>>>,
     events: &Events,
 ) -> bool {
     use crate::protocol::messages::EventType;
@@ -8008,6 +8073,21 @@ async fn boundary_event(
     // checkpoint's is opened on the settled path alone, so asking it here made
     // the window settled-path only too.
     if boundaries.window(hand_id).is_none() {
+        // **Not yet, rather than not at all.** A hand id at or above the live
+        // hand's names a boundary this client has not reached: the sender
+        // ended hand k first, and its request is exactly what phase 1 will
+        // want a moment later. Held under `early_checkpoints`' two bounds --
+        // two hands, one copy per seat -- and admitted when the window opens.
+        // A hand id below the live hand's is a window T47 closed: consumed,
+        // and the seat re-emits at the next boundary (section 4.10).
+        if hand_id >= h.hand_id() && (early.contains_key(&hand_id) || early.len() < 2) {
+            let slot = early.entry(hand_id).or_default();
+            if slot.len() < usize::from(crate::protocol::constants::MAX_SEATS)
+                && !slot.iter().any(|b| b[..] == bytes[..])
+            {
+                slot.push(bytes.to_vec());
+            }
+        }
         return true;
     }
     let Ok(opened) = crate::net::chained::open_in_hand(
