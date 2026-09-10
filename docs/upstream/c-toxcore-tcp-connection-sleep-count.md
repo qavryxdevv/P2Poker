@@ -1,7 +1,8 @@
 # Draft for upstream: `set_tcp_connection_to_status(..., true)` never returns the sleepers it added
 
-**Status: draft, not filed.** Written 2026-09-10 from `S1-CQ` in `docs/DECISIONS.md`.
-Filing it is the owner's call; nothing here has been sent anywhere.
+**Status: filed, 2026-09-10, on the owner's word — https://github.com/TokTok/c-toxcore/pull/3081**
+(part A only, against `master`, from the `qavryxdev` fork, branch `fix/tcp-connection-sleep-count`).
+Written from `S1-CQ` in `docs/DECISIONS.md`. Part B of patch 0027 stays local by design.
 
 Target: `c-toxcore` v0.2.23, `toxcore/TCP_connection.c`. Our vendored copy carries
 the fix as `patches/0027-a-waking-connection-to-takes-its-sleepers-back.patch`
