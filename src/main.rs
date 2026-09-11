@@ -616,10 +616,34 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     }
                     if let Some(name) = then_join.clone() {
                         println!("looking for {name} (the second table)");
-                        join = Some(name);
+                        join = Some(name.clone());
                         join_asked = None;
                         last_ask = None;
                         connect_asks = 0;
+                        // A table the lobby already lists is asked for at
+                        // once, as a player who can see it would. The event
+                        // arm below asks only when the table is heard again,
+                        // and the next lobby question is thirty seconds away
+                        // (D-040) -- a wait that was the harness's, not the
+                        // client's (run202725-3: heard at 90 s, left at 95 s,
+                        // asked at 120 s).
+                        let listed = state
+                            .lobby
+                            .tables()
+                            .find(|l| l.held.ad.table_name == name)
+                            .map(|l| (*l.key, l.held.ad.max_buyin));
+                        if let Some((key, buyin)) = listed {
+                            println!("asking to join {name} (already listed)");
+                            join_asked = Some(std::time::Instant::now());
+                            let _ = commands
+                                .send(NodeCommand::JoinTable {
+                                    key,
+                                    buyin,
+                                    seat: None,
+                                    password: None,
+                                })
+                                .await;
+                        }
                     }
                 }
                 Some(event) = rx.recv() => {

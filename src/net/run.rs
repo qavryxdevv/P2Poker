@@ -970,6 +970,37 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // RPC and the ratification stay on the mesh either way; what moves is the
     // hand. See `net::toxsink` for why the cfg lives there and not here.
     let mut tox_sink = super::toxsink::TableSink::none();
+    // `D-042`: the client's one Tox instance starts with the client, so the
+    // first table it founds or joins finds the DHT warm and its relays up; a
+    // table is a group on it. A failure here is a warning and not the end:
+    // `start` tries again when a table comes.
+    match tox_sink.boot(&profile_dir) {
+        Ok(Some(mine)) => {
+            let r = tox_sink.reach();
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "tox: this client's instance is up from the start, key {}; of {} known nodes, {} bootstrapped and {} TCP relays were accepted{}",
+                    short_hash(&mine),
+                    r.nodes,
+                    r.booted,
+                    r.relays,
+                    if r.refreshed {
+                        ", from a list refreshed on this start"
+                    } else {
+                        ", from the stored list"
+                    }
+                )))
+                .await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "tox: no instance at the client's start ({e}); the first table tries again"
+                )))
+                .await;
+        }
+    }
     // Said once, when the group is really joined. On the founder that is
     // immediate; on a joiner it is after an invitation arrives **and** its chat
     // id matches the advertisement's, which is the one moment worth reporting -
@@ -1178,6 +1209,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut table_closed = false;
     // A tournament that has once been full has started, and does not reopen.
     let mut tournament_started = false;
+    // `D-042`: when the tournament ended here, so the table's group can be
+    // left `TOURNAMENT_LEAVE_GRACE` after -- long enough for the resend loop
+    // to give a slow seat the terminal message again, and no longer.
+    let mut table_over_at: Option<std::time::Instant> = None;
     let mut have_reservation = false;
     // **Whether the reservation this client holds can carry a hand, and which
     // poker peers are reachable only through it.**
@@ -1952,6 +1987,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         () => {{
             table_closed = false;
             tournament_started = false;
+            table_over_at = None;
             ever_dealt = false;
             hand = None;
             late_cert_said = None;
@@ -3994,6 +4030,32 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 password,
                             )
                         };
+                        // **fault-harness only.** `P2P_POKER_START_STACK=<chips>`
+                        // starts every seat of this founder's Sit & Go with that
+                        // many chips, so a tournament ENDS inside a run -- 300
+                        // against blinds of 50/100 is a few hands. The advert
+                        // carries it to the joiners as any start stack; the
+                        // buy-in is the stack, both bounds, as §6 requires.
+                        let ad = if cfg!(feature = "fault-harness") && tournament {
+                            let mut ad = ad;
+                            if let Some(stack) = std::env::var("P2P_POKER_START_STACK")
+                                .ok()
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .filter(|s| *s > 0)
+                            {
+                                ad.start_stack = stack;
+                                ad.min_buyin = stack;
+                                ad.max_buyin = stack;
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "fault-harness: every seat starts with {stack} chips"
+                                    )))
+                                    .await;
+                            }
+                            ad
+                        } else {
+                            ad
+                        };
                         // A tournament pays every entrant the same stack, so the
                         // founder's own seat takes the start stack and not what
                         // the dialog offered — `SeatEntry::admissible` admits
@@ -5097,6 +5159,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // cryptographic ones are bounded per stage rather than per hand.
             _ = stall.tick() => {
                 let now = super::node::now_unix_ms();
+                // `D-042`, the owner's rule: when the tournament is over, the
+                // group it was played in is left and the friends it was played
+                // with go (after `FRIEND_LINGER`, at the driver). A little after
+                // the end, so the resend loop gives a slow seat the terminal
+                // message twice more; the table itself stays on the felt until
+                // the player leaves it. On this two-second tick: the thirty-second
+                // one missed a whole run's end (`run212648-3`).
+                if let Some(since) = table_over_at {
+                    if since.elapsed() >= TOURNAMENT_LEAVE_GRACE && tox_sink.is_on_tox() {
+                        tox_sink.clear();
+                        let _ = events
+                            .send(NodeEvent::Warning(
+                                "the tournament is over: this client left the table's group, and the friends it played with go once no other table needs them".into(),
+                            ))
+                            .await;
+                    }
+                }
                 // fault-harness: `P2P_POKER_LEAVE_TABLE_AT=<s>` leaves the table at
                 // that second, as the window's button would -- for measuring how
                 // the others' lobbies learn that a table is gone (D-040).
@@ -6772,6 +6851,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 "the table has no next hand to deal".into(),
                             ))
                             .await;
+                        // `D-042`: the tournament is over. Its group is left
+                        // once the terminal message has had time to arrive
+                        // everywhere; see the housekeeping tick.
+                        if table_over_at.is_none() {
+                            table_over_at = Some(std::time::Instant::now());
+                        }
                     }
                 }
             }
@@ -7480,6 +7565,11 @@ fn advert_hash_of(bytes: &[u8]) -> [u8; 32] {
 
 /// §7.2's bound on a table name, in **bytes**.
 pub const TABLE_NAME_MAX: usize = 64;
+
+/// `D-042`: how long after a tournament's end its group is left. Two
+/// rounds of the five-second resend loop, so a seat that missed the terminal
+/// message hears it again before anybody is gone.
+pub const TOURNAMENT_LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Cut a string to at most `max` bytes, without cutting a character in half.
 ///

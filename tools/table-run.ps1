@@ -69,6 +69,12 @@ param(
     # finished tournament the players could not sit at a new table without a
     # restart). The second table's logs follow the first's in the same files.
     [ValidateRange(0, 3600)][int]$RehostAt = 0,
+    # `-StartStack <chips>`: the founder's Sit & Go starts every seat with that
+    # many chips instead of the preset's 10 000 (`P2P_POKER_START_STACK`, a
+    # fault-harness knob), so a tournament ENDS inside a run -- at 300 chips
+    # against blinds of 50/100 in a few hands. For D-042's end of tournament:
+    # the group left ten seconds after the last hand, the friends after.
+    [ValidateRange(0, 1000000)][int]$StartStack = 0,
     [ValidateRange(30, 3600)][int]$Seconds = 300,
     [string]$Exe,
     [switch]$KeepLogs,
@@ -360,8 +366,11 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
     $stall = if ($StallJoin -gt 0 -and $i -eq $StallJoinNode) { $StallJoin } else { 0 }
     $mute = if ($MuteFor -gt 0 -and $i -eq $MuteNode) { $MuteFor } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt)
+    # Not `$startStack`: PowerShell's names are case-insensitive and that IS
+    # the parameter. The founder alone; the advert carries it to the joiners.
+    $stackForNode = if ($StartStack -gt 0 -and $i -eq 0) { $StartStack } else { 0 }
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack)
         if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
         if ($downAt -gt 0) {
             $env:P2P_POKER_LINK_DOWN_AT = "$downAt"
@@ -372,6 +381,7 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
         if ($stopAtOpen -gt 0) { $env:P2P_POKER_STOP_AT_OPEN_AFTER = "$stopAtOpen" }
         if ($stopAtHand -gt 0) { $env:P2P_POKER_STOP_AT_HAND = "$stopAtHand" }
         if ($leaveAt -gt 0) { $env:P2P_POKER_LEAVE_TABLE_AT = "$leaveAt" }
+        if ($stack -gt 0) { $env:P2P_POKER_START_STACK = "$stack" }
         if ($mute -gt 0) {
             $env:P2P_POKER_MUTE_AT = "$muteAt"
             $env:P2P_POKER_MUTE_FOR = "$mute"
@@ -498,6 +508,7 @@ if ($NoJoin -or $Watchers -gt 0) {
 }
 if ($LeaveTableAt -gt 0) { Write-Host "==> n0 leaves its table at $LeaveTableAt s" }
 if ($RehostAt -gt 0) { Write-Host "==> at $RehostAt s n0 leaves and hosts $table-2; the joiners follow five seconds later" }
+if ($StartStack -gt 0) { Write-Host "==> every seat starts with $StartStack chips, so the tournament ends inside the run" }
 if ($ThinkMs -gt 0) { Write-Host "==> every seat waits $ThinkMs ms before it acts; past the table's own clock, the seat's client acts for it" }
 Write-Host "$nodeCount nodes started; waiting up to $($Seconds + 60) s"
 $null = Wait-Job -Job $jobs -Timeout ($Seconds + 60)
@@ -540,7 +551,12 @@ foreach ($entry in $logs) {
     $opens = @()
     $overs = 0
     $formed = $false
+    # Which table a hand belongs to: a `-RehostAt` run holds two in one log,
+    # each with its own hand #1 on its own genesis, and comparing across them
+    # read a clean run as forked (run212040-3).
+    $tableNo = 0
     foreach ($l in $lines) {
+        if ($l -match '^\s*[0-9.]+\s+left the table') { $tableNo++ }
         if ($l -match "^\s*([0-9.]+)\s+in the table's Tox group") {
             if ($null -eq $group) { $group = [double]::Parse($Matches[1], $inv) }
         }
@@ -550,6 +566,7 @@ foreach ($entry in $logs) {
                 Hand    = [int]$Matches[2]
                 Genesis = $Matches[3]
                 Seats   = $Matches[4]
+                Table   = $tableNo
             }
         }
         if ($l -match 'hand #\d+ is over') { $overs++ }
@@ -589,7 +606,7 @@ foreach ($n in $nodes) {
         $bad = 0
         $beyond = 0
         foreach ($o in $n.Opens) {
-            $ref = $founder.Opens | Where-Object { $_.Hand -eq $o.Hand } | Select-Object -First 1
+            $ref = $founder.Opens | Where-Object { $_.Hand -eq $o.Hand -and $_.Table -eq $o.Table } | Select-Object -First 1
             if ($null -eq $ref) { $beyond++ } elseif ($ref.Genesis -ne $o.Genesis) { $bad++ }
         }
         $compared = $n.Opens.Count - $beyond
@@ -617,7 +634,7 @@ $forked = @($nodes | Where-Object { $_.Opens.Count -gt 0 -and $_.Node -ne 'n0' }
     $n = $_
     ($n.Opens | Where-Object {
         $o = $_
-        $ref = $founder.Opens | Where-Object { $_.Hand -eq $o.Hand } | Select-Object -First 1
+        $ref = $founder.Opens | Where-Object { $_.Hand -eq $o.Hand -and $_.Table -eq $o.Table } | Select-Object -First 1
         ($null -ne $ref) -and ($ref.Genesis -ne $o.Genesis)
     }).Count -gt 0
 })

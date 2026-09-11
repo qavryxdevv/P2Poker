@@ -234,7 +234,9 @@ pub enum Command {
     /// asks has restarted and lost everything it held, the group among it.
     /// `net::run` sends this from the `AlreadySeated` path and nowhere else.
     Rejoined([u8; 32]),
-    /// Leave the group and stop.
+    /// Close this table: say what it still holds, leave its group. The
+    /// instance and its thread stay for the next table, and the friends no
+    /// open table needs go `FRIEND_LINGER` later (`D-042`).
     Leave,
 }
 
@@ -401,28 +403,141 @@ pub struct Trouble {
     pub join_fails: AtomicU64,
 }
 
-/// The handle the rest of the client holds.
+/// A table's number inside the client's one driver (`D-042`).
+pub type TableId = u32;
+
+/// What a handle sends the driver: a table to open, a table's command, or the
+/// end of the client.
+enum Ctl {
+    Open {
+        id: TableId,
+        setup: Setup,
+        out: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        inbox: tokio::sync::mpsc::Sender<FromTable>,
+        chat: tokio::sync::watch::Sender<Option<[u8; 32]>>,
+        trouble: Arc<Trouble>,
+    },
+    For {
+        id: TableId,
+        command: Command,
+    },
+    Stop,
+}
+
+/// **The client's one Tox instance, on its own thread, for every table this
+/// client sits at (`D-042`).**
+///
+/// It used to be an instance per table, made when the table was founded or
+/// joined and killed when it was left. Each new instance bootstrapped into the
+/// Tox DHT from nothing and found its friends again from nothing, so a second
+/// table in the same client had *tox friends up 0* for its first minute and
+/// dealt its first hand 85 s after the hosting against 20 s for a first table
+/// (`S1-DN`, `run202725-3`) -- and the owner's players restarted their clients
+/// to sit at a new table. The instance now starts with the client and carries
+/// every table as a group; a table is a group and a roster, and closing it
+/// leaves the group. The friendships are the instance's, shared by every
+/// table, and go `FRIEND_LINGER` after the last table that needed them.
+///
+/// Started by the node at launch (`TableSink::boot`), so the DHT is warm before
+/// any table exists.
+pub struct Driver {
+    control: sync_mpsc::Sender<Ctl>,
+    next: AtomicU32,
+    mine: [u8; 32],
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Driver {
+    /// Take the instance onto its thread and keep it there for the client's
+    /// life. Bootstrapping is the caller's, before this.
+    pub fn start(tox: Tox) -> Driver {
+        let mine: [u8; 32] = tox.address()[..32].try_into().unwrap_or([0u8; 32]);
+        let (ctl_tx, ctl_rx) = sync_mpsc::channel::<Ctl>();
+        let thread = std::thread::Builder::new()
+            .name("tox".into())
+            .spawn(move || run(tox, ctl_rx))
+            .expect("a thread for the client's Tox instance");
+        Driver {
+            control: ctl_tx,
+            next: AtomicU32::new(1),
+            mine,
+            thread: Some(thread),
+        }
+    }
+
+    /// This client's own Tox public key.
+    pub fn mine(&self) -> [u8; 32] {
+        self.mine
+    }
+
+    /// Open a table: its group (created here for a founder, awaited from an
+    /// invitation otherwise), its roster, its own channels and counters.
+    pub fn open(&self, setup: Setup) -> ToxTable {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        // **Deep enough for a re-send burst plus the event that matters.** The
+        // node re-broadcasts everything it has said every five seconds, which
+        // is up to sixty-four messages at once, and a fresh action arriving
+        // while that backlog is in the channel must not be the one dropped.
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        // **Deep enough to absorb one peer's ring releasing at once.** A peer
+        // whose stream is blocked buffers up to GCC_BUFFER_SIZE = 2048
+        // messages; when the missing one arrives they are all delivered in a
+        // rush. Measured, `split101212-10`: 1 282 hand events dropped on one
+        // node at 256, in bursts of 174 to 602.
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel::<FromTable>(2_048);
+        let (chat_tx, chat_rx) = tokio::sync::watch::channel::<Option<[u8; 32]>>(None);
+        let trouble = Arc::new(Trouble::default());
+        let _ = self.control.send(Ctl::Open {
+            id,
+            setup,
+            out: out_rx,
+            inbox: in_tx,
+            chat: chat_tx,
+            trouble: Arc::clone(&trouble),
+        });
+        ToxTable {
+            id,
+            out: out_tx,
+            inbox: in_rx,
+            control: self.control.clone(),
+            chat: chat_rx,
+            trouble,
+        }
+    }
+}
+
+impl Drop for Driver {
+    /// The client is ending: every table is closed, what they still held is
+    /// said, and the thread is joined -- it owns a socket, and a client that
+    /// exits while one is still running leaves a seat looking occupied to
+    /// everybody else.
+    fn drop(&mut self) {
+        let _ = self.control.send(Ctl::Stop);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The handle the rest of the client holds: one table at the driver.
 ///
 /// Implements [`TableTransport`], so nothing above it knows a Tox group is
-/// underneath — which is the whole point of `table::transport` existing.
+/// underneath -- which is the whole point of `table::transport` existing.
 pub struct ToxTable {
+    id: TableId,
     out: tokio::sync::mpsc::Sender<Vec<u8>>,
     inbox: tokio::sync::mpsc::Receiver<FromTable>,
-    control: sync_mpsc::Sender<Command>,
+    control: sync_mpsc::Sender<Ctl>,
     /// The group's `chat_id`, once there is a group.
     ///
     /// The founder **needs** this: `TableAd::on_tox` puts it in the
     /// advertisement, and until it is there nobody can check that the group
-    /// they were invited into is the one the table named. It is a `watch`
-    /// rather than a return value because the group does not exist when
-    /// `spawn` returns — the driver creates it on its own thread — and a
-    /// constructor that blocked until it did would block the client's startup
-    /// on a socket.
+    /// they were invited into is the one the table named. A `watch` rather
+    /// than a return value because the driver creates the group on its own
+    /// thread, and a constructor that blocked until it did would block the
+    /// client on a socket.
     chat: tokio::sync::watch::Receiver<Option<[u8; 32]>>,
     trouble: Arc<Trouble>,
-    /// Kept so a caller can wait for the thread to finish on shutdown, and so
-    /// that dropping the handle does not orphan it silently.
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ToxTable {
@@ -436,7 +551,7 @@ impl ToxTable {
     /// The node loop publishes from inside arms that already hold the swarm,
     /// and an `await` there would be an await in the middle of handling one
     /// event. The channel is bounded, so a caller that outruns the driver gets
-    /// `false` rather than a stall — and a message dropped here is re-sent by
+    /// `false` rather than a stall -- and a message dropped here is re-sent by
     /// the loop that exists because no transport in this design keeps history.
     pub fn try_broadcast(&self, bytes: &[u8]) -> bool {
         bytes.len() <= fragment::MAX_MESSAGE && self.out.try_send(bytes.to_vec()).is_ok()
@@ -449,10 +564,8 @@ impl ToxTable {
 
     /// Wait until there is a group, and give back its `chat_id`.
     ///
-    /// `None` if the driver stopped without ever having one — a founder whose
-    /// `tox_group_new` failed, or a joiner that was never invited. A caller
-    /// that treated that as "wait for ever" would hang a table on a group that
-    /// is not coming.
+    /// `None` if the table was closed without ever having one -- a founder
+    /// whose `tox_group_new` failed, or a joiner that was never invited.
     pub async fn wait_for_chat_id(&mut self) -> Option<[u8; 32]> {
         loop {
             if let Some(id) = *self.chat.borrow_and_update() {
@@ -469,20 +582,31 @@ impl ToxTable {
     /// Best effort: a driver that has already stopped answers nothing, which is
     /// the same as the table being over.
     pub fn tell(&self, c: Command) {
-        let _ = self.control.send(c);
+        let _ = self.control.send(Ctl::For {
+            id: self.id,
+            command: c,
+        });
     }
 }
 
 impl Drop for ToxTable {
+    /// Closing the handle closes the table: what it still holds is said, its
+    /// group is left. The instance stays for the next table (`D-042`).
     fn drop(&mut self) {
-        let _ = self.control.send(Command::Leave);
-        if let Some(t) = self.thread.take() {
-            // Joined rather than detached: the thread owns a Tox instance and a
-            // socket, and a client that exits while one is still running leaves
-            // a seat looking occupied to everybody else.
-            let _ = t.join();
-        }
+        let _ = self.control.send(Ctl::For {
+            id: self.id,
+            command: Command::Leave,
+        });
     }
+}
+
+/// One instance for one table, as before `D-042` -- for the tests, whose
+/// driver then outlives the handle for the process's life.
+pub fn spawn(tox: Tox, setup: Setup) -> ToxTable {
+    let driver = Driver::start(tox);
+    let table = driver.open(setup);
+    std::mem::forget(driver);
+    table
 }
 
 #[async_trait::async_trait]
@@ -515,7 +639,10 @@ impl TableTransport for ToxTable {
     }
 
     async fn leave(&mut self) {
-        let _ = self.control.send(Command::Leave);
+        let _ = self.control.send(Ctl::For {
+            id: self.id,
+            command: Command::Leave,
+        });
         self.inbox.close();
     }
 
@@ -582,430 +709,606 @@ const REINVITE_EVERY: Duration = Duration::from_secs(30);
 //
 // If this is ever wanted again, the shape that works is **pre-warming** -- 
 // create the Tox instance when the client starts and only the group when the
-// table is founded -- not blocking at the point of use.
+// table is founded -- not blocking at the point of use. `D-042` built exactly
+// that: the instance starts with the client (`TableSink::boot`) and a table
+// is a group on it.
 
 /// Start the driver on its own thread.
 ///
 /// `tox` is moved onto that thread and stays there. The returned handle is the
 /// only way to reach it, and dropping the handle stops it.
-pub fn spawn(tox: Tox, setup: Setup) -> ToxTable {
-    // **Deep enough for a re-send burst plus the event that matters.** The node
-    // re-broadcasts everything it has said every five seconds, which is up to
-    // sixty-four messages at once, and a fresh action arriving while that
-    // backlog is in the channel must not be the one dropped. `try_broadcast`
-    // refuses silently when it is full, and refusing a *re-send* is free while
-    // refusing a new event costs a seat its deadline.
-    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
-    // **Deep enough to absorb one peer's ring releasing at once.**
-    //
-    // It was 256, and 256 is smaller than the burst this transport produces by
-    // construction. A peer whose stream is blocked buffers up to GCC_BUFFER_SIZE
-    // = 2048 messages; when the missing one finally arrives they are all
-    // delivered in a rush. `patches/0009` made that repair happen in one round
-    // trip instead of three seconds, which makes the rush both more frequent and
-    // no smaller.
-    //
-    // Measured, `split101212-10`: 1 282 hand events dropped on one node, 1 018
-    // on another, in bursts of 174 to 602 -- every one of them a game event that
-    // reached this client and went in the bin, and every one of them a seat
-    // diverging from the table. 2048 is that bound rather than a guess.
-    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<FromTable>(2_048);
-    let (ctl_tx, ctl_rx) = sync_mpsc::channel::<Command>();
-    let (chat_tx, chat_rx) = tokio::sync::watch::channel::<Option<[u8; 32]>>(None);
-    let trouble = Arc::new(Trouble::default());
-    let theirs = Arc::clone(&trouble);
 
-    let thread = std::thread::Builder::new()
-        .name("tox-table".into())
-        .spawn(move || run(tox, setup, out_rx, in_tx, ctl_rx, chat_tx, theirs))
-        .expect("a thread for the table's transport");
+/// How long a friendship no open table needs is kept before it is dropped.
+///
+/// **The friends of a finished game go with it -- the owner's rule -- and the
+/// next table the same players sit at is the case `S1-DN` is about.** A
+/// friendship dropped and re-added is looked up again through the onion from
+/// nothing, which is a good part of the minute a second table used to wait
+/// for; one kept for two minutes past the game's end is still up when the
+/// founder opens the next table and the others join it. Past that a client
+/// at the lobby holds no game's connections.
+pub const FRIEND_LINGER: Duration = Duration::from_secs(120);
 
-    ToxTable {
-        out: out_tx,
-        inbox: in_rx,
-        control: ctl_tx,
-        chat: chat_rx,
-        trouble,
-        thread: Some(thread),
+/// One table's state at the driver: its group, its roster, the bridge from
+/// group keys to application keys, what it has invited, who is confirmed,
+/// what it still has to say, and the channels and counters the node holds
+/// the other end of.
+struct TableState {
+    setup: Setup,
+    /// The seats' Tox keys, this client's excepted (see `Setup::roster`).
+    roster: Vec<[u8; 32]>,
+    /// Group key -> application key, learned from verified traffic (`S1-I`).
+    known_as: HashMap<[u8; 32], [u8; 32]>,
+    group: Option<u32>,
+    invited: Vec<u32>,
+    confirmed: std::collections::HashSet<u32>,
+    accepted_at: Option<Instant>,
+    self_joined: bool,
+    rejoins: u32,
+    stalled_once: bool,
+    was_reachable: bool,
+    last_reinvite: Instant,
+    pending: Vec<Vec<u8>>,
+    next_id: u32,
+    reassembler: Reassembler<u32>,
+    /// Turns left to say what `pending` holds before the table is closed;
+    /// `None` for a table that is open.
+    closing: Option<usize>,
+    /// When the founder's last invitation went, and how many members were
+    /// confirmed then. See `invite_pending`.
+    last_invite: Option<(Instant, usize)>,
+    out: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    inbox: tokio::sync::mpsc::Sender<FromTable>,
+    chat: tokio::sync::watch::Sender<Option<[u8; 32]>>,
+    trouble: Arc<Trouble>,
+}
+
+impl TableState {
+    /// The Tox keys this table needs a friendship with: its roster, and for a
+    /// joiner its founder.
+    fn needs(&self, key: &[u8; 32]) -> bool {
+        self.roster.contains(key)
+            || matches!(&self.setup.role, Role::Joiner { founder, .. } if founder == key)
     }
 }
 
-/// The driver loop. Owns the Tox instance for its whole life.
-fn run(
-    mut tox: Tox,
-    setup: Setup,
-    mut out: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    inbox: tokio::sync::mpsc::Sender<FromTable>,
-    control: sync_mpsc::Receiver<Command>,
-    chat: tokio::sync::watch::Sender<Option<[u8; 32]>>,
-    trouble: Arc<Trouble>,
+fn friend_number(friends: &HashMap<u32, [u8; 32]>, key: &[u8; 32]) -> Option<u32> {
+    friends.iter().find(|(_, k)| *k == key).map(|(n, _)| *n)
+}
+
+/// A friendship for this key, if there is none yet, and no longer idle if
+/// there is. Friendships are the instance's and shared by every table; a
+/// second table with the same player finds the connection already up, which
+/// is the whole point of `D-042`.
+fn befriend(
+    tox: &mut Tox,
+    friends: &mut HashMap<u32, [u8; 32]>,
+    idle: &mut HashMap<u32, Instant>,
+    key: &[u8; 32],
 ) {
-    // Tox friend number -> that friend's public key, so an invitation can be
-    // matched against the roster rather than accepted from whoever sends one.
-    let mut friends: HashMap<u32, [u8; 32]> = HashMap::new();
-    // **This client's own key, so it can never be added to its own roster.**
-    // `Setup::roster` says *this client's excepted*, and the caller does not
-    // keep to it: `net::run::seat_on_tox` tells the driver about **every** seat
-    // the formation holds, its own included, and `Command::Seated` then pushed
-    // it here. The count that comes out is one too many, so the group-complete
-    // gate waits for a seat that is this client and can never arrive - measured,
-    // every joiner at a six-seat table reporting *held 4 of 6 other seats* and
-    // running to the sixty-second fallback, while the founder, whose own key was
-    // not in the list, reported *4 of 5*.
-    //
-    // Guarded here rather than at the caller because this is the one place that
-    // owns the list, and a second caller would make the same mistake.
-    let me: [u8; 32] = tox.address()[..32].try_into().unwrap_or([0u8; 32]);
-    let mut roster: Vec<[u8; 32]> = setup.roster.iter().copied().filter(|k| *k != me).collect();
-    // A group peer's own key, against the application key verified to have
-    // signed a message from it. The only authenticated bridge between the two
-    // key spaces `S1-I` found this client comparing across. Bounded by the
-    // group, which is private and at most `MAX_SEATS`.
-    let mut known_as: std::collections::HashMap<[u8; 32], [u8; 32]> =
-        std::collections::HashMap::new();
-    for key in &roster {
-        if let Ok(n) = tox.add_friend(key) {
-            friends.insert(n, *key);
+    match friend_number(friends, key) {
+        Some(n) => {
+            idle.remove(&n);
+        }
+        None => {
+            if let Ok(n) = tox.add_friend(key) {
+                friends.insert(n, *key);
+            }
         }
     }
+}
 
-    let mut group: Option<u32> = match &setup.role {
-        Role::Host => tox.new_group(&setup.group_name, &setup.self_name).ok(),
-        Role::Joiner { .. } | Role::Back { .. } => None,
+fn by_group(tables: &mut HashMap<TableId, TableState>, g: u32) -> Option<&mut TableState> {
+    tables.values_mut().find(|t| t.group == Some(g))
+}
+
+/// Close one table: leave its group, and mark the friends no other open table
+/// needs as idle, for the sweep to drop after `FRIEND_LINGER`. What the table
+/// still held was said before this (see `closing`).
+fn close_table(
+    tox: &mut Tox,
+    tables: &mut HashMap<TableId, TableState>,
+    id: TableId,
+    friends: &HashMap<u32, [u8; 32]>,
+    idle: &mut HashMap<u32, Instant>,
+) {
+    let Some(t) = tables.remove(&id) else {
+        return;
     };
-    // Said as soon as there is something to say. The founder's advertisement
-    // cannot name the group until this arrives, and nothing else can check the
-    // group it was invited into until the advertisement names it.
-    announce(&tox, group, &chat);
+    if let Some(g) = t.group {
+        let _ = tox.leave(g);
+    }
+    let mut keys: Vec<[u8; 32]> = t.roster.clone();
+    if let Role::Joiner { founder, .. } = &t.setup.role {
+        keys.push(*founder);
+    }
+    for key in keys {
+        if tables.values().any(|o| o.needs(&key)) {
+            continue;
+        }
+        if let Some(n) = friend_number(friends, &key) {
+            idle.entry(n).or_insert_with(Instant::now);
+        }
+    }
+}
 
-    let mut invited: Vec<u32> = Vec::new();
-    // Which friends toxcore currently reports as up. **Kept because an
-    // invitation is a condition, not an event.** It was sent only from the
-    // `FriendConnection` up-edge, so an invitation that toxcore refused was
-    // never retried: `invited` is only appended to when `invite` succeeds, and
-    // the one trigger had already passed. The next up-edge for that friend
-    // comes when the connection drops and returns, which at a table means a
-    // seated player sits outside the group until the network hiccups.
-    //
-    // Observed once at three seats: a seat entered the group at **100 s**,
-    // having asked to join at 1.5 s, and in between opened its own hands on a
-    // genesis nobody else held. It never played a hand and still printed
-    // `TABLE FORMED seats=3`.
+/// The sweep, per table: invitations owed, the counters the node reads, the
+/// membership and friend-link sets the felt is drawn from, and a joiner's
+/// second try at a join that never finished.
+fn sweep_table(
+    tox: &mut Tox,
+    t: &mut TableState,
+    friends: &HashMap<u32, [u8; 32]>,
+    connected: &std::collections::HashSet<u32>,
+    self_connection: u64,
+) {
+    t.reassembler.sweep(millis());
+    // **Offer the group again to whoever is not in it.** See `REINVITE_EVERY`:
+    // `invited` says what this client has done, and a peer that restarted
+    // needs asking again even though it does. Only while the group is short;
+    // the invitations themselves go one at a time from the loop.
+    if matches!(t.setup.role, Role::Host) && t.last_reinvite.elapsed() >= REINVITE_EVERY {
+        let short = match t.group {
+            Some(g) => tox.peer_count(g) < t.roster.len(),
+            None => false,
+        };
+        if short {
+            t.invited.clear();
+            t.last_invite = None;
+        }
+        t.last_reinvite = Instant::now();
+    }
+    // Whether the group now holds every other seat. **Counted, not matched**:
+    // `tox_group_peer_get_public_key` gives a peer's group key, not the friend
+    // key the roster holds, so no scan can say which seat a member is. A count
+    // answers the only question the gate asks, and it is sound because the
+    // group is PRIVATE and the founder the sole admin.
+    let seen = match t.group {
+        Some(g) => tox.peer_count(g),
+        None => 0,
+    };
+    // The friend connections that are up among the ones THIS table needs.
+    let mine_up = connected
+        .iter()
+        .filter(|n| friends.get(n).is_some_and(|k| t.needs(k)))
+        .count();
+    t.trouble.self_connection.store(self_connection, Ordering::Relaxed);
+    t.trouble.friends_up.store(mine_up as u64, Ordering::Relaxed);
+    t.trouble.in_group.store(seen as u64, Ordering::Relaxed);
+    // `D-035`, `D-041`: which seats are confirmed members right now, by
+    // APPLICATION key through the bridge `known_as` holds.
+    if let Ok(mut present) = t.trouble.present.lock() {
+        present.clear();
+        if let Some(g) = t.group {
+            for (group_key, app_key) in t.known_as.iter() {
+                let member =
+                    (0..Tox::PEER_SCAN).find(|p| tox.peer_key(g, *p).ok().as_ref() == Some(group_key));
+                if member.is_some_and(|p| t.confirmed.contains(&p)) {
+                    present.insert(*app_key);
+                }
+            }
+        }
+    }
+    // `D-041`: and the friend connections that are up, by Tox key.
+    if let Ok(mut up) = t.trouble.friends_on.lock() {
+        up.clear();
+        for n in connected.iter() {
+            if let Some(k) = friends.get(n) {
+                up.insert(*k);
+            }
+        }
+    }
+    // `D-037`: every sweep while the founder's friendship is up and its key is
+    // not a confirmed member, a member offers the group again -- bounded by
+    // `invited`, which the founder's down-edge clears.
+    if let (Role::Joiner { founder, .. }, Some(g)) = (&t.setup.role, t.group) {
+        if t.self_joined {
+            if let Some(n) = friend_number(friends, founder) {
+                let absent =
+                    !peer_for(tox, g, founder, &t.known_as).is_some_and(|p| t.confirmed.contains(&p));
+                if absent && connected.contains(&n) && !t.invited.contains(&n) {
+                    if tox.invite(g, n).is_ok() {
+                        t.invited.push(n);
+                        t.trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+    t.trouble
+        .confirmed_peers
+        .store(t.confirmed.len() as u64, Ordering::Relaxed);
+    t.trouble.founder_link.store(
+        match &t.setup.role {
+            Role::Host => 3,
+            Role::Joiner { founder, .. } => friend_number(friends, founder)
+                .map(|n| tox.friend_connection(n).max(0) as u64)
+                .unwrap_or(0),
+            // `D-037`: no founder to reach; the best member link stands in.
+            Role::Back { .. } => t
+                .roster
+                .iter()
+                .filter_map(|k| friend_number(friends, k))
+                .map(|n| tox.friend_connection(n).max(0) as u64)
+                .max()
+                .unwrap_or(0),
+        },
+        Ordering::Relaxed,
+    );
+    t.trouble.want_in_group.store(t.roster.len() as u64, Ordering::Relaxed);
+    // **An empty roster is not a complete group**: `seen >= roster.len()` is
+    // vacuously true at zero, and the roster reaches this thread one turn
+    // behind the node loop that sets it. Measured, `split001316-2`: hand 1
+    // opened into a group the joiner did not enter for another thirty seconds.
+    t.trouble.complete.store(
+        t.group.is_some() && !t.roster.is_empty() && seen >= t.roster.len(),
+        Ordering::Relaxed,
+    );
+
+    // **A join that never finished, given up and started again** (`S1-AA`
+    // shape (i)). Past `JOIN_GRACE` the chat is destroyed -- the one lever
+    // that clears toxcore's gate -- and the next invitation tries again, at
+    // most `MAX_REJOINS` times; the budget is fresh whenever this client
+    // becomes invitable again, so an outage does not spend it.
+    let can_be_invited = self_connection > 0 && mine_up > 0;
+    if can_be_invited && !t.was_reachable {
+        t.rejoins = 0;
+        t.trouble.rejoins.store(0, Ordering::Relaxed);
+    }
+    t.was_reachable = can_be_invited;
+    if !t.self_joined
+        && t.group.is_some()
+        && can_be_invited
+        && matches!(t.setup.role, Role::Joiner { .. } | Role::Back { .. })
+    {
+        if let Some(since) = t.accepted_at {
+            if since.elapsed() >= JOIN_GRACE && t.rejoins < MAX_REJOINS {
+                if let Some(g) = t.group.take() {
+                    let _ = tox.leave(g);
+                }
+                t.accepted_at = None;
+                t.confirmed.clear();
+                t.rejoins += 1;
+                t.trouble.rejoins.store(t.rejoins as u64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The driver: one instance, every table, until the client ends.
+fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
+    // Tox friend number -> that friend's public key. The instance's, shared by
+    // every table: a friendship outlives the table it was made for as long as
+    // any open table needs it, and `FRIEND_LINGER` past that.
+    let mut friends: HashMap<u32, [u8; 32]> = HashMap::new();
+    // Friends no open table needs, and since when.
+    let mut idle: HashMap<u32, Instant> = HashMap::new();
+    // **This client's own key, so it can never be added to a roster.** See
+    // `Setup::roster`: the caller tells the driver about every seat, its own
+    // included, and a roster that counted it would wait for a seat that can
+    // never arrive -- measured, every joiner at a six-seat table reporting
+    // *held 4 of 6 other seats* and running to the sixty-second fallback.
+    let me: [u8; 32] = tox.address()[..32].try_into().unwrap_or([0u8; 32]);
+    // Which friends toxcore currently reports as up. An invitation is a
+    // condition, not an event (see `invite_pending`), and this is the set the
+    // condition is read from; reconciled every sweep, since events say what
+    // changed and never what is.
     let mut connected: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut reassembler: Reassembler<u32> = Reassembler::new(fragment::TOX_PACKET);
-    let mut next_id: u32 = 0;
-    // **When this client accepted an invitation, and whether the join ever
-    // finished.** `S1-AA` shape (i).
-    //
-    // `tox_group_join_invite` hands back a group number nine steps before the
-    // joiner is a confirmed peer, and `confirmed = true` is set in exactly one
-    // place in `group_chats.c`. If the handshake does not complete within
-    // `GC_UNCONFIRMED_PEER_TIMEOUT` — twelve seconds, refreshed only by lossy
-    // packets and lossless *fragments*, never by a handshake — the inviter's
-    // address-less entry is reaped, silently: no `peer_exit`, no timeout-list
-    // entry, no log this client could ever see.
-    //
-    // **And there is no way back.** `do_timed_out_reconn` only ever considers
-    // peers that were once confirmed; a fresh invitation over the friend link
-    // is refused inside `Messenger.c` because a chat with that id already
-    // exists; and `gc_rejoin_group` has nobody left to handshake with. (An
-    // earlier draft of this comment said the joiner's chat is private and so
-    // never announced. It is not: `gc_accept_invite` creates it `GI_PUBLIC`.
-    // The dead end is the reap and the id gate, not the privacy state.)
-    // The seat sits at `group 0/N` for the rest of the run with every
-    // friendship up and nothing wrong that it can name. Seven runs in 134.
-    //
-    // `tox_group_leave` destroys the chat, which is the one lever that clears
-    // that gate — and the driver already owns it.
-    let mut confirmed: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut accepted_at: Option<Instant> = None;
-    let mut self_joined = false;
-    let mut rejoins = 0u32;
-    // **The stall fires once per process, and the reason is a measurement.**
-    //
-    // `stall_join_secs` caches the variable, and this sleep sits in the
-    // invite-accept arm, so before 2026-09-07 EVERY acceptance slept -- the
-    // ones this loop's own `MAX_REJOINS` recovery made included. A run's
-    // *"group join restarted 3 time(s)"* was three re-stalls, and the harness
-    // was guaranteeing that the lever it exists to test could not work.
-    //
-    // It cost a reading: `runs/split165852-9` against `runs/split164628-9` was
-    // read as a dose-response across `GC_UNCONFIRMED_PEER_TIMEOUT` when it is
-    // *stall shorter than the reaper* against *stall longer than it*, which is
-    // a fact about the knob rather than about the client.
-    let mut stalled_once = false;
-    // Whether this client could be invited at the previous sweep. See the
-    // budget rule in the sweep below.
-    let mut was_reachable = false;
+    let mut tables: HashMap<TableId, TableState> = HashMap::new();
     let mut last_sweep = Instant::now();
-    let mut last_reinvite = Instant::now();
-    let mut pending: Vec<Vec<u8>> = Vec::new();
+    let mut stopping = false;
 
     loop {
         // --- what the client asked for -------------------------------------
-        let mut stop = false;
-        while let Ok(cmd) = control.try_recv() {
-            match cmd {
-                Command::Nudge { app_key, seat } => {
-                    // Costs one small lossy packet, and toxcore throttles it to
-                    // one per second per connection, so a caller may ask on
-                    // every tick. It does nothing at all if the peer never sent
-                    // the message — which is what stops it helping a seat that
-                    // is simply silent, and is why it cannot be used to grief.
-                    // **The reverse of `known_as`, not `peer_for`.**
-                    //
-                    // Both entry points take a public key, so the peer NUMBER
-                    // is not wanted — and `peer_for` finds one by walking
-                    // `0..PEER_SCAN` = 64 with a `tox_group_peer_get_public_key`
-                    // for each, every one of which takes the Tox lock. At nine
-                    // waiting seats on a two-second tick that is up to 576
-                    // lock-taking FFI calls a tick, on the thread whose job is
-                    // to pump the group's messages. Measured, the first version
-                    // of this did exactly that: **the table dropped from 44
-                    // hands in 900 s to 18, and one seat ran eight hands ahead
-                    // of the rest.** The map the driver already keeps answers
-                    // the same question with no FFI and no lock at all.
-                    if let Some(g) = group {
-                        let group_key = known_as
-                            .iter()
-                            .find(|(_, a)| **a == app_key)
-                            .map(|(gk, _)| *gk);
-                        if let Some(group_key) = group_key {
-                            tox.request_missing(g, &group_key);
-                            // And record whether this seat is talking, for the
-                            // vote that is about to be considered.
-                            let bit = 1u32 << u32::from(seat.min(31));
-                            if tox.recv_pending(g, &group_key) > 0 {
-                                trouble.mid_delivery.fetch_or(bit, Ordering::Relaxed);
-                            } else {
-                                trouble.mid_delivery.fetch_and(!bit, Ordering::Relaxed);
-                            }
+        while let Ok(ctl) = control.try_recv() {
+            match ctl {
+                Ctl::Stop => {
+                    stopping = true;
+                    for t in tables.values_mut() {
+                        t.closing.get_or_insert(FLUSH_TURNS);
+                    }
+                }
+                Ctl::Open {
+                    id,
+                    setup,
+                    out,
+                    inbox,
+                    chat,
+                    trouble,
+                } => {
+                    let roster: Vec<[u8; 32]> =
+                        setup.roster.iter().copied().filter(|k| *k != me).collect();
+                    for key in &roster {
+                        befriend(&mut tox, &mut friends, &mut idle, key);
+                    }
+                    if let Role::Joiner { founder, .. } = &setup.role {
+                        if *founder != me {
+                            befriend(&mut tox, &mut friends, &mut idle, founder);
                         }
                     }
+                    let group = match &setup.role {
+                        Role::Host => tox.new_group(&setup.group_name, &setup.self_name).ok(),
+                        Role::Joiner { .. } | Role::Back { .. } => None,
+                    };
+                    // Said as soon as there is something to say: the founder's
+                    // advertisement cannot name the group until this arrives.
+                    announce(&tox, group, &chat);
+                    tables.insert(
+                        id,
+                        TableState {
+                            setup,
+                            roster,
+                            known_as: HashMap::new(),
+                            group,
+                            invited: Vec::new(),
+                            confirmed: std::collections::HashSet::new(),
+                            accepted_at: None,
+                            self_joined: false,
+                            rejoins: 0,
+                            stalled_once: false,
+                            was_reachable: false,
+                            last_reinvite: Instant::now(),
+                            pending: Vec::new(),
+                            next_id: 0,
+                            reassembler: Reassembler::new(fragment::TOX_PACKET),
+                            closing: None,
+                            last_invite: None,
+                            out,
+                            inbox,
+                            chat,
+                            trouble,
+                        },
+                    );
                 }
-                Command::Seated(key) if key == me => {
-                    // This client. Not a friend of itself and not a peer of
-                    // itself; see `me` above for what happened when it was.
-                }
-                Command::Seated(key) => {
-                    if !roster.contains(&key) {
-                        roster.push(key);
+                Ctl::For {
+                    id,
+                    command: Command::Leave,
+                } => {
+                    // **Said before it is left, not dropped.** What is still
+                    // in `pending` when a table closes is the LAST message it
+                    // produced -- the `HAND_COMPLETE` that ends the hand.
+                    // Measured: a hand played to the river over Tox, the seat
+                    // that finished first left, and the other sat at the
+                    // settlement stage until its deadline. Bounded, because
+                    // leaving must not become waiting: `FLUSH_TURNS` turns of
+                    // the loop below, and the other tables keep their turns.
+                    if let Some(t) = tables.get_mut(&id) {
+                        t.closing.get_or_insert(FLUSH_TURNS);
                     }
-                    if let Ok(n) = tox.add_friend(&key) {
-                        friends.insert(n, key);
-                    }
                 }
-                // What signed traffic has taught this client about who is who
-                // in the group: a peer's **group** key, paired with the
-                // **application** key whose signature the node loop verified on
-                // a message from it. The only authenticated bridge between the
-                // two key spaces, and it needs no new message because every
-                // hand event already carries one.
-                Command::KnownAs { group_key, app_key } => {
-                    known_as.insert(group_key, app_key);
-                }
-                Command::Unseated(key) => {
-                    roster.retain(|k| *k != key);
-                    // Removed from the group where this client is the admin.
-                    // Elsewhere it is not refused so much as impossible, and
-                    // pretending to do it would be a second membership answer
-                    // beside the roster's.
-                    if matches!(setup.role, Role::Host) {
-                        if let Some(g) = group {
-                            if let Some(peer) = peer_for(&tox, g, &key, &known_as) {
-                                let _ = tox.kick(g, peer);
-                            }
-                        }
-                    }
-                }
-                Command::Rejoined(key) if key != me => {
-                    if matches!(setup.role, Role::Host) {
-                        if let Some(n) = friends.iter().find(|(_, k)| **k == key).map(|(n, _)| *n) {
-                            invited.retain(|f| *f != n);
-                            // **And if the friendship is down, start it over.**
-                            // Forgetting that the peer was invited is not enough
-                            // on its own: `invite_pending` sends only to a
-                            // connected friend, and toxcore will keep trying the
-                            // address the peer had before it restarted for
-                            // something over two and a half minutes — see
-                            // `Tox::forget_friend` for the constants. Measured,
-                            // the founder sat at `tox friends up 2` of three for
-                            // a whole five-minute run.
-                            //
-                            // Only while it is down. A connected friend is
-                            // reachable and deleting it would throw away a
-                            // working connection to solve a problem it does not
-                            // have.
-                            if !connected.contains(&n) {
-                                let _ = tox.forget_friend(n);
-                                friends.remove(&n);
-                                connected.remove(&n);
-                                invited.retain(|f| *f != n);
-                                if let Ok(fresh) = tox.add_friend(&key) {
-                                    friends.insert(fresh, key);
+                Ctl::For { id, command } => {
+                    let Some(t) = tables.get_mut(&id) else {
+                        continue;
+                    };
+                    match command {
+                        Command::Nudge { app_key, seat } => {
+                            // `patches/0011`: ask this seat for the message a
+                            // stage is waiting on -- one small lossy packet,
+                            // throttled by toxcore, harmless to a seat that
+                            // never sent it. The reverse of `known_as`, not
+                            // `peer_for`: both entry points take a public key,
+                            // and a scan of `0..PEER_SCAN` per nudge took the
+                            // Tox lock up to 576 times a tick (measured: the
+                            // table dropped from 44 hands in 900 s to 18).
+                            if let Some(g) = t.group {
+                                let group_key = t
+                                    .known_as
+                                    .iter()
+                                    .find(|(_, a)| **a == app_key)
+                                    .map(|(gk, _)| *gk);
+                                if let Some(group_key) = group_key {
+                                    tox.request_missing(g, &group_key);
+                                    let bit = 1u32 << u32::from(seat.min(31));
+                                    if tox.recv_pending(g, &group_key) > 0 {
+                                        t.trouble.mid_delivery.fetch_or(bit, Ordering::Relaxed);
+                                    } else {
+                                        t.trouble.mid_delivery.fetch_and(!bit, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
-                        invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
+                        // This client. Not a friend of itself and not a peer
+                        // of itself; see `me` above.
+                        Command::Seated(key) if key == me => {}
+                        Command::Seated(key) => {
+                            if !t.roster.contains(&key) {
+                                t.roster.push(key);
+                            }
+                            befriend(&mut tox, &mut friends, &mut idle, &key);
+                        }
+                        // What signed traffic has taught this client about who
+                        // is who in the group: the only authenticated bridge
+                        // between the two key spaces (`S1-I`).
+                        Command::KnownAs { group_key, app_key } => {
+                            t.known_as.insert(group_key, app_key);
+                        }
+                        Command::Unseated(key) => {
+                            t.roster.retain(|k| *k != key);
+                            // Removed from the group where this client is the
+                            // admin; elsewhere it is impossible rather than
+                            // refused.
+                            if matches!(t.setup.role, Role::Host) {
+                                if let Some(g) = t.group {
+                                    if let Some(peer) = peer_for(&tox, g, &key, &t.known_as) {
+                                        let _ = tox.kick(g, peer);
+                                    }
+                                }
+                            }
+                        }
+                        Command::Rejoined(key) if key != me => {
+                            // A seat back after a restart needs the group
+                            // offered afresh; a friendship that is down is
+                            // remade so the invitation has a link to ride --
+                            // toxcore keeps trying the address the peer had
+                            // before it restarted for over two and a half
+                            // minutes otherwise (see `Tox::forget_friend`).
+                            if matches!(t.setup.role, Role::Host) {
+                                if let Some(n) = friend_number(&friends, &key) {
+                                    t.invited.retain(|f| *f != n);
+                                    if !connected.contains(&n) {
+                                        let _ = tox.forget_friend(n);
+                                        friends.remove(&n);
+                                        connected.remove(&n);
+                                        idle.remove(&n);
+                                        if let Ok(fresh) = tox.add_friend(&key) {
+                                            friends.insert(fresh, key);
+                                        }
+                                    }
+                                }
+                                t.last_invite = None;
+                                invite_pending(&mut tox, t, &friends, &connected);
+                            }
+                        }
+                        Command::Rejoined(_) => {}
+                        Command::Leave => {}
                     }
                 }
-                Command::Rejoined(_) => {}
-                Command::Leave => stop = true,
             }
-        }
-        if stop {
-            // **Flushed before leaving, not dropped.** Breaking here discarded
-            // whatever was still in `pending`, and what is still in `pending`
-            // when a client stops is the *last* message it produced - the
-            // `HAND_COMPLETE` that ends the hand. Measured: a hand played to the
-            // river over Tox, the seat that finished first left, and the other
-            // sat at the settlement stage until its deadline waiting for a
-            // message that had been built, queued and thrown away.
-            //
-            // Bounded, because leaving must not become waiting: a fixed number
-            // of turns, and then it goes whatever is left.
-            for _ in 0..FLUSH_TURNS {
-                if pending.is_empty() {
-                    break;
-                }
-                tox.iterate();
-                if let Some(g) = group {
-                    flush(&mut tox, g, &mut pending, &mut next_id, &trouble);
-                }
-                std::thread::sleep(tox.interval().min(MAX_TICK));
-            }
-            break;
         }
 
         // --- one turn of toxcore's own loop --------------------------------
         for e in tox.iterate() {
             match e {
                 Event::FriendConnection { friend, status } if status != 0 => {
-                    // Up. The founder invites every seat the roster names, once
-                    // its friend connection is up — before that there is nothing
-                    // to invite, because an invitation is carried over the
-                    // friendship. Trying here as well as in the sweep only makes
-                    // the common case immediate; `invite_pending` is what makes
-                    // it certain.
                     connected.insert(friend);
-                    if matches!(setup.role, Role::Host) {
-                        invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
-                    }
-                    // `D-037`: a member offers the group to the founder whose
-                    // friendship has just come up -- a founder that restarted
-                    // has the same key and no group. A founder still in the
-                    // group refuses the offer (it holds one), so a link that
-                    // merely flapped costs one refused invitation.
-                    if let (Role::Joiner { founder, .. }, Some(g)) = (&setup.role, group) {
-                        if self_joined && friends.get(&friend) == Some(founder) {
-                            invited.retain(|f| *f != friend);
-                            if tox.invite(g, friend).is_ok() {
-                                invited.push(friend);
-                                trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
+                    for t in tables.values_mut() {
+                        if t.closing.is_some() {
+                            continue;
+                        }
+                        // Up. The founder invites every seat the roster names
+                        // once its friend connection is up -- from the loop
+                        // below, one at a time (`invite_pending`).
+                        // `D-037`: a member offers the group to the founder
+                        // whose friendship has just come up -- a founder that
+                        // restarted has the same key and no group. One still
+                        // in the group refuses the offer.
+                        if let (Role::Joiner { founder, .. }, Some(g)) = (&t.setup.role, t.group) {
+                            if t.self_joined && friends.get(&friend) == Some(founder) {
+                                t.invited.retain(|f| *f != friend);
+                                if tox.invite(g, friend).is_ok() {
+                                    t.invited.push(friend);
+                                    t.trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
                 }
                 Event::FriendConnection { friend, .. } => {
                     // Down. The invitation is forgotten so that a peer which
-                    // reconnects is invited again — a group membership does not
-                    // survive a client restart, and a peer that came back
-                    // without one would sit outside the table for ever.
+                    // reconnects is invited again.
                     connected.remove(&friend);
-                    invited.retain(|f| *f != friend);
+                    for t in tables.values_mut() {
+                        t.invited.retain(|f| *f != friend);
+                    }
                 }
                 Event::GroupInvite { friend, invite } => {
-                    // **Only from the founder the advertisement named.** An
-                    // invitation is an offer; this client joins the table it
-                    // decided to join, and a friend that is on the roster but
-                    // is not the founder has no business inviting anybody.
-                    let expected = match (&setup.role, friends.get(&friend)) {
-                        (Role::Joiner { founder, chat_id }, Some(key)) if key == founder => {
-                            *chat_id
-                        }
-                        // `D-037`: the founder back after a restart takes any
-                        // roster member's invitation -- every friend it has is
-                        // one -- into the group it advertised and no other.
-                        (Role::Back { chat_id }, Some(_)) => *chat_id,
-                        _ => None,
-                    };
-                    // Refused outright when the advertisement named no group:
-                    // there is nothing to compare against, and an invitation
-                    // accepted on trust is the whole thing the id is published
-                    // to prevent.
-                    if let (Some(want), None) = (expected, group) {
-                        if let Ok(joined) = tox.accept_invite(friend, &invite, &setup.self_name) {
-                            // **Read back and compared.** Accepting is the only
-                            // way to learn which group the invitation was for;
-                            // Tox does not say beforehand. So the check is
-                            // after, and a mismatch leaves at once — the table
-                            // then ends at its own deadline, which is the right
-                            // outcome for a founder that pointed somewhere
-                            // nobody advertised.
-                            match tox.chat_id(joined) {
-                                Ok(id) if id == want => {
-                                    group = Some(joined);
-                                    accepted_at = Some(Instant::now());
-                                    self_joined = false;
-                                    announce(&tox, group, &chat);
-                                    // **The harness's stall, and nothing else
-                                    // in this loop knows about it.** Sleeping
-                                    // here starves the handshake past
-                                    // toxcore's twelve-second reaper without
-                                    // touching a single line of the code under
-                                    // test — the driver goes on believing it
-                                    // holds a group, which is exactly what the
-                                    // seven measured victims believed.
-                                    let stall = stall_join_secs();
-                                    if stall > 0 && !stalled_once {
-                                        stalled_once = true;
-                                        std::thread::sleep(Duration::from_secs(stall));
-                                    }
-                                }
-                                _ => {
-                                    let _ = tox.leave(joined);
-                                }
+                    // **Which table this invitation could be for**: one still
+                    // without a group, whose advertisement named one (an
+                    // invitation with nothing to compare against is refused
+                    // outright, see `Role`), and whose role names this friend
+                    // -- a joiner's founder, or for a founder coming back any
+                    // member of its roster (`D-037`). An invitation says
+                    // nothing about which group it is for: it is accepted,
+                    // the group's id read back and compared, and a mismatch
+                    // is left at once.
+                    let from = friends.get(&friend).copied();
+                    let candidates: Vec<(TableId, [u8; 32])> = tables
+                        .iter()
+                        .filter_map(|(id, t)| {
+                            if t.group.is_some() || t.closing.is_some() {
+                                return None;
                             }
+                            match (&t.setup.role, from) {
+                                (
+                                    Role::Joiner {
+                                        founder,
+                                        chat_id: Some(want),
+                                    },
+                                    Some(k),
+                                ) if k == *founder => Some((*id, *want)),
+                                (Role::Back { chat_id: Some(want) }, Some(k))
+                                    if t.roster.contains(&k) =>
+                                {
+                                    Some((*id, *want))
+                                }
+                                _ => None,
+                            }
+                        })
+                        .collect();
+                    let Some((first, _)) = candidates.first().copied() else {
+                        continue;
+                    };
+                    let self_name = tables[&first].setup.self_name.clone();
+                    let Ok(joined) = tox.accept_invite(friend, &invite, &self_name) else {
+                        continue;
+                    };
+                    let got = tox.chat_id(joined).ok();
+                    let target = candidates
+                        .iter()
+                        .find(|(_, want)| Some(*want) == got)
+                        .map(|(id, _)| *id);
+                    match target.and_then(|id| tables.get_mut(&id)) {
+                        Some(t) => {
+                            t.group = Some(joined);
+                            t.accepted_at = Some(Instant::now());
+                            t.self_joined = false;
+                            announce(&tox, t.group, &t.chat);
+                            // **The harness's stall, once per process.**
+                            // Sleeping here starves the handshake past
+                            // toxcore's twelve-second reaper without touching
+                            // the code under test.
+                            let stall = stall_join_secs();
+                            if stall > 0 && !t.stalled_once {
+                                t.stalled_once = true;
+                                std::thread::sleep(Duration::from_secs(stall));
+                            }
+                        }
+                        None => {
+                            let _ = tox.leave(joined);
                         }
                     }
                 }
                 Event::GroupSelfJoin { group: g } => {
                     // **The join actually finished.** Until this fires, holding
-                    // a group number means nothing: this client can neither
-                    // send to anybody nor be sent to.
-                    if group == Some(g) {
-                        self_joined = true;
-                        accepted_at = None;
+                    // a group number means nothing.
+                    if let Some(t) = by_group(&mut tables, g) {
+                        t.self_joined = true;
+                        t.accepted_at = None;
                     }
                 }
                 Event::GroupJoinFail { group: g, reason } => {
                     // toxcore gave up on its own. Leave, so the chat id stops
                     // blocking the next invitation, and let the sweep retry.
-                    if group == Some(g) {
+                    if let Some(t) = by_group(&mut tables, g) {
                         let _ = tox.leave(g);
-                        group = None;
-                        accepted_at = None;
-                        self_joined = false;
-                        confirmed.clear();
-                        trouble.join_fails.fetch_add(1, Ordering::Relaxed);
+                        t.group = None;
+                        t.accepted_at = None;
+                        t.self_joined = false;
+                        t.confirmed.clear();
+                        t.trouble.join_fails.fetch_add(1, Ordering::Relaxed);
                         let _ = reason;
                     }
                 }
                 Event::GroupPeerJoin { group: g, peer } => {
-                    if group == Some(g) {
-                        confirmed.insert(peer);
+                    if let Some(t) = by_group(&mut tables, g) {
+                        t.confirmed.insert(peer);
                     }
                 }
-                Event::GroupPeerExit { group: g, peer, key, quit } => {
-                    if group == Some(g) {
-                        confirmed.remove(&peer);
+                Event::GroupPeerExit {
+                    group: g,
+                    peer,
+                    key,
+                    quit,
+                } => {
+                    if let Some(t) = by_group(&mut tables, g) {
+                        t.confirmed.remove(&peer);
                         // `D-035`: a seat this driver knows by its group key is
                         // reported gone, on purpose or by timing out.
-                        if let Some(app) = key.and_then(|k| known_as.get(&k).copied()) {
-                            if let Ok(mut present) = trouble.present.lock() {
+                        if let Some(app) = key.and_then(|k| t.known_as.get(&k).copied()) {
+                            if let Ok(mut present) = t.trouble.present.lock() {
                                 present.remove(&app);
                             }
-                            if let Ok(mut gone) = trouble.gone.lock() {
+                            if let Ok(mut gone) = t.trouble.gone.lock() {
                                 gone.push((app, quit));
                             }
                         }
@@ -1013,118 +1316,74 @@ fn run(
                 }
                 Event::GroupPacket { group: g, peer, data } => {
                     // Reassembled here, so nothing above this module ever sees
-                    // a fragment. A refusal costs this sender its part-built
-                    // message and nothing else — see `table::fragment` for what
-                    // each one means.
-                    match reassembler.accept(&peer, &data, millis()) {
-                        Ok(Some(message)) => {
-                            // **The sender's GROUP key, and it is advisory —
-                            // which is what `FromTable::claimed` has always
-                            // promised.** It is not a player's signing key and
-                            // is not evidence about one; the signature inside
-                            // the message is the only thing that says who
-                            // spoke.
-                            //
-                            // It was `None`, and discarding it cost D-019's
-                            // kick: `peer_for` compared a peer's group key
-                            // against the roster's **friend** key, which
-                            // `tox.h:3823` says are different things — a group
-                            // key is *"permanently tied to a particular peer"*
-                            // per group, while the roster holds the long-term
-                            // key `tox_friend_add_norequest` uses. The
-                            // comparison could never be true, so no player was
-                            // ever removed from a group. Carried out here, the
-                            // node loop can pair it with the application key
-                            // that signed the message and learn the mapping
-                            // from **verified** traffic instead. `S1-I`.
-                            let item = FromTable {
-                                claimed: tox.peer_key(g, peer).ok(),
-                                bytes: message,
-                            };
-                            if inbox.try_send(item).is_err() {
-                                // The client is not draining. Dropping is right:
-                                // blocking here would stop `tox_iterate`, and a
-                                // transport that stalls the network to wait for
-                                // its reader is a transport that loses the
-                                // connection as well as the message.
-                                //
-                                // **Counted, because it was silent.** This is a
-                                // game event going into the bin; the seat that
-                                // loses it diverges from the table, and until
-                                // this counter existed nothing anywhere said so.
-                                trouble.inbox_dropped.fetch_add(1, Ordering::Relaxed);
+                    // a fragment.
+                    if let Some(t) = by_group(&mut tables, g) {
+                        match t.reassembler.accept(&peer, &data, millis()) {
+                            Ok(Some(message)) => {
+                                // The sender's GROUP key, advisory: the
+                                // signature inside the message is the only
+                                // thing that says who spoke. Carried out so
+                                // the node loop can pair it with the signing
+                                // key (`S1-I`).
+                                let item = FromTable {
+                                    claimed: tox.peer_key(g, peer).ok(),
+                                    bytes: message,
+                                };
+                                if t.inbox.try_send(item).is_err() {
+                                    // The client is not draining. Dropping is
+                                    // right: blocking here would stop
+                                    // `tox_iterate`. Counted, because it was
+                                    // silent.
+                                    t.trouble.inbox_dropped.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
+                            Ok(None) => {}
+                            Err(_) => {}
                         }
-                        Ok(None) => {}
-                        Err(_) => {}
                     }
                 }
                 Event::FriendRequestIgnored => {}
             }
         }
 
-        // --- and what the client wants said --------------------------------
-        while let Ok(message) = out.try_recv() {
-            pending.push(message);
+        // --- the founder's invitations, one at a time -------------------------
+        for t in tables.values_mut() {
+            if matches!(t.setup.role, Role::Host) && t.closing.is_none() {
+                invite_pending(&mut tox, t, &friends, &connected);
+            }
         }
-        if let Some(g) = group {
-            flush(&mut tox, g, &mut pending, &mut next_id, &trouble);
+
+        // --- and what each table wants said ---------------------------------
+        for t in tables.values_mut() {
+            while let Ok(message) = t.out.try_recv() {
+                t.pending.push(message);
+            }
+            if let Some(g) = t.group {
+                flush(&mut tox, g, &mut t.pending, &mut t.next_id, &t.trouble);
+            }
+        }
+        // Tables that are closing go once what they held is said, or once
+        // their turns are spent.
+        let done: Vec<TableId> = tables
+            .iter()
+            .filter(|(_, t)| t.closing.is_some_and(|left| left == 0 || t.pending.is_empty()))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in done {
+            close_table(&mut tox, &mut tables, id, &friends, &mut idle);
+        }
+        for t in tables.values_mut() {
+            if let Some(left) = t.closing.as_mut() {
+                *left = left.saturating_sub(1);
+            }
+        }
+        if stopping && tables.is_empty() {
+            break;
         }
 
         if last_sweep.elapsed() >= SWEEP_EVERY {
-            reassembler.sweep(millis());
-            // Every seat that is connected, on the roster and not yet in — see
-            // `invite_pending`. Cheap: it does nothing at all once every friend
-            // has been invited, which is the state a table spends its life in.
-            if matches!(setup.role, Role::Host) {
-                invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
-            }
-            // **Offer the group again to whoever is not in it.** See
-            // `REINVITE_EVERY`: `invited` says what this client has done, and
-            // a peer that restarted needs asking again even though it does.
-            // Only while the group is short, so a whole table sends nothing.
-            if matches!(setup.role, Role::Host)
-                && last_reinvite.elapsed() >= REINVITE_EVERY
-            {
-                let short = match group {
-                    Some(g) => tox.peer_count(g) < roster.len(),
-                    None => false,
-                };
-                if short {
-                    invited.clear();
-                    invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
-                }
-                last_reinvite = Instant::now();
-            }
-
-            // And whether the group now holds every other seat. `roster` is
-            // this client's excepted (see `Setup::roster`), so the answer is a
-            // straight comparison. At most ten keys and a scan each, once every
-            // five seconds.
-            //
-            // **Counted, not matched, and the API forces that.**
-            // `tox_group_peer_get_public_key` gives a peer's *group* public key
-            // (`tox.h:3823`) — a per-group identity, not the friend key the
-            // roster holds — so no scan can say *which* seat a group member is.
-            // The first version of this compared the two key spaces, always
-            // found nothing, and made the gate above it time out every single
-            // time: measured, six seats all in the group by 20.7 s and hand 1
-            // held until the 60-second fallback fired.
-            //
-            // A count answers the only question the gate asks. It cannot tell a
-            // stranger from a seat, which is sound here because the group is
-            // PRIVATE and the founder is the sole admin: the only way in is an
-            // invitation the founder sent to a roster key.
-            let seen = match group {
-                Some(g) => tox.peer_count(g),
-                None => 0,
-            };
-            // **Asked of toxcore rather than remembered.** `connected` is
-            // built from `FriendConnection` events, which say what has changed
-            // and never what is; a connection whose event was missed is
-            // invisible to it for ever. Reconciled here every sweep, so the set
-            // the invitations are sent to cannot drift from the one toxcore
-            // would deliver them over.
+            // **Asked of toxcore rather than remembered.** `connected` is built
+            // from events, which say what has changed and never what is.
             for (n, _) in friends.iter() {
                 if tox.friend_connection(*n) > 0 {
                     connected.insert(*n);
@@ -1132,162 +1391,29 @@ fn run(
                     connected.remove(n);
                 }
             }
-            trouble
-                .self_connection
-                .store(tox.connection().max(0) as u64, Ordering::Relaxed);
-            trouble.friends_up.store(connected.len() as u64, Ordering::Relaxed);
-            trouble.in_group.store(seen as u64, Ordering::Relaxed);
-            // `D-035`: which roster seats are confirmed members right now.
-            // `D-041`: by APPLICATION key, through the bridge `known_as` holds
-            // (group key -> application key, learned from a signed frame,
-            // `S1-I`). The first version walked `roster`, which holds Tox
-            // keys, and compared those to application keys: nobody ever
-            // matched, this set was empty in every run, and the felt drew
-            // every seat that never answered a libp2p ping as offline.
-            if let Ok(mut present) = trouble.present.lock() {
-                present.clear();
-                if let Some(g) = group {
-                    for (group_key, app_key) in known_as.iter() {
-                        let member = (0..Tox::PEER_SCAN)
-                            .find(|p| tox.peer_key(g, *p).ok().as_ref() == Some(group_key));
-                        if member.is_some_and(|p| confirmed.contains(&p)) {
-                            present.insert(*app_key);
-                        }
-                    }
+            let self_connection = tox.connection().max(0) as u64;
+            for t in tables.values_mut() {
+                if t.closing.is_none() {
+                    sweep_table(&mut tox, t, &friends, &connected, self_connection);
                 }
             }
-            // `D-041`: and the friend connections that are up, by Tox key.
-            if let Ok(mut up) = trouble.friends_on.lock() {
-                up.clear();
-                for n in connected.iter() {
-                    if let Some(k) = friends.get(n) {
-                        up.insert(*k);
-                    }
-                }
-            }
-            // `D-037`: and every sweep while the founder's friendship is up and
-            // its key is not a confirmed member, the group is offered again --
-            // bounded by `invited`, which the founder's down-edge clears. The
-            // up-edge above is the immediate case; this is what makes it
-            // certain, as `invite_pending` is for the founder's own invitations.
-            if let (Role::Joiner { founder, .. }, Some(g)) = (&setup.role, group) {
-                if self_joined {
-                    if let Some(n) = friends.iter().find(|(_, k)| *k == founder).map(|(n, _)| *n) {
-                        let absent = !peer_for(&tox, g, founder, &known_as)
-                            .is_some_and(|p| confirmed.contains(&p));
-                        if absent && connected.contains(&n) && !invited.contains(&n) {
-                            if tox.invite(g, n).is_ok() {
-                                invited.push(n);
-                                trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-            }
-            trouble
-                .confirmed_peers
-                .store(confirmed.len() as u64, Ordering::Relaxed);
-            trouble.founder_link.store(
-                match &setup.role {
-                    Role::Host => 3,
-                    Role::Joiner { founder, .. } => friends
-                        .iter()
-                        .find(|(_, k)| *k == founder)
-                        .map(|(n, _)| tox.friend_connection(*n).max(0) as u64)
-                        .unwrap_or(0),
-                    // `D-037`: no founder to reach; the best member link stands in.
-                    Role::Back { .. } => friends
-                        .iter()
-                        .map(|(n, _)| tox.friend_connection(*n).max(0) as u64)
-                        .max()
-                        .unwrap_or(0),
-                },
-                Ordering::Relaxed,
-            );
-            trouble.want_in_group.store(roster.len() as u64, Ordering::Relaxed);
-            // **An empty roster is not a complete group, and saying it was
-            // cost a table.**
-            //
-            // `seen >= roster.len()` is vacuously true at `roster.len() == 0`,
-            // and the roster reaches this thread by `Command::Seated`, one turn
-            // behind the node loop that sets it. So in the gap between a seat
-            // being admitted and this driver being told about it, an **empty**
-            // group answered *complete*.
-            //
-            // `hand_one_may_open` asks this first and returns `true` on it
-            // without consulting anything else, so the floor added by `S1-AA` —
-            // never deal while the group holds nobody — was short-circuited by
-            // the very condition it exists to catch.
-            //
-            // Measured, `split001316-2`: the founder seated the second player at
-            // 19.1 s and opened hand 1 at **19.2 s**, into a group the joiner did
-            // not enter until **51.6 s**. Both sides opened at the same genesis,
-            // so formation was correct; the opening simply went to nobody, the
-            // founder timed out at 51.0 s, and the joiner opened its own hand 1
-            // at 56.6 s waiting for a seat that had already given up.
-            //
-            // **It was invisible until today.** Hand traffic used to go to the
-            // per-table GossipSub topic as well, where the joiner had been
-            // connected since 16.5 s, so libp2p delivered what Tox could not and
-            // the defect never showed. D-019's second amendment took that
-            // fallback away — the owner's instruction, and the capacity argument
-            // behind it — and this surfaced on the first run afterwards.
-            trouble.complete.store(
-                group.is_some() && !roster.is_empty() && seen >= roster.len(),
-                Ordering::Relaxed,
-            );
-
-            // **A join that never finished, given up and started again.**
-            //
-            // Twelve seconds is toxcore's own reaper; this waits `JOIN_GRACE`,
-            // comfortably past it, so a slow but working handshake is never
-            // interrupted. Past that the chat is destroyed — which is the only
-            // action that lets the founder's next invitation through — and the
-            // sweep's ordinary re-invite does the rest.
-            //
-            // Bounded, because a client that leaves and rejoins for ever is
-            // worse than one that sits still: after `MAX_REJOINS` it stops and
-            // the count is on the status line, which turns an invisible failure
-            // into a number.
-            //
-            // **The budget is per healthy period, not per run, and the first
-            // measured run is why.** `-StallJoin 30` on a four-seat table: the
-            // seat came back from the stall with its transport still recovering
-            // — one friendship of three — spent all three attempts on rejoins
-            // that could not work, and then sat at `group 0 seen/0 confirmed/3`
-            // with `tox friends up 3` and no attempts left. The budget had been
-            // eaten by the outage rather than by the fault it exists for.
-            //
-            // Two rules follow, and both are about not spending an attempt that
-            // cannot succeed. A rejoin needs the **founder** to be able to
-            // invite, which needs its friendship up; and when the friendships
-            // come back after having been down, the seat is in a new situation
-            // and the budget is fresh.
-            let can_be_invited = tox.connection() > 0 && !connected.is_empty();
-            if can_be_invited && !was_reachable {
-                // Back from an outage. Anything spent during it was spent on
-                // nothing.
-                rejoins = 0;
-                trouble.rejoins.store(0, Ordering::Relaxed);
-            }
-            was_reachable = can_be_invited;
-
-            if !self_joined
-                && group.is_some()
-                && can_be_invited
-                && matches!(setup.role, Role::Joiner { .. } | Role::Back { .. })
-            {
-                if let Some(since) = accepted_at {
-                    if since.elapsed() >= JOIN_GRACE && rejoins < MAX_REJOINS {
-                        if let Some(g) = group.take() {
-                            let _ = tox.leave(g);
-                        }
-                        accepted_at = None;
-                        confirmed.clear();
-                        rejoins += 1;
-                        trouble.rejoins.store(rejoins as u64, Ordering::Relaxed);
-                    }
-                }
+            // `D-042`: the friends of a closed table go once no open table has
+            // needed them for `FRIEND_LINGER`.
+            let stale: Vec<u32> = idle
+                .iter()
+                .filter(|(n, since)| {
+                    since.elapsed() >= FRIEND_LINGER
+                        && !friends
+                            .get(n)
+                            .is_some_and(|k| tables.values().any(|t| t.needs(k)))
+                })
+                .map(|(n, _)| *n)
+                .collect();
+            for n in stale {
+                let _ = tox.forget_friend(n);
+                friends.remove(&n);
+                connected.remove(&n);
+                idle.remove(&n);
             }
             last_sweep = Instant::now();
         }
@@ -1295,13 +1421,10 @@ fn run(
         std::thread::sleep(tox.interval().min(MAX_TICK));
     }
 
-    if let Some(g) = group {
-        let _ = tox.leave(g);
-        // One more turn so the part message actually goes out before the
-        // instance is dropped. Leaving without it is leaving silently, and the
-        // other seats then wait out a deadline for somebody who has gone.
-        tox.iterate();
-    }
+    // One more turn so the last part message actually goes out before the
+    // instance is dropped. Leaving without it is leaving silently, and the
+    // other seats then wait out a deadline for somebody who has gone.
+    tox.iterate();
 }
 
 /// How many turns a leaving driver spends trying to send what it still holds.
@@ -1310,37 +1433,61 @@ fn run(
 /// for an empty queue: at `MAX_TICK` this is at most a second and a half.
 const FLUSH_TURNS: usize = 30;
 
-/// Invite every seat that is connected, on the roster and not in the group yet.
+/// How long the founder waits for an invited seat to become a confirmed
+/// member before it invites the next one regardless.
+pub const INVITE_GAP: Duration = Duration::from_secs(3);
+
+/// Invite the next seat that is connected, on the roster and not in the group
+/// yet -- **one at a time**, the next once the last is a confirmed member or
+/// `INVITE_GAP` after (`D-042`).
 ///
-/// **An invitation is a condition, not an event, and this is the difference.**
-/// It used to be sent only from the `FriendConnection` up-edge. Two things
-/// followed. A refusal from `tox_group_invite_friend` was never retried, since
-/// `invited` is only appended to when the call succeeds and the trigger had
-/// already gone by; and the next up-edge for that friend arrives when the
-/// connection drops and returns, so a seated player could sit outside the table
-/// until the network happened to hiccup.
+/// **An invitation is a condition, not an event.** It used to be sent only
+/// from the `FriendConnection` up-edge, so a refusal from
+/// `tox_group_invite_friend` was never retried and a seated player could sit
+/// outside the table until the network happened to hiccup. Called every turn
+/// of the loop now, which is what makes it certain rather than likely; cheap,
+/// since it does nothing once every friend has been invited.
 ///
-/// Called from the up-edge as well, so the ordinary case is still immediate.
-/// The sweep is what makes it certain rather than likely.
+/// **And one at a time, because two seats invited in the same instant do not
+/// find each other.** A joiner learns the members from one sync response, at
+/// its join, and opens a handshake to each of them; a seat that is not yet a
+/// confirmed member when that response is built is not in it. Two seats
+/// invited together each sync before the other is confirmed, so neither holds
+/// the other and neither opens the handshake -- they meet only when the
+/// founder's next ping carries a peer count they do not have (every
+/// `GC_PING_TIMEOUT`) and their own sync limit has passed. Measured,
+/// `run212040-3`: a warm instance invited both seats of a second table in
+/// one sweep, each saw *group 1 seen/1 confirmed/2 wanted* for 18 s, and the
+/// table's first hand came 25 s after the join, where a first table -- whose
+/// friend links came up a second apart -- dealt 5 s after it. A seat invited
+/// after the last is confirmed gets the last in its own sync.
 fn invite_pending(
     tox: &mut Tox,
-    group: Option<u32>,
+    t: &mut TableState,
     friends: &HashMap<u32, [u8; 32]>,
     connected: &std::collections::HashSet<u32>,
-    invited: &mut Vec<u32>,
-    trouble: &Trouble,
 ) {
-    let Some(g) = group else { return };
-    for friend in pending_invites(connected, friends, invited) {
-        if tox.invite(g, friend).is_ok() {
-            trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
-            invited.push(friend);
-        } else {
-            // Counted rather than logged: a refusal here is ordinary while the
-            // group is settling, and the number is only interesting if it does
-            // not stop growing.
-            trouble.invites_refused.fetch_add(1, Ordering::Relaxed);
+    let Some(g) = t.group else { return };
+    if let Some((at, confirmed_then)) = t.last_invite {
+        if t.confirmed.len() <= confirmed_then && at.elapsed() < INVITE_GAP {
+            return;
         }
+    }
+    let Some(friend) = pending_invites(connected, friends, &t.roster, &t.invited)
+        .into_iter()
+        .next()
+    else {
+        return;
+    };
+    if tox.invite(g, friend).is_ok() {
+        t.trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
+        t.invited.push(friend);
+        t.last_invite = Some((Instant::now(), t.confirmed.len()));
+    } else {
+        // Counted rather than logged: a refusal here is ordinary while the
+        // group is settling, and the number is only interesting if it does
+        // not stop growing.
+        t.trouble.invites_refused.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1354,12 +1501,15 @@ fn invite_pending(
 fn pending_invites(
     connected: &std::collections::HashSet<u32>,
     friends: &HashMap<u32, [u8; 32]>,
+    roster: &[[u8; 32]],
     invited: &[u32],
 ) -> Vec<u32> {
+    // `D-042`: this table's roster and nobody else's -- the friendships are
+    // the instance's, shared by every table this client sits at.
     let mut out: Vec<u32> = connected
         .iter()
         .copied()
-        .filter(|f| friends.contains_key(f) && !invited.contains(f))
+        .filter(|f| friends.get(f).is_some_and(|k| roster.contains(k)) && !invited.contains(f))
         .collect();
     out.sort_unstable();
     out
@@ -1508,26 +1658,34 @@ mod tests {
             .into_iter()
             .collect();
         let set = |xs: &[u32]| xs.iter().copied().collect::<std::collections::HashSet<u32>>();
+        let everyone: Vec<[u8; 32]> = friends.values().copied().collect();
 
         // Connected, on the roster, not yet invited: owed.
-        assert_eq!(pending_invites(&set(&[1, 2]), &friends, &[]), vec![1, 2]);
+        assert_eq!(pending_invites(&set(&[1, 2]), &friends, &everyone, &[]), vec![1, 2]);
 
         // Already invited: not owed again. A second invitation is not harmful,
         // but sending one every five seconds for the life of a table is.
-        assert_eq!(pending_invites(&set(&[1, 2]), &friends, &[1]), vec![2]);
+        assert_eq!(pending_invites(&set(&[1, 2]), &friends, &everyone, &[1]), vec![2]);
 
         // **The case the edge got wrong.** The friend is connected and the
         // invitation was refused, so it is not in `invited` — and there will be
         // no second up-edge. The sweep must still owe it.
-        assert_eq!(pending_invites(&set(&[3]), &friends, &[1, 2]), vec![3]);
+        assert_eq!(pending_invites(&set(&[3]), &friends, &everyone, &[1, 2]), vec![3]);
 
         // Connected but not a seat at this table: never owed. The founder
         // invites the roster, not everyone toxcore has a friendship with.
-        assert_eq!(pending_invites(&set(&[9]), &friends, &[]), Vec::<u32>::new());
+        assert_eq!(pending_invites(&set(&[9]), &friends, &everyone, &[]), Vec::<u32>::new());
 
         // Not connected: nothing to invite over, which is the case the edge
         // handled correctly and this must not change.
-        assert_eq!(pending_invites(&set(&[]), &friends, &[]), Vec::<u32>::new());
+        assert_eq!(pending_invites(&set(&[]), &friends, &everyone, &[]), Vec::<u32>::new());
+
+        // `D-042`: a friend of the instance that is not on THIS table's
+        // roster is another table's, and never owed this table's group.
+        assert_eq!(
+            pending_invites(&set(&[1, 2, 3]), &friends, &[[2u8; 32]], &[]),
+            vec![2]
+        );
     }
 
     /// **The whole stack, between two real Tox instances**: a nine-kilobyte
@@ -1593,9 +1751,11 @@ mod tests {
 
         // A `SHUFFLE_STEP`-sized message: seven fragments at Tox's packet.
         let message: Vec<u8> = (0..9_000).map(|i| (i % 251) as u8).collect();
-        assert_eq!(
-            fragment::split(&message, 0, fragment::TOX_PACKET).unwrap().len(),
-            7
+        // Several fragments -- how many follows the packet size, and is not
+        // what this test is about (it was a stale 7 against today's 19).
+        assert!(
+            fragment::split(&message, 0, fragment::TOX_PACKET).unwrap().len() > 1,
+            "a nine-kilobyte message is more than one packet"
         );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(90);

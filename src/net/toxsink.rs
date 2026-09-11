@@ -80,6 +80,10 @@ pub enum Seat {
 /// Empty until a table forms on Tox, and empty for ever in a build without the
 /// feature.
 pub struct TableSink {
+    /// `D-042`: the client's one Tox instance, started with the client and
+    /// kept for its life; every table is a group on it.
+    #[cfg(feature = "tox")]
+    driver: Option<crate::tox::table::Driver>,
     #[cfg(feature = "tox")]
     inner: Option<crate::tox::table::ToxTable>,
     /// This client's own Tox public key, once an instance is running.
@@ -148,6 +152,8 @@ impl TableSink {
     pub const fn none() -> Self {
         Self {
             #[cfg(feature = "tox")]
+            driver: None,
+            #[cfg(feature = "tox")]
             inner: None,
             #[cfg(feature = "tox")]
             mine: None,
@@ -196,45 +202,18 @@ impl TableSink {
     /// on every start would take the table with it, because both ends add each
     /// other from keys carried in the advertisement and the join request and a
     /// Tox friendship is two-sided.
+    ///
+    /// `D-042`: the instance is started here, before any table exists, and
+    /// bootstrapped into the Tox DHT -- so a table opened later finds the DHT
+    /// warm and its friends' links up. Called by the node at launch; `start`
+    /// calls it too when a table comes first. Idempotent.
     #[allow(unused_variables)]
-    /// Start the table's Tox driver, or keep the one already running.
-    ///
-    /// # The second call used to throw the first away
-    ///
-    /// This built a new `Tox` instance every time and replaced `inner`,
-    /// dropping the running driver — its thread, its friendships and its place
-    /// in the group — and starting over from a fresh DHT bootstrap.
-    ///
-    /// **The joiner path calls it on every `JoinTable`**, and a headless client
-    /// asks to join every thirty seconds for as long as it is not seated. So a
-    /// client that restarted and was answered *already seated* tore down and
-    /// rebuilt its own Tox identity every half minute for ever, and was never in
-    /// one place long enough for the founder to find it.
-    ///
-    /// That is what four earlier fixes were aimed at and missed. The founder's
-    /// counters said `tox friends up 2` of three for a whole five-minute run
-    /// while it sent fifteen invitations to the two it could reach; the peer it
-    /// could not reach was resetting itself on a timer.
-    ///
-    /// A second call now returns the running instance's key. Changing tables
-    /// goes through [`clear`](Self::clear) first, which is what `LeaveTable`
-    /// already does.
-    pub fn start(
-        &mut self,
-        profile: &Path,
-        role: Role,
-        group_name: &str,
-        self_name: &str,
-        roster: Vec<[u8; 32]>,
-    ) -> Result<Option<[u8; 32]>, String> {
+    pub fn boot(&mut self, profile: &Path) -> Result<Option<[u8; 32]>, String> {
         #[cfg(feature = "tox")]
         {
-            // Said before anything that can fail: the claim is that this table's
-            // traffic belongs on a group, not that one was built.
-            self.wants_tox = true;
             use crate::tox::{table, Tox};
 
-            if self.inner.is_some() {
+            if self.driver.is_some() {
                 return Ok(self.mine);
             }
 
@@ -248,18 +227,12 @@ impl TableSink {
 
             // The node list, refreshed at most daily, and **every node added to
             // both of toxcore's lists**: the DHT over UDP and the relay list on
-            // every TCP port it advertises. The relays are not a fallback that
-            // waits for UDP to fail - measured, two machines behind one router
-            // reach the DHT in nine seconds and never reach each other without
-            // them, because the hole punch asks the router to hairpin.
-            // **Counted, because every one of these was `let _ =` and the
-            // relay fallback therefore had no instrument at all.** When a whole
-            // evening of runs died with `tox self tcp, tox friends up 0, invites
-            // 0 sent`, nothing anywhere could say whether zero relays had been
-            // added or all of them had and the friendships failed anyway — and
-            // those are different faults with different fixes. A mechanism whose
-            // outcome is invisible is a mechanism that fails silently, which is
-            // the same defect this client has now been bitten by four times.
+            // one TCP port each. The relays are not a fallback that waits for
+            // UDP to fail -- measured, two machines behind one router reach the
+            // DHT in nine seconds and never reach each other without them.
+            // **Counted**, because every one of these was `let _ =` once and a
+            // whole evening of runs died with nothing to say whether a relay
+            // had been added at all (`S1-U`).
             let refreshed = if crate::tox::nodes::stale(profile, 0) {
                 crate::tox::nodes::refresh(profile).is_ok()
             } else {
@@ -274,10 +247,10 @@ impl TableSink {
                     booted += 1;
                 }
                 // **One port, chosen.** toxcore dedups by the relay's public
-                // key, so every port after the first is a silent no-op — 24 of
-                // 45 calls, measured — and a node whose first port does not
-                // complete its handshake in ten seconds is wiped and never
-                // retried on the others. See `nodes::best_tcp_port`.
+                // key, so every port after the first is a silent no-op, and a
+                // node whose first port does not complete its handshake in ten
+                // seconds is wiped and never retried on the others. See
+                // `nodes::best_tcp_port`.
                 if let Some(port) = crate::tox::nodes::best_tcp_port(&n.tcp_ports) {
                     if tox.add_tcp_relay(&n.host, port, &n.key).is_ok() {
                         relays += 1;
@@ -290,21 +263,7 @@ impl TableSink {
                 relays,
                 refreshed,
             };
-
-            let role = match role {
-                Role::Host => table::Role::Host,
-                Role::Joiner { founder, chat_id } => table::Role::Joiner { founder, chat_id },
-                Role::Back { chat_id } => table::Role::Back { chat_id },
-            };
-            self.inner = Some(table::spawn(
-                tox,
-                table::Setup {
-                    role,
-                    group_name: group_name.to_string(),
-                    self_name: self_name.to_string(),
-                    roster,
-                },
-            ));
+            self.driver = Some(table::Driver::start(tox));
             self.mine = Some(mine);
             Ok(Some(mine))
         }
@@ -314,11 +273,64 @@ impl TableSink {
         }
     }
 
-    /// The group's `chat_id`, once there is a group.
+    /// Open this client's table on the instance: a group of its own, created
+    /// here for a founder and awaited from an invitation otherwise.
     ///
-    /// The founder puts it in the advertisement with `TableAd::on_tox`, and
-    /// until it is there nobody can check that the group they were invited into
-    /// is the one the table named.
+    /// # The second call used to throw the first away
+    ///
+    /// This built a new `Tox` instance every time and replaced `inner`,
+    /// dropping the running driver -- its thread, its friendships and its
+    /// place in the group -- and starting over from a fresh DHT bootstrap.
+    /// **The joiner path calls it on every `JoinTable`**, and a headless client
+    /// asks to join every thirty seconds for as long as it is not seated, so a
+    /// client that restarted and was answered *already seated* tore down and
+    /// rebuilt its own Tox identity every half minute for ever. A second call
+    /// answers with the running table. Changing tables goes through
+    /// [`clear`](Self::clear) first, which is what `LeaveTable` does.
+    pub fn start(
+        &mut self,
+        profile: &Path,
+        role: Role,
+        group_name: &str,
+        self_name: &str,
+        roster: Vec<[u8; 32]>,
+    ) -> Result<Option<[u8; 32]>, String> {
+        #[cfg(feature = "tox")]
+        {
+            use crate::tox::table;
+
+            // Said before anything that can fail: the claim is that this table's
+            // traffic belongs on a group, not that one was built.
+            self.wants_tox = true;
+            if self.inner.is_some() {
+                return Ok(self.mine);
+            }
+            if self.driver.is_none() {
+                self.boot(profile)?;
+            }
+            let Some(driver) = self.driver.as_ref() else {
+                return Err("no tox instance".into());
+            };
+            let role = match role {
+                Role::Host => table::Role::Host,
+                Role::Joiner { founder, chat_id } => table::Role::Joiner { founder, chat_id },
+                Role::Back { chat_id } => table::Role::Back { chat_id },
+            };
+            self.inner = Some(driver.open(table::Setup {
+                role,
+                group_name: group_name.to_string(),
+                self_name: self_name.to_string(),
+                roster,
+            }));
+            Ok(self.mine)
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            let _ = (profile, role, group_name, self_name, roster);
+            Ok(None)
+        }
+    }
+
     pub fn chat_id(&self) -> Option<[u8; 32]> {
         #[cfg(feature = "tox")]
         {
@@ -706,18 +718,15 @@ impl TableSink {
         }
     }
 
-    /// Give it up, leaving the group.
+    /// Give the table up: what it still holds is said, its group is left,
+    /// and the friends no other open table needs go after `FRIEND_LINGER`
+    /// (`D-042`). The instance and this client's key stay for the next
+    /// table.
     pub fn clear(&mut self) {
         #[cfg(feature = "tox")]
         {
-            // Dropping the handle tells the driver to leave and joins its
-            // thread, which flushes whatever it still holds — the last message
-            // of a hand is exactly what is in that queue.
             self.inner = None;
             self.wants_tox = false;
-            // And the key goes with it, so a later `start` builds afresh rather
-            // than answering with the key of an instance that has stopped.
-            self.mine = None;
         }
     }
 
