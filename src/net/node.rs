@@ -337,6 +337,10 @@ pub enum NodeEvent {
     /// `S1-CS`: how a seat's connection is doing -- the last ping's
     /// round trip, or `None` when its last connection closed.
     SeatLink { seat: u8, rtt_ms: Option<u64> },
+    /// `D-035`: a seat's client left the table's group -- on purpose
+    /// (`quit`) or by timing out. The seat is shown gone; heads-up a quit
+    /// ends the game.
+    SeatLeft { seat: u8, quit: bool },
     /// A peer was found in the public lobby, through the DHT.
     ///
     /// Separate from [`LocalPeer`](NodeEvent::LocalPeer) on purpose. The two
@@ -500,6 +504,7 @@ impl NodeEvent {
             | Self::LobbySaid { .. }
             | Self::TableSaid { .. }
             | Self::SeatLink { .. }
+            | Self::SeatLeft { .. }
             // `S1-CR`: the question about an unfinished game, and its answer.
             | Self::UnfinishedSession { .. }
             | Self::SessionResumed { .. }

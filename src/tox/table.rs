@@ -291,6 +291,13 @@ pub struct Trouble {
     /// every log this client writes. Which is the same defect as reading a
     /// zero that was never measured.
     pub inbox_dropped: AtomicU64,
+    /// `D-035`: the roster seats whose client is a confirmed member of the
+    /// group right now, by application key -- recomputed every sweep, for
+    /// the window's link indicator.
+    pub present: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// `D-035`: seats whose client left the group since the node last
+    /// asked, by application key, each with whether it quit on purpose.
+    pub gone: std::sync::Mutex<Vec<([u8; 32], bool)>>,
     /// Whether every other seat on the roster is in the group right now.
     ///
     /// **Here because a table whose group is not complete deals a hand nobody
@@ -957,9 +964,19 @@ fn run(
                         confirmed.insert(peer);
                     }
                 }
-                Event::GroupPeerExit { group: g, peer } => {
+                Event::GroupPeerExit { group: g, peer, key, quit } => {
                     if group == Some(g) {
                         confirmed.remove(&peer);
+                        // `D-035`: a seat this driver knows by its group key is
+                        // reported gone, on purpose or by timing out.
+                        if let Some(app) = key.and_then(|k| known_as.get(&k).copied()) {
+                            if let Ok(mut present) = trouble.present.lock() {
+                                present.remove(&app);
+                            }
+                            if let Ok(mut gone) = trouble.gone.lock() {
+                                gone.push((app, quit));
+                            }
+                        }
                     }
                 }
                 Event::GroupPacket { group: g, peer, data } => {
@@ -1088,6 +1105,17 @@ fn run(
                 .store(tox.connection().max(0) as u64, Ordering::Relaxed);
             trouble.friends_up.store(connected.len() as u64, Ordering::Relaxed);
             trouble.in_group.store(seen as u64, Ordering::Relaxed);
+            // `D-035`: which roster seats are confirmed members right now.
+            if let Ok(mut present) = trouble.present.lock() {
+                present.clear();
+                if let Some(g) = group {
+                    for key in roster.iter() {
+                        if peer_for(&tox, g, key, &known_as).is_some_and(|p| confirmed.contains(&p)) {
+                            present.insert(*key);
+                        }
+                    }
+                }
+            }
             trouble
                 .confirmed_peers
                 .store(confirmed.len() as u64, Ordering::Relaxed);

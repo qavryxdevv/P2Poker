@@ -64,6 +64,7 @@ impl AppState {
                     }),
                     won: hand.and_then(|h| h.won.get(i).copied()).unwrap_or(0),
                     muted: self.muted.contains(n),
+                    left: self.gone.contains(n),
                     link: self.links.get(n).map(|(rtt, at)| Link {
                         rtt_ms: *rtt,
                         stale: at.elapsed().as_millis() as u64 > LINK_STALE_MS,
@@ -138,6 +139,7 @@ impl AppState {
             opponent_gone_s: self.opponent_gone_for_s(),
             opponent_out: self.opponent_out,
             opponent_slow: self.opponent_gone.as_ref().is_some_and(|g| g.slow),
+            opponent_left: self.opponent_left,
             chat: self
                 .table_chat
                 .iter()

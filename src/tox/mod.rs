@@ -107,8 +107,16 @@ pub enum Event {
     /// delivered, and why every reading of the status line before this had to
     /// hedge.
     GroupPeerJoin { group: u32, peer: u32 },
-    /// A confirmed peer left, was kicked, or timed out.
-    GroupPeerExit { group: u32, peer: u32 },
+    /// A confirmed peer left, was kicked, or timed out. `key` is its group
+    /// key, read inside the callback while the peer still exists; `quit`
+    /// is `TOX_GROUP_EXIT_TYPE_QUIT` -- the peer left on purpose -- as
+    /// against a timeout or a severed connection (`D-035`).
+    GroupPeerExit {
+        group: u32,
+        peer: u32,
+        key: Option<[u8; 32]>,
+        quit: bool,
+    },
 }
 
 /// Where the C callbacks put what they are given, for the length of one
@@ -249,10 +257,10 @@ unsafe extern "C" fn on_group_peer_join(
 /// chose.
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn on_group_peer_exit(
-    _tox: *mut sys::Tox,
+    tox: *mut sys::Tox,
     group: u32,
     peer: u32,
-    _exit_type: c_int,
+    exit_type: c_int,
     _name: *const u8,
     _name_len: usize,
     _part: *const u8,
@@ -260,7 +268,19 @@ unsafe extern "C" fn on_group_peer_exit(
     user_data: *mut c_void,
 ) {
     let Some(s) = sink(user_data) else { return };
-    s.events.push(Event::GroupPeerExit { group, peer });
+    // `D-035`: the key is readable only now, while the peer still exists.
+    let mut key = [0u8; 32];
+    let mut err: c_int = 0;
+    // SAFETY: the callback runs inside `tox_iterate` with a live `tox`, and
+    // `key` is the thirty-two bytes the call writes.
+    let got = unsafe { sys::tox_group_peer_get_public_key(tox, group, peer, key.as_mut_ptr(), &mut err) };
+    // `TOX_GROUP_EXIT_TYPE_QUIT` is the first value of the enum.
+    s.events.push(Event::GroupPeerExit {
+        group,
+        peer,
+        key: got.then_some(key),
+        quit: exit_type == 0,
+    });
 }
 
 /// This client's own join finished. See [`Event::GroupSelfJoin`].

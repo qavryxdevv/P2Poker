@@ -428,6 +428,50 @@ impl TableSink {
 
     /// Hand events received and thrown away because the node loop was not
     /// draining. Any non-zero value is a seat diverging from the table.
+    /// `D-035`: seats whose client left the table's group since the last
+    /// call, each with whether it quit on purpose.
+    pub fn take_gone(&self) -> Vec<([u8; 32], bool)> {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t
+                    .trouble()
+                    .gone
+                    .lock()
+                    .map(|mut g| std::mem::take(&mut *g))
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// `D-035`: whether a seat's client is a confirmed member of the table's
+    /// group right now -- the reading the window's link indicator is made of
+    /// once the hand rides the group.
+    pub fn in_group(&self, app_key: &[u8; 32]) -> bool {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t
+                    .trouble()
+                    .present
+                    .lock()
+                    .map(|p| p.contains(app_key))
+                    .unwrap_or(false),
+                None => false,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            let _ = app_key;
+            false
+        }
+    }
+
     pub fn inbox_dropped(&self) -> u64 {
         #[cfg(feature = "tox")]
         {

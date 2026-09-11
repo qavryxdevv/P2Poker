@@ -99,6 +99,9 @@ pub struct SeatView {
     pub won: Chips,
     /// `S1-CS`: this player does not hear the seat.
     pub muted: bool,
+    /// `D-035`: the seat's client left the table's group; drawn dim, with
+    /// *left the table* where its cards were, and no clock.
+    pub left: bool,
     /// `S1-CS`: the seat's connection, as the last ping said; `None` before
     /// any reading.
     pub link: Option<Link>,
@@ -152,6 +155,8 @@ pub struct TableView {
     pub opponent_out: bool,
     /// `D-034`: the opponent is on the line but long past their time to decide.
     pub opponent_slow: bool,
+    /// `D-035`: the opponent quit the table; the game is over.
+    pub opponent_left: bool,
 }
 
 /// The smallest table window the client allows, which every row of the
@@ -359,7 +364,9 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
     if let Some(secs) = view.opponent_gone_s {
         // `D-032`: the fourth absence is final -- no waiting is offered.
         let out = view.opponent_out;
-        let title = if out {
+        let title = if view.opponent_left {
+            "Opponent left"
+        } else if out {
             "Opponent is out"
         } else if view.opponent_slow {
             "Opponent is taking too long"
@@ -372,12 +379,16 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ui.ctx(), |ui| {
                 ui.set_min_width(360.0);
-                if view.opponent_slow {
+                if view.opponent_left {
+                    ui.label("Your opponent left the table.");
+                } else if view.opponent_slow {
                     ui.label(format!("Your opponent has been on the clock for {secs} s past their time to decide."));
                 } else {
                     ui.label(format!("Your opponent has been unreachable for {secs} s."));
                 }
-                if out {
+                if view.opponent_left {
+                    ui.label(RichText::new("The game is over.").color(theme::TEXT_DIM));
+                } else if out {
                     ui.label(
                         RichText::new("That is their fourth absence. Three returns are the limit: the game ends here.")
                             .color(theme::TEXT_DIM),
@@ -516,7 +527,7 @@ fn felt_and_people(
         let acting = view.to_act == Some(seat.seat);
         let ring = if acting {
             theme::ACCENT
-        } else if seat.folded || seat.sitting_out {
+        } else if seat.folded || seat.sitting_out || seat.left {
             theme::LINE
         } else {
             theme::RAIL_OUTER_EDGE
@@ -553,7 +564,7 @@ fn felt_and_people(
             });
         }
 
-        let dim = seat.folded || seat.sitting_out;
+        let dim = seat.folded || seat.sitting_out || seat.left;
         // `S1-CS`: the seat on the clock wears the time it has left as its
         // plate's colour, green to amber to red, and the ring of dots.
         paint::plaque(
@@ -591,7 +602,13 @@ fn felt_and_people(
             paint::centred(
                 p,
                 where_the_cards_were.center(),
-                if seat.sitting_out { "sitting out" } else { "folded" },
+                if seat.left {
+                    "left the table"
+                } else if seat.sitting_out {
+                    "sitting out"
+                } else {
+                    "folded"
+                },
                 (where_the_cards_were.height() * 0.30).clamp(10.0, 16.0),
                 theme::TEXT_DIM,
             );
@@ -1020,6 +1037,7 @@ impl TableView {
             opponent_gone_s: None,
             opponent_out: false,
             opponent_slow: false,
+            opponent_left: false,
         }
     }
 }

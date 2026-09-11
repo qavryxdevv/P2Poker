@@ -267,7 +267,7 @@ fn main() {
                 Event::GroupPeerJoin { group, peer } => {
                     println!("group {group}: peer {peer} confirmed")
                 }
-                Event::GroupPeerExit { group, peer } => {
+                Event::GroupPeerExit { group, peer, .. } => {
                     println!("group {group}: peer {peer} left")
                 }
                 Event::GroupJoinFail { group, reason } => {

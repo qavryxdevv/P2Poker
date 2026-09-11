@@ -1962,12 +1962,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         alive.insert(peer, (std::time::Instant::now(), Some(rtt)));
                         // `S1-CS`: the window shows each seat's link.
                         if let Some(seat) = seat_of_peer(table.as_ref(), &peer) {
-                            let _ = events
-                                .send(NodeEvent::SeatLink {
-                                    seat,
-                                    rtt_ms: Some(u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX)),
-                                })
-                                .await;
+                            // `D-035`: a ping answered from the lobby is not a seat
+                            // at the table. Once the hand rides the group, the
+                            // reading is the seat's membership there: a client that
+                            // left the group gets no reading, whatever its lobby
+                            // connection says, and the window's link goes stale.
+                            let at_the_table = !tox_sink.is_on_tox()
+                                || table
+                                    .as_ref()
+                                    .and_then(|f| {
+                                        f.roster().seats().iter().find(|e| e.seat == seat).map(|e| e.app_public_key)
+                                    })
+                                    .is_some_and(|k| tox_sink.in_group(&k));
+                            if at_the_table {
+                                let _ = events
+                                    .send(NodeEvent::SeatLink {
+                                        seat,
+                                        rtt_ms: Some(u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX)),
+                                    })
+                                    .await;
+                            }
                         }
                     }
                     SwarmEvent::ConnectionClosed {
@@ -4791,6 +4805,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let _ = events.send(NodeEvent::Warning(format!("could not fold: {e}"))).await;
                     }
                     None => {}
+                }
+                // `D-035`: seats whose client left the table's group.
+                for (app, quit) in tox_sink.take_gone() {
+                    if let Some(seat) = table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
+                        let _ = events.send(NodeEvent::SeatLeft { seat, quit }).await;
+                        let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None }).await;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "seat {seat} left the table's group{}",
+                                if quit { " on purpose" } else { ": its connection timed out" }
+                            )))
+                            .await;
+                    }
                 }
                 // `S1-CS`: the group count, the moment it changes.
                 if table.is_some() {
