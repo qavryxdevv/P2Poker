@@ -165,11 +165,18 @@ param(
     # two-seat rule (D-031) is about. Needs a binary built with `--features fault-harness`.
     [switch]$DropAtOpen,
     [ValidateRange(0, 600)][int]$DropFor = 20,
+    # `-DropNodes`: which joiners drop (node numbers, comma-separated). One by
+    # default; several stop at the same moment -- D-036's shape, where the
+    # table certifies them together -- and each comes back on its own return.
+    # A return that would start after the run is over is not started: the seat
+    # stays away.
+    [string]$DropNodes = '1',
     # A seat slower than this to enter the Tox group keeps the logs, however
     # well the rest of the run went. Sixty seconds is far outside the ordinary
     # spread, which has been 10-25 s in every run measured.
     [int]$LateGroupSeconds = 60
 )
+$droppers = @($DropNodes -split ',' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 
 $ErrorActionPreference = 'Stop'
 
@@ -292,7 +299,7 @@ for ($i = 0; $i -lt $Seats; $i++) {
     if ($leaving) { $mine = $LeaverSeconds }
     # The dropper stops at `-DropAt` and is started again below. Its own `--for`
     # is cut to the outage's start; the second half gets the rest of the run.
-    $dropping = ($DropAt -gt 0 -and $i -eq 1 -and -not $leaving)
+    $dropping = ($DropAt -gt 0 -and $droppers -contains $i -and -not $leaving)
     if ($dropping) { $mine = if ($DropOnTurn -or $DropAtOpen) { $DropAt + 150 } else { $DropAt } }
     $stopOnTurn = if ($dropping -and $DropOnTurn) { $DropAt } else { 0 }
     $stopAtOpen = if ($dropping -and $DropAtOpen) { $DropAt } else { 0 }
@@ -388,39 +395,47 @@ if ($MuteFor -gt 0) {
     Write-Host "    (S1-BM: expect the seat certified out, then asking to sit in at the next settled boundary, then dealt in; needs --features fault-harness)"
 }
 if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
-    if ($DropOnTurn -or $DropAtOpen) {
-        Write-Host "==> n1 stops at its first $(if ($DropAtOpen) { 'hand open' } else { 'turn' }) at or after $DropAt s and returns $DropFor s after that, same profile"
-        # The main thread has nothing else to do until the run ends, so it waits
-        # for the dropper's process here and starts the return when it is gone.
-        $null = Wait-Job -Job $jobs[1] -Timeout ($DropAt + 200)
-        $stoppedAt = [int](((Get-Date) - $t0).TotalSeconds)
-        Write-Host "==> n1 stopped at $stoppedAt s; back in $DropFor s"
-        $delay = $DropFor
-        $spent = $stoppedAt + $DropFor
-    } else {
-        Write-Host "==> n1 drops at $DropAt s and returns $DropFor s later, same profile"
-        $delay = $DropAt + $DropFor
-        $spent = $DropAt + $DropFor
+    foreach ($dn in $droppers) {
+        if ($DropOnTurn -or $DropAtOpen) {
+            Write-Host "==> n$dn stops at its first $(if ($DropAtOpen) { 'hand open' } else { 'turn' }) at or after $DropAt s and returns $DropFor s after that, same profile"
+            # The main thread has nothing else to do until the run ends, so it waits
+            # for the dropper's process here and starts the return when it is gone.
+            $null = Wait-Job -Job $jobs[$dn] -Timeout ($DropAt + 200)
+            $stoppedAt = [int](((Get-Date) - $t0).TotalSeconds)
+            Write-Host "==> n$dn stopped at $stoppedAt s; back in $DropFor s"
+            $delay = $DropFor
+            $spent = $stoppedAt + $DropFor
+        } else {
+            Write-Host "==> n$dn drops at $DropAt s and returns $DropFor s later, same profile"
+            $delay = $DropAt + $DropFor
+            $spent = $DropAt + $DropFor
+        }
+        # A return that would start after the run is over is no return: the
+        # seat stays away, which is what `-DropFor 600` is for.
+        if ($spent + 30 -gt $Seconds) {
+            Write-Host "==> n$dn stays away: its return would fall after the run"
+            continue
+        }
+        $return = Start-Job -ArgumentList $Exe, $work, $table, $Seconds, $delay, $spent, $dn -ScriptBlock {
+            param($exe, $work, $table, $seconds, $delay, $spent, $dn)
+            Start-Sleep -Seconds $delay
+            # **The same profile, deliberately.** It carries the identity and the
+            # application key, so this is the seat coming back rather than a new
+            # player taking one.
+            $p = Join-Path $work "n$dn"
+            $log = Join-Path $work "n$dn-again.log"
+            $start = Get-Date
+            $inv = [System.Globalization.CultureInfo]::InvariantCulture
+            $left = $seconds - $spent
+            if ($left -lt 30) { $left = 30 }
+            # `--resume` (S1-CR): the returning process rejoins from its own session record;
+            # `--join` stays as the name it would otherwise look for.
+            & $exe --headless --autoplay --for "$left" --profile $p --join $table --resume 2>&1 |
+                ForEach-Object { ((((Get-Date) - $start).TotalSeconds).ToString('F1', $inv)).PadLeft(7) + '  ' + $_ } |
+                Out-File -FilePath $log -Encoding utf8
+        }
+        $jobs += $return
     }
-    $return = Start-Job -ArgumentList $Exe, $work, $table, $Seconds, $delay, $spent -ScriptBlock {
-        param($exe, $work, $table, $seconds, $delay, $spent)
-        Start-Sleep -Seconds $delay
-        # **The same profile, deliberately.** It carries the identity and the
-        # application key, so this is the seat coming back rather than a new
-        # player taking one.
-        $p = Join-Path $work 'n1'
-        $log = Join-Path $work 'n1-again.log'
-        $start = Get-Date
-        $inv = [System.Globalization.CultureInfo]::InvariantCulture
-        $left = $seconds - $spent
-        if ($left -lt 30) { $left = 30 }
-        # `--resume` (S1-CR): the returning process rejoins from its own session record;
-        # `--join` stays as the name it would otherwise look for.
-        & $exe --headless --autoplay --for "$left" --profile $p --join $table --resume 2>&1 |
-            ForEach-Object { ((((Get-Date) - $start).TotalSeconds).ToString('F1', $inv)).PadLeft(7) + '  ' + $_ } |
-            Out-File -FilePath $log -Encoding utf8
-    }
-    $jobs += $return
 }
 
 Write-Host "$Seats nodes started; waiting up to $($Seconds + 60) s"
@@ -448,7 +463,9 @@ $inv = [System.Globalization.CultureInfo]::InvariantCulture
 $logs = @()
 for ($i = 0; $i -lt $Seats; $i++) { $logs += @{ Name = "n$i"; Path = (Join-Path $work "n$i.log") } }
 if ($LeaverSeconds -gt 0) { $logs += @{ Name = 'nR'; Path = (Join-Path $work 'nR.log') } }
-if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) { $logs += @{ Name = 'n1-again'; Path = (Join-Path $work 'n1-again.log') } }
+if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
+    foreach ($dn in $droppers) { $logs += @{ Name = "n$dn-again"; Path = (Join-Path $work "n$dn-again.log") } }
+}
 
 $nodes = @()
 foreach ($entry in $logs) {

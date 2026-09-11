@@ -5854,6 +5854,19 @@ impl Hand {
         !quiet.is_empty() && Self::admissible(self.voters_of(&quiet).len(), quiet.len())
     }
 
+    /// D-036: how many votes a subject needs, for the tally's denominator --
+    /// the voters of the whole quiet set this client waits on, which is the
+    /// set the certificate will carry. The single-subject count read *3/4
+    /// agree* on a certificate that had just completed among three.
+    fn tally_need(&self) -> usize {
+        let quiet: Vec<SeatIdx> = self
+            .waiting_for()
+            .into_iter()
+            .filter(|s| *s != self.open.my_seat)
+            .collect();
+        self.voters_of(&quiet).len()
+    }
+
     /// D-036's floor, both halves: at least two voters, and more voters
     /// than seats named. Below two, "unanimity" is one interested party
     /// (D-008); at or below the named count, a group short of a majority of
@@ -6366,7 +6379,7 @@ impl Hand {
             self.tally = Some((
                 seat,
                 self.votes.get(&digest).map(|m| m.len()).unwrap_or(0),
-                self.voters(seat).len(),
+                self.tally_need(),
                 digest,
             ));
             out.push(Send::Broadcast(bytes));
@@ -6415,12 +6428,7 @@ impl Hand {
         let digest = mine.subject_digest();
         self.take_vote(digest, seat, bytes.to_vec(), body);
         let held = self.votes.get(&digest).map(|m| m.len()).unwrap_or(0);
-        self.tally = Some((
-            mine.subject_seat,
-            held,
-            self.voters(mine.subject_seat).len(),
-            digest,
-        ));
+        self.tally = Some((mine.subject_seat, held, self.tally_need(), digest));
         // The vote that completes the set is what produces the certificate, so
         // the two are one call: there is no state in which unanimity has been
         // reached and nobody has said so.
