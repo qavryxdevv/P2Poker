@@ -342,6 +342,12 @@ pub struct JoiningView {
     pub name: String,
     pub elapsed_s: u64,
     pub failed: Option<String>,
+    /// `S1-DE`: the rejoin of the game on record -- said as such, and a
+    /// failed one offers to forget the record.
+    pub rejoin: bool,
+    /// `S1-DE`: the node gave the rejoin up; the reason is in `failed`, and
+    /// the one button left closes the window.
+    pub gone: bool,
 }
 
 /// Everything the pane draws, prepared away from the paint loop.

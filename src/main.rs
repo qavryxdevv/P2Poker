@@ -1199,8 +1199,8 @@ impl Client {
         );
 
         match answered {
-            Some(render::LobbyAction::Resume { key, stack }) => self.resume_unfinished(key, stack),
-            Some(render::LobbyAction::Forget) => self.tell(NodeCommand::ForgetSession),
+            Some(render::LobbyAction::Resume) => self.rejoin_unfinished(),
+            Some(render::LobbyAction::Forget) => self.forget_unfinished(),
             _ => {}
         }
         if closed || matches!(action, p2p_poker::gui::table::TableAction::BackToLobby) {
@@ -1263,21 +1263,27 @@ impl Client {
     }
 
     /// `S1-CR`: rejoin the unfinished game on record, from either window.
-    fn resume_unfinished(&mut self, key: [u8; 32], stack: u64) {
-        let name = self
-            .state
-            .unfinished
-            .as_ref()
-            .map(|u| u.table_name.clone())
-            .unwrap_or_else(|| short_key(&key));
-        self.state.begin_join(key, name, stack, None);
-        self.tell(NodeCommand::ResumeSession);
-        self.tell(NodeCommand::JoinTable {
-            key,
-            buyin: stack,
-            seat: None,
-            password: None,
-        });
+    /// `S1-DE`: the question is taken down at the answer and the join it
+    /// starts is the rejoin; the node puts the recorded advert back on offer
+    /// and the ordinary join follows.
+    fn rejoin_unfinished(&mut self) {
+        if let Some(u) = self.state.rejoin_unfinished() {
+            self.tell(NodeCommand::ResumeSession);
+            self.tell(NodeCommand::JoinTable {
+                key: u.key,
+                buyin: u.stack,
+                seat: None,
+                password: None,
+            });
+        }
+    }
+
+    /// `S1-DE`: forget the unfinished game on record -- at the question, or
+    /// at a rejoin that failed. The window's part goes at once; the node
+    /// removes the record and says so.
+    fn forget_unfinished(&mut self) {
+        self.state.forget_unfinished();
+        self.tell(NodeCommand::ForgetSession);
     }
 
     fn tell(&mut self, command: NodeCommand) {
@@ -1314,11 +1320,9 @@ impl eframe::App for Client {
         // `S1-CX`: an unreachable heads-up opponent is said once it is worth saying.
         self.state.tick_opponent();
         // `--resume` in the window: the question is answered *rejoin* once.
-        if self.resume {
-            if let Some(u) = self.state.unfinished.clone() {
-                self.resume = false;
-                self.resume_unfinished(u.key, u.stack);
-            }
+        if self.resume && self.state.unfinished.is_some() {
+            self.resume = false;
+            self.rejoin_unfinished();
         }
         // `--join NAME` in the window: the first table of that name, once.
         if let Some(name) = self.join.clone() {
@@ -1409,6 +1413,11 @@ impl eframe::App for Client {
                     render::LobbyAction::RetryJoin => {
                         if let Some(j) = self.state.joining.clone() {
                             self.state.retry_join();
+                            // `S1-DE`: a rejoin tried again needs the recorded
+                            // advert back on offer first.
+                            if j.rejoin {
+                                self.tell(NodeCommand::ResumeSession);
+                            }
                             self.tell(NodeCommand::JoinTable {
                                 key: j.key,
                                 buyin: j.buyin,
@@ -1424,8 +1433,8 @@ impl eframe::App for Client {
                         }
                     }
                     render::LobbyAction::LeaveTable => self.tell(NodeCommand::LeaveTable),
-                    render::LobbyAction::Resume { key, stack } => self.resume_unfinished(key, stack),
-                    render::LobbyAction::Forget => self.tell(NodeCommand::ForgetSession),
+                    render::LobbyAction::Resume => self.rejoin_unfinished(),
+                    render::LobbyAction::Forget => self.forget_unfinished(),
                     render::LobbyAction::Say(text) => self.tell(NodeCommand::SayInLobby(text)),
                     render::LobbyAction::Save(mut settings) => {
                         settings.repair(&self.app_key);

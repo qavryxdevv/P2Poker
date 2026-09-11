@@ -67,11 +67,12 @@ pub enum LobbyAction {
     },
     OpenTableWindow,
     LeaveTable,
-    /// `S1-CR`: rejoin the unfinished game on record, buying in with the
-    /// stack the record holds (the founder answers *already seated* and the
-    /// figure is not read).
-    Resume { key: [u8; 32], stack: u64 },
-    /// `S1-CR`: forget the unfinished game on record.
+    /// `S1-CR`: rejoin the unfinished game on record. The app state holds
+    /// the record's table and stack; the founder answers *already seated*
+    /// and the buy-in figure is not read.
+    Resume,
+    /// `S1-CR`: forget the unfinished game on record -- answered at the
+    /// question, or at a rejoin that failed (`S1-DE`).
     Forget,
     /// `S1-CS`: try the join in progress again.
     RetryJoin,
@@ -277,16 +278,19 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
 
     // `S1-CR`: an unfinished game on record is asked about before anything
     // else, in the middle of the window; the table window asks too.
+    // `S1-DE`: what these two windows answer is kept apart from `action`
+    // and applied last. The tables column's result is assigned to `action`
+    // below, and it used to be assigned over the answer -- so *Rejoin*,
+    // *Forget it*, *Try again* and *Cancel* all returned nothing from here.
+    let mut asked: Option<LobbyAction> = None;
     if let Some(u) = view.unfinished.as_ref() {
-        if let Some(what) = unfinished_window(ui.ctx(), u) {
-            action = what;
-        }
+        asked = unfinished_window(ui.ctx(), u);
     }
     // `S1-CS`: the small window that says a join is in progress, with a
     // clock on it, and says why when it ends badly.
     if let Some(j) = view.joining.as_ref() {
         if let Some(what) = joining_window(ui.ctx(), j) {
-            action = what;
+            asked = Some(what);
         }
     }
     // The chat box is in the middle column and the columns are drawn inside
@@ -368,6 +372,11 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     if let Some(what) = dialog(ui, state) {
         action = what;
     }
+    // `S1-DE`: a button in the question or the connecting window beats the
+    // columns; nothing else can have been pressed in the same pass.
+    if let Some(what) = asked {
+        action = what;
+    }
 
     action
 }
@@ -389,7 +398,7 @@ pub fn unfinished_window(ctx: &egui::Context, u: &crate::app::Unfinished) -> Opt
             ui.label("Rejoin it? The table deals you back in at the next hand boundary.");
             ui.horizontal(|ui| {
                 if ui.button("Rejoin").clicked() {
-                    action = Some(LobbyAction::Resume { key: u.key, stack: u.stack });
+                    action = Some(LobbyAction::Resume);
                 }
                 if ui.button("Forget it").clicked() {
                     action = Some(LobbyAction::Forget);
@@ -400,12 +409,16 @@ pub fn unfinished_window(ctx: &egui::Context, u: &crate::app::Unfinished) -> Opt
 }
 
 /// `S1-CS`: connecting to a table -- a spinner and the seconds so far while
-/// the join is open, the reason and two buttons once it has failed. The
+/// the join is open, the reason and the buttons once it has failed. The
 /// window closes by itself when the seat comes: the view then carries no
-/// join, and nothing is drawn.
+/// join, and nothing is drawn. `S1-DE`: the rejoin of the game on record is
+/// said as such; a failed one offers to try again, to leave it for now and
+/// to forget the record; one the node has given up on says why, and its one
+/// button closes it.
 pub fn joining_window(ctx: &egui::Context, j: &super::lobby::JoiningView) -> Option<LobbyAction> {
     let mut action = None;
-    egui::Window::new(RichText::new("Connecting").size(19.0).strong())
+    let (title, verb) = if j.rejoin { ("Rejoining", "rejoin") } else { ("Connecting", "join") };
+    egui::Window::new(RichText::new(title).size(19.0).strong())
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
@@ -415,7 +428,11 @@ pub fn joining_window(ctx: &egui::Context, j: &super::lobby::JoiningView) -> Opt
                 None => {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(format!("connecting to {}… {} s", j.name, j.elapsed_s));
+                        ui.label(if j.rejoin {
+                            format!("rejoining {}… {} s", j.name, j.elapsed_s)
+                        } else {
+                            format!("connecting to {}… {} s", j.name, j.elapsed_s)
+                        });
                     });
                     // A frame every few hundred milliseconds keeps the spinner
                     // turning and the seconds honest.
@@ -424,15 +441,35 @@ pub fn joining_window(ctx: &egui::Context, j: &super::lobby::JoiningView) -> Opt
                         action = Some(LobbyAction::CancelJoin);
                     }
                 }
+                Some(why) if j.gone => {
+                    ui.label(RichText::new(format!("could not rejoin {}", j.name)).color(theme::DANGER).strong());
+                    // The window's ground is light, so the reason takes the
+                    // label's own colour: `theme::TEXT` is the dark panels'
+                    // and was unreadable here (`shots-de/r3`).
+                    ui.label(why);
+                    ui.label("The game is no longer on record.");
+                    if ui.button("Close").clicked() {
+                        action = Some(LobbyAction::CancelJoin);
+                    }
+                }
                 Some(why) => {
-                    ui.label(RichText::new(format!("could not join {}", j.name)).color(theme::DANGER).strong());
-                    ui.label(RichText::new(why).color(theme::TEXT));
+                    ui.label(RichText::new(format!("could not {verb} {}", j.name)).color(theme::DANGER).strong());
+                    // The window's ground is light, so the reason takes the
+                    // label's own colour: `theme::TEXT` is the dark panels'
+                    // and was unreadable here (`shots-de/r3`).
+                    ui.label(why);
+                    if j.rejoin {
+                        ui.label("The game stays on record; the question comes back at the next start.");
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Try again").clicked() {
                             action = Some(LobbyAction::RetryJoin);
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.button(if j.rejoin { "Not now" } else { "Cancel" }).clicked() {
                             action = Some(LobbyAction::CancelJoin);
+                        }
+                        if j.rejoin && ui.button("Forget it").clicked() {
+                            action = Some(LobbyAction::Forget);
                         }
                     });
                 }

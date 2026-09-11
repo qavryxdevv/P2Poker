@@ -3865,6 +3865,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 "that table is no longer advertised".into())).await;
                             continue;
                         };
+                        // `S1-DE`: a seat that sits down elsewhere is not resuming
+                        // any more -- the recorded ratification is the old table's,
+                        // and a resuming client adopts hands rather than deriving
+                        // hand 1. The record stays until the new table's replaces it.
+                        if resuming && resume.as_ref().is_some_and(|r| r.table_key != key) {
+                            resuming = false;
+                        }
                         joined_key = Some(key);
                         joined_ad = Some(held.ad.clone());
                         joined_advert_hash = Some(held.advert_hash);
@@ -4066,7 +4073,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let _ = crate::storage::session::forget(&profile_dir);
                         resume = None;
                         resuming = false;
-                        let _ = events.send(NodeEvent::Warning("the unfinished session is forgotten".into())).await;
+                        // `S1-DE`: said as the record going, which is what the
+                        // window acts on; a warning left its question standing.
+                        let _ = events
+                            .send(NodeEvent::SessionGaveUp { why: "forgotten at the player's word".into() })
+                            .await;
                     }
                     NodeCommand::SetNickname(name) => {
                         // Bounded here as well as where it is chosen. §4.3's

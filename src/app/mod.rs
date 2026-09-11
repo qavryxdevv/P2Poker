@@ -298,6 +298,12 @@ pub struct Joining {
     pub since: std::time::Instant,
     /// Why it failed, once it has.
     pub failed: Option<String>,
+    /// `S1-DE`: this join is the rejoin of the game on record. The window
+    /// says so, and a failed one offers to forget the record.
+    pub rejoin: bool,
+    /// `S1-DE`: the node said the session is gone, so there is nothing to
+    /// try again; the window says why, and its one button closes it.
+    pub gone: bool,
 }
 
 /// How long a join may go unanswered before the window calls it failed.
@@ -424,6 +430,12 @@ impl AppState {
             }
             NodeEvent::SessionGaveUp { why } => {
                 self.unfinished = None;
+                // `S1-DE`: a rejoin in progress ends here, with the reason
+                // where the player is looking; there is nothing to try again.
+                if let Some(j) = self.joining.as_mut().filter(|j| j.rejoin) {
+                    j.failed = Some(why.clone());
+                    j.gone = true;
+                }
                 self.note(format!("the unfinished game is gone: {why}"));
             }
             NodeEvent::LocalPeer(p) => self.note(format!("found {p} on this network")),
@@ -1089,7 +1101,34 @@ impl AppState {
             password,
             since: std::time::Instant::now(),
             failed: None,
+            rejoin: false,
+            gone: false,
         });
+    }
+
+    /// `S1-DE`: the player answered *rejoin*. The question is taken down at
+    /// the answer -- the node's own word on it comes at the deal, minutes
+    /// later, or never -- and the join it starts is marked as the rejoin, so
+    /// the connecting window says which game it is and, if it fails, offers
+    /// to forget the record. What the node must be told comes back; a second
+    /// answer finds no question.
+    pub fn rejoin_unfinished(&mut self) -> Option<Unfinished> {
+        let u = self.unfinished.take()?;
+        self.begin_join(u.key, u.table_name.clone(), u.stack, None);
+        if let Some(j) = self.joining.as_mut() {
+            j.rejoin = true;
+        }
+        Some(u)
+    }
+
+    /// `S1-DE`: the player answered *forget it* -- at the question, or at a
+    /// rejoin that failed. The question and the rejoin's window go at once;
+    /// the node forgets the record and says so in the log.
+    pub fn forget_unfinished(&mut self) {
+        self.unfinished = None;
+        if self.joining.as_ref().is_some_and(|j| j.rejoin) {
+            self.joining = None;
+        }
     }
 
     /// The join is tried again, from now.
@@ -1150,6 +1189,8 @@ impl AppState {
             name: j.name.clone(),
             elapsed_s: j.since.elapsed().as_secs(),
             failed: j.failed.clone(),
+            rejoin: j.rejoin,
+            gone: j.gone,
         });
         v.chat = self.chat.iter().cloned().collect();
         // Name and key together, because a name is decoration. Sorted by name
@@ -1627,6 +1668,71 @@ mod tests {
         assert!(s.joining.as_ref().unwrap().failed.as_deref().unwrap().contains("no answer"));
         s.joining = None;
         assert!(s.view().joining.is_none());
+    }
+
+    /// `S1-DE`: the question about an unfinished game is answered once.
+    /// *Rejoin* takes it down and starts a join the window can tell from any
+    /// other; *forget it* takes it down with nothing started; a rejoin that
+    /// failed keeps its window, with the reason, and can be forgotten from
+    /// there; and one the node gives up on ends in that window with the
+    /// reason and nothing to try again.
+    #[test]
+    fn the_unfinished_question_is_answered_once_and_a_rejoin_says_so() {
+        let on_record = || NodeEvent::UnfinishedSession {
+            key: [7u8; 32],
+            table_name: "Riverside".into(),
+            seat: 1,
+            stack: 10_000,
+            hand_id: 0,
+        };
+        let mut s = AppState::new();
+        s.apply(on_record());
+        assert!(s.view().unfinished.is_some(), "the window asks");
+
+        // Rejoin: the question goes, and the join is the rejoin.
+        let u = s.rejoin_unfinished().expect("the record to rejoin");
+        assert_eq!((u.key, u.stack), ([7u8; 32], 10_000));
+        assert!(s.unfinished.is_none(), "the question is answered");
+        let j = s.view().joining.expect("a join in progress");
+        assert!(j.rejoin && !j.gone && j.failed.is_none() && j.name == "Riverside", "{j:?}");
+        assert!(s.rejoin_unfinished().is_none(), "answered once");
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
+        assert!(s.joining.is_none(), "a seat ends the rejoin like any join");
+
+        // Forget it, at the question: nothing started, and the node's word
+        // on it changes nothing.
+        s.apply(on_record());
+        s.forget_unfinished();
+        assert!(s.unfinished.is_none() && s.joining.is_none());
+        s.apply(NodeEvent::SessionGaveUp { why: "forgotten at the player's word".into() });
+        assert!(s.unfinished.is_none() && s.joining.is_none());
+
+        // A rejoin the founder does not answer keeps its window, with the
+        // reason, and is forgotten from there.
+        s.apply(on_record());
+        s.rejoin_unfinished();
+        s.apply(NodeEvent::LeftTable { why: "the founder did not answer: timeout".into() });
+        let j = s.view().joining.expect("the failed rejoin is still shown");
+        assert!(j.rejoin && !j.gone && j.failed.as_deref().is_some_and(|w| w.contains("did not answer")), "{j:?}");
+        s.forget_unfinished();
+        assert!(s.joining.is_none(), "forgotten from the failed rejoin");
+
+        // A rejoin the node gives up on ends with the reason and nothing to
+        // try again.
+        s.apply(on_record());
+        s.rejoin_unfinished();
+        s.apply(NodeEvent::JoinRefused { reason: 5 });
+        s.apply(NodeEvent::SessionGaveUp { why: "the founder refused the rejoin (reason 5)".into() });
+        let j = s.view().joining.expect("said where the player is looking");
+        assert!(j.rejoin && j.gone && j.failed.as_deref().is_some_and(|w| w.contains("refused")), "{j:?}");
+        assert!(s.unfinished.is_none());
+
+        // An ordinary join is no rejoin, and the node's give-up does not touch it.
+        s.joining = None;
+        s.begin_join([8u8; 32], "Elsewhere".into(), 1_000, None);
+        s.apply(NodeEvent::SessionGaveUp { why: "no advertisement and no peer of the session for ten minutes".into() });
+        let j = s.view().joining.expect("the ordinary join goes on");
+        assert!(!j.rejoin && !j.gone && j.failed.is_none(), "{j:?}");
     }
 
     /// `S1-CX`: a heads-up opponent that cannot be reached is said once and
