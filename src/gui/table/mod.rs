@@ -147,6 +147,9 @@ pub struct TableView {
     /// `S1-CX`: how long the heads-up opponent has been unreachable, once
     /// it is worth asking about and until the player has answered.
     pub opponent_gone_s: Option<u64>,
+    /// `D-032`: the opponent's fourth absence; the game ends here, and the
+    /// one thing left to do is leave.
+    pub opponent_out: bool,
 }
 
 /// The smallest table window the client allows, which every row of the
@@ -352,20 +355,30 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
     // fold a hand for them, so the player is asked the one question that
     // has an answer -- wait, or leave.
     if let Some(secs) = view.opponent_gone_s {
-        egui::Window::new(RichText::new("Opponent disconnected").size(19.0).strong())
+        // `D-032`: the fourth absence is final -- no waiting is offered.
+        let out = view.opponent_out;
+        let title = if out { "Opponent is out" } else { "Opponent disconnected" };
+        egui::Window::new(RichText::new(title).size(19.0).strong())
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ui.ctx(), |ui| {
                 ui.set_min_width(360.0);
                 ui.label(format!("Your opponent has been unreachable for {secs} s."));
-                ui.label(
-                    RichText::new("Heads-up, nobody can fold a hand for an absent player: the table waits for them.")
-                        .color(theme::TEXT_DIM),
-                );
-                ui.label("Wait for them to come back, or end the game and leave the table.");
+                if out {
+                    ui.label(
+                        RichText::new("That is their fourth absence. Three returns are the limit: the game ends here.")
+                            .color(theme::TEXT_DIM),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Heads-up, nobody can fold a hand for an absent player: the table waits for them.")
+                            .color(theme::TEXT_DIM),
+                    );
+                    ui.label("Wait for them to come back, or end the game and leave the table.");
+                }
                 ui.horizontal(|ui| {
-                    if ui.button("Wait").clicked() {
+                    if !out && ui.button("Wait").clicked() {
                         action = TableAction::KeepWaiting;
                     }
                     if ui
@@ -993,6 +1006,7 @@ impl TableView {
             hand_over: false,
             chat: Vec::new(),
             opponent_gone_s: None,
+            opponent_out: false,
         }
     }
 }

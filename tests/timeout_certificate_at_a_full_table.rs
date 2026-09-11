@@ -303,6 +303,7 @@ fn opening_at_max_seats(my_seat: u8) -> Opening {
         hand_deadline_ms: 3_600_000,
         grace: vec![GRACE_HANDS; n],
         present_run: vec![0; n],
+        returns: vec![0; n],
         button: None,
     }
 }

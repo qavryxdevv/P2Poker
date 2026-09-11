@@ -395,6 +395,7 @@ fn opening3(my_seat: u8) -> Opening {
         hand_deadline_ms: 600_000,
         grace: vec![GRACE_HANDS; 3],
         present_run: vec![0; 3],
+        returns: vec![0; 3],
         button: None,
     }
 }

@@ -196,6 +196,12 @@ pub struct AppState {
     pub joining: Option<Joining>,
     /// `S1-CX`: the heads-up opponent this client cannot reach, if any.
     pub opponent_gone: Option<OpponentGone>,
+    /// `D-032`: how many absences worth asking about ended with the
+    /// opponent back; at `MAX_RETURNS` the next absence is final.
+    pub opponent_returns: u8,
+    /// `D-032`: the opponent's fourth absence; the game ends here, and
+    /// nothing reachable undoes it.
+    pub opponent_out: bool,
 }
 
 impl Seat {
@@ -653,13 +659,12 @@ impl AppState {
                 }
             }
             NodeEvent::Carrier { seen, want } => {
-                // `S1-CX`: heads-up, the group is the opponent. An empty group
-                // starts an episode; a count of seats *seen* ends none, because
-                // the group went on seeing a seat that had stopped
-                // (`run080025-2`) -- only a ping does.
-                if want > 0 && seen == 0 && self.heads_up_opponent().is_some() {
-                    self.opponent_reachable(false);
-                }
+                // `S1-CX`: the group's count is not a reading of the opponent's
+                // link either way. It went on *seeing* a seat that had stopped
+                // (`run080025-2`), and it is empty for the ten to sixty seconds
+                // the other seat takes to join a freshly set table's group --
+                // which is not an opponent out of reach. A closed connection and
+                // a stale link start an episode; a ping ends one.
                 let now = self.last_sweep_ms;
                 if let Some(s) = self.seated.as_mut() {
                     s.heard = Some(seen);
@@ -894,6 +899,8 @@ impl AppState {
     /// table, because the hand was never cleared.
     fn forget_the_table(&mut self) {
         self.opponent_gone = None;
+        self.opponent_returns = 0;
+        self.opponent_out = false;
         self.clock_for(None);
         self.table_chat.clear();
         self.muted.clear();
@@ -917,8 +924,24 @@ impl AppState {
     /// A reading about the heads-up opponent: reachable clears the episode,
     /// unreachable starts one if none is open.
     fn opponent_reachable(&mut self, reachable: bool) {
+        // `D-032`: the fourth absence is final.
+        if self.opponent_out {
+            return;
+        }
         if reachable {
-            self.opponent_gone = None;
+            // `D-032`: an absence worth asking about that ended is a return.
+            if self
+                .opponent_gone
+                .take()
+                .is_some_and(|g| g.since.elapsed().as_millis() as u64 >= OPPONENT_GONE_MS)
+            {
+                self.opponent_returns = self.opponent_returns.saturating_add(1);
+                self.note(format!(
+                    "your opponent is back: return {} of {} (D-032)",
+                    self.opponent_returns,
+                    crate::protocol::constants::MAX_RETURNS
+                ));
+            }
         } else if self.opponent_gone.is_none() {
             self.opponent_gone = Some(OpponentGone {
                 since: std::time::Instant::now(),
@@ -951,9 +974,20 @@ impl AppState {
             if let Some(g) = self.opponent_gone.as_mut() {
                 g.said = true;
             }
-            self.note(format!(
-                "your opponent has been unreachable for {secs} s; heads-up, nobody can fold a hand for them (D-007): wait for them, or leave the table"
-            ));
+            // `D-032`: three returns and no more -- the fourth absence ends the
+            // game, and the one thing left to do is leave.
+            if self.opponent_returns >= crate::protocol::constants::MAX_RETURNS {
+                self.opponent_out = true;
+                self.note(format!(
+                    "your opponent has been unreachable for {secs} s, for the {}th time; {} returns are the limit (D-032): the game ends here -- leave the table",
+                    self.opponent_returns + 1,
+                    crate::protocol::constants::MAX_RETURNS
+                ));
+            } else {
+                self.note(format!(
+                    "your opponent has been unreachable for {secs} s; heads-up, nobody can fold a hand for them (D-007): wait for them, or leave the table"
+                ));
+            }
         }
     }
 
@@ -1548,7 +1582,9 @@ mod tests {
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40) });
         assert!(s.opponent_gone.is_none(), "a ping ends the episode");
         s.apply(NodeEvent::Carrier { seen: 0, want: 1 });
-        assert!(s.opponent_gone.as_ref().is_some_and(|g| !g.dismissed), "the group empty is a new episode, asked anew");
+        assert!(s.opponent_gone.is_none(), "an empty group is the other seat still joining it, not an opponent out of reach");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| !g.dismissed), "a closed connection is a new episode, asked anew");
         s.apply(NodeEvent::Carrier { seen: 1, want: 1 });
         assert!(s.opponent_gone.is_some(), "a seat the group merely sees is not one this client can reach");
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30) });
@@ -1574,5 +1610,42 @@ mod tests {
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
         s.apply(NodeEvent::Carrier { seen: 0, want: 2 });
         assert!(s.opponent_gone.is_none());
+    }
+
+    /// `D-032`: three returns and no more. Each absence worth asking about
+    /// that ends is a return; a blip shorter than the question is not; at the
+    /// fourth absence the question is final and nothing reachable undoes it.
+    #[test]
+    fn a_heads_up_opponent_may_return_three_times() {
+        use crate::protocol::constants::MAX_RETURNS;
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        for n in 1..=MAX_RETURNS {
+            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+            s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
+            s.tick_opponent();
+            assert!(!s.opponent_out, "absence {n} is not the last");
+            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40) });
+            assert_eq!(s.opponent_returns, n, "return {n} counted");
+            assert!(s.log.back().unwrap().contains("D-032"), "and said");
+        }
+        // A blip shorter than the question does not count.
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40) });
+        assert_eq!(s.opponent_returns, MAX_RETURNS, "a blip is no return");
+        // The fourth absence is final.
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+        s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
+        s.tick_opponent();
+        assert!(s.opponent_out, "the fourth absence ends the game");
+        let line = s.log.back().unwrap().clone();
+        assert!(line.contains("D-032") && line.contains("limit"), "{line}");
+        assert!(s.table_view().opponent_out, "the window is told");
+        assert!(s.table_view().opponent_gone_s.is_some(), "and still shows how long");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40) });
+        assert!(s.opponent_out, "and nothing reachable undoes it");
+        assert_eq!(s.opponent_returns, MAX_RETURNS);
     }
 }

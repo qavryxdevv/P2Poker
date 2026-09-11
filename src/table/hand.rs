@@ -269,6 +269,11 @@ pub struct Opening {
     /// How many consecutive hands each seat has been present for, towards
     /// [`REPLENISH_AFTER`].
     pub present_run: Vec<u8>,
+    /// `D-032`: how many times each seat has come back to the table by a
+    /// return certificate (`S1-BM`), indexed by seat. Carried like `grace`,
+    /// this receiver's own; at `MAX_RETURNS` this client votes for no further
+    /// return of that seat, and a certificate needs every voter.
+    pub returns: Vec<u8>,
     /// How long the whole hand may take before any peer may end it.
     ///
     /// `PROTOCOL.md` §8: the only terminus a stalled **cryptographic** stage
@@ -357,6 +362,7 @@ impl Opening {
             // nobody who has missed one.
             grace: vec![GRACE_HANDS; usize::from(ad.max_players)],
             present_run: vec![0; usize::from(ad.max_players)],
+            returns: vec![0; usize::from(ad.max_players)],
             // The first hand of a table: nothing has decided the button yet.
             button: None,
         })
@@ -486,6 +492,7 @@ impl Opening {
             roster_hash: body.roster_hash,
             grace: vec![GRACE_HANDS; usize::from(base.max_players)],
             present_run: vec![0; usize::from(base.max_players)],
+            returns: vec![0; usize::from(base.max_players)],
             ..base
         })
     }
@@ -1592,6 +1599,9 @@ pub struct Hand {
     returning: BTreeMap<Hash, Collective>,
     /// Whether this client has asked to sit in at this boundary.
     sit_in_asked: bool,
+    /// `D-032`: the seats whose return this client refused this hand, so the
+    /// refusal is said once.
+    return_refused: BTreeSet<SeatIdx>,
     params: std::sync::Arc<DeckParams>,
     /// Events for a stage this client has not reached. Held rather than
     /// refused, because GossipSub does not order two messages and a peer that
@@ -1831,6 +1841,7 @@ impl Hand {
             return_evidence: BTreeMap::new(),
             returning: BTreeMap::new(),
             sit_in_asked: false,
+            return_refused: BTreeSet::new(),
                 voice,
                 own_init,
                 abort_hold_said: None,
@@ -5413,11 +5424,12 @@ impl Hand {
             return None;
         }
         let stage = now_ms.saturating_sub(self.stage_at_ms);
-        if stage >= u64::from(self.open.crypto_step_timeout_ms) {
+        let budget = self.stage_budget_ms();
+        if stage >= u64::from(budget) {
             return Some(format!(
                 "this stage's budget: {} s of {} s{who} (the hand itself has used                  {} s of {} s)",
                 stage / 1_000,
-                self.open.crypto_step_timeout_ms / 1_000,
+                budget / 1_000,
                 hand / 1_000,
                 self.open.hand_deadline_ms / 1_000,
             ));
@@ -5451,14 +5463,20 @@ impl Hand {
         // itself within `CARRIER_GIVES_UP_MS`. A hand the other seat never
         // signed (stage 0) keeps the ordinary one: that is the hand a returning
         // seat is waited for in, and the two-seat rule's whole road.
-        let budget = if self.open.required.len() == 2 && self.stage_zero_done {
+        now_ms.saturating_sub(self.stage_at_ms) >= u64::from(self.stage_budget_ms())
+    }
+
+    /// The budget of the current cryptographic stage: `crypto_step_timeout_ms`,
+    /// or heads-up for a hand both seats have signed, `HEADS_UP_STAGE_BUDGET_MS`
+    /// (`S1-CX`). One place, so the clock and its report agree.
+    fn stage_budget_ms(&self) -> u32 {
+        if self.open.required.len() == 2 && self.stage_zero_done {
             self.open
                 .crypto_step_timeout_ms
                 .max(crate::protocol::constants::HEADS_UP_STAGE_BUDGET_MS)
         } else {
             self.open.crypto_step_timeout_ms
-        };
-        now_ms.saturating_sub(self.stage_at_ms) >= u64::from(budget)
+        }
     }
 
     /// Whether this hand may be given up on now.
@@ -7827,6 +7845,8 @@ impl Hand {
         let mut present_run = self.open.present_run.clone();
         grace.resize(n, GRACE_HANDS);
         present_run.resize(n, 0);
+        let mut returns = self.open.returns.clone();
+        returns.resize(n, 0);
         // **What counts as having taken part must be agreed, not observed.**
         // `signed` is this client's own record of whose events it accepted, and
         // two honest peers legitimately differ in it: a hand ended by a
@@ -7962,6 +7982,10 @@ impl Hand {
         }
         for seat in &self.returned {
             let s = usize::from(*seat);
+            // `D-032`: a return is counted whether or not it changes the roster.
+            if let Some(r) = returns.get_mut(s) {
+                *r = r.saturating_add(1);
+            }
             if alive.get(s).copied().unwrap_or(false) && !required.contains(seat) {
                 required.push(*seat);
                 if let Some(g) = grace.get_mut(s) {
@@ -8070,6 +8094,7 @@ impl Hand {
             hand_deadline_ms: self.open.hand_deadline_ms,
             grace,
             present_run,
+            returns,
             button: Some(positions.button),
         })
     }
@@ -8561,6 +8586,11 @@ impl Hand {
 
     /// `IN(k)`: the subjects of complete return certificates banked at this
     /// boundary, ascending.
+    /// `D-032`: how many times each seat has come back, indexed by seat.
+    pub fn returns(&self) -> &[u8] {
+        &self.open.returns
+    }
+
     pub fn returned(&self) -> &[SeatIdx] {
         &self.returned
     }
@@ -8745,6 +8775,18 @@ impl Hand {
                 || !self.occupies_a_seat(seat)
                 || self.boundary_stack_of(seat) == 0
             {
+                continue;
+            }
+            // `D-032`: three returns and no more. A certificate needs every
+            // voter, so this one refusal keeps the seat out; said once per hand.
+            let came_back = self.open.returns.get(usize::from(seat)).copied().unwrap_or(0);
+            if came_back >= crate::protocol::constants::MAX_RETURNS {
+                if self.return_refused.insert(seat) {
+                    self.cert_note.push(format!(
+                        "seat {seat} asks to come back, having come back {came_back} times already; {} returns are the limit (D-032), so this client votes for no further return of that seat",
+                        crate::protocol::constants::MAX_RETURNS
+                    ));
+                }
                 continue;
             }
             let Some((request_hash, state_hash)) =
@@ -9248,6 +9290,7 @@ mod tests {
             hand_deadline_ms: 600_000,
             grace: vec![GRACE_HANDS; 3],
             present_run: vec![0; 3],
+            returns: vec![0; 3],
             button: None,
         }
     }
@@ -9289,6 +9332,7 @@ mod tests {
             hand_deadline_ms: 600_000,
             grace: vec![GRACE_HANDS; 5],
             present_run: vec![0; 5],
+            returns: vec![0; 5],
             button: None,
         }
     }
@@ -9382,6 +9426,7 @@ mod tests {
             hand_deadline_ms: 600_000,
             grace: vec![GRACE_HANDS; 3],
             present_run: vec![0; 3],
+            returns: vec![0; 3],
             button: None,
         }
     }
@@ -13881,5 +13926,49 @@ mod tests {
         assert!(!a.may_abandon(NOW + u64::from(HEADS_UP_STAGE_BUDGET_MS) - 1_000));
         assert!(a.may_abandon(NOW + u64::from(HEADS_UP_STAGE_BUDGET_MS)), "and on the heads-up budget it is");
         assert!(b.may_abandon(NOW + u64::from(HEADS_UP_STAGE_BUDGET_MS)));
+    }
+
+    /// `D-032`: a return is counted in every seat's next hand, and at
+    /// `MAX_RETURNS` this client votes for no further return of that seat --
+    /// a certificate needs every voter, so one refusal keeps the seat out.
+    #[test]
+    fn three_returns_are_the_limit() {
+        use crate::protocol::constants::MAX_RETURNS;
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        let ev = evidence_of(&mut hands[2], &keys[2], 2);
+        let table_id = hands[0].table_id();
+        let va = hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap();
+        let vb = hands[1].vote_on_returns(std::slice::from_ref(&ev), &keys[1], NOW).unwrap();
+        let from_a = hands[1].on_event(&bytes_of(&va)[0], &keys[1], NOW).unwrap();
+        let from_b = hands[0].on_event(&bytes_of(&vb)[0], &keys[0], NOW).unwrap();
+        let cert_a = certs_in(&from_b, &table_id, 1);
+        let cert_b = certs_in(&from_a, &table_id, 1);
+        assert!(hands[0].on_event(&cert_b[0], &keys[0], NOW).is_ok());
+        assert!(hands[1].on_event(&cert_a[0], &keys[1], NOW).is_ok());
+        assert!(hands[2].on_event(&cert_a[0], &keys[2], NOW).is_ok());
+        for (i, h) in hands.iter().enumerate() {
+            let next = h.next_hand().expect("a successor");
+            assert_eq!(next.returns[2], 1, "seat {i}: one return counted");
+            assert_eq!(next.returns[0], 0, "seat {i}: and nobody else's");
+        }
+
+        // Three returns already: this client votes for no more, and says so once.
+        let (mut hands, keys) = a_settled_hand_with_a_bystander();
+        hands[0].open.returns[2] = MAX_RETURNS;
+        let ev = evidence_of(&mut hands[2], &keys[2], 2);
+        assert!(
+            hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap().is_empty(),
+            "no vote at the limit"
+        );
+        assert!(hands[0].take_cert_note().is_some_and(|n| n.contains("D-032")), "and it says so");
+        assert!(hands[0].vote_on_returns(std::slice::from_ref(&ev), &keys[0], NOW).unwrap().is_empty());
+        assert!(hands[0].take_cert_note().is_none(), "once");
+        // The other voter, whose count is short, votes -- and one vote is no certificate.
+        let vb = hands[1].vote_on_returns(std::slice::from_ref(&ev), &keys[1], NOW).unwrap();
+        assert_eq!(vb.len(), 1);
+        let from_b = hands[0].on_event(&bytes_of(&vb)[0], &keys[0], NOW).unwrap();
+        assert!(certs_in(&from_b, &table_id, 1).is_empty(), "one vote seals nothing");
+        assert!(hands[0].returned().is_empty(), "the seat stays out");
+        assert!(hands[1].returned().is_empty());
     }
 }

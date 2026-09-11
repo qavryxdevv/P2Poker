@@ -136,6 +136,7 @@ impl AppState {
             turn_id: self.turns,
             hand_over: hand.map(|h| h.over).unwrap_or(false),
             opponent_gone_s: self.opponent_gone_for_s(),
+            opponent_out: self.opponent_out,
             chat: self
                 .table_chat
                 .iter()

@@ -530,6 +530,8 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
         }
 
         let mut state = AppState::new();
+        // `D-032`: the opponent's fourth absence ends the game; said once.
+        let mut left_for_returns = false;
         // The last ask, whichever edge made it. A floor under the new
         // edge, never a timer: it is read and never waited on.
         let mut last_ask: Option<std::time::Instant> = None;
@@ -619,6 +621,12 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     // that window was never said to have been away
                     // (`run083626-2`), so the log could not show the question.
                     state.tick_opponent();
+                    // `D-032`: a headless client leaves at once; the window asks
+                    // the player to, with the one button left.
+                    if state.opponent_out && !left_for_returns {
+                        left_for_returns = true;
+                        let _ = commands.send(NodeCommand::LeaveTable).await;
+                    }
                     let fresh = usize::try_from(state.emitted - before).unwrap_or(0);
                     for line in state.log.iter().skip(state.log.len().saturating_sub(fresh)) {
                         println!("{line}");

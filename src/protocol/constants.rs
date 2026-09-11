@@ -557,6 +557,15 @@ pub const CARRIER_GIVES_UP_MS: u32 = 58_000;
 /// hand the other seat never signed (stage 0), which is the returning seat's
 /// case and the two-seat rule's whole road.
 pub const HEADS_UP_STAGE_BUDGET_MS: u32 = 100_000;
+
+/// `D-032`: how many times a seat may come back to a table it dropped out
+/// of. At three seats or more a return is a certificate (`S1-BM`) and every
+/// seat counts them hand to hand; at the limit a client votes for no further
+/// return of that seat, and a certificate needs every voter. Heads-up the
+/// other seat's client counts the absences it asked about, and at the fourth
+/// ends the game. The owner's rule, so that nobody holds a table up by
+/// dropping out again and again.
+pub const MAX_RETURNS: u8 = 3;
 const _: () = assert!(HEADS_UP_STAGE_BUDGET_MS > CARRIER_GIVES_UP_MS + CARRIER_LADDER_LAST_MS);
 
 /// **The shortest stage budget a table may advertise.**

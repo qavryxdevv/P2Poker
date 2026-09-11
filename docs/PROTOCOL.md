@@ -8063,6 +8063,12 @@ HEADS_UP_STAGE_BUDGET_MS        = 100 000       (client liveness, D-031: heads-u
   give-up of a hand the other seat is in must wait out a brief outage the
   carrier repairs by itself within CARRIER_GIVES_UP_MS. A hand the other seat
   never signed keeps crypto_step_timeout_ms.)
+MAX_RETURNS                     = 3             (client liveness, D-032: how many
+  times a seat may come back to a table it dropped out of. At three seats or
+  more a return is a certificate and every seat counts them; at the limit a
+  client votes for no further return of that seat, and a certificate needs
+  every voter. Heads-up the other seat's client counts the absences it asked
+  about, and at the fourth ends the game.)
 MAX_RETAINED_HAND_RECORDS       = 4 096         (§5.3's retained hand record, the
   per-hand (hand_id, was_solitary, p, checkpoint8_state_hash) tuple §4.0 step 10b
   evaluates a stale-hand event against, where p is P(hand_id - 1) and was_solitary

@@ -166,6 +166,7 @@ async fn main() {
         hand_deadline_ms: 600_000,
         grace: vec![2, 2],
         present_run: vec![0, 0],
+        returns: vec![0, 0],
         button: None,
     };
 
