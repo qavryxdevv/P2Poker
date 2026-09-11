@@ -4676,7 +4676,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 if resuming {
                     let stuck = hand.as_ref().and_then(|h| {
                         let me = h.my_seat();
-                        (!h.required().contains(&me) && !h.returned().contains(&me)).then_some(h.hand_id())
+                        let bystander = !h.required().contains(&me) && !h.returned().contains(&me);
+                        // `S1-CX`: heads-up, a member's adopted hand in which nothing
+                        // was dealt is abandoned for a newer hand the other seat has
+                        // opened -- that seat is the whole table, and it has moved on
+                        // (`run085603-2`: the returning seat sat in a hand the survivor
+                        // had given up, while the survivor opened four more).
+                        let undealt_heads_up = table.as_ref().is_some_and(|f| f.roster().len() == 2)
+                            && h.street().is_none()
+                            && !h.over();
+                        (bystander || undealt_heads_up).then_some(h.hand_id())
                     });
                     if let (Some(current), Some(f)) = (stuck, table.as_ref()) {
                         let occupied = f.roster().len();
@@ -4798,12 +4807,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(f) = table.as_ref() {
                         if f.session().is_some() {
                             let occupied = f.roster().len();
+                            // `S1-CX`: at two seats the one other seat's opening is the
+                            // whole table's, and a hand waiting at stage 0 for this seat
+                            // has no later frame to show -- so its opening alone is enough.
+                            // Before this, only a hand the survivor had already given up
+                            // could be adopted (`run085603-2`).
+                            let heads_up = occupied == 2;
                             let pick = resume_inits
                                 .iter()
                                 .rev()
                                 .find(|(hid, copies)| {
                                     copies.len() * 2 > occupied.saturating_sub(1)
-                                        && (copies.len() >= occupied
+                                        && (heads_up
+                                            || copies.len() >= occupied
                                             || resume_early.iter().any(|(h, _)| h == *hid))
                                 })
                                 .map(|(h, c)| (*h, c.clone()));
@@ -4829,8 +4845,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                             let deadline = o.crypto_step_timeout_ms;
                                             let seat = o.my_seat;
+                                            // A member's opening goes out; a bystander's
+                                            // `open` says nothing the table may hear.
+                                            let member = o.required.contains(&seat);
                                             match crate::table::hand::Hand::open(o, &app_key, now, deadline) {
-                                                Ok((mut h, _)) => {
+                                                Ok((mut h, opening_sends)) => {
+                                                    if member {
+                                                        publish_hand(opening_sends, &mut swarm, &mut said, &tox_sink);
+                                                    }
                                                     for c in &copies {
                                                         if let Err(e) = h.on_event(c, &app_key, now) {
                                                             let _ = events
@@ -4871,8 +4893,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         .await;
                                                     let _ = events
                                                         .send(NodeEvent::Warning(format!(
-                                                            "resumed at hand #{hid} as a bystander (seat {seat}) from {} copies, {n} frame(s) replayed; it asks to sit in at this hand's boundary",
-                                                            copies.len()
+                                                            "resumed at hand #{hid} as {} (seat {seat}) from {} copies, {n} frame(s) replayed; {}",
+                                                            if member { "a member" } else { "a bystander" },
+                                                            copies.len(),
+                                                            if member {
+                                                                "this seat signed it and is dealt in"
+                                                            } else {
+                                                                "it asks to sit in at this hand's boundary"
+                                                            }
                                                         )))
                                                         .await;
                                                     let _ = events.send(NodeEvent::SessionResumed { hand_id: hid }).await;

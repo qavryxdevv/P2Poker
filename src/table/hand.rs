@@ -5445,7 +5445,20 @@ impl Hand {
         if !self.crypto_stage() {
             return false;
         }
-        now_ms.saturating_sub(self.stage_at_ms) >= u64::from(self.open.crypto_step_timeout_ms)
+        // `S1-CX`: heads-up, a hand both seats have signed keeps the longer
+        // budget -- nobody can vote at two seats, so this budget's only effect
+        // is a unilateral give-up, and the carrier repairs a brief outage by
+        // itself within `CARRIER_GIVES_UP_MS`. A hand the other seat never
+        // signed (stage 0) keeps the ordinary one: that is the hand a returning
+        // seat is waited for in, and the two-seat rule's whole road.
+        let budget = if self.open.required.len() == 2 && self.stage_zero_done {
+            self.open
+                .crypto_step_timeout_ms
+                .max(crate::protocol::constants::HEADS_UP_STAGE_BUDGET_MS)
+        } else {
+            self.open.crypto_step_timeout_ms
+        };
+        now_ms.saturating_sub(self.stage_at_ms) >= u64::from(budget)
     }
 
     /// Whether this hand may be given up on now.
@@ -13762,5 +13775,111 @@ mod tests {
         assert_eq!(next.required, vec![0, 1], "the seat that stopped is still waited for");
         assert_eq!(next.genesis, foreseen, "and the give-up opened exactly where it was foreseen");
         assert!(a.genesis_if_given_up().is_none(), "nothing to foresee once the hand is over");
+    }
+
+    /// The two-seat fixture with the roster hash its seats and stacks really
+    /// hash to: `Opening::adopt` checks a copy's stacks against it.
+    fn heads_up_opening(my_seat: SeatIdx) -> Opening {
+        let mut o = opening(my_seat);
+        let roster: Vec<crate::protocol::transcript::RosterSeat> = o
+            .seats
+            .iter()
+            .map(|(seat, key, stack)| crate::protocol::transcript::RosterSeat {
+                seat: *seat,
+                app_public_key: *key,
+                stack_at_hand_start: *stack,
+            })
+            .collect();
+        o.roster_hash = crate::protocol::transcript::roster_hash(&roster);
+        o
+    }
+
+    /// `S1-CX`, heads-up: the returning seat adopts the running hand from the
+    /// one other seat's copy as a member -- it says its own opening (which
+    /// the node must send), the survivor's copy completes stage 0 there, and
+    /// the stage budget holds for it like for any member, so a hand the
+    /// survivor no longer answers in ends here too and the next opens with
+    /// both seats.
+    #[test]
+    fn heads_up_a_returning_seat_adopts_the_running_hand_as_a_member() {
+        let keys = [key(10), key(11)];
+        let (mut a, from_a) = Hand::open(heads_up_opening(0), &keys[0], NOW, 30_000).unwrap();
+        let copy = bytes_of(&from_a);
+        assert_eq!(copy.len(), 1, "one opening from the survivor");
+        let mut o = Opening::adopt(heads_up_opening(1), &copy).expect("the one other seat's copy carries it");
+        assert_eq!(o.required, vec![0], "the copies name their signers only");
+        // The node's rule at two seats: a returning seat with chips is required.
+        o.required.push(1);
+        o.required.sort_unstable();
+        let (mut b, from_b) = Hand::open(o, &keys[1], NOW + 5_000, 30_000).unwrap();
+        assert!(!from_b.is_empty(), "a member says its opening, and the node must send it");
+        assert_eq!(a.genesis(), b.genesis(), "one hand");
+        deliver(&mut b, &from_a, &keys[1]);
+        deliver(&mut a, &from_b, &keys[0]);
+        assert!(a.dealt(), "the survivor's stage 0 is complete (it waits for {:?}, the shuffle)", a.waiting_for());
+        // Nothing more comes from the survivor: the budget holds for the adopted
+        // member -- the heads-up one, since both seats have signed this hand.
+        assert!(!b.may_abandon(NOW + 5_000 + 31_000), "not on the ordinary budget: the other seat is in this hand");
+        assert!(b.may_abandon(NOW + 5_000 + 101_000), "the heads-up budget holds for the adopted member");
+        assert!(b.abort_now(Abort::Deadline, &keys[1], NOW + 106_000).is_ok());
+        assert!(b.over());
+        assert_eq!(b.next_hand().expect("a table").required, vec![0, 1]);
+    }
+
+    /// The shape `run085603-2` showed: the survivor had already given the hand
+    /// up when the returning seat adopted it, so the copy comes with the
+    /// give-up. A give-up from the other seat waits for this client's own
+    /// deadline (§4.10), and at that deadline the hand ends here too -- by the
+    /// held give-up or by this client's own -- and both open the same next hand.
+    #[test]
+    fn heads_up_a_survivors_give_up_ends_the_adopted_hand_at_this_clients_deadline() {
+        let keys = [key(10), key(11)];
+        let (mut a, from_a) = Hand::open(heads_up_opening(0), &keys[0], NOW, 30_000).unwrap();
+        let gave_up = a.abort_now(Abort::Deadline, &keys[0], NOW + 30_000).unwrap();
+        assert!(a.over());
+        let mut o = Opening::adopt(heads_up_opening(1), &bytes_of(&from_a)).unwrap();
+        o.required.push(1);
+        o.required.sort_unstable();
+        let adopted_at = NOW + 40_000;
+        let (mut b, _) = Hand::open(o, &keys[1], adopted_at, 30_000).unwrap();
+        deliver(&mut b, &from_a, &keys[1]);
+        for Send::Broadcast(bytes) in &gave_up {
+            let _ = b.hold(bytes.clone());
+        }
+        let (_, failures) = b.replay_early(&keys[1], adopted_at);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(!b.over(), "a give-up from the other seat waits for this client's own deadline");
+        let late = adopted_at + 31_000;
+        let _ = b.replay_early(&keys[1], late);
+        if !b.over() {
+            assert!(b.may_abandon(late), "at this client's deadline the hand ends, one way or the other");
+            assert!(b.abort_now(Abort::Deadline, &keys[1], late).is_ok());
+        }
+        assert!(b.over());
+        let (na, nb) = (a.next_hand().expect("a table"), b.next_hand().expect("a table"));
+        assert_eq!(nb.required, vec![0, 1]);
+        assert_eq!(na.genesis, nb.genesis, "and both open the same next hand");
+    }
+
+    /// `S1-CX`, heads-up: a hand both seats have signed is not given up on the
+    /// ordinary stage budget -- the carrier repairs a brief outage by itself
+    /// within `CARRIER_GIVES_UP_MS` -- but on `HEADS_UP_STAGE_BUDGET_MS`; a
+    /// hand the other seat never signed keeps the ordinary budget.
+    #[test]
+    fn heads_up_a_signed_hand_keeps_the_longer_stage_budget() {
+        use crate::protocol::constants::HEADS_UP_STAGE_BUDGET_MS;
+        let keys = [key(10), key(11)];
+        let (mut a, from_a) = Hand::open(opening(0), &keys[0], NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening(1), &keys[1], NOW, 30_000).unwrap();
+        // The other seat never signs: the ordinary budget ends this hand.
+        assert!(a.may_abandon(NOW + 31_000), "stage 0, the other seat never signed: the ordinary budget");
+        // Both signed: the longer one.
+        deliver(&mut b, &from_a, &keys[1]);
+        deliver(&mut a, &from_b, &keys[0]);
+        assert!(!a.may_abandon(NOW + 31_000), "signed by both: not on the ordinary budget");
+        assert!(!b.may_abandon(NOW + 31_000));
+        assert!(!a.may_abandon(NOW + u64::from(HEADS_UP_STAGE_BUDGET_MS) - 1_000));
+        assert!(a.may_abandon(NOW + u64::from(HEADS_UP_STAGE_BUDGET_MS)), "and on the heads-up budget it is");
+        assert!(b.may_abandon(NOW + u64::from(HEADS_UP_STAGE_BUDGET_MS)));
     }
 }

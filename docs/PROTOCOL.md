@@ -8057,6 +8057,12 @@ RESUME_GIVE_UP_MS               = 600 000       (client liveness, D-029: how lon
 RESUME_RECORD_MAX_AGE_MS        = 1 800 000     (client liveness, D-031: how old a
   session record may be and still be offered at start; an older one names a
   game that is long over and is dropped instead of asked about.)
+HEADS_UP_STAGE_BUDGET_MS        = 100 000       (client liveness, D-031: heads-up,
+  the stage budget of a hand both seats have signed. Nobody can vote at two
+  seats, so a stage budget's only effect there is a unilateral give-up, and a
+  give-up of a hand the other seat is in must wait out a brief outage the
+  carrier repairs by itself within CARRIER_GIVES_UP_MS. A hand the other seat
+  never signed keeps crypto_step_timeout_ms.)
 MAX_RETAINED_HAND_RECORDS       = 4 096         (§5.3's retained hand record, the
   per-hand (hand_id, was_solitary, p, checkpoint8_state_hash) tuple §4.0 step 10b
   evaluates a stale-hand event against, where p is P(hand_id - 1) and was_solitary

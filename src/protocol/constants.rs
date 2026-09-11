@@ -544,6 +544,21 @@ pub const DEAF_MS: u64 = 120_000;
 /// left to wait for: the peer is no longer in the group.
 pub const CARRIER_GIVES_UP_MS: u32 = 58_000;
 
+/// `S1-CX` (D-031): heads-up, the stage budget of a hand **both seats have
+/// signed**. At two seats nobody can vote, so a stage budget's only effect
+/// is a unilateral give-up -- and a give-up of a hand the other seat is in
+/// is exactly what must not happen while a brief outage is still repairable:
+/// the carrier holds every unacknowledged frame for [`CARRIER_GIVES_UP_MS`]
+/// and delivers it late, in order, the moment the line is back. Measured
+/// before this (`run090108-2`): one seat's line cut for thirty seconds, the
+/// seat gave the hand up on the ordinary budget while the other had dealt it,
+/// and the two could not meet again before the hand deadline. The window plus
+/// the carrier's last blind re-send (33 s), rounded up; the ordinary budget still ends a
+/// hand the other seat never signed (stage 0), which is the returning seat's
+/// case and the two-seat rule's whole road.
+pub const HEADS_UP_STAGE_BUDGET_MS: u32 = 100_000;
+const _: () = assert!(HEADS_UP_STAGE_BUDGET_MS > CARRIER_GIVES_UP_MS + CARRIER_LADDER_LAST_MS);
+
 /// **The shortest stage budget a table may advertise.**
 ///
 /// `S1-BK`: a stage that must finish in less time than the carrier needs to
