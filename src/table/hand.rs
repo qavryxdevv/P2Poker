@@ -1501,6 +1501,15 @@ pub struct Hand {
     /// Whether the player has been told, this hand, that D-036's floor is
     /// what holds it: the seats that stopped are half the table or more.
     floor_said: bool,
+    /// `D-034`: when the last event that could give somebody the turn was
+    /// EMITTED, on its emitter's clock -- an action, a deal, a board -- and
+    /// this client's own action's `now_ms`.
+    last_stamp_ms: u64,
+    /// `D-034`: when the seat now to act was given the turn, on the clock
+    /// of the seat that gave it. The own clock and every window's countdown
+    /// start here rather than at delivery, so a late delivery does not add
+    /// to the thirty seconds.
+    turn_began_unix_ms: u64,
     /// Seat → the genesis its sequence-0 `HAND_INIT` of this hand named, when
     /// that is not this client's. A roster seat's signed word that it opened
     /// this hand elsewhere: the evidence a client on a private branch can
@@ -1925,6 +1934,8 @@ impl Hand {
                 dealt_said: false,
                 cert_note: Vec::new(),
                 floor_said: false,
+                last_stamp_ms: opened_at_ms,
+                turn_began_unix_ms: opened_at_ms,
                 foreign_genesis: BTreeMap::new(),
                 genesis_note: None,
                 genesis_said: false,
@@ -3147,6 +3158,8 @@ impl Hand {
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::DealPrivate)?;
+        // `D-034`: the deal that completes gives pre-flop's first turn.
+        self.last_stamp_ms = opened.envelope.emitted_at_unix_ms;
         let seat = self.seat_of(&opened.sender)?;
         self.note_signed(seat);
         let body: DealPrivate =
@@ -3386,10 +3399,12 @@ impl Hand {
         };
         match up {
             Some(to_act) => {
+                let began = self.last_stamp_ms;
                 let Phase::Playing { play, .. } = &mut self.phase else {
                     return Err(Failed::NothingFurther);
                 };
                 play.step = Step::Acting { to_act };
+                self.turn_began_unix_ms = began;
                 Ok(Vec::new())
             }
             // Nobody can act. Either every remaining seat is all in — the
@@ -3460,6 +3475,8 @@ impl Hand {
             Body::Amount(a) => self.say(kind, a, ACTION_CAP, key, now_ms)?,
         };
         let hash = self.opened(&bytes, kind)?.event_hash;
+        // `D-034`: this client's own action gives the next seat its turn now.
+        self.last_stamp_ms = now_ms;
         let mut out = vec![Send::Broadcast(bytes)];
         out.append(&mut self.apply_action(me, action, kind, hash, key, now_ms)?);
         // What this turn cost the reserve, charged once and only on the action
@@ -3488,6 +3505,8 @@ impl Hand {
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, kind)?;
         let seat = self.seat_of(&opened.sender)?;
+        // `D-034`: the turn this action gives begins when the action was made.
+        self.last_stamp_ms = opened.envelope.emitted_at_unix_ms;
         self.note_signed(seat);
 
         let (head, action) = match kind {
@@ -3616,10 +3635,12 @@ impl Hand {
         };
         match next {
             Some(to_act) => {
+                let began = self.last_stamp_ms;
                 let Phase::Playing { play, .. } = &mut self.phase else {
                     return Err(Failed::NothingFurther);
                 };
                 play.step = Step::Acting { to_act };
+                self.turn_began_unix_ms = began;
                 Ok(Vec::new())
             }
             None => self.close_round_and_open(key, now_ms),
@@ -3825,6 +3846,8 @@ impl Hand {
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
         let opened = self.opened(bytes, EventType::BoardReveal)?;
+        // `D-034`: a street that opens on this board gives its first turn now.
+        self.last_stamp_ms = opened.envelope.emitted_at_unix_ms;
         let seat = self.seat_of(&opened.sender)?;
         self.note_signed(seat);
         let body: BoardReveal =
@@ -8117,6 +8140,7 @@ impl Hand {
             to_call: play.round.to_call(to_act),
             legal: play.round.legal(to_act)?,
             pot: play.pot(),
+            began_unix_ms: self.turn_began_unix_ms,
         })
     }
 
@@ -9035,6 +9059,9 @@ pub struct Turn {
     pub legal: LegalActions,
     /// Everything committed this hand so far.
     pub pot: Chips,
+    /// `D-034`: when this seat was given the turn, on the giver's clock
+    /// (unix ms). Zero when unknown.
+    pub began_unix_ms: u64,
 }
 
 /// A board of exactly five cards, or nothing.

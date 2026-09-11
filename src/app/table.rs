@@ -68,9 +68,10 @@ impl AppState {
                     won: hand.and_then(|h| h.won.get(i).copied()).unwrap_or(0),
                     muted: self.muted.contains(n),
                     left: self.gone.contains(n),
-                    link: self.links.get(n).map(|(rtt, at)| Link {
+                    link: self.links.get(n).map(|(rtt, group, at)| Link {
                         rtt_ms: *rtt,
                         stale: at.elapsed().as_millis() as u64 > LINK_STALE_MS,
+                        group: *group,
                     }),
                 }
             })
@@ -395,7 +396,7 @@ mod tests {
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
         s.apply(state(1, 0, 150, Some(2), &[1_000, 950, 900], &[0, 50, 100], &[false; 3]));
-        s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(2) });
+        s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(2), elapsed_ms: 0 });
         let v = s.table_view();
         assert!(!v.can_act);
         assert_eq!(v.pot, 150, "the pot is there when it is somebody else's turn");
@@ -552,6 +553,7 @@ mod tests {
             can_raise: true,
             min_raise_to: 200,
             max_raise_to: 1_000,
+            elapsed_ms: 0,
         };
         assert_eq!(s.table_view().turn_id, 0);
         s.apply(turn(1));
@@ -559,7 +561,7 @@ mod tests {
         assert_eq!(v.turn_id, 1);
         assert!(v.can_act);
         assert_eq!((v.min_raise, v.max_raise, v.to_call), (200, 1_000, 100));
-        s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(1) });
+        s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(1), elapsed_ms: 0 });
         assert_eq!(s.table_view().turn_id, 1, "somebody else's turn is not a new turn of ours");
         s.apply(turn(1));
         assert_eq!(s.table_view().turn_id, 2);
@@ -607,14 +609,14 @@ mod tests {
         let mut s = seated(0);
         s.apply(NodeEvent::TableSaid { seat: 1, nickname: "Bob".into(), text: "hi".into() });
         s.apply(NodeEvent::TableSaid { seat: 2, nickname: "Carol".into(), text: "hello".into() });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(80) });
-        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(80), group: false });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false });
         let v = s.table_view();
         assert_eq!(v.chat.len(), 2);
         assert_eq!(v.chat[0].seat, 1);
         assert!(v.chat[1].who.contains("Carol"));
-        assert_eq!(v.seats[1].link, Some(Link { rtt_ms: Some(80), stale: false }));
-        assert_eq!(v.seats[2].link, Some(Link { rtt_ms: None, stale: false }));
+        assert_eq!(v.seats[1].link, Some(Link { rtt_ms: Some(80), stale: false, group: false }));
+        assert_eq!(v.seats[2].link, Some(Link { rtt_ms: None, stale: false, group: false }));
         assert_eq!(v.seats[0].link, None, "nobody pings themselves");
 
         s.muted.insert(1);

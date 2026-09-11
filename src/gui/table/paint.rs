@@ -323,12 +323,17 @@ pub fn clock_plate(left: f32) -> Color32 {
 /// round trip, and the figure on the plate's edge. Grey once the reading
 /// is stale, red once the connection closed.
 pub fn link(p: &Painter, avatar: Rect, plate: Rect, link: &super::Link) {
-    let (colour, text) = match (link.rtt_ms, link.stale) {
-        (None, _) => (theme::DANGER, "offline".to_string()),
-        (Some(_), true) => (theme::TEXT_DIM, "no ping".to_string()),
-        (Some(ms), false) if ms <= 150 => (theme::OK, format!("{ms} ms")),
-        (Some(ms), false) if ms <= 500 => (theme::WARN, format!("{ms} ms")),
-        (Some(ms), false) => (theme::DANGER, format!("{ms} ms")),
+    // `D-041`: the group's word first. A seat the table's group holds is on
+    // the line whether or not a ping ever answered -- a seat reached only
+    // through a relay never answers one -- and a fresh ping adds its figure.
+    let (colour, text) = match (link.rtt_ms, link.stale, link.group) {
+        (Some(ms), false, _) if ms <= 150 => (theme::OK, format!("{ms} ms")),
+        (Some(ms), false, _) if ms <= 500 => (theme::WARN, format!("{ms} ms")),
+        (Some(ms), false, false) => (theme::DANGER, format!("{ms} ms")),
+        (Some(ms), false, true) => (theme::WARN, format!("{ms} ms")),
+        (_, _, true) => (theme::OK, "on the line".to_string()),
+        (None, _, false) => (theme::DANGER, "offline".to_string()),
+        (Some(_), true, false) => (theme::TEXT_DIM, "no ping".to_string()),
     };
     let r = (avatar.width() * 0.13).clamp(3.0, 6.0);
     let at = pos2(avatar.left() + r + 1.0, avatar.top() + r + 1.0);

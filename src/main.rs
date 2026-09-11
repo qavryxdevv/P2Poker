@@ -245,6 +245,30 @@ fn main() {
         }
     });
 
+    // `S1-DL`: a second table in the same process. `--then-host NAME` or
+    // `--then-join NAME` with `--then-at S`: at second S this client leaves
+    // whatever table it is at and hosts, or looks for, NAME -- the owner's
+    // report that after a finished tournament the players could not sit at
+    // a new table without restarting every client.
+    let then_at = value_of("--then-at").and_then(|v| v.parse::<u64>().ok());
+    let then_host = value_of("--then-host").map(|name| {
+        use p2p_poker::net::lobby::TableKind;
+        use p2p_poker::protocol::constants::{RATED_START_STACK, RATED_SEATS};
+        let seats = value_of("--seats")
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(RATED_SEATS)
+            .clamp(2, RATED_SEATS);
+        NodeCommand::CreateTable {
+            kind: if has("--cash") { TableKind::Cash } else { TableKind::SitAndGo },
+            name,
+            seats,
+            min_players: value_of("--min").and_then(|v| v.parse::<u8>().ok()).unwrap_or(2).clamp(2, seats),
+            buyin: RATED_START_STACK,
+            password: None,
+        }
+    });
+    let then_join = value_of("--then-join");
+
     let settings = p2p_poker::storage::settings::load(&dir, &app_key);
     println!("name     {}", settings.nickname);
 
@@ -335,6 +359,9 @@ fn main() {
         autoplay,
         stay_out,
         resume,
+        then_at,
+        then_host,
+        then_join,
     };
 
     if has("--headless") {
@@ -491,6 +518,9 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
         stay_out,
         resume,
         join: _,
+        then_at,
+        then_host,
+        then_join,
         ..
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
@@ -529,6 +559,17 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
             let _ = commands.send(command).await;
         }
 
+        // `S1-DL`: the second table, on its own timer.
+        let then = async {
+            match then_at {
+                Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(then);
+        let mut then_host = then_host;
+        let mut then_done = false;
+
         let mut state = AppState::new();
         // `D-032`: the opponent's fourth absence ends the game; said once.
         let mut left_for_returns = false;
@@ -563,6 +604,24 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => break,
                 _ = &mut deadline => break,
+                _ = &mut then, if !then_done => {
+                    then_done = true;
+                    println!("leaving the table for another, as --then-at asked");
+                    let _ = commands.send(NodeCommand::LeaveTable).await;
+                    if let Some(command) = then_host.take() {
+                        if let NodeCommand::CreateTable { name, .. } = &command {
+                            println!("hosting  {name} (the second table)");
+                        }
+                        let _ = commands.send(command).await;
+                    }
+                    if let Some(name) = then_join.clone() {
+                        println!("looking for {name} (the second table)");
+                        join = Some(name);
+                        join_asked = None;
+                        last_ask = None;
+                        connect_asks = 0;
+                    }
+                }
                 Some(event) = rx.recv() => {
                     // Folded through the same state the window uses, so the two
                     // modes cannot disagree about what happened.
@@ -767,6 +826,10 @@ struct Run {
     autoplay: Option<std::time::Duration>,
     /// `--stay-out`: never ask to be dealt back in (`S1-BM`).
     stay_out: bool,
+    /// `S1-DL`: `--then-at S` with `--then-host NAME` or `--then-join NAME`.
+    then_at: Option<u64>,
+    then_host: Option<NodeCommand>,
+    then_join: Option<String>,
     /// `--resume`: rejoin the unfinished session on record, headless (`S1-CR`).
     resume: bool,
 }
@@ -789,6 +852,10 @@ fn windowed(player: Player, run: Run) -> Started {
         autoplay,
         stay_out,
         resume,
+        // `S1-DL`'s second-table switches are the headless driver's alone.
+        then_at: _,
+        then_host: _,
+        then_join: _,
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     // The same headroom as the headless path, for the same reason.

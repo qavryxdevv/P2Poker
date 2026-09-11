@@ -58,6 +58,17 @@ param(
     [switch]$NoJoin,
     [ValidateRange(0, 8)][int]$Watchers = 0,
     [ValidateRange(0, 3600)][int]$LeaveTableAt = 0,
+    # `-ThinkMs <ms>`: every seat waits that long before it acts (`--autoplay <ms>`);
+    # above the table's own thirty seconds the seat's OWN clock acts first, which
+    # is how the check/fold's timing is measured from the other seats' side
+    # (D-034). A slow table, not comparable with the rest of the corpus.
+    [ValidateRange(0, 120000)][int]$ThinkMs = 0,
+    # `-RehostAt <s>`: at that second the founder leaves its table and hosts a
+    # second one ("<table>-2"), and five seconds later every joiner leaves and
+    # looks for it -- a second table in the same processes (S1-DL: after a
+    # finished tournament the players could not sit at a new table without a
+    # restart). The second table's logs follow the first's in the same files.
+    [ValidateRange(0, 3600)][int]$RehostAt = 0,
     [ValidateRange(30, 3600)][int]$Seconds = 300,
     [string]$Exe,
     [switch]$KeepLogs,
@@ -332,11 +343,15 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     $stopOnTurn = if ($dropping -and $DropOnTurn) { $DropAt } else { 0 }
     $stopAtOpen = if ($dropping -and $DropAtOpen) { $DropAt } else { 0 }
     $stopAtHand = if ($dropping -and $DropAtHand -gt 0) { $DropAtHand } else { 0 }
-    $nodeArgs = @('--headless', '--autoplay', '--for', "$mine", '--profile', $profileDir)
+    $nodeArgs = @('--headless', '--autoplay')
+    if ($ThinkMs -gt 0) { $nodeArgs += "$ThinkMs" }
+    $nodeArgs += @('--for', "$mine", '--profile', $profileDir)
     if ($i -eq 0) {
         $nodeArgs += @('--host', $table, '--seats', "$founderSeats")
+        if ($RehostAt -gt 0) { $nodeArgs += @('--then-host', "$table-2", '--then-at', "$RehostAt") }
     } elseif ($i -lt $Seats -and -not $NoJoin) {
         $nodeArgs += @('--join', $table)
+        if ($RehostAt -gt 0) { $nodeArgs += @('--then-join', "$table-2", '--then-at', "$($RehostAt + 5)") }
     }
     # Otherwise a watcher: the lobby only, joining nothing.
     $leaveAt = if ($LeaveTableAt -gt 0 -and $i -eq 0) { $LeaveTableAt } else { 0 }
@@ -482,6 +497,8 @@ if ($NoJoin -or $Watchers -gt 0) {
     Write-Host "==> $($nodeCount - 1 - $(if ($NoJoin) { 0 } else { $Seats - 1 })) watcher(s) join nothing and only watch the lobby; the founder offers $founderSeats seat(s)"
 }
 if ($LeaveTableAt -gt 0) { Write-Host "==> n0 leaves its table at $LeaveTableAt s" }
+if ($RehostAt -gt 0) { Write-Host "==> at $RehostAt s n0 leaves and hosts $table-2; the joiners follow five seconds later" }
+if ($ThinkMs -gt 0) { Write-Host "==> every seat waits $ThinkMs ms before it acts; past the table's own clock, the seat's client acts for it" }
 Write-Host "$nodeCount nodes started; waiting up to $($Seconds + 60) s"
 $null = Wait-Job -Job $jobs -Timeout ($Seconds + 60)
 

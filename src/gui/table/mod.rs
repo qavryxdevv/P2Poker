@@ -253,6 +253,9 @@ pub struct Link {
     pub rtt_ms: Option<u64>,
     /// The reading is old enough to doubt.
     pub stale: bool,
+    /// `D-041`: the table's group holds the seat as a confirmed member --
+    /// on the line whatever the ping says.
+    pub group: bool,
 }
 
 /// What the player is holding in the action bar between frames, and the

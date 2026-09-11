@@ -514,13 +514,19 @@ impl TableAd {
                 first_small_blind: RATED_SMALL_BLIND,
                 small_blind_cap: sng_small_blind_cap(seats),
             },
-            action_timeout_ms: 20_000,
-            action_grace_ms: 5_000,
+            // `D-034`: thirty seconds to decide, three for the network, no
+            // reserve -- on every table this client hosts. The rated preset
+            // alone keeps §13's numbers; this constructor served both, and
+            // the owner's Sit & Go tables were dealt 20 s plus a 30 s reserve,
+            // so the first slow decision took 50 s at every seat (S1-DM,
+            // `split201510-3`).
+            action_timeout_ms: if seats == RATED_SEATS { 20_000 } else { crate::protocol::constants::DECISION_MS },
+            action_grace_ms: if seats == RATED_SEATS { 5_000 } else { crate::protocol::constants::DECISION_GRACE_MS },
             crypto_step_timeout_ms: 30_000,
             hand_deadline_ms: sng_hand_deadline_ms(seats) as u32,
             join_deadline_ms: 120_000,
             hand_delay_ms: 7_000,
-            time_bank_ms: crate::protocol::constants::default_time_bank_ms(seats),
+            time_bank_ms: if seats == RATED_SEATS { crate::protocol::constants::default_time_bank_ms(seats) } else { 0 },
             button_rule: 1,
             odd_chip_rule: 1,
             showdown_policy: 1,

@@ -305,6 +305,10 @@ pub struct Trouble {
     /// group right now, by application key -- recomputed every sweep, for
     /// the window's link indicator.
     pub present: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// `D-041`: the roster seats whose friend connection is up right now,
+    /// by Tox key -- a seat that has not spoken in the group yet is still
+    /// on the line by this.
+    pub friends_on: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
     /// `D-035`: seats whose client left the group since the node last
     /// asked, by application key, each with whether it quit on purpose.
     pub gone: std::sync::Mutex<Vec<([u8; 32], bool)>>,
@@ -1134,13 +1138,30 @@ fn run(
             trouble.friends_up.store(connected.len() as u64, Ordering::Relaxed);
             trouble.in_group.store(seen as u64, Ordering::Relaxed);
             // `D-035`: which roster seats are confirmed members right now.
+            // `D-041`: by APPLICATION key, through the bridge `known_as` holds
+            // (group key -> application key, learned from a signed frame,
+            // `S1-I`). The first version walked `roster`, which holds Tox
+            // keys, and compared those to application keys: nobody ever
+            // matched, this set was empty in every run, and the felt drew
+            // every seat that never answered a libp2p ping as offline.
             if let Ok(mut present) = trouble.present.lock() {
                 present.clear();
                 if let Some(g) = group {
-                    for key in roster.iter() {
-                        if peer_for(&tox, g, key, &known_as).is_some_and(|p| confirmed.contains(&p)) {
-                            present.insert(*key);
+                    for (group_key, app_key) in known_as.iter() {
+                        let member = (0..Tox::PEER_SCAN)
+                            .find(|p| tox.peer_key(g, *p).ok().as_ref() == Some(group_key));
+                        if member.is_some_and(|p| confirmed.contains(&p)) {
+                            present.insert(*app_key);
                         }
+                    }
+                }
+            }
+            // `D-041`: and the friend connections that are up, by Tox key.
+            if let Ok(mut up) = trouble.friends_on.lock() {
+                up.clear();
+                for n in connected.iter() {
+                    if let Some(k) = friends.get(n) {
+                        up.insert(*k);
                     }
                 }
             }

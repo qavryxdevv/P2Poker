@@ -237,9 +237,14 @@ pub enum NodeEvent {
         can_raise: bool,
         min_raise_to: u64,
         max_raise_to: u64,
+        /// `D-034`: how long ago the turn was given, on the clock of the
+        /// seat that gave it -- the window's countdown starts that far in,
+        /// so a late delivery does not add to the thirty seconds.
+        elapsed_ms: u64,
     },
-    /// Somebody else is to act, or nobody is.
-    NotYourTurn { hand_id: u64, seat: Option<u8> },
+    /// Somebody else is to act, or nobody is. `elapsed_ms` as for
+    /// [`YourTurn`](NodeEvent::YourTurn): how long that seat has had it.
+    NotYourTurn { hand_id: u64, seat: Option<u8>, elapsed_ms: u64 },
     /// A street opened and these are the cards on it.
     Board { hand_id: u64, cards: Vec<u8> },
     /// The hand is over.
@@ -338,8 +343,12 @@ pub enum NodeEvent {
         text: String,
     },
     /// `S1-CS`: how a seat's connection is doing -- the last ping's
-    /// round trip, or `None` when its last connection closed.
-    SeatLink { seat: u8, rtt_ms: Option<u64> },
+    /// round trip, or `None` when its last connection closed -- and, `D-041`,
+    /// whether the table's group holds the seat as a confirmed member right
+    /// now. On a Tox table the group carries the hand, so `group` is the
+    /// reading that says *on the line*; the ping is a figure beside it that a
+    /// seat reached only through a relay never answers.
+    SeatLink { seat: u8, rtt_ms: Option<u64>, group: bool },
     /// `D-035`: a seat's client left the table's group -- on purpose
     /// (`quit`) or by timing out. The seat is shown gone; heads-up a quit
     /// ends the game.

@@ -479,6 +479,28 @@ impl TableSink {
         }
     }
 
+    /// `D-041`: whether the friend connection to this Tox key is up right
+    /// now -- on the line, whether or not it has spoken in the group yet.
+    pub fn friend_up(&self, tox_key: &[u8; 32]) -> bool {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t
+                    .trouble()
+                    .friends_on
+                    .lock()
+                    .map(|p| p.contains(tox_key))
+                    .unwrap_or(false),
+                None => false,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            let _ = tox_key;
+            false
+        }
+    }
+
     pub fn inbox_dropped(&self) -> u64 {
         #[cfg(feature = "tox")]
         {

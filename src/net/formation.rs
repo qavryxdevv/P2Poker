@@ -269,7 +269,11 @@ impl Formation {
             peer_id: my_peer_id.clone(),
             display_name: my_name.clone(),
             buyin: my_buyin,
-            tox_key: None,
+            // `D-041`: the founder's own Tox key rides in its roster entry, as
+            // every joiner's does in theirs -- it was `None`, so at every other
+            // seat the founder had no friend link to read and was drawn as not on
+            // the line until its first frame taught the group key.
+            tox_key: under.ad.founder_tox_key,
         };
         // Through the same gate as anybody else's seat. A founder that seated
         // itself outside the rules would be the one entry no joiner could have

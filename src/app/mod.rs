@@ -195,7 +195,7 @@ pub struct AppState {
     /// `S1-CS`: seats this player does not want to hear. Local, never sent.
     pub muted: std::collections::BTreeSet<u8>,
     /// `S1-CS`: each seat's last link reading and when it arrived.
-    pub links: std::collections::BTreeMap<u8, (Option<u64>, std::time::Instant)>,
+    pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, std::time::Instant)>,
     /// `S1-CS`: the join in progress, if one is.
     pub joining: Option<Joining>,
     /// `S1-CX`: the heads-up opponent this client cannot reach, if any.
@@ -486,14 +486,18 @@ impl AppState {
                     said: text,
                 });
             }
-            NodeEvent::SeatLink { seat, rtt_ms } => {
-                self.links.insert(seat, (rtt_ms, std::time::Instant::now()));
+            NodeEvent::SeatLink { seat, rtt_ms, group } => {
+                // `D-041`: on the line when the table's group holds the seat,
+                // or when a ping answered; the group is the reading that
+                // matters where the hand rides it.
+                let reachable = rtt_ms.is_some() || group;
+                self.links.insert(seat, (rtt_ms, group, std::time::Instant::now()));
                 // `D-035`: a reading from the table's group is a seat back in it.
-                if rtt_ms.is_some() {
+                if reachable {
                     self.gone.remove(&seat);
                 }
                 if self.heads_up_opponent() == Some(seat) {
-                    self.opponent_reachable(rtt_ms.is_some());
+                    self.opponent_reachable(reachable);
                 }
             }
             // `D-035`: a seat's client left the table's group. On purpose,
@@ -588,7 +592,7 @@ impl AppState {
                     }
                 }
                 self.last_stacks = stacks;
-                self.clock_for(to_act);
+                self.clock_for(to_act, 0);
             }
             NodeEvent::YourTurn {
                 hand_id,
@@ -601,6 +605,7 @@ impl AppState {
                 can_raise,
                 min_raise_to,
                 max_raise_to,
+                elapsed_ms,
             } => {
                 let _ = street;
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
@@ -618,19 +623,19 @@ impl AppState {
                 }
                 self.turns = self.turns.saturating_add(1);
                 let me = self.seated.as_ref().and_then(|s| s.seat);
-                self.clock_for(me);
+                self.clock_for(me, elapsed_ms);
                 self.note(if to_call > 0 {
                     format!("hand #{hand_id}: your turn — {to_call} to call")
                 } else {
                     format!("hand #{hand_id}: your turn")
                 });
             }
-            NodeEvent::NotYourTurn { hand_id, seat } => {
+            NodeEvent::NotYourTurn { hand_id, seat, elapsed_ms } => {
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
                     h.turn = None;
                     h.waiting_on = seat;
                 }
-                self.clock_for(seat);
+                self.clock_for(seat, elapsed_ms);
                 // Logged, because "whose turn is it" is the question a player
                 // asks of a table that appears to be doing nothing — and a
                 // table that is doing nothing because it is waiting for
@@ -703,7 +708,7 @@ impl AppState {
                     h.bets = vec![0; h.bets.len()];
                 }
                 self.last_stacks = stacks;
-                self.clock_for(None);
+                self.clock_for(None, 0);
                 self.note(format!("hand #{hand_id} is over"));
             }
             NodeEvent::CardsDealt { hand_id, seats } => {
@@ -996,7 +1001,7 @@ impl AppState {
         self.opponent_out = false;
         self.gone.clear();
         self.opponent_left = false;
-        self.clock_for(None);
+        self.clock_for(None, 0);
         self.table_chat.clear();
         self.muted.clear();
         self.links.clear();
@@ -1081,7 +1086,7 @@ impl AppState {
             let stale = self
                 .links
                 .get(&opponent)
-                .is_some_and(|(_, at)| at.elapsed().as_millis() as u64 > app_link_stale_ms());
+                .is_some_and(|(_, _, at)| at.elapsed().as_millis() as u64 > app_link_stale_ms());
             if stale {
                 self.opponent_reachable(false);
             }
@@ -1199,13 +1204,26 @@ impl AppState {
     /// `S1-CS`: the decision clock runs for the seat to act, from the moment
     /// this client learned it was that seat's turn; a seat that was already
     /// on the clock keeps its start.
-    fn clock_for(&mut self, seat: Option<u8>) {
+    /// `D-034`: the clock starts when the turn was GIVEN, on the giver's
+    /// clock -- `elapsed_ms` in -- and not when this window heard of it, so
+    /// the countdown and the seat's own fold end together. A later word
+    /// about the same seat only ever moves the start earlier.
+    fn clock_for(&mut self, seat: Option<u8>, elapsed_ms: u64) {
+        let anchored = seat.map(|_| {
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(elapsed_ms))
+                .unwrap_or_else(std::time::Instant::now)
+        });
         if seat != self.turn_seat {
             self.turn_seat = seat;
-            self.turn_since = seat.map(|_| std::time::Instant::now());
+            self.turn_since = anchored;
             // `D-034`: the slow opponent acted; the question is withdrawn.
             if self.opponent_gone.as_ref().is_some_and(|g| g.slow) {
                 self.opponent_gone = None;
+            }
+        } else if let (Some(was), Some(now)) = (self.turn_since, anchored) {
+            if now < was {
+                self.turn_since = Some(now);
             }
         }
     }
@@ -1682,13 +1700,13 @@ mod tests {
         });
         assert_eq!(s.turn_seat, Some(2));
         let started = s.turn_since.expect("a clock is running");
-        s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(2) });
+        s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(2), elapsed_ms: 0 });
         assert_eq!(s.turn_since, Some(started), "the same seat keeps its start");
-        s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(1) });
+        s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(1), elapsed_ms: 0 });
         assert_eq!(s.turn_seat, Some(1));
         assert!(s.turn_since.is_some());
         s.apply(NodeEvent::YourTurn {
-            hand_id: 1, street: 0, to_call: 20, pot: 50, can_check: false, can_call: true, can_bet: false, can_raise: true, min_raise_to: 40, max_raise_to: 1_000,
+            hand_id: 1, street: 0, to_call: 20, pot: 50, can_check: false, can_call: true, can_bet: false, can_raise: true, min_raise_to: 40, max_raise_to: 1_000, elapsed_ms: 0,
         });
         assert_eq!(s.turn_seat, Some(0), "our own turn is our own clock");
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3] });
@@ -1710,8 +1728,8 @@ mod tests {
         assert_eq!(last.seat, 2);
         assert!(last.who.contains("Carol") && last.who.contains("seat 2"));
         assert_eq!(last.said, format!("line {}", MAX_CHAT_LINES + 4));
-        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: Some(120) });
-        assert_eq!(s.links.get(&2).map(|(r, _)| *r), Some(Some(120)));
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: Some(120), group: false });
+        assert_eq!(s.links.get(&2).map(|(r, _, _)| *r), Some(Some(120)));
         s.apply(NodeEvent::LeftTable { why: "left the table".into() });
         assert!(s.table_chat.is_empty() && s.links.is_empty(), "the chat and the links went with the table");
     }
@@ -1817,7 +1835,7 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
         assert!(s.opponent_gone.is_some(), "the closed connection opens an episode");
         assert_eq!(s.opponent_gone_for_s(), None, "not worth asking about yet");
         s.tick_opponent();
@@ -1833,19 +1851,19 @@ mod tests {
 
         s.dismiss_opponent_gone();
         assert_eq!(s.opponent_gone_for_s(), None, "the player chose to wait");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false });
         assert!(s.opponent_gone.is_none(), "a ping ends the episode");
         s.apply(NodeEvent::Carrier { seen: 0, want: 1 });
         assert!(s.opponent_gone.is_none(), "an empty group is the other seat still joining it, not an opponent out of reach");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
         assert!(s.opponent_gone.as_ref().is_some_and(|g| !g.dismissed), "a closed connection is a new episode, asked anew");
         s.apply(NodeEvent::Carrier { seen: 1, want: 1 });
         assert!(s.opponent_gone.is_some(), "a seat the group merely sees is not one this client can reach");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false });
         assert!(s.opponent_gone.is_none(), "a ping is");
         // And a reading gone stale -- no ping for longer than the window doubts --
         // starts an episode by itself.
-        s.links.insert(1, (Some(30), std::time::Instant::now() - std::time::Duration::from_millis(app_link_stale_ms() + 1_000)));
+        s.links.insert(1, (Some(30), false, std::time::Instant::now() - std::time::Duration::from_millis(app_link_stale_ms() + 1_000)));
         s.tick_opponent();
         assert!(s.opponent_gone.is_some(), "a stale link is an unreachable opponent");
     }
@@ -1861,7 +1879,7 @@ mod tests {
             seats: vec![(0, "a".into(), 1_000), (1, "b".into(), 1_000), (2, "c".into(), 1_000)],
         });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
         s.apply(NodeEvent::Carrier { seen: 0, want: 2 });
         assert!(s.opponent_gone.is_none());
     }
@@ -1877,20 +1895,20 @@ mod tests {
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
         for n in 1..=MAX_RETURNS {
-            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
             s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
             s.tick_opponent();
             assert!(!s.opponent_out, "absence {n} is not the last");
-            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40) });
+            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false });
             assert_eq!(s.opponent_returns, n, "return {n} counted");
             assert!(s.log.back().unwrap().contains("D-032"), "and said");
         }
         // A blip shorter than the question does not count.
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false });
         assert_eq!(s.opponent_returns, MAX_RETURNS, "a blip is no return");
         // The fourth absence is final.
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
         s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
         s.tick_opponent();
         assert!(s.opponent_out, "the fourth absence ends the game");
@@ -1898,7 +1916,7 @@ mod tests {
         assert!(line.contains("D-032") && line.contains("limit"), "{line}");
         assert!(s.table_view().opponent_out, "the window is told");
         assert!(s.table_view().opponent_gone_s.is_some(), "and still shows how long");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false });
         assert!(s.opponent_out, "and nothing reachable undoes it");
         assert_eq!(s.opponent_returns, MAX_RETURNS);
     }
@@ -1921,7 +1939,7 @@ mod tests {
             big_blind: 100,
             action_ms: 30_000,
         });
-        s.clock_for(Some(1));
+        s.clock_for(Some(1), 0);
         s.tick_opponent();
         assert!(s.opponent_gone.is_none(), "inside their time, nothing is asked");
         s.turn_since = Some(std::time::Instant::now() - std::time::Duration::from_millis(30_000 + OPPONENT_GONE_MS + 1_000));
@@ -1932,15 +1950,15 @@ mod tests {
         assert!(line.contains("on the clock") && line.contains("D-007"), "{line}");
         assert!(s.table_view().opponent_gone_s.is_some());
         // They act: the question is withdrawn, and nothing was counted.
-        s.clock_for(Some(0));
+        s.clock_for(Some(0), 0);
         assert!(s.opponent_gone.is_none(), "the slow opponent acted");
         assert_eq!(s.opponent_returns, 0, "no absence, no return");
         // A ping while the slow question stands changes nothing either.
-        s.clock_for(Some(1));
+        s.clock_for(Some(1), 0);
         s.turn_since = Some(std::time::Instant::now() - std::time::Duration::from_millis(30_000 + OPPONENT_GONE_MS + 1_000));
         s.tick_opponent();
         assert!(s.opponent_gone.as_ref().is_some_and(|g| g.slow));
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false });
         assert!(s.opponent_gone.is_none(), "a reading that reaches them ends any episode");
         assert_eq!(s.opponent_returns, 0, "but a slow one was no absence");
     }
@@ -1954,13 +1972,13 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(20) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(20), group: false });
         // A timeout: gone from the felt, not the end of the game.
         s.apply(NodeEvent::SeatLeft { seat: 1, quit: false });
         assert!(s.gone.contains(&1));
         assert!(s.table_view().seats.iter().any(|v| v.seat == 1 && v.left), "drawn as left");
         assert!(!s.opponent_out && !s.opponent_left);
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false });
         assert!(!s.gone.contains(&1), "seen in the group again: back");
         assert!(!s.table_view().seats.iter().any(|v| v.seat == 1 && v.left));
         // A quit ends a game of two, at once.
@@ -1969,7 +1987,7 @@ mod tests {
         let v = s.table_view();
         assert!(v.opponent_left && v.opponent_gone_s.is_some(), "the window is told at once");
         assert!(s.log.back().unwrap().contains("left the table"), "{}", s.log.back().unwrap());
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false });
         assert!(s.opponent_out && s.opponent_left, "nothing on the line undoes a quit");
         assert_eq!(s.opponent_returns, 0, "a quit is no return");
     }

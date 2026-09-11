@@ -1041,6 +1041,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     > = std::collections::HashMap::new();
     let mut snapshot_answered: std::collections::HashMap<libp2p::PeerId, tokio::time::Instant> =
         std::collections::HashMap::new();
+    // `D-041`: the last link reading told to the window per seat -- the ping,
+    // the group's word, and when -- so the stall tick says it again only on a
+    // change or every ten seconds.
+    let mut link_said: std::collections::HashMap<u8, (Option<u64>, bool, tokio::time::Instant)> =
+        std::collections::HashMap::new();
 
     // When each lobby provider was last dialled, so a record for a client that
     // is long gone is not dialled every minute for ever.
@@ -1974,6 +1979,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             crossed_for = None;
             checkpoint_said = false;
             frozen = None;
+            link_said.clear();
             ahead.clear();
             adrift = None;
             // **Its own doc says *cleared when the freeze is*, and the line
@@ -2107,18 +2113,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // reading is the seat's membership there: a client that
                             // left the group gets no reading, whatever its lobby
                             // connection says, and the window's link goes stale.
-                            let at_the_table = !tox_sink.is_on_tox()
-                                || table
-                                    .as_ref()
-                                    .and_then(|f| {
-                                        f.roster().seats().iter().find(|e| e.seat == seat).map(|e| e.app_public_key)
-                                    })
-                                    .is_some_and(|k| tox_sink.in_group(&k));
+                            // `D-041`: and the group's word rides with the figure.
+                            let in_group = table
+                                .as_ref()
+                                .and_then(|f| {
+                                    f.roster().seats().iter().find(|e| e.seat == seat).map(|e| e.app_public_key)
+                                })
+                                .is_some_and(|k| tox_sink.in_group(&k));
+                            let at_the_table = !tox_sink.is_on_tox() || in_group;
                             if at_the_table {
                                 let _ = events
                                     .send(NodeEvent::SeatLink {
                                         seat,
                                         rtt_ms: Some(u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX)),
+                                        group: tox_sink.is_on_tox() && in_group,
                                     })
                                     .await;
                             }
@@ -2151,7 +2159,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `S1-CS`: a seat whose last connection closed is shown so.
                         if num_established == 0 {
                             if let Some(seat) = seat_of_peer(table.as_ref(), &peer_id) {
-                                let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None }).await;
+                                // `D-041`: on a Tox table a libp2p connection closing
+                                // says nothing about the seat; the group does.
+                                let group = tox_sink.is_on_tox()
+                                    && table
+                                        .as_ref()
+                                        .and_then(|f| {
+                                            f.roster().seats().iter().find(|e| e.seat == seat).map(|e| e.app_public_key)
+                                        })
+                                        .is_some_and(|k| tox_sink.in_group(&k));
+                                let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None, group }).await;
                             }
                         }
                     }
@@ -4571,6 +4588,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 group_key: gk,
                                 app_key: app,
                             });
+                            // `D-041`: said, because the felt's *on the line* rests on it.
+                            let seat = table.as_ref().and_then(|f| f.roster().seat_of(&app));
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "group member {} is seat {:?} (application key {})",
+                                    short_hash(&gk),
+                                    seat,
+                                    short_hash(&app)
+                                )))
+                                .await;
                         }
                     }
                 }
@@ -5077,6 +5104,58 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     println!("fault-harness: leaving the table, as P2P_POKER_LEAVE_TABLE_AT asked");
                     leave_table_now!();
                 }
+                // `D-041`: every seat's link as the table's group knows it. On a
+                // Tox table the group carries the hand and the felt reads presence
+                // from it; a libp2p ping is a figure beside that reading, and a
+                // seat reached only through a relay never answers one -- the
+                // owner saw the far seat drawn *offline* through a whole game, and
+                // the far seat saw everybody so.
+                if tox_sink.is_on_tox() {
+                    if let Some(f) = table.as_ref() {
+                        let me = f.my_seat();
+                        let fresh: Vec<(u8, Option<u64>, bool)> = f
+                            .roster()
+                            .seats()
+                            .iter()
+                            .filter(|e| Some(e.seat) != me)
+                            .map(|e| {
+                                let group = tox_sink.in_group(&e.app_public_key)
+                                    || e.tox_key.is_some_and(|k| tox_sink.friend_up(&k));
+                                let rtt = libp2p::PeerId::from_bytes(&e.peer_id)
+                                    .ok()
+                                    .and_then(|p| alive.get(&p).copied())
+                                    .and_then(|(at, rtt)| rtt.filter(|_| at.elapsed() < std::time::Duration::from_secs(15)))
+                                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                                (e.seat, rtt, group)
+                            })
+                            .collect();
+                        for (seat, rtt, group) in fresh {
+                            let (changed, again) = match link_said.get(&seat) {
+                                Some((r, g, at)) => (
+                                    *r != rtt || *g != group,
+                                    at.elapsed() >= std::time::Duration::from_secs(10),
+                                ),
+                                None => (true, true),
+                            };
+                            if changed || again {
+                                link_said.insert(seat, (rtt, group, tokio::time::Instant::now()));
+                                let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: rtt, group }).await;
+                            }
+                            if changed {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "seat {seat} link: {}{}",
+                                        if group { "on the line by the table's group" } else { "not on the line by the table's group" },
+                                        match rtt {
+                                            Some(ms) => format!(", ping {ms} ms"),
+                                            None => String::new(),
+                                        }
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
+                }
                 // fault-harness: parked certificate copies that are due.
                 if !delayed_certs.is_empty() {
                     let at_now = tokio::time::Instant::now();
@@ -5225,7 +5304,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 for (app, quit) in tox_sink.take_gone() {
                     if let Some(seat) = table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
                         let _ = events.send(NodeEvent::SeatLeft { seat, quit }).await;
-                        let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None }).await;
+                        let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false }).await;
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "seat {seat} left the table's group{}",
@@ -10443,11 +10522,12 @@ async fn report_hand(
                     can_raise: t.legal.can_raise,
                     min_raise_to: t.legal.min_raise_to,
                     max_raise_to: t.legal.max_raise_to,
+                    elapsed_ms: turn_elapsed_ms(t.began_unix_ms),
                 })
                 .await;
             return Report {
                 ended: None,
-                clock: Clock::Start,
+                clock: Clock::Start { began_unix_ms: t.began_unix_ms },
             };
         }
         Some(t) => {
@@ -10455,6 +10535,7 @@ async fn report_hand(
                 .send(NodeEvent::NotYourTurn {
                     hand_id,
                     seat: Some(t.seat),
+                    elapsed_ms: turn_elapsed_ms(t.began_unix_ms),
                 })
                 .await;
             return Report {
@@ -10464,7 +10545,7 @@ async fn report_hand(
         }
         None => {
             let _ = events
-                .send(NodeEvent::NotYourTurn { hand_id, seat: None })
+                .send(NodeEvent::NotYourTurn { hand_id, seat: None, elapsed_ms: 0 })
                 .await;
             if h.over() {
                 let seats = u8::try_from(h.stacks().len()).unwrap_or(0);
@@ -10501,6 +10582,15 @@ struct Report {
     clock: Clock,
 }
 
+/// `D-034`: how long ago a turn was given, for a window's countdown -- zero
+/// when the stamp is unknown or from a clock ahead of this one.
+fn turn_elapsed_ms(began_unix_ms: u64) -> u64 {
+    if began_unix_ms == 0 {
+        return 0;
+    }
+    super::node::now_unix_ms().saturating_sub(began_unix_ms)
+}
+
 /// What a report says about the clock.
 ///
 /// Three answers and not two, because "nothing changed" must not be confused
@@ -10508,8 +10598,9 @@ struct Report {
 /// restarted on every redelivery would never run out.
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
 enum Clock {
-    /// It is newly this client's turn: start counting.
-    Start,
+    /// It is newly this client's turn: start counting -- from when the turn
+    /// was given, on the giver's clock (`D-034`; zero when unknown).
+    Start { began_unix_ms: u64 },
     /// It is not this client's turn: stop.
     Stop,
     /// Nothing changed. Leave the clock exactly as it is.
@@ -10525,7 +10616,25 @@ impl Clock {
         timeout: std::time::Duration,
     ) -> Option<tokio::time::Instant> {
         match self {
-            Clock::Start => Some(tokio::time::Instant::now() + timeout),
+            // `D-034`: the thirty seconds run from the moment the turn was
+            // given, on the clock of the seat that gave it, when that is
+            // earlier than *now plus the timeout* -- a late delivery does not
+            // add to them, and the fold lands where every other window's
+            // countdown ends. Never more than the timeout, never less than
+            // half a second, and the plain timeout when the stamp is unknown
+            // or from a clock that is ahead of this one.
+            Clock::Start { began_unix_ms } => {
+                let now_unix = super::node::now_unix_ms();
+                let left = if began_unix_ms == 0 || began_unix_ms > now_unix {
+                    timeout
+                } else {
+                    let deadline = began_unix_ms.saturating_add(timeout.as_millis() as u64);
+                    std::time::Duration::from_millis(deadline.saturating_sub(now_unix))
+                        .min(timeout)
+                        .max(std::time::Duration::from_millis(500))
+                };
+                Some(tokio::time::Instant::now() + left)
+            }
             Clock::Stop => None,
             Clock::Leave => was,
         }
