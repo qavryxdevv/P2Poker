@@ -264,6 +264,33 @@ impl Transcript {
 #[cfg_attr(test, derive(Debug))]
 pub struct SecretKey(Scalar);
 
+impl SecretKey {
+    /// p2p-poker (D-033): the scalar's canonical bytes, so a client can keep
+    /// its hand's key on its own disk across a restart and play the hand out.
+    /// Never part of a message: the key is the player's own, like the identity key
+    /// beside which it is kept.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        self.0
+            .serialize_compressed(&mut out[..])
+            .expect("a scalar of this field is thirty-two bytes");
+        out
+    }
+
+    /// The inverse of [`SecretKey::to_bytes`]; `None` for bytes that are not a
+    /// canonical scalar.
+    pub fn from_bytes(bytes: &[u8; 32]) -> Option<Self> {
+        <Scalar as ark_serialize::CanonicalDeserialize>::deserialize_compressed(&bytes[..])
+            .ok()
+            .map(SecretKey)
+    }
+
+    /// The public key this secret answers for.
+    pub fn public_key(&self) -> PublicKey {
+        PublicKey((GENERATOR * self.0).into_affine())
+    }
+}
+
 /// Wrapper type indicating that a value has been cryptographically verified.
 ///
 /// This type provides compile-time guarantees that proofs have been checked

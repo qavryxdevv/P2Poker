@@ -37,7 +37,7 @@ use crate::protocol::constants::{RESUME_GIVE_UP_MS, RESUME_RECORD_MAX_AGE_MS};
 
 /// The record's own version, so a later shape can refuse an older one rather
 /// than misread it.
-pub const RECORD_VERSION: u8 = 2;
+pub const RECORD_VERSION: u8 = 3;
 
 /// An unfinished session, as the node last knew it.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -79,6 +79,14 @@ pub struct Record {
     /// (`run202634-3`). Version 2 of the record.
     #[n(13)]
     pub ratification: Vec<u8>,
+    /// `D-033`: the running hand's card material -- this seat's deck key --
+    /// from the moment the deck stage began, so a client that restarts inside
+    /// the hand can take it up and play it out. All zero when none is kept.
+    #[cbor(n(14), with = "minicbor::bytes")]
+    pub hand_secret: [u8; 32],
+    /// `D-033`: the hand `hand_secret` belongs to; 0 when none is kept.
+    #[n(15)]
+    pub secret_hand_id: u64,
 }
 
 pub fn session_path(dir: &Path) -> PathBuf {
@@ -183,6 +191,8 @@ mod tests {
             advert: vec![0xAA; 300],
             advert_hash: [8; 32],
             ratification: vec![0xBB; 210],
+            hand_secret: [7; 32],
+            secret_hand_id: 6,
         }
     }
 

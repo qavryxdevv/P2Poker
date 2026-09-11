@@ -343,3 +343,12 @@ ones.
 Proofs made by this fork do not verify under upstream `ziffle` 0.1.0, and
 upstream's do not verify here. That is intended and is why the fork happens
 before anything is persisted.
+
+### The kept secret (p2p-poker D-033, 2026-09-11)
+
+`SecretKey` gained `to_bytes`, `from_bytes` and `public_key`: the canonical
+scalar bytes, their inverse, and the public key the secret answers for. A
+client keeps its hand's deck secret in its session record on its own disk,
+so that after a restart inside a hand it can take up the hand it was in.
+Nothing on the wire changes: the bytes are for the disk beside the identity
+key and for nothing else.

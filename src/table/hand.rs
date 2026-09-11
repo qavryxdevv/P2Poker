@@ -1602,6 +1602,24 @@ pub struct Hand {
     /// `D-032`: the seats whose return this client refused this hand, so the
     /// refusal is said once.
     return_refused: BTreeSet<SeatIdx>,
+    /// `D-033`: this client re-entered a hand its previous process was a member
+    /// of. While set, this seat's own contributions come from the wire -- the
+    /// frames its previous process signed, said again by the table -- rather
+    /// than being made here; [`Hand::restore_done`] ends it and makes whatever
+    /// the current stage still wants from this seat.
+    restoring: bool,
+    /// `D-033`: the previous process's deck secret, from the session record,
+    /// until the deck stage takes it.
+    restored_secret: Option<HandSecret>,
+    /// `D-033`: no secret for this hand (none kept, or not this hand's): the
+    /// hand can be followed and folded, not played out -- no share of this
+    /// seat's is ever made, its cards are not read, and at a showdown it mucks.
+    fold_only: bool,
+    /// `D-033`: every frame this hand accepted from the wire, in the order
+    /// accepted, for a seat back from a restart to take the hand up from --
+    /// said again by the node beside its own frames.
+    transcript: Vec<Vec<u8>>,
+    transcript_seen: BTreeSet<Hash>,
     params: std::sync::Arc<DeckParams>,
     /// Events for a stage this client has not reached. Held rather than
     /// refused, because GossipSub does not order two messages and a peer that
@@ -1643,6 +1661,38 @@ impl Hand {
         next_deadline_ms: u32,
         voice: Voice,
     ) -> Result<(Hand, Vec<Send>), Failed> {
+        Self::open_inner(o, key, now_ms, next_deadline_ms, voice, None)
+    }
+
+    /// `D-033`: open a hand whose stage 0 this seat signed in its previous
+    /// life. No new opening is made or heard: the old one, said again by the
+    /// table, arrives like anybody's; so does every later frame of this
+    /// seat's. `kept` is the deck secret from the session record, if the record
+    /// names this hand -- without it the hand can be followed and folded, not
+    /// played out. The caller replays the table's frames, then calls
+    /// [`Hand::restore_done`].
+    pub fn open_restoring(
+        o: Opening,
+        key: &SigningKey,
+        now_ms: u64,
+        next_deadline_ms: u32,
+        kept: Option<&[u8; 32]>,
+    ) -> Result<Hand, Failed> {
+        let secret = kept.and_then(HandSecret::kept);
+        Self::open_inner(o, key, now_ms, next_deadline_ms, Voice::Speak, Some(secret)).map(|(h, _)| h)
+    }
+
+    fn open_inner(
+        o: Opening,
+        key: &SigningKey,
+        now_ms: u64,
+        next_deadline_ms: u32,
+        voice: Voice,
+        restore: Option<Option<HandSecret>>,
+    ) -> Result<(Hand, Vec<Send>), Failed> {
+        let restoring = restore.is_some();
+        let fold_only = matches!(restore, Some(None));
+        let restored_secret = restore.flatten();
         let occupied: Vec<SeatIdx> = o.seats.iter().map(|(s, _, _)| *s).collect();
         let button = o
             .button
@@ -1790,7 +1840,9 @@ impl Hand {
         // it is not built.
         let a_member = accepted.contains(&o.my_seat);
         let mut signed = vec![false; usize::from(o.max_players)];
-        if a_member {
+        // `D-033`: a restored member's opening is the one its previous life
+        // signed, and it comes from the wire.
+        if a_member && !restoring {
             let own_hash = chained::open(&bytes, FRAME_CAP, EventType::HandInit, &slot)
                 .map_err(Failed::Wire)?
                 .event_hash;
@@ -1804,7 +1856,7 @@ impl Hand {
         // or muted hand is a member like any other — its own copy is in its
         // own stage, so the stage completes the moment the table's copies
         // land — and only the wire is withheld.
-        let (sends, own_init) = match (a_member, voice) {
+        let (sends, own_init) = match (a_member && !restoring, voice) {
             (true, Voice::Speak) => (vec![Send::Broadcast(bytes)], None),
             (true, Voice::Quiet) => (Vec::new(), Some(bytes)),
             (true, Voice::Muted) | (false, _) => (Vec::new(), None),
@@ -1842,6 +1894,11 @@ impl Hand {
             returning: BTreeMap::new(),
             sit_in_asked: false,
             return_refused: BTreeSet::new(),
+                restoring,
+                restored_secret,
+                fold_only,
+                transcript: Vec::new(),
+                transcript_seen: BTreeSet::new(),
                 voice,
                 own_init,
                 abort_hold_said: None,
@@ -1971,6 +2028,14 @@ impl Hand {
 
         let out = self.dispatch(bytes, kind, key, now_ms);
         self.mark_stage(now_ms);
+        // `D-033`: kept once, for a seat back from a restart.
+        if out.is_ok() {
+            if let Ok(opened) = self.opened(bytes, kind) {
+                if self.transcript_seen.insert(opened.event_hash) {
+                    self.transcript.push(bytes.to_vec());
+                }
+            }
+        }
         // **Caught here, because here is where the frame still exists.** A
         // reveal share proved wrong is `PROTOCOL.md` §4.10's `cause = 3`, whose
         // evidence is the offending event itself — and the three reveal
@@ -2196,6 +2261,33 @@ impl Hand {
 
         let me = self.open.seats[self.seat_index()].1;
         let ctx = self.deck_ctx(&me);
+        // `D-033`: restoring, this seat's key comes from the wire and the secret
+        // from the session record; the stage opens with this seat's slot open.
+        // A fresh secret nothing is encrypted to stands in when none was kept.
+        if self.restoring {
+            let (fresh, _, _) = self.params.keygen(&ctx);
+            let secret = match self.restored_secret.take() {
+                Some(s) => s,
+                None => {
+                    self.fold_only = true;
+                    fresh
+                }
+            };
+            let stage = Collective::closed(
+                self.slot.sequence,
+                EventType::DeckInit.code(),
+                &self.mine.dealt_in,
+            )
+            .ok_or(Failed::NotInThisStage)?;
+            self.stage_zero_done = true;
+            self.phase = Phase::Deck {
+                stage,
+                by_seat: vec![None; usize::from(self.open.max_players)],
+                keys: Vec::new(),
+                secret,
+            };
+            return Ok(Vec::new());
+        }
         // The key is generated either way: `Phase::Deck` needs a `HandSecret`,
         // and a secret nothing is encrypted to is inert.
         let (secret, wire_key, proof) = self.params.keygen(&ctx);
@@ -2289,6 +2381,16 @@ impl Hand {
             seat,
             why: "not a point on the curve",
         })?;
+        // `D-033`: this seat's own key, said again by the table, must be the
+        // one the kept secret answers for; otherwise the secret is another
+        // hand's and this one can only be followed and folded.
+        if seat == self.open.my_seat && self.restoring && !self.fold_only {
+            if let Phase::Deck { secret, .. } = &self.phase {
+                if secret.wire_key().encode() != wire_key.encode() {
+                    self.fold_only = true;
+                }
+            }
+        }
         let proof = WireKeyProof::decode(&body.proof).map_err(|_| Failed::BadKey {
             seat,
             why: "not a well-formed ownership proof",
@@ -2410,7 +2512,7 @@ impl Hand {
         let Phase::Shuffling { deal, chain, .. } = &mut self.phase else {
             return Ok(Vec::new());
         };
-        if chain.whose_turn() != Some(self.open.my_seat) {
+        if self.restoring || chain.whose_turn() != Some(self.open.my_seat) {
             return Ok(Vec::new());
         }
         let round = u8::try_from(chain.steps_taken()).map_err(|_| Failed::NotInThisStage)?;
@@ -2739,18 +2841,12 @@ impl Hand {
             index_map_hash: map.index_map_hash(),
             apk: deal.deck.apk().encode(),
         };
-        let bytes = self.say(EventType::DeckCommit, &mine, DECK_COMMIT_CAP, key, now_ms)?;
-        let mut stage = Collective::closed(
+        let stage = Collective::closed(
             self.slot.sequence,
             EventType::DeckCommit.code(),
             &self.mine.dealt_in,
         )
         .ok_or(Failed::NotInThisStage)?;
-        stage.hear(
-            self.open.my_seat,
-            self.opened(&bytes, EventType::DeckCommit)?.event_hash,
-        );
-
         self.phase = Phase::Committing {
             deal,
             table: Table {
@@ -2760,7 +2856,42 @@ impl Hand {
             stage,
             mine,
         };
-        Ok(vec![Send::Broadcast(bytes)])
+        // `D-033`: restoring, this seat's commitment comes from the wire.
+        if self.restoring {
+            return Ok(Vec::new());
+        }
+        self.commit_mine(key, now_ms)
+    }
+
+    /// This seat's commitment to the final deck, said and heard; the stage
+    /// closes here if this was the last one owed.
+    fn commit_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let me = self.open.my_seat;
+        let mine = match &self.phase {
+            Phase::Committing { stage, mine, .. } if stage.heard(me).is_none() => mine.clone(),
+            _ => return Ok(Vec::new()),
+        };
+        let bytes = self.say(EventType::DeckCommit, &mine, DECK_COMMIT_CAP, key, now_ms)?;
+        let hash = self.opened(&bytes, EventType::DeckCommit)?.event_hash;
+        let complete = {
+            let Phase::Committing { stage, .. } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            stage.hear(me, hash);
+            stage.complete()
+        };
+        let mut out = vec![Send::Broadcast(bytes)];
+        if complete {
+            let parent = {
+                let Phase::Committing { stage, .. } = &self.phase else {
+                    return Err(Failed::NothingFurther);
+                };
+                stage.hash().expect("a complete stage has one")
+            };
+            self.slot = self.slot.then(parent);
+            out.append(&mut self.begin_dealing(key, now_ms)?);
+        }
+        Ok(out)
     }
 
     fn on_deck_commit(
@@ -2847,59 +2978,119 @@ impl Hand {
             return Ok(Vec::new());
         }
 
-        let mine_indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
-        let my_key = deal.key_of(me).ok_or(Failed::NotInThisStage)?;
-        let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
-
-        // The map is cloned rather than moved because `DECK_COMMIT` committed
-        // to its hash and `index_map()` still answers from `Table`. It is a
-        // `Vec<u8>` and a byte; both copies are built from one value and
-        // neither is ever mutated, so there is nothing that can drift.
-        let mut dealing = Dealing::new(table.map.clone(), self.mine.dealt_in.clone());
-        let identity = Identity {
-            seat: me,
-            key: my_key,
-            secret: &deal.secret,
-        };
-
-        // Ascending by index, which is the canonical order, and built by
-        // walking the map rather than by sorting afterwards - a sort would hide
-        // a duplicate instead of making it impossible.
-        let mut entries = Vec::new();
-        for index in every_hole_index(&table.map) {
-            let (token, proof) = dealing
-                .own_share(&deal.as_ref(&table), &identity, index, &ctx)
-                .map_err(|e| refused(me, e))?;
-            // This client's own two are computed, recorded, and never sent.
-            if !mine_indices.iter().any(|i| i.get() == index.get()) {
-                entries.push(RevealEntry {
-                    deck_index: index.get(),
-                    token: token.encode(),
-                    proof: proof.encode(),
-                });
-            }
-        }
-
-        let body = DealPrivate { entries };
-        let bytes = self.say(EventType::DealPrivate, &body, DEAL_PRIVATE_CAP, key, now_ms)?;
-        let mut stage = Collective::closed(
+        let stage = Collective::closed(
             self.slot.sequence,
             EventType::DealPrivate.code(),
             &self.mine.dealt_in,
         )
         .ok_or(Failed::NotInThisStage)?;
-        stage.hear(
-            me,
-            self.opened(&bytes, EventType::DealPrivate)?.event_hash,
-        );
-
+        let mut dealing = Dealing::new(table.map.clone(), self.mine.dealt_in.clone());
+        if self.restoring {
+            // `D-033`: this seat's shares for the others' cards come from the
+            // wire; the shares for its own two cards it makes here, with the kept
+            // secret, so the cards can be read when the stage closes.
+            if !self.fold_only {
+                let mine_indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
+                let my_key = deal.key_of(me).ok_or(Failed::NotInThisStage)?;
+                let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
+                let identity = Identity {
+                    seat: me,
+                    key: my_key,
+                    secret: &deal.secret,
+                };
+                for index in mine_indices.iter().copied() {
+                    dealing
+                        .own_share(&deal.as_ref(&table), &identity, index, &ctx)
+                        .map_err(|e| refused(me, e))?;
+                }
+            }
+            self.phase = Phase::Dealing {
+                deal,
+                table,
+                stage,
+                dealing: Box::new(dealing),
+            };
+            return Ok(Vec::new());
+        }
         self.phase = Phase::Dealing {
             deal,
             table,
             stage,
             dealing: Box::new(dealing),
         };
-        Ok(vec![Send::Broadcast(bytes)])
+        self.deal_mine(key, now_ms)
+    }
+
+    /// This seat's shares for every hole card -- the others' sent, its own
+    /// kept -- said and heard; the stage closes here if this was the last one
+    /// owed. A share already recorded (the own cards, after a restore) is not
+    /// made twice; a hand with no secret makes none.
+    fn deal_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let me = self.open.my_seat;
+        if self.fold_only {
+            return Ok(Vec::new());
+        }
+        let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
+        let entries = {
+            let Phase::Dealing {
+                deal,
+                table,
+                stage,
+                dealing,
+            } = &mut self.phase
+            else {
+                return Err(Failed::NothingFurther);
+            };
+            if stage.heard(me).is_some() {
+                return Ok(Vec::new());
+            }
+            let mine_indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
+            let my_key = deal.key_of(me).ok_or(Failed::NotInThisStage)?;
+            let identity = Identity {
+                seat: me,
+                key: my_key,
+                secret: &deal.secret,
+            };
+            let mut entries = Vec::new();
+            for index in every_hole_index(&table.map) {
+                if dealing.outstanding(index).is_some_and(|o| !o.contains(&me)) {
+                    continue;
+                }
+                let (token, proof) = dealing
+                    .own_share(&deal.as_ref(table), &identity, index, &ctx)
+                    .map_err(|e| refused(me, e))?;
+                if !mine_indices.iter().any(|i| i.get() == index.get()) {
+                    entries.push(RevealEntry {
+                        deck_index: index.get(),
+                        token: token.encode(),
+                        proof: proof.encode(),
+                    });
+                }
+            }
+            entries
+        };
+        let body = DealPrivate { entries };
+        let bytes = self.say(EventType::DealPrivate, &body, DEAL_PRIVATE_CAP, key, now_ms)?;
+        let hash = self.opened(&bytes, EventType::DealPrivate)?.event_hash;
+        let complete = {
+            let Phase::Dealing { stage, .. } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            stage.hear(me, hash);
+            stage.complete()
+        };
+        let mut out = vec![Send::Broadcast(bytes)];
+        if complete {
+            let parent = {
+                let Phase::Dealing { stage, .. } = &self.phase else {
+                    return Err(Failed::NothingFurther);
+                };
+                stage.hash().expect("a complete stage has one")
+            };
+            self.slot = self.slot.then(parent);
+            out.append(&mut self.read_my_cards(key, now_ms)?);
+        }
+        Ok(out)
     }
 
     fn on_deal_private(
@@ -3038,7 +3229,8 @@ impl Hand {
         // hand for it with `NotInThisStage` — and because the phase is taken
         // out with `mem::replace` above, the failure left it in `Between` for
         // ever, one stage short of the settlement §4.9 needs it to reach.
-        let cards: Option<[Card; 2]> = if self.mine.dealt_in.contains(&me) {
+        // `D-033`: a hand with no secret reads no cards; it can only fold.
+        let cards: Option<[Card; 2]> = if self.mine.dealt_in.contains(&me) && !self.fold_only {
             let indices = table.map.hole_cards(me).ok_or(Failed::NotInThisStage)?;
             let mut cards = Vec::with_capacity(2);
             for index in indices {
@@ -3472,20 +3664,53 @@ impl Hand {
             return Ok(Vec::new());
         }
 
+        {
+            let stage = Collective::closed(
+                self.slot.sequence,
+                EventType::BoardReveal.code(),
+                &self.mine.dealt_in,
+            )
+            .ok_or(Failed::NotInThisStage)?;
+            let Phase::Playing { play, .. } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            play.dealing.advance(RevealStage::Betting(street));
+            play.step = Step::Opening { street, stage };
+        }
+        // `D-033`: restoring, this seat's shares for the board come from the wire.
+        if self.restoring {
+            return Ok(Vec::new());
+        }
+        self.board_mine(key, now_ms)
+    }
+
+    /// This seat's shares for the street being opened, said and heard; the
+    /// street opens here if this was the last share owed. A hand with no secret
+    /// makes none, and says so once.
+    fn board_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let me = self.open.my_seat;
+        let street = match &self.phase {
+            Phase::Playing { play, .. } => match &play.step {
+                Step::Opening { street, stage } if stage.heard(me).is_none() => *street,
+                _ => return Ok(Vec::new()),
+            },
+            _ => return Ok(Vec::new()),
+        };
+        if self.fold_only {
+            let line = "this seat has no secret for this hand (D-033), so it cannot help open the board; the table waits".to_string();
+            if !self.cert_note.contains(&line) {
+                self.cert_note.push(line);
+            }
+            return Ok(Vec::new());
+        }
         let ctx = self.deck_ctx(&self.open.seats[self.seat_index()].1);
         let my_key = *self
             .keys_by_seat(me)
             .ok_or(Failed::NotInThisStage)?;
-
         let entries = {
             let Phase::Playing { deal, table, play } = &mut self.phase else {
                 return Err(Failed::NothingFurther);
             };
-            // The reveal stage moves first, or the shares for this street are
-            // not yet due and `own_share` refuses them. `advance` never moves
-            // backwards, which is what keeps a late message from reopening an
-            // earlier street.
-            play.dealing.advance(RevealStage::Betting(street));
             let identity = Identity {
                 seat: me,
                 key: &my_key,
@@ -3505,29 +3730,47 @@ impl Hand {
             }
             entries
         };
-
         let body = BoardReveal {
             street: street_code(street),
             entries,
         };
         let bytes = self.say(EventType::BoardReveal, &body, BOARD_REVEAL_CAP, key, now_ms)?;
         let hash = self.opened(&bytes, EventType::BoardReveal)?.event_hash;
-        let mut stage = Collective::closed(
-            self.slot.sequence,
-            EventType::BoardReveal.code(),
-            &self.mine.dealt_in,
-        )
-        .ok_or(Failed::NotInThisStage)?;
-        stage.hear(me, hash);
-
-        let Phase::Playing { play, .. } = &mut self.phase else {
-            return Err(Failed::NothingFurther);
+        let complete = {
+            let Phase::Playing { play, .. } = &mut self.phase else {
+                return Err(Failed::NothingFurther);
+            };
+            let Step::Opening { stage, .. } = &mut play.step else {
+                return Err(Failed::NothingFurther);
+            };
+            stage.hear(me, hash);
+            stage.complete()
         };
-        play.step = Step::Opening { street, stage };
-        Ok(vec![Send::Broadcast(bytes)])
+        let mut out = vec![Send::Broadcast(bytes)];
+        if complete {
+            let parent = {
+                let Phase::Playing { deal, table, play } = &mut self.phase else {
+                    return Err(Failed::NothingFurther);
+                };
+                for index in Self::street_indices(&table.map, street) {
+                    play.dealing
+                        .open(&deal.as_ref(table), index)
+                        .map_err(|_| Failed::BadToken {
+                            seat: me,
+                            why: "the board stage completed without every share",
+                        })?;
+                }
+                let Step::Opening { stage, .. } = &play.step else {
+                    return Err(Failed::NothingFurther);
+                };
+                stage.hash().ok_or(Failed::NotInThisStage)?
+            };
+            self.slot = self.slot.then(parent);
+            out.append(&mut self.open_betting(street, key, now_ms)?);
+        }
+        Ok(out)
     }
 
-    /// One seat's contribution to a street's board cards.
     fn on_board_reveal(
         &mut self,
         bytes: &[u8],
@@ -3727,6 +3970,10 @@ impl Hand {
         key: &SigningKey,
         now_ms: u64,
     ) -> Result<Vec<Send>, Failed> {
+        // `D-033`: restoring, what this seat said at the showdown comes from the wire.
+        if self.restoring {
+            return Ok(Vec::new());
+        }
         let me = self.open.my_seat;
         let (my_place, first) = {
             let Phase::Playing { play, .. } = &self.phase else {
@@ -3752,7 +3999,8 @@ impl Hand {
             (at, order[0])
         };
 
-        if self.shows_rather_than_mucks(my_place, first)? {
+        // `D-033`: a hand with no secret can show nothing, so it mucks.
+        if !self.fold_only && self.shows_rather_than_mucks(my_place, first)? {
             self.show(key, now_ms)
         } else {
             self.muck(key, now_ms)
@@ -8236,6 +8484,123 @@ impl Hand {
     /// 1's, which is what makes it the thing to compare between two peers.
     pub fn slot(&self) -> Slot {
         self.slot
+    }
+
+    /// `D-033`: the table's frames are replayed; whatever the current stage
+    /// still wants from this seat is made now, and from here on the hand is
+    /// played like any other. Nothing to do for a hand that was not restoring.
+    pub fn restore_done(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        if !self.restoring {
+            return Ok(Vec::new());
+        }
+        self.restoring = false;
+        let which = match &self.phase {
+            Phase::Deck { .. } => 1,
+            Phase::Shuffling { .. } => 2,
+            Phase::Committing { .. } => 3,
+            Phase::Dealing { .. } => 4,
+            Phase::Playing { play, .. } => match &play.step {
+                Step::Opening { .. } => 5,
+                Step::Showdown { .. } => 6,
+                _ => 0,
+            },
+            _ => 0,
+        };
+        match which {
+            1 => self.deck_mine(key, now_ms),
+            2 => self.shuffle_if_mine(key, now_ms),
+            3 => self.commit_mine(key, now_ms),
+            4 => self.deal_mine(key, now_ms),
+            5 => self.board_mine(key, now_ms),
+            6 => self.speak_at_showdown(key, now_ms),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// `D-033`: every frame this hand accepted from the wire, in the order
+    /// accepted. This client's own frames are the node's (`said`).
+    pub fn transcript(&self) -> &[Vec<u8>] {
+        &self.transcript
+    }
+
+    /// `D-033`: whether this hand is still taking this seat's frames from the wire.
+    pub fn is_restoring(&self) -> bool {
+        self.restoring
+    }
+
+    /// `D-033`: whether this seat can play the hand out -- it holds the hand's
+    /// secret -- or can only follow it and fold.
+    pub fn can_play_on(&self) -> bool {
+        !self.fold_only
+    }
+
+    /// This seat's own deck key, made and said now: a restored hand whose deck
+    /// stage still waits for this seat never had its previous life's key, so a
+    /// fresh one is as good as any. The stage closes here if this was the last
+    /// key owed.
+    fn deck_mine(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let me = self.open.my_seat;
+        let heard = match &self.phase {
+            Phase::Deck { stage, .. } => stage.heard(me).is_some(),
+            _ => return Ok(Vec::new()),
+        };
+        if heard || !self.mine.dealt_in.contains(&me) {
+            return Ok(Vec::new());
+        }
+        let me_key = self.open.seats[self.seat_index()].1;
+        let ctx = self.deck_ctx(&me_key);
+        let (secret, wire_key, proof) = self.params.keygen(&ctx);
+        let body = DeckInit {
+            key: wire_key.encode(),
+            proof: proof.encode(),
+        };
+        let bytes = chained::seal(
+            EventType::DeckInit,
+            &self.slot,
+            &body,
+            key,
+            now_ms,
+            self.open.crypto_step_timeout_ms,
+            DECK_INIT_CAP,
+        )
+        .map_err(Failed::Wire)?;
+        let hash = self.opened(&bytes, EventType::DeckInit)?.event_hash;
+        let complete = {
+            let Phase::Deck {
+                stage,
+                keys,
+                by_seat,
+                secret: held,
+            } = &mut self.phase
+            else {
+                return Err(Failed::NothingFurther);
+            };
+            let own = HandDeck::verify_key(wire_key, &proof, keys, &ctx).map_err(|_| Failed::BadKey {
+                seat: me,
+                why: "this client's own proof did not verify",
+            })?;
+            *held = secret;
+            keys.push(own);
+            if let Some(slot) = by_seat.get_mut(usize::from(me)) {
+                *slot = Some(own);
+            }
+            stage.hear(me, hash);
+            stage.complete()
+        };
+        // A key of this seat's own making: the hand can be played out.
+        self.fold_only = false;
+        let mut out = vec![Send::Broadcast(bytes)];
+        if complete {
+            let parent = {
+                let Phase::Deck { stage, .. } = &self.phase else {
+                    return Err(Failed::NothingFurther);
+                };
+                stage.hash().expect("a complete stage has one")
+            };
+            self.slot = self.slot.then(parent);
+            out.append(&mut self.begin_shuffle(key, now_ms)?);
+        }
+        Ok(out)
     }
 
     /// This client's own secret for the hand, once it has one.
@@ -13970,5 +14335,157 @@ mod tests {
         assert!(certs_in(&from_b, &table_id, 1).is_empty(), "one vote seals nothing");
         assert!(hands[0].returned().is_empty(), "the seat stays out");
         assert!(hands[1].returned().is_empty());
+    }
+
+    /// `D-033`: a table of two, dealt to the first bet, seen from a third
+    /// hand -- the second seat's next life -- that replays the table's frames
+    /// with the kept secret. Every frame either side said, in the order it
+    /// was said.
+    fn heads_up_to_the_first_bet() -> ([Hand; 2], [SigningKey; 2], Vec<Vec<u8>>, [u8; 32]) {
+        let keys = [key(10), key(11)];
+        let (a, from_a) = Hand::open(heads_up_opening(0), &keys[0], NOW, 30_000).unwrap();
+        let (b, from_b) = Hand::open(heads_up_opening(1), &keys[1], NOW, 30_000).unwrap();
+        let mut hands = [a, b];
+        let mut transcript: Vec<Vec<u8>> = Vec::new();
+        let mut queue: Vec<(usize, Vec<Send>)> = vec![(1, from_b), (0, from_a)];
+        while !queue.is_empty() {
+            let (from, sends) = queue.remove(0);
+            if sends.is_empty() {
+                continue;
+            }
+            transcript.extend(bytes_of(&sends));
+            let to = 1 - from;
+            let more = deliver(&mut hands[to], &sends, &keys[to]);
+            queue.push((to, more));
+        }
+        assert!(hands[0].street().is_some() && hands[1].street().is_some(), "dealt");
+        assert!(hands[0].turn().is_some(), "somebody is to act");
+        let kept = hands[1].secret().expect("a member holds its secret").keep();
+        (hands, keys, transcript, kept)
+    }
+
+    /// Carry what one seat said to the other, and the replies back, until
+    /// nothing more is said -- in the order said.
+    fn pump(hands: &mut [Hand; 2], keys: &[SigningKey; 2], from: usize, sends: Vec<Send>) {
+        let mut queue: Vec<(usize, Vec<Send>)> = vec![(from, sends)];
+        while !queue.is_empty() {
+            let (from, sends) = queue.remove(0);
+            if sends.is_empty() {
+                continue;
+            }
+            let to = 1 - from;
+            let more = deliver(&mut hands[to], &sends, &keys[to]);
+            queue.push((to, more));
+        }
+    }
+
+    /// Replay the table's frames into a restored hand, holding what is early.
+    fn replay(into: &mut Hand, transcript: &[Vec<u8>], key: &SigningKey) {
+        for bytes in transcript {
+            match into.on_event(bytes, key, NOW) {
+                Ok(_) => {}
+                Err(Failed::NotYet) => {
+                    let _ = into.hold(bytes.clone());
+                }
+                Err(e) => panic!("replaying a frame the table accepted: {e}"),
+            }
+        }
+        let (_, failures) = into.replay_early(key, NOW);
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// `D-033`: the second seat's client restarts inside a dealt hand. Its next
+    /// life adopts the hand from both openings, takes its own frames from the
+    /// wire and its secret from the record, reads the same two cards, and plays
+    /// the hand out to one settlement on both sides.
+    #[test]
+    fn a_member_comes_back_into_a_dealt_hand_with_its_secret_and_plays_it_out() {
+        let ([a, b], keys, transcript, kept) = heads_up_to_the_first_bet();
+        let copies: Vec<Vec<u8>> = transcript[..2].to_vec();
+        let o = Opening::adopt(heads_up_opening(1), &copies).expect("both openings");
+        assert_eq!(o.required, vec![0, 1]);
+        let mut b2 = Hand::open_restoring(o, &keys[1], NOW + 60_000, 30_000, Some(&kept)).unwrap();
+        assert!(b2.is_restoring());
+        replay(&mut b2, &transcript, &keys[1]);
+        let late = b2.restore_done(&keys[1], NOW + 60_000).unwrap();
+        assert!(late.is_empty(), "nothing was owed at the first bet: {}", late.len());
+        assert!(!b2.is_restoring() && b2.can_play_on());
+        assert_eq!(b2.street(), b.street(), "the same street");
+        assert_eq!(b2.turn().map(|t| t.seat), b.turn().map(|t| t.seat), "the same seat to act");
+        assert_eq!(b2.cards(), b.cards(), "the same two cards, read with the kept secret");
+        assert!(b2.cards().is_some());
+        drop(b);
+        // Played out: whoever is to act checks or calls, until the hand is over.
+        let mut hands = [a, b2];
+        for _ in 0..40 {
+            if hands[0].over() && hands[1].over() {
+                break;
+            }
+            let Some(turn) = hands[0].turn().or_else(|| hands[1].turn()) else {
+                break;
+            };
+            let actor = usize::from(turn.seat);
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[actor].act(action, &keys[actor], NOW + 60_000).unwrap();
+            let mut queue: Vec<(usize, Vec<Send>)> = vec![(actor, sends)];
+            while !queue.is_empty() {
+                let (from, sends) = queue.remove(0);
+                if sends.is_empty() {
+                    continue;
+                }
+                let to = 1 - from;
+                let more = deliver(&mut hands[to], &sends, &keys[to]);
+                queue.push((to, more));
+            }
+        }
+        let [a, b2] = hands;
+        assert!(a.over() && b2.over(), "played out on both sides");
+        assert_eq!(a.terminal(), b2.terminal(), "one settlement");
+        assert_eq!(a.stacks(), b2.stacks());
+    }
+
+    /// `D-033`: the same restart with no secret kept -- or one of another hand.
+    /// The next life follows the hand and can fold at its turn; it reads no
+    /// cards and makes no share.
+    #[test]
+    fn a_member_back_without_its_secret_can_only_fold() {
+        let ([mut a, b], keys, transcript, kept) = heads_up_to_the_first_bet();
+        let copies: Vec<Vec<u8>> = transcript[..2].to_vec();
+        // Another hand's secret is as good as none.
+        let mut wrong = kept;
+        wrong[0] ^= 1;
+        let wrong = HandSecret::kept(&wrong).map(|s| s.keep());
+        for kept in [None, wrong.as_ref()] {
+            let o = Opening::adopt(heads_up_opening(1), &copies).unwrap();
+            let mut b2 = Hand::open_restoring(o, &keys[1], NOW + 60_000, 30_000, kept).unwrap();
+            replay(&mut b2, &transcript, &keys[1]);
+            let _ = b2.restore_done(&keys[1], NOW + 60_000).unwrap();
+            assert!(!b2.can_play_on(), "no secret, no play");
+            assert_eq!(b2.street(), b.street());
+            assert!(b2.cards().is_none(), "no cards to read");
+            if b2.turn().is_some_and(|t| t.mine) {
+                let sends = b2.act(Action::Fold, &keys[1], NOW + 60_000).expect("a fold needs no secret");
+                let mut hands = [a, b2];
+                pump(&mut hands, &keys, 1, sends);
+                assert!(hands[0].over() && hands[1].over(), "the fold ends a hand of two");
+                assert_eq!(hands[0].terminal(), hands[1].terminal());
+                return;
+            }
+        }
+        // The first seat is to act: it acts, then the second folds.
+        let turn = a.turn().expect("the first seat is to act");
+        let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+        let sends = a.act(action, &keys[0], NOW + 60_000).unwrap();
+        let o = Opening::adopt(heads_up_opening(1), &copies).unwrap();
+        let mut b2 = Hand::open_restoring(o, &keys[1], NOW + 60_000, 30_000, None).unwrap();
+        replay(&mut b2, &transcript, &keys[1]);
+        let _ = b2.restore_done(&keys[1], NOW + 60_000).unwrap();
+        deliver(&mut b2, &sends, &keys[1]);
+        assert!(b2.turn().is_some_and(|t| t.mine), "now the second seat is to act");
+        let sends = b2.act(Action::Fold, &keys[1], NOW + 60_000).expect("a fold needs no secret");
+        let mut hands = [a, b2];
+        pump(&mut hands, &keys, 1, sends);
+        assert!(hands[0].over() && hands[1].over(), "the fold ends a hand of two");
+        assert_eq!(hands[0].terminal(), hands[1].terminal());
     }
 }

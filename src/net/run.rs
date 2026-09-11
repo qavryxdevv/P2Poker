@@ -859,6 +859,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // say *the players are joining the group* as they do and not on the
     // thirty-second status line.
     let mut carrier_reported: Option<(u64, u64)> = None;
+    // `D-033`: the hand whose card material the session record holds.
+    let mut material_recorded: Option<u64> = None;
     // `S1-CX`: the other seat's next hand, seen while this one is still
     // inside a hand nothing was dealt in -- the hand id and the parent it
     // carries -- for the stall tick to give this hand up on, if the parent
@@ -878,7 +880,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // Write the session record: the table as joined, this seat, the boundary
     // reached. A no-op for a founder.
     macro_rules! remember_session {
-        ($hand_id:expr, $terminal:expr, $stack:expr) => {{
+        ($hand_id:expr, $terminal:expr, $stack:expr) => {
+            remember_session!($hand_id, $terminal, $stack, None::<[u8; 32]>)
+        };
+        ($hand_id:expr, $terminal:expr, $stack:expr, $kept:expr) => {{
+            let kept: Option<[u8; 32]> = $kept;
             if let (Some(key), Some(ad), Some(advert_hash), Some(f)) =
                 (joined_key, joined_ad.as_ref(), joined_advert_hash, table.as_ref())
             {
@@ -900,6 +906,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         advert,
                         advert_hash,
                         ratification: f.my_ratification().map(<[u8]>::to_vec).unwrap_or_default(),
+                        hand_secret: kept.unwrap_or([0u8; 32]),
+                        secret_hand_id: if kept.is_some() { $hand_id } else { 0 },
                     };
                     match crate::storage::session::save(&profile_dir, &record) {
                         Ok(()) => {
@@ -4163,6 +4171,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 tox_sink.try_broadcast(&bytes);
                                 n += 1;
                             }
+                            // `D-033`: and the running hand -- every frame accepted
+                            // and every frame said -- so a seat back from a restart
+                            // can take the hand up where it stood.
+                            if let Some(h) = hand.as_ref() {
+                                let hid = h.hand_id();
+                                let mut frames = 0usize;
+                                for b in h.transcript() {
+                                    tox_sink.try_broadcast(b);
+                                    frames += 1;
+                                }
+                                for b in said.iter() {
+                                    if crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok().map(|(_, h, _)| h) == Some(hid) {
+                                        tox_sink.try_broadcast(b);
+                                        frames += 1;
+                                    }
+                                }
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "and hand #{hid}'s {frames} frame(s), for a seat back from a restart (D-033)"
+                                    )))
+                                    .await;
+                            }
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
                                     "a ratification copy arrived after the table was set; said {n} message(s) again over the group"
@@ -4702,6 +4732,44 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // `D-033`: the running hand's card material goes into the session
+                // record the moment the deck stage begins, so a restart inside the
+                // hand can take it up again and play it out.
+                let material = hand.as_ref().and_then(|h| {
+                    let s = h.secret()?;
+                    if material_recorded == Some(h.hand_id()) {
+                        return None;
+                    }
+                    let stack = h.stacks().get(usize::from(h.my_seat())).copied().unwrap_or(0);
+                    Some((h.hand_id(), stack, s.keep()))
+                });
+                if let Some((hid, stack, kept)) = material {
+                    material_recorded = Some(hid);
+                    remember_session!(hid, [0; 32], stack, Some(kept));
+                }
+                // `D-033`: a seat back without its material cannot play the hand on;
+                // at its turn it folds, as the owner's rule says.
+                let folded = match hand.as_mut() {
+                    Some(h) if !h.can_play_on() && h.turn().is_some_and(|t| t.mine) => {
+                        let now = super::node::now_unix_ms();
+                        Some(h.act(crate::poker::actions::Action::Fold, &app_key, now))
+                    }
+                    _ => None,
+                };
+                match folded {
+                    Some(Ok(sends)) => {
+                        publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                        let _ = events
+                            .send(NodeEvent::Warning(
+                                "folded: this seat's card material was lost with the client that stopped, so the hand cannot be played on (D-033)".into(),
+                            ))
+                            .await;
+                    }
+                    Some(Err(e)) => {
+                        let _ = events.send(NodeEvent::Warning(format!("could not fold: {e}"))).await;
+                    }
+                    None => {}
+                }
                 // `S1-CS`: the group count, the moment it changes.
                 if table.is_some() {
                     let group = tox_sink.group_seen();
@@ -4828,6 +4896,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     let now = super::node::now_unix_ms();
                                     match crate::table::hand::Opening::adopt(base, &copies) {
                                         Ok(mut o) => {
+                                            // `D-033`: a copy of this seat's own opening among
+                                            // the table's means the previous life signed this
+                                            // hand: it is taken up where it stood, not opened anew.
+                                            let signed_before = o.required.contains(&o.my_seat);
+                                            let kept: Option<[u8; 32]> = resume
+                                                .as_ref()
+                                                .filter(|r| r.secret_hand_id == hid && r.hand_secret != [0u8; 32])
+                                                .map(|r| r.hand_secret);
                                             // `S1-CX`: heads-up there is no certificate to
                                             // come back by (D-007), and the one other seat
                                             // is the whole table. A returning seat that is
@@ -4848,9 +4924,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // A member's opening goes out; a bystander's
                                             // `open` says nothing the table may hear.
                                             let member = o.required.contains(&seat);
-                                            match crate::table::hand::Hand::open(o, &app_key, now, deadline) {
+                                            let opened = if signed_before {
+                                                crate::table::hand::Hand::open_restoring(o, &app_key, now, deadline, kept.as_ref())
+                                                    .map(|h| (h, Vec::new()))
+                                            } else {
+                                                crate::table::hand::Hand::open(o, &app_key, now, deadline)
+                                            };
+                                            match opened {
                                                 Ok((mut h, opening_sends)) => {
-                                                    if member {
+                                                    if member && !signed_before {
                                                         publish_hand(opening_sends, &mut swarm, &mut said, &tox_sink);
                                                     }
                                                     for c in &copies {
@@ -4876,6 +4958,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                             .send(NodeEvent::Warning(format!("a held frame was refused by the adopted hand #{hid}: {e}")))
                                                             .await;
                                                     }
+                                                    // `D-033`: the table's frames are in; whatever the
+                                                    // stage still wants from this seat is made now.
+                                                    if signed_before {
+                                                        match h.restore_done(&app_key, now) {
+                                                            Ok(sends) => publish_hand(sends, &mut swarm, &mut said, &tox_sink),
+                                                            Err(e) => {
+                                                                let _ = events
+                                                                    .send(NodeEvent::Warning(format!("the taken-up hand #{hid} could not go on: {e}")))
+                                                                    .await;
+                                                            }
+                                                        }
+                                                    }
                                                     let first = h.first_held().and_then(|b| {
                                                         let (kind, _, seq) = crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok()?;
                                                         let o = crate::net::chained::open_in_hand(b, crate::table::hand::FRAME_CAP, kind, &h.table_id(), hid).ok()?;
@@ -4896,7 +4990,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                             "resumed at hand #{hid} as {} (seat {seat}) from {} copies, {n} frame(s) replayed; {}",
                                                             if member { "a member" } else { "a bystander" },
                                                             copies.len(),
-                                                            if member {
+                                                            if signed_before && h.can_play_on() {
+                                                                "this seat's previous life signed it, and with the kept card material it plays on where it stood (D-033)"
+                                                            } else if signed_before {
+                                                                "this seat's previous life signed it; without its card material it can only follow and fold (D-033)"
+                                                            } else if member {
                                                                 "this seat signed it and is dealt in"
                                                             } else {
                                                                 "it asks to sit in at this hand's boundary"
@@ -7369,7 +7467,7 @@ fn stop_on_turn_due(since: tokio::time::Instant) -> bool {
 /// beside it -- under two bounds: two hand ids of inits with one copy per
 /// seat each, and `RESUME_EARLY_CAP` other frames, oldest out. Returns
 /// whether the frame was a hand frame at all.
-const RESUME_EARLY_CAP: usize = 128;
+const RESUME_EARLY_CAP: usize = 1_024;
 
 fn stash_for_resume(
     bytes: &[u8],
@@ -10623,7 +10721,7 @@ mod late_roster_tests {
     fn a_resuming_client_keeps_inits_by_hand_and_the_rest_bounded() {
         use crate::protocol::messages::EventType;
         let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let seal = |kind: EventType, hand_id: u64, tag: u8| -> Vec<u8> {
+        let seal = |kind: EventType, hand_id: u64, tag: u16| -> Vec<u8> {
             let slot = crate::net::chained::Slot {
                 table_id: [1; 32],
                 hand_id,
@@ -10646,7 +10744,7 @@ mod late_roster_tests {
         assert!(early.is_empty(), "and hand 5's other frames went with it");
         assert!(stash_for_resume(&seal(EventType::HandInit, 4, 0), &mut inits, &mut early));
         assert!(!inits.contains_key(&4), "a hand below the two held is not kept");
-        for i in 0..(RESUME_EARLY_CAP as u8).saturating_add(10) {
+        for i in 0..(RESUME_EARLY_CAP as u16).saturating_add(10) {
             let _ = stash_for_resume(&seal(EventType::DeckInit, 7, i), &mut inits, &mut early);
         }
         assert_eq!(early.len(), RESUME_EARLY_CAP, "bounded, oldest out");

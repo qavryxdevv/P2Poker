@@ -188,8 +188,10 @@ pub struct VerifiedToken(LibVerified<RevealToken>);
 ///
 /// Opaque, and deliberately **not** a [`DeckWire`] type even though the library
 /// makes its inner value one: the per-hand deck secret must not be reachable
-/// from the wire, and the way to guarantee that is for there to be no encoding
-/// of it at all.
+/// from the wire, and no message type carries it. `D-033` gives it one form
+/// outside the wire, [`HandSecret::keep`], for the session record on the
+/// player's own disk, so that a client which restarts inside a hand can take
+/// the hand up again and play it out.
 ///
 /// It also exists so that no module outside `src/mental_poker/` names a library
 /// type (`CONTRIBUTING.md` §4.4). The first draft of `table::dealing` took a
@@ -201,6 +203,26 @@ impl core::fmt::Debug for HandSecret {
     /// Never prints the key.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("HandSecret(<redacted>)")
+    }
+}
+
+impl HandSecret {
+    /// `D-033`: the form kept on the player's own disk, in the session record,
+    /// so that a client which restarts inside a hand can play it out. Not a
+    /// [`DeckWire`] type, and no message carries it.
+    pub fn keep(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+
+    /// A secret back from [`HandSecret::keep`]; `None` for bytes that are no key.
+    pub fn kept(bytes: &[u8; 32]) -> Option<Self> {
+        SecretKey::from_bytes(bytes).map(HandSecret)
+    }
+
+    /// The key this secret answers for, to check a kept secret against the key
+    /// the table holds for this seat.
+    pub fn wire_key(&self) -> WireKey {
+        WireKey(self.0.public_key())
     }
 }
 
