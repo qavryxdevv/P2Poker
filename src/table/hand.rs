@@ -2028,12 +2028,14 @@ impl Hand {
 
         let out = self.dispatch(bytes, kind, key, now_ms);
         self.mark_stage(now_ms);
-        // `D-033`: kept once, for a seat back from a restart.
+        // `D-033`: kept once, for a seat back from a restart -- keyed by the
+        // frame's own bytes: the slot has moved on by now, and a frame opened
+        // against it reads as a stage this hand has left (`run105747-2`, where
+        // the survivor said only its own frames again).
         if out.is_ok() {
-            if let Ok(opened) = self.opened(bytes, kind) {
-                if self.transcript_seen.insert(opened.event_hash) {
-                    self.transcript.push(bytes.to_vec());
-                }
+            let digest: Hash = *blake3::hash(bytes).as_bytes();
+            if self.transcript_seen.insert(digest) {
+                self.transcript.push(bytes.to_vec());
             }
         }
         // **Caught here, because here is where the frame still exists.** A
@@ -14341,12 +14343,13 @@ mod tests {
     /// hand -- the second seat's next life -- that replays the table's frames
     /// with the kept secret. Every frame either side said, in the order it
     /// was said.
-    fn heads_up_to_the_first_bet() -> ([Hand; 2], [SigningKey; 2], Vec<Vec<u8>>, [u8; 32]) {
+    fn heads_up_to_the_first_bet() -> ([Hand; 2], [SigningKey; 2], Vec<Vec<u8>>, Vec<Vec<u8>>, [u8; 32]) {
         let keys = [key(10), key(11)];
         let (a, from_a) = Hand::open(heads_up_opening(0), &keys[0], NOW, 30_000).unwrap();
         let (b, from_b) = Hand::open(heads_up_opening(1), &keys[1], NOW, 30_000).unwrap();
         let mut hands = [a, b];
         let mut transcript: Vec<Vec<u8>> = Vec::new();
+        let mut a_said: Vec<Vec<u8>> = Vec::new();
         let mut queue: Vec<(usize, Vec<Send>)> = vec![(1, from_b), (0, from_a)];
         while !queue.is_empty() {
             let (from, sends) = queue.remove(0);
@@ -14354,14 +14357,23 @@ mod tests {
                 continue;
             }
             transcript.extend(bytes_of(&sends));
+            if from == 0 {
+                a_said.extend(bytes_of(&sends));
+            }
             let to = 1 - from;
             let more = deliver(&mut hands[to], &sends, &keys[to]);
             queue.push((to, more));
         }
         assert!(hands[0].street().is_some() && hands[1].street().is_some(), "dealt");
+        // Every frame said was accepted by exactly the other seat, and kept there.
+        assert_eq!(
+            hands[0].transcript().len() + hands[1].transcript().len(),
+            transcript.len(),
+            "each side keeps what it accepted from the other"
+        );
         assert!(hands[0].turn().is_some(), "somebody is to act");
         let kept = hands[1].secret().expect("a member holds its secret").keep();
-        (hands, keys, transcript, kept)
+        (hands, keys, transcript, a_said, kept)
     }
 
     /// Carry what one seat said to the other, and the replies back, until
@@ -14377,6 +14389,15 @@ mod tests {
             let more = deliver(&mut hands[to], &sends, &keys[to]);
             queue.push((to, more));
         }
+    }
+
+    /// What the survivor says again to a seat back from a restart: the frames
+    /// it accepted (its transcript) and its own -- replayed into the restored
+    /// hand, which holds what is early.
+    fn replay_from_the_table(into: &mut Hand, survivor: &Hand, survivor_said: &[Vec<u8>], key: &SigningKey) {
+        let mut frames: Vec<Vec<u8>> = survivor.transcript().to_vec();
+        frames.extend(survivor_said.iter().cloned());
+        replay(into, &frames, key);
     }
 
     /// Replay the table's frames into a restored hand, holding what is early.
@@ -14400,13 +14421,13 @@ mod tests {
     /// the hand out to one settlement on both sides.
     #[test]
     fn a_member_comes_back_into_a_dealt_hand_with_its_secret_and_plays_it_out() {
-        let ([a, b], keys, transcript, kept) = heads_up_to_the_first_bet();
+        let ([a, b], keys, transcript, a_said, kept) = heads_up_to_the_first_bet();
         let copies: Vec<Vec<u8>> = transcript[..2].to_vec();
         let o = Opening::adopt(heads_up_opening(1), &copies).expect("both openings");
         assert_eq!(o.required, vec![0, 1]);
         let mut b2 = Hand::open_restoring(o, &keys[1], NOW + 60_000, 30_000, Some(&kept)).unwrap();
         assert!(b2.is_restoring());
-        replay(&mut b2, &transcript, &keys[1]);
+        replay_from_the_table(&mut b2, &a, &a_said, &keys[1]);
         let late = b2.restore_done(&keys[1], NOW + 60_000).unwrap();
         assert!(late.is_empty(), "nothing was owed at the first bet: {}", late.len());
         assert!(!b2.is_restoring() && b2.can_play_on());
@@ -14449,7 +14470,7 @@ mod tests {
     /// cards and makes no share.
     #[test]
     fn a_member_back_without_its_secret_can_only_fold() {
-        let ([mut a, b], keys, transcript, kept) = heads_up_to_the_first_bet();
+        let ([mut a, b], keys, transcript, a_said, kept) = heads_up_to_the_first_bet();
         let copies: Vec<Vec<u8>> = transcript[..2].to_vec();
         // Another hand's secret is as good as none.
         let mut wrong = kept;
@@ -14458,7 +14479,7 @@ mod tests {
         for kept in [None, wrong.as_ref()] {
             let o = Opening::adopt(heads_up_opening(1), &copies).unwrap();
             let mut b2 = Hand::open_restoring(o, &keys[1], NOW + 60_000, 30_000, kept).unwrap();
-            replay(&mut b2, &transcript, &keys[1]);
+            replay_from_the_table(&mut b2, &a, &a_said, &keys[1]);
             let _ = b2.restore_done(&keys[1], NOW + 60_000).unwrap();
             assert!(!b2.can_play_on(), "no secret, no play");
             assert_eq!(b2.street(), b.street());
@@ -14478,7 +14499,7 @@ mod tests {
         let sends = a.act(action, &keys[0], NOW + 60_000).unwrap();
         let o = Opening::adopt(heads_up_opening(1), &copies).unwrap();
         let mut b2 = Hand::open_restoring(o, &keys[1], NOW + 60_000, 30_000, None).unwrap();
-        replay(&mut b2, &transcript, &keys[1]);
+        replay_from_the_table(&mut b2, &a, &a_said, &keys[1]);
         let _ = b2.restore_done(&keys[1], NOW + 60_000).unwrap();
         deliver(&mut b2, &sends, &keys[1]);
         assert!(b2.turn().is_some_and(|t| t.mine), "now the second seat is to act");

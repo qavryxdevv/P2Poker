@@ -4740,7 +4740,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if material_recorded == Some(h.hand_id()) {
                         return None;
                     }
-                    let stack = h.stacks().get(usize::from(h.my_seat())).copied().unwrap_or(0);
+                    let stack = h.stack_at_boundary(h.my_seat());
                     Some((h.hand_id(), stack, s.keep()))
                 });
                 if let Some((hid, stack, kept)) = material {
