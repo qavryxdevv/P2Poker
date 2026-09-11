@@ -42,6 +42,12 @@ pub enum Role {
         /// group it is invited into against.
         chat_id: Option<[u8; 32]>,
     },
+    /// `D-037`: the founder, back after a restart. Its group is gone with the
+    /// old process; it takes an invitation from any roster member into the
+    /// group the advertisement named, and nothing else.
+    Back {
+        chat_id: Option<[u8; 32]>,
+    },
 }
 
 /// Something the roster decided, for the driver. A mirror of
@@ -288,6 +294,7 @@ impl TableSink {
             let role = match role {
                 Role::Host => table::Role::Host,
                 Role::Joiner { founder, chat_id } => table::Role::Joiner { founder, chat_id },
+                Role::Back { chat_id } => table::Role::Back { chat_id },
             };
             self.inner = Some(table::spawn(
                 tox,

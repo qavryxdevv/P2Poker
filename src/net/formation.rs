@@ -305,6 +305,84 @@ impl Formation {
         })
     }
 
+    /// `D-037`: the founder, back after a restart, rebuilt from its own record
+    /// -- the table key it signed with, the advertisement as it stood, and the
+    /// last `PLAYER_LIST` it signed, checked against the table key as any
+    /// joiner checks a list. It holds the roster and its seat 0, ratifies (the
+    /// recorded `TABLE_READY` verbatim, when given: the same `event_hash`, so
+    /// the same session as the table's), and answers joins as the founder
+    /// again. The group and the session it takes up from the members like any
+    /// returning seat. Returns the state and what it says at once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn found_back(
+        app: SigningKey,
+        table_seed: [u8; 32],
+        ad: TableAd,
+        advert_hash: Hash,
+        list_bytes: &[u8],
+        recorded_ready: Option<Vec<u8>>,
+        now_ms: u64,
+    ) -> Result<(Self, Vec<Send>), Failed> {
+        let table_key = SigningKey::from_bytes(&table_seed);
+        let table_id = table_key.verifying_key().to_bytes();
+        let under = JoinedUnder::pin(ad, advert_hash, table_id);
+        let (list, sender, _) = joinwire::receive_player_list_at(list_bytes).map_err(Failed::Wire)?;
+        let roster = admit_list(&list, &sender, None, &under).map_err(Failed::List)?;
+        let my_buyin = roster
+            .seats()
+            .iter()
+            .find(|e| e.seat == 0)
+            .map(|e| e.buyin)
+            .unwrap_or(0);
+        let mut f = Formation {
+            app,
+            founder: Some(FounderPart {
+                key: table_key,
+                issued: VecDeque::new(),
+                password: None,
+            }),
+            under,
+            roster,
+            serial: 0,
+            my_seat: Some(0),
+            my_buyin,
+            pending: None,
+            ratified: BTreeMap::new(),
+            ratified_bytes: BTreeMap::new(),
+            sent_ready: false,
+            session: None,
+            capabilities: vec![DECK_CAPABILITY.to_vec()],
+            said: Said::default(),
+            early: VecDeque::new(),
+            recorded_ready,
+            recorded_refused: false,
+        };
+        f.said.list = Some(list_bytes.to_vec());
+        let out = f.adopt(&list, now_ms)?;
+        Ok((f, out))
+    }
+
+    /// `D-037`: the table key's seed, for the founder's record. `None` for a
+    /// seat that joined.
+    pub fn table_seed(&self) -> Option<[u8; 32]> {
+        self.founder.as_ref().map(|f| f.key.to_bytes())
+    }
+
+    /// `D-037`: the last `PLAYER_LIST` this founder signed, verbatim.
+    pub fn my_list(&self) -> Option<&[u8]> {
+        self.said.list.as_deref()
+    }
+
+    /// The advertisement this table was joined under, as it stands.
+    pub fn ad(&self) -> &TableAd {
+        &self.under.ad
+    }
+
+    /// The hash a `JOIN_REQUEST` names for that advertisement.
+    pub fn advert_hash(&self) -> Hash {
+        self.under.advert_hash
+    }
+
     /// Ask to join somebody else's table. Returns the state and the signed
     /// `JOIN_REQUEST` to send.
     #[allow(clippy::too_many_arguments)]
@@ -669,6 +747,35 @@ impl Formation {
         // re-broadcasts — §7.2 rule 7 refuses one that changed a parameter — so
         // this is the advertisement they joined under, exactly as `JoinedUnder`
         // means it.
+        // `S1-J`, and `D-037` moved it up here: a seat already on the roster is
+        // answered *already seated* and given the roster again, whichever copy
+        // of the advertisement it names. The lookup below is for strangers --
+        // a founder back from a restart holds no signed copy at all, and a
+        // seat that comes back names the copy it heard, which need not be the
+        // founder's last.
+        if seated {
+            let reply = joinwire::publish_join_reject(
+                request_hash,
+                RejectReason::AlreadySeated,
+                0,
+                &f.key,
+                now_ms,
+            )?;
+            let mut out = vec![Send::Reply(reply)];
+            if self.serial > 0 {
+                let list = PlayerList {
+                    roster: self.roster.seats().to_vec(),
+                    table_params_hash: self.under.params,
+                    list_serial: self.serial,
+                };
+                if let Ok(bytes) = joinwire::publish_player_list(&list, &f.key, now_ms) {
+                    self.said.list = Some(bytes.clone());
+                    out.push(Send::Broadcast(bytes));
+                }
+            }
+            return Ok(out);
+        }
+
         let under = match f.find(&req.advert_hash) {
             Some(i) => JoinedUnder {
                 advert_hash: i.hash,
@@ -2609,6 +2716,68 @@ mod tests {
             t.joiners.push(j);
         }
         (t, a, hash)
+    }
+
+    /// `D-037`: the founder, restarted, is rebuilt from what it recorded --
+    /// the table key, the advertisement, its last list -- says the recorded
+    /// ratification byte for byte, computes the table's session from the
+    /// members' copies, and answers a seated peer as the founder again.
+    #[test]
+    fn the_founder_comes_back_from_its_own_record() {
+        let (t, a, hash) = form_three();
+        let table_id = t.founder.table_id();
+        let session = t.founder.session().expect("the table settled");
+        let seed = t.founder.table_seed().expect("the founder holds the table key");
+        assert_eq!(seed, [200u8; 32], "the seed the fixture founded with");
+        let list = t.founder.my_list().expect("the founder signed a list").to_vec();
+        let recorded = t.founder.my_ratification().expect("and ratified").to_vec();
+        let ad = t.founder.ad().clone();
+        let advert_hash = t.founder.advert_hash();
+        assert_eq!(advert_hash, hash);
+        let others: Vec<Vec<u8>> = t.joiners.iter().flat_map(|j| j.say_again(NOW)).collect();
+        let later = NOW + 60_000;
+
+        let (mut back, said) = Formation::found_back(
+            key(1),
+            seed,
+            ad,
+            advert_hash,
+            &list,
+            Some(recorded.clone()),
+            later,
+        )
+        .expect("rebuilt from the record");
+        assert!(back.is_founder(), "the founder again");
+        assert_eq!(back.my_seat(), Some(0));
+        assert_eq!(back.table_id(), table_id);
+        assert_eq!(
+            said,
+            vec![Send::Broadcast(recorded.clone())],
+            "what it says is the recorded ratification, byte for byte"
+        );
+        assert!(!back.recorded_ratification_refused());
+        for b in others {
+            if joinwire::receive_table_ready(&b, &table_id, &back.genesis()).is_ok() {
+                let _ = back.on_table_ready(&b);
+            }
+        }
+        assert_eq!(back.session(), Some(session), "the same session identity as the table's");
+
+        // A seated peer asking again is answered as the founder always did:
+        // already seated, and the roster said again.
+        let (_, again) = Formation::join(
+            key(2), a.clone(), hash, table_id, peer(2), "player 2".into(), 1_000, None, None, [9u8; 32], later, None,
+        )
+        .unwrap();
+        let out = back
+            .on_join_request(&again, &peer(2), true, later)
+            .expect("answered by the founder");
+        assert!(
+            out.iter().any(|s| matches!(s, Send::Broadcast(b) if joinwire::receive_player_list(b).is_ok())),
+            "the roster said again: serial {}, sent {:?}",
+            back.serial(),
+            out.iter().map(|s| match s { Send::Reply(b) => format!("reply {} B", b.len()), Send::Broadcast(b) => format!("broadcast {} B", b.len()) }).collect::<Vec<_>>()
+        );
     }
 
     /// `S1-CR`: a seat that restarts says the ratification it recorded,

@@ -55,7 +55,10 @@ impl AppState {
                     bet: hand.and_then(|h| h.bets.get(i).copied()).unwrap_or(0),
                     cards: hole_cards(hand, *n, hero),
                     folded: hand.and_then(|h| h.folded.get(i).copied()).unwrap_or(false),
-                    sitting_out: false,
+                    // `S1-DG`: a roster seat the running hand does not deal in
+                    // sits it out -- certified out, or busted -- and the felt
+                    // says so rather than drawing it like any other seat.
+                    sitting_out: hand.is_some_and(|h| !h.dealt_in.contains(n)),
                     clock: (self.turn_seat == Some(*n) && !hand.is_some_and(|h| h.over)).then(|| {
                         clock_fraction(
                             self.turn_since.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0),
@@ -220,6 +223,13 @@ fn note(
         (Some(h), _) if h.over => format!("hand #{} is over", h.hand_id),
         (Some(h), _) if h.cards.is_some() => format!(
             "hand #{} — your cards are dealt; the button is at seat {}",
+            h.hand_id, h.button
+        ),
+        // `S1-DG`: a hand this client follows without a seat in it -- back
+        // from a restart and not yet dealt in, or certified out -- is said as
+        // that, not as a deck being sealed while the others play the river.
+        (Some(h), _) if h.street.is_some() => format!(
+            "hand #{} — you are not dealt in this hand; the button is at seat {}",
             h.hand_id, h.button
         ),
         (Some(h), _) => match (h.shuffling, h.deck_ready) {
@@ -411,6 +421,63 @@ mod tests {
         assert_eq!(v.seats.iter().map(|x| x.won).collect::<Vec<_>>(), vec![0, 300, 0]);
         assert_eq!(v.street, "hand over");
         assert_eq!(v.seats.iter().map(|x| x.bet).collect::<Vec<_>>(), vec![0, 0, 0], "nothing is in front of anybody once the pot is paid");
+    }
+
+    /// `S1-DG`: a hand ended without a settlement restores every stack to
+    /// the hand's start, and the felt shows those -- not the buy-ins, which
+    /// is what an empty stack list from the engine used to mean here.
+    #[test]
+    fn a_hand_ended_without_a_settlement_shows_the_stacks_it_started_with() {
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_100, 900, 1_000], shown: vec![None, None, None] });
+        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::TableState {
+            hand_id: 2,
+            street: 0,
+            pot: 150,
+            to_act: Some(0),
+            stacks: vec![1_100, 850, 900],
+            bets: vec![0, 50, 100],
+            folded: vec![false, false, false],
+        });
+        assert_eq!(s.table_view().seats.iter().map(|x| x.stack).collect::<Vec<_>>(), vec![1_100, 850, 900]);
+        // The deadline ends it: no settlement, no stacks reported.
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![], shown: vec![None, None, None] });
+        let v = s.table_view();
+        assert!(v.hand_over);
+        assert_eq!(v.seats.iter().map(|x| x.stack).collect::<Vec<_>>(), vec![1_100, 900, 1_000], "the stacks the hand started with");
+        assert_eq!(v.seats.iter().map(|x| x.won).collect::<Vec<_>>(), vec![0, 0, 0], "nobody won anything");
+        assert_eq!(v.seats.iter().map(|x| x.bet).collect::<Vec<_>>(), vec![0, 0, 0]);
+    }
+
+    /// `S1-DG`: a roster seat the running hand does not deal in sits it out,
+    /// and the felt says so; a hero outside the hand is told so, not shown a
+    /// deck being sealed while the others play. Before this every seat drew
+    /// like any other and the note read the deck's state.
+    #[test]
+    fn a_seat_not_dealt_in_sits_out_and_a_hero_outside_the_hand_is_told() {
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1] });
+        let v = s.table_view();
+        assert!(v.seats.iter().any(|x| x.seat == 2 && x.sitting_out), "seat 2 sits this hand out");
+        assert!(v.seats.iter().filter(|x| x.seat != 2).all(|x| !x.sitting_out));
+
+        let mut b = seated(2);
+        b.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1] });
+        b.apply(NodeEvent::TableState {
+            hand_id: 3,
+            street: 1,
+            pot: 200,
+            to_act: Some(1),
+            stacks: vec![900, 900, 1_000],
+            bets: vec![0, 0, 0],
+            folded: vec![false, false, false],
+        });
+        let v = b.table_view();
+        assert_eq!(v.street, "flop");
+        assert!(v.note.as_deref().is_some_and(|n| n.contains("not dealt in")), "{:?}", v.note);
+        assert!(v.seats.iter().any(|x| x.seat == 2 && x.sitting_out), "the hero itself sits out");
     }
 
     /// The hero's hand is named on the left, with the odds of improving over

@@ -137,7 +137,9 @@ pub enum Role {
         /// this the founder could invite a player into a group nobody
         /// advertised, and every other client would be watching a different
         /// one — a table whose traffic nobody else can see, which is the shape
-        /// a founder colluding with one player would want. So the group is
+        /// a founder colluding with one player would want. (`D-037`: the
+        /// founder itself, back after a restart, is `Back` below -- the same
+        /// check, an invitation from any roster member.) So the group is
         /// joined, its id read back, and compared; a mismatch is left again at
         /// once.
         ///
@@ -145,6 +147,14 @@ pub enum Role {
         /// build with no Tox. There is then nothing to compare against and
         /// nothing to be invited to, so an invitation is refused outright
         /// rather than accepted on trust.
+        chat_id: Option<[u8; 32]>,
+    },
+    /// `D-037`: the founder, back after a restart. The group it created went
+    /// with the old process; the members still hold it, and one of them
+    /// offers it again when this key's friendship comes back up. Any roster
+    /// member's invitation is taken, and only into the group the
+    /// advertisement named.
+    Back {
         chat_id: Option<[u8; 32]>,
     },
 }
@@ -657,7 +667,7 @@ fn run(
 
     let mut group: Option<u32> = match &setup.role {
         Role::Host => tox.new_group(&setup.group_name, &setup.self_name).ok(),
-        Role::Joiner { .. } => None,
+        Role::Joiner { .. } | Role::Back { .. } => None,
     };
     // Said as soon as there is something to say. The founder's advertisement
     // cannot name the group until this arrives, and nothing else can check the
@@ -877,6 +887,20 @@ fn run(
                     if matches!(setup.role, Role::Host) {
                         invite_pending(&mut tox, group, &friends, &connected, &mut invited, &trouble);
                     }
+                    // `D-037`: a member offers the group to the founder whose
+                    // friendship has just come up -- a founder that restarted
+                    // has the same key and no group. A founder still in the
+                    // group refuses the offer (it holds one), so a link that
+                    // merely flapped costs one refused invitation.
+                    if let (Role::Joiner { founder, .. }, Some(g)) = (&setup.role, group) {
+                        if self_joined && friends.get(&friend) == Some(founder) {
+                            invited.retain(|f| *f != friend);
+                            if tox.invite(g, friend).is_ok() {
+                                invited.push(friend);
+                                trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
                 Event::FriendConnection { friend, .. } => {
                     // Down. The invitation is forgotten so that a peer which
@@ -895,6 +919,10 @@ fn run(
                         (Role::Joiner { founder, chat_id }, Some(key)) if key == founder => {
                             *chat_id
                         }
+                        // `D-037`: the founder back after a restart takes any
+                        // roster member's invitation -- every friend it has is
+                        // one -- into the group it advertised and no other.
+                        (Role::Back { chat_id }, Some(_)) => *chat_id,
                         _ => None,
                     };
                     // Refused outright when the advertisement named no group:
@@ -1116,6 +1144,25 @@ fn run(
                     }
                 }
             }
+            // `D-037`: and every sweep while the founder's friendship is up and
+            // its key is not a confirmed member, the group is offered again --
+            // bounded by `invited`, which the founder's down-edge clears. The
+            // up-edge above is the immediate case; this is what makes it
+            // certain, as `invite_pending` is for the founder's own invitations.
+            if let (Role::Joiner { founder, .. }, Some(g)) = (&setup.role, group) {
+                if self_joined {
+                    if let Some(n) = friends.iter().find(|(_, k)| *k == founder).map(|(n, _)| *n) {
+                        let absent = !peer_for(&tox, g, founder, &known_as)
+                            .is_some_and(|p| confirmed.contains(&p));
+                        if absent && connected.contains(&n) && !invited.contains(&n) {
+                            if tox.invite(g, n).is_ok() {
+                                invited.push(n);
+                                trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
             trouble
                 .confirmed_peers
                 .store(confirmed.len() as u64, Ordering::Relaxed);
@@ -1126,6 +1173,12 @@ fn run(
                         .iter()
                         .find(|(_, k)| *k == founder)
                         .map(|(n, _)| tox.friend_connection(*n).max(0) as u64)
+                        .unwrap_or(0),
+                    // `D-037`: no founder to reach; the best member link stands in.
+                    Role::Back { .. } => friends
+                        .iter()
+                        .map(|(n, _)| tox.friend_connection(*n).max(0) as u64)
+                        .max()
                         .unwrap_or(0),
                 },
                 Ordering::Relaxed,
@@ -1201,7 +1254,7 @@ fn run(
             if !self_joined
                 && group.is_some()
                 && can_be_invited
-                && matches!(setup.role, Role::Joiner { .. })
+                && matches!(setup.role, Role::Joiner { .. } | Role::Back { .. })
             {
                 if let Some(since) = accepted_at {
                     if since.elapsed() >= JOIN_GRACE && rejoins < MAX_REJOINS {

@@ -78,6 +78,10 @@ pub struct HandInProgress {
     pub hand_id: u64,
     pub button: u8,
     pub dealt_in: Vec<u8>,
+    /// `S1-DG`: every stack as the hand began -- what a hand ended without a
+    /// settlement restores. The last boundary's figures, taken when the hand
+    /// began; the table's own reports move `last_stacks` during the hand.
+    pub start_stacks: Vec<u64>,
     /// The seat whose turn it is to shuffle, while the chain is running.
     pub shuffling: Option<u8>,
     /// Whether the chain has closed and the deck is final.
@@ -524,6 +528,7 @@ impl AppState {
                     hand_id,
                     button,
                     dealt_in,
+                    start_stacks: self.last_stacks.clone(),
                     // `HAND_INIT` completing is what starts the chain, so at
                     // this instant nobody has shuffled yet. The first
                     // `DeckProgress` names the seat that is up.
@@ -655,19 +660,40 @@ impl AppState {
                 stacks,
                 shown,
             } => {
+                // `S1-DG`: a hand that ended without a settlement -- the
+                // deadline, a certificate -- restores every stack to the
+                // hand's start, and the engine reports no stacks for it. Those
+                // are the stacks this window held at the last boundary; taking
+                // the empty list showed every seat's buy-in until the next
+                // deal.
+                let restored = stacks.is_empty();
+                let stacks = if restored {
+                    self.hand
+                        .as_ref()
+                        .filter(|h| h.hand_id == hand_id && !h.start_stacks.is_empty())
+                        .map(|h| h.start_stacks.clone())
+                        .unwrap_or_else(|| self.last_stacks.clone())
+                } else {
+                    stacks
+                };
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
                     // `S1-CS`: what each seat gained is the settlement's figure
                     // over the engine's last one -- what the chips fly with.
+                    // Nothing flies to anybody when every stack was restored.
                     let before: &[u64] = if h.stacks_now.is_empty() {
                         &self.last_stacks
                     } else {
                         &h.stacks_now
                     };
-                    let won: Vec<u64> = stacks
-                        .iter()
-                        .enumerate()
-                        .map(|(i, s)| s.saturating_sub(before.get(i).copied().unwrap_or(*s)))
-                        .collect();
+                    let won: Vec<u64> = if restored {
+                        vec![0; stacks.len()]
+                    } else {
+                        stacks
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| s.saturating_sub(before.get(i).copied().unwrap_or(*s)))
+                            .collect()
+                    };
                     h.won = won;
                     h.stacks = stacks.clone();
                     h.shown = shown;
@@ -840,8 +866,12 @@ impl AppState {
                 if self.joining.as_ref().is_some_and(|j| j.key == key) {
                     self.joining = None;
                 }
-                self.table(key).seat = Some(seat);
-                self.note(format!("seat {seat} at {}", short(&key)));
+                // `S1-DG`: said with every roster now; noted when it changes.
+                let t = self.table(key);
+                if t.seat != Some(seat) {
+                    t.seat = Some(seat);
+                    self.note(format!("seat {seat} at {}", short(&key)));
+                }
             }
             NodeEvent::Roster { key, seats } => {
                 let n = seats.len();
@@ -866,8 +896,15 @@ impl AppState {
                 t.action_ms = action_ms;
             }
             NodeEvent::TableReal { key, session } => {
-                self.table(key).session = Some(session);
-                self.note(format!("the table is set: session {}", short(&session)));
+                // Said once per session: a seat back from a restart hears the
+                // table set again with every ratification copy the members
+                // answer with, and the log read *the table is set* twenty
+                // times over (`run163147-3`).
+                let t = self.table(key);
+                if t.session != Some(session) {
+                    t.session = Some(session);
+                    self.note(format!("the table is set: session {}", short(&session)));
+                }
             }
             NodeEvent::JoinRefused { reason } => {
                 // The founder's claim, said as a claim. A rejection is never

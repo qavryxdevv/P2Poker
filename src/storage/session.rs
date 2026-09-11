@@ -17,7 +17,9 @@
 //! question *rejoin table X, seat N, stack S?*; and when it was written.
 //!
 //! **When it is written and when it goes.** Written at every hand boundary by
-//! the node, and at the moment the table is set. Removed when the session ends
+//! the node, and at the moment the table is set -- for a seat that joined and,
+//! since `D-037`, for the founder too, whose record carries the table key's
+//! seed and its last signed roster so that it can come back as the founder. Removed when the session ends
 //! for this seat — it left by its own choice, the table closed, the tournament
 //! is over — and when a rejoin learns the session is gone. It is never removed
 //! by a crash, which is the whole point.
@@ -37,7 +39,7 @@ use crate::protocol::constants::{RESUME_GIVE_UP_MS, RESUME_RECORD_MAX_AGE_MS};
 
 /// The record's own version, so a later shape can refuse an older one rather
 /// than misread it.
-pub const RECORD_VERSION: u8 = 3;
+pub const RECORD_VERSION: u8 = 4;
 
 /// An unfinished session, as the node last knew it.
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -87,6 +89,16 @@ pub struct Record {
     /// `D-033`: the hand `hand_secret` belongs to; 0 when none is kept.
     #[n(15)]
     pub secret_hand_id: u64,
+    /// `D-037`: the table key's seed when this is the founder's record -- the
+    /// founder signs the roster again after its return. All zero for a seat
+    /// that joined. Version 4 of the record.
+    #[cbor(n(16), with = "minicbor::bytes")]
+    pub founder_seed: [u8; 32],
+    /// `D-037`: the founder's last signed `PLAYER_LIST`, verbatim, so the
+    /// roster is rebuilt from the founder's own word and checked against the
+    /// table key like any list. Empty for a seat that joined.
+    #[n(17)]
+    pub roster_list: Vec<u8>,
 }
 
 pub fn session_path(dir: &Path) -> PathBuf {
@@ -193,6 +205,8 @@ mod tests {
             ratification: vec![0xBB; 210],
             hand_secret: [7; 32],
             secret_hand_id: 6,
+            founder_seed: [5; 32],
+            roster_list: vec![0xCC; 180],
         }
     }
 

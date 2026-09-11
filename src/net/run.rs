@@ -889,11 +889,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         };
         ($hand_id:expr, $terminal:expr, $stack:expr, $kept:expr) => {{
             let kept: Option<[u8; 32]> = $kept;
-            if let (Some(key), Some(ad), Some(advert_hash), Some(f)) =
-                (joined_key, joined_ad.as_ref(), joined_advert_hash, table.as_ref())
-            {
+            // `D-037`: the founder's record too -- its own table, advert and
+            // hash, with the table key's seed and its last signed roster, so
+            // that it can come back as the founder. A seat that joined records
+            // what it joined under.
+            let who = table.as_ref().and_then(|f| {
+                if f.is_founder() {
+                    Some((f.table_id(), f.ad().clone(), f.advert_hash(), f))
+                } else {
+                    Some((joined_key?, joined_ad.as_ref()?.clone(), joined_advert_hash?, f))
+                }
+            });
+            if let Some((key, ad, advert_hash, f)) = who {
                 if let (Some(session), Some(my_seat), Ok(advert)) =
-                    (f.session(), f.my_seat(), super::advert::to_body_bytes(ad))
+                    (f.session(), f.my_seat(), super::advert::to_body_bytes(&ad))
                 {
                     let record = crate::storage::session::Record {
                         version: crate::storage::session::RECORD_VERSION,
@@ -912,6 +921,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         ratification: f.my_ratification().map(<[u8]>::to_vec).unwrap_or_default(),
                         hand_secret: kept.unwrap_or([0u8; 32]),
                         secret_hand_id: if kept.is_some() { $hand_id } else { 0 },
+                        founder_seed: f.table_seed().unwrap_or([0u8; 32]),
+                        roster_list: if f.is_founder() {
+                            f.my_list().map(<[u8]>::to_vec).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        },
                     };
                     match crate::storage::session::save(&profile_dir, &record) {
                         Ok(()) => {
@@ -3864,6 +3879,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // *“asking to join”* at 63.6 s and again at 64.7 s, with
                         // the Tox warning printed twice, which is what two
                         // commands look like from the outside.
+                        // `D-037`: the founder's own record was taken up by
+                        // `ResumeSession`; the `JoinTable` the window and the
+                        // headless client send after it has nobody to ask, and
+                        // is not a fault.
+                        if resume.as_ref().is_some_and(|r| r.founder_seed != [0u8; 32] && r.table_key == key)
+                            && table.as_ref().is_some_and(|f| f.is_founder())
+                        {
+                            continue;
+                        }
                         if table.is_some() {
                             let _ = events
                                 .send(NodeEvent::Warning(
@@ -4043,6 +4067,110 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         };
                         if table.is_some() {
                             let _ = events.send(NodeEvent::Warning("already at a table; leave it before rejoining another".into())).await;
+                            continue;
+                        }
+                        // `D-037`: the founder's own record. There is no founder to
+                        // ask, so the roster is rebuilt from the list it signed, the
+                        // group is re-entered on a member's invitation, and the
+                        // session is taken up from the members' ratifications like
+                        // any returning seat's -- then the running hand is adopted
+                        // and the seat comes back by D-028 or D-031.
+                        if r.founder_seed != [0u8; 32] {
+                            let (seed, list, ratification, advert_hash, stack, hand_id) = (
+                                r.founder_seed,
+                                r.roster_list.clone(),
+                                r.ratification.clone(),
+                                r.advert_hash,
+                                r.my_stack,
+                                r.hand_id,
+                            );
+                            let ad = match super::advert::from_body_bytes(&r.advert) {
+                                Ok(ad) => ad,
+                                Err(e) => {
+                                    let _ = crate::storage::session::forget(&profile_dir);
+                                    resume = None;
+                                    let _ = events
+                                        .send(NodeEvent::SessionGaveUp { why: format!("the recorded advert does not read: {e:?}") })
+                                        .await;
+                                    continue;
+                                }
+                            };
+                            let now = super::node::now_unix_ms();
+                            // The members' Tox keys, from the founder's own list:
+                            // the friendships a member's invitation rides on.
+                            let members: Vec<[u8; 32]> = joinwire::receive_player_list_at(&list)
+                                .map(|(l, _, _)| l.roster.iter().filter(|e| e.seat != 0).filter_map(|e| e.tox_key).collect())
+                                .unwrap_or_default();
+                            if ad.founder_tox_key.is_some() {
+                                match tox_sink.start(
+                                    &profile_dir,
+                                    super::toxsink::Role::Back { chat_id: ad.tox_chat_id },
+                                    &ad.table_name,
+                                    &nickname,
+                                    members,
+                                ) {
+                                    Ok(_) => {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "this table's traffic is on a Tox group, {}; waiting for a member to offer it again",
+                                                ad.tox_chat_id.map(|c| short_hash(&c)).unwrap_or_else(|| "unnamed".into())
+                                            )))
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!("no Tox for this table ({e}); the hand will not reach it")))
+                                            .await;
+                                    }
+                                }
+                            }
+                            match Formation::found_back(
+                                app_key.clone(),
+                                seed,
+                                ad.clone(),
+                                advert_hash,
+                                &list,
+                                (!ratification.is_empty()).then(|| ratification.clone()),
+                                now,
+                            ) {
+                                Ok((f, sends)) => {
+                                    let key = f.table_id();
+                                    let topic = joinrpc::table_topic(&key);
+                                    let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                                    table_topic = Some(topic.clone());
+                                    table = Some(f);
+                                    // A table that is set is not advertised again.
+                                    ever_dealt = true;
+                                    resuming = true;
+                                    resume_since_ms = now;
+                                    resume_last_peer_ms = None;
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "rejoining {} as its founder (seat 0, stack {stack}, last at hand #{hand_id}) from the session record",
+                                            ad.table_name
+                                        )))
+                                        .await;
+                                    let _ = events.send(NodeEvent::Hosting { key }).await;
+                                    report_params(&events, table.as_ref().unwrap()).await;
+                                    report_roster(&events, table.as_ref().unwrap()).await;
+                                    if let Some(f) = table.as_ref() {
+                                        seat_on_tox(f, &tox_sink);
+                                    }
+                                    for send in sends {
+                                        if let Send::Broadcast(bytes) = send {
+                                            let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes.clone());
+                                            tox_sink.try_broadcast(&bytes);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = crate::storage::session::forget(&profile_dir);
+                                    resume = None;
+                                    let _ = events
+                                        .send(NodeEvent::SessionGaveUp { why: format!("the founder's record does not rebuild the table: {e:?}") })
+                                        .await;
+                                }
+                            }
                             continue;
                         }
                         // The recorded advert, back on offer under the hash a
@@ -4748,7 +4876,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // the record on disk is the one this client came back from,
                 // and this write replaced its hand and stack with hand #0 and
                 // the buy-in (`run202634-3`); the next boundary writes it.
-                if joined_key.is_some() && !resuming {
+                // `D-037`: the founder's record too. The gate read `joined_key`
+                // alone, so the founder wrote nothing and came back to no
+                // record (`run160631-3`).
+                let founder_here = table.as_ref().is_some_and(|f| f.is_founder());
+                if (joined_key.is_some() || founder_here) && !resuming {
                     if let Some(f) = table.as_ref() {
                         if f.session().is_some() && f.session() != recorded_session {
                             let stack = f
@@ -6925,6 +7057,21 @@ fn seat_on_tox(f: &Formation, tox: &super::toxsink::TableSink) {
 }
 
 async fn report_roster(events: &Events, f: &Formation) {
+    // `S1-DG`: the seat, whenever the roster is said and the formation knows
+    // it. A seat that came back through *already seated* learned its number
+    // from the founder's list and told the window nothing -- `Seated` went
+    // out only with a fresh acceptance -- so the window had no hero and drew
+    // the player's own cards face down while the hand's name beside them
+    // read the cards it held. Said again with every roster; the window
+    // notes it only when it changes.
+    if let Some(seat) = f.my_seat() {
+        let _ = events
+            .send(NodeEvent::Seated {
+                key: f.table_id(),
+                seat,
+            })
+            .await;
+    }
     let seats = f
         .roster()
         .seats()
