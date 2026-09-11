@@ -861,6 +861,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut carrier_reported: Option<(u64, u64)> = None;
     // `D-033`: the hand whose card material the session record holds.
     let mut material_recorded: Option<u64> = None;
+    // `D-033`: when the running hand was last said again to a seat back from a restart.
+    let mut hand_said_again_ms: u64 = 0;
+    // `D-033`: the stage the running hand is at, and since when, for the re-say above.
+    let mut stage_waiting: (u64, u64) = (u64::MAX, 0);
     // `S1-CX`: the other seat's next hand, seen while this one is still
     // inside a hand nothing was dealt in -- the hand id and the parent it
     // carries -- for the stall tick to give this hand up on, if the parent
@@ -1278,6 +1282,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .await;
                                 }
                                 publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                                // `D-033`: the hand's card material goes into the
+                                // record the moment the deck stage begins -- not on
+                                // the next tick, which a stop at the deal beat by a
+                                // second (`run110811-2`).
+                                let material = $h.secret().and_then(|s| {
+                                    if material_recorded == Some($h.hand_id()) {
+                                        return None;
+                                    }
+                                    Some(($h.hand_id(), $h.stack_at_boundary($h.my_seat()), s.keep()))
+                                });
+                                if let Some((hid, stack, kept)) = material {
+                                    material_recorded = Some(hid);
+                                    remember_session!(hid, [0; 32], stack, Some(kept));
+                                }
                                 // Outside `dealt()`: a certificate is
                                 // decided at cryptographic stages too, and
                                 // gating the report on cards being out
@@ -4174,7 +4192,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // `D-033`: and the running hand -- every frame accepted
                             // and every frame said -- so a seat back from a restart
                             // can take the hand up where it stood.
-                            if let Some(h) = hand.as_ref() {
+                            // Once a minute at most: a seat back from a restart repeats its
+                            // ratification every thirty seconds until it has dealt, and a
+                            // dealt hand is a hundred kilobytes of frames.
+                            if let Some(h) = hand.as_ref().filter(|_| now.saturating_sub(hand_said_again_ms) >= 60_000) {
+                                hand_said_again_ms = now;
                                 let hid = h.hand_id();
                                 let mut frames = 0usize;
                                 for b in h.transcript() {
@@ -5178,6 +5200,49 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 for seat in h.waiting_for() {
                     if let Some(key) = h.key_of(seat) {
                         tox_sink.nudge(key, seat);
+                    }
+                }
+                // `D-033`: a seat this hand has waited on for twenty seconds that is
+                // back on the line -- after an outage longer than the carrier's memory
+                // -- holds none of this hand's frames since; say them again, its own
+                // with them, once a minute at most.
+                if stage_waiting.0 != h.slot().sequence {
+                    stage_waiting = (h.slot().sequence, now);
+                }
+                if now.saturating_sub(stage_waiting.1) >= 20_000
+                    && now.saturating_sub(hand_said_again_ms) >= 60_000
+                {
+                    let back: Vec<u8> = h
+                        .waiting_for()
+                        .into_iter()
+                        .filter(|s| {
+                            table
+                                .as_ref()
+                                .and_then(|f| f.roster().seats().iter().find(|e| e.seat == *s).map(|e| e.peer_id.clone()))
+                                .and_then(|b| libp2p::PeerId::from_bytes(&b).ok())
+                                .and_then(|p| alive.get(&p).copied())
+                                .is_some_and(|(at, rtt)| rtt.is_some() && at.elapsed() < std::time::Duration::from_secs(15))
+                        })
+                        .collect();
+                    if !back.is_empty() {
+                        hand_said_again_ms = now;
+                        let hid = h.hand_id();
+                        let mut frames = 0usize;
+                        for b in h.transcript() {
+                            tox_sink.try_broadcast(b);
+                            frames += 1;
+                        }
+                        for b in said.iter() {
+                            if crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok().map(|(_, x, _)| x) == Some(hid) {
+                                tox_sink.try_broadcast(b);
+                                frames += 1;
+                            }
+                        }
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "hand #{hid} has waited on seat(s) {back:?} that are back on the line: said its {frames} frame(s) again (D-033)"
+                            )))
+                            .await;
                     }
                 }
 
@@ -6871,7 +6936,13 @@ fn new_table(
     use crate::protocol::constants::hand_deadline_min_ms;
 
     let seats = seats.clamp(2, MAX_SEATS);
-    let (action, grace, crypto, delay) = (20_000u32, 5_000u32, 30_000u32, 7_000u32);
+    // `D-034`: thirty seconds to decide, three for the network, no reserve.
+    let (action, grace, crypto, delay) = (
+        crate::protocol::constants::DECISION_MS,
+        crate::protocol::constants::DECISION_GRACE_MS,
+        30_000u32,
+        7_000u32,
+    );
     TableAd {
         game: 1,
         mode: 1,
@@ -6913,9 +6984,10 @@ fn new_table(
             grace as u64,
             crypto as u64,
             delay as u64,
-            crate::protocol::constants::default_time_bank_ms(seats) as u64,
+            0,
         ) as u32,
-        time_bank_ms: crate::protocol::constants::default_time_bank_ms(seats),
+        // `D-034`: no reserve; the fold follows the thirty seconds and the grace.
+        time_bank_ms: 0,
         join_deadline_ms: 120_000,
         hand_delay_ms: delay,
         button_rule: 1,

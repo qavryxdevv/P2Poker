@@ -150,6 +150,8 @@ pub struct TableView {
     /// `D-032`: the opponent's fourth absence; the game ends here, and the
     /// one thing left to do is leave.
     pub opponent_out: bool,
+    /// `D-034`: the opponent is on the line but long past their time to decide.
+    pub opponent_slow: bool,
 }
 
 /// The smallest table window the client allows, which every row of the
@@ -357,14 +359,24 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
     if let Some(secs) = view.opponent_gone_s {
         // `D-032`: the fourth absence is final -- no waiting is offered.
         let out = view.opponent_out;
-        let title = if out { "Opponent is out" } else { "Opponent disconnected" };
+        let title = if out {
+            "Opponent is out"
+        } else if view.opponent_slow {
+            "Opponent is taking too long"
+        } else {
+            "Opponent disconnected"
+        };
         egui::Window::new(RichText::new(title).size(19.0).strong())
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ui.ctx(), |ui| {
                 ui.set_min_width(360.0);
-                ui.label(format!("Your opponent has been unreachable for {secs} s."));
+                if view.opponent_slow {
+                    ui.label(format!("Your opponent has been on the clock for {secs} s past their time to decide."));
+                } else {
+                    ui.label(format!("Your opponent has been unreachable for {secs} s."));
+                }
                 if out {
                     ui.label(
                         RichText::new("That is their fourth absence. Three returns are the limit: the game ends here.")
@@ -1007,6 +1019,7 @@ impl TableView {
             chat: Vec::new(),
             opponent_gone_s: None,
             opponent_out: false,
+            opponent_slow: false,
         }
     }
 }

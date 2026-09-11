@@ -310,6 +310,10 @@ pub struct OpponentGone {
     pub since: std::time::Instant,
     pub said: bool,
     pub dismissed: bool,
+    /// `D-034`: the opponent is on the line but long past their time to
+    /// decide -- D-007's other case, asked about with the same question and
+    /// said as what it is. Ends when they act; no absence and no return.
+    pub slow: bool,
 }
 
 /// How long an opponent must be unreachable before it is said: longer
@@ -933,7 +937,7 @@ impl AppState {
             if self
                 .opponent_gone
                 .take()
-                .is_some_and(|g| g.since.elapsed().as_millis() as u64 >= OPPONENT_GONE_MS)
+                .is_some_and(|g| !g.slow && g.since.elapsed().as_millis() as u64 >= OPPONENT_GONE_MS)
             {
                 self.opponent_returns = self.opponent_returns.saturating_add(1);
                 self.note(format!(
@@ -947,6 +951,7 @@ impl AppState {
                 since: std::time::Instant::now(),
                 said: false,
                 dismissed: false,
+                slow: false,
             });
         }
     }
@@ -954,6 +959,31 @@ impl AppState {
     /// Called every frame and on every sweep: an opponent unreachable for
     /// `OPPONENT_GONE_MS` is said once, in D-007's words.
     pub fn tick_opponent(&mut self) {
+        // `D-034`: a present opponent long past their time to decide is asked
+        // about too -- heads-up nobody can fold for them (D-007), and the
+        // question is the same. The episode ends when they act.
+        if let (Some(opponent), Some(since), Some(allowance)) = (
+            self.heads_up_opponent(),
+            self.turn_since,
+            self.seated.as_ref().map(|s| s.action_ms),
+        ) {
+            let past = since.elapsed().as_millis() as u64;
+            if self.turn_seat == Some(opponent)
+                && allowance > 0
+                && past > allowance + OPPONENT_GONE_MS
+                && self.opponent_gone.is_none()
+                && !self.opponent_out
+            {
+                self.opponent_gone = Some(OpponentGone {
+                    since: std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_millis(OPPONENT_GONE_MS))
+                        .unwrap_or_else(std::time::Instant::now),
+                    said: false,
+                    dismissed: false,
+                    slow: true,
+                });
+            }
+        }
         // A link reading gone stale is an opponent this client cannot reach,
         // whether or not the connection was ever seen to close.
         if let Some(opponent) = self.heads_up_opponent() {
@@ -982,6 +1012,12 @@ impl AppState {
                     "your opponent has been unreachable for {secs} s, for the {}th time; {} returns are the limit (D-032): the game ends here -- leave the table",
                     self.opponent_returns + 1,
                     crate::protocol::constants::MAX_RETURNS
+                ));
+            } else if self.opponent_gone.as_ref().is_some_and(|g| g.slow) {
+                let past = self.turn_since.map(|t| t.elapsed().as_secs()).unwrap_or(secs);
+                let allowance = self.seated.as_ref().map(|s| s.action_ms / 1_000).unwrap_or(0);
+                self.note(format!(
+                    "your opponent has been on the clock for {past} s, past their {allowance} s to decide; heads-up, nobody can fold a hand for them (D-007): wait for them, or leave the table"
                 ));
             } else {
                 self.note(format!(
@@ -1049,6 +1085,10 @@ impl AppState {
         if seat != self.turn_seat {
             self.turn_seat = seat;
             self.turn_since = seat.map(|_| std::time::Instant::now());
+            // `D-034`: the slow opponent acted; the question is withdrawn.
+            if self.opponent_gone.as_ref().is_some_and(|g| g.slow) {
+                self.opponent_gone = None;
+            }
         }
     }
 
@@ -1647,5 +1687,47 @@ mod tests {
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40) });
         assert!(s.opponent_out, "and nothing reachable undoes it");
         assert_eq!(s.opponent_returns, MAX_RETURNS);
+    }
+
+    /// `D-034`: a present heads-up opponent long past their time to decide is
+    /// asked about with the same question, said as what it is; the episode ends
+    /// when they act, and it is no absence and no return.
+    #[test]
+    fn a_slow_heads_up_opponent_is_asked_about_and_the_question_ends_when_they_act() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::TableParams {
+            key: [7u8; 32],
+            name: "t".into(),
+            seats: 2,
+            needed: 2,
+            small_blind: 50,
+            big_blind: 100,
+            action_ms: 30_000,
+        });
+        s.clock_for(Some(1));
+        s.tick_opponent();
+        assert!(s.opponent_gone.is_none(), "inside their time, nothing is asked");
+        s.turn_since = Some(std::time::Instant::now() - std::time::Duration::from_millis(30_000 + OPPONENT_GONE_MS + 1_000));
+        s.tick_opponent();
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.slow), "past their time and the question's own wait: asked");
+        assert!(s.opponent_gone_for_s().is_some(), "and asked at once");
+        let line = s.log.back().unwrap().clone();
+        assert!(line.contains("on the clock") && line.contains("D-007"), "{line}");
+        assert!(s.table_view().opponent_gone_s.is_some());
+        // They act: the question is withdrawn, and nothing was counted.
+        s.clock_for(Some(0));
+        assert!(s.opponent_gone.is_none(), "the slow opponent acted");
+        assert_eq!(s.opponent_returns, 0, "no absence, no return");
+        // A ping while the slow question stands changes nothing either.
+        s.clock_for(Some(1));
+        s.turn_since = Some(std::time::Instant::now() - std::time::Duration::from_millis(30_000 + OPPONENT_GONE_MS + 1_000));
+        s.tick_opponent();
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.slow));
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30) });
+        assert!(s.opponent_gone.is_none(), "a reading that reaches them ends any episode");
+        assert_eq!(s.opponent_returns, 0, "but a slow one was no absence");
     }
 }

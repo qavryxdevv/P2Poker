@@ -8069,6 +8069,14 @@ MAX_RETURNS                     = 3             (client liveness, D-032: how man
   client votes for no further return of that seat, and a certificate needs
   every voter. Heads-up the other seat's client counts the absences it asked
   about, and at the fourth ends the game.)
+DECISION_MS                     = 30 000        (client liveness, D-034: how long a
+  seat at one of this client's own tables has to decide once it is its turn;
+  the window's clock runs over exactly this. The rated preset keeps its own
+  numbers.)
+DECISION_GRACE_MS               = 3 000         (client liveness, D-034: the
+  network's share on top of DECISION_MS, not the player's; the table's
+  certificate can fold a seat after the two together, and the client's own
+  tables offer no reserve beyond.)
 MAX_RETAINED_HAND_RECORDS       = 4 096         (§5.3's retained hand record, the
   per-hand (hand_id, was_solitary, p, checkpoint8_state_hash) tuple §4.0 step 10b
   evaluates a stale-hand event against, where p is P(hand_id - 1) and was_solitary

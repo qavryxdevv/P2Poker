@@ -137,6 +137,7 @@ impl AppState {
             hand_over: hand.map(|h| h.over).unwrap_or(false),
             opponent_gone_s: self.opponent_gone_for_s(),
             opponent_out: self.opponent_out,
+            opponent_slow: self.opponent_gone.as_ref().is_some_and(|g| g.slow),
             chat: self
                 .table_chat
                 .iter()

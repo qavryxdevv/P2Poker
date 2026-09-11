@@ -566,6 +566,18 @@ pub const HEADS_UP_STAGE_BUDGET_MS: u32 = 100_000;
 /// ends the game. The owner's rule, so that nobody holds a table up by
 /// dropping out again and again.
 pub const MAX_RETURNS: u8 = 3;
+
+/// `D-034`: how long a seat at one of this client's own tables has to decide,
+/// once it is its turn -- the owner's rule, thirty seconds when the client is
+/// on the line, then the forced fold. The window's clock runs over exactly
+/// this. The rated preset keeps its own numbers.
+pub const DECISION_MS: u32 = 30_000;
+
+/// `D-034`: the network's share on top of [`DECISION_MS`], not the player's --
+/// an action that left on time may arrive a moment late at the seats whose
+/// clocks would otherwise fold it. The table's certificate can fold a seat
+/// after the two together; the client's own tables offer no reserve beyond.
+pub const DECISION_GRACE_MS: u32 = 3_000;
 const _: () = assert!(HEADS_UP_STAGE_BUDGET_MS > CARRIER_GIVES_UP_MS + CARRIER_LADDER_LAST_MS);
 
 /// **The shortest stage budget a table may advertise.**
