@@ -774,7 +774,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // Set once that evidence is conclusive: `(the table's hand, this client's)`.
     // A latch, and terminal — see `note_a_hand_ahead`.
     let mut adrift: Option<(u64, u64)> = None;
-    let mut adrift_said = false;
     // Said once: this client is on a TCP relay and the group is not filling.
     let mut udp_warned = false;
     // **A checkpoint copy that arrived before this client opened its own
@@ -1522,7 +1521,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         // `S1-CR`: a resumed bystander keeps a newer hand's
                                         // frames too, so a hand it adopted and cannot follow
                                         // is abandoned for the next one at the stall tick.
-                                        if resuming && hand_id > $h.hand_id() {
+                                        // `D-038`: kept whether or not this client is resuming.
+                                        // A seat that finds itself on a hand nobody else has
+                                        // rejoins the table from these, and they are bounded --
+                                        // two hand ids, one copy per seat, `RESUME_EARLY_CAP`
+                                        // other frames -- so an ordinary table's pause skew costs
+                                        // a few frames of memory and nothing else.
+                                        if hand_id > $h.hand_id() {
                                             let _ = stash_for_resume($bytes, &mut resume_inits, &mut resume_early);
                                         }
                                         // `S1-CX`: the next hand's opening from a seat one
@@ -1830,6 +1835,64 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
         }};
     }
+    // `D-038`: this client is on a hand nobody else has -- a strict majority
+    // of the seats still in the game are two or more hands past it -- so the
+    // hand it holds will never end and every hand it would derive is its
+    // own. It used to stop here for good: `adrift` was a terminus, one line
+    // and no further hand, and the player sat at a table that had gone on
+    // without them (`run172000-3`, after a 70 s outage). Now it does what a
+    // seat back from a restart does (D-029, `S1-CR`): drops the branch,
+    // keeps the table, the group and the keys, adopts the table's running
+    // hand from the majority's copies as a bystander and asks to sit in at
+    // that hand's boundary (D-028); D-032 counts the return. Nothing of the
+    // table's rests on anything dropped here: no other seat signed a frame
+    // of the branch, or the branch would be the table.
+    macro_rules! rejoin_from_copies {
+        ($theirs:expr, $mine:expr) => {{
+            let dead: u64 = $mine;
+            let _ = events
+                .send(NodeEvent::Warning(format!(
+                    "this client is on a hand nobody else has: the table is at hand #{} and this client reached only hand #{dead}. That hand is dropped and the table's running hand is adopted from the others' copies; this seat asks to sit in at its boundary (D-038)",
+                    $theirs
+                )))
+                .await;
+            previous = None;
+            hand = None;
+            pending_repair = None;
+            give_up_for = None;
+            next_inits.clear();
+            next_early.clear();
+            resume_inits.retain(|k, _| *k > dead);
+            resume_early.retain(|(k, _)| *k > dead);
+            resume_said = None;
+            ahead.clear();
+            adrift = None;
+            frozen = None;
+            genesis_wait_said = None;
+            late_cert_said = None;
+            late_banked_for = None;
+            unsettled_abort_here = None;
+            late_settle_said = None;
+            next_hand_at = None;
+            deal_at = None;
+            return_hold = None;
+            boundary_done_for = None;
+            act_by = None;
+            stage_waiting = (u64::MAX, 0);
+            boundaries = crate::table::boundary::Boundaries::new();
+            early_checkpoints.clear();
+            early_boundary.clear();
+            crossed_for = None;
+            checkpoint_said = false;
+            purge_hand_from_said(&mut said, dead);
+            hand_reported = false;
+            deck_reported = None;
+            cards_reported = false;
+            turn_reported = None;
+            abort_reported = false;
+            resuming = true;
+        }};
+    }
     macro_rules! leave_the_table {
         () => {{
             table_closed = false;
@@ -1863,7 +1926,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             frozen = None;
             ahead.clear();
             adrift = None;
-            adrift_said = false;
             // **Its own doc says *cleared when the freeze is*, and the line
             // above clears the freeze.** Left behind, the next table's first
             // freeze would be silent — the one state that stops a client
@@ -4891,6 +4953,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                // `D-038`: a hand nobody else has, still waiting at some stage,
+                // never arms `next_hand_at`, so the latch is read here as well.
+                if let Some((theirs, mine)) = adrift {
+                    rejoin_from_copies!(theirs, mine);
+                }
                 // `S1-CR`: a resumed bystander whose adopted hand did not follow --
                 // the table has moved on to a hand it holds a majority of copies
                 // for -- abandons it and adopts again; the hand it had was never
@@ -4899,15 +4966,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let stuck = hand.as_ref().and_then(|h| {
                         let me = h.my_seat();
                         let bystander = !h.required().contains(&me) && !h.returned().contains(&me);
-                        // `S1-CX`: heads-up, a member's adopted hand in which nothing
-                        // was dealt is abandoned for a newer hand the other seat has
-                        // opened -- that seat is the whole table, and it has moved on
-                        // (`run085603-2`: the returning seat sat in a hand the survivor
-                        // had given up, while the survivor opened four more).
-                        let undealt_heads_up = table.as_ref().is_some_and(|f| f.roster().len() == 2)
-                            && h.street().is_none()
-                            && !h.over();
-                        (bystander || undealt_heads_up).then_some(h.hand_id())
+                        // `S1-CX`: a member's adopted hand in which nothing was dealt
+                        // is abandoned for a newer hand a majority has opened -- the
+                        // table has moved on (`run085603-2`: the returning seat sat in
+                        // a hand the survivor had given up, while the survivor opened
+                        // four more). Heads-up before `D-039`, any size since: a seat
+                        // the table deals in adopts at stage 0, and a table that gave
+                        // that hand up on its budget meanwhile has dealt on without it.
+                        let undealt = h.street().is_none() && !h.over();
+                        (bystander || undealt).then_some(h.hand_id())
                     });
                     if let (Some(current), Some(f)) = (stuck, table.as_ref()) {
                         let occupied = f.roster().len();
@@ -5089,22 +5156,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let pick = resume_inits
                                 .iter()
                                 .rev()
-                                .find(|(hid, copies)| {
-                                    copies.len() * 2 > occupied.saturating_sub(1)
-                                        && (heads_up
-                                            || copies.len() >= occupied
-                                            || resume_early.iter().any(|(h, _)| h == *hid))
-                                })
+                                .find(|(_, copies)| copies.len() * 2 > occupied.saturating_sub(1))
                                 .map(|(h, c)| (*h, c.clone()));
                             if let Some((hid, copies)) = pick {
+                                // `D-039`: whether the set that signed is exact is asked
+                                // after the adoption, which reads the table's own word on
+                                // who is dealt in. A seat the table deals in signs the hand
+                                // as a member whatever stage 0 is at -- its copy may be the
+                                // one the table is waiting for. A bystander still needs
+                                // stage 0 closed elsewhere (every copy in, or a later frame
+                                // seen), because it follows the signers' set and nobody
+                                // waits for it.
+                                let exact = heads_up
+                                    || copies.len() >= occupied
+                                    || resume_early.iter().any(|(h, _)| *h == hid);
                                 if let Some(base) = crate::table::hand::Opening::from_formation(f, hid) {
                                     let now = super::node::now_unix_ms();
-                                    match crate::table::hand::Opening::adopt(base, &copies) {
-                                        Ok(mut o) => {
+                                    match crate::table::hand::Opening::adopt_with_signers(base, &copies) {
+                                        Ok((mut o, signers)) => {
                                             // `D-033`: a copy of this seat's own opening among
                                             // the table's means the previous life signed this
                                             // hand: it is taken up where it stood, not opened anew.
-                                            let signed_before = o.required.contains(&o.my_seat);
+                                            let signed_before = signers.contains(&o.my_seat);
                                             let kept: Option<[u8; 32]> = resume
                                                 .as_ref()
                                                 .filter(|r| r.secret_hand_id == hid && r.hand_secret != [0u8; 32])
@@ -5129,7 +5202,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // A member's opening goes out; a bystander's
                                             // `open` says nothing the table may hear.
                                             let member = o.required.contains(&seat);
-                                            let opened = if signed_before {
+                                            let opened = if !member && !exact {
+                                                Err(crate::table::hand::Failed::NotYet)
+                                            } else if signed_before {
                                                 crate::table::hand::Hand::open_restoring(o, &app_key, now, deadline, kept.as_ref())
                                                     .map(|h| (h, Vec::new()))
                                             } else {
@@ -5141,10 +5216,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         publish_hand(opening_sends, &mut swarm, &mut said, &tox_sink);
                                                     }
                                                     for c in &copies {
-                                                        if let Err(e) = h.on_event(c, &app_key, now) {
-                                                            let _ = events
-                                                                .send(NodeEvent::Warning(format!("the adopted hand #{hid} refused one of its copies: {e}")))
-                                                                .await;
+                                                        match h.on_event(c, &app_key, now) {
+                                                            // `D-039`: a member's stage 0 may close on the last
+                                                            // copy, and what the hand then owes the next stage
+                                                            // comes out here. Dropped, seat 3 of `run182312-4`
+                                                            // never said its deck contribution and was certified
+                                                            // out of the hand it had just been dealt into, while
+                                                            // seat 1, whose stage 0 closed on a frame that came
+                                                            // through the ordinary road, played on. A restored hand
+                                                            // (D-033) says its part from `restore_done` below.
+                                                            Ok(sends) if member && !signed_before => {
+                                                                publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                                                            }
+                                                            Ok(_) => {}
+                                                            Err(e) => {
+                                                                let _ = events
+                                                                    .send(NodeEvent::Warning(format!("the adopted hand #{hid} refused one of its copies: {e}")))
+                                                                    .await;
+                                                            }
                                                         }
                                                     }
                                                     let carried: Vec<Vec<u8>> = resume_early
@@ -5217,6 +5306,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     abort_reported = false;
                                                     resume_said = None;
                                                 }
+                                                Err(crate::table::hand::Failed::NotYet) => {
+                                                    if resume_said != Some(hid) {
+                                                        resume_said = Some(hid);
+                                                        let _ = events
+                                                            .send(NodeEvent::Warning(format!(
+                                                                "hand #{hid}: {} copies, and they do not deal this seat in; stage 0 is still open there, so this seat follows once it closes or takes the next hand (D-039)",
+                                                                copies.len()
+                                                            )))
+                                                            .await;
+                                                    }
+                                                }
                                                 Err(e) => {
                                                     if resume_said != Some(hid) {
                                                         resume_said = Some(hid);
@@ -5280,16 +5380,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         pending_repair = Some(o);
                     } else if adrift.is_none() {
                         // **And when this client has latched itself out the
-                        // repair is dropped, deliberately but until now
-                        // silently.** The arm above keeps a repair through a
-                        // freeze and says so; this one takes it and lets it go,
-                        // which is right today because a latched client deals
-                        // no further hand and the latch is a terminus by
-                        // design. It is written down because it stops being
-                        // harmless the moment the latch becomes reachable from
-                        // inside a running hand — which is what `S1-BW` and
-                        // `S1-CD` are both asking for, and it would arm the
-                        // gate that discards the repair (`S1-CE`).
+                        // repair is dropped, deliberately.** The arm above
+                        // keeps a repair through a freeze and says so; this
+                        // one lets it go, because a latched client is about to
+                        // drop the branch the repair is for and rejoin from the
+                        // table's copies (`D-038`), which is the repair.
                         let reopened = reopen_hand(
                             o,
                             &mut hand,
@@ -6128,15 +6223,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // Withholding it helps nobody and blocks everybody, and the
                 // seat is going to stop dealing either way — which is all the
                 // latch was ever for.
+                //
+                // `D-038`: and it is no longer a terminus. The checkpoint above
+                // has gone out, so the others are not held up; this client
+                // drops its branch and rejoins from the table's copies.
                 if let Some((theirs, mine)) = adrift {
-                    if !adrift_said {
-                        adrift_said = true;
-                        let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "this client is out: the table is at hand {theirs} and this client reached only {mine}, so it has been dealing a hand nobody else has. No further hand is dealt here — but hand {mine}'s checkpoint has gone out, so the others are not held up by this."
-                            )))
-                            .await;
-                    }
+                    rejoin_from_copies!(theirs, mine);
                     continue;
                 }
 
@@ -6167,7 +6259,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     genesis_wait_said = Some(h.hand_id());
                                     let _ = events
                                         .send(NodeEvent::Warning(format!(
-                                            "hand #{} ended with no peer at its genesis: seat(s) {:?} hold {} and this client holds {} with {:?} counted; hand #{} is not dealt here until a certificate about hand #{} repairs it",
+                                            "hand #{} ended with no peer at its genesis: seat(s) {:?} hold {} and this client holds {} with {:?} counted; hand #{} is not dealt here until a certificate about hand #{} repairs it, or the table is two hands on and this seat rejoins it (D-038)",
                                             h.hand_id(),
                                             seats,
                                             short_hash(&g),
@@ -7723,6 +7815,21 @@ fn stop_at_open_due() -> bool {
     }
 }
 
+/// fault-harness: whether `P2P_POKER_STOP_AT_HAND` names the hand whose open
+/// this is. Read once; `false` in every build without the feature.
+fn stop_at_hand_due(hand_id: u64) -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let at = AT.get_or_init(|| {
+        std::env::var("P2P_POKER_STOP_AT_HAND")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    *at == Some(hand_id)
+}
+
 /// fault-harness: whether `P2P_POKER_STOP_ON_TURN_AFTER` names a second this
 /// loop has reached. Read once; `false` in every build without the feature.
 fn stop_on_turn_due(since: tokio::time::Instant) -> bool {
@@ -8076,6 +8183,14 @@ async fn begin_hand_with(
             // is what the two-seat rule and the give-up convergence are about.
             if stop_at_open_due() {
                 println!("fault-harness: stopping at the open of hand #{}, as P2P_POKER_STOP_AT_OPEN_AFTER asked", h.hand_id());
+                std::process::exit(0);
+            }
+            // `P2P_POKER_STOP_AT_HAND=<k>`: the same stop keyed on the hand
+            // number, so that several processes stop at the SAME hand --
+            // a second counted from each process's own start straddles
+            // their clocks when a hand opens near it (`run180731-4`).
+            if stop_at_hand_due(h.hand_id()) {
+                println!("fault-harness: stopping at the open of hand #{}, as P2P_POKER_STOP_AT_HAND asked", h.hand_id());
                 std::process::exit(0);
             }
             *hand = Some(h);
@@ -8671,17 +8786,23 @@ fn short_hash(h: &[u8; 32]) -> String {
 /// half by certifying the seat away. This is the other half: **the client takes
 /// itself out** instead of dealing a private tournament for the rest of the run.
 ///
-/// **Two seats, because one is not evidence.** Each `Holding::AnotherHand`
-/// carries a signature this hand has already verified against this table, so a
-/// roster seat naming a hand this client has not reached is that seat's own word
-/// that it is elsewhere. One seat could be mistaken or hostile; two independent
-/// ones cannot both be, and it is the same floor §4.9 puts on a reconciliation
-/// round for the same reason.
+/// **A strict majority of the seats still in the game, because two is not the
+/// table.** Each `Holding::AnotherHand` carries a signature this hand has
+/// already verified against this table, so a roster seat naming a hand this
+/// client has not reached is that seat's own word that it is elsewhere. Two
+/// seats used to be the floor, and two seats on a private branch of their own
+/// -- aborting their way through hands nobody deals -- latched six healthy
+/// seats out of a table of nine (`split111706-9`: `n0` at hand 6, `n6` at 3,
+/// the six at hand 1 for the rest of the run). The table is wherever a strict
+/// majority of the seats still in the game are, counted against this client's
+/// own `required` and `returned` sets and nobody else: a seat certified out
+/// that goes on dealing alone is not evidence of anything.
 ///
-/// **Terminal, deliberately.** Nothing here can catch up: the openings of the
-/// hands in between were derived from settlements this client never saw, and no
-/// message carries one (`S1-Q`, closed by scope). Latching is therefore honest
-/// where a retry would not be.
+/// **A return, not a terminus (`D-038`).** Nothing here can catch up on its
+/// own -- the openings of the hands in between were derived from settlements
+/// this client never saw -- but the table's copies of its running hand are
+/// evidence enough to adopt it (`S1-CR`), and the latch now hands over to
+/// `rejoin_from_copies!`.
 fn note_a_hand_ahead(
     h: &crate::table::hand::Hand,
     hand_id: u64,
@@ -8701,7 +8822,16 @@ fn note_a_hand_ahead(
     if adrift.is_some() {
         return;
     }
-    if let Some(out) = adrift_now(mine, ahead) {
+    let me = h.my_seat();
+    let others: std::collections::BTreeSet<u8> = h
+        .required()
+        .iter()
+        .chain(h.returned().iter())
+        .copied()
+        .filter(|s| *s != me)
+        .collect();
+    let others: Vec<u8> = others.into_iter().collect();
+    if let Some(out) = adrift_now(mine, ahead, &others) {
         *adrift = Some(out);
     }
 }
@@ -8711,13 +8841,18 @@ fn note_a_hand_ahead(
 /// `note_a_hand_ahead` needs a whole `Hand` and a live table to be called; this
 /// is the part that decides, and a test that had to rebuild the caller would
 /// end up restating the rule instead of checking it.
-fn adrift_now(mine: u64, ahead: &std::collections::HashMap<u8, u64>) -> Option<(u64, u64)> {
-    let saying: Vec<u64> = ahead.values().copied().filter(|k| *k > mine).collect();
+fn adrift_now(mine: u64, ahead: &std::collections::HashMap<u8, u64>, others: &[u8]) -> Option<(u64, u64)> {
+    // **A majority of the others, and two hands each.** One hand of margin is
+    // what a table looks like while somebody is still inside `Ended::pause`;
+    // a seat outside `others` is not in the game as this client knows it, and
+    // its word about where the table is counts for nothing.
+    let saying: Vec<u64> = others
+        .iter()
+        .filter_map(|s| ahead.get(s).copied())
+        .filter(|k| *k >= mine.saturating_add(ADRIFT_MARGIN))
+        .collect();
     let furthest = saying.iter().copied().max()?;
-    // **Two seats, and two hands.** One seat running ahead is that peer's
-    // problem; one hand of margin is what a table looks like while somebody is
-    // still inside `Ended::pause`.
-    (saying.len() >= 2 && furthest >= mine + ADRIFT_MARGIN).then_some((furthest, mine))
+    (saying.len() * 2 > others.len()).then_some((furthest, mine))
 }
 
 /// How many hands ahead the table must be before this client calls itself out.
@@ -8744,6 +8879,8 @@ fn adrift_now(mine: u64, ahead: &std::collections::HashMap<u8, u64>) -> Option<(
 /// behind and will catch up emits into a hand everybody else already finished,
 /// which is late rather than divergent. §8.3's timeout certificate removes a
 /// seat that really has stopped, and it does not need this to fire first.
+/// And two hands is also the margin at which the table has demonstrably dealt
+/// on without this seat, which is what `D-038`'s return rests on.
 const ADRIFT_MARGIN: u64 = 2;
 
 /// T47: hand `k+1`'s `HAND_INIT` stage has completed, so hand `k`'s checkpoint
@@ -10472,34 +10609,75 @@ mod tests {
         let at = |pairs: &[(u8, u64)]| -> HashMap<u8, u64> {
             pairs.iter().copied().collect()
         };
+        let three = [1u8, 2, 3];
+        let two = [1u8, 2];
 
         // Three seats, one hand ahead: the showdown-pause skew, and the shape of
         // thirty-six of the thirty-seven real evictions.
         assert_eq!(
-            adrift_now(mine, &at(&[(1, mine + 1), (2, mine + 1), (3, mine + 1)])),
+            adrift_now(mine, &at(&[(1, mine + 1), (2, mine + 1), (3, mine + 1)]), &three),
             None,
             "three seats one hand ahead is a pause, not a divergence"
         );
 
         // Two hands is past any pause.
         assert_eq!(
-            adrift_now(mine, &at(&[(1, mine + 2), (2, mine + 2)])),
+            adrift_now(mine, &at(&[(1, mine + 2), (2, mine + 2)]), &two),
             Some((mine + 2, mine)),
             "two hands behind is adrift"
         );
 
         // The one true positive on record: five hands, run212350-4.
         assert_eq!(
-            adrift_now(6, &at(&[(1, 11), (2, 11), (3, 10)])),
+            adrift_now(6, &at(&[(1, 11), (2, 11), (3, 10)]), &three),
             Some((11, 6)),
             "the case this mechanism exists for still fires"
         );
 
-        // One seat is never the table, whatever the margin.
-        assert_eq!(adrift_now(mine, &at(&[(1, mine + 9)])), None, "one seat is not the table");
+        // One seat of two is never the table, whatever the margin.
+        assert_eq!(adrift_now(mine, &at(&[(1, mine + 9)]), &two), None, "one seat of two is not the table");
 
         // And a table nobody is ahead of says nothing.
-        assert_eq!(adrift_now(mine, &at(&[(1, mine), (2, mine - 1)])), None);
+        assert_eq!(adrift_now(mine, &at(&[(1, mine), (2, mine - 1)]), &two), None);
+    }
+
+    /// **`D-038`: two seats are not the table, a strict majority of the seats
+    /// still in the game is.** `split111706-9` had two seats aborting their way
+    /// through hands nobody dealt, and six healthy seats latched themselves out
+    /// on their word. Broken deliberately: with the old `>= 2` rule the first
+    /// assertion fails.
+    #[test]
+    fn a_minority_two_hands_ahead_is_not_the_table_and_a_majority_is() {
+        use std::collections::HashMap;
+        let mine = 1u64;
+        let at = |pairs: &[(u8, u64)]| -> HashMap<u8, u64> {
+            pairs.iter().copied().collect()
+        };
+        let eight: Vec<u8> = (1u8..=8).collect();
+
+        // Two of eight, five and two hands on: a private branch, not the table.
+        assert_eq!(adrift_now(mine, &at(&[(1, 6), (6, 3)]), &eight), None, "two of eight is a minority");
+        // Four of eight is not a strict majority either.
+        assert_eq!(adrift_now(mine, &at(&[(1, 3), (2, 3), (3, 3), (4, 3)]), &eight), None, "four of eight is half");
+        // Five of eight, two hands on, is the table gone on without this seat.
+        assert_eq!(
+            adrift_now(mine, &at(&[(1, 3), (2, 3), (3, 3), (4, 3), (5, 4)]), &eight),
+            Some((4, mine)),
+            "five of eight two hands on is the table"
+        );
+        // A seat that is one hand on does not count towards the majority.
+        assert_eq!(
+            adrift_now(mine, &at(&[(1, 3), (2, 3), (3, 3), (4, 3), (5, 2)]), &eight),
+            None,
+            "a seat one hand on is inside the pause"
+        );
+        // A seat outside the game as this client knows it -- certified out, still
+        // dealing alone -- is not evidence, however far it has got.
+        assert_eq!(adrift_now(mine, &at(&[(9, 40), (10, 40), (11, 40)]), &eight), None, "strangers are not the table");
+        // Heads-up the one other seat is the whole table.
+        assert_eq!(adrift_now(mine, &at(&[(1, 3)]), &[1u8]), Some((3, mine)), "heads-up the other seat is the table");
+        // And with nobody else in the game there is no table to be behind.
+        assert_eq!(adrift_now(mine, &at(&[(1, 3)]), &[]), None);
     }
 
     /// **And IPv6, on the same port, on both transports.**

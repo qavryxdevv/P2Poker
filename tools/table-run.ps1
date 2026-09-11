@@ -164,6 +164,14 @@ param(
     # a seat gone while the next hand waits at stage 0, which is the shape the
     # two-seat rule (D-031) is about. Needs a binary built with `--features fault-harness`.
     [switch]$DropAtOpen,
+    # `-DropAtHand <k>`: the droppers stop at the open of hand #k, whichever
+    # second that is, so that several of them stop at the SAME hand. `-DropAtOpen`
+    # counts seconds from each process's own start, and a hand that opens near
+    # that mark straddles their clocks: in `run180731-4` one dropper stopped at
+    # hand #1 and the other at hand #2, and the table certified them one at a
+    # time instead of facing both gone at once. `-DropAt` is not needed with it.
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateRange(0, 100000)][int]$DropAtHand = 0,
     [ValidateRange(0, 600)][int]$DropFor = 20,
     # `-DropNodes`: which joiners drop (node numbers, comma-separated). One by
     # default; several stop at the same moment -- D-036's shape, where the
@@ -300,10 +308,11 @@ for ($i = 0; $i -lt $Seats; $i++) {
     if ($leaving) { $mine = $LeaverSeconds }
     # The dropper stops at `-DropAt` and is started again below. Its own `--for`
     # is cut to the outage's start; the second half gets the rest of the run.
-    $dropping = ($DropAt -gt 0 -and $droppers -contains $i -and -not $leaving)
-    if ($dropping) { $mine = if ($DropOnTurn -or $DropAtOpen) { $DropAt + 150 } else { $DropAt } }
+    $dropping = (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $droppers -contains $i -and -not $leaving)
+    if ($dropping) { $mine = if ($DropAtHand -gt 0) { $Seconds } elseif ($DropOnTurn -or $DropAtOpen) { $DropAt + 150 } else { $DropAt } }
     $stopOnTurn = if ($dropping -and $DropOnTurn) { $DropAt } else { 0 }
     $stopAtOpen = if ($dropping -and $DropAtOpen) { $DropAt } else { 0 }
+    $stopAtHand = if ($dropping -and $DropAtHand -gt 0) { $DropAtHand } else { 0 }
     $nodeArgs = @('--headless', '--autoplay', '--for', "$mine", '--profile', $profileDir)
     if ($i -eq 0) {
         $nodeArgs += @('--host', $table, '--seats', "$Seats")
@@ -315,8 +324,8 @@ for ($i = 0; $i -lt $Seats; $i++) {
     $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
     $stall = if ($StallJoin -gt 0 -and $i -eq $StallJoinNode) { $StallJoin } else { 0 }
     $mute = if ($MuteFor -gt 0 -and $i -eq $MuteNode) { $MuteFor } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand)
         if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
         if ($downAt -gt 0) {
             $env:P2P_POKER_LINK_DOWN_AT = "$downAt"
@@ -325,6 +334,7 @@ for ($i = 0; $i -lt $Seats; $i++) {
         if ($stall -gt 0) { $env:P2P_POKER_STALL_JOIN = "$stall" }
         if ($stopOnTurn -gt 0) { $env:P2P_POKER_STOP_ON_TURN_AFTER = "$stopOnTurn" }
         if ($stopAtOpen -gt 0) { $env:P2P_POKER_STOP_AT_OPEN_AFTER = "$stopAtOpen" }
+        if ($stopAtHand -gt 0) { $env:P2P_POKER_STOP_AT_HAND = "$stopAtHand" }
         if ($mute -gt 0) {
             $env:P2P_POKER_MUTE_AT = "$muteAt"
             $env:P2P_POKER_MUTE_FOR = "$mute"
@@ -395,9 +405,16 @@ if ($MuteFor -gt 0) {
     if ($MuteFor -le 30) { Write-Host "    WARNING: under the 30 s decision deadline, so the table will not vote it out" }
     Write-Host "    (S1-BM: expect the seat certified out, then asking to sit in at the next settled boundary, then dealt in; needs --features fault-harness)"
 }
-if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
+if (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $LeaverSeconds -eq 0) {
     foreach ($dn in $droppers) {
-        if ($DropOnTurn -or $DropAtOpen) {
+        if ($DropAtHand -gt 0) {
+            Write-Host "==> n$dn stops at the open of hand #$DropAtHand and returns $DropFor s after that, same profile"
+            $null = Wait-Job -Job $jobs[$dn] -Timeout $Seconds
+            $stoppedAt = [int](((Get-Date) - $t0).TotalSeconds)
+            Write-Host "==> n$dn stopped at $stoppedAt s; back in $DropFor s"
+            $delay = $DropFor
+            $spent = $stoppedAt + $DropFor
+        } elseif ($DropOnTurn -or $DropAtOpen) {
             Write-Host "==> n$dn stops at its first $(if ($DropAtOpen) { 'hand open' } else { 'turn' }) at or after $DropAt s and returns $DropFor s after that, same profile"
             # The main thread has nothing else to do until the run ends, so it waits
             # for the dropper's process here and starts the return when it is gone.
@@ -464,7 +481,7 @@ $inv = [System.Globalization.CultureInfo]::InvariantCulture
 $logs = @()
 for ($i = 0; $i -lt $Seats; $i++) { $logs += @{ Name = "n$i"; Path = (Join-Path $work "n$i.log") } }
 if ($LeaverSeconds -gt 0) { $logs += @{ Name = 'nR'; Path = (Join-Path $work 'nR.log') } }
-if ($DropAt -gt 0 -and $LeaverSeconds -eq 0) {
+if (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $LeaverSeconds -eq 0) {
     foreach ($dn in $droppers) { $logs += @{ Name = "n$dn-again"; Path = (Join-Path $work "n$dn-again.log") } }
 }
 

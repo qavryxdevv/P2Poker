@@ -195,10 +195,21 @@ function Get-RunVerdict {
         }
 
         # -- a seat the table left behind -------------------------------------------
-        $out = @($lines | Select-String 'this client is out: the table is at hand')
+        # `D-038`: the latch is a return. A seat that latched and was back in
+        # the roster afterwards is BEHIND-REJOINED -- flagged, because the
+        # reader should know it happened -- and one that never came back is
+        # ADRIFT. The old line is kept for the logs already on disk.
+        $out = @($lines | Select-String 'this client is out: the table is at hand|this client is on a hand nobody else has')
         if ($out.Count -gt 0) {
-            $verdicts += 'ADRIFT'
-            $why += ("$($out[-1])" -replace '^\s*[\d.]+\s+', '')
+            $last = $out[-1]
+            $back = @($lines | Select-String 'back in the roster from hand' | Where-Object { $_.LineNumber -gt $last.LineNumber })
+            if ($back.Count -gt 0) {
+                $verdicts += 'BEHIND-REJOINED'
+                $why += (("$last" -replace '^\s*[\d.]+\s+', '') + '; then: ' + ("$($back[-1])" -replace '^\s*[\d.]+\s+', ''))
+            } else {
+                $verdicts += 'ADRIFT'
+                $why += ("$last" -replace '^\s*[\d.]+\s+', '')
+            }
         }
 
         if (-not $verdicts) { $verdicts += 'ok' }

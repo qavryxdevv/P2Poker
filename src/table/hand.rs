@@ -394,6 +394,28 @@ impl Opening {
     /// `base` carries what the copies do not: the table, the session, the
     /// roster's keys, this client's seat, and the advertised parameters.
     pub fn adopt(base: Opening, copies: &[Vec<u8>]) -> Result<Opening, Failed> {
+        Self::adopt_with_signers(base, copies).map(|(o, _)| o)
+    }
+
+    /// [`adopt`](Self::adopt), and the seats whose copies carried it. The node
+    /// tells a seat whose previous life signed the hand (D-033: taken up where
+    /// it stood) from one the table deals in without a copy of its own (D-039:
+    /// opened anew and said) by this, since both are in `required`.
+    ///
+    /// **`D-039`: the required set is the body's `dealt_in` joined with the
+    /// signers.** `dealt_in` is the table's own word on who plays this hand,
+    /// signed by a strict majority of the other seats, and `dealt_in ⊆ R(k)`
+    /// (§4.4); the signers are in `R(k)` by having signed. So the union is a
+    /// subset of `R(k)` that is exact whenever every required seat is dealt in,
+    /// which is every hand this client can open (a required seat outside
+    /// `dealt_in` is one with no chips or no grace, and nothing here emits a
+    /// sit-out). Before this the set was the signers alone, so a seat the table
+    /// was waiting for at stage 0 -- back from a restart, still required, its
+    /// copy the one thing missing -- adopted as a bystander that could not sign,
+    /// and at a table where half the seats had restarted together nobody could
+    /// certify anybody, no stage 0 ever closed, and the hands aborted on their
+    /// budget for the rest of the run (`run175510-4`).
+    pub fn adopt_with_signers(base: Opening, copies: &[Vec<u8>]) -> Result<(Opening, Vec<SeatIdx>), Failed> {
         use std::collections::BTreeMap;
         let occupied: Vec<SeatIdx> = base.seats.iter().map(|(s, _, _)| *s).collect();
         // (parent, body bytes) -> (seats that signed exactly this, the body)
@@ -480,9 +502,13 @@ impl Opening {
                 what: "the copies' blinds were the schedule's for this hand",
             });
         }
-        Ok(Opening {
+        let signers: Vec<SeatIdx> = signers.into_iter().collect();
+        let mut required: Vec<SeatIdx> = body.dealt_in.iter().copied().chain(signers.iter().copied()).collect();
+        required.sort_unstable();
+        required.dedup();
+        let opening = Opening {
             genesis,
-            required: signers.into_iter().collect(),
+            required,
             readmitted: Vec::new(),
             seats,
             small_blind: body.small_blind,
@@ -494,7 +520,8 @@ impl Opening {
             present_run: vec![0; usize::from(base.max_players)],
             returns: vec![0; usize::from(base.max_players)],
             ..base
-        })
+        };
+        Ok((opening, signers))
     }
 
     /// Why `from_formation` would decline, or `None` if it would not.
@@ -1471,6 +1498,9 @@ pub struct Hand {
     dealt_said: bool,
     /// Diagnostic: what the certificate path last decided.
     cert_note: Vec<String>,
+    /// Whether the player has been told, this hand, that D-036's floor is
+    /// what holds it: the seats that stopped are half the table or more.
+    floor_said: bool,
     /// Seat → the genesis its sequence-0 `HAND_INIT` of this hand named, when
     /// that is not this client's. A roster seat's signed word that it opened
     /// this hand elsewhere: the evidence a client on a private branch can
@@ -1894,6 +1924,7 @@ impl Hand {
                 dealt_note: None,
                 dealt_said: false,
                 cert_note: Vec::new(),
+                floor_said: false,
                 foreign_genesis: BTreeMap::new(),
                 genesis_note: None,
                 genesis_said: false,
@@ -5875,6 +5906,35 @@ impl Hand {
         voters >= 2 && voters > named
     }
 
+    /// The floor, told to the player once per hand when it is what holds
+    /// the hand: the seats that stopped are half the table or more, so no
+    /// certificate can remove them: a betting stage waits until the hand's
+    /// own time runs out, a crypto stage ends on its budget with every stack
+    /// restored and the next hand waits again. Three seats dealt in or more -- heads-up
+    /// the window says its own words (D-007, D-034). A note and nothing
+    /// else: the rule is D-036's and the player's way out is the door.
+    fn say_floor_once(&mut self, now_ms: u64) {
+        if self.floor_said || self.mine.dealt_in.len() < 3 {
+            return;
+        }
+        let quiet: Vec<SeatIdx> = self
+            .waiting_for()
+            .into_iter()
+            .filter(|s| *s != self.open.my_seat && self.mine.dealt_in.contains(s))
+            .collect();
+        if quiet.is_empty() {
+            return;
+        }
+        let voters = self.voters_of(&quiet).len();
+        let waited_s = now_ms.saturating_sub(self.stage_at_ms) / 1_000;
+        self.floor_said = true;
+        self.cert_note.push(format!(
+            "seat(s) {} have not acted at this stage for {waited_s} s and no certificate can remove them: {voters} seat(s) are present to vote about the {} that stopped, and the rule needs two voters at least and more voters than seats named (D-036); the table waits for them -- wait, or leave the table",
+            Self::seats_words(&quiet),
+            quiet.len()
+        ));
+    }
+
     /// D-036: the quiet set this client holds a complete case for, with its
     /// voters -- the greatest set `S` of dealt-in seats voted about at this
     /// stage such that every seat of `V(S)` (dealt in, outside `S`, not
@@ -6318,6 +6378,7 @@ impl Hand {
             // D-036: the floor is the joint one -- the seats outside the
             // quiet set are two at least, and more than the quiet.
             if !self.certificate_possible() {
+                self.say_floor_once(now_ms);
                 continue;
             }
             // **And this client has to be one of the voters.**
@@ -8514,18 +8575,21 @@ impl Hand {
     }
 
     /// How long this client may take on its own turn before it acts for its
-    /// owner.
+    /// owner: **`action_timeout_ms` plus what is left of the reserve**, the
+    /// player's own clock and the one the window shows.
     ///
-    /// **`action_timeout_ms + action_grace_ms`**, which is `PROTOCOL.md` §8.2's
-    /// deadline for a betting action and not a number of this client's
-    /// choosing. The player's own clock is the shorter one — the timeout — and
-    /// the grace is what absorbs the round trip, so a client that folded at the
-    /// timeout would be folding hands that had in fact been played in time.
+    /// The grace is the network's share on top of it (D-034) and belongs to
+    /// the OTHER seats' clocks, where `next_deadline_for` adds it so that a
+    /// round trip does not read as a seat that did not act. It used to be
+    /// added here as well, so this client's own check or fold went out three
+    /// seconds after the clock its owner was watching had run out -- and,
+    /// since the others' clocks started a delivery earlier, it raced their
+    /// vote instead of landing before it. The owner's question at the window,
+    /// 2026-09-11 evening: *every seat folds for itself at its own thirty
+    /// seconds; the others force it only if that does not come.*
     pub fn action_deadline(&self) -> std::time::Duration {
         std::time::Duration::from_millis(
-            u64::from(self.open.action_timeout_ms)
-                .saturating_add(u64::from(self.open.action_grace_ms))
-                .saturating_add(u64::from(self.bank_left_ms)),
+            u64::from(self.open.action_timeout_ms).saturating_add(u64::from(self.bank_left_ms)),
         )
     }
 
@@ -14153,6 +14217,62 @@ mod tests {
         assert_eq!(adopted.grace, vec![GRACE_HANDS; 4], "per-receiver accumulators start fresh");
     }
 
+    /// `D-039`: the table's own word on who is dealt in decides membership.
+    /// Four seats all in hand one; hand two's copies from three of them name
+    /// seat 3 in `dealt_in`, so seat 3 -- back from a restart with no copy of
+    /// its own -- adopts as a member, its opening is the table's body byte for
+    /// byte under its own signature, and the members' stage 0 closes on it.
+    /// Broken deliberately: with `required = signers` alone the first
+    /// assertion on `required` fails.
+    #[test]
+    fn a_seat_the_tables_copies_deal_in_adopts_as_a_member_and_signs_the_same_body() {
+        let keys: Vec<SigningKey> = (10..14).map(key).collect();
+        let mut hands = Vec::new();
+        let mut first = Vec::new();
+        for seat in 0..4u8 {
+            let mut o = opening4(seat);
+            o.required = vec![0, 1, 2, 3];
+            let (h, sends) = Hand::open(o, &keys[usize::from(seat)], NOW, 30_000).unwrap();
+            hands.push(h);
+            first.push((usize::from(seat), sends));
+        }
+        play_out(&mut hands, &keys, &[0, 1, 2, 3], first);
+        for h in &hands {
+            assert!(h.betting_over() && h.checkpoint8().is_some(), "hand 1 settled everywhere");
+        }
+        let (copies, mut opened) = hand_two_copies(&hands, &keys);
+        let (adopted, signers) = Opening::adopt_with_signers(adopter_base(), &copies).expect("three of four");
+        assert_eq!(signers, vec![0, 1, 2], "the copies' signers");
+        assert_eq!(adopted.required, vec![0, 1, 2, 3], "the copies deal seat 3 in, so it is required");
+        let (h3, sends) = Hand::open(adopted, &keys[3], NOW, 30_000).unwrap();
+        let mine = bytes_of(&sends);
+        assert_eq!(mine.len(), 1, "a member says its opening");
+        let table_id = hands[0].table_id();
+        let theirs = chained::open_in_hand(&copies[0], FRAME_CAP, EventType::HandInit, &table_id, 2).unwrap();
+        let ours = chained::open_in_hand(&mine[0], FRAME_CAP, EventType::HandInit, &table_id, 2).unwrap();
+        assert_eq!(ours.envelope.payload, theirs.envelope.payload, "the table's body, under seat 3's signature");
+        assert_eq!(ours.envelope.previous_event_hash, theirs.envelope.previous_event_hash, "at the table's genesis");
+        assert_eq!(h3.genesis(), opened[0].genesis(), "one hand");
+        // Once the last copy is in, stage 0 closes here too and the hand owes
+        // the deck stage its part: the node must say what `on_event` returns
+        // for these copies (seat 3 of `run182312-4` never did, and was
+        // certified out of the hand it had just been dealt into).
+        let mut h3 = h3;
+        let mut owed = Vec::new();
+        for c in &copies {
+            owed = h3.on_event(c, &keys[3], NOW + 1_000).expect("a member's copy");
+        }
+        assert!(h3.dealt(), "stage 0 closed on the copies: {:?}", h3.waiting_for());
+        assert!(!owed.is_empty(), "the deck stage's contribution comes out of the last copy");
+        // The members' stage 0 was waiting for exactly this copy.
+        for c in &copies[1..] {
+            opened[0].on_event(c, &keys[0], NOW + 1_000).expect("a member's copy");
+        }
+        assert!(!opened[0].dealt(), "stage 0 is open without seat 3: {:?}", opened[0].waiting_for());
+        opened[0].on_event(&mine[0], &keys[0], NOW + 2_000).expect("seat 3's copy");
+        assert!(opened[0].dealt(), "and closes on it");
+    }
+
     /// A strict majority of the occupied seats, at one genesis: two of four
     /// is not one, a fork among the copies leaves no majority, and a copy
     /// signed by a key the roster does not hold counts for nothing.
@@ -14434,6 +14554,26 @@ mod tests {
         }
     }
 
+    /// D-034: a seat's own clock is the timeout the window shows plus what is
+    /// left of its reserve, and not the grace -- the grace is the others'
+    /// allowance for the round trip. Broken deliberately: adding the grace
+    /// back reddens the first assertion.
+    #[test]
+    fn a_seats_own_clock_is_its_timeout_and_reserve_and_not_the_grace() {
+        let mut o = opening_n(3, 0);
+        o.action_timeout_ms = 30_000;
+        o.action_grace_ms = 3_000;
+        o.time_bank_ms = 0;
+        let (h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
+        assert_eq!(h.action_deadline(), std::time::Duration::from_secs(30), "the thirty seconds on the window");
+        let mut o = opening_n(3, 0);
+        o.action_timeout_ms = 30_000;
+        o.action_grace_ms = 3_000;
+        o.time_bank_ms = 5_000;
+        let (h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
+        assert_eq!(h.action_deadline(), std::time::Duration::from_secs(35), "plus the reserve, when the table has one");
+    }
+
     /// D-036: the voters must outnumber the quiet. Two present seats cannot
     /// certify three quiet ones, so they do not vote at all, and the hand
     /// ends on the deadline naming nobody, as before.
@@ -14448,6 +14588,12 @@ mod tests {
         let t1 = NOW + 30_000;
         assert!(a.vote_on_timeouts(&keys[0], t1, 0).unwrap().is_empty(), "no vote where no certificate can follow");
         assert!(b.vote_on_timeouts(&keys[1], t1, 0).unwrap().is_empty());
+        // And the player is told why the hand waits, once: the seats that
+        // stopped are more than half the table, so the floor holds.
+        let note = a.take_cert_note().expect("the player is told");
+        assert!(note.contains("no certificate can remove them") && note.contains("[2, 3, 4]"), "{note}");
+        assert!(a.vote_on_timeouts(&keys[0], t1 + 500, 0).unwrap().is_empty());
+        assert!(a.take_cert_note().is_none(), "said once per hand");
         // No certificate to wait for, so the stage budget alone ends it.
         let t2 = t1 + 1_000;
         assert!(a.may_abandon(t2), "no certificate possible: the deadline ends it at one budget");
@@ -14543,11 +14689,9 @@ mod tests {
         let (mut a, from_a) = Hand::open(heads_up_opening(0), &keys[0], NOW, 30_000).unwrap();
         let copy = bytes_of(&from_a);
         assert_eq!(copy.len(), 1, "one opening from the survivor");
-        let mut o = Opening::adopt(heads_up_opening(1), &copy).expect("the one other seat's copy carries it");
-        assert_eq!(o.required, vec![0], "the copies name their signers only");
-        // The node's rule at two seats: a returning seat with chips is required.
-        o.required.push(1);
-        o.required.sort_unstable();
+        let o = Opening::adopt(heads_up_opening(1), &copy).expect("the one other seat's copy carries it");
+        // `D-039`: the survivor's body deals this seat in, so it is required.
+        assert_eq!(o.required, vec![0, 1], "the table's own word on who is dealt in");
         let (mut b, from_b) = Hand::open(o, &keys[1], NOW + 5_000, 30_000).unwrap();
         assert!(!from_b.is_empty(), "a member says its opening, and the node must send it");
         assert_eq!(a.genesis(), b.genesis(), "one hand");
@@ -14574,9 +14718,8 @@ mod tests {
         let (mut a, from_a) = Hand::open(heads_up_opening(0), &keys[0], NOW, 30_000).unwrap();
         let gave_up = a.abort_now(Abort::Deadline, &keys[0], NOW + 30_000).unwrap();
         assert!(a.over());
-        let mut o = Opening::adopt(heads_up_opening(1), &bytes_of(&from_a)).unwrap();
-        o.required.push(1);
-        o.required.sort_unstable();
+        let o = Opening::adopt(heads_up_opening(1), &bytes_of(&from_a)).unwrap();
+        assert_eq!(o.required, vec![0, 1], "the survivor's body deals this seat in (D-039)");
         let adopted_at = NOW + 40_000;
         let (mut b, _) = Hand::open(o, &keys[1], adopted_at, 30_000).unwrap();
         deliver(&mut b, &from_a, &keys[1]);

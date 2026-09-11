@@ -16,7 +16,7 @@ has outlived its deadline while it has not voted about a seat it waits for:
     long past false, my seat 1, sequence 22; seat 0: subject yes,
     voters [1, 2, ...], I voted false, votes held 0, mid-delivery true
 
-Every per-seat entry falls in one of five buckets, and **only the last one is
+Every per-seat entry falls in one of six buckets, and **only the last one is
 what S1-BR is open for**: a vote owed, eligible, past twice the stage budget,
 and not cast.
 
@@ -29,6 +29,9 @@ and not cast.
                  delivering that seat's traffic, and the gate yields at
                  `long_past_stage`, twice *that stage's* budget -- so a wait
                  longer than the printed `deadline` is not an overrun
+  alone          the voter set is this client alone: D-036's floor needs two
+                 voters, so heads-up nobody certifies anybody (D-007, D-034)
+                 and the vote is deliberately not cast
   UNMET          eligible, not voted, long past, and not mid-delivery
 
 Usage:
@@ -78,6 +81,8 @@ def fold(paths):
                     k = 'already voted'
                 elif me not in voters:
                     k = 'bystander'
+                elif len(voters) < 2:
+                    k = 'alone (D-036 floor)'
                 elif not subject:
                     k = 'no subject'
                 elif not long_past:
@@ -124,7 +129,7 @@ def main():
               'client waits for)' % (float(entries) / lines))
     print()
     for k in ('lever', 'lever, past the printed deadline', 'within the stage budget',
-              'bystander', 'already voted', 'no subject', 'UNMET'):
+              'bystander', 'already voted', 'no subject', 'alone (D-036 floor)', 'UNMET'):
         if cat.get(k) is None and k != 'UNMET':
             continue
         print('  %-32s %d' % (k, cat.get(k, 0)))

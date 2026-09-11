@@ -2735,7 +2735,11 @@ the disposition of J2, and the clause it replaces is deleted (D-013):**
 > chain-`k` stage-0 event of this table signed by a roster key, grouped by
 > `(previous_event_hash, body)` and byte-identical within the group; the parent
 > is taken as `GENESIS(k)`, the body's `n(9) stacks`, `n(1) button_position`,
-> `n(4) level` and blinds as the opening's, and the seats that signed as `R(k)`.
+> `n(4) level` and blinds as the opening's, and **the body's `n(8) dealt_in` joined
+> with the seats that signed as `R(k)`** (D-039; it was the signers alone). A receiver
+> that `dealt_in` names is a member of the adopted hand: it opens it at that genesis
+> and emits its own `HAND_INIT(k)` with the same body, which is the copy the table's
+> stage 0 is waiting for. A receiver it does not name is a bystander, as below.
 > The body's stacks must hash to its `n(10) roster_hash` and its blinds must be
 > §7.2's for hand `k`, so a majority cannot name a table that does not exist.
 > **Nothing here enters a genesis**: the receiver adopts what the table derived
@@ -2749,6 +2753,14 @@ the disposition of J2, and the clause it replaces is deleted (D-013):**
 > is what makes it a deriving member again, and it also says the adopted set
 > was exact. A majority at one genesis is followed whatever a minority signed;
 > a table with no majority at one genesis is one this receiver waits at.
+>
+> **A seat on a hand nobody else has — normative, D-038 (`S1-DH`).** A receiver that holds a hand of this table
+> while a strict majority of the seats in its own required and returned sets, other than itself, have signed hands
+> two or more ids past it drops that hand and every local fact of the branch, keeps the table, the group and its
+> keys, and takes the road above from the table's copies: it adopts the running hand as a bystander and asks to sit
+> in at its boundary (§4.10, §8.3.1). Nothing of the table's rests on the dropped branch, since no other seat signed a
+> frame of it; a seat outside those sets is not evidence of where the table is, and two seats are not the table.
+> The return counts under D-032.
 >
 The deleted clause read *"every seat that will be `dealt_in`, plus every occupied
 seat that is absent or sitting out and therefore posts dead money"*. It defined the
