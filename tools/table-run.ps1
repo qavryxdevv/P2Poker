@@ -176,7 +176,8 @@ param(
     # spread, which has been 10-25 s in every run measured.
     [int]$LateGroupSeconds = 60
 )
-$droppers = @($DropNodes -split ',' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+# Comma or space: `-DropNodes 1,2` can reach a [string] parameter as "1 2".
+$droppers = @("$DropNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 
 $ErrorActionPreference = 'Stop'
 

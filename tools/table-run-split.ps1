@@ -196,6 +196,13 @@ param(
     # what S1-Q put in scope and what neither -Deaf alone nor -LinkDown
     # models (S1-CM, S1-CO). Needs the fault harness, like -Deaf itself.
     [switch]$DeafBothWays,
+    # -StopAtOpen <s> -StopSeats "3,5,7": those local seats stop at their first
+    # hand open at or after that second and stay away -- several seats quiet
+    # at one stage, D-036's shape (S1-CT: three of nine). Needs the fault
+    # harness. The far seat is never one of them; it is the relay-only seat
+    # whose vote and copy have to cross the far link.
+    [ValidateRange(0, 3600)][int]$StopAtOpen = 0,
+    [string]$StopSeats = '',
     [switch]$NoBuild,
     # **Build without `fault-harness`, and therefore without toxcore's log.**
     #
@@ -411,6 +418,7 @@ $header = @(
     "stall  $(if ($Stall -gt 0) { "far seat $StallSeat starves its group handshake for $Stall s after accepting the invitation (fault-harness; S1-AA shape (i) on demand)$(if ($Stall -gt 15) { ' - WARNING: over 15 s stops the seat iterating toxcore at all, so this models the KNOB and not shape (i); 13-15 s trips the 12 s group reaper while the friend connections survive' })" } else { 'no forced handshake stall' })"
     "drop   $(if ($DropConfirm -gt 0) { "the founder does not send its first $DropConfirm invite confirmation(s); every loop keeps running (fault-harness; the instrument -Stall never was)" } else { 'every invite confirmation is sent' })"
     "deaf   $(if ($DeafFor -gt 0) { "local seat $DeafSeat ignores its peers' group packets from $DeafAt s for $DeafFor s, $(if ($DeafBothWays) { 'AND drops its own on the wire after the ring took them (patch 0025): a symmetric outage' } else { 'still sending (patch 0016): the downlink half only' })$(if ($DeafFor -le 58) { ' - under the 58 s peer timeout: nobody is timed out and every packet missed is replayed by the ring when the window ends, the brief-outage model (S1-CM, S1-CO)' })" } else { 'nobody is deaf' })"
+    "stop   $(if ($StopAtOpen -gt 0) { "local seat(s) $StopSeats stop at their first hand open at or after $StopAtOpen s and stay away - several seats quiet at one stage, D-036's shape (fault-harness)" } else { 'nobody stops' })"
     "work   $work"
 )
 $header | ForEach-Object { Write-Host $_ }
@@ -692,6 +700,16 @@ for (`$i = 0; `$i -lt $There; `$i++) {
             $knobs['P2P_POKER_DEAF_AT'] = "$DeafAt"
             $knobs['P2P_POKER_DEAF_FOR'] = "$DeafFor"
             if ($DeafBothWays) { $knobs['P2P_POKER_DEAF_UPLINK'] = '1' }
+        }
+        # Comma or space: `-StopSeats 3,5,7` reaches a [string] parameter as
+        # "3 5 7" when PowerShell has already made an array of it. **Not
+        # `$stopSeats`**: variable names are case-insensitive, so that would be
+        # the [string] parameter itself, and an array assigned to it becomes
+        # the string "3 5 7" -- which `-contains 3` never matches (measured:
+        # `split150518-9` stopped nobody).
+        $stopList = @("$StopSeats" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+        if ($StopAtOpen -gt 0 -and $stopList -contains $i) {
+            $knobs['P2P_POKER_STOP_AT_OPEN_AFTER'] = "$StopAtOpen"
         }
         $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $knobs -ScriptBlock {
             param($exe, $nodeArgs, $log, $knobs)
