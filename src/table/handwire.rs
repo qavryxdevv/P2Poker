@@ -768,17 +768,7 @@ impl TimeoutVote {
     /// stage — two mutually partitioned peers each voting against the other is
     /// enough — from manufacturing an equivocation proof against itself.
     pub fn subject_digest(&self) -> Hash {
-        crate::protocol::serialization::h(
-            crate::protocol::signatures::Domain::TimeoutCert.context(),
-            &[
-                &self.subject_sequence.to_be_bytes(),
-                &[self.subject_seat],
-                &self.subject_event_type.to_be_bytes(),
-                &self.parent_event_hash,
-                &self.deadline_ms.to_be_bytes(),
-                &self.kind.to_be_bytes(),
-            ],
-        )
+        CertSubject::of(self).digest()
     }
 
     /// Whether two votes are about the same thing.
@@ -797,7 +787,81 @@ impl TimeoutVote {
     }
 }
 
+/// D-036: what a `TIMEOUT_CERT` is about -- the seats quiet at one stage under
+/// one deadline, one or several. A vote names one seat; a certificate names
+/// the whole set `S` and carries, for every member of `S`, a vote from every
+/// seat of `V(S)` = the dealt-in seats less `S` less the seats already
+/// certified. With one seat this is D-023's certificate exactly, digest and
+/// all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertSubject {
+    pub subject_sequence: u64,
+    /// Ascending, no duplicates, never empty.
+    pub subject_seats: Vec<SeatIdx>,
+    pub subject_event_type: u16,
+    pub parent_event_hash: Hash,
+    pub deadline_ms: u32,
+    pub kind: u16,
+}
+
+impl CertSubject {
+    /// The one-seat subject a vote names.
+    pub fn of(vote: &TimeoutVote) -> Self {
+        CertSubject {
+            subject_sequence: vote.subject_sequence,
+            subject_seats: vec![vote.subject_seat],
+            subject_event_type: vote.subject_event_type,
+            parent_event_hash: vote.parent_event_hash,
+            deadline_ms: vote.deadline_ms,
+            kind: vote.kind,
+        }
+    }
+
+    /// The digest a certificate identifies its subject by: every field but
+    /// the position, the seats as one ascending byte string -- so one seat
+    /// hashes to what `TimeoutVote::subject_digest` always did.
+    pub fn digest(&self) -> Hash {
+        crate::protocol::serialization::h(
+            crate::protocol::signatures::Domain::TimeoutCert.context(),
+            &[
+                &self.subject_sequence.to_be_bytes(),
+                self.subject_seats.as_slice(),
+                &self.subject_event_type.to_be_bytes(),
+                &self.parent_event_hash,
+                &self.deadline_ms.to_be_bytes(),
+                &self.kind.to_be_bytes(),
+            ],
+        )
+    }
+
+    /// The vote this certificate must carry about `seat`.
+    pub fn vote_about(&self, seat: SeatIdx) -> TimeoutVote {
+        TimeoutVote {
+            subject_sequence: self.subject_sequence,
+            subject_seat: seat,
+            subject_event_type: self.subject_event_type,
+            parent_event_hash: self.parent_event_hash,
+            deadline_ms: self.deadline_ms,
+            kind: self.kind,
+        }
+    }
+
+    /// Whether a vote is about this stage under this deadline, whichever
+    /// seat it names.
+    pub fn same_stage(&self, v: &TimeoutVote) -> bool {
+        self.subject_sequence == v.subject_sequence
+            && self.subject_event_type == v.subject_event_type
+            && self.parent_event_hash == v.parent_event_hash
+            && self.deadline_ms == v.deadline_ms
+            && self.kind == v.kind
+    }
+}
+
 /// `TIMEOUT_CERT 0x0602`: the voter set, unanimously, saying a deadline passed.
+///
+/// D-036: about one seat or several -- `votes` carries, for every seat named
+/// (ascending), the vote of every seat of `V(S)` (ascending by voter), and
+/// the subject digest commits to the whole set.
 ///
 /// A **collective** stage whose required emitter set is `V(subject)` — the same
 /// set that had to vote — so each voter emits its own copy. Legal only when

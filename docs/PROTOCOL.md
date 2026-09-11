@@ -3424,15 +3424,18 @@ belongs in the key*, and for a certificate that field is the subject.
 
 | Field | Type | Limit / rule |
 |---|---|---|
-| `n(0) subject_digest` | `bytes[32]` | `h("p2p-poker v1 timeout-cert", [u64_be(subject_sequence), u8(subject_seat), u16_be(subject_event_type), parent_event_hash, u32_be(deadline_ms), u16_be(kind)])` |
-| `n(1) votes` | `Vec<bytes>` | ≤ `MAX_SEATS - 1` entries, each a complete `SignedEvent` of a `TIMEOUT_VOTE`, sorted ascending by voter seat |
+| `n(0) subject_digest` | `bytes[32]` | `h("p2p-poker v1 timeout-cert", [u64_be(subject_sequence), bytes(subject_seats), u16_be(subject_event_type), parent_event_hash, u32_be(deadline_ms), u16_be(kind)])` — `subject_seats` the seats named, ascending, one byte each; for one seat this is `u8(subject_seat)` as before (D-036) |
+| `n(1) votes` | `Vec<bytes>` | for every seat named, ascending, one complete `SignedEvent` of a `TIMEOUT_VOTE` about it from every seat of `V(S)`, ascending by voter; ≤ `MAX_SEATS² / 4` entries (D-036: `\|V(S)\| > \|S\|` and `\|S\| + \|V(S)\| <= MAX_SEATS`) |
 
 *Receiver must validate:* every embedded vote independently passes §4.0 steps
-2–11; all votes carry the same subject; the voter set is exactly `V(subject)` as
-§8.3 defines it, with no duplicates, and **every seat absent from it is absent
-because a completed, valid certificate in this hand already names that seat as
-attributed** — a `V` shrunk by bare votes is not a `V`; `|V(subject)| >= 2`;
-`subject_digest` recomputes; the emitter is itself a member of `V(subject)`.
+2–11; all votes are about one stage under one deadline, and the seats they name
+are `S`, the set the certificate is about (D-036); every seat of `S` has a vote
+from one and the same voter set, no seat of `S` is in it, and that set is exactly
+`V(S)` as §8.3 defines it, with no duplicates — **every seat absent from it is
+absent because it is named by this certificate or by a completed, valid
+certificate earlier in this hand** — a `V` shrunk by bare votes is not a `V`;
+`|V(S)| >= 2` and `|V(S)| > |S|`; a `kind = 1` certificate names one seat;
+`subject_digest` recomputes; the emitter is itself a member of `V(S)`.
 
 **The certificate stage is collective.** The required emitter set is `V(subject)`;
 each voter emits its own certificate carrying the same votes in the same order;
@@ -6980,6 +6983,18 @@ D-007 at every table size. Wherever an earlier draft of this document said "at
 > **completed, valid certificate earlier in this hand already names as
 > attributed**. Nothing else removes a seat from `V`.
 >
+> **D-036 — several seats quiet at one stage (2026-09-11).** A certificate names
+> a set `S` of seats quiet at one stage under one deadline, and its voter set is
+> `V(S)` = the dealt-in seats, minus `S`, minus every seat a completed, valid
+> certificate earlier in this hand already names. Every member of `V(S)` votes
+> about every member of `S`, and the certificate carries all of those votes.
+> Legal only when `|V(S)| >= 2` **and `|V(S)| > |S|`** — the voters outnumber
+> the seats named, so no group short of a majority of the live seats completes a
+> certificate about the rest. `V(subject)` everywhere in this corpus is the case
+> `|S| = 1`, digest and bytes alike. Being voted against is still not exclusion:
+> `S` leaves `V(S)` only inside the certificate that unanimously names every
+> member of it, and a vote removes nobody from anything.
+>
 > **Being voted against is not exclusion.** A `TIMEOUT_VOTE` is one peer's
 > unilateral assertion, this section concedes below that a lying voter is
 > unprovable, and a rule that let an assertion shrink `V` would let one modified
@@ -7279,13 +7294,24 @@ whatever it pays. D-008 deletes the rule and replaces it with §8.3's inductive 
 seat leaves `V` only once a completed, valid certificate already names it as
 attributed.**
 
-**Two simultaneous subjects therefore deadlock, by design.** Neither certificate
-can form, because neither voter set can be reduced. That is the price of the
-fix and it is a price worth paying: the exclusion rule bought only a faster path
-to an abort that the whole-hand limit already reaches, and it cost the integrity
-of the certificate at every table size.
+**Two simultaneous subjects deadlocked, by design, until D-036 (2026-09-11).**
+Neither certificate could form, because neither voter set could be reduced, and
+that was the price of the fix above. D-036 pays it differently: the two are
+named **together**, by one certificate whose voter set is everybody else —
+`V(S)` = the dealt-in seats less `S` less the already certified (§8.3) — with a
+vote from every one of them about every seat named. Nothing shrinks `V` by
+assertion: the seats named leave `V(S)` only inside the certificate that
+unanimously names all of them. And the voters must outnumber the named,
+`|V(S)| > |S|`, so a group short of a majority of the live seats completes nothing
+about the rest — the one-client attack above needs, at six seats, five votes it
+does not have, and two clients at six seats can name the other four no more
+than they can leave the table and play without them. A sealer names the greatest
+set every outside seat has voted about; such sets are closed under union, so the
+honest seats converge on one, and a certificate carries its votes so a seat that
+missed one holds it from the copy (`DECISIONS.md` D-036).
 
-The deadlock is resolved by the whole-hand limit and by nothing else. When
+Where the quiet seats are half the live seats or more no certificate forms, no
+vote is cast, and the whole-hand limit resolves it as before. When
 `hand_deadline_ms` expires the hand aborts with `cause = 1`, `attributed = []`,
 `cert_hash = None`, and stacks restored. **Nobody is named**, because a seat that
 did not vote may be silent, partitioned or simply slow, and naming a partitioned
@@ -7347,7 +7373,7 @@ hand by going silent together, at no cost to either. The earlier rule — attrib
 confiscation.
 
 D-006 did not settle simultaneous failure, and neither does this. **OPEN QUESTION
-Q-02** stays open with the above as its written interim behaviour; the same
+Q-02** is answered by D-036 (§8.3, §8.4), the above having been its written interim behaviour; the same
 question is `STATE_MACHINE.md` Q3 and is carried as blocking in
 `THREAT_MODEL.md` §9.2 (OQ-E).
 
@@ -7820,7 +7846,7 @@ about the wire and not about the threat model:**
 | # | Question | Blocks | Owner |
 |---|---|---|---|
 | **Q-01** | Is `showdown_policy = TDA_MUCK` offered at all, or is `MANDATORY_REVEAL` the only permitted value? Mucking preserves live poker's strategic value but weakens §13 verification from "the award was correct" to "the award was correct given who did not forfeit" — a colluding pair could have one player muck a winner. Mandatory reveal is fully verifiable but leaks strictly more than real poker does, which is itself a long-run edge. [RULES A8] | `STATE_MACHINE.md`, the engine's showdown path | project owner; belongs in `DECISIONS.md` |
-| **Q-02** | **Not blocking version 1 (D-015): no certificate is produced, so no multi-subject case arises; the question returns with the machinery.** **How is a multi-subject deadline certificate constructed, and whom does it attribute?** `signers == participants \ {subject}` is unachievable when two or more seats are simultaneously unresponsive, because each required voter set contains the other subject. **Interim behaviour, written into §8.4 and revised by D-008:** the exclusion rule that removed already-subject seats from `V` is **deleted** — it let one modified client shrink `V` to itself at any table size (N3) — so simultaneous subjects now deadlock until `hand_deadline_ms`, when the hand aborts with `cause = 1`, `attributed = []`, `cert_hash = None`, stacks restored. Two colluding seats can still void a hand for free. D-006 specified unanimity for the single-subject case only. Same question as `STATE_MACHINE.md` Q3; carried as blocking in `THREAT_MODEL.md` §9.2 as OQ-E. | `STATE_MACHINE.md`, Phase 4 | project owner |
+| **Q-02** | **Answered by D-036 (2026-09-11): several seats quiet at one stage are named together by one certificate, whose voter set is every other live seat and whose votes cover every seat named; legal only when the voters are at least two and outnumber the named (§8.3, §8.4).** The question was: **how is a multi-subject deadline certificate constructed, and whom does it attribute?** `signers == participants \ {subject}` was unachievable when two or more seats were unresponsive at once, because each required voter set contained the other subject; the exclusion rule that removed already-subject seats from `V` had been deleted by D-008 because it let one client shrink `V` to itself, and simultaneous subjects then deadlocked until `hand_deadline_ms`. D-036 keeps D-008 whole — nothing leaves `V` on a bare vote — and attributes the whole set at once, on the word of everybody outside it. Same question as `STATE_MACHINE.md` Q3 and `THREAT_MODEL.md` OQ-E, answered with it. | `STATE_MACHINE.md`, Phase 4 | project owner |
 | **Q-03** | Should `TABLE_READY` require every participant to have completed a §1.2 handshake with every other, or is founder-mediated introduction acceptable when a pair cannot connect directly? Requiring a full mesh is the safe answer and is what §1.5 specifies, but it means one unreachable pair prevents a table that would otherwise form. Relates to D-004's symmetric-NAT case. | `NETWORK_STACK.md`, §1.5 | project owner |
 | **Q-04** | **CLOSED.** Should the certificate stage be collective instead of a `CERT_SETTLE_MS` timer with a lowest-seat tie-break? **Answer: collective** (§4.8). A certificate's body is a pure function of the votes, so by §3.2's stage-kind principle it carries no choice and must not have a single writer; the emitter set is `V(subject)`; the timer, the tie-break and the chain fork all disappear together, and `CERT_SETTLE_MS` is deleted from §13. | — | closed by the Phase 0 fix plan, C-10 |
 | **Q-05** | **Moot for `kind = 2` in version 1 (D-015), which is not produced; live for `kind = 1` and `kind = 3`.** Does a `DISPUTE` need to be gossiped to the whole lobby, or only within the table mesh? Lobby-wide gossip gives non-participants durable evidence of equivocation, which is the only reputational pressure play money has; it also creates a defamation and spam vector, since a `DISPUTE` is cheap to emit and its `note` is attacker-controlled text. | `THREAT_MODEL.md`, §7.6 | project owner |

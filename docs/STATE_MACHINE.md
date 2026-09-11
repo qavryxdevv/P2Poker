@@ -1856,6 +1856,10 @@ live ∧ ¬all_in. `round_closed(s)` is the `POKER_RULES.md` A2 predicate: every
 abbreviated. A transition not listed does not exist; any event arriving in a state with no
 matching row is a `Rejection` and leaves the state bit-identical (I21, I13).
 
+**D-036 (2026-09-11) widens the subject to a set.** A certificate names every seat quiet at one stage, its voter set
+is `V(S)` = the dealt-in seats less `S` less the already certified, and it is legal only when `|V(S)| >= 2` and
+`|V(S)| > |S|`; `V(subject)` below is the case `|S| = 1`. Q3 is answered with `PROTOCOL.md` Q-02 (§8.3, §8.4 there).
+
 **`V(subject)` appears in no guard in this table, and that is D-015.** The required voter set of
 §8.4 was read by six rows and by nothing else; with those rows deleted there is no guard left
 that needs it, no guard that reads `certified_subjects`, and no guard that reads a certificate

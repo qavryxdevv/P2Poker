@@ -344,6 +344,12 @@ fn a_table_without_a_reserve_votes_at_the_plain_deadline() {
 /// own copy to the stage that was already open. Both survivors then held a
 /// stage neither could close, and no message was refused anywhere — one
 /// reported `one is already in progress` while the other waited for it.
+///
+/// D-036: the copy carries the votes it is made of, so the vote that would
+/// have justified it arrives inside it. Seat 1 holds a complete set the
+/// moment the copy is in, seals its own, and -- two voters, both copies now
+/// heard -- the stage completes and the hand ends at once. Seat 0's own vote,
+/// arriving after, changes nothing.
 #[test]
 fn a_peers_certificate_arriving_first_does_not_silence_this_client() {
     let (mut t, opening) = Table::open_with_seat_two_silent();
@@ -369,25 +375,12 @@ fn a_peers_certificate_arriving_first_does_not_silence_this_client() {
     let certs: Vec<Vec<u8>> = certs.into_iter().map(|Send::Broadcast(b)| b).collect();
     assert_eq!(certs.len(), 1, "seat 0 should certify once it has both votes");
 
-    // That certificate reaches seat 1 **before** seat 0's own vote does. Seat 1
-    // cannot sign yet — it holds one vote — and must not be counted as having.
-    let out = t.hands[1]
+    // That certificate reaches seat 1 **before** seat 0's own vote does. It
+    // carries that vote, so seat 1's set is complete: it seals its own copy,
+    // the stage over the two voters closes, and the hand ends here (D-036).
+    let queue: Vec<Vec<u8>> = t.hands[1]
         .on_event(&certs[0], &t.keys[1], LATE)
-        .expect("a certificate from a voter is accepted");
-    assert!(
-        out.is_empty(),
-        "seat 1 signed a certificate before it held a complete set of votes"
-    );
-    assert!(
-        t.hands[1].aborted().is_none(),
-        "seat 1 ended the hand on one peer's word"
-    );
-
-    // Now the vote arrives, and seat 1 owes its copy to a stage already open.
-    let (_, ref zero_vote) = votes[0];
-    let mut queue: Vec<Vec<u8>> = t.hands[1]
-        .on_event(zero_vote, &t.keys[1], LATE)
-        .expect("seat 0's vote is accepted")
+        .expect("a certificate from a voter is accepted")
         .into_iter()
         .map(|Send::Broadcast(b)| b)
         .collect();
@@ -395,8 +388,21 @@ fn a_peers_certificate_arriving_first_does_not_silence_this_client() {
         !queue.is_empty(),
         "seat 1 stayed silent, so the stage seat 0 opened can never close"
     );
+    assert!(
+        t.hands[1].aborted().is_some(),
+        "seat 1 holds both votes and both copies; the certificate ends the hand"
+    );
 
-    t.settle(std::mem::take(&mut queue), LATE);
+    // Seat 0's own vote arrives after the fact and says nothing new: held by
+    // a hand that is over, never refused.
+    let (_, ref zero_vote) = votes[0];
+    match t.hands[1].on_event(zero_vote, &t.keys[1], LATE) {
+        Ok(out) => assert!(out.is_empty(), "a vote this client already holds says nothing new"),
+        Err(Failed::NotYet) => {}
+        Err(e) => panic!("seat 0's late vote was refused: {e}"),
+    }
+
+    t.settle(queue, LATE);
     assert!(t.refusals.is_empty(), "something was refused: {:?}", t.refusals);
     for s in 0..2usize {
         assert!(

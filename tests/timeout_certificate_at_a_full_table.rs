@@ -132,6 +132,50 @@ fn a_certificate_carrying_max_seats_minus_one_votes_fits_its_cap() {
     );
 }
 
+/// D-036: a certificate names every seat quiet at one stage and carries, for
+/// each of them, a vote from every seat outside the set. With more voters
+/// than seats named and `|S| + |V| <= MAX_SEATS`, the widest is four named
+/// by six: twenty-four whole signed votes, which is the number the cap has
+/// to hold.
+#[test]
+fn a_joint_certificate_at_its_widest_fits_its_cap() {
+    let named = 4u8;
+    let voters = MAX_SEATS - named;
+    assert!(voters > named && voters + named == MAX_SEATS);
+    let mut votes: Vec<Vec<u8>> = Vec::new();
+    for subject in 0..named {
+        for voter in 0..voters {
+            let mut v = a_vote();
+            v.subject_seat = subject;
+            votes.push(
+                chained::seal(
+                    EventType::TimeoutVote,
+                    &slot(),
+                    &v,
+                    &key(voter + 1),
+                    u64::MAX,
+                    u32::MAX,
+                    TIMEOUT_VOTE_CAP,
+                )
+                .expect("a vote is inside its own cap"),
+            );
+        }
+    }
+    assert_eq!(votes.len(), 24);
+    let per_vote = votes[0].len();
+    let cert = TimeoutCert {
+        subject_digest: [0x11; 32],
+        votes,
+    };
+    let encoded = canonical(&cert).len();
+    assert!(
+        encoded <= TIMEOUT_CERT_CAP,
+        "a joint certificate at its widest encodes to {encoded} B, over \
+         TIMEOUT_CERT_CAP = {TIMEOUT_CERT_CAP} B; one sealed vote is {per_vote} B and \
+         twenty-four are carried whole (D-036)",
+    );
+}
+
 /// The same question asked of the other body whose cap is a round 4 096, and
 /// whose doc likewise describes a maximum nobody ever built: *"at most
 /// `MAX_SEATS` pots, each with three seat lists, plus four vectors of that
