@@ -858,6 +858,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // say *the players are joining the group* as they do and not on the
     // thirty-second status line.
     let mut carrier_reported: Option<(u64, u64)> = None;
+    // `S1-CX`: the other seat's next hand, seen while this one is still
+    // inside a hand nothing was dealt in -- the hand id and the parent it
+    // carries -- for the stall tick to give this hand up on, if the parent
+    // is what this hand's own give-up opens at.
+    let mut give_up_for: Option<(u64, [u8; 32])> = None;
     if let Some(r) = resume.as_ref() {
         let _ = events
             .send(NodeEvent::UnfinishedSession {
@@ -1464,6 +1469,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         // is abandoned for the next one at the stall tick.
                                         if resuming && hand_id > $h.hand_id() {
                                             let _ = stash_for_resume($bytes, &mut resume_inits, &mut resume_early);
+                                        }
+                                        // `S1-CX`: the next hand's opening from a seat one
+                                        // hand ahead, while nothing has been dealt here.
+                                        if !resuming && hand_id == $h.hand_id() + 1 && $h.street().is_none() && !$h.over() {
+                                            if let Ok((crate::protocol::messages::EventType::HandInit, _, 0)) =
+                                                crate::net::chained::peek($bytes, TABLE_FRAME_PEEK)
+                                            {
+                                                if let Ok(o) = crate::net::chained::open_in_hand(
+                                                    $bytes,
+                                                    crate::table::hand::FRAME_CAP,
+                                                    crate::protocol::messages::EventType::HandInit,
+                                                    &$h.table_id(),
+                                                    hand_id,
+                                                ) {
+                                                    give_up_for = Some((hand_id, o.envelope.previous_event_hash));
+                                                }
+                                            }
                                         }
                                         note_a_hand_ahead(
                                             $h,
@@ -4681,6 +4703,48 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 want: u16::try_from(group.1).unwrap_or(u16::MAX),
                             })
                             .await;
+                    }
+                }
+                // `S1-CX`: heads-up, give up a hand nothing was dealt in when the
+                // other seat has opened the next one from exactly that give-up.
+                // After a line outage the two seats were one hand apart and chased
+                // each other, each giving its hand up on the budget after the other
+                // had moved on (`run080531-2`); no chips are at stake before the
+                // deal, an abort's terminal follows from the genesis, and the other
+                // seat's copy names the parent, so the two open the same hand.
+                if let Some((next, parent)) = give_up_for.take() {
+                    let mut given_up: Option<Result<(u64, Vec<crate::table::hand::Send>), (u64, crate::table::hand::Failed)>> = None;
+                    if let (Some(h), Some(f)) = (hand.as_mut(), table.as_ref()) {
+                        if f.roster().len() == 2
+                            && h.hand_id() + 1 == next
+                            && h.street().is_none()
+                            && !h.over()
+                            && h.genesis_if_given_up() == Some(parent)
+                        {
+                            let current = h.hand_id();
+                            let now = super::node::now_unix_ms();
+                            given_up = Some(
+                                h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now)
+                                    .map(|sends| (current, sends))
+                                    .map_err(|e| (current, e)),
+                            );
+                        }
+                    }
+                    match given_up {
+                        Some(Ok((current, sends))) => {
+                            publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "gave up hand #{current}, in which nothing was dealt: the other seat has opened hand #{next} from that give-up, and this client opens it too"
+                                )))
+                                .await;
+                        }
+                        Some(Err((current, e))) => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("could not give hand #{current} up: {e}")))
+                                .await;
+                        }
+                        None => {}
                     }
                 }
                 // `S1-CR`: the recorded ratification did not fit the roster the

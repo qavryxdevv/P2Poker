@@ -3339,8 +3339,20 @@ table with an absent opponent froze and said nothing, and a restarted client was
    returning seat that is in the roster with chips signs the hand it adopts at stage 0 and is dealt in as a member, because there is
    no return certificate at two seats and the one other seat is the whole table: what it plays for is what the other seat's copy
    names, and disputing that is D-007's territory -- leaving.
-4. **What this does not do:** end a hand stuck on an absent seat before the table's hand deadline (`S1-CZ`, with the proposal that
-   would), or say anything heads-up that a certificate says at three seats.
+4. **Both seats stay required at two seats.** The first heads-up run (`run080025-2`) had the survivor's next hand require a
+   seat that had *taken part*, so one missed hand left the table with no next hand to deal. There is no table without both
+   seats and no certificate to say one is absent, so both seats with chips stay required whatever a hand heard from them: a
+   seat that stopped is waited for at stage 0, the hand is given up on the stage's budget and opened again, and a client that
+   comes back finds a hand to sign.
+5. **A hand nothing was dealt in is given up when the other seat has opened the next one from that give-up.** After a
+   thirty-second line outage (`run080531-2`) the two seats were one hand apart and chased each other for the rest of the run:
+   one gave hand k up on the budget and opened k+1, the other finished k's stage 0 late from the re-sent copy, and each then
+   gave its hand up after the other had moved on. No chips are at stake before the deal, an abort's terminal follows from the
+   genesis (`Hand::genesis_if_given_up`), and the other seat's `HAND_INIT` names the parent it opened at -- so a seat inside
+   an undealt hand that sees the next one opened at exactly its own give-up gives up too, and the two open the same hand.
+   Heads-up only, where the other seat is the whole table; with certificates the aborts are shared.
+6. **What this does not do:** end a hand stuck on an absent seat before its stage budget or, once dealt, the table's hand
+   deadline (`S1-CZ`); or say anything heads-up that a certificate says at three seats.
 
 **Guard.** `app` (two tests), `storage::session` (one), `table::hand` (`Opening::adopt`'s test, rewritten for the majority of the
-others), and the runs named in the `S1-CX` row once measured.
+others; `heads_up_a_seat_that_stopped_is_still_required_next_hand`), and the runs named in the `S1-CX` row.

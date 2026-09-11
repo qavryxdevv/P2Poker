@@ -7747,6 +7747,27 @@ impl Hand {
             // exhaustive without a wildcard that could swallow a new phase.
             _ => return None,
         };
+        self.next_hand_with(terminal, stacks)
+    }
+
+    /// `S1-CX`: the genesis the next hand would open at if this hand were
+    /// given up now -- an abort's terminal is a function of this hand's
+    /// genesis and moves no chips, so the answer is known before the fact.
+    /// `None` once the hand is over: `next_hand` answers then.
+    pub fn genesis_if_given_up(&self) -> Option<Hash> {
+        if self.over() {
+            return None;
+        }
+        let terminal = crate::protocol::transcript::abort_terminal(
+            &self.open.table_id,
+            self.open.hand_id,
+            &self.open.genesis,
+        );
+        self.next_hand_with(terminal, self.mine.stacks.clone()).map(|o| o.genesis)
+    }
+
+    /// Hand `k+1` from a terminal and the stacks everybody holds at it.
+    fn next_hand_with(&self, terminal: Hash, stacks: Vec<Chips>) -> Option<Opening> {
         let stacks = &stacks;
         let alive: Vec<bool> = (0..usize::from(self.open.max_players))
             .map(|i| stacks.get(i).copied().unwrap_or(0) > 0)
@@ -7901,6 +7922,31 @@ impl Hand {
         // would be required and not dealt in -- correction 4 of READMISSION.md.
         // `∩ ALIVE` applies to them as to everybody.
         let mut required = required;
+        // `S1-CX`: at two seats there is no table without both, and no
+        // certificate to say a seat is absent (D-007). Both seats with chips
+        // stay required, whatever this hand heard from them: a seat that
+        // stopped is waited for at stage 0, the hand is given up on the
+        // stage's budget and opened again, and a client that comes back
+        // finds a hand to sign. Measured before this: one missed hand and
+        // the survivor had *no next hand to deal* (`run080025-2`).
+        if self.open.required.len() == 2 {
+            required = self
+                .open
+                .required
+                .iter()
+                .copied()
+                .filter(|s| alive.get(usize::from(*s)).copied().unwrap_or(false))
+                .collect();
+            for s in &required {
+                let i = usize::from(*s);
+                if let Some(g) = grace.get_mut(i) {
+                    *g = GRACE_HANDS;
+                }
+                if let Some(p) = present_run.get_mut(i) {
+                    *p = 0;
+                }
+            }
+        }
         for seat in &self.returned {
             let s = usize::from(*seat);
             if alive.get(s).copied().unwrap_or(false) && !required.contains(seat) {
@@ -13700,5 +13746,21 @@ mod tests {
         let nb = b.next_hand().expect("on both");
         assert!(!na.required.contains(&2), "{:?}", na.required);
         assert_eq!(na.genesis, nb.genesis, "one GENESIS(k+1)");
+    }
+
+    /// `S1-CX`, heads-up: a seat that stopped is still required in the next
+    /// hand -- there is no table without both -- and the genesis that hand
+    /// opens at is known before this one is given up.
+    #[test]
+    fn heads_up_a_seat_that_stopped_is_still_required_next_hand() {
+        let keys = [key(10), key(11)];
+        let (mut a, _from_a) = Hand::open(opening(0), &keys[0], NOW, 30_000).unwrap();
+        // Seat 1 never says anything in this hand.
+        let foreseen = a.genesis_if_given_up().expect("a hand not yet over can say");
+        assert!(a.abort_now(Abort::Deadline, &keys[0], NOW + 30_000).is_ok());
+        let next = a.next_hand().expect("two seats with chips is a table");
+        assert_eq!(next.required, vec![0, 1], "the seat that stopped is still waited for");
+        assert_eq!(next.genesis, foreseen, "and the give-up opened exactly where it was foreseen");
+        assert!(a.genesis_if_given_up().is_none(), "nothing to foresee once the hand is over");
     }
 }

@@ -25,6 +25,11 @@ use crate::net::node::NodeEvent;
 /// `S1-CS`: the table window's view, derived here so it can be tested.
 mod table;
 
+/// The window's own stale-link threshold, for the opponent question.
+fn app_link_stale_ms() -> u64 {
+    table::LINK_STALE_MS
+}
+
 /// The founder's reason codes, §4.3, in the words a player can act on.
 ///
 /// Two of the eight are never sent by this client because nothing in the corpus
@@ -648,9 +653,12 @@ impl AppState {
                 }
             }
             NodeEvent::Carrier { seen, want } => {
-                // `S1-CX`: heads-up, the group is the opponent.
-                if want > 0 && self.heads_up_opponent().is_some() {
-                    self.opponent_reachable(seen >= 1);
+                // `S1-CX`: heads-up, the group is the opponent. An empty group
+                // starts an episode; a count of seats *seen* ends none, because
+                // the group went on seeing a seat that had stopped
+                // (`run080025-2`) -- only a ping does.
+                if want > 0 && seen == 0 && self.heads_up_opponent().is_some() {
+                    self.opponent_reachable(false);
                 }
                 let now = self.last_sweep_ms;
                 if let Some(s) = self.seated.as_mut() {
@@ -923,6 +931,17 @@ impl AppState {
     /// Called every frame and on every sweep: an opponent unreachable for
     /// `OPPONENT_GONE_MS` is said once, in D-007's words.
     pub fn tick_opponent(&mut self) {
+        // A link reading gone stale is an opponent this client cannot reach,
+        // whether or not the connection was ever seen to close.
+        if let Some(opponent) = self.heads_up_opponent() {
+            let stale = self
+                .links
+                .get(&opponent)
+                .is_some_and(|(_, at)| at.elapsed().as_millis() as u64 > app_link_stale_ms());
+            if stale {
+                self.opponent_reachable(false);
+            }
+        }
         let due = self
             .opponent_gone
             .as_ref()
@@ -1531,7 +1550,14 @@ mod tests {
         s.apply(NodeEvent::Carrier { seen: 0, want: 1 });
         assert!(s.opponent_gone.as_ref().is_some_and(|g| !g.dismissed), "the group empty is a new episode, asked anew");
         s.apply(NodeEvent::Carrier { seen: 1, want: 1 });
-        assert!(s.opponent_gone.is_none());
+        assert!(s.opponent_gone.is_some(), "a seat the group merely sees is not one this client can reach");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30) });
+        assert!(s.opponent_gone.is_none(), "a ping is");
+        // And a reading gone stale -- no ping for longer than the window doubts --
+        // starts an episode by itself.
+        s.links.insert(1, (Some(30), std::time::Instant::now() - std::time::Duration::from_millis(app_link_stale_ms() + 1_000)));
+        s.tick_opponent();
+        assert!(s.opponent_gone.is_some(), "a stale link is an unreachable opponent");
     }
 
     /// At three seats the certificate does the work (D-023) and no question is
