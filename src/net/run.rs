@@ -1223,6 +1223,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     //
     // Every name it touches is declared above this point, which is what makes
     // `macro_rules!` hygiene resolve them to the loop's own bindings.
+    // `S1-CW`: what every road that can end a hand does once its frames are
+    // out -- the abort said once, the boundary armed, this client's clock
+    // read. `hand_event!` below does it for an incoming event; the stall
+    // tick's vote and its replay of held events can end the hand too, and
+    // did so with nobody told: a certificate at a cryptographic stage ends
+    // the hand before any card is out, and both survivors of a three-seat
+    // table sat on the ended hand for the rest of the run.
+    macro_rules! hand_may_have_ended {
+        ($h:expr) => {{
+            if let Some(why) = $h.aborted().filter(|_| !abort_reported) {
+                abort_reported = true;
+                act_by = None;
+                let _ = events.send(NodeEvent::Warning(abort_words(why))).await;
+                arm_boundary!(std::time::Duration::from_millis(800));
+            }
+            let report = report_hand($h, &events, &mut turn_reported).await;
+            if let Some(end) = report.ended {
+                arm_boundary!(end.pause());
+            }
+            act_by = hurry(report.clock.apply(act_by, $h.action_deadline()), autoplay);
+        }};
+    }
     macro_rules! hand_event {
         ($h:expr, $bytes:expr) => {{
             use crate::table::hand::Failed;
@@ -1346,112 +1368,103 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             })
                                             .await;
                                     }
-                                    // The cards, once and once only. They
-                                    // are read from a complete set of
-                                    // verified shares or not at all, so
-                                    // there is no partial state to report.
-                                            // How the count stands. A vote that is
-                                    // never counted is the quietest way
-                                    // this machinery can fail: everybody
-                                    // says their clock ran out and nothing
-                                    // happens.
-                                    if let Some((subject, held, need, d)) = $h.take_tally() {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(format!(
-                                                "seat {subject} @{}: {held}/{need} agree",
-                                                short_hash(&d)
-                                            )))
-                                            .await;
-                                    }
-                                    // **`S1-BB`: the carrier at the moment of
-                                    // the accusation, not at the moment of
-                                    // holding back.** One line per vote this
-                                    // client casts, whatever the bit says, so
-                                    // the sample is not conditioned on the
-                                    // lever the bit itself sets.
-                                    for (subject, mid, long_past) in $h.take_vote_carrier() {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(format!(
-                                                "voted about seat {subject}: mid-delivery {mid}, \
-                                                 long past {long_past}"
-                                            )))
-                                            .await;
-                                    }
-                                    // A seat the table acted for, once.
-                                    if let Some((seat, what)) = $h.take_certified_action() {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(format!(
-                                                "the table acted for seat {seat}: {what:?}"
-                                            )))
-                                            .await;
-                                    }
-                                    if let Some(why) =
-                                        $h.aborted().filter(|_| !abort_reported)
-                                    {
-                                        abort_reported = true;
-                                        act_by = None;
-                                        // **Which abort, and not one
-                                        // sentence for all of them.** This
-                                        // said "a peer ended the hand on
-                                        // its own deadline" whatever
-                                        // happened, and since `cause = 2`
-                                        // exists that is sometimes simply
-                                        // untrue: a hand ended by a proof
-                                        // that does not hold ends in
-                                        // seconds, names a seat, and has
-                                        // nothing to do with anybody's
-                                        // clock. A player told the wrong
-                                        // reason looks for the wrong fault.
-                                        let said = match why {
-                                            crate::table::hand::Abort::BadShuffle { seat } => {
-                                                format!(
-                                                    "seat {seat}'s shuffle proof does not hold; the hand is void and every stack is restored"
-                                                )
-                                            }
-                                            crate::table::hand::Abort::BadReveal { seat } => {
-                                                format!(
-                                                    "seat {seat}'s reveal proof does not hold against the committed deck; the hand is void and every stack is restored"
-                                                )
-                                            }
-                                            crate::table::hand::Abort::Told { cause: 2 } => {
-                                                "a peer proved a shuffle did not hold; the hand is void and every stack is restored".into()
-                                            }
-                                            crate::table::hand::Abort::Told { cause: 3 } => {
-                                                "a peer proved a reveal share did not hold; the hand is void and every stack is restored".into()
-                                            }
-                                            _ => "a peer ended the hand on its own deadline; every stack is restored".into(),
-                                        };
-                                        let _ = events
-                                            .send(NodeEvent::Warning(said))
-                                            .await;
-                                        arm_boundary!(std::time::Duration::from_millis(800));
-                                    }
-                                    let report =
-                                        report_hand($h, &events, &mut turn_reported).await;
-                                    if let Some(end) = report.ended {
-                                        arm_boundary!(end.pause());
-                                    }
-                                    act_by = hurry(report.clock.apply(act_by, $h.action_deadline()), autoplay);
-                                    if let Some(cards) = $h.cards().filter(|_| !cards_reported) {
-                                        cards_reported = true;
-                                        let _ = events
-                                            .send(NodeEvent::CardsDealt {
-                                                hand_id: $h.hand_id(),
-                                                seats: $h.init().dealt_in.clone(),
-                                            })
-                                            .await;
-                                        let _ = events
-                                            .send(NodeEvent::HoleCards {
-                                                hand_id: $h.hand_id(),
-                                                cards: [cards[0].index(), cards[1].index()],
-                                            })
-                                            .await;
-                                    }
                                 } else {
                                     let _ = events
                                         .send(NodeEvent::HandWaiting {
                                             hand_id: $h.hand_id(),
                                             seats: $h.waiting_for(),
+                                        })
+                                        .await;
+                                }
+                                // `S1-CW`: from here on for a dealt hand and an
+                                // undealt one alike. A certificate at a cryptographic
+                                // stage ends the hand before any card is out, and
+                                // everything below -- the abort said, the boundary
+                                // armed, the clock stopped -- used to run only under
+                                // `dealt()`: both survivors of a three-seat table sat
+                                // on a hand that had ended, saying *waiting for seats*
+                                // with nobody named, for the rest of the run
+                                // (`run195623-3`, `run131730-3`).
+                                // The cards, once and once only. They
+                                // are read from a complete set of
+                                // verified shares or not at all, so
+                                // there is no partial state to report.
+                                        // How the count stands. A vote that is
+                                // never counted is the quietest way
+                                // this machinery can fail: everybody
+                                // says their clock ran out and nothing
+                                // happens.
+                                if let Some((subject, held, need, d)) = $h.take_tally() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "seat {subject} @{}: {held}/{need} agree",
+                                            short_hash(&d)
+                                        )))
+                                        .await;
+                                }
+                                // **`S1-BB`: the carrier at the moment of
+                                // the accusation, not at the moment of
+                                // holding back.** One line per vote this
+                                // client casts, whatever the bit says, so
+                                // the sample is not conditioned on the
+                                // lever the bit itself sets.
+                                for (subject, mid, long_past) in $h.take_vote_carrier() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "voted about seat {subject}: mid-delivery {mid}, \
+                                             long past {long_past}"
+                                        )))
+                                        .await;
+                                }
+                                // A seat the table acted for, once.
+                                if let Some((seat, what)) = $h.take_certified_action() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "the table acted for seat {seat}: {what:?}"
+                                        )))
+                                        .await;
+                                }
+                                if let Some(why) =
+                                    $h.aborted().filter(|_| !abort_reported)
+                                {
+                                    abort_reported = true;
+                                    act_by = None;
+                                    // **Which abort, and not one
+                                    // sentence for all of them.** This
+                                    // said "a peer ended the hand on
+                                    // its own deadline" whatever
+                                    // happened, and since `cause = 2`
+                                    // exists that is sometimes simply
+                                    // untrue: a hand ended by a proof
+                                    // that does not hold ends in
+                                    // seconds, names a seat, and has
+                                    // nothing to do with anybody's
+                                    // clock. A player told the wrong
+                                    // reason looks for the wrong fault.
+                                    let said = abort_words(why);
+                                    let _ = events
+                                        .send(NodeEvent::Warning(said))
+                                        .await;
+                                    arm_boundary!(std::time::Duration::from_millis(800));
+                                }
+                                let report =
+                                    report_hand($h, &events, &mut turn_reported).await;
+                                if let Some(end) = report.ended {
+                                    arm_boundary!(end.pause());
+                                }
+                                act_by = hurry(report.clock.apply(act_by, $h.action_deadline()), autoplay);
+                                if let Some(cards) = $h.cards().filter(|_| !cards_reported) {
+                                    cards_reported = true;
+                                    let _ = events
+                                        .send(NodeEvent::CardsDealt {
+                                            hand_id: $h.hand_id(),
+                                            seats: $h.init().dealt_in.clone(),
+                                        })
+                                        .await;
+                                    let _ = events
+                                        .send(NodeEvent::HoleCards {
+                                            hand_id: $h.hand_id(),
+                                            cards: [cards[0].index(), cards[1].index()],
                                         })
                                         .await;
                                 }
@@ -5217,6 +5230,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         .await;
                 }
                 publish_hand(replayed, &mut swarm, &mut said, &tox_sink);
+                // `S1-CW`: a held certificate replayed here can end the hand too.
+                hand_may_have_ended!(h);
                 let Some(h) = hand.as_mut() else { continue };
 
                 // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
@@ -5350,6 +5365,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events.send(NodeEvent::Warning(n)).await;
                         }
                         publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                        // `S1-CW`: this vote completed a certificate whose stage a
+                        // peer's copy had opened, and the hand ended here -- before
+                        // any card was out, at the client that voted last. Said and
+                        // succeeded like a hand ended by any event; before this the
+                        // founder of a three-seat table sat on an ended hand for the
+                        // rest of the run (`run195623-3`, `run131730-3`).
+                        hand_may_have_ended!(h);
                     }
                     Ok(_) => {
                         if let Some(n) = h.take_cert_note() {
@@ -9809,6 +9831,34 @@ async fn hand_one_may_open(
 /// whose turn, the pot, the board's length, whether the hand is over, and
 /// (`S1-CS`) every stack and every bet.
 type HandReport = (Option<u8>, u64, u64, bool, Vec<u64>, Vec<u64>);
+
+/// The sentence a player is told when a hand ends without a settlement.
+///
+/// **Which abort, and not one sentence for all of them.** This said "a peer
+/// ended the hand on its own deadline" whatever happened, and since
+/// `cause = 2` exists that is sometimes simply untrue: a hand ended by a
+/// proof that does not hold ends in seconds, names a seat, and has nothing
+/// to do with anybody's clock. A player told the wrong reason looks for the
+/// wrong fault. A function since `S1-CW`: the stall tick's vote can end the
+/// hand too, and says the same.
+fn abort_words(why: crate::table::hand::Abort) -> String {
+    use crate::table::hand::Abort;
+    match why {
+        Abort::BadShuffle { seat } => {
+            format!("seat {seat}'s shuffle proof does not hold; the hand is void and every stack is restored")
+        }
+        Abort::BadReveal { seat } => format!(
+            "seat {seat}'s reveal proof does not hold against the committed deck; the hand is void and every stack is restored"
+        ),
+        Abort::Told { cause: 2 } => {
+            "a peer proved a shuffle did not hold; the hand is void and every stack is restored".into()
+        }
+        Abort::Told { cause: 3 } => {
+            "a peer proved a reveal share did not hold; the hand is void and every stack is restored".into()
+        }
+        _ => "a peer ended the hand on its own deadline; every stack is restored".into(),
+    }
+}
 
 async fn report_hand(
     h: &crate::table::hand::Hand,
