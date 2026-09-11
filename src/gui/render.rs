@@ -276,28 +276,11 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     let mut action = LobbyAction::None;
 
     // `S1-CR`: an unfinished game on record is asked about before anything
-    // else, in the middle of the window, and the two answers are the two
-    // things the node can do with the record.
+    // else, in the middle of the window; the table window asks too.
     if let Some(u) = view.unfinished.as_ref() {
-        egui::Window::new(RichText::new("Unfinished game").size(19.0).strong())
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ui.ctx(), |ui| {
-                ui.label(format!(
-                    "You left a game unfinished at {} -- seat {}, stack {}, last at hand #{}.",
-                    u.table_name, u.seat, u.stack, u.hand_id
-                ));
-                ui.label("Rejoin it? The table deals you back in at the next hand boundary.");
-                ui.horizontal(|ui| {
-                    if ui.button("Rejoin").clicked() {
-                        action = LobbyAction::Resume { key: u.key, stack: u.stack };
-                    }
-                    if ui.button("Forget it").clicked() {
-                        action = LobbyAction::Forget;
-                    }
-                });
-            });
+        if let Some(what) = unfinished_window(ui.ctx(), u) {
+            action = what;
+        }
     }
     // `S1-CS`: the small window that says a join is in progress, with a
     // clock on it, and says why when it ends badly.
@@ -386,6 +369,33 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
         action = what;
     }
 
+    action
+}
+
+/// `S1-CR`: the question about an unfinished game, drawn in whichever window
+/// the player is looking at -- the lobby's and the table's both. The two
+/// answers are the two things the node can do with the record.
+pub fn unfinished_window(ctx: &egui::Context, u: &crate::app::Unfinished) -> Option<LobbyAction> {
+    let mut action = None;
+    egui::Window::new(RichText::new("Unfinished game").size(19.0).strong())
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.label(format!(
+                "You left a game unfinished at {} -- seat {}, stack {}, last at hand #{}.",
+                u.table_name, u.seat, u.stack, u.hand_id
+            ));
+            ui.label("Rejoin it? The table deals you back in at the next hand boundary.");
+            ui.horizontal(|ui| {
+                if ui.button("Rejoin").clicked() {
+                    action = Some(LobbyAction::Resume { key: u.key, stack: u.stack });
+                }
+                if ui.button("Forget it").clicked() {
+                    action = Some(LobbyAction::Forget);
+                }
+            });
+        });
     action
 }
 

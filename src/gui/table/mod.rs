@@ -144,6 +144,9 @@ pub struct TableView {
     pub hand_over: bool,
     /// `S1-CS`: what the seats have said, the muted ones left out.
     pub chat: Vec<TableChatLine>,
+    /// `S1-CX`: how long the heads-up opponent has been unreachable, once
+    /// it is worth asking about and until the player has answered.
+    pub opponent_gone_s: Option<u64>,
 }
 
 /// The smallest table window the client allows, which every row of the
@@ -219,6 +222,10 @@ pub enum TableAction {
     /// `S1-CS`: stop hearing this seat, or hear it again. Local.
     Mute(SeatIdx),
     Unmute(SeatIdx),
+    /// `S1-CX`: the heads-up opponent is gone and the player waits.
+    KeepWaiting,
+    /// `S1-CX`: the heads-up opponent is gone and the player leaves.
+    LeaveTable,
 }
 
 /// `S1-CS`: a line of table chat as the window shows it.
@@ -340,6 +347,37 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
                 }
             });
         });
+
+    // `S1-CX`: the heads-up opponent cannot be reached. D-007: nobody can
+    // fold a hand for them, so the player is asked the one question that
+    // has an answer -- wait, or leave.
+    if let Some(secs) = view.opponent_gone_s {
+        egui::Window::new(RichText::new("Opponent disconnected").size(19.0).strong())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(360.0);
+                ui.label(format!("Your opponent has been unreachable for {secs} s."));
+                ui.label(
+                    RichText::new("Heads-up, nobody can fold a hand for an absent player: the table waits for them.")
+                        .color(theme::TEXT_DIM),
+                );
+                ui.label("Wait for them to come back, or end the game and leave the table.");
+                ui.horizontal(|ui| {
+                    if ui.button("Wait").clicked() {
+                        action = TableAction::KeepWaiting;
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("Leave the table").color(theme::TEXT)).fill(theme::DANGER))
+                        .clicked()
+                    {
+                        action = TableAction::LeaveTable;
+                    }
+                });
+            });
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+    }
 
     egui::Panel::bottom("table-actions")
         .frame(
@@ -954,6 +992,7 @@ impl TableView {
             turn_id: 0,
             hand_over: false,
             chat: Vec::new(),
+            opponent_gone_s: None,
         }
     }
 }

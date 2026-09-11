@@ -24,6 +24,9 @@
 //!                                 certified out of a table
 //! p2p-poker --headless --resume   rejoin the unfinished session on record,
 //!                                 if there is one; the window asks instead
+//! p2p-poker --join N --resume     the same two in the window, for a scripted
+//!                                 run of it: sit at the first table called N,
+//!                                 answer *rejoin* without being asked
 //! ```
 //!
 //! `--renderer` is there to be overridden, not to be typed. The client draws
@@ -318,6 +321,7 @@ fn main() {
         settings,
     };
     let run = Run {
+        join: value_of("--join"),
         hosted,
         bounded,
         screen: if has("--table") {
@@ -334,7 +338,8 @@ fn main() {
     };
 
     if has("--headless") {
-        headless(player, run, value_of("--join"));
+        let join = run.join.clone();
+        headless(player, run, join);
         return;
     }
 
@@ -485,6 +490,7 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
         autoplay,
         stay_out,
         resume,
+        join: _,
         ..
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
@@ -734,6 +740,8 @@ struct Player {
 
 /// What this particular start is for: everything that came off the command line.
 struct Run {
+    /// `--join NAME`: sit at the first table of that name, in either mode.
+    join: Option<String>,
     hosted: Option<NodeCommand>,
     bounded: Option<u64>,
     screen: Screen,
@@ -757,6 +765,7 @@ fn windowed(player: Player, run: Run) -> Started {
         settings,
     } = player;
     let Run {
+        join,
         hosted,
         bounded,
         screen,
@@ -765,7 +774,7 @@ fn windowed(player: Player, run: Run) -> Started {
         port,
         autoplay,
         stay_out,
-        resume: _,
+        resume,
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     // The same headroom as the headless path, for the same reason.
@@ -897,6 +906,8 @@ fn windowed(player: Player, run: Run) -> Started {
             Ok(Box::new(Client {
                 state,
                 screen,
+                join,
+                resume,
                 table_closed: false,
                 ui: render::LobbyUi::new(settings),
                 table_ui: Default::default(),
@@ -1074,6 +1085,12 @@ enum Screen {
 struct Client {
     state: AppState,
     screen: Screen,
+    /// `--join NAME` in the window: sit at the first table of that name the
+    /// lobby shows, once, for a scripted run.
+    join: Option<String>,
+    /// `--resume` in the window: answer the question about an unfinished
+    /// game with *rejoin*, once, without being asked.
+    resume: bool,
     /// The player shut the table window. It does not re-open by itself until
     /// they sit down somewhere else, or ask for it.
     table_closed: bool,
@@ -1135,6 +1152,11 @@ impl Client {
         let view = self.table_view();
         let mut action = p2p_poker::gui::table::TableAction::None;
         let mut closed = false;
+        // `S1-CR`, `S1-CY`: the question about an unfinished game is asked
+        // here as well as in the lobby -- the player looking at the table
+        // window never saw the lobby's.
+        let unfinished = self.state.unfinished.clone();
+        let mut answered: Option<render::LobbyAction> = None;
 
         ctx.show_viewport_immediate(
             ViewportId::from_hash_of("p2p-poker-table"),
@@ -1153,12 +1175,20 @@ impl Client {
                     .show(ctx, |ui| {
                         action = p2p_poker::gui::table::draw(ui, &view, &mut self.table_ui);
                     });
+                if let Some(u) = unfinished.as_ref() {
+                    answered = render::unfinished_window(ctx, u);
+                }
                 if ctx.input(|i| i.viewport().close_requested()) {
                     closed = true;
                 }
             },
         );
 
+        match answered {
+            Some(render::LobbyAction::Resume { key, stack }) => self.resume_unfinished(key, stack),
+            Some(render::LobbyAction::Forget) => self.tell(NodeCommand::ForgetSession),
+            _ => {}
+        }
         if closed || matches!(action, p2p_poker::gui::table::TableAction::BackToLobby) {
             self.screen = Screen::Lobby;
             self.table_closed = true;
@@ -1196,6 +1226,15 @@ impl Client {
                 self.state.muted.remove(&seat);
                 None
             }
+            // `S1-CX`: the two answers to an unreachable heads-up opponent.
+            Ta::KeepWaiting => {
+                self.state.dismiss_opponent_gone();
+                None
+            }
+            Ta::LeaveTable => {
+                self.tell(NodeCommand::LeaveTable);
+                None
+            }
             Ta::None | Ta::BackToLobby => None,
         };
         if let Some(a) = played {
@@ -1207,6 +1246,24 @@ impl Client {
     /// the library so that every claim the window makes has a test (`S1-CS`).
     fn table_view(&self) -> p2p_poker::gui::table::TableView {
         self.state.table_view()
+    }
+
+    /// `S1-CR`: rejoin the unfinished game on record, from either window.
+    fn resume_unfinished(&mut self, key: [u8; 32], stack: u64) {
+        let name = self
+            .state
+            .unfinished
+            .as_ref()
+            .map(|u| u.table_name.clone())
+            .unwrap_or_else(|| short_key(&key));
+        self.state.begin_join(key, name, stack, None);
+        self.tell(NodeCommand::ResumeSession);
+        self.tell(NodeCommand::JoinTable {
+            key,
+            buyin: stack,
+            seat: None,
+            password: None,
+        });
     }
 
     fn tell(&mut self, command: NodeCommand) {
@@ -1240,6 +1297,35 @@ impl eframe::App for Client {
 
         // `S1-CS`: a join nobody answers is called failed on the clock.
         self.state.tick_join();
+        // `S1-CX`: an unreachable heads-up opponent is said once it is worth saying.
+        self.state.tick_opponent();
+        // `--resume` in the window: the question is answered *rejoin* once.
+        if self.resume {
+            if let Some(u) = self.state.unfinished.clone() {
+                self.resume = false;
+                self.resume_unfinished(u.key, u.stack);
+            }
+        }
+        // `--join NAME` in the window: the first table of that name, once.
+        if let Some(name) = self.join.clone() {
+            if self.state.seated.is_none() && self.state.joining.is_none() && self.state.unfinished.is_none() {
+                let found = self
+                    .state
+                    .lobby
+                    .tables()
+                    .find(|l| l.held.ad.table_name == name)
+                    .map(|l| (*l.key, l.held.ad.max_buyin));
+                if let Some((key, buyin)) = found {
+                    self.state.begin_join(key, name.clone(), buyin, None);
+                    self.tell(NodeCommand::JoinTable {
+                        key,
+                        buyin,
+                        seat: None,
+                        password: None,
+                    });
+                }
+            }
+        }
 
         if let Some(secs) = self.bounded {
             if self.started.elapsed() >= Duration::from_secs(secs) {
@@ -1324,22 +1410,7 @@ impl eframe::App for Client {
                         }
                     }
                     render::LobbyAction::LeaveTable => self.tell(NodeCommand::LeaveTable),
-                    render::LobbyAction::Resume { key, stack } => {
-                        let name = self
-                            .state
-                            .unfinished
-                            .as_ref()
-                            .map(|u| u.table_name.clone())
-                            .unwrap_or_else(|| short_key(&key));
-                        self.state.begin_join(key, name, stack, None);
-                        self.tell(NodeCommand::ResumeSession);
-                        self.tell(NodeCommand::JoinTable {
-                            key,
-                            buyin: stack,
-                            seat: None,
-                            password: None,
-                        });
-                    }
+                    render::LobbyAction::Resume { key, stack } => self.resume_unfinished(key, stack),
                     render::LobbyAction::Forget => self.tell(NodeCommand::ForgetSession),
                     render::LobbyAction::Say(text) => self.tell(NodeCommand::SayInLobby(text)),
                     render::LobbyAction::Save(mut settings) => {

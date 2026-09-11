@@ -189,6 +189,8 @@ pub struct AppState {
     pub links: std::collections::BTreeMap<u8, (Option<u64>, std::time::Instant)>,
     /// `S1-CS`: the join in progress, if one is.
     pub joining: Option<Joining>,
+    /// `S1-CX`: the heads-up opponent this client cannot reach, if any.
+    pub opponent_gone: Option<OpponentGone>,
 }
 
 impl Seat {
@@ -285,6 +287,23 @@ pub struct Joining {
 /// Longer than the node's own request timeout plus the time a founder has
 /// been measured to take to become dialable.
 pub const JOIN_WAIT_MS: u64 = 90_000;
+
+/// `S1-CX`: a heads-up opponent this client cannot reach, since when,
+/// whether the log has said so and whether the player has answered.
+///
+/// D-007: at two seats nobody can fold a hand for an absent player and
+/// the remedy is to leave the table -- so the window asks, once per
+/// episode, and a headless client writes the same sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpponentGone {
+    pub since: std::time::Instant,
+    pub said: bool,
+    pub dismissed: bool,
+}
+
+/// How long an opponent must be unreachable before it is said: longer
+/// than a reconnection takes, shorter than a player's patience.
+pub const OPPONENT_GONE_MS: u64 = 15_000;
 
 /// `S1-CR`: what the window asks about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,6 +451,9 @@ impl AppState {
             }
             NodeEvent::SeatLink { seat, rtt_ms } => {
                 self.links.insert(seat, (rtt_ms, std::time::Instant::now()));
+                if self.heads_up_opponent() == Some(seat) {
+                    self.opponent_reachable(rtt_ms.is_some());
+                }
             }
             NodeEvent::HandBegan {
                 hand_id,
@@ -626,6 +648,10 @@ impl AppState {
                 }
             }
             NodeEvent::Carrier { seen, want } => {
+                // `S1-CX`: heads-up, the group is the opponent.
+                if want > 0 && self.heads_up_opponent().is_some() {
+                    self.opponent_reachable(seen >= 1);
+                }
                 let now = self.last_sweep_ms;
                 if let Some(s) = self.seated.as_mut() {
                     s.heard = Some(seen);
@@ -639,6 +665,7 @@ impl AppState {
             }
             NodeEvent::Swept { now_ms } => {
                 self.last_sweep_ms = now_ms;
+                self.tick_opponent();
                 // A player who has stopped saying they are here stops being
                 // here. There is no goodbye message, because a client that is
                 // switched off does not send one.
@@ -858,6 +885,7 @@ impl AppState {
     /// window reopened used to show the last game's cards at the next
     /// table, because the hand was never cleared.
     fn forget_the_table(&mut self) {
+        self.opponent_gone = None;
         self.clock_for(None);
         self.table_chat.clear();
         self.muted.clear();
@@ -866,6 +894,65 @@ impl AppState {
         self.waiting_for.clear();
         self.last_stacks.clear();
         self.strength = None;
+    }
+
+    /// `S1-CX`: the other seat, when this table is heads-up and set.
+    fn heads_up_opponent(&self) -> Option<u8> {
+        let s = self.seated.as_ref()?;
+        if s.session.is_none() || s.roster.len() != 2 {
+            return None;
+        }
+        let me = s.seat?;
+        s.roster.iter().map(|(n, _, _)| *n).find(|n| *n != me)
+    }
+
+    /// A reading about the heads-up opponent: reachable clears the episode,
+    /// unreachable starts one if none is open.
+    fn opponent_reachable(&mut self, reachable: bool) {
+        if reachable {
+            self.opponent_gone = None;
+        } else if self.opponent_gone.is_none() {
+            self.opponent_gone = Some(OpponentGone {
+                since: std::time::Instant::now(),
+                said: false,
+                dismissed: false,
+            });
+        }
+    }
+
+    /// Called every frame and on every sweep: an opponent unreachable for
+    /// `OPPONENT_GONE_MS` is said once, in D-007's words.
+    pub fn tick_opponent(&mut self) {
+        let due = self
+            .opponent_gone
+            .as_ref()
+            .filter(|g| !g.said && g.since.elapsed().as_millis() as u64 >= OPPONENT_GONE_MS)
+            .map(|g| g.since.elapsed().as_secs());
+        if let Some(secs) = due {
+            if let Some(g) = self.opponent_gone.as_mut() {
+                g.said = true;
+            }
+            self.note(format!(
+                "your opponent has been unreachable for {secs} s; heads-up, nobody can fold a hand for them (D-007): wait for them, or leave the table"
+            ));
+        }
+    }
+
+    /// The player chose to wait: the question is not asked again for this
+    /// episode. A new one -- the opponent back, then gone again -- asks anew.
+    pub fn dismiss_opponent_gone(&mut self) {
+        if let Some(g) = self.opponent_gone.as_mut() {
+            g.dismissed = true;
+        }
+    }
+
+    /// How long the opponent has been unreachable, once it is worth asking
+    /// about and until the player has answered.
+    pub fn opponent_gone_for_s(&self) -> Option<u64> {
+        self.opponent_gone
+            .as_ref()
+            .filter(|g| !g.dismissed && g.since.elapsed().as_millis() as u64 >= OPPONENT_GONE_MS)
+            .map(|g| g.since.elapsed().as_secs())
     }
 
     /// `S1-CS`: the window asked to sit down; the small window says so until
@@ -1412,5 +1499,54 @@ mod tests {
         assert!(s.joining.as_ref().unwrap().failed.as_deref().unwrap().contains("no answer"));
         s.joining = None;
         assert!(s.view().joining.is_none());
+    }
+
+    /// `S1-CX`: a heads-up opponent that cannot be reached is said once and
+    /// asked about until the player answers; a reading that reaches them ends
+    /// the episode, and a new one asks anew.
+    #[test]
+    fn a_heads_up_opponent_that_cannot_be_reached_is_said_and_asked_about() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+        assert!(s.opponent_gone.is_some(), "the closed connection opens an episode");
+        assert_eq!(s.opponent_gone_for_s(), None, "not worth asking about yet");
+        s.tick_opponent();
+        assert!(!s.log.iter().any(|l| l.contains("unreachable")), "nor saying");
+
+        s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
+        assert!(s.opponent_gone_for_s().is_some_and(|secs| secs >= 16));
+        s.tick_opponent();
+        let line = s.log.back().unwrap().clone();
+        assert!(line.contains("unreachable") && line.contains("D-007"), "{line}");
+        s.tick_opponent();
+        assert_eq!(s.log.iter().filter(|l| l.contains("unreachable")).count(), 1, "said once");
+
+        s.dismiss_opponent_gone();
+        assert_eq!(s.opponent_gone_for_s(), None, "the player chose to wait");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40) });
+        assert!(s.opponent_gone.is_none(), "a ping ends the episode");
+        s.apply(NodeEvent::Carrier { seen: 0, want: 1 });
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| !g.dismissed), "the group empty is a new episode, asked anew");
+        s.apply(NodeEvent::Carrier { seen: 1, want: 1 });
+        assert!(s.opponent_gone.is_none());
+    }
+
+    /// At three seats the certificate does the work (D-023) and no question is
+    /// asked, whatever the links say.
+    #[test]
+    fn a_three_seat_table_asks_no_such_question() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster {
+            key: [7u8; 32],
+            seats: vec![(0, "a".into(), 1_000), (1, "b".into(), 1_000), (2, "c".into(), 1_000)],
+        });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None });
+        s.apply(NodeEvent::Carrier { seen: 0, want: 2 });
+        assert!(s.opponent_gone.is_none());
     }
 }
