@@ -613,6 +613,12 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     }
                     let before = state.emitted;
                     state.apply(event);
+                    // `S1-CX`: the opponent question's clock runs on every event
+                    // here, as it runs on every frame in the window. The sweep
+                    // alone is thirty seconds apart, and an opponent back inside
+                    // that window was never said to have been away
+                    // (`run083626-2`), so the log could not show the question.
+                    state.tick_opponent();
                     let fresh = usize::try_from(state.emitted - before).unwrap_or(0);
                     for line in state.log.iter().skip(state.log.len().saturating_sub(fresh)) {
                         println!("{line}");

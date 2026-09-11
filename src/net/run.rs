@@ -759,6 +759,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let delay_since = tokio::time::Instant::now();
+    let _ = PROCESS_STARTED.get_or_init(std::time::Instant::now);
     let mut delayed_certs: Vec<(tokio::time::Instant, Vec<u8>)> = Vec::new();
     let mut releasing_certs = false;
     let mut delay_said = false;
@@ -7296,6 +7297,27 @@ fn seat_of_peer(f: Option<&Formation>, peer: &PeerId) -> Option<u8> {
     f?.roster().seats().iter().find(|e| e.peer_id == bytes).map(|e| e.seat)
 }
 
+/// When this node loop started, for the fault switches that count from it.
+static PROCESS_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// fault-harness: whether `P2P_POKER_STOP_AT_OPEN_AFTER` names a second this
+/// loop has reached. Read once; `false` in every build without the feature.
+fn stop_at_open_due() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static AFTER: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let after = AFTER.get_or_init(|| {
+        std::env::var("P2P_POKER_STOP_AT_OPEN_AFTER")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    match (after, PROCESS_STARTED.get()) {
+        (Some(s), Some(since)) => since.elapsed().as_secs() >= *s,
+        _ => false,
+    }
+}
+
 /// fault-harness: whether `P2P_POKER_STOP_ON_TURN_AFTER` names a second this
 /// loop has reached. Read once; `false` in every build without the feature.
 fn stop_on_turn_due(since: tokio::time::Instant) -> bool {
@@ -7643,6 +7665,14 @@ async fn begin_hand_with(
                     seats: h.waiting_for(),
                 })
                 .await;
+            // fault-harness: `P2P_POKER_STOP_AT_OPEN_AFTER=<s>` stops this process
+            // at its first hand open at or after that second -- a client gone
+            // while the next hand waits at stage 0 (`run080025-2`'s shape), which
+            // is what the two-seat rule and the give-up convergence are about.
+            if stop_at_open_due() {
+                println!("fault-harness: stopping at the open of hand #{}, as P2P_POKER_STOP_AT_OPEN_AFTER asked", h.hand_id());
+                std::process::exit(0);
+            }
             *hand = Some(h);
         }
         Err(e) => {
