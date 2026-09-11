@@ -824,7 +824,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // set by `ResumeSession` and cleared when this seat is dealt in again,
     // when the session is forgotten, or when the rejoin gives up.
     let mut resume: Option<crate::storage::session::Record> =
-        crate::storage::session::load(&profile_dir);
+        crate::storage::session::load_recent(&profile_dir, super::node::now_unix_ms());
     let mut resuming = false;
     let mut resume_since_ms: u64 = 0;
     let mut resume_last_peer_ms: Option<u64> = None;
@@ -4659,7 +4659,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let occupied = f.roster().len();
                         let newer = resume_inits
                             .iter()
-                            .any(|(hid, copies)| *hid > current && copies.len() * 2 > occupied);
+                            .any(|(hid, copies)| *hid > current && copies.len() * 2 > occupied.saturating_sub(1));
                         if newer {
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
@@ -4737,7 +4737,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .iter()
                                 .rev()
                                 .find(|(hid, copies)| {
-                                    copies.len() * 2 > occupied
+                                    copies.len() * 2 > occupied.saturating_sub(1)
                                         && (copies.len() >= occupied
                                             || resume_early.iter().any(|(h, _)| h == *hid))
                                 })
@@ -4746,7 +4746,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(base) = crate::table::hand::Opening::from_formation(f, hid) {
                                     let now = super::node::now_unix_ms();
                                     match crate::table::hand::Opening::adopt(base, &copies) {
-                                        Ok(o) => {
+                                        Ok(mut o) => {
+                                            // `S1-CX`: heads-up there is no certificate to
+                                            // come back by (D-007), and the one other seat
+                                            // is the whole table. A returning seat that is
+                                            // in the roster with chips signs the hand it
+                                            // adopts and is dealt in, as a member; the
+                                            // other seat's copy names what it plays for.
+                                            if f.roster().len() == 2 {
+                                                let me = o.my_seat;
+                                                if o.seats.iter().any(|(s, _, st)| *s == me && *st > 0)
+                                                    && !o.required.contains(&me)
+                                                {
+                                                    o.required.push(me);
+                                                    o.required.sort_unstable();
+                                                }
+                                            }
                                             let deadline = o.crypto_step_timeout_ms;
                                             let seat = o.my_seat;
                                             match crate::table::hand::Hand::open(o, &app_key, now, deadline) {

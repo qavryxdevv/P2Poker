@@ -8054,6 +8054,9 @@ RESUME_GIVE_UP_MS               = 600 000       (client liveness, D-029: how lon
   advertisement is gone and no peer of the session has answered; while the
   advert is up the attempt never ends on a timer, and a finished session is
   learned from the founder's refusal.)
+RESUME_RECORD_MAX_AGE_MS        = 1 800 000     (client liveness, D-031: how old a
+  session record may be and still be offered at start; an older one names a
+  game that is long over and is dropped instead of asked about.)
 MAX_RETAINED_HAND_RECORDS       = 4 096         (§5.3's retained hand record, the
   per-hand (hand_id, was_solitary, p, checkpoint8_state_hash) tuple §4.0 step 10b
   evaluates a stale-hand event against, where p is P(hand_id - 1) and was_solitary

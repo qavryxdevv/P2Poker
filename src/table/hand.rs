@@ -428,7 +428,12 @@ impl Opening {
         else {
             return Err(Failed::NotYet);
         };
-        if signers.len() * 2 <= occupied.len() {
+        // A strict majority of the occupied seats **other than the adopter's**:
+        // the adopter has signed nothing, so it is not a seat that could have
+        // agreed. Heads-up that is the one other seat, which is what lets a
+        // restarted client come back to a two-seat table at all (`S1-CX`).
+        let others = occupied.iter().filter(|s| **s != base.my_seat).count();
+        if signers.len() * 2 <= others {
             return Err(Failed::NotYet);
         }
         if body.stacks.len() != base.seats.len() {
@@ -13519,21 +13524,25 @@ mod tests {
     fn adoption_needs_a_strict_majority_of_the_roster_at_one_genesis() {
         let (hands, keys) = a_table_after_hand_one();
         let (copies, _) = hand_two_copies(&hands, &keys);
-        assert!(matches!(Opening::adopt(adopter_base(), &copies[..2]), Err(Failed::NotYet)), "two of four is not a majority");
+        // Two of the three OTHER seats is a majority; one of three is not.
+        assert!(Opening::adopt(adopter_base(), &copies[..2]).is_ok(), "two of the three others carry it");
+        assert!(matches!(Opening::adopt(adopter_base(), &copies[..1]), Err(Failed::NotYet)), "one of three is not a majority");
         assert!(matches!(Opening::adopt(adopter_base(), &[]), Err(Failed::NotYet)));
         // A member that derived another genesis signs a copy nobody else holds.
         let mut astray = hands[1].next_hand().unwrap();
         astray.genesis = [9; 32];
         let (_, sends) = Hand::open(astray, &keys[1], NOW, 30_000).unwrap();
         let forked = vec![copies[0].clone(), bytes_of(&sends).remove(0), copies[2].clone()];
-        assert!(matches!(Opening::adopt(adopter_base(), &forked), Err(Failed::NotYet)), "two at one genesis, one at another: no majority of four");
+        assert!(Opening::adopt(adopter_base(), &forked).is_ok(), "two at one genesis, one at another: the two carry it");
+        let split = vec![copies[0].clone(), bytes_of(&sends).remove(0)];
+        assert!(matches!(Opening::adopt(adopter_base(), &split), Err(Failed::NotYet)), "one at each genesis: no majority of three");
         // A stranger's copy, well-formed and signed, is not a roster seat's.
         let table_id = hands[0].table_id();
         let opened = chained::open_in_hand(&copies[0], FRAME_CAP, EventType::HandInit, &table_id, 2).unwrap();
         let body: HandInit = chained::payload(&opened, HAND_INIT_CAP).unwrap();
         let slot = Slot { table_id, hand_id: 2, sequence: 0, previous_event_hash: opened.envelope.previous_event_hash };
         let stranger = chained::seal(EventType::HandInit, &slot, &body, &key(99), NOW, 30_000, HAND_INIT_CAP).unwrap();
-        assert!(matches!(Opening::adopt(adopter_base(), &[copies[0].clone(), copies[1].clone(), stranger.clone()]), Err(Failed::NotYet)));
+        assert!(matches!(Opening::adopt(adopter_base(), &[copies[0].clone(), stranger.clone()]), Err(Failed::NotYet)), "a stranger's copy does not count");
         let with_stranger = vec![copies[0].clone(), copies[1].clone(), copies[2].clone(), stranger];
         assert!(Opening::adopt(adopter_base(), &with_stranger).is_ok(), "the three roster copies still carry it");
     }

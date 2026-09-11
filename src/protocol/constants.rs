@@ -82,6 +82,13 @@ pub const RETURN_GRACE_MS: u64 = 6_000;
 /// liveness parameter, not a wire rule.
 pub const RESUME_GIVE_UP_MS: u64 = 600_000;
 
+/// How old a session record may be and still be offered at start
+/// (`S1-CY`): thirty minutes from the last boundary it recorded. A client
+/// started later than that is not asked about a game that is, in every
+/// case measured, long over; the record is dropped instead. A client
+/// liveness parameter, not a wire rule.
+pub const RESUME_RECORD_MAX_AGE_MS: u64 = 1_800_000;
+
 /// How many reconciliation rounds the checkpoint band has room for.
 ///
 /// `PROTOCOL.md` §4.9: round `r` takes `BOUNDARY_CHECKPOINT_BASE + 2r` for its

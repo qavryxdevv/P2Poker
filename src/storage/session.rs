@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use minicbor::{Decode, Encode};
 
-use crate::protocol::constants::RESUME_GIVE_UP_MS;
+use crate::protocol::constants::{RESUME_GIVE_UP_MS, RESUME_RECORD_MAX_AGE_MS};
 
 /// The record's own version, so a later shape can refuse an older one rather
 /// than misread it.
@@ -108,6 +108,18 @@ pub fn load(dir: &Path) -> Option<Record> {
     let bytes = std::fs::read(session_path(dir)).ok()?;
     let record: Record = minicbor::decode(&bytes).ok()?;
     if record.version != RECORD_VERSION {
+        return None;
+    }
+    Some(record)
+}
+
+/// The record, if there is one this version can read and it is recent
+/// enough to act on (`S1-CY`): a record older than `RESUME_RECORD_MAX_AGE_MS`
+/// names a game that is long over, so it is dropped rather than offered.
+pub fn load_recent(dir: &Path, now_ms: u64) -> Option<Record> {
+    let record = load(dir)?;
+    if now_ms.saturating_sub(record.written_unix_ms) > RESUME_RECORD_MAX_AGE_MS {
+        let _ = forget(dir);
         return None;
     }
     Some(record)
@@ -234,5 +246,21 @@ mod tests {
         assert!(!give_up(t0 + ten + 5_000, false, Some(t0 + 10_000), t0), "a peer seen after the start restarts the count");
         assert!(give_up(t0 + ten + 10_000, false, Some(t0 + 10_000), t0), "and the count runs out ten minutes after that peer");
         assert!(!give_up(t0 + ten - 1, false, Some(t0 - ten), t0), "a peer seen BEFORE the attempt began does not shorten it");
+    }
+
+    /// `S1-CY`: a record written half an hour ago or more is not offered and
+    /// is gone from the profile; a fresh one is offered as before.
+    #[test]
+    fn a_stale_record_is_dropped_rather_than_offered() {
+        let dir = scratch("stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = a_record();
+        r.written_unix_ms = 1_700_000_000_000;
+        save(&dir, &r).unwrap();
+        assert!(load_recent(&dir, r.written_unix_ms + RESUME_RECORD_MAX_AGE_MS).is_some(), "at the limit it is still offered");
+        assert_eq!(load(&dir).as_ref(), Some(&r));
+        assert!(load_recent(&dir, r.written_unix_ms + RESUME_RECORD_MAX_AGE_MS + 1).is_none(), "past it, not");
+        assert_eq!(load(&dir), None, "and the record is gone, so the next start does not ask either");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
