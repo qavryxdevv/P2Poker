@@ -829,6 +829,13 @@ impl AppState {
                 }
             }
             NodeEvent::TableRefused { reason } => self.note(format!("advert refused: {reason}")),
+            // `D-040`: withdrawn by its founder's own answer, so it leaves the
+            // screen now rather than when its advert would have expired.
+            NodeEvent::TableGone { key, why } => {
+                if self.lobby.remove(&key) {
+                    self.note(format!("table {} gone: {why}", crate::gui::lobby::short_key(&key)));
+                }
+            }
             // Kept out of the log by default. Most dials fail on an open DHT and
             // a log full of them buries the lines that mean something — but the
             // count is carried, because "most dials fail" and "this client is
@@ -1434,6 +1441,35 @@ mod tests {
         let line = s.view().status.summary();
         assert!(!line.contains("cannot carry a hand"), "{line}");
         assert_eq!(line, "Looking for peers");
+    }
+
+    /// `D-040`: a table whose founder no longer offers it leaves the screen the
+    /// moment the node says so, long before its advert would have expired.
+    #[test]
+    fn a_table_its_founder_withdrew_leaves_the_screen_at_once() {
+        let mut s = AppState::new();
+        let now = 1_700_000_000_000u64;
+        let ad = crate::net::lobby::TableAd::rated_sng(
+            "Riverside".into(),
+            [9u8; 32],
+            vec![1, 2, 3],
+            now,
+        );
+        let key = [7u8; 32];
+        s.apply(NodeEvent::TableSeen {
+            key,
+            ad: Box::new(ad),
+            params_hash: [1u8; 32],
+            advert_hash: [2u8; 32],
+        });
+        assert_eq!(s.view().tables.len(), 1, "the table arrived");
+        s.apply(NodeEvent::TableGone { key, why: "its founder no longer offers it".into() });
+        assert_eq!(s.view().tables.len(), 0, "and it is gone at once");
+        assert!(s.log.iter().any(|l| l.contains("gone: its founder no longer offers it")), "{:?}", s.log);
+        // Said once: a second word about a table already gone is nothing.
+        let before = s.log.len();
+        s.apply(NodeEvent::TableGone { key, why: "again".into() });
+        assert_eq!(s.log.len(), before);
     }
 
     /// A table nobody re-advertises must leave the interface's own lobby, and

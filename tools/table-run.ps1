@@ -43,6 +43,21 @@
 [CmdletBinding()]
 param(
     [ValidateRange(2, 10)][int]$Seats = 6,
+    # **The lobby measurement (D-040).** `-HostSeats <n>` is the founder's own
+    # `--seats` when it should differ from the number of nodes; `-NoJoin` makes
+    # every node but the founder a WATCHER -- it joins nothing and only watches
+    # the lobby, so the table stays open (*waiting for players*) for the whole
+    # run; `-Watchers <k>` adds k more such watchers, numbered after the seats;
+    # `-LeaveTableAt <s>` has the founder leave its table at that second, as the
+    # window's button would (`P2P_POKER_LEAVE_TABLE_AT`, needs `--features
+    # fault-harness`). A watcher's log says when the table reached it (*table X
+    # (name)*, and *heard by asking* when the question carried it rather than the
+    # mesh) and when it went (*withdrawn: its founder no longer offers it*, or
+    # *expired*). `tools/fold-lobby.py` reads those lines.
+    [ValidateRange(0, 10)][int]$HostSeats = 0,
+    [switch]$NoJoin,
+    [ValidateRange(0, 8)][int]$Watchers = 0,
+    [ValidateRange(0, 3600)][int]$LeaveTableAt = 0,
     [ValidateRange(30, 3600)][int]$Seconds = 300,
     [string]$Exe,
     [switch]$KeepLogs,
@@ -186,6 +201,10 @@ param(
 )
 # Comma or space: `-DropNodes 1,2` can reach a [string] parameter as "1 2".
 $droppers = @("$DropNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+# Not `$hostSeats`: PowerShell variable names are case-insensitive and that
+# would BE the parameter.
+$founderSeats = if ($HostSeats -gt 0) { $HostSeats } else { $Seats }
+$nodeCount = $Seats + $Watchers
 
 $ErrorActionPreference = 'Stop'
 
@@ -255,7 +274,7 @@ Write-Host ''
 # the half of the measurement that says WHERE a hand's time goes.
 $t0 = Get-Date
 $jobs = @()
-for ($i = 0; $i -lt $Seats; $i++) {
+for ($i = 0; $i -lt $nodeCount; $i++) {
     $profileDir = Join-Path $work "n$i"
     New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
         # **A stable identity per seat, because a fresh one is a permanent
@@ -315,17 +334,19 @@ for ($i = 0; $i -lt $Seats; $i++) {
     $stopAtHand = if ($dropping -and $DropAtHand -gt 0) { $DropAtHand } else { 0 }
     $nodeArgs = @('--headless', '--autoplay', '--for', "$mine", '--profile', $profileDir)
     if ($i -eq 0) {
-        $nodeArgs += @('--host', $table, '--seats', "$Seats")
-    } else {
+        $nodeArgs += @('--host', $table, '--seats', "$founderSeats")
+    } elseif ($i -lt $Seats -and -not $NoJoin) {
         $nodeArgs += @('--join', $table)
     }
+    # Otherwise a watcher: the lobby only, joining nothing.
+    $leaveAt = if ($LeaveTableAt -gt 0 -and $i -eq 0) { $LeaveTableAt } else { 0 }
 
     $diverge = if ($DivergeAt -gt 0 -and $i -eq $DivergeNode) { $DivergeAt } else { 0 }
     $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
     $stall = if ($StallJoin -gt 0 -and $i -eq $StallJoinNode) { $StallJoin } else { 0 }
     $mute = if ($MuteFor -gt 0 -and $i -eq $MuteNode) { $MuteFor } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt)
         if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
         if ($downAt -gt 0) {
             $env:P2P_POKER_LINK_DOWN_AT = "$downAt"
@@ -335,6 +356,7 @@ for ($i = 0; $i -lt $Seats; $i++) {
         if ($stopOnTurn -gt 0) { $env:P2P_POKER_STOP_ON_TURN_AFTER = "$stopOnTurn" }
         if ($stopAtOpen -gt 0) { $env:P2P_POKER_STOP_AT_OPEN_AFTER = "$stopAtOpen" }
         if ($stopAtHand -gt 0) { $env:P2P_POKER_STOP_AT_HAND = "$stopAtHand" }
+        if ($leaveAt -gt 0) { $env:P2P_POKER_LEAVE_TABLE_AT = "$leaveAt" }
         if ($mute -gt 0) {
             $env:P2P_POKER_MUTE_AT = "$muteAt"
             $env:P2P_POKER_MUTE_FOR = "$mute"
@@ -456,7 +478,11 @@ if (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $LeaverSeconds -eq 0) {
     }
 }
 
-Write-Host "$Seats nodes started; waiting up to $($Seconds + 60) s"
+if ($NoJoin -or $Watchers -gt 0) {
+    Write-Host "==> $($nodeCount - 1 - $(if ($NoJoin) { 0 } else { $Seats - 1 })) watcher(s) join nothing and only watch the lobby; the founder offers $founderSeats seat(s)"
+}
+if ($LeaveTableAt -gt 0) { Write-Host "==> n0 leaves its table at $LeaveTableAt s" }
+Write-Host "$nodeCount nodes started; waiting up to $($Seconds + 60) s"
 $null = Wait-Job -Job $jobs -Timeout ($Seconds + 60)
 
 $stillRunning = @($jobs | Where-Object { $_.State -eq 'Running' })
@@ -479,7 +505,7 @@ $jobs | Remove-Job -Force
 # tell a seat that played from one that did not, and this table is what says so.
 $inv = [System.Globalization.CultureInfo]::InvariantCulture
 $logs = @()
-for ($i = 0; $i -lt $Seats; $i++) { $logs += @{ Name = "n$i"; Path = (Join-Path $work "n$i.log") } }
+for ($i = 0; $i -lt $nodeCount; $i++) { $logs += @{ Name = "n$i"; Path = (Join-Path $work "n$i.log") } }
 if ($LeaverSeconds -gt 0) { $logs += @{ Name = 'nR'; Path = (Join-Path $work 'nR.log') } }
 if (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $LeaverSeconds -eq 0) {
     foreach ($dn in $droppers) { $logs += @{ Name = "n$dn-again"; Path = (Join-Path $work "n$dn-again.log") } }

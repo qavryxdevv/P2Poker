@@ -138,6 +138,9 @@ pub enum NodeEvent {
     },
     /// An advert was refused, with the reason as text for the log.
     TableRefused { reason: String },
+    /// A table this client listed is gone before its advert expired: its
+    /// founder answered a lobby question (§7.5, D-040) without it.
+    TableGone { key: [u8; 32], why: String },
     /// AutoNAT decided.
     Reachability { public: bool },
     /// The router opened a port, or would not.
@@ -492,6 +495,7 @@ impl NodeEvent {
             | Self::LeftTable { .. }
             // The lobby list and the counters above it.
             | Self::TableSeen { .. }
+            | Self::TableGone { .. }
             | Self::PokerPeer { .. }
             // The status line, which is a claim about whether this client can
             // play at all.

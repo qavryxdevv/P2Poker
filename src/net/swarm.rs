@@ -53,6 +53,7 @@ use libp2p::{
 };
 
 use super::joinrpc::JoinCodec;
+use super::snapshot::SnapshotCodec;
 use crate::protocol::constants::{
     GOSSIP_MAX_TRANSMIT, IDLE_CONNECTION_TIMEOUT_MS, LOBBY_CHAT_TOPIC, LOBBY_TOPIC,
     MDNS_QUERY_INTERVAL_MS,
@@ -115,6 +116,10 @@ pub const RELAY_MAX_CIRCUITS_PER_PEER: usize = 4;
 /// is long enough for a relayed round trip and short enough that a player is not
 /// left looking at a button that appears to have done nothing.
 pub const JOIN_RPC_TIMEOUT_MS: u64 = 30_000;
+/// How long a lobby question (§7.5) waits for its answer. Short: the answer
+/// is one advert or none, and an unanswered question is asked again at the
+/// next housekeeping tick anyway.
+pub const SNAPSHOT_RPC_TIMEOUT_MS: u64 = 10_000;
 
 
 // ---------------------------------------------------------------------------
@@ -363,6 +368,13 @@ pub struct PokerBehaviour {
     /// peers who are not yet at a table together: there is no mesh to carry it,
     /// and an unanswered request has to become a timeout rather than silence.
     pub join: request_response::Behaviour<JoinCodec>,
+    /// The lobby snapshot RPC (§7.5): one question, one answer, on
+    /// `/p2p-poker/lobby-snapshot/1`.
+    ///
+    /// Asked of every poker peer, because the mesh's own subscription
+    /// exchange happens once per peer and does not always happen at all
+    /// (`S1-DK`, D-040): a table's advert must not depend on it.
+    pub snapshot: request_response::Behaviour<SnapshotCodec>,
     /// Local-network discovery.
     ///
     /// Not an optimisation. Two clients on one LAN get each other's **external**
@@ -604,6 +616,15 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                     )],
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_millis(JOIN_RPC_TIMEOUT_MS)),
+                ),
+                snapshot: request_response::Behaviour::with_codec(
+                    SnapshotCodec,
+                    [(
+                        super::snapshot::protocol(),
+                        request_response::ProtocolSupport::Full,
+                    )],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_millis(SNAPSHOT_RPC_TIMEOUT_MS)),
                 ),
                 mem_limits: libp2p::memory_connection_limits::Behaviour::with_max_percentage(0.25),
                 upnp: libp2p::upnp::tokio::Behaviour::default(),

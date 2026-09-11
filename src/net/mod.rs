@@ -14,6 +14,7 @@ pub mod peerbook;
 pub mod portmap;
 pub mod relay;
 pub mod run;
+pub mod snapshot;
 pub mod streams;
 pub mod swarm;
 /// Where a table's game traffic goes when it rides Tox (D-019), and a stub of

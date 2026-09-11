@@ -585,6 +585,13 @@ impl Formation {
         &self.under.ad
     }
 
+    /// The advertisement this founder is offering right now, as the signed
+    /// bytes it last put on the wire -- what a lobby question (§7.5) is
+    /// answered with. `None` for a seat that is not the founder.
+    pub fn current_advert(&self) -> Option<Vec<u8>> {
+        self.founder.as_ref()?.issued.back().map(|i| i.event.clone())
+    }
+
     /// The parameter hash every later comparison is against.
     pub fn under_params(&self) -> Hash {
         self.under.params

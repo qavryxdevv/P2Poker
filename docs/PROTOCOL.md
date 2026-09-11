@@ -6473,9 +6473,13 @@ port materially helps everyone else (D-003).
 ### 7.5 Snapshot for a newly joined client
 
 `SPEC_CS.md` §3 requires a new client to request a snapshot of existing tables from
-several peers before relying on live GossipSub. This runs over
-`request_response::cbor` on `/p2p-poker/lobby-snapshot/1`, **not** over GossipSub,
-because a lobby with hundreds of tables would blow past any sane gossip frame.
+several peers before relying on live GossipSub. This runs as a request-response
+RPC on `/p2p-poker/lobby-snapshot/1` with the RPC codec's own framing -- a
+length-prefixed signed event each way, as the join RPC (§4.3), never a second
+encoding around a signature -- and **not** over GossipSub, because a lobby with
+hundreds of tables would blow past any sane gossip frame, and because the mesh is
+not to be relied on for it at all (below). Both messages are signed by the
+sender's application key.
 [LIBP2P §6]
 
 **`0x0104 LOBBY_SNAPSHOT_REQUEST`** — `n(0) max_tables: u16` (≤ 128),
@@ -6498,6 +6502,24 @@ Codec limits are set explicitly: `set_request_size_maximum(SNAPSHOT_REQ_MAX)` =
 1 024 and `set_response_size_maximum(SNAPSHOT_RESP_MAX)` = 262 144. The response
 fits by construction: `128 × 1 536 = 196 608` B plus array and envelope overhead.
 [LIBP2P §7]
+
+> **Asked of everybody, all the time -- normative, D-040 (`S1-DK`).** GossipSub tells
+> a peer what topics a client is on once, with their first connection, and a first
+> connection that did not carry that exchange leaves the founder deaf to a neighbour
+> that is listening for as long as any connection between them stays open: measured,
+> a founder whose every `publish` said *nobody subscribed* while the joiner sat
+> connected, subscribed and grafted to it. So the question is not for a newly
+> joined client alone. **A client asks every poker peer** -- one whose `identify`
+> carries this protocol's version -- the moment it is recognised and again every
+> `AD_REBROADCAST_MS` while it is connected. **A founder answers with the advert it
+> offers right now** (its own open table; a table that has dealt is not offered,
+> §7.3); any client may add adverts it holds, up to `SNAPSHOT_MAX_ADS`. The asker
+> takes every advert through §7.2's checklist as if it had come over gossip. **An
+> answer is also a withdrawal**: a table the asker lists whose `founder_peer_id` is
+> the answering peer and which the answer does not name is removed at once -- the
+> founder is the authority on what it offers -- rather than at `AD_TTL_MS`. A
+> responder answers at most one question per peer in five seconds; a question it
+> cannot read it does not answer.
 
 ### 7.6 Anti-spam
 

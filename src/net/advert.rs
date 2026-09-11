@@ -425,6 +425,17 @@ pub fn publish(
     .map_err(|_| "the signed event does not encode")
 }
 
+/// The table key an advert names, from its bytes alone: the envelope's
+/// sender. No signature is checked here -- the one use is to know WHICH
+/// table an answer to a lobby question (§7.5) spoke about when the store
+/// had already heard that copy (`NotNewer`) or this client's own rate limit
+/// refused it, so that the answer is not read as the founder withdrawing it.
+pub fn table_key_of(bytes: &[u8]) -> Option<[u8; 32]> {
+    let signed: SignedEvent = from_canonical(bytes, LOBBY_MSG_MAX).ok()?;
+    let envelope: EventBody = from_canonical(&signed.body, LOBBY_MSG_MAX).ok()?;
+    Some(envelope.sender_public_key)
+}
+
 /// Take an advert off the wire.
 ///
 /// `from_peer` is the GossipSub source, which is **not** the table key: a peer

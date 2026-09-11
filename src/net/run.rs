@@ -71,6 +71,7 @@ use crate::table::hand::Holding;
 use super::swarm::{CONNECTION_CEILING, MAX_CONNECTIONS, MIN_CONNECTIONS};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
 use super::joinwire::DISPLAY_NAME_MAX;
+use crate::protocol::constants::SNAPSHOT_MAX_ADS;
 use crate::protocol::constants::{
     RETURN_GRACE_MS,
     AD_TTL_MS, HAND_DEADLINE_CAP_MS, LOBBY_MSG_MAX, MAX_SEATS,
@@ -1030,6 +1031,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // whether it was one without asking `identify` about a peer already gone.
     let mut poker_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
+    // `D-040`, §7.5: the lobby questions this client has asked and not yet
+    // had answered, by request id, with the nonce the answer must carry and
+    // the peer it was asked of; and when each peer was last answered, so a
+    // peer asking every second costs one answer in five.
+    let mut snapshot_pending: std::collections::HashMap<
+        libp2p::request_response::OutboundRequestId,
+        ([u8; 32], libp2p::PeerId),
+    > = std::collections::HashMap::new();
+    let mut snapshot_answered: std::collections::HashMap<libp2p::PeerId, tokio::time::Instant> =
+        std::collections::HashMap::new();
 
     // When each lobby provider was last dialled, so a record for a client that
     // is long gone is not dialled every minute for ever.
@@ -1847,6 +1858,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // that hand's boundary (D-028); D-032 counts the return. Nothing of the
     // table's rests on anything dropped here: no other seat signed a frame
     // of the branch, or the branch would be the table.
+    // The player's own leave, from the window or from the fault knob below:
+    // the group, the topic, the table, every local fact, the record.
+    macro_rules! leave_table_now {
+        () => {{
+            // The Tox group goes with the table: dropping the handle tells
+            // the driver to leave and joins its thread, which flushes what it
+            // still holds -- the last message of a hand sits in that queue.
+            tox_sink.clear();
+            tox_group_said = false;
+            table_announces = 0;
+            if let Some(t) = table_topic.take() {
+                let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
+            }
+            table = None;
+            leave_the_table!();
+            dht_effort(&mut swarm, false);
+            // `S1-CR`: a seat that leaves by its own choice has no session to come back to.
+            let _ = crate::storage::session::forget(&profile_dir);
+            resume = None;
+            resuming = false;
+            let _ = events.send(NodeEvent::LeftTable {
+                why: "left the table".into(),
+            }).await;
+        }};
+    }
     macro_rules! rejoin_from_copies {
         ($theirs:expr, $mine:expr) => {{
             let dead: u64 = $mine;
@@ -1891,6 +1927,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             turn_reported = None;
             abort_reported = false;
             resuming = true;
+        }};
+    }
+    // `D-040`: ask one poker peer what it offers (§7.5). A fresh nonce per
+    // question; the answer is matched on it.
+    macro_rules! ask_lobby {
+        ($peer:expr) => {{
+            let p: libp2p::PeerId = $peer;
+            let now = super::node::now_unix_ms();
+            let mut nonce = [0u8; 32];
+            let _ = crate::security::rng::fill(&mut nonce);
+            if let Ok(bytes) = super::snapshot::ask(&app_key, nonce, now) {
+                let id = swarm.behaviour_mut().snapshot.send_request(&p, bytes);
+                snapshot_pending.insert(id, (nonce, p));
+            }
         }};
     }
     macro_rules! leave_the_table {
@@ -2141,6 +2191,158 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 adequate,
                             })
                             .await;
+                    }
+                    // `D-040`: a lobby question, or an answer to this client's.
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Snapshot(
+                        request_response::Event::Message { peer, message, .. },
+                    )) => {
+                        let now = super::node::now_unix_ms();
+                        match message {
+                            request_response::Message::Request { request, channel, .. } => {
+                                // One answer per peer in five seconds bounds what
+                                // answering costs; a question is cheap to ask.
+                                let recently = snapshot_answered
+                                    .get(&peer)
+                                    .is_some_and(|at| at.elapsed() < Duration::from_secs(5));
+                                if recently {
+                                    continue;
+                                }
+                                let Ok((ask, _asker)) = super::snapshot::open_ask(&request, now) else {
+                                    // A question this client cannot read is not answered.
+                                    continue;
+                                };
+                                snapshot_answered.insert(peer, tokio::time::Instant::now());
+                                // This client's own table while it is open: the founder
+                                // is the source of its advert, and a table that has dealt
+                                // is not offered (D-037).
+                                let mut adverts: Vec<Vec<u8>> = Vec::new();
+                                if let Some(f) = table.as_ref().filter(|f| f.is_founder() && !ever_dealt) {
+                                    if let Some(b) = f.current_advert() {
+                                        adverts.push(b);
+                                    }
+                                }
+                                adverts.truncate(usize::from(ask.max_tables).min(SNAPSHOT_MAX_ADS));
+                                let offered = adverts.len();
+                                if let Ok(bytes) = super::snapshot::tell(&app_key, ask.nonce, adverts, false, now) {
+                                    let _ = swarm.behaviour_mut().snapshot.send_response(channel, bytes);
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "lobby: answered {peer} with {offered} table(s) offered"
+                                        )))
+                                        .await;
+                                }
+                            }
+                            request_response::Message::Response { request_id, response } => {
+                                let Some((nonce, asked)) = snapshot_pending.remove(&request_id) else {
+                                    continue;
+                                };
+                                if asked != peer {
+                                    continue;
+                                }
+                                let (adverts, answered_at) = match super::snapshot::open_tell(&response, &nonce, now) {
+                                    Ok(a) => a,
+                                    Err(e) => {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "the lobby answer from {peer} could not be read: {e:?}"
+                                            )))
+                                            .await;
+                                        continue;
+                                    }
+                                };
+                                // **The responder is not trusted for anything** (§7.5):
+                                // every advert goes through the checklist an advert heard
+                                // over gossip goes through.
+                                let before: std::collections::HashSet<[u8; 32]> =
+                                    state.lobby.tables().map(|l| *l.key).collect();
+                                let from = peer_bytes(&peer);
+                                let mut named: Vec<[u8; 32]> = Vec::new();
+                                for bytes in &adverts {
+                                    match advert::receive(bytes, from, now, &mut state.limits, &mut state.lobby) {
+                                        Ok(key) => {
+                                            named.push(key);
+                                            if let Some(held) = state.lobby.get(&key) {
+                                                let name = held.ad.table_name.clone();
+                                                let _ = events
+                                                    .send(NodeEvent::TableSeen {
+                                                        key,
+                                                        ad: Box::new(held.ad.clone()),
+                                                        params_hash: held.params_hash,
+                                                        advert_hash: held.advert_hash,
+                                                    })
+                                                    .await;
+                                                if !before.contains(&key) {
+                                                    let _ = events
+                                                        .send(NodeEvent::Warning(format!(
+                                                            "lobby: table {} ({name}) heard by asking {peer}",
+                                                            short_hash(&key)
+                                                        )))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                        // Named all the same: a copy the store already holds
+                                        // (`NotNewer`, the re-advert that came over the mesh a
+                                        // moment earlier) or one this client's own limit refused
+                                        // is still the founder saying the table is open. Not
+                                        // counting it withdrew every table at the first tick
+                                        // after its re-advert (`run192317-3`, both watchers at
+                                        // 30.0 s).
+                                        Err(advert::NotAccepted::NotTaken(_)) | Err(advert::NotAccepted::RateLimited) => {
+                                            if let Some(key) = advert::table_key_of(bytes) {
+                                                named.push(key);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = events
+                                                .send(NodeEvent::Warning(format!(
+                                                    "an answer from {peer} carried an advert this client refused: {e:?}"
+                                                )))
+                                                .await;
+                                        }
+                                    }
+                                }
+                                // The other half of the answer: a founder that no longer
+                                // names a table this client lists from it has withdrawn it.
+                                // Only a table advertised BEFORE the answer, on the founder's
+                                // own clock: an answer older than the advert was made before
+                                // the table was set up and says nothing about it
+                                // (`run192317-3`: the first question beat the hosting by a
+                                // second, and its empty answer withdrew the table for 29 s).
+                                let pb = peer.to_bytes();
+                                let gone: Vec<([u8; 32], String)> = state
+                                    .lobby
+                                    .tables()
+                                    .filter(|l| {
+                                        l.held.ad.founder_peer_id == pb
+                                            && !named.contains(l.key)
+                                            && l.held.ad.timestamp_unix_ms < answered_at
+                                    })
+                                    .map(|l| (*l.key, l.held.ad.table_name.clone()))
+                                    .collect();
+                                for (key, name) in gone {
+                                    state.lobby.remove(&key);
+                                    let _ = events
+                                        .send(NodeEvent::TableGone {
+                                            key,
+                                            why: "its founder no longer offers it".into(),
+                                        })
+                                        .await;
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "lobby: table {} ({name}) withdrawn: its founder {peer} no longer offers it",
+                                            short_hash(&key)
+                                        )))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(PokerBehaviourEvent::Snapshot(
+                        request_response::Event::OutboundFailure { request_id, .. },
+                    )) => {
+                        // Asked again at the next tick; nothing to say.
+                        snapshot_pending.remove(&request_id);
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Join(
                         request_response::Event::Message { peer, message, .. },
@@ -2975,6 +3177,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events
                                 .send(NodeEvent::PokerPeer { peer: peer_id, gone: false })
                                 .await;
+                            // `D-040`: and ask it what it offers, now.
+                            ask_lobby!(peer_id);
                         }
 
                         let relays = info.protocols.contains(&libp2p::relay::HOP_PROTOCOL_NAME);
@@ -4329,26 +4533,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     NodeCommand::LeaveTable => {
-                        // The Tox group goes with the table. Dropping the handle
-                        // tells the driver to leave and joins its thread, which
-                        // flushes what it still holds - the last message of a hand
-                        // is exactly what sits in that queue.
-                        tox_sink.clear();
-                            tox_group_said = false;
-                            table_announces = 0;
-                        if let Some(t) = table_topic.take() {
-                            let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
-                        }
-                        table = None;
-                        leave_the_table!();
-                        dht_effort(&mut swarm, false);
-                        // `S1-CR`: a seat that leaves by its own choice has no session to come back to.
-                        let _ = crate::storage::session::forget(&profile_dir);
-                        resume = None;
-                        resuming = false;
-                        let _ = events.send(NodeEvent::LeftTable {
-                            why: "left the table".into(),
-                        }).await;
+                        leave_table_now!();
                     }
                 }
             }
@@ -4885,6 +5070,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // cryptographic ones are bounded per stage rather than per hand.
             _ = stall.tick() => {
                 let now = super::node::now_unix_ms();
+                // fault-harness: `P2P_POKER_LEAVE_TABLE_AT=<s>` leaves the table at
+                // that second, as the window's button would -- for measuring how
+                // the others' lobbies learn that a table is gone (D-040).
+                if table.is_some() && leave_table_due() {
+                    println!("fault-harness: leaving the table, as P2P_POKER_LEAVE_TABLE_AT asked");
+                    leave_table_now!();
+                }
                 // fault-harness: parked certificate copies that are due.
                 if !delayed_certs.is_empty() {
                     let at_now = tokio::time::Instant::now();
@@ -6508,6 +6700,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             _ = housekeeping.tick() => {
                 let now = super::node::now_unix_ms();
                 state.tick(now);
+                // `D-040`, §7.5: every `AD_REBROADCAST_MS`, ask every poker peer
+                // on the line what it offers. Bounded by the number of poker
+                // peers, which is small, and by one question per peer per tick.
+                {
+                    let peers: Vec<libp2p::PeerId> = poker_peers
+                        .iter()
+                        .copied()
+                        .filter(|p| swarm.is_connected(p))
+                        .take(SNAPSHOT_ASKS_PER_TICK)
+                        .collect();
+                    for p in peers {
+                        ask_lobby!(p);
+                    }
+                }
 
                 // **Who is actually on the line**, said once per housekeeping
                 // tick while there is a table.
@@ -7814,6 +8020,27 @@ fn stop_at_open_due() -> bool {
         _ => false,
     }
 }
+
+/// fault-harness: whether `P2P_POKER_LEAVE_TABLE_AT` names a second this loop
+/// has reached. Read once; `false` in every build without the feature.
+fn leave_table_due() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let at = AT.get_or_init(|| {
+        std::env::var("P2P_POKER_LEAVE_TABLE_AT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    match (at, PROCESS_STARTED.get()) {
+        (Some(s), Some(since)) => since.elapsed().as_secs() >= *s,
+        _ => false,
+    }
+}
+
+/// How many poker peers one housekeeping tick asks about their tables.
+const SNAPSHOT_ASKS_PER_TICK: usize = 32;
 
 /// fault-harness: whether `P2P_POKER_STOP_AT_HAND` names the hand whose open
 /// this is. Read once; `false` in every build without the feature.
