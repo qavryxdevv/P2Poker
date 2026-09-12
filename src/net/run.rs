@@ -667,6 +667,10 @@ struct TableRun {
     out_keys: std::collections::BTreeSet<[u8; 32]>,
     /// `D-047`: this client's own seat has been told it is out.
     out_told: bool,
+    /// `S1-EH`: whether another seat was ever on the line here, and whether
+    /// the last word about this client's own line was *nobody reachable*.
+    ever_on_line: bool,
+    nobody_said: bool,
     readmitted: Vec<u8>,
     /// `S1-BM`: the evidence a return vote is cast on, by boundary and by
     /// subject. Written by `boundary_event` (the subject's `PLAYER_SIT_IN`)
@@ -838,6 +842,8 @@ impl TableRun {
             out_words: Vec::new(),
             out_keys: std::collections::BTreeSet::new(),
             out_told: false,
+            ever_on_line: false,
+            nobody_said: false,
             readmitted: Vec::new(),
             sit_ins: SitIns::default(),
             resume,
@@ -1242,6 +1248,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // whether it was one without asking `identify` about a peer already gone.
     let mut poker_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
+    // `S1-EH`: this client's line to the Tox network as last said to the
+    // window (0 offline, 1 tcp, 2 udp); one instance, so one reading.
+    let mut tox_line_reported: Option<u64> = None;
     // `D-040`, §7.5: the lobby questions this client has asked and not yet
     // had answered, by request id, with the nonce the answer must carry and
     // the peer it was asked of; and when each peer was last answered, so a
@@ -6038,6 +6047,35 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                    // `S1-EH`: this client's own line to the Tox network, said on
+                    // change -- the window draws it over the felt while it is gone.
+                    if t.tox_sink.is_on_tox() {
+                        let line = t.tox_sink.tox_connection();
+                        if tox_line_reported != Some(line) {
+                            let before = tox_line_reported;
+                            tox_line_reported = Some(line);
+                            let how = match line {
+                                2 => "udp",
+                                1 => "tcp",
+                                _ => "offline",
+                            };
+                            let _ = events.send(NodeEvent::ToxLine { how }).await;
+                            // Said only past the client's start: the library says
+                            // *offline* until the DHT answers, which is nobody's line
+                            // going away.
+                            if line == 0 && before.is_some_and(|b| b > 0) {
+                                let _ = events
+                                    .send(NodeEvent::Warning(
+                                        "the Tox network is unreachable from here: the table's hands ride it, and nothing said here reaches the others until it is back".into(),
+                                    ))
+                                    .await;
+                            } else if line > 0 && before == Some(0) {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!("the Tox network is reachable again ({how})")))
+                                    .await;
+                            }
+                        }
+                    }
                     // `D-041`: every seat's link as the table's group knows it. On a
                     // Tox table the group carries the hand and the felt reads presence
                     // from it; a libp2p ping is a figure beside that reading, and a
@@ -6073,6 +6111,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     (e.seat, group, quiet_s)
                                 })
                                 .collect();
+                            // `S1-EH`: the group's reading of this client's own line,
+                            // faster than the library's verdict on its connection (a
+                            // 45 s cut never moved that, run202830-2): every other seat
+                            // off the line at once, once one was on it, is nobody
+                            // reachable from here. Said on change.
+                            let all_off = !fresh.is_empty() && fresh.iter().all(|(_, g, _)| !*g);
+                            if fresh.iter().any(|(_, g, _)| *g) {
+                                t.ever_on_line = true;
+                            }
+                            if t.ever_on_line && all_off != t.nobody_said {
+                                t.nobody_said = all_off;
+                                let _ = events
+                                    .send(NodeEvent::Warning(if all_off {
+                                        "no seat of the table can be reached from here: the line may be down".to_string()
+                                    } else {
+                                        "a seat of the table can be reached again from here".to_string()
+                                    }))
+                                    .await;
+                            }
                             for (seat, group, quiet_s) in fresh {
                                 let (changed, moved, again) = match t.link_said.get(&seat) {
                                     Some((g, q, at)) => (

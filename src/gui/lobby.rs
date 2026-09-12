@@ -290,6 +290,9 @@ pub struct NetworkStatus {
     pub dht_announced: bool,
     pub relay: Option<RelayStatus>,
     pub public: Option<bool>,
+    /// `S1-EH`: this client's line to the Tox network -- `udp`, `tcp` or
+    /// `offline`; `None` before any table rode it.
+    pub tox: Option<&'static str>,
     /// How many dials have failed.
     ///
     /// Counted rather than logged line by line: most dials fail on an open DHT,

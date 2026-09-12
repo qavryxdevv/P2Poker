@@ -163,6 +163,9 @@ pub struct TableView {
     /// `D-047`: this seat is out of the table for good -- said with the one
     /// thing left to do, closing the table.
     pub out_for_good: Option<String>,
+    /// `S1-EH`: a word over the felt about this client's own line, while it
+    /// is gone: which network is unavailable.
+    pub line: Option<String>,
 }
 
 /// The smallest table window the client allows, which every row of the
@@ -479,6 +482,30 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
             state.motion.observe(view, now);
             if let Some(a) = felt_and_people(ui, &l, view, &state.motion, now) {
                 action = a;
+            }
+            // `S1-EH`: this client's own line, over the felt while it is gone.
+            if let Some(line) = view.line.as_ref() {
+                let p = ui.painter();
+                let sentences: Vec<&str> = line.split(". ").collect();
+                let w = (area.width() * 0.72).max(340.0);
+                let h = 34.0 + 17.0 * sentences.len() as f32;
+                let rect = egui::Rect::from_center_size(
+                    egui::pos2(area.center().x, area.center().y - area.height() * 0.05),
+                    egui::vec2(w, h),
+                );
+                p.rect_filled(rect, 10.0, egui::Color32::from_black_alpha(205));
+                paint::centred(p, egui::pos2(rect.center().x, rect.top() + 16.0), "Line down", 16.0, theme::DANGER);
+                for (i, s) in sentences.iter().enumerate() {
+                    let text = if s.ends_with('.') { s.to_string() } else { format!("{s}.") };
+                    paint::centred(
+                        p,
+                        egui::pos2(rect.center().x, rect.top() + 36.0 + 17.0 * i as f32),
+                        &text,
+                        12.5,
+                        theme::TEXT,
+                    );
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
             }
             if state.motion.active(now) {
                 ui.ctx().request_repaint();
@@ -1128,6 +1155,7 @@ impl TableView {
             opponent_slow: false,
             opponent_left: false,
             out_for_good: None,
+            line: None,
         }
     }
 }

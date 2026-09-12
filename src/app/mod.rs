@@ -160,6 +160,7 @@ pub struct TableApp {
     pub opponent_gone: Option<OpponentGone>,
     pub opponent_was_reachable: bool,
     pub out_for_good: Option<String>,
+    pub ever_on_line: bool,
     pub opponent_returns: u8,
     pub opponent_out: bool,
     pub gone: std::collections::BTreeSet<u8>,
@@ -253,6 +254,9 @@ pub struct AppState {
     /// `D-047`: this seat is out of the table for good, and why; the window
     /// says so and holds the table until the player closes it.
     pub out_for_good: Option<String>,
+    /// `S1-EH`: whether any other seat has been on the line at this table
+    /// once -- before that, nobody reachable is a group still forming.
+    pub ever_on_line: bool,
     /// `D-032`: how many absences worth asking about ended with the
     /// opponent back; at `MAX_RETURNS` the next absence is final.
     pub opponent_returns: u8,
@@ -474,6 +478,7 @@ impl AppState {
         std::mem::swap(&mut self.opponent_gone, &mut other.opponent_gone);
         std::mem::swap(&mut self.opponent_was_reachable, &mut other.opponent_was_reachable);
         std::mem::swap(&mut self.out_for_good, &mut other.out_for_good);
+        std::mem::swap(&mut self.ever_on_line, &mut other.ever_on_line);
         std::mem::swap(&mut self.opponent_returns, &mut other.opponent_returns);
         std::mem::swap(&mut self.opponent_out, &mut other.opponent_out);
         std::mem::swap(&mut self.gone, &mut other.gone);
@@ -560,6 +565,17 @@ impl AppState {
             NodeEvent::Announced => {
                 self.status.dht_announced = true;
                 self.note("this client is listed in the public lobby".into());
+            }
+            // `S1-EH`: this client's own line to the Tox network, said on change.
+            NodeEvent::ToxLine { how } => {
+                let before = self.status.tox.replace(how);
+                // Noted past the client's start only: the library says *offline*
+                // until the DHT answers, which is nobody's line going away.
+                if how == "offline" && before.is_some_and(|b| b != "offline") {
+                    self.note("the Tox network is unreachable from here: the table's hands ride it".into());
+                } else if how != "offline" && before == Some("offline") && self.ever_on_line {
+                    self.note(format!("the Tox network is reachable again ({how})"));
+                }
             }
             NodeEvent::Reachability { public } => {
                 self.status.public = Some(public);
@@ -666,6 +682,9 @@ impl AppState {
                 // or when a ping answered; the group is the reading that
                 // matters where the hand rides it.
                 let reachable = rtt_ms.is_some() || group;
+                if group {
+                    self.ever_on_line = true;
+                }
                 self.links.insert(seat, (rtt_ms, group, quiet_s, std::time::Instant::now()));
                 // `D-035`: a reading from the table's group is a seat back in it.
                 if reachable {
@@ -1186,6 +1205,7 @@ impl AppState {
         self.opponent_gone = None;
         self.opponent_was_reachable = false;
         self.out_for_good = None;
+        self.ever_on_line = false;
         self.opponent_returns = 0;
         self.opponent_out = false;
         self.gone.clear();
@@ -1326,6 +1346,43 @@ impl AppState {
                 ));
             }
         }
+    }
+
+    /// `S1-EH`: what to say over the felt about this client's own line, if
+    /// anything: the Tox network gone (the library's own verdict), with the
+    /// lobby network's state beside it; or, before the library says so, a
+    /// table where nobody can be reached any more. Gone the moment the line
+    /// is back and a seat is heard.
+    pub fn line_message(&self) -> Option<String> {
+        let seated = self.seated.as_ref()?;
+        // Once a seat has been on the line here: before that the library's
+        // *offline* is the DHT still answering nobody, and the group's silence
+        // is a group still forming.
+        if !self.ever_on_line {
+            return None;
+        }
+        if self.status.tox == Some("offline") {
+            let lobby = if self.status.peers == 0 {
+                "The lobby network is unreachable too: the internet is down."
+            } else {
+                "The lobby network is still connected."
+            };
+            return Some(format!(
+                "No connection to the Tox network. The table's hands ride it: nothing said here reaches the others until it is back. {lobby}"
+            ));
+        }
+        if seated.session.is_none() || !self.ever_on_line || self.opponent_left {
+            return None;
+        }
+        let me = seated.seat?;
+        let others: Vec<u8> = seated.roster.iter().map(|(n, _, _)| *n).filter(|n| *n != me).collect();
+        if others.is_empty() {
+            return None;
+        }
+        let nobody = others
+            .iter()
+            .all(|n| self.links.get(n).is_some_and(|(_, group, _, _)| !*group));
+        nobody.then(|| "Nobody at the table can be reached: the line may be down.".to_string())
     }
 
     /// The player chose to wait: the question rests for `OPPONENT_ASK_AGAIN_MS`

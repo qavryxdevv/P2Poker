@@ -153,6 +153,11 @@ pub enum NodeEvent {
     TableGone { key: [u8; 32], why: String },
     /// AutoNAT decided.
     Reachability { public: bool },
+    /// `S1-EH`: this client's own line to the Tox network, the table's
+    /// carrier -- `udp`, `tcp` or `offline` -- said on change, so the window
+    /// can say over the felt which network is gone and take it down when
+    /// the line is back.
+    ToxLine { how: &'static str },
     /// The router opened a port, or would not.
     ///
     /// **Not** a statement about reachability. A router behind a carrier NAT
@@ -458,6 +463,7 @@ impl NodeEvent {
                 | NodeEvent::LobbyPeer(_)
                 | NodeEvent::LocalPeer(_)
                 | NodeEvent::Reachability { .. }
+                | NodeEvent::ToxLine { .. }
                 | NodeEvent::PortMapped { .. }
                 | NodeEvent::Announced
                 | NodeEvent::Swept { .. }
@@ -528,6 +534,7 @@ impl NodeEvent {
             // The status line, which is a claim about whether this client can
             // play at all.
             | Self::Reachability { .. }
+            | Self::ToxLine { .. }
             | Self::Reserved { .. }
             | Self::NoRelayFound { .. }
             // Both change a pane a player is looking at, and a line of chat

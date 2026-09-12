@@ -126,8 +126,10 @@ function Get-RunVerdict {
         # that is not confirmed and returns success anyway when there are none,
         # so a table can look complete and reach nobody. Transient during a
         # handshake; a finding when it is still true at the end of a run.
+        # S1-DZ (2026-09-12): the count seen is confirmed members plus this
+        # client itself, so the difference that matters is past one.
         if ($last -match 'group (\d+) seen/(\d+) confirmed/' -and
-            [int]$Matches[1] -gt [int]$Matches[2] -and $formed) {
+            [int]$Matches[1] -gt ([int]$Matches[2] + 1) -and $formed) {
             $verdicts += 'UNCONFIRMED-PEERS'
             $why += "$($Matches[1]) peers seen but only $($Matches[2]) confirmed at the end of the run; the group send path skips the difference"
         }
