@@ -366,6 +366,10 @@ pub enum NodeEvent {
     /// (`quit`) or by timing out. The seat is shown gone; heads-up a quit
     /// ends the game.
     SeatLeft { seat: u8, quit: bool },
+    /// `D-047`: this client's own seat is out of the table for good -- the
+    /// table's word about its fourth absence, verified. The window says so
+    /// and holds the table until the player closes it.
+    OutForGood { key: [u8; 32], why: String },
     /// A peer was found in the public lobby, through the DHT.
     ///
     /// Separate from [`LocalPeer`](NodeEvent::LocalPeer) on purpose. The two
@@ -516,6 +520,7 @@ impl NodeEvent {
             | Self::HandEnded { .. }
             | Self::JoinRefused { .. }
             | Self::LeftTable { .. }
+            | Self::OutForGood { .. }
             // The lobby list and the counters above it.
             | Self::TableSeen { .. }
             | Self::TableGone { .. }

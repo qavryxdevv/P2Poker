@@ -1034,8 +1034,13 @@ fn sweep_table(
     // key the roster holds, so no scan can say which seat a member is. A count
     // answers the only question the gate asks, and it is sound because the
     // group is PRIVATE and the founder the sole admin.
+    // `S1-DZ`: CONFIRMED members, this client among them -- never the
+    // library's peer count, which holds unconfirmed entries: an invitation
+    // half-way through its handshake, a dropped seat's old key re-added by
+    // the library's own reconnection. The founder dealt hand #1 at 17 s to a
+    // seat still handshaking (run192753-3), which never caught up.
     let seen = match t.group {
-        Some(g) => tox.peer_count(g),
+        Some(_) => 1 + t.confirmed.len(),
         None => 0,
     };
     // The friend connections that are up among the ones THIS table needs.

@@ -160,6 +160,9 @@ pub struct TableView {
     pub opponent_slow: bool,
     /// `D-035`: the opponent quit the table; the game is over.
     pub opponent_left: bool,
+    /// `D-047`: this seat is out of the table for good -- said with the one
+    /// thing left to do, closing the table.
+    pub out_for_good: Option<String>,
 }
 
 /// The smallest table window the client allows, which every row of the
@@ -240,6 +243,9 @@ pub enum TableAction {
     KeepWaiting,
     /// `S1-CX`: the heads-up opponent is gone and the player leaves.
     LeaveTable,
+    /// `D-047`: this seat is out of the table for good; the player closes
+    /// the table.
+    CloseOut,
 }
 
 /// `S1-CS`: a line of table chat as the window shows it.
@@ -423,6 +429,29 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
                 });
             });
         ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+    }
+
+    // `D-047`: this seat is out of the table for good -- said once, with the
+    // one thing left to do.
+    if let Some(why) = view.out_for_good.as_ref() {
+        egui::Window::new(RichText::new("Out of the game").size(19.0).strong())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(400.0);
+                ui.label(
+                    "You were removed from this table after your fourth absence: your connection dropped too often, and the table plays on without you.",
+                );
+                ui.label(RichText::new("Your game at this table is over for good.").strong());
+                ui.label(RichText::new(why.as_str()).color(theme::TEXT_DIM).small());
+                if ui
+                    .add(egui::Button::new(RichText::new("Close the table").color(theme::TEXT)).fill(theme::DANGER))
+                    .clicked()
+                {
+                    action = TableAction::CloseOut;
+                }
+            });
     }
 
     egui::Panel::bottom("table-actions")
@@ -1098,6 +1127,7 @@ impl TableView {
             opponent_out: false,
             opponent_slow: false,
             opponent_left: false,
+            out_for_good: None,
         }
     }
 }

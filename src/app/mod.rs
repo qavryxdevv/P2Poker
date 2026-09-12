@@ -45,6 +45,7 @@ fn refusal(code: u16) -> &'static str {
         6 => "banned",
         7 => "capabilities do not match",
         8 => "already seated",
+        9 => "this seat was removed after its fourth absence; the game at this table is over for good (D-047)",
         _ => "no reason this client understands",
     }
 }
@@ -158,6 +159,7 @@ pub struct TableApp {
     pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, Option<u64>, std::time::Instant)>,
     pub opponent_gone: Option<OpponentGone>,
     pub opponent_was_reachable: bool,
+    pub out_for_good: Option<String>,
     pub opponent_returns: u8,
     pub opponent_out: bool,
     pub gone: std::collections::BTreeSet<u8>,
@@ -248,6 +250,9 @@ pub struct AppState {
     /// group, not an absence: a game used to begin with a return spent and
     /// the question asked while the other seat was handshaking.
     pub opponent_was_reachable: bool,
+    /// `D-047`: this seat is out of the table for good, and why; the window
+    /// says so and holds the table until the player closes it.
+    pub out_for_good: Option<String>,
     /// `D-032`: how many absences worth asking about ended with the
     /// opponent back; at `MAX_RETURNS` the next absence is final.
     pub opponent_returns: u8,
@@ -468,6 +473,7 @@ impl AppState {
         std::mem::swap(&mut self.links, &mut other.links);
         std::mem::swap(&mut self.opponent_gone, &mut other.opponent_gone);
         std::mem::swap(&mut self.opponent_was_reachable, &mut other.opponent_was_reachable);
+        std::mem::swap(&mut self.out_for_good, &mut other.out_for_good);
         std::mem::swap(&mut self.opponent_returns, &mut other.opponent_returns);
         std::mem::swap(&mut self.opponent_out, &mut other.opponent_out);
         std::mem::swap(&mut self.gone, &mut other.gone);
@@ -1104,6 +1110,12 @@ impl AppState {
                 }
                 self.note(format!("the founder says no: {}", refusal(reason)));
             }
+            // `D-047`: this seat is out of the table for good. The table is held
+            // for the window to say so; leaving is the player's click.
+            NodeEvent::OutForGood { key: _, why } => {
+                self.out_for_good = Some(why.clone());
+                self.note(why);
+            }
             NodeEvent::LeftTable { why } => {
                 self.forget_the_table();
                 self.seated = None;
@@ -1173,6 +1185,7 @@ impl AppState {
     fn forget_the_table(&mut self) {
         self.opponent_gone = None;
         self.opponent_was_reachable = false;
+        self.out_for_good = None;
         self.opponent_returns = 0;
         self.opponent_out = false;
         self.gone.clear();
@@ -1571,11 +1584,12 @@ mod tests {
     /// player nothing at all.
     #[test]
     fn every_reason_code_has_words() {
-        for code in 1..=8u16 {
+        // `D-047`: code 9 is the seat out for good.
+        for code in 1..=9u16 {
             assert_ne!(refusal(code), "no reason this client understands");
         }
         assert_eq!(refusal(0), "no reason this client understands");
-        assert_eq!(refusal(9), "no reason this client understands");
+        assert_eq!(refusal(10), "no reason this client understands");
     }
 
     #[test]

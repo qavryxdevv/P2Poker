@@ -126,6 +126,9 @@ pub enum RejectReason {
     /// at `TABLE_READY`. Same disposition as `Banned` and for the same reason.
     CapabilityMismatch = 7,
     AlreadySeated = 8,
+    /// `D-047`: the seat is out of this table for good, after its fourth
+    /// absence; no request from that key sits here again.
+    OutForGood = 9,
 }
 
 impl RejectReason {

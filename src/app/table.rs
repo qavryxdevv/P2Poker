@@ -146,6 +146,7 @@ impl AppState {
             opponent_out: self.opponent_out,
             opponent_slow: self.opponent_gone.as_ref().is_some_and(|g| g.slow),
             opponent_left: self.opponent_left,
+            out_for_good: self.out_for_good.clone(),
             chat: self
                 .table_chat
                 .iter()

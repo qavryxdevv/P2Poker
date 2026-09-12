@@ -725,6 +725,14 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     if matches!(&event, NodeEvent::LeftTable { why } if why == "left the table") {
                         join = None;
                     }
+                    // `D-047`: a seat out of a table for good does not ask for it
+                    // again -- told by the table's word, or refused with the reason
+                    // when it asked from its record (run195328-3 asked twice more).
+                    if matches!(&event, NodeEvent::OutForGood { .. })
+                        || matches!(&event, NodeEvent::JoinRefused { reason } if *reason == 9)
+                    {
+                        join = None;
+                    }
                     // What the log had before, so only new lines are printed.
                     // Most events add none — a re-broadcast this client already
                     // holds, a peer count — and printing `log.back()` after
@@ -1465,6 +1473,14 @@ impl Client {
             }
             Ta::LeaveTable => {
                 self.tell(NodeCommand::LeaveTable);
+                None
+            }
+            // `D-047`: out of the table for good; the player closes it, for good.
+            Ta::CloseOut => {
+                self.confirm_exit = None;
+                self.tell(NodeCommand::LeaveTable);
+                self.screen = Screen::Lobby;
+                self.table_closed = true;
                 None
             }
             Ta::None | Ta::Exit => None,

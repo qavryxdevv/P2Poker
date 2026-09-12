@@ -154,6 +154,28 @@ pub struct Ask {
 
 /// §7.5's `LOBBY_SNAPSHOT_RESPONSE` body: `n(0) request_nonce`, `n(1)
 /// adverts`, each a complete signed `LOBBY_TABLE_AD`, `n(2) truncated`.
+/// `D-047`: the table's word about a seat out of it for good -- the
+/// certificate of its fourth absence, so the seat's own client can verify
+/// it against the table's roster from the bytes alone and needs nobody's
+/// authority for it, the founder's included.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
+pub struct OutWord {
+    #[cbor(n(0), with = "minicbor::bytes")]
+    pub table_id: [u8; 32],
+    #[cbor(n(1), with = "minicbor::bytes")]
+    pub app_key: [u8; 32],
+    #[n(2)]
+    pub seat: u8,
+    #[n(3)]
+    pub hand_id: u64,
+    #[n(4)]
+    pub cert: minicbor::bytes::ByteVec,
+}
+
+/// `D-047`: how many such words one answer carries at most.
+pub const SNAPSHOT_MAX_OUT: usize = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 #[cbor(array)]
 pub struct Tell {
@@ -163,6 +185,10 @@ pub struct Tell {
     pub adverts: Vec<minicbor::bytes::ByteVec>,
     #[n(2)]
     pub truncated: bool,
+    /// `D-047`: the words about seats out for good, from the tables this
+    /// client sits at; absent in an answer from before the field existed.
+    #[n(3)]
+    pub out: Option<Vec<OutWord>>,
 }
 
 /// Why a frame was not taken.
@@ -205,10 +231,32 @@ pub fn tell(
     if adverts.iter().any(|a| a.len() > TABLE_AD_SIGNED_MAX) {
         return Err("an advert over its cap");
     }
+    tell_out(key, request_nonce, adverts, truncated, Vec::new(), now_ms)
+}
+
+/// `tell`, with the words about seats out for good (`D-047`).
+pub fn tell_out(
+    key: &SigningKey,
+    request_nonce: [u8; 32],
+    adverts: Vec<Vec<u8>>,
+    truncated: bool,
+    out: Vec<OutWord>,
+    now_ms: u64,
+) -> Result<Vec<u8>, &'static str> {
+    if adverts.len() > SNAPSHOT_MAX_ADS {
+        return Err("more adverts than a snapshot may carry");
+    }
+    if adverts.iter().any(|a| a.len() > TABLE_AD_SIGNED_MAX) {
+        return Err("an advert over its cap");
+    }
+    if out.len() > SNAPSHOT_MAX_OUT || out.iter().any(|w| w.cert.len() > crate::table::hand::FRAME_CAP) {
+        return Err("more words about seats out than a snapshot may carry");
+    }
     let body = Tell {
         request_nonce,
         adverts: adverts.into_iter().map(minicbor::bytes::ByteVec::from).collect(),
         truncated,
+        out: if out.is_empty() { None } else { Some(out) },
     };
     seal(key, EventType::LobbySnapshotResponse, &body, now_ms)
 }
@@ -230,6 +278,16 @@ pub fn open_ask(bytes: &[u8], now_ms: u64) -> Result<(Ask, [u8; 32]), Refused> {
 /// `run192317-3`, where the first question beat the hosting by a second and
 /// its empty answer withdrew the table for 29 s).
 pub fn open_tell(bytes: &[u8], expected_nonce: &[u8; 32], now_ms: u64) -> Result<(Vec<Vec<u8>>, u64), Refused> {
+    open_tell_out(bytes, expected_nonce, now_ms).map(|(adverts, at, _)| (adverts, at))
+}
+
+/// `open_tell`, with the words about seats out for good (`D-047`) -- as
+/// bytes still: the receiver verifies each against its own roster.
+pub fn open_tell_out(
+    bytes: &[u8],
+    expected_nonce: &[u8; 32],
+    now_ms: u64,
+) -> Result<(Vec<Vec<u8>>, u64, Vec<OutWord>), Refused> {
     let (payload, _who, emitted_at) = open(bytes, EventType::LobbySnapshotResponse, SNAPSHOT_RESP_MAX, now_ms)?;
     let tell: Tell = from_canonical(&payload, SNAPSHOT_RESP_MAX)
         .map_err(|_| Refused::Malformed("not a snapshot response body"))?;
@@ -243,7 +301,11 @@ pub fn open_tell(bytes: &[u8], expected_nonce: &[u8; 32], now_ms: u64) -> Result
     if adverts.iter().any(|a| a.len() > TABLE_AD_SIGNED_MAX) {
         return Err(Refused::TooMany);
     }
-    Ok((adverts, emitted_at))
+    let out = tell.out.unwrap_or_default();
+    if out.len() > SNAPSHOT_MAX_OUT || out.iter().any(|w| w.cert.len() > crate::table::hand::FRAME_CAP) {
+        return Err(Refused::TooMany);
+    }
+    Ok((adverts, emitted_at, out))
 }
 
 fn seal<B: Encode<()>>(

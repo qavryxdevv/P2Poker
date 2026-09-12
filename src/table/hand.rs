@@ -1456,6 +1456,10 @@ pub struct Hand {
     /// voter — §4.10's *"it verified that certificate itself"* — and otherwise
     /// the first peer copy it checked.
     proof: Option<(Hash, Vec<u8>)>,
+    /// `D-047`: the bytes of the certificate that named each seat this hand,
+    /// by seat -- the table's word for the seat's own client. Kept at the
+    /// bank, because a certificate never enters the transcript.
+    words: BTreeMap<SeatIdx, Vec<u8>>,
     /// R4: a betting stage certified while this client was elsewhere. The two
     /// chains cannot be reconciled, so this is reported and not repaired.
     forked: Option<String>,
@@ -1932,6 +1936,7 @@ impl Hand {
                 struck: BTreeSet::new(),
                 banked: BTreeSet::new(),
                 proof: None,
+                words: BTreeMap::new(),
                 forked: None,
                 late: None,
                 bank_left_ms: o.time_bank_ms,
@@ -7168,6 +7173,10 @@ impl Hand {
         if self.settled() || self.banked.len() >= BANKED_CAP {
             return false;
         }
+        // `D-047`: the word, kept by the seats it names.
+        for seat in &subject.subject_seats {
+            self.words.insert(*seat, raw.to_vec());
+        }
         self.certs.insert(
             event_hash,
             CertFact {
@@ -9244,6 +9253,14 @@ impl Hand {
     /// `MAX_RETURNS` returns behind them, this hand or before. Their chips
     /// leave the table at the next boundary; the node removes them from the
     /// table's group for good and a client that finds itself here leaves.
+    /// `D-047`: the certificate that took this seat out this hand -- the
+    /// latest one naming it -- as bytes, for this client's lobby answers.
+    /// From the bank, not the transcript: a certificate never enters the
+    /// transcript (run193937-3 kept no word and told nobody).
+    pub fn word_about(&self, seat: SeatIdx) -> Option<Vec<u8>> {
+        self.words.get(&seat).cloned()
+    }
+
     pub fn out_for_good(&self) -> Vec<SeatIdx> {
         let mut out = self.open.out.clone();
         for seat in &self.certified {
@@ -9912,6 +9929,52 @@ impl Hand {
         // from a complete set of its own.
         self.certify_returns_if_unanimous(key, now_ms)
     }
+}
+
+
+/// `D-047`: what a timeout certificate says, verified from its bytes alone --
+/// the table, the hand, the roster's keys -- so a seat's own client can read
+/// the word about itself from a hand it never held (its line was down when
+/// the table certified it the fourth time). The subjects it names and the
+/// seats that voted; `None` for anything that does not verify. The checks
+/// are `verify_certificate`'s, less the ones that need the hand.
+pub fn certificate_names(
+    raw: &[u8],
+    table_id: &[u8; 32],
+    hand_id: u64,
+    seat_of: &dyn Fn(&[u8; 32]) -> Option<SeatIdx>,
+) -> Option<(Vec<SeatIdx>, BTreeSet<SeatIdx>)> {
+    let opened = chained::open_in_hand(raw, FRAME_CAP, EventType::TimeoutCert, table_id, hand_id).ok()?;
+    let body: TimeoutCert = chained::payload(&opened, TIMEOUT_CERT_CAP).ok()?;
+    let max_votes = usize::from(crate::protocol::constants::MAX_SEATS).pow(2) / 4;
+    if body.votes.len() < 2 || body.votes.len() > max_votes {
+        return None;
+    }
+    seat_of(&opened.sender)?;
+    let mut stage: Option<CertSubject> = None;
+    let mut subjects: Vec<SeatIdx> = Vec::new();
+    let mut voters: BTreeSet<SeatIdx> = BTreeSet::new();
+    for vote in &body.votes {
+        let v = chained::open_in_hand(vote, FRAME_CAP, EventType::TimeoutVote, table_id, hand_id).ok()?;
+        let voter = seat_of(&v.sender)?;
+        let named: TimeoutVote = chained::payload(&v, TIMEOUT_VOTE_CAP).ok()?;
+        match &stage {
+            None => stage = Some(CertSubject::of(&named)),
+            Some(first) => {
+                if !first.same_stage(&named) {
+                    return None;
+                }
+            }
+        }
+        if voter == named.subject_seat {
+            return None;
+        }
+        if !subjects.contains(&named.subject_seat) {
+            subjects.push(named.subject_seat);
+        }
+        voters.insert(voter);
+    }
+    Some((subjects, voters))
 }
 
 #[cfg(test)]

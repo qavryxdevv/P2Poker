@@ -765,6 +765,14 @@ impl Formation {
     /// refused here.** It is answered as it was before, with `AlreadySeated`
     /// and a freshly signed roster (`S1-J`); that path exists for a peer that
     /// lost its list and gating it here would undo the fix without saying so.
+    /// `D-047`: a seat out of this table for good asks to sit again -- refused
+    /// with the reason, whatever else the request says.
+    pub fn refuse_out(&self, bytes: &[u8], now_ms: u64) -> Result<Vec<u8>, Failed> {
+        let f = self.founder.as_ref().ok_or(Failed::NotTheFounder)?;
+        let (_, _, request_hash) = joinwire::receive_join_request(bytes)?;
+        Ok(joinwire::publish_join_reject(request_hash, RejectReason::OutForGood, 0, &f.key, now_ms)?)
+    }
+
     pub fn on_join_request(
         &mut self,
         bytes: &[u8],

@@ -6497,7 +6497,13 @@ sender's application key.
 **`0x0105 LOBBY_SNAPSHOT_RESPONSE`** — `n(0) request_nonce: bytes[32]`,
 `n(1) adverts: Vec<bytes>` (≤ `SNAPSHOT_MAX_ADS` = 128 entries, each a complete
 `SignedEvent` of a `LOBBY_TABLE_AD`, each ≤ `TABLE_AD_SIGNED_MAX` = 1 536 B),
-`n(2) truncated: bool`.
+`n(2) truncated: bool`, and since D-047 (2026-09-12) `n(3) out: Option<Vec<OutWord>>` -- the
+table's word about seats out for good from the tables the answerer sits at, each
+`OutWord` = `n(0) table_id: bytes[32]`, `n(1) app_key: bytes[32]`, `n(2) seat: u8`,
+`n(3) hand_id: u64`, `n(4) cert: bytes` (a complete `TIMEOUT_CERT` of that hand, ≤ `FRAME_CAP`);
+at most `SNAPSHOT_MAX_OUT` = 4 an answer, absent when there is none. The receiver verifies
+each certificate from its bytes against the table's roster and reads only the word about
+its own seat; the answerer's authority is not what it rests on.
 
 The response is a container of independently signed adverts. **The responder is
 not trusted for anything.** Each embedded advert is validated by §7.2's full

@@ -659,6 +659,14 @@ struct TableRun {
     /// Group keys this client has already paired with an application key. One
     /// pairing per peer per run; see `signer_of`.
     taught: std::collections::HashSet<[u8; 32]>,
+    /// `D-047`: the table's word about each seat out for good -- seat, key,
+    /// the hand, the certificate -- carried in this client's lobby answers so
+    /// the seat's own client is told.
+    out_words: Vec<(u8, [u8; 32], u64, Vec<u8>)>,
+    /// `D-047`: the keys out for good; a request from one is refused.
+    out_keys: std::collections::BTreeSet<[u8; 32]>,
+    /// `D-047`: this client's own seat has been told it is out.
+    out_told: bool,
     readmitted: Vec<u8>,
     /// `S1-BM`: the evidence a return vote is cast on, by boundary and by
     /// subject. Written by `boundary_event` (the subject's `PLAYER_SIT_IN`)
@@ -827,6 +835,9 @@ impl TableRun {
             early_boundary: std::collections::HashMap::new(),
             disputes_seen: 0usize,
             taught: std::collections::HashSet::new(),
+            out_words: Vec::new(),
+            out_keys: std::collections::BTreeSet::new(),
+            out_told: false,
             readmitted: Vec::new(),
             sit_ins: SitIns::default(),
             resume,
@@ -2155,6 +2166,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let at_the_limit = $h.returns().get(usize::from(seat)).copied().unwrap_or(0)
                         >= crate::protocol::constants::MAX_RETURNS;
                     if at_the_limit {
+                        // The word for the seat's own client, kept for this
+                        // client's lobby answers; and no request from that key
+                        // sits here again.
+                        match $h.word_about(seat) {
+                            Some(cert) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "the word about seat {seat} is kept for its client's asking: {} bytes of hand #{}",
+                                        cert.len(),
+                                        $h.hand_id()
+                                    )))
+                                    .await;
+                                $t.out_words.retain(|(s, _, _, _)| *s != seat);
+                                $t.out_words.push((seat, app, $h.hand_id(), cert));
+                            }
+                            None => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "no certificate about seat {seat} is banked this hand: its client cannot be told by asking"
+                                    )))
+                                    .await;
+                            }
+                        }
+                        $t.out_keys.insert(app);
                         $t.tox_sink.tell(super::toxsink::Seat::Remove {
                             app_key: Some(app),
                             tox_key: line,
@@ -2574,7 +2609,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 adverts.truncate(usize::from(ask.max_tables).min(SNAPSHOT_MAX_ADS));
                                 let offered = adverts.len();
-                                if let Ok(bytes) = super::snapshot::tell(&app_key, ask.nonce, adverts, false, now) {
+                                // `D-047`: the table's word about the seats out for good,
+                                // from every table this client sits at, for their own
+                                // clients -- the certificate, which they verify themselves.
+                                let mut out: Vec<super::snapshot::OutWord> = Vec::new();
+                                for x in tables.iter() {
+                                    if let Some(f) = x.table.as_ref() {
+                                        for (seat, app, hand_id, cert) in x.out_words.iter() {
+                                            out.push(super::snapshot::OutWord {
+                                                table_id: f.table_id(),
+                                                app_key: *app,
+                                                seat: *seat,
+                                                hand_id: *hand_id,
+                                                cert: minicbor::bytes::ByteVec::from(cert.clone()),
+                                            });
+                                        }
+                                    }
+                                }
+                                out.truncate(super::snapshot::SNAPSHOT_MAX_OUT);
+                                if let Ok(bytes) = super::snapshot::tell_out(&app_key, ask.nonce, adverts, false, out, now) {
                                     let _ = swarm.behaviour_mut().snapshot.send_response(channel, bytes);
                                     let _ = events
                                         .send(NodeEvent::Warning(format!(
@@ -2590,7 +2643,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 if asked != peer {
                                     continue;
                                 }
-                                let (adverts, answered_at) = match super::snapshot::open_tell(&response, &nonce, now) {
+                                let (adverts, answered_at, out_words) = match super::snapshot::open_tell_out(&response, &nonce, now) {
                                     Ok(a) => a,
                                     Err(e) => {
                                         let _ = events
@@ -2601,6 +2654,50 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         continue;
                                     }
                                 };
+                                // `D-047`: the table's word about this client's own seat,
+                                // verified from the certificate's bytes against the roster --
+                                // not the answerer's authority. Said once; a headless client
+                                // leaves, a window holds the table for its player to close.
+                                for w in out_words.iter().filter(|w| w.app_key == my_app_key) {
+                                    for i in 0..tables.len() {
+                                        let verdict: Option<String> = (|| {
+                                            let t = &tables[i];
+                                            let f = t.table.as_ref()?;
+                                            if t.out_told || f.table_id() != w.table_id || f.my_seat() != Some(w.seat) {
+                                                return None;
+                                            }
+                                            let roster = f.roster().clone();
+                                            let (subjects, voters) = crate::table::hand::certificate_names(
+                                                &w.cert,
+                                                &w.table_id,
+                                                w.hand_id,
+                                                &|k| roster.seat_of(k),
+                                            )?;
+                                            if !subjects.contains(&w.seat)
+                                                || voters.contains(&w.seat)
+                                                || voters.len() < 2
+                                                || voters.len() <= subjects.len()
+                                            {
+                                                return None;
+                                            }
+                                            Some(format!(
+                                                "seat {} -- this client -- is out of the table for good after its fourth absence (D-047): the table's word, certified by seats {:?} at hand #{}, carried in the lobby answer of {peer}",
+                                                w.seat, voters, w.hand_id
+                                            ))
+                                        })();
+                                        if let Some(why) = verdict {
+                                            let t = &mut tables[i];
+                                            t.out_told = true;
+                                            let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                                            let _ = events
+                                                .send(NodeEvent::OutForGood { key: w.table_id, why: why.clone() })
+                                                .await;
+                                            if autoplay.is_some() {
+                                                leave_table_now!(t, why);
+                                            }
+                                        }
+                                    }
+                                }
                                 // **The responder is not trusted for anything** (§7.5):
                                 // every advert goes through the checklist an advert heard
                                 // over gossip goes through.
@@ -2738,6 +2835,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .and_then(|e| e.tox_key);
                                 if let Some(k) = returning {
                                     t.tox_sink.tell(super::toxsink::Seat::Back(k));
+                                }
+                                // `D-047`: a seat out of this table for good asks again --
+                                // refused with the reason, whatever else the request says.
+                                if let Ok((_, sender, _)) = super::joinwire::receive_join_request(&request) {
+                                    if t.out_keys.contains(&sender) {
+                                        if let Ok(bytes) = f.refuse_out(&request, now) {
+                                            let _ = swarm.behaviour_mut().join.send_response(channel, bytes);
+                                        }
+                                        let _ = events
+                                            .send(NodeEvent::Warning(
+                                                "a seat out of this table for good asked to sit again and was refused (D-047)".into(),
+                                            ))
+                                            .await;
+                                        continue;
+                                    }
                                 }
                                 match f.on_join_request(&request, &authenticated, t.ever_dealt, now) {
                                     Ok(sends) => {
@@ -5911,11 +6023,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         h.out_for_good().contains(&me).then_some(me)
                     });
                     if let Some(me) = out_myself {
-                        let why = format!(
-                            "seat {me} -- this client -- is out of the table for good after its fourth absence (D-047): leaving"
-                        );
-                        let _ = events.send(NodeEvent::Warning(why.clone())).await;
-                        leave_table_now!(t, why);
+                        if !t.out_told {
+                            t.out_told = true;
+                            let why = format!(
+                                "seat {me} -- this client -- is out of the table for good after its fourth absence (D-047): the table certified it four times over"
+                            );
+                            let key = t.table.as_ref().map(|f| f.table_id()).unwrap_or([0; 32]);
+                            let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                            let _ = events.send(NodeEvent::OutForGood { key, why: why.clone() }).await;
+                            // A headless client leaves at once; a window holds the
+                            // table until its player closes it.
+                            if autoplay.is_some() {
+                                leave_table_now!(t, why);
+                            }
+                        }
                     }
                     // `D-041`: every seat's link as the table's group knows it. On a
                     // Tox table the group carries the hand and the felt reads presence
