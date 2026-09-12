@@ -268,6 +268,11 @@ fn main() {
         }
     });
     let then_join = value_of("--then-join");
+    // `D-043`: `--also-join NAME --also-at S` asks to join NAME at S seconds
+    // WITHOUT leaving the table this client sits at -- a second table in one
+    // client, which the node opens as a second slot.
+    let also_join = value_of("--also-join");
+    let also_at = value_of("--also-at").and_then(|v| v.parse::<u64>().ok());
 
     let settings = p2p_poker::storage::settings::load(&dir, &app_key);
     println!("name     {}", settings.nickname);
@@ -362,6 +367,8 @@ fn main() {
         then_at,
         then_host,
         then_join,
+        also_join,
+        also_at,
     };
 
     if has("--headless") {
@@ -521,6 +528,8 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
         then_at,
         then_host,
         then_join,
+        also_join,
+        also_at,
         ..
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
@@ -569,6 +578,14 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
         tokio::pin!(then);
         let mut then_host = then_host;
         let mut then_done = false;
+        let also = async {
+            match also_at {
+                Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(also);
+        let mut also_done = also_join.is_none();
 
         let mut state = AppState::new();
         // `D-032`: the opponent's fourth absence ends the game; said once.
@@ -604,6 +621,30 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => break,
                 _ = &mut deadline => break,
+                _ = &mut also, if !also_done => {
+                    also_done = true;
+                    if let Some(name) = also_join.clone() {
+                        let listed = state
+                            .lobby
+                            .tables()
+                            .find(|l| l.held.ad.table_name == name)
+                            .map(|l| (*l.key, l.held.ad.max_buyin));
+                        match listed {
+                            Some((key, buyin)) => {
+                                println!("asking to join {name} as well (a second table)");
+                                let _ = commands
+                                    .send(NodeCommand::JoinTable {
+                                        key,
+                                        buyin,
+                                        seat: None,
+                                        password: None,
+                                    })
+                                    .await;
+                            }
+                            None => println!("{name} is not in the lobby, so no second table"),
+                        }
+                    }
+                }
                 _ = &mut then, if !then_done => {
                     then_done = true;
                     println!("leaving the table for another, as --then-at asked");
@@ -854,6 +895,10 @@ struct Run {
     then_at: Option<u64>,
     then_host: Option<NodeCommand>,
     then_join: Option<String>,
+    /// `--also-join NAME` and `--also-at S`: a second table, joined without
+    /// leaving the first (`D-043`).
+    also_join: Option<String>,
+    also_at: Option<u64>,
     /// `--resume`: rejoin the unfinished session on record, headless (`S1-CR`).
     resume: bool,
 }
@@ -880,6 +925,8 @@ fn windowed(player: Player, run: Run) -> Started {
         then_at: _,
         then_host: _,
         then_join: _,
+        also_join: _,
+        also_at: _,
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     // The same headroom as the headless path, for the same reason.

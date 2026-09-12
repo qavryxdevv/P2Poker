@@ -5837,6 +5837,24 @@ static int handle_gc_handshake_response(const GC_Chat *_Nonnull chat, const IP_P
 
     const uint8_t *sender_session_pk = data;
 
+    /* p2p-poker (patch 0030): the same answer heard again -- the other side
+     * answered our repeated request as well. Taking it as new set the
+     * expected id back to 2 and sent the ack and the invite request once
+     * more, on a stream the other side had gone on numbering. Same session
+     * key, same shared key: already greeted, nothing to do. */
+    if (gconn->handshaked) {
+        uint8_t would_be[CRYPTO_SHARED_KEY_SIZE];
+        encrypt_precompute(sender_session_pk, gconn->session_secret_key, would_be);
+        const bool same_greeting_again = pk_equal(would_be, gconn->session_shared_key);
+        crypto_memzero(would_be, sizeof(would_be));
+
+        if (same_greeting_again) {
+            LOGGER_DEBUG(chat->log, "p2p-poker: peer %d repeated the handshake response already taken; nothing reset",
+                         peer_number);
+            return 0;
+        }
+    }
+
     gcc_make_session_shared_key(gconn, sender_session_pk);
 
     set_sig_pk(&gconn->addr.public_key, data + ENC_PUBLIC_KEY_SIZE);
@@ -5928,6 +5946,20 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
      * still holds as handshaked, so both message rings are about to be stale.
      * See the two sites below. */
     bool in_place_rehandshake = false;
+    /* p2p-poker (patch 0030): the same greeting heard again. A requester
+     * whose first request was answered slowly sends it once more three
+     * seconds later, and both copies arrive. The second used to be taken
+     * for a new greeting: `handshaked` cleared, both rings reset, the
+     * expected id set back to 1 -- while the requester, which had the
+     * answer by then, went on numbering from where it was. Nothing it sent
+     * after that could be read: "Got lossless packet from unconfirmed
+     * peer" and "Failed to create recv array entry; entry is not empty"
+     * every three seconds until the join grace ran out (run083639-3, the
+     * first client at two tables). A retry carries the same session key as
+     * the request it repeats and so derives the shared key this entry
+     * already holds; a peer that really starts over has fresh session keys.
+     * The retry is answered again and nothing is reset. */
+    bool same_greeting_again = false;
 
     if (is_new_peer) {
         peer_number = peer_add(chat, ipp, sender_pk);
@@ -5945,6 +5977,18 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
         }
 
         if (gconn->handshaked) {
+            uint8_t would_be[CRYPTO_SHARED_KEY_SIZE];
+            encrypt_precompute(data, gconn->session_secret_key, would_be);
+            same_greeting_again = pk_equal(would_be, gconn->session_shared_key);
+            crypto_memzero(would_be, sizeof(would_be));
+
+            if (same_greeting_again) {
+                LOGGER_DEBUG(chat->log, "p2p-poker: peer %d repeated the handshake request it was answered for; answered again, nothing reset",
+                             peer_number);
+            }
+        }
+
+        if (gconn->handshaked && !same_greeting_again) {
             gconn->handshaked = false;
             /* p2p-poker (patch 0015, S1-BO): noted here, acted on where the
              * re-handshake is committed. The rings are cleared beside
@@ -6054,7 +6098,9 @@ static int handle_gc_handshake_request(GC_Chat *_Nonnull chat, const IP_Port *_N
                      peer_number, send_dropped, recv_dropped);
     }
 
-    gcc_set_recv_message_id(gconn, 1);  // handshake request is always first packet
+    if (!same_greeting_again) {
+        gcc_set_recv_message_id(gconn, 1);  // handshake request is always first packet
+    }
 
     gconn->is_pending_handshake_response = true;
     gconn->pending_handshake_type = request_type;

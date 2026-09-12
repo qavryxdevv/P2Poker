@@ -75,6 +75,12 @@ param(
     # against blinds of 50/100 in a few hands. For D-042's end of tournament:
     # the group left ten seconds after the last hand, the friends after.
     [ValidateRange(0, 1000000)][int]$StartStack = 0,
+    # `-TwoTables`: a second table "<table>-B" (three seats) hosted by node
+    # $Seats, joined by node $Seats+1, and joined AS WELL by n1 at `-AlsoAt`
+    # seconds without leaving the first -- one client at two tables (D-043).
+    # n1's log then carries both tables' hands; read it with fold-tables.py.
+    [switch]$TwoTables,
+    [ValidateRange(0, 3600)][int]$AlsoAt = 60,
     [ValidateRange(30, 3600)][int]$Seconds = 300,
     [string]$Exe,
     [switch]$KeepLogs,
@@ -221,7 +227,7 @@ $droppers = @("$DropNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEac
 # Not `$hostSeats`: PowerShell variable names are case-insensitive and that
 # would BE the parameter.
 $founderSeats = if ($HostSeats -gt 0) { $HostSeats } else { $Seats }
-$nodeCount = $Seats + $Watchers
+$nodeCount = $Seats + $Watchers + $(if ($TwoTables) { 2 } else { 0 })
 
 $ErrorActionPreference = 'Stop'
 
@@ -355,9 +361,14 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     if ($i -eq 0) {
         $nodeArgs += @('--host', $table, '--seats', "$founderSeats")
         if ($RehostAt -gt 0) { $nodeArgs += @('--then-host', "$table-2", '--then-at', "$RehostAt") }
+    } elseif ($TwoTables -and $i -eq $Seats + $Watchers) {
+        $nodeArgs += @('--host', "$table-B", '--seats', '3')
+    } elseif ($TwoTables -and $i -eq $Seats + $Watchers + 1) {
+        $nodeArgs += @('--join', "$table-B")
     } elseif ($i -lt $Seats -and -not $NoJoin) {
         $nodeArgs += @('--join', $table)
         if ($RehostAt -gt 0) { $nodeArgs += @('--then-join', "$table-2", '--then-at', "$($RehostAt + 5)") }
+        if ($TwoTables -and $i -eq 1) { $nodeArgs += @('--also-join', "$table-B", '--also-at', "$AlsoAt") }
     }
     # Otherwise a watcher: the lobby only, joining nothing.
     $leaveAt = if ($LeaveTableAt -gt 0 -and $i -eq 0) { $LeaveTableAt } else { 0 }
@@ -509,6 +520,7 @@ if ($NoJoin -or $Watchers -gt 0) {
 if ($LeaveTableAt -gt 0) { Write-Host "==> n0 leaves its table at $LeaveTableAt s" }
 if ($RehostAt -gt 0) { Write-Host "==> at $RehostAt s n0 leaves and hosts $table-2; the joiners follow five seconds later" }
 if ($StartStack -gt 0) { Write-Host "==> every seat starts with $StartStack chips, so the tournament ends inside the run" }
+if ($TwoTables) { Write-Host "==> a second table $table-B: hosted by n$($Seats + $Watchers), joined by n$($Seats + $Watchers + 1), and by n1 as well at $AlsoAt s" }
 if ($ThinkMs -gt 0) { Write-Host "==> every seat waits $ThinkMs ms before it acts; past the table's own clock, the seat's client acts for it" }
 Write-Host "$nodeCount nodes started; waiting up to $($Seconds + 60) s"
 $null = Wait-Job -Job $jobs -Timeout ($Seconds + 60)
