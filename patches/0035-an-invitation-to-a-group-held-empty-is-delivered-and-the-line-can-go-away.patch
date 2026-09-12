@@ -1,0 +1,238 @@
+# 0035 - an invitation to a group held with nobody else in it is delivered; and, for the bed, the line goes away.
+#
+# S1-EB (2026-09-12), the owner's report: the far machine's internet cut mid-hand at a
+# heads-up table, Wait pressed on both sides, the internet back -- and neither side
+# could find the other again. The library deletes a member no packet reached for
+# GC_CONFIRMED_PEER_TIMEOUT (58 s) at every member alike, so the seat that lost its
+# line held a copy of the table's group with nobody in it and the founder a copy
+# without the seat. The founder offers the group again over the friendship as soon
+# as that is back; Messenger.c hands an invitation to the application only for a
+# chat it does not hold (group_not_added), so the offer was swallowed at the seat,
+# and a seat whose old address no longer answered -- the library's own way back is the
+# address it last knew, tried for a quarter of an hour -- had no way back at all.
+#
+# Two parts.
+#
+# (a) group_held_empty (group_chats.c/.h, Messenger.c): an invitation to a chat this
+#     client holds with no other member confirmed in it, and not being left, is
+#     delivered to the application, which decides. Ours leaves the emptied copy and
+#     takes the invitation at its next turn, once the chat is gone (a confirmation read
+#     while both copies are held would find the old one, gc_get_group_by_public_key
+#     going by chat id). A chat with a member still in it delivers nothing, as before.
+#     The wire is untouched: no packet, no field, no behaviour of any peer changes.
+#
+# (b) p2p_poker_cut_line (net.c/.h), entirely inside #ifdef P2P_POKER_FAULT_HARNESS,
+#     which build.rs defines only under the cargo feature: while set, every socket call
+#     behaves as a machine whose internet has gone -- sends report their bytes as sent,
+#     receives say nothing arrived (and read and throw away what did, so nothing stale
+#     is delivered when the line returns), new connections fail. The process and its
+#     timers live on, so the library does what a real outage makes it do: friends go
+#     offline, group members time out at 58 s, relays are dropped, and everything comes
+#     back through the DHT. The application's own outage knob (P2P_POKER_LINK_DOWN_AT)
+#     drops table messages above a transport that stays up and can never reach this.
+#
+# Vendored tree patched in place. Re-apply on a toxcore bump with
+#   git apply patches/0035-*.patch
+# and check tools/build-tox.ps1's markers (0035a in net.c, 0035b in group_chats.c).
+
+diff --git a/vendor/c-toxcore/toxcore/Messenger.c b/vendor/c-toxcore/toxcore/Messenger.c
+index 67a5404..0687653 100644
+--- a/vendor/c-toxcore/toxcore/Messenger.c
++++ b/vendor/c-toxcore/toxcore/Messenger.c
+@@ -2286,7 +2286,11 @@ static int m_handle_packet_invite_groupchat(Messenger *_Nonnull m, const int fri
+     const uint32_t join_data_len = data_length - 2;
+ 
+     if (m->group_invite != nullptr && data[1] == GROUP_INVITE && data_length != 2 + GC_JOIN_DATA_LENGTH) {
+-        if (group_not_added(m->group_handler, join_data, join_data_len)) {
++        /* p2p-poker (patch 0035): and for a group this client holds with
++         * nobody else in it, so a member back from an outage can take the
++         * founder's fresh invitation -- see group_held_empty. */
++        if (group_not_added(m->group_handler, join_data, join_data_len)
++                || group_held_empty(m->group_handler, join_data, join_data_len)) {
+             m->group_invite(m, friendcon_id, join_data, GC_JOIN_DATA_LENGTH,
+                             join_data + GC_JOIN_DATA_LENGTH, join_data_len - GC_JOIN_DATA_LENGTH, userdata);
+         }
+diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
+index d892174..c9907c8 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.c
++++ b/vendor/c-toxcore/toxcore/group_chats.c
+@@ -8518,6 +8518,45 @@ bool group_not_added(const GC_Session *c, const uint8_t *chat_id, uint32_t lengt
+     return !group_exists(c, chat_id);
+ }
+ 
++/* p2p-poker (patch 0035): an invitation to a group this client holds with
++ * nobody else in it is delivered.
++ *
++ * The library hands an invitation to the application only for a chat it
++ * does not hold (`group_not_added`, Messenger.c). A member whose line went
++ * away for longer than GC_CONFIRMED_PEER_TIMEOUT has, when it returns, a
++ * chat that holds nobody: every other member timed out of its view, as it
++ * did out of theirs. The library tries the addresses it last knew for a
++ * while; a founder that still holds the group offers it again over the
++ * friendship as soon as that is back -- and that offer was swallowed here,
++ * so a seat whose old address no longer answered could never be brought
++ * back (S1-EB: two seats waiting on each other for good after one lost its
++ * internet mid-hand, the owner's report of 2026-09-12). Such an invitation
++ * is delivered and the application decides: ours leaves the empty copy and
++ * takes it. A chat with a member still in it, or one being left, delivers
++ * nothing, as before; the wire is untouched. */
++bool group_held_empty(const GC_Session *c, const uint8_t *chat_id, uint32_t length)
++{
++    if (length < CHAT_ID_SIZE) {
++        return false;
++    }
++
++    const GC_Chat *chat = gc_get_group_by_public_key(c, chat_id);
++
++    if (chat == nullptr || chat->flag_exit) {
++        return false;
++    }
++
++    for (uint32_t i = 1; i < chat->numpeers; ++i) {
++        const GC_Connection *gconn = get_gc_connection(chat, i);
++
++        if (gconn != nullptr && gconn->confirmed) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
+ int gc_invite_friend(const GC_Session *c, GC_Chat *chat, int32_t friend_number,
+                      gc_send_group_invite_packet_cb *callback)
+ {
+diff --git a/vendor/c-toxcore/toxcore/group_chats.h b/vendor/c-toxcore/toxcore/group_chats.h
+index e57e8d6..fd67c5f 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.h
++++ b/vendor/c-toxcore/toxcore/group_chats.h
+@@ -726,6 +726,10 @@ bool handle_gc_invite_accepted_packet(const GC_Session *_Nonnull c, int friend_n
+  */
+ bool group_not_added(const GC_Session *_Nonnull c, const uint8_t *_Nonnull chat_id, uint32_t length);
+ 
++/** p2p-poker (patch 0035): true when this client holds the chat with this id and
++ * no other member is confirmed in it -- see group_chats.c. */
++bool group_held_empty(const GC_Session *_Nonnull c, const uint8_t *_Nonnull chat_id, uint32_t length);
++
+ /** @brief Handles an invite confirmed packet.
+  *
+  * Return 0 on success.
+diff --git a/vendor/c-toxcore/toxcore/net.c b/vendor/c-toxcore/toxcore/net.c
+index da142bc..2297599 100644
+--- a/vendor/c-toxcore/toxcore/net.c
++++ b/vendor/c-toxcore/toxcore/net.c
+@@ -5,6 +5,32 @@
+ 
+ #include "net.h"
+ 
++#ifdef P2P_POKER_FAULT_HARNESS
++/* p2p-poker (patch 0035): the line goes away.
++ *
++ * A test instrument, not a repair. While the flag below is set every socket
++ * call in this file behaves as a machine whose internet has gone: nothing
++ * goes out (a send reports its bytes as sent, as the kernel does when the
++ * cable is out), nothing comes in (a receive says there is nothing, and what
++ * did arrive is read and thrown away, so nothing stale is delivered when the
++ * line returns), and a new connection fails. The process, its timers and
++ * every instance keep running, which is what separates this from the
++ * harness's stall (patch 0023's family) and from the application's own
++ * outage knob (P2P_POKER_LINK_DOWN_AT), which drops table messages above a
++ * transport that stays up and so never makes the library forget anybody. The
++ * library then does what it does on a real outage: friends go offline,
++ * group members time out at GC_CONFIRMED_PEER_TIMEOUT, relays are dropped,
++ * and all of it comes back through the DHT once the line does. One flag for
++ * the process: the client runs one instance (D-042), and the harness runs
++ * every node in a process of its own. */
++static bool p2p_poker_line_cut = false;
++
++void p2p_poker_cut_line(bool cut)
++{
++    p2p_poker_line_cut = cut;
++}
++#endif /* P2P_POKER_FAULT_HARNESS */
++
+ int net_socket_to_native(Socket sock)
+ {
+     return (force int)sock.value;
+@@ -38,31 +64,65 @@ int ns_listen(const Network *ns, Socket sock, int backlog)
+ 
+ int ns_connect(const Network *ns, Socket sock, const IP_Port *addr)
+ {
++#ifdef P2P_POKER_FAULT_HARNESS
++    if (p2p_poker_line_cut) {
++        return -1;
++    }
++#endif /* P2P_POKER_FAULT_HARNESS */
+     return ns->funcs->connect(ns->obj, sock, addr);
+ }
+ 
+ int ns_recvbuf(const Network *ns, Socket sock)
+ {
++#ifdef P2P_POKER_FAULT_HARNESS
++    if (p2p_poker_line_cut) {
++        return 0;
++    }
++#endif /* P2P_POKER_FAULT_HARNESS */
+     return ns->funcs->recvbuf(ns->obj, sock);
+ }
+ 
+ int ns_recv(const Network *ns, Socket sock, uint8_t *buf, size_t len)
+ {
++#ifdef P2P_POKER_FAULT_HARNESS
++    if (p2p_poker_line_cut) {
++        return -1;
++    }
++#endif /* P2P_POKER_FAULT_HARNESS */
+     return ns->funcs->recv(ns->obj, sock, buf, len);
+ }
+ 
+ int ns_recvfrom(const Network *ns, Socket sock, uint8_t *buf, size_t len, IP_Port *addr)
+ {
++#ifdef P2P_POKER_FAULT_HARNESS
++    if (p2p_poker_line_cut) {
++        /* Read and thrown away, so the line comes back with nothing stale. */
++        while (ns->funcs->recvfrom(ns->obj, sock, buf, len, addr) >= 0) {
++            continue;
++        }
++        return -1;
++    }
++#endif /* P2P_POKER_FAULT_HARNESS */
+     return ns->funcs->recvfrom(ns->obj, sock, buf, len, addr);
+ }
+ 
+ int ns_send(const Network *ns, Socket sock, const uint8_t *buf, size_t len)
+ {
++#ifdef P2P_POKER_FAULT_HARNESS
++    if (p2p_poker_line_cut) {
++        return (int)len;
++    }
++#endif /* P2P_POKER_FAULT_HARNESS */
+     return ns->funcs->send(ns->obj, sock, buf, len);
+ }
+ 
+ int ns_sendto(const Network *ns, Socket sock, const uint8_t *buf, size_t len, const IP_Port *addr)
+ {
++#ifdef P2P_POKER_FAULT_HARNESS
++    if (p2p_poker_line_cut) {
++        return (int)len;
++    }
++#endif /* P2P_POKER_FAULT_HARNESS */
+     return ns->funcs->sendto(ns->obj, sock, buf, len, addr);
+ }
+ 
+diff --git a/vendor/c-toxcore/toxcore/net.h b/vendor/c-toxcore/toxcore/net.h
+index f4dbc2e..d3901a0 100644
+--- a/vendor/c-toxcore/toxcore/net.h
++++ b/vendor/c-toxcore/toxcore/net.h
+@@ -134,6 +134,11 @@ int ns_recv(const Network *_Nonnull ns, Socket sock, uint8_t *_Nonnull buf, size
+ int ns_recvfrom(const Network *_Nonnull ns, Socket sock, uint8_t *_Nonnull buf, size_t len, IP_Port *_Nonnull addr);
+ int ns_send(const Network *_Nonnull ns, Socket sock, const uint8_t *_Nonnull buf, size_t len);
+ int ns_sendto(const Network *_Nonnull ns, Socket sock, const uint8_t *_Nonnull buf, size_t len, const IP_Port *_Nonnull addr);
++
++#ifdef P2P_POKER_FAULT_HARNESS
++/** p2p-poker (patch 0035): the line goes away while `cut` holds -- see net.c. */
++void p2p_poker_cut_line(bool cut);
++#endif /* P2P_POKER_FAULT_HARNESS */
+ Socket ns_socket(const Network *_Nonnull ns, int domain, int type, int proto);
+ int ns_socket_nonblock(const Network *_Nonnull ns, Socket sock, bool nonblock);
+ int ns_getsockopt(const Network *_Nonnull ns, Socket sock, int level, int optname, void *_Nonnull optval, size_t *_Nonnull optlen);

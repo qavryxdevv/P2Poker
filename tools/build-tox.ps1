@@ -250,6 +250,12 @@ $patched = @(
     @{ File   = 'toxcore/tox.h'
        Marker = 'p2p-poker (patch 0034): the table''s word removes a member'
        Why    = '0034: D-045, the owner''s rule. No ghost in a table''s group: a member the players'' word removed is dropped here and, for good, never added again; and a founder''s kick counts only for a key that word allowed, so no founder throws a legitimate seat out. The wire is untouched.' }
+    @{ File   = 'toxcore/net.c'
+       Marker = 'p2p-poker (patch 0035): the line goes away'
+       Why    = '0035a: S1-EB''s instrument. The application''s outage knob (-LinkDownAt) drops table messages above a transport that stays up, so the library never forgets anybody; a real outage makes it forget every member at 58 s and the owner''s deadlock lives past that. Entirely inside #ifdef P2P_POKER_FAULT_HARNESS' }
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker (patch 0035): an invitation to a group this client holds with'
+       Why    = '0035b: S1-EB. An invitation to a chat this client holds was swallowed in Messenger.c; a member back from an outage holds an emptied copy of the table''s group and its founder''s fresh invitation never reached the application, so a seat whose old address no longer answered could never be brought back. Delivered when the chat holds nobody else; the wire is untouched.' }
 )
 
 Step 'checking the patches are in the vendored source'

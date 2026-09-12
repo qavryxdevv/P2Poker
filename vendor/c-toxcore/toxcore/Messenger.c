@@ -2286,7 +2286,11 @@ static int m_handle_packet_invite_groupchat(Messenger *_Nonnull m, const int fri
     const uint32_t join_data_len = data_length - 2;
 
     if (m->group_invite != nullptr && data[1] == GROUP_INVITE && data_length != 2 + GC_JOIN_DATA_LENGTH) {
-        if (group_not_added(m->group_handler, join_data, join_data_len)) {
+        /* p2p-poker (patch 0035): and for a group this client holds with
+         * nobody else in it, so a member back from an outage can take the
+         * founder's fresh invitation -- see group_held_empty. */
+        if (group_not_added(m->group_handler, join_data, join_data_len)
+                || group_held_empty(m->group_handler, join_data, join_data_len)) {
             m->group_invite(m, friendcon_id, join_data, GC_JOIN_DATA_LENGTH,
                             join_data + GC_JOIN_DATA_LENGTH, join_data_len - GC_JOIN_DATA_LENGTH, userdata);
         }

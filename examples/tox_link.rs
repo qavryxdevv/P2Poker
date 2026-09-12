@@ -273,6 +273,9 @@ fn main() {
                 Event::GroupJoinFail { group, reason } => {
                     println!("group {group} join failed, reason {reason}")
                 }
+                Event::GroupModeration { group, target_is_self, kick } => {
+                    println!("group {group}: moderation, about me {target_is_self}, a kick {kick}")
+                }
             }
         }
 

@@ -726,6 +726,10 @@ bool handle_gc_invite_accepted_packet(const GC_Session *_Nonnull c, int friend_n
  */
 bool group_not_added(const GC_Session *_Nonnull c, const uint8_t *_Nonnull chat_id, uint32_t length);
 
+/** p2p-poker (patch 0035): true when this client holds the chat with this id and
+ * no other member is confirmed in it -- see group_chats.c. */
+bool group_held_empty(const GC_Session *_Nonnull c, const uint8_t *_Nonnull chat_id, uint32_t length);
+
 /** @brief Handles an invite confirmed packet.
  *
  * Return 0 on success.

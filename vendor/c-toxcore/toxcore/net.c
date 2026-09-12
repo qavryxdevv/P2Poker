@@ -5,6 +5,32 @@
 
 #include "net.h"
 
+#ifdef P2P_POKER_FAULT_HARNESS
+/* p2p-poker (patch 0035): the line goes away.
+ *
+ * A test instrument, not a repair. While the flag below is set every socket
+ * call in this file behaves as a machine whose internet has gone: nothing
+ * goes out (a send reports its bytes as sent, as the kernel does when the
+ * cable is out), nothing comes in (a receive says there is nothing, and what
+ * did arrive is read and thrown away, so nothing stale is delivered when the
+ * line returns), and a new connection fails. The process, its timers and
+ * every instance keep running, which is what separates this from the
+ * harness's stall (patch 0023's family) and from the application's own
+ * outage knob (P2P_POKER_LINK_DOWN_AT), which drops table messages above a
+ * transport that stays up and so never makes the library forget anybody. The
+ * library then does what it does on a real outage: friends go offline,
+ * group members time out at GC_CONFIRMED_PEER_TIMEOUT, relays are dropped,
+ * and all of it comes back through the DHT once the line does. One flag for
+ * the process: the client runs one instance (D-042), and the harness runs
+ * every node in a process of its own. */
+static bool p2p_poker_line_cut = false;
+
+void p2p_poker_cut_line(bool cut)
+{
+    p2p_poker_line_cut = cut;
+}
+#endif /* P2P_POKER_FAULT_HARNESS */
+
 int net_socket_to_native(Socket sock)
 {
     return (force int)sock.value;
@@ -38,31 +64,65 @@ int ns_listen(const Network *ns, Socket sock, int backlog)
 
 int ns_connect(const Network *ns, Socket sock, const IP_Port *addr)
 {
+#ifdef P2P_POKER_FAULT_HARNESS
+    if (p2p_poker_line_cut) {
+        return -1;
+    }
+#endif /* P2P_POKER_FAULT_HARNESS */
     return ns->funcs->connect(ns->obj, sock, addr);
 }
 
 int ns_recvbuf(const Network *ns, Socket sock)
 {
+#ifdef P2P_POKER_FAULT_HARNESS
+    if (p2p_poker_line_cut) {
+        return 0;
+    }
+#endif /* P2P_POKER_FAULT_HARNESS */
     return ns->funcs->recvbuf(ns->obj, sock);
 }
 
 int ns_recv(const Network *ns, Socket sock, uint8_t *buf, size_t len)
 {
+#ifdef P2P_POKER_FAULT_HARNESS
+    if (p2p_poker_line_cut) {
+        return -1;
+    }
+#endif /* P2P_POKER_FAULT_HARNESS */
     return ns->funcs->recv(ns->obj, sock, buf, len);
 }
 
 int ns_recvfrom(const Network *ns, Socket sock, uint8_t *buf, size_t len, IP_Port *addr)
 {
+#ifdef P2P_POKER_FAULT_HARNESS
+    if (p2p_poker_line_cut) {
+        /* Read and thrown away, so the line comes back with nothing stale. */
+        while (ns->funcs->recvfrom(ns->obj, sock, buf, len, addr) >= 0) {
+            continue;
+        }
+        return -1;
+    }
+#endif /* P2P_POKER_FAULT_HARNESS */
     return ns->funcs->recvfrom(ns->obj, sock, buf, len, addr);
 }
 
 int ns_send(const Network *ns, Socket sock, const uint8_t *buf, size_t len)
 {
+#ifdef P2P_POKER_FAULT_HARNESS
+    if (p2p_poker_line_cut) {
+        return (int)len;
+    }
+#endif /* P2P_POKER_FAULT_HARNESS */
     return ns->funcs->send(ns->obj, sock, buf, len);
 }
 
 int ns_sendto(const Network *ns, Socket sock, const uint8_t *buf, size_t len, const IP_Port *addr)
 {
+#ifdef P2P_POKER_FAULT_HARNESS
+    if (p2p_poker_line_cut) {
+        return (int)len;
+    }
+#endif /* P2P_POKER_FAULT_HARNESS */
     return ns->funcs->sendto(ns->obj, sock, buf, len, addr);
 }
 

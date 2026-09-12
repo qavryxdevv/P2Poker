@@ -101,6 +101,40 @@ fn stall_join_secs() -> u64 {
     0
 }
 
+/// **The client's internet goes away, at the socket** (`patches/0035`).
+///
+/// `P2P_POKER_OFFLINE_AT=<s>` and `P2P_POKER_OFFLINE_FOR=<s>`: from that
+/// second of the driver's life -- the client's start, since `D-042` starts
+/// the instance with the client -- and for that long, nothing this instance
+/// sends leaves the machine and nothing reaches it, and the library does what
+/// a real outage makes it do: friends go offline, the table's group times its
+/// members out at 58 s, relays are dropped, and all of it comes back through
+/// the DHT once the line does. The process, the node loop and the lobby's own
+/// transport live on.
+///
+/// **Different from `P2P_POKER_LINK_DOWN_AT`**, which drops the table's
+/// messages above a transport that stays up and so never makes the library
+/// forget anybody: the owner's report of 2026-09-12 -- a seat's internet cut
+/// mid-hand, both sides choosing to wait, and no way back once the line
+/// returned (`S1-EB`) -- lives entirely past the library's timeout, where
+/// that knob cannot reach. Compiled out without `--features fault-harness`.
+#[cfg(feature = "fault-harness")]
+fn offline_window() -> Option<(Duration, Duration)> {
+    use std::sync::OnceLock;
+    static WINDOW: OnceLock<Option<(Duration, Duration)>> = OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let read = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let at = read("P2P_POKER_OFFLINE_AT");
+        let dur = read("P2P_POKER_OFFLINE_FOR");
+        (at > 0 && dur > 0).then(|| (Duration::from_secs(at), Duration::from_secs(dur)))
+    })
+}
+
 /// How long a joiner waits for its own join to finish before it gives it up.
 ///
 /// **Comfortably past toxcore's own reaper, and deliberately so.**
@@ -268,6 +302,9 @@ pub enum Command {
 /// mechanism by which a busy table falls behind, and it was being swallowed.
 #[derive(Default)]
 pub struct Trouble {
+    /// `S1-EB`: how many times an emptied copy of a table's group was left
+    /// here so the group's fresh offer could be taken.
+    pub left_empty: AtomicU64,
     /// **Which seats the carrier is mid-delivery with, one bit per seat.**
     ///
     /// Set while `gcc_recv_pending` reports messages from that seat sitting in
@@ -1143,6 +1180,14 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
     let mut tables: HashMap<TableId, TableState> = HashMap::new();
     let mut last_sweep = Instant::now();
     let mut stopping = false;
+    // `S1-EB`: invitations taken one turn after the emptied copy of their
+    // group was left, once the library has let go of the chat.
+    let mut invites_to_take: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut invites_deferred: Vec<(u32, Vec<u8>)> = Vec::new();
+    #[cfg(feature = "fault-harness")]
+    let started = Instant::now();
+    #[cfg(feature = "fault-harness")]
+    let mut line_cut = false;
 
     loop {
         // --- what the client asked for -------------------------------------
@@ -1359,6 +1404,9 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                                         let peer = t.peer_keys.iter().find(|(_, k)| **k == gk).map(|(p, _)| *p);
                                         if let Some(p) = peer {
                                             let _ = tox.kick(g, p);
+                                            // `S1-ED`: the library's kick deletes without the exit
+                                            // callback; the bookkeeping is done here.
+                                            member_gone(&tox, t, g, p, Some(gk), false);
                                         }
                                     }
                                     if tox.peer_drop(g, &gk, for_good) {
@@ -1407,6 +1455,21 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
             }
         }
 
+        // `patches/0035`: the harness's outage, applied on its edges.
+        #[cfg(feature = "fault-harness")]
+        if let Some((at, dur)) = offline_window() {
+            let now = started.elapsed();
+            let cut = now >= at && now < at + dur;
+            if cut != line_cut {
+                tox.cut_line(cut);
+                line_cut = cut;
+                println!(
+                    "fault-harness: the internet {} at {} s, as P2P_POKER_OFFLINE_AT asked",
+                    if cut { "goes away" } else { "is back" },
+                    now.as_secs()
+                );
+            }
+        }
         // --- one turn of toxcore's own loop --------------------------------
         for e in tox.iterate() {
             match e {
@@ -1443,70 +1506,42 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                     }
                 }
                 Event::GroupInvite { friend, invite } => {
-                    // **Which table this invitation could be for**: one still
-                    // without a group, whose advertisement named one (an
-                    // invitation with nothing to compare against is refused
-                    // outright, see `Role`), and whose role names this friend
-                    // -- a joiner's founder, or for a founder coming back any
-                    // member of its roster (`D-037`). An invitation says
-                    // nothing about which group it is for: it is accepted,
-                    // the group's id read back and compared, and a mismatch
-                    // is left at once.
+                    // `S1-EB`: a table whose group this client still holds with
+                    // nobody else left in it -- every other member timed out of
+                    // this view, as this client did out of theirs -- leaves that
+                    // copy now and takes the invitation at the next turn, once
+                    // the library has let go of the chat: a confirmation read
+                    // while both copies are held would find the old one. The
+                    // library delivers such an invitation since `patches/0035`;
+                    // before it, the founder's fresh offer was swallowed and a
+                    // seat whose old address no longer answered had no way back.
                     let from = friends.get(&friend).copied();
-                    let candidates: Vec<(TableId, [u8; 32])> = tables
-                        .iter()
-                        .filter_map(|(id, t)| {
-                            if t.group.is_some() || t.closing.is_some() {
-                                return None;
-                            }
-                            match (&t.setup.role, from) {
-                                (
-                                    Role::Joiner {
-                                        founder,
-                                        chat_id: Some(want),
-                                    },
-                                    Some(k),
-                                ) if k == *founder => Some((*id, *want)),
-                                (Role::Back { chat_id: Some(want) }, Some(k))
-                                    if t.roster.contains(&k) =>
-                                {
-                                    Some((*id, *want))
-                                }
-                                _ => None,
-                            }
-                        })
-                        .collect();
-                    let Some((first, _)) = candidates.first().copied() else {
-                        continue;
-                    };
-                    let self_name = tables[&first].setup.self_name.clone();
-                    let Ok(joined) = tox.accept_invite(friend, &invite, &self_name) else {
-                        continue;
-                    };
-                    let got = tox.chat_id(joined).ok();
-                    let target = candidates
-                        .iter()
-                        .find(|(_, want)| Some(*want) == got)
-                        .map(|(id, _)| *id);
-                    match target.and_then(|id| tables.get_mut(&id)) {
-                        Some(t) => {
-                            t.group = Some(joined);
-                            t.accepted_at = Some(Instant::now());
+                    let mut left_one = false;
+                    for t in tables.values_mut() {
+                        if !(t.self_joined && t.confirmed.is_empty() && t.closing.is_none()) {
+                            continue;
+                        }
+                        if !invitation_fits(t, from) {
+                            continue;
+                        }
+                        if let Some(g) = t.group.take() {
+                            let _ = tox.leave(g);
                             t.self_joined = false;
-                            announce(&tox, t.group, &t.chat);
-                            // **The harness's stall, once per process.**
-                            // Sleeping here starves the handshake past
-                            // toxcore's twelve-second reaper without touching
-                            // the code under test.
-                            let stall = stall_join_secs();
-                            if stall > 0 && !t.stalled_once {
-                                t.stalled_once = true;
-                                std::thread::sleep(Duration::from_secs(stall));
-                            }
+                            t.accepted_at = None;
+                            t.peer_keys.clear();
+                            t.peer_lines.clear();
+                            t.invited.clear();
+                            t.trouble.left_empty.fetch_add(1, Ordering::Relaxed);
+                            println!(
+                                "the table's group held nobody else here and it is offered again: left the old copy, taking the invitation (S1-EB)"
+                            );
+                            left_one = true;
                         }
-                        None => {
-                            let _ = tox.leave(joined);
-                        }
+                    }
+                    if left_one {
+                        invites_deferred.push((friend, invite));
+                    } else {
+                        take_invitation(&mut tox, &mut tables, &friends, friend, &invite);
                     }
                 }
                 Event::GroupSelfJoin { group: g } => {
@@ -1557,47 +1592,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                     quit,
                 } => {
                     if let Some(t) = by_group(&mut tables, g) {
-                        t.confirmed.remove(&peer);
-                        let remembered = t.peer_keys.remove(&peer);
-                        let line = t.peer_lines.remove(&peer);
-                        // `D-035`: a seat this driver knows by its group key is
-                        // reported gone, on purpose or by timing out. `S1-DS`: by
-                        // the key remembered for the peer when the callback
-                        // could not read one.
-                        let key = key.or(remembered);
-                        if let Some(app) = key.and_then(|k| t.known_as.get(&k).copied()) {
-                            // `S1-DU`: a seat back under a fresh key is still here
-                            // by that entry -- the one that timed out is gone, the
-                            // seat is not. A quit is the live process saying so,
-                            // and any other entry of that seat is the stale one.
-                            // The library has dropped the leaving peer before
-                            // this, so the scan holds the others.
-                            let still = !quit
-                                && entries_of(&app, scan_pairs(&tox, g), &t.known_as)
-                                    .iter()
-                                    .any(|(p, _)| t.confirmed.contains(p));
-                            if !still {
-                                if let Ok(mut present) = t.trouble.present.lock() {
-                                    present.remove(&app);
-                                }
-                                if let Ok(mut gone) = t.trouble.gone.lock() {
-                                    gone.push((app, quit));
-                                }
-                            }
-                        }
-                        // `S1-DV`: and by the line it came in over, taught or not.
-                        if let Some(l) = line {
-                            let still = !quit
-                                && t.peer_lines.iter().any(|(p, k)| *k == l && t.confirmed.contains(p));
-                            if !still {
-                                if let Ok(mut present) = t.trouble.present_lines.lock() {
-                                    present.remove(&l);
-                                }
-                                if let Ok(mut gone) = t.trouble.gone_lines.lock() {
-                                    gone.push((l, quit));
-                                }
-                            }
-                        }
+                        member_gone(&tox, t, g, peer, key, quit);
                     }
                 }
                 Event::GroupPacket { group: g, peer, data } => {
@@ -1656,6 +1651,13 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                 Event::FriendRequestIgnored => {}
             }
         }
+
+        // `S1-EB`: the invitations deferred a turn ago, their old copies gone
+        // with the turn of toxcore's loop just taken.
+        for (friend, invite) in std::mem::take(&mut invites_to_take) {
+            take_invitation(&mut tox, &mut tables, &friends, friend, &invite);
+        }
+        invites_to_take.append(&mut invites_deferred);
 
         // --- the founder's invitations, one at a time -------------------------
         for t in tables.values_mut() {
@@ -1772,6 +1774,127 @@ pub const INVITE_GAP: Duration = Duration::from_secs(3);
 /// table's first hand came 25 s after the join, where a first table -- whose
 /// friend links came up a second apart -- dealt 5 s after it. A seat invited
 /// after the last is confirmed gets the last in its own sync.
+/// A member is gone from this view, on purpose, by timing out, or by the
+/// table's word: the driver's maps, the felt's presence sets and the
+/// `gone` queues the node reads are brought up to date. Called from the
+/// library's exit callback, and by the founder's own kick (`S1-ED`): the
+/// library deletes a kicked member without that callback, and a dead peer
+/// number left in `peer_lines` kept the seat *on the line* by its line at
+/// the founder's felt until the seat itself came back (run161903-3).
+fn member_gone(tox: &Tox, t: &mut TableState, g: u32, peer: u32, key: Option<[u8; 32]>, quit: bool) {
+    t.confirmed.remove(&peer);
+    let remembered = t.peer_keys.remove(&peer);
+    let line = t.peer_lines.remove(&peer);
+    // `D-035`: a seat this driver knows by its group key is
+    // reported gone, on purpose or by timing out. `S1-DS`: by
+    // the key remembered for the peer when the callback
+    // could not read one.
+    let key = key.or(remembered);
+    if let Some(app) = key.and_then(|k| t.known_as.get(&k).copied()) {
+        // `S1-DU`: a seat back under a fresh key is still here
+        // by that entry -- the one that timed out is gone, the
+        // seat is not. A quit is the live process saying so,
+        // and any other entry of that seat is the stale one.
+        // The library has dropped the leaving peer before
+        // this, so the scan holds the others.
+        let still = !quit
+            && entries_of(&app, scan_pairs(tox, g), &t.known_as)
+                .iter()
+                .any(|(p, _)| t.confirmed.contains(p));
+        if !still {
+            if let Ok(mut present) = t.trouble.present.lock() {
+                present.remove(&app);
+            }
+            if let Ok(mut gone) = t.trouble.gone.lock() {
+                gone.push((app, quit));
+            }
+        }
+    }
+    // `S1-DV`: and by the line it came in over, taught or not.
+    if let Some(l) = line {
+        let still = !quit
+            && t.peer_lines.iter().any(|(p, k)| *k == l && t.confirmed.contains(p));
+        if !still {
+            if let Ok(mut present) = t.trouble.present_lines.lock() {
+                present.remove(&l);
+            }
+            if let Ok(mut gone) = t.trouble.gone_lines.lock() {
+                gone.push((l, quit));
+            }
+        }
+    }
+}
+
+/// Whether an invitation from this friend could be for this table: a
+/// joiner's founder, or for a founder coming back any member of its roster
+/// (`D-037`); and only a table whose advertisement named a group, since an
+/// invitation says nothing about which group it is for (see `Role`).
+fn invitation_fits(t: &TableState, from: Option<[u8; 32]>) -> bool {
+    match (&t.setup.role, from) {
+        (Role::Joiner { founder, chat_id: Some(_) }, Some(k)) => k == *founder,
+        (Role::Back { chat_id: Some(_) }, Some(k)) => t.roster.contains(&k),
+        _ => false,
+    }
+}
+
+/// The group an invitation is for, if a table of this client wants one.
+fn wanted_chat(t: &TableState) -> Option<[u8; 32]> {
+    match &t.setup.role {
+        Role::Joiner { chat_id, .. } | Role::Back { chat_id } => *chat_id,
+        Role::Host => None,
+    }
+}
+
+/// Take an invitation for whichever table it fits: one still without a
+/// group, whose advertisement named one, and whose role names this friend.
+/// It is accepted, the group's id read back and compared, and a mismatch is
+/// left at once.
+fn take_invitation(
+    tox: &mut Tox,
+    tables: &mut HashMap<TableId, TableState>,
+    friends: &HashMap<u32, [u8; 32]>,
+    friend: u32,
+    invite: &[u8],
+) {
+    let from = friends.get(&friend).copied();
+    let candidates: Vec<(TableId, [u8; 32])> = tables
+        .iter()
+        .filter(|(_, t)| t.group.is_none() && t.closing.is_none() && invitation_fits(t, from))
+        .filter_map(|(id, t)| wanted_chat(t).map(|want| (*id, want)))
+        .collect();
+    let Some((first, _)) = candidates.first().copied() else {
+        return;
+    };
+    let self_name = tables[&first].setup.self_name.clone();
+    let Ok(joined) = tox.accept_invite(friend, invite, &self_name) else {
+        return;
+    };
+    let got = tox.chat_id(joined).ok();
+    let target = candidates
+        .iter()
+        .find(|(_, want)| Some(*want) == got)
+        .map(|(id, _)| *id);
+    match target.and_then(|id| tables.get_mut(&id)) {
+        Some(t) => {
+            t.group = Some(joined);
+            t.accepted_at = Some(Instant::now());
+            t.self_joined = false;
+            announce(tox, t.group, &t.chat);
+            // **The harness's stall, once per process.** Sleeping here
+            // starves the handshake past toxcore's twelve-second reaper
+            // without touching the code under test.
+            let stall = stall_join_secs();
+            if stall > 0 && !t.stalled_once {
+                t.stalled_once = true;
+                std::thread::sleep(Duration::from_secs(stall));
+            }
+        }
+        None => {
+            let _ = tox.leave(joined);
+        }
+    }
+}
+
 fn invite_pending(
     tox: &mut Tox,
     t: &mut TableState,

@@ -8518,6 +8518,45 @@ bool group_not_added(const GC_Session *c, const uint8_t *chat_id, uint32_t lengt
     return !group_exists(c, chat_id);
 }
 
+/* p2p-poker (patch 0035): an invitation to a group this client holds with
+ * nobody else in it is delivered.
+ *
+ * The library hands an invitation to the application only for a chat it
+ * does not hold (`group_not_added`, Messenger.c). A member whose line went
+ * away for longer than GC_CONFIRMED_PEER_TIMEOUT has, when it returns, a
+ * chat that holds nobody: every other member timed out of its view, as it
+ * did out of theirs. The library tries the addresses it last knew for a
+ * while; a founder that still holds the group offers it again over the
+ * friendship as soon as that is back -- and that offer was swallowed here,
+ * so a seat whose old address no longer answered could never be brought
+ * back (S1-EB: two seats waiting on each other for good after one lost its
+ * internet mid-hand, the owner's report of 2026-09-12). Such an invitation
+ * is delivered and the application decides: ours leaves the empty copy and
+ * takes it. A chat with a member still in it, or one being left, delivers
+ * nothing, as before; the wire is untouched. */
+bool group_held_empty(const GC_Session *c, const uint8_t *chat_id, uint32_t length)
+{
+    if (length < CHAT_ID_SIZE) {
+        return false;
+    }
+
+    const GC_Chat *chat = gc_get_group_by_public_key(c, chat_id);
+
+    if (chat == nullptr || chat->flag_exit) {
+        return false;
+    }
+
+    for (uint32_t i = 1; i < chat->numpeers; ++i) {
+        const GC_Connection *gconn = get_gc_connection(chat, i);
+
+        if (gconn != nullptr && gconn->confirmed) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int gc_invite_friend(const GC_Session *c, GC_Chat *chat, int32_t friend_number,
                      gc_send_group_invite_packet_cb *callback)
 {

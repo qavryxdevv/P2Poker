@@ -157,6 +157,7 @@ pub struct TableApp {
     pub muted: std::collections::BTreeSet<u8>,
     pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, Option<u64>, std::time::Instant)>,
     pub opponent_gone: Option<OpponentGone>,
+    pub opponent_was_reachable: bool,
     pub opponent_returns: u8,
     pub opponent_out: bool,
     pub gone: std::collections::BTreeSet<u8>,
@@ -242,6 +243,11 @@ pub struct AppState {
     pub joining: Option<Joining>,
     /// `S1-CX`: the heads-up opponent this client cannot reach, if any.
     pub opponent_gone: Option<OpponentGone>,
+    /// `S1-EC`: whether the opponent has been on the line once at this
+    /// table. Before that, *not on the line* is a seat still joining the
+    /// group, not an absence: a game used to begin with a return spent and
+    /// the question asked while the other seat was handshaking.
+    pub opponent_was_reachable: bool,
     /// `D-032`: how many absences worth asking about ended with the
     /// opponent back; at `MAX_RETURNS` the next absence is final.
     pub opponent_returns: u8,
@@ -361,13 +367,16 @@ pub const JOIN_WAIT_MS: u64 = 90_000;
 /// whether the log has said so and whether the player has answered.
 ///
 /// D-007: at two seats nobody can fold a hand for an absent player and
-/// the remedy is to leave the table -- so the window asks, once per
-/// episode, and a headless client writes the same sentence.
+/// the remedy is to leave the table -- so the window asks, and asks again
+/// every `OPPONENT_ASK_AGAIN_MS` while the player waits (D-046), and a
+/// headless client writes the same sentence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpponentGone {
     pub since: std::time::Instant,
     pub said: bool,
-    pub dismissed: bool,
+    /// `D-046`: when the player last chose to wait; `None` while the
+    /// question stands.
+    pub dismissed_at: Option<std::time::Instant>,
     /// `D-034`: the opponent is on the line but long past their time to
     /// decide -- D-007's other case, asked about with the same question and
     /// said as what it is. Ends when they act; no absence and no return.
@@ -377,6 +386,11 @@ pub struct OpponentGone {
 /// How long an opponent must be unreachable before it is said: longer
 /// than a reconnection takes, shorter than a player's patience.
 pub const OPPONENT_GONE_MS: u64 = 15_000;
+
+/// `D-046`: how long a player's *Wait* holds before the question about an
+/// opponent still out of reach is asked again -- the owner's "a few tens of
+/// seconds", so that a wait is never for ever.
+pub const OPPONENT_ASK_AGAIN_MS: u64 = 30_000;
 
 /// `S1-CR`: what the window asks about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,6 +467,7 @@ impl AppState {
         std::mem::swap(&mut self.muted, &mut other.muted);
         std::mem::swap(&mut self.links, &mut other.links);
         std::mem::swap(&mut self.opponent_gone, &mut other.opponent_gone);
+        std::mem::swap(&mut self.opponent_was_reachable, &mut other.opponent_was_reachable);
         std::mem::swap(&mut self.opponent_returns, &mut other.opponent_returns);
         std::mem::swap(&mut self.opponent_out, &mut other.opponent_out);
         std::mem::swap(&mut self.gone, &mut other.gone);
@@ -671,7 +686,7 @@ impl AppState {
                             .checked_sub(std::time::Duration::from_millis(OPPONENT_GONE_MS))
                             .unwrap_or_else(std::time::Instant::now),
                         said: true,
-                        dismissed: false,
+                        dismissed_at: None,
                         slow: false,
                     });
                     self.note("your opponent left the table (D-035): the game is over -- leave the table".into());
@@ -1151,6 +1166,7 @@ impl AppState {
     /// table, because the hand was never cleared.
     fn forget_the_table(&mut self) {
         self.opponent_gone = None;
+        self.opponent_was_reachable = false;
         self.opponent_returns = 0;
         self.opponent_out = false;
         self.gone.clear();
@@ -1183,6 +1199,7 @@ impl AppState {
             return;
         }
         if reachable {
+            self.opponent_was_reachable = true;
             // `D-032`: an absence worth asking about that ended is a return.
             if self
                 .opponent_gone
@@ -1196,11 +1213,14 @@ impl AppState {
                     crate::protocol::constants::MAX_RETURNS
                 ));
             }
-        } else if self.opponent_gone.is_none() {
+        } else if self.opponent_gone.is_none() && self.opponent_was_reachable {
+            // `S1-EC`: only an opponent that has been on the line can be out of
+            // reach; before that the seat is still joining (S1-CX said so for
+            // the group's count, and this reading needed the same rule).
             self.opponent_gone = Some(OpponentGone {
                 since: std::time::Instant::now(),
                 said: false,
-                dismissed: false,
+                dismissed_at: None,
                 slow: false,
             });
         }
@@ -1229,7 +1249,7 @@ impl AppState {
                         .checked_sub(std::time::Duration::from_millis(OPPONENT_GONE_MS))
                         .unwrap_or_else(std::time::Instant::now),
                     said: false,
-                    dismissed: false,
+                    dismissed_at: None,
                     slow: true,
                 });
             }
@@ -1243,6 +1263,18 @@ impl AppState {
                 .is_some_and(|(_, _, _, at)| at.elapsed().as_millis() as u64 > app_link_stale_ms());
             if stale {
                 self.opponent_reachable(false);
+            }
+        }
+        // `D-046`: a player who chose to wait is asked again after
+        // `OPPONENT_ASK_AGAIN_MS` if the opponent is still out of reach, the
+        // log line with it -- a wait is not for ever.
+        if let Some(g) = self.opponent_gone.as_mut() {
+            if g
+                .dismissed_at
+                .is_some_and(|d| d.elapsed().as_millis() as u64 >= OPPONENT_ASK_AGAIN_MS)
+            {
+                g.dismissed_at = None;
+                g.said = false;
             }
         }
         let due = self
@@ -1277,11 +1309,12 @@ impl AppState {
         }
     }
 
-    /// The player chose to wait: the question is not asked again for this
-    /// episode. A new one -- the opponent back, then gone again -- asks anew.
+    /// The player chose to wait: the question rests for `OPPONENT_ASK_AGAIN_MS`
+    /// and comes back if the opponent is still out of reach (D-046). A new
+    /// episode -- the opponent back, then gone again -- asks anew.
     pub fn dismiss_opponent_gone(&mut self) {
         if let Some(g) = self.opponent_gone.as_mut() {
-            g.dismissed = true;
+            g.dismissed_at = Some(std::time::Instant::now());
         }
     }
 
@@ -1290,7 +1323,7 @@ impl AppState {
     pub fn opponent_gone_for_s(&self) -> Option<u64> {
         self.opponent_gone
             .as_ref()
-            .filter(|g| !g.dismissed && g.since.elapsed().as_millis() as u64 >= OPPONENT_GONE_MS)
+            .filter(|g| g.dismissed_at.is_none() && g.since.elapsed().as_millis() as u64 >= OPPONENT_GONE_MS)
             .map(|g| g.since.elapsed().as_secs())
     }
 
@@ -1991,6 +2024,13 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        // `S1-EC`: before the opponent was ever on the line, *not on the line* is a
+        // seat still joining the group, not an absence -- run160251-2 spent a return
+        // (D-032) and asked the question at 19 s while the joiner was handshaking.
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
+        assert!(s.opponent_gone.is_none(), "no episode before the opponent was ever reached");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0) });
+        assert!(s.opponent_gone.is_none() && s.opponent_returns == 0, "the first contact is not a return");
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
         assert!(s.opponent_gone.is_some(), "the closed connection opens an episode");
         assert_eq!(s.opponent_gone_for_s(), None, "not worth asking about yet");
@@ -2007,12 +2047,21 @@ mod tests {
 
         s.dismiss_opponent_gone();
         assert_eq!(s.opponent_gone_for_s(), None, "the player chose to wait");
+        s.tick_opponent();
+        assert_eq!(s.opponent_gone_for_s(), None, "and is not asked again at once");
+        // `D-046`: thirty seconds later, still out of reach, the question comes back.
+        s.opponent_gone.as_mut().unwrap().dismissed_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_ASK_AGAIN_MS + 1_000));
+        s.tick_opponent();
+        assert!(s.opponent_gone_for_s().is_some(), "asked again after the wait (D-046)");
+        assert_eq!(s.log.iter().filter(|l| l.contains("unreachable")).count(), 2, "and said again");
+        s.dismiss_opponent_gone();
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
         assert!(s.opponent_gone.is_none(), "a ping ends the episode");
         s.apply(NodeEvent::Carrier { seen: 0, want: 1 });
         assert!(s.opponent_gone.is_none(), "an empty group is the other seat still joining it, not an opponent out of reach");
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
-        assert!(s.opponent_gone.as_ref().is_some_and(|g| !g.dismissed), "a closed connection is a new episode, asked anew");
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.dismissed_at.is_none()), "a closed connection is a new episode, asked anew");
         s.apply(NodeEvent::Carrier { seen: 1, want: 1 });
         assert!(s.opponent_gone.is_some(), "a seat the group merely sees is not one this client can reach");
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false, quiet_s: None });
@@ -2050,6 +2099,9 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        // `S1-EC`: the opponent has been on the line once; before that nothing is an absence.
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
+        assert_eq!(s.opponent_returns, 0, "the first contact is no return");
         for n in 1..=MAX_RETURNS {
             s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
             s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);

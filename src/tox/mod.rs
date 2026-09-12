@@ -994,6 +994,15 @@ impl Tox {
         unsafe { sys::tox_group_peer_allow_kick(self.ptr, group, peer_key.as_ptr()) }
     }
 
+    /// `patches/0035`, harness builds only: this process's internet goes
+    /// away while `cut` holds, at the socket, so the library forgets its
+    /// friends and its groups' members exactly as a real outage makes it.
+    #[cfg(feature = "fault-harness")]
+    pub fn cut_line(&mut self, cut: bool) {
+        // SAFETY: sets a flag in the library; no pointer is involved.
+        unsafe { sys::p2p_poker_cut_line(cut) }
+    }
+
     pub fn peer_key(&self, group: u32, peer: u32) -> Result<[u8; 32], Failed> {
         let mut out = [0u8; 32];
         let mut err: c_int = 0;

@@ -428,3 +428,11 @@ pub type tox_group_custom_packet_cb = Option<
         user_data: *mut c_void,
     ),
 >;
+
+// **`patches/0035`**, harness builds only: the line goes away while `cut`
+// holds -- every socket of the process sends into nothing, receives nothing
+// and connects to nobody. One flag for the process.
+#[cfg(feature = "fault-harness")]
+extern "C" {
+    pub fn p2p_poker_cut_line(cut: bool);
+}

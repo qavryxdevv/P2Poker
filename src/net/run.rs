@@ -6564,12 +6564,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .waiting_for()
                             .into_iter()
                             .filter(|s| {
-                                t.table
-                                    .as_ref()
-                                    .and_then(|f| f.roster().seats().iter().find(|e| e.seat == *s).map(|e| e.peer_id.clone()))
-                                    .and_then(|b| libp2p::PeerId::from_bytes(&b).ok())
-                                    .and_then(|p| alive.get(&p).copied())
-                                    .is_some_and(|(at, rtt)| rtt.is_some() && at.elapsed() < std::time::Duration::from_secs(15))
+                                // `S1-EB`: on a Tox table the line is the group's (D-041,
+                                // S1-DX) -- the seat is a member the group has heard within
+                                // fifteen seconds. The ping reading below never fires there,
+                                // a Tox table pinging nobody, so this re-say had been dead
+                                // on every Tox table since S1-DX.
+                                let by_group = h.key_of(*s).is_some_and(|k| {
+                                    t.tox_sink.in_group(&k) && t.tox_sink.quiet_secs(&k).is_none_or(|q| q < 15)
+                                });
+                                // The ping reading counts only where the hand rides libp2p:
+                                // the lobby's swarm keeps pinging over a line the table has
+                                // lost (run160251-2 said *back on the line* to a seat whose
+                                // internet was gone).
+                                by_group
+                                    || (!t.tox_sink.is_on_tox()
+                                        && t.table
+                                            .as_ref()
+                                            .and_then(|f| f.roster().seats().iter().find(|e| e.seat == *s).map(|e| e.peer_id.clone()))
+                                            .and_then(|b| libp2p::PeerId::from_bytes(&b).ok())
+                                            .and_then(|p| alive.get(&p).copied())
+                                            .is_some_and(|(at, rtt)| rtt.is_some() && at.elapsed() < std::time::Duration::from_secs(15)))
                             })
                             .collect();
                         if !back.is_empty() {

@@ -174,6 +174,19 @@ param(
     [ValidateRange(0, 100000)][int]$LinkDownAt = 0,
     [ValidateRange(0, 3600)][int]$LinkDownFor = 15,
     [ValidateRange(0, 32)][int]$LinkDownNode = 1,
+    # `-OfflineAt <s> -OfflineFor <s> -OfflineNode <n>`: one node's INTERNET goes
+    # away at the socket (patches/0035): nothing it sends leaves the machine,
+    # nothing reaches it, new connections fail; the process, its timers and the
+    # lobby's own transport live on. The library then does what a real outage
+    # makes it do -- friends offline, group members timed out at 58 s, relays
+    # dropped -- and comes back through the DHT once the line does.
+    # `-LinkDownAt` cannot reach any of that: it drops table messages above a
+    # transport that stays up. S1-EB was measured with this.
+    #
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateRange(0, 100000)][int]$OfflineAt = 0,
+    [ValidateRange(0, 3600)][int]$OfflineFor = 75,
+    [ValidateRange(0, 32)][int]$OfflineNode = 1,
     # `-StallJoin <seconds> -StallJoinNode <n>` starves one joiner's **group
     # handshake** for that long, right after it accepts the invitation.
     #
@@ -400,6 +413,7 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
 
     $diverge = if ($DivergeAt -gt 0 -and $i -eq $DivergeNode) { $DivergeAt } else { 0 }
     $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
+    $offAt = if ($OfflineAt -gt 0 -and $i -eq $OfflineNode) { $OfflineAt } else { 0 }
     $stall = if ($StallJoin -gt 0 -and $i -eq $StallJoinNode) { $StallJoin } else { 0 }
     $mute = if ($MuteFor -gt 0 -and $i -eq $MuteNode) { $MuteFor } else { 0 }
     # Not `$startStack`: PowerShell's names are case-insensitive and that IS
@@ -408,8 +422,12 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # The founder alone, and handed to the job like the stack: the job sees
     # nothing of this scope (the first run printed the banner and kicked nobody).
     $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor)
+        if ($offAt -gt 0) {
+            $env:P2P_POKER_OFFLINE_AT = "$offAt"
+            $env:P2P_POKER_OFFLINE_FOR = "$offFor"
+        }
         if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
         if ($downAt -gt 0) {
             $env:P2P_POKER_LINK_DOWN_AT = "$downAt"
@@ -482,6 +500,10 @@ if ($StallJoin -gt 0) {
     Write-Host "==> n$StallJoinNode starves its group handshake for $StallJoin s after accepting the invite"
     Write-Host "    (S1-AA shape (i): past 12 s the inviter entry is reaped and there is no way back;"
     Write-Host "     expect a leave-and-rejoin, counted on the status line. Needs --features fault-harness)"
+}
+if ($OfflineAt -gt 0) {
+    Write-Host "==> n$OfflineNode's INTERNET goes away at $OfflineAt s for $OfflineFor s, at the socket; the process lives on"
+    Write-Host "    (needs a binary built with --features fault-harness; expect the library's 58 s timeout at every member)"
 }
 if ($LinkDownAt -gt 0) {
     Write-Host "==> n$LinkDownNode loses its LINE at $LinkDownAt s for $LinkDownFor s; the process lives on"

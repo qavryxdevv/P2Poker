@@ -134,6 +134,11 @@ int ns_recv(const Network *_Nonnull ns, Socket sock, uint8_t *_Nonnull buf, size
 int ns_recvfrom(const Network *_Nonnull ns, Socket sock, uint8_t *_Nonnull buf, size_t len, IP_Port *_Nonnull addr);
 int ns_send(const Network *_Nonnull ns, Socket sock, const uint8_t *_Nonnull buf, size_t len);
 int ns_sendto(const Network *_Nonnull ns, Socket sock, const uint8_t *_Nonnull buf, size_t len, const IP_Port *_Nonnull addr);
+
+#ifdef P2P_POKER_FAULT_HARNESS
+/** p2p-poker (patch 0035): the line goes away while `cut` holds -- see net.c. */
+void p2p_poker_cut_line(bool cut);
+#endif /* P2P_POKER_FAULT_HARNESS */
 Socket ns_socket(const Network *_Nonnull ns, int domain, int type, int proto);
 int ns_socket_nonblock(const Network *_Nonnull ns, Socket sock, bool nonblock);
 int ns_getsockopt(const Network *_Nonnull ns, Socket sock, int level, int optname, void *_Nonnull optval, size_t *_Nonnull optlen);
