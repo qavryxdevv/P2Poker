@@ -105,6 +105,9 @@ pub struct SeatView {
     /// `S1-CS`: the seat's connection, as the last ping said; `None` before
     /// any reading.
     pub link: Option<Link>,
+    /// `S1-DO`: the hand this seat showed at the showdown, in words, for
+    /// every seat but the hero (whose own is on the panel).
+    pub shown_hand: Option<String>,
 }
 
 /// The whole table, as a snapshot.
@@ -471,12 +474,21 @@ fn felt_and_people(
     // always cast on something already drawn.
     // The pot plaque only when there is a pot. An empty one is a box with a
     // zero in it, and it is where the note about waiting goes instead.
-    if view.pot > 0 {
+    // `S1-DO`: and while the pot is on its way to the winner, the plaque
+    // stays with the figure in flight, so the chips are seen leaving
+    // something rather than appearing from nowhere.
+    let paying: Chips = motion
+        .in_flight(now)
+        .iter()
+        .filter(|f| f.from == motion::Node::Pot)
+        .map(|f| f.amount)
+        .sum();
+    if view.pot > 0 || paying > 0 {
         paint::plaque(p, l.pot, Color32::from_black_alpha(150), theme::FELT_KEYLINE);
         paint::centred(
             p,
             l.pot.center(),
-            &format!("Total pot: {}", view.pot),
+            &format!("Total pot: {}", if view.pot > 0 { view.pot } else { paying }),
             // A floor, because the plaque scales with a felt that a taller
             // action bar makes shorter, and the pot is the one figure on
             // the table nobody may have to squint at.
@@ -493,6 +505,9 @@ fn felt_and_people(
         }
     }
 
+    // `S1-DO`: the names of the hands shown at the showdown, drawn after
+    // every seat so no plate covers one.
+    let mut names: Vec<(egui::Rect, std::sync::Arc<egui::Galley>)> = Vec::new();
     for slot in &l.seats {
         let Some(seat) = view.seats.iter().find(|s| s.seat == slot.seat) else {
             // An empty chair still gets its outline, so the shape of the table
@@ -515,7 +530,29 @@ fn felt_and_people(
 
         // Cards first: they sit behind the plate in the reference and the plate
         // must win where they meet.
-        for (rect, facing) in slot.cards.iter().zip(seat.cards.iter()) {
+        //
+        // `S1-DO`: an opponent that showed at the showdown is drawn at the
+        // hero's size, grown toward the middle (the owner's request: at the
+        // seat's size a shown hand could not be read), with its hand named
+        // beside the cards.
+        let showed = seat.seat != view.hero
+            && !seat.folded
+            && !seat.sitting_out
+            && !seat.left
+            && seat.cards.iter().all(|f| matches!(f, Facing::Up(_)));
+        let card_rects = if showed { l.shown_cards(slot) } else { slot.cards };
+        if showed {
+            if let Some(name) = seat.shown_hand.as_deref() {
+                let galley = p.layout_no_wrap(
+                    name.to_string(),
+                    egui::FontId::proportional((l.metrics.hero_card.y * 0.15).clamp(11.0, 15.0)),
+                    theme::TEXT,
+                );
+                let at = l.shown_label(slot, &card_rects, galley.size() + egui::vec2(12.0, 6.0));
+                names.push((at, galley));
+            }
+        }
+        for (rect, facing) in card_rects.iter().zip(seat.cards.iter()) {
             // A folded seat has mucked. Drawing backs for it would say it is
             // still in the hand, which is the one thing a card must never say
             // wrongly.
@@ -634,18 +671,33 @@ fn felt_and_people(
         }
     }
 
+    for (at, galley) in names {
+        paint::plaque(p, at, Color32::from_black_alpha(190), theme::FELT_KEYLINE);
+        p.galley(at.center() - galley.size() * 0.5, galley, theme::TEXT);
+    }
+
     // `S1-CS`: chips on their way -- a street's bets into the pot, the pot
-    // to the winner -- drawn where they are now, over everything.
+    // to the winner -- drawn where they are now, over everything. `S1-DO`:
+    // the payout at half again a bet's size, and to the winner's plate
+    // rather than its bet marker, which is where the chips end up.
     for f in motion.in_flight(now) {
+        let payout = f.from == motion::Node::Pot;
         let at = |n: motion::Node| match n {
             motion::Node::Pot => Some(l.pot.center()),
-            motion::Node::Seat(s) => l.seat(s).map(|slot| slot.bet.center()),
+            motion::Node::Seat(s) => l.seat(s).map(|slot| {
+                if payout {
+                    slot.plate.center()
+                } else {
+                    slot.bet.center()
+                }
+            }),
         };
         if let (Some(from), Some(to)) = (at(f.from), at(f.to)) {
             let pos = from + (to - from) * f.progress(now);
+            let size = if payout { l.metrics.bet * 1.5 } else { l.metrics.bet };
             paint::chips(
                 p,
-                egui::Rect::from_center_size(pos, l.metrics.bet),
+                egui::Rect::from_center_size(pos, size),
                 &f.amount.to_string(),
             );
         }

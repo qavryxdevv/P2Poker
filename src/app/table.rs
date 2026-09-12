@@ -73,6 +73,7 @@ impl AppState {
                         stale: at.elapsed().as_millis() as u64 > LINK_STALE_MS,
                         group: *group,
                     }),
+                    shown_hand: shown_name(hand, *n, hero),
                 }
             })
             .collect::<Vec<_>>();
@@ -279,6 +280,22 @@ fn board_cards(hand: Option<&HandInProgress>) -> [Facing; 5] {
     out
 }
 
+/// `S1-DO`: the hand a seat showed at the showdown, in words -- as the
+/// hero's own panel would say it -- for every seat but the hero, from the
+/// cards it showed and the board. `None` for a seat that showed nothing:
+/// a folded or mucked hand was never opened, so there is nothing to name.
+fn shown_name(hand: Option<&HandInProgress>, seat: u8, hero: Option<u8>) -> Option<String> {
+    use crate::poker::state::Card;
+    let h = hand?;
+    if hero == Some(seat) {
+        return None;
+    }
+    let pair = h.shown.get(usize::from(seat)).copied().flatten()?;
+    let hole = [Card::from_index(pair[0]).ok()?, Card::from_index(pair[1]).ok()?];
+    let board: Vec<Card> = h.board.iter().filter_map(|i| Card::from_index(*i).ok()).collect();
+    Some(crate::poker::strength::describe(hole, &board))
+}
+
 /// What to draw in one seat's two card slots.
 ///
 /// Face-up only for this client's own seat, and only from cards it opened
@@ -422,6 +439,57 @@ mod tests {
         assert_eq!(v.seats.iter().map(|x| x.won).collect::<Vec<_>>(), vec![0, 300, 0]);
         assert_eq!(v.street, "hand over");
         assert_eq!(v.seats.iter().map(|x| x.bet).collect::<Vec<_>>(), vec![0, 0, 0], "nothing is in front of anybody once the pot is paid");
+    }
+
+    /// `S1-DO`: a seat that showed at the showdown has its hand named on the
+    /// felt, the way the hero's panel names the hero's; the hero's own seat
+    /// and a seat that showed nothing have no name.
+    #[test]
+    fn a_shown_hand_is_named_for_every_seat_but_the_hero() {
+        use crate::poker::state::{Card, Rank, Suit};
+        let idx = |r: Rank, s: Suit| {
+            let want = Card::new(r, s);
+            (0..52u8).find(|i| Card::from_index(*i).ok() == Some(want)).expect("a card has an index")
+        };
+        let mut s = seated(1);
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::CardsDealt { hand_id: 3, seats: vec![0, 1, 2] });
+        s.apply(state(3, 3, 300, None, &[900, 900, 900], &[0, 0, 0], &[false; 3]));
+        let board = vec![
+            idx(Rank::King, Suit::Spades),
+            idx(Rank::King, Suit::Hearts),
+            idx(Rank::Five, Suit::Diamonds),
+            idx(Rank::Nine, Suit::Clubs),
+            idx(Rank::Two, Suit::Spades),
+        ];
+        s.apply(NodeEvent::Board { hand_id: 3, cards: board.clone() });
+        s.apply(NodeEvent::HandEnded {
+            hand_id: 3,
+            stacks: vec![1_200, 900, 600],
+            shown: vec![
+                Some([idx(Rank::Ace, Suit::Spades), idx(Rank::King, Suit::Diamonds)]),
+                Some([idx(Rank::Seven, Suit::Clubs), idx(Rank::Eight, Suit::Clubs)]),
+                None,
+            ],
+        });
+        let v = s.table_view();
+        let named = v.seats[0].shown_hand.clone().expect("seat 0 showed, so its hand is named");
+        let cards: Vec<Card> = board.iter().map(|i| Card::from_index(*i).unwrap()).collect();
+        assert_eq!(
+            named,
+            crate::poker::strength::describe(
+                [Card::new(Rank::Ace, Suit::Spades), Card::new(Rank::King, Suit::Diamonds)],
+                &cards
+            ),
+            "named as the hero's panel would name it"
+        );
+        assert!(named.to_lowercase().contains("king"), "{named}");
+        assert!(v.seats[1].shown_hand.is_none(), "the hero's own hand is on the panel, not the felt");
+        assert!(v.seats[2].shown_hand.is_none(), "a seat that showed nothing has nothing to name");
+        assert!(
+            v.seats[0].cards.iter().all(|f| matches!(f, crate::gui::table::Facing::Up(_))),
+            "and its cards are face up"
+        );
     }
 
     /// `S1-DG`: a hand ended without a settlement restores every stack to

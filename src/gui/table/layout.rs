@@ -469,6 +469,93 @@ impl Layout {
         }
         v
     }
+
+    /// `S1-DO`: an opponent's shown cards at the hero's size.
+    ///
+    /// Grown from the seat's own pair toward the middle of the table, so the
+    /// edge that faces the plate stays where it was -- the pair's reach along
+    /// the outward direction is kept, and the plate and the portrait were
+    /// separated from it along that very axis, so they stay clear -- and
+    /// shrunk back only as far as it takes to stay clear of the board and
+    /// the pot. The hero's own slot is returned as it is: those cards are
+    /// at the hero's size already.
+    pub fn shown_cards(&self, slot: &SeatSlot) -> [Rect; 2] {
+        if slot.is_hero {
+            return slot.cards;
+        }
+        let mut scale = (self.metrics.hero_card.x / slot.cards[0].width().max(1.0)).max(1.0);
+        let clear = |pair: &[Rect; 2]| {
+            pair.iter()
+                .all(|r| !r.intersects(self.pot) && self.board.iter().all(|b| !r.intersects(*b)))
+        };
+        loop {
+            let pair = grown_pair(slot, scale);
+            if scale <= 1.0 || clear(&pair) {
+                return pair;
+            }
+            scale = (scale - 0.05).max(1.0);
+        }
+    }
+
+    /// `S1-DO`: where an opponent's hand is named at the showdown -- a box
+    /// of `size` just past its shown `cards` toward the middle of the table,
+    /// or beside them when the middle is taken by the board, the pot or
+    /// another seat; failing every clear place, the one that at least keeps
+    /// off the board, the pot and this seat's own plate.
+    pub fn shown_label(&self, slot: &SeatSlot, cards: &[Rect; 2], size: Vec2) -> Rect {
+        let pair = cards[0].union(cards[1]);
+        let inward = -slot.out;
+        let side = vec2(-inward.y, inward.x);
+        let at = |dir: Vec2| {
+            let reach = support(Rect::from_center_size(Pos2::ZERO, pair.size()), Pos2::ZERO, dir)
+                + support(Rect::from_center_size(Pos2::ZERO, size), Pos2::ZERO, dir)
+                + 4.0;
+            Rect::from_center_size(pair.center() + dir * reach, size)
+        };
+        let middle: Vec<Rect> = self.board.iter().copied().chain(std::iter::once(self.pot)).collect();
+        let own = [slot.plate, slot.avatar];
+        let others: Vec<Rect> = self
+            .seats
+            .iter()
+            .filter(|s| s.seat != slot.seat)
+            .flat_map(|s| [s.plate, s.avatar, s.cards[0], s.cards[1]])
+            .collect();
+        let clear_of = |r: Rect, boxes: &[Rect]| boxes.iter().all(|b| !r.intersects(*b));
+        let candidates = [at(inward), at(side), at(-side)];
+        candidates
+            .iter()
+            .copied()
+            .find(|r| {
+                self.felt.contains_rect(*r)
+                    && clear_of(*r, &middle)
+                    && clear_of(*r, &own)
+                    && clear_of(*r, &others)
+            })
+            .or_else(|| {
+                candidates.iter().copied().find(|r| {
+                    self.area.contains_rect(*r) && clear_of(*r, &middle) && clear_of(*r, &own)
+                })
+            })
+            .unwrap_or(candidates[0])
+    }
+}
+
+/// The seat's card pair at `scale` times its size, the reach along the
+/// outward direction kept, so it grows toward the middle of the table.
+fn grown_pair(slot: &SeatSlot, scale: f32) -> [Rect; 2] {
+    let inward = -slot.out;
+    let small = slot.cards[0].union(slot.cards[1]);
+    let cs = slot.cards[0].size() * scale;
+    let gap = (slot.cards[1].left() - slot.cards[0].right()).max(0.0) * scale;
+    let big = vec2(cs.x * 2.0 + gap, cs.y);
+    let shift = support(Rect::from_center_size(Pos2::ZERO, big), Pos2::ZERO, inward)
+        - support(Rect::from_center_size(Pos2::ZERO, small.size()), Pos2::ZERO, inward);
+    let centre = small.center() + inward * shift;
+    let apart = (cs.x + gap) * 0.5;
+    [
+        Rect::from_center_size(pos2(centre.x - apart, centre.y), cs),
+        Rect::from_center_size(pos2(centre.x + apart, centre.y), cs),
+    ]
 }
 
 #[cfg(test)]
@@ -495,6 +582,75 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `S1-DO`: an opponent's shown cards grow toward the middle, never
+    /// shrink below the seat's own, never pass the hero's size, and cover
+    /// neither the plate, the portrait, the board nor the pot -- at every
+    /// table, every hero seat and every window size.
+    #[test]
+    fn shown_cards_grow_inward_and_cover_nothing_that_matters() {
+        every_layout(|l, n, hero| {
+            for slot in &l.seats {
+                let shown = l.shown_cards(slot);
+                if slot.is_hero {
+                    assert_eq!(shown, slot.cards, "{n}/{hero}: the hero's cards are their own");
+                    continue;
+                }
+                for r in &shown {
+                    assert!(
+                        r.width() >= slot.cards[0].width() - 0.01,
+                        "{n}/{hero}: seat {}'s shown card shrank",
+                        slot.seat
+                    );
+                    assert!(
+                        r.width() <= l.metrics.hero_card.x + 0.01,
+                        "{n}/{hero}: seat {}'s shown card is bigger than the hero's",
+                        slot.seat
+                    );
+                    assert!(
+                        !r.intersects(slot.plate) && !r.intersects(slot.avatar),
+                        "{n}/{hero}: seat {}'s shown card covers its own plate",
+                        slot.seat
+                    );
+                    assert!(
+                        !r.intersects(l.pot) && l.board.iter().all(|b| !r.intersects(*b)),
+                        "{n}/{hero}: seat {}'s shown card covers the middle",
+                        slot.seat
+                    );
+                    assert!(l.area.contains_rect(*r), "{n}/{hero}: seat {}'s shown card leaves the window", slot.seat);
+                }
+                // Grown by more than a little wherever the middle allows it:
+                // the whole point is that a shown hand can be read.
+                let grew = shown[0].width() / slot.cards[0].width();
+                assert!(grew >= 1.0, "{n}/{hero}: {grew}");
+            }
+        });
+    }
+
+    /// `S1-DO`: the name of a shown hand sits inside the window, off the
+    /// board, the pot, the seat's own plate and portrait, and off the cards
+    /// it names.
+    #[test]
+    fn a_shown_hands_name_keeps_off_the_middle_and_its_own_seat() {
+        every_layout(|l, n, hero| {
+            for slot in l.seats.iter().filter(|s| !s.is_hero) {
+                let cards = l.shown_cards(slot);
+                let label = l.shown_label(slot, &cards, vec2(104.0, 16.0));
+                assert!(l.area.contains_rect(label), "{n}/{hero}: seat {}'s name leaves the window", slot.seat);
+                assert!(
+                    !label.intersects(l.pot) && l.board.iter().all(|b| !label.intersects(*b)),
+                    "{n}/{hero}: seat {}'s name is on the middle",
+                    slot.seat
+                );
+                assert!(
+                    !label.intersects(slot.plate) && !label.intersects(slot.avatar),
+                    "{n}/{hero}: seat {}'s name is on its own plate",
+                    slot.seat
+                );
+                assert!(cards.iter().all(|c| !label.intersects(*c)), "{n}/{hero}: seat {}'s name is on its cards", slot.seat);
+            }
+        });
     }
 
     /// The thing that was asked for first: wherever the hero was seated, they

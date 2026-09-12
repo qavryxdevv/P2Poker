@@ -16,8 +16,12 @@
 use super::TableView;
 use crate::poker::state::{Chips, SeatIdx};
 
-/// How long a chip takes to get where it is going, in seconds.
+/// How long a bet takes to reach the pot, in seconds.
 pub const FLIGHT_SECS: f64 = 0.45;
+/// How long the pot takes to reach the seat that won it (`S1-DO`): long
+/// enough to be seen -- at a bet's pace the owner never saw the payout at
+/// all -- and short enough that the next deal is not kept waiting.
+pub const PAYOUT_SECS: f64 = 1.4;
 
 /// Where chips come from and go to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,19 +37,21 @@ pub struct Flight {
     pub to: Node,
     pub amount: Chips,
     pub started: f64,
+    /// How long this flight takes: a bet's pace, or the payout's.
+    pub secs: f64,
 }
 
 impl Flight {
     /// How far along, eased so it starts fast and settles, in `0..=1`.
     pub fn progress(&self, now: f64) -> f32 {
-        let t = ((now - self.started) / FLIGHT_SECS).clamp(0.0, 1.0) as f32;
+        let t = ((now - self.started) / self.secs).clamp(0.0, 1.0) as f32;
         1.0 - (1.0 - t).powi(3)
     }
 
-    /// Landed at `FLIGHT_SECS`, to within a microsecond: the clock is a float
+    /// Landed at its own time, to within a microsecond: the clock is a float
     /// and `10.1 + 0.45 - 10.1` is not `0.45`.
     pub fn landed(&self, now: f64) -> bool {
-        now - self.started >= FLIGHT_SECS - 1e-6
+        now - self.started >= self.secs - 1e-6
     }
 }
 
@@ -84,6 +90,7 @@ impl Motion {
                         to: Node::Pot,
                         amount: *before,
                         started: now,
+                        secs: FLIGHT_SECS,
                     });
                 }
             }
@@ -96,6 +103,7 @@ impl Motion {
                     to: Node::Seat(s.seat),
                     amount: s.won,
                     started: now,
+                    secs: PAYOUT_SECS,
                 });
             }
         }
@@ -186,6 +194,10 @@ mod tests {
         assert_eq!(flights[0].amount, 400);
         m.observe(&table(3, 400, &[0, 0], &[0, 400], true), 5.2);
         assert_eq!(m.in_flight(5.2).len(), 1, "seen again, not started again");
+        // `S1-DO`: at the payout's own pace -- still in the air when a bet
+        // would have landed, down at `PAYOUT_SECS`.
+        assert!(m.active(5.1 + FLIGHT_SECS + 0.1), "the payout is slower than a bet");
+        assert!(!m.active(5.1 + PAYOUT_SECS));
     }
 
     /// A new hand's blinds appear where they are; nothing flies from a hand
