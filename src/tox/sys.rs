@@ -263,6 +263,21 @@ extern "C" {
         group_number: u32,
         peer_public_key: *const u8,
     ) -> u32;
+    /// **`patches/0034`.** The table's word removes a member: dropped here as
+    /// a kicked one, and with `for_good` refused for the group's life.
+    pub fn tox_group_peer_drop(
+        tox: *const Tox,
+        group_number: u32,
+        peer_public_key: *const u8,
+        for_good: bool,
+    ) -> bool;
+    /// **`patches/0034`.** The table's word allows the founder's kick of this
+    /// key here; any other kick is ignored.
+    pub fn tox_group_peer_allow_kick(
+        tox: *const Tox,
+        group_number: u32,
+        peer_public_key: *const u8,
+    ) -> bool;
     /// `tox.h:4475`
     pub fn tox_group_send_custom_packet(
         tox: *const Tox,
@@ -340,6 +355,8 @@ extern "C" {
     pub fn tox_callback_group_peer_join(tox: *mut Tox, callback: tox_group_peer_join_cb);
     /// `tox.h:4872`
     pub fn tox_callback_group_peer_exit(tox: *mut Tox, callback: tox_group_peer_exit_cb);
+    /// `tox.h:5513`
+    pub fn tox_callback_group_moderation(tox: *mut Tox, callback: tox_group_moderation_cb);
 }
 
 /// `tox.h:4801`. Fires when another peer becomes **confirmed** — the same flag
@@ -351,6 +368,19 @@ pub type tox_group_peer_join_cb = Option<
 
 /// `tox.h:4862`.
 #[allow(clippy::type_complexity)]
+/// `tox.h:5498`, `patches/0034`: a moderation event -- a kick, or a role
+/// given or taken; `mod_type` zero is a kick.
+pub type tox_group_moderation_cb = Option<
+    unsafe extern "C" fn(
+        tox: *mut Tox,
+        group_number: u32,
+        source_peer_id: u32,
+        target_peer_id: u32,
+        mod_type: c_int,
+        user_data: *mut c_void,
+    ),
+>;
+
 pub type tox_group_peer_exit_cb = Option<
     unsafe extern "C" fn(
         tox: *mut Tox,

@@ -71,6 +71,10 @@ param(
     # back -- a client that crashed and was started again (S1-DU). Zero: it
     # stays dead.
     [ValidateRange(0, 600)][int]$KillFor = 0,
+    # `-KickWithoutWordAt <s>`: the founder kicks its first other seat without the
+    # table's word at that second (D-045), for measuring that no member honours
+    # it. Needs --features fault-harness.
+    [ValidateRange(0, 3600)][int]$KickWithoutWordAt = 0,
     # `-ThinkMs <ms>`: every seat waits that long before it acts (`--autoplay <ms>`);
     # above the table's own thirty seconds the seat's OWN clock acts first, which
     # is how the check/fold's timing is measured from the other seats' side
@@ -393,8 +397,11 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # Not `$startStack`: PowerShell's names are case-insensitive and that IS
     # the parameter. The founder alone; the advert carries it to the joiners.
     $stackForNode = if ($StartStack -gt 0 -and $i -eq 0) { $StartStack } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack)
+    # The founder alone, and handed to the job like the stack: the job sees
+    # nothing of this scope (the first run printed the banner and kicked nobody).
+    $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt)
         if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
         if ($downAt -gt 0) {
             $env:P2P_POKER_LINK_DOWN_AT = "$downAt"
@@ -405,6 +412,7 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
         if ($stopAtOpen -gt 0) { $env:P2P_POKER_STOP_AT_OPEN_AFTER = "$stopAtOpen" }
         if ($stopAtHand -gt 0) { $env:P2P_POKER_STOP_AT_HAND = "$stopAtHand" }
         if ($leaveAt -gt 0) { $env:P2P_POKER_LEAVE_TABLE_AT = "$leaveAt" }
+        if ($kickAt -gt 0) { $env:P2P_POKER_KICK_WITHOUT_WORD_AT = "$kickAt" }
         if ($stack -gt 0) { $env:P2P_POKER_START_STACK = "$stack" }
         if ($mute -gt 0) {
             $env:P2P_POKER_MUTE_AT = "$muteAt"
@@ -531,6 +539,7 @@ if ($NoJoin -or $Watchers -gt 0) {
     Write-Host "==> $($nodeCount - 1 - $(if ($NoJoin) { 0 } else { $Seats - 1 })) watcher(s) join nothing and only watch the lobby; the founder offers $founderSeats seat(s)"
 }
 if ($LeaveTableAt -gt 0) { Write-Host "==> n$LeaveTableNode leaves its table at $LeaveTableAt s" }
+if ($KickWithoutWordAt -gt 0) { Write-Host "==> n0 kicks a seat without the table's word at $KickWithoutWordAt s (D-045)" }
 if ($KillAt -gt 0) {
     Write-Host "==> n$KillNode is killed outright at $KillAt s"
     $killProfile = Join-Path $work "n$KillNode"

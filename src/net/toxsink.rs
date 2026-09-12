@@ -63,6 +63,14 @@ pub enum Seat {
     /// driver takes the seats it did not have and drops the ones no longer
     /// named, so its group gate wants the seats that remain.
     Roster(Vec<[u8; 32]>),
+    /// `D-045`: the table's word removed a seat; see `Command::Remove`.
+    Remove {
+        app_key: Option<[u8; 32]>,
+        tox_key: Option<[u8; 32]>,
+        for_good: bool,
+    },
+    /// fault-harness: a founder's kick without the word (`D-045`).
+    KickWithoutWord([u8; 32]),
     /// It is back after a restart and needs the group offered again. See
     /// `tox::table::Command::Rejoined` for why nothing else notices.
     Back([u8; 32]),
@@ -664,6 +672,40 @@ impl TableSink {
         }
     }
 
+    /// `D-045`: members this client dropped from the table's group by the
+    /// table's word.
+    pub fn removed(&self) -> u64 {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().removed.load(Ordering::Relaxed),
+                None => 0,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            0
+        }
+    }
+
+    /// `D-045`: the times this client was itself removed from the table's
+    /// group by the table's word.
+    pub fn kicked_out(&self) -> u64 {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().kicked_out.load(Ordering::Relaxed),
+                None => 0,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            0
+        }
+    }
+
     /// **Why** the refusals happened, by `Tox_Err_Group_Send_Custom_Packet`:
     /// index 1 group-not-found, 2 too-long, 3 empty, 4 disconnected,
     /// 5 fail-send. Index 0 is unused.
@@ -806,6 +848,8 @@ impl TableSink {
                     Seat::Took(k) => Command::Seated(k),
                     Seat::Left(k) => Command::Unseated(k),
                     Seat::Roster(keys) => Command::Roster(keys),
+                    Seat::Remove { app_key, tox_key, for_good } => Command::Remove { app_key, tox_key, for_good },
+                    Seat::KickWithoutWord(k) => Command::KickWithoutWord(k),
                     Seat::Back(k) => Command::Rejoined(k),
                     Seat::KnownAs {
                         group_key,

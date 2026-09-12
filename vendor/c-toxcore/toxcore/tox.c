@@ -4254,6 +4254,41 @@ uint32_t tox_group_peer_friend_number(const Tox *_Nonnull tox, uint32_t group_nu
     return friend_number < 0 ? UINT32_MAX : (uint32_t)friend_number;
 }
 
+bool tox_group_peer_drop(const Tox *_Nonnull tox, uint32_t group_number, const uint8_t *_Nonnull peer_public_key,
+                         bool for_good)
+{
+    assert(tox != nullptr);
+
+    tox_lock(tox);
+    GC_Chat *chat = gc_get_group(tox->m->group_handler, group_number);
+
+    if (chat == nullptr) {
+        tox_unlock(tox);
+        return false;
+    }
+
+    const bool was_there = gc_peer_drop(chat, peer_public_key, for_good);
+    tox_unlock(tox);
+    return was_there;
+}
+
+bool tox_group_peer_allow_kick(const Tox *_Nonnull tox, uint32_t group_number, const uint8_t *_Nonnull peer_public_key)
+{
+    assert(tox != nullptr);
+
+    tox_lock(tox);
+    GC_Chat *chat = gc_get_group(tox->m->group_handler, group_number);
+
+    if (chat == nullptr) {
+        tox_unlock(tox);
+        return false;
+    }
+
+    gc_allow_kick(chat, peer_public_key);
+    tox_unlock(tox);
+    return true;
+}
+
 bool tox_group_send_custom_packet(const Tox *_Nonnull tox, uint32_t group_number, bool lossless, const uint8_t *_Nonnull data,
                                   size_t length, Tox_Err_Group_Send_Custom_Packet *_Nullable error)
 {

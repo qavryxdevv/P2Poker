@@ -5212,6 +5212,10 @@ static int handle_gc_custom_packet(const GC_Session *_Nonnull c, const GC_Chat *
  * Return 0 if packet is handled correctly.
  * Return -1 if packet has invalid size.
  */
+/* p2p-poker (patch 0034): declared here, defined beside peer_add. */
+static bool p2p_list_holds(const uint8_t (*list)[ENC_PUBLIC_KEY_SIZE], uint16_t num, const uint8_t *public_key);
+static void p2p_list_remember(uint8_t (*list)[ENC_PUBLIC_KEY_SIZE], uint16_t *num, const uint8_t *public_key);
+
 static int handle_gc_kick_peer(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat, const GC_Peer *_Nonnull setter_peer, const uint8_t *_Nonnull data,
                                uint16_t length, void *_Nullable userdata)
 {
@@ -5224,6 +5228,15 @@ static int handle_gc_kick_peer(const GC_Session *_Nonnull c, GC_Chat *_Nonnull c
     }
 
     const uint8_t *target_pk = data;
+
+    /* p2p-poker (patch 0034): a founder's kick counts only where the table's
+     * word allowed it -- the players' certificate, or the roster said again
+     * before the first hand. Without it the kick is ignored, by the target
+     * too: no founder throws a legitimate seat out of the table's group. */
+    if (!p2p_list_holds(chat->p2p_kick_allowed, chat->p2p_num_kick_allowed, target_pk)) {
+        LOGGER_DEBUG(chat->log, "p2p-poker: a kick without the table's word is ignored");
+        return 0;
+    }
 
     const int target_peer_number = get_peer_number_of_enc_pk(chat, target_pk, false);
     GC_Peer *target_peer = get_gc_peer(chat, target_peer_number);
@@ -7194,10 +7207,74 @@ static int peer_update(const GC_Chat *chat, const GC_Peer *peer, uint32_t peer_n
     return peer_number;
 }
 
+/* p2p-poker (patch 0034): the two lists the table's word keeps on a chat. */
+static bool p2p_list_holds(const uint8_t (*list)[ENC_PUBLIC_KEY_SIZE], uint16_t num, const uint8_t *public_key)
+{
+    for (uint16_t i = 0; i < num; ++i) {
+        if (memcmp(list[i], public_key, ENC_PUBLIC_KEY_SIZE) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void p2p_list_remember(uint8_t (*list)[ENC_PUBLIC_KEY_SIZE], uint16_t *num, const uint8_t *public_key)
+{
+    if (p2p_list_holds(list, *num, public_key)) {
+        return;
+    }
+
+    if (*num >= 32) {
+        /* The oldest goes; a table has at most ten seats. */
+        memmove(list[0], list[1], (size_t)(*num - 1) * ENC_PUBLIC_KEY_SIZE);
+        --*num;
+    }
+
+    memcpy(list[*num], public_key, ENC_PUBLIC_KEY_SIZE);
+    ++*num;
+}
+
+bool gc_peer_drop(GC_Chat *chat, const uint8_t *public_key, bool for_good)
+{
+    if (for_good) {
+        p2p_list_remember(chat->p2p_gone_for_good, &chat->p2p_num_gone_for_good, public_key);
+    }
+
+    const int peer_number = get_peer_number_of_enc_pk(chat, public_key, false);
+
+    if (peer_number <= 0) {
+        return false;
+    }
+
+    GC_Connection *gconn = get_gc_connection(chat, peer_number);
+
+    if (gconn == nullptr) {
+        return false;
+    }
+
+    LOGGER_DEBUG(chat->log, "p2p-poker: peer %d removed by the table's word%s", peer_number,
+                 for_good ? " for good" : "");
+    gcc_mark_for_deletion(gconn, chat->tcp_conn, GC_EXIT_TYPE_KICKED, nullptr, 0);
+    return true;
+}
+
+void gc_allow_kick(GC_Chat *chat, const uint8_t *public_key)
+{
+    p2p_list_remember(chat->p2p_kick_allowed, &chat->p2p_num_kick_allowed, public_key);
+}
+
 int peer_add(GC_Chat *chat, const IP_Port *ipp, const uint8_t *public_key)
 {
     if (get_peer_number_of_enc_pk(chat, public_key, false) != -1) {
         return -2;
+    }
+
+    /* p2p-poker (patch 0034): a member the table's word removed for good is
+     * not added again, whatever brings its key back. */
+    if (p2p_list_holds(chat->p2p_gone_for_good, chat->p2p_num_gone_for_good, public_key)) {
+        LOGGER_DEBUG(chat->log, "p2p-poker: a key the table's word removed for good is not added again");
+        return -3;
     }
 
     const GC_Peer_Id peer_id = get_new_peer_id(chat);

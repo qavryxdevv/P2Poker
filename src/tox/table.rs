@@ -189,6 +189,20 @@ pub enum Command {
     /// `D-044`: the roster as the formation holds it now, by Tox key; seats
     /// it no longer names leave this table's roster here.
     Roster(Vec<[u8; 32]>),
+    /// `D-045`: the table's word removed a seat -- the players' certificate
+    /// with the group's silence, or the roster said again before the first
+    /// hand (`for_good`). Every entry the seat has, by application key or by
+    /// the line its invitation went over, is allowed to be kicked, kicked
+    /// where this client is the founder, and dropped from this client's
+    /// view of the group.
+    Remove {
+        app_key: Option<[u8; 32]>,
+        tox_key: Option<[u8; 32]>,
+        for_good: bool,
+    },
+    /// fault-harness: the founder kicks this seat without the table's word,
+    /// for measuring that nobody honours it (`D-045`).
+    KickWithoutWord([u8; 32]),
     /// **`patches/0011`. Ask this seat for the message a stage is waiting on.**
     ///
     /// A lost group message is normally repaired in one round trip: the
@@ -311,6 +325,10 @@ pub struct Trouble {
     /// the last twenty seconds: that seat's message said again, not a seat
     /// back under a fresh key (S1-DU), whose old entry has been quiet.
     pub claims_refused: AtomicU64,
+    /// `D-045`: members this client dropped from a group by the table's
+    /// word, and the times this client was itself removed by it.
+    pub removed: AtomicU64,
+    pub kicked_out: AtomicU64,
     /// `D-035`: the roster seats whose client is a confirmed member of the
     /// group right now, by application key -- recomputed every sweep, for
     /// the window's link indicator.
@@ -844,16 +862,45 @@ fn befriend(
 /// than refused. (Before `S1-DV` the kick looked the Tox key up as an
 /// application key, and found nothing.)
 fn unseat(tox: &mut Tox, t: &TableState, key: &[u8; 32]) {
-    if !matches!(t.setup.role, Role::Host) {
-        return;
-    }
     let Some(g) = t.group else {
         return;
     };
-    let peers: Vec<u32> = t.peer_lines.iter().filter(|(_, l)| *l == key).map(|(p, _)| *p).collect();
-    for p in peers {
-        let _ = tox.kick(g, p);
+    // `D-045`: the roster's word. Every member sees the seat leave the roster
+    // (the founder's signed list), so every member drops it for good; the
+    // founder's kick counts because every member allowed it on that word.
+    let host = matches!(t.setup.role, Role::Host);
+    for gk in keys_of_seat(t, None, Some(key)) {
+        let _ = tox.allow_kick(g, &gk);
+        if host {
+            if let Some(p) = t.peer_keys.iter().find(|(_, k)| **k == gk).map(|(p, _)| *p) {
+                let _ = tox.kick(g, p);
+            }
+        }
+        if tox.peer_drop(g, &gk, true) {
+            t.trouble.removed.fetch_add(1, Ordering::Relaxed);
+        }
     }
+}
+
+/// `D-045`: every group key a seat speaks from -- taught for its application
+/// key, or held by a member that came in over its line.
+fn keys_of_seat(t: &TableState, app_key: Option<&[u8; 32]>, tox_key: Option<&[u8; 32]>) -> Vec<[u8; 32]> {
+    let mut keys: Vec<[u8; 32]> = Vec::new();
+    if let Some(app) = app_key {
+        keys.extend(t.known_as.iter().filter(|(_, a)| *a == app).map(|(gk, _)| *gk));
+    }
+    if let Some(line) = tox_key {
+        for (peer, l) in t.peer_lines.iter() {
+            if l == line {
+                if let Some(gk) = t.peer_keys.get(peer) {
+                    keys.push(*gk);
+                }
+            }
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 fn by_group(tables: &mut HashMap<TableId, TableState>, g: u32) -> Option<&mut TableState> {
@@ -1279,6 +1326,13 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                             // -- a joiner's driver had never been told a seat was
                             // gone, and waited for it (`run130909-3`: *2 wanted*
                             // ninety seconds after the founder said two).
+                            // `D-045`: only a roster that names this client is the
+                            // table's word; one that does not -- an empty one,
+                            // `run140845-3`, where a joiner reported it and would
+                            // have dropped its founder for good -- changes nothing.
+                            if !keys.contains(&me) {
+                                continue;
+                            }
                             let gone: Vec<[u8; 32]> =
                                 t.roster.iter().filter(|k| !keys.contains(k)).copied().collect();
                             for key in gone {
@@ -1293,6 +1347,33 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                                     t.roster.push(key);
                                 }
                                 befriend(&mut tox, &mut friends, &mut idle, &key);
+                            }
+                        }
+                        Command::Remove { app_key, tox_key, for_good } => {
+                            if let Some(g) = t.group {
+                                let keys = keys_of_seat(t, app_key.as_ref(), tox_key.as_ref());
+                                let host = matches!(t.setup.role, Role::Host);
+                                for gk in keys {
+                                    let _ = tox.allow_kick(g, &gk);
+                                    if host {
+                                        let peer = t.peer_keys.iter().find(|(_, k)| **k == gk).map(|(p, _)| *p);
+                                        if let Some(p) = peer {
+                                            let _ = tox.kick(g, p);
+                                        }
+                                    }
+                                    if tox.peer_drop(g, &gk, for_good) {
+                                        t.trouble.removed.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+                        Command::KickWithoutWord(key) => {
+                            if let Some(g) = t.group {
+                                let peers: Vec<u32> =
+                                    t.peer_lines.iter().filter(|(_, l)| **l == key).map(|(p, _)| *p).collect();
+                                for p in peers {
+                                    let _ = tox.kick(g, p);
+                                }
                             }
                         }
                         Command::Rejoined(key) if key != me => {
@@ -1551,6 +1632,27 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                         }
                     }
                 }
+                // `D-045`: this client was removed by the table's word. The group
+                // it held is left, so an invitation can bring it back (D-031); a
+                // group held would refuse one.
+                Event::GroupModeration {
+                    group: g,
+                    target_is_self: true,
+                    kick: true,
+                } => {
+                    if let Some(t) = by_group(&mut tables, g) {
+                        let _ = tox.leave(g);
+                        t.group = None;
+                        t.self_joined = false;
+                        t.confirmed.clear();
+                        t.peer_keys.clear();
+                        t.peer_lines.clear();
+                        t.known_as.clear();
+                        t.invited.clear();
+                        t.trouble.kicked_out.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Event::GroupModeration { .. } => {}
                 Event::FriendRequestIgnored => {}
             }
         }

@@ -7600,6 +7600,13 @@ impl Hand {
         self.open.required.clone()
     }
 
+    /// `D-045`: the seats the table has certified out of this hand so far,
+    /// in the order the certificates completed. Both `required` sets are
+    /// fixed for a hand; this is what a certificate moves.
+    pub fn certified_seats(&self) -> &[SeatIdx] {
+        &self.certified
+    }
+
     /// Every input the next hand's roster is derived from, in one line.
     ///
     /// Written because two readings of the derivation gave answers a live log

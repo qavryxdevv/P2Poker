@@ -349,6 +349,13 @@ typedef struct GC_Chat {
     int         friend_connection_id;  // identifier for group's messenger friend connection
 
     bool        flag_exit;  // true if the group will be deleted after the next do_gc() iteration
+    /* p2p-poker (patch 0034): members the table's word removed for good, never
+     * added again for this chat's life; and members the founder may kick,
+     * because the table's word allowed it. Both by group encryption key. */
+    uint8_t  p2p_gone_for_good[32][ENC_PUBLIC_KEY_SIZE];
+    uint16_t p2p_num_gone_for_good;
+    uint8_t  p2p_kick_allowed[32][ENC_PUBLIC_KEY_SIZE];
+    uint16_t p2p_num_kick_allowed;
 } GC_Chat;
 
 #ifndef MESSENGER_DEFINED

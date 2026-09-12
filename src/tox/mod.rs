@@ -117,6 +117,14 @@ pub enum Event {
         key: Option<[u8; 32]>,
         quit: bool,
     },
+    /// `patches/0034`: a moderation event in a group -- `kick` for a kick,
+    /// `target_is_self` when this client is the one kicked. A kick without
+    /// the table's word never reaches this: the library ignores it.
+    GroupModeration {
+        group: u32,
+        target_is_self: bool,
+        kick: bool,
+    },
 }
 
 /// Where the C callbacks put what they are given, for the length of one
@@ -280,6 +288,28 @@ unsafe extern "C" fn on_group_peer_exit(
         peer,
         key: got.then_some(key),
         quit: exit_type == 0,
+    });
+}
+
+/// `patches/0034`: a moderation event -- this client learns of a kick, its
+/// own included. See [`Event::GroupModeration`].
+unsafe extern "C" fn on_group_moderation(
+    tox: *mut sys::Tox,
+    group: u32,
+    _source: u32,
+    target: u32,
+    mod_type: c_int,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    let mut err: c_int = 0;
+    // SAFETY: the callback runs inside `tox_iterate` with a live `tox`.
+    let me = unsafe { sys::tox_group_self_get_peer_id(tox, group, &mut err) };
+    s.events.push(Event::GroupModeration {
+        group,
+        target_is_self: err == 0 && me == target,
+        // `TOX_GROUP_MOD_EVENT_KICK` is the first value of the enum.
+        kick: mod_type == 0,
     });
 }
 
@@ -569,6 +599,7 @@ impl Tox {
             // **The confirmed-peer set, which `peer_count` is not.**
             sys::tox_callback_group_peer_join(ptr, Some(on_group_peer_join));
             sys::tox_callback_group_peer_exit(ptr, Some(on_group_peer_exit));
+            sys::tox_callback_group_moderation(ptr, Some(on_group_moderation));
             sys::tox_callback_friend_connection_status(ptr, Some(on_friend_connection));
             sys::tox_callback_friend_request(ptr, Some(on_friend_request));
 
@@ -946,6 +977,21 @@ impl Tox {
         // SAFETY: as above; the call only reads.
         let n = unsafe { sys::tox_group_peer_friend_number(self.ptr, group, peer_key.as_ptr()) };
         (n != u32::MAX).then_some(n)
+    }
+
+    /// `patches/0034`: the table's word removes the member with this group
+    /// key from this client's view of the group; `for_good` refuses the key
+    /// for the group's life. Whether a member was there to drop.
+    pub fn peer_drop(&mut self, group: u32, peer_key: &[u8; 32], for_good: bool) -> bool {
+        // SAFETY: valid pointer; the key is exactly the public key's size.
+        unsafe { sys::tox_group_peer_drop(self.ptr, group, peer_key.as_ptr(), for_good) }
+    }
+
+    /// `patches/0034`: the table's word allows the founder's kick of this key
+    /// here.
+    pub fn allow_kick(&mut self, group: u32, peer_key: &[u8; 32]) -> bool {
+        // SAFETY: as above.
+        unsafe { sys::tox_group_peer_allow_kick(self.ptr, group, peer_key.as_ptr()) }
     }
 
     pub fn peer_key(&self, group: u32, peer: u32) -> Result<[u8; 32], Failed> {

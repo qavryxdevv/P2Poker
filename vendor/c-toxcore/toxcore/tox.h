@@ -4543,6 +4543,24 @@ uint32_t tox_group_peer_friend_number(
     const Tox *tox, Tox_Group_Number group_number,
     const uint8_t peer_public_key[]);
 
+/**
+ * p2p-poker (patch 0034): the table's word removes a member. Drops the member
+ * with this group key from this client's view of the group as a kicked one,
+ * and with `for_good` refuses the key for the group's life. Local; the wire
+ * is untouched. Returns whether a member was there to drop.
+ */
+bool tox_group_peer_drop(
+    const Tox *tox, Tox_Group_Number group_number,
+    const uint8_t peer_public_key[], bool for_good);
+
+/**
+ * p2p-poker (patch 0034): the table's word allows the founder's kick of this
+ * key here. A kick of any key not allowed is ignored, by its target too.
+ */
+bool tox_group_peer_allow_kick(
+    const Tox *tox, Tox_Group_Number group_number,
+    const uint8_t peer_public_key[]);
+
 typedef enum Tox_Err_Group_Send_Custom_Private_Packet {
 
     /**

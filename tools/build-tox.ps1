@@ -247,6 +247,9 @@ $patched = @(
     @{ File   = 'toxcore/tox.h'
        Marker = 'p2p-poker (patch 0033): the friend this member came into the group through'
        Why    = '0033: S1-DV. Before the first hand the group has taught no application key, so an exit or a silence mapped to no seat; the friend number the invitation travelled over is known to the library on both sides and this reads it, so a founder knows every seat it invited from the join.' }
+    @{ File   = 'toxcore/tox.h'
+       Marker = 'p2p-poker (patch 0034): the table''s word removes a member'
+       Why    = '0034: D-045, the owner''s rule. No ghost in a table''s group: a member the players'' word removed is dropped here and, for good, never added again; and a founder''s kick counts only for a key that word allowed, so no founder throws a legitimate seat out. The wire is untouched.' }
 )
 
 Step 'checking the patches are in the vendored source'

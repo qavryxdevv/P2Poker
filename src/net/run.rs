@@ -465,6 +465,13 @@ struct TableRun {
     /// `S1-DW`: the claims the table's group had refused when this client
     /// last said so.
     claims_refused_said: u64,
+    /// `D-045`: the members removed by the table's word, and the times this
+    /// client was itself removed, when last said.
+    removed_said: u64,
+    kicked_out_said: u64,
+    /// `D-045`: the running hand's certified-out seats as last seen, by hand
+    /// id -- a seat new to them is the table's word about it.
+    required_seen: (u64, Vec<u8>),
     /// The last turn told to the interface, so a stage per action does not
     /// become a redraw per action.
     turn_reported: Option<HandReport>,
@@ -781,6 +788,9 @@ impl TableRun {
             abort_reported: false,
             inbox_dropped_said: 0,
             claims_refused_said: 0,
+            removed_said: 0,
+            kicked_out_said: 0,
+            required_seen: (0, Vec::new()),
             turn_reported: None,
             next_hand_at: None,
             deal_at: None,
@@ -1632,7 +1642,46 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             "the table acted for seat {seat}: {what:?}"
                                         )))
                                         .await;
+                                    // `D-045`, the owner's rule: a seat the table acted for
+                                    // that the group has not heard from for `QUIET_LIMIT_S`
+                                    // is a member that no longer plays, and the players' word removes it from the
+                                    // group -- every member drops it, and the founder's kick
+                                    // counts because every member allowed it on that word.
+                                    // Not for good: a seat that comes back is invited again
+                                    // (D-031). A seat merely slow, still heard, stays.
+                                    let entry = $t.table.as_ref().and_then(|f| {
+                                        f.roster()
+                                            .seats()
+                                            .iter()
+                                            .find(|e| e.seat == seat)
+                                            .map(|e| (e.app_public_key, e.tox_key))
+                                    });
+                                    if let Some((app, line)) = entry {
+                                        let quiet = [
+                                            $t.tox_sink.quiet_secs(&app),
+                                            line.and_then(|k| $t.tox_sink.quiet_line(&k)),
+                                        ]
+                                        .into_iter()
+                                        .flatten()
+                                        .min();
+                                        let held = $t.tox_sink.in_group(&app)
+                                            || line.is_some_and(|k| $t.tox_sink.in_group_line(&k));
+                                        if held && quiet.is_some_and(|q| q >= QUIET_LIMIT_S) {
+                                            $t.tox_sink.tell(super::toxsink::Seat::Remove {
+                                                app_key: Some(app),
+                                                tox_key: line,
+                                                for_good: false,
+                                            });
+                                            let _ = events
+                                                .send(NodeEvent::Warning(format!(
+                                                    "seat {seat}, acted for by the table and silent in its group for {} s, is removed from the group by the table's word (D-045)",
+                                                    quiet.unwrap_or(0)
+                                                )))
+                                                .await;
+                                        }
+                                    }
                                 }
+                                remove_by_the_word!($t, $h);
                                 if let Some(why) =
                                     $h.aborted().filter(|_| !$t.abort_reported)
                                 {
@@ -2068,6 +2117,69 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.resume = None;
             $t.resuming = false;
             let _ = events.send(NodeEvent::LeftTable { why: $why }).await;
+        }};
+    }
+    // `D-045`, the owner's rule: a seat the table certified out of the hand
+    // that the group has not heard from for `QUIET_LIMIT_S` is a member that
+    // no longer plays, and the players' word removes it from the group --
+    // every member drops it, and the founder's kick counts because every
+    // member allowed it on that word. Not for good: a seat that comes back
+    // is invited again (D-031). A seat merely slow, still heard, stays and
+    // says so. Read at the certificate's own moment and again on the stall
+    // tick; a hand that is over is not skipped, since a timeout certificate
+    // ends the hand it certifies in.
+    macro_rules! remove_by_the_word {
+        ($t:ident, $h:expr) => {{
+            let id = $h.hand_id();
+            let cert: Vec<u8> = $h.certified_seats().to_vec();
+            if $t.required_seen.0 != id {
+                $t.required_seen = (id, Vec::new());
+            }
+            let fresh: Vec<u8> = cert.iter().copied().filter(|s| !$t.required_seen.1.contains(s)).collect();
+            $t.required_seen.1 = cert;
+            for seat in fresh {
+                let entry = $t.table.as_ref().and_then(|f| {
+                    f.roster()
+                        .seats()
+                        .iter()
+                        .find(|e| e.seat == seat)
+                        .map(|e| (e.app_public_key, e.tox_key))
+                });
+                if let Some((app, line)) = entry {
+                    let quiet = [
+                        $t.tox_sink.quiet_secs(&app),
+                        line.and_then(|k| $t.tox_sink.quiet_line(&k)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                    let held = $t.tox_sink.in_group(&app)
+                        || line.is_some_and(|k| $t.tox_sink.in_group_line(&k));
+                    if held && quiet.is_some_and(|q| q >= QUIET_LIMIT_S) {
+                        $t.tox_sink.tell(super::toxsink::Seat::Remove {
+                            app_key: Some(app),
+                            tox_key: line,
+                            for_good: false,
+                        });
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "seat {seat}, certified out of the hand and silent in the table's group for {} s, is removed from the group by the table's word (D-045)",
+                                quiet.unwrap_or(0)
+                            )))
+                            .await;
+                    } else {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "seat {seat} certified out of the hand, still heard by the table's group ({}): it stays a member (D-045)",
+                                match quiet {
+                                    Some(q) => format!("{q} s ago"),
+                                    None => "no reading".to_string(),
+                                }
+                            )))
+                            .await;
+                    }
+                }
+            }
         }};
     }
     macro_rules! rejoin_from_copies {
@@ -5197,6 +5309,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             )))
                             .await;
                     }
+                    // `D-045`: said when the count grows.
+                    let removed = t.tox_sink.removed();
+                    if removed > t.removed_said {
+                        t.removed_said = removed;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "{removed} member(s) of the table's group removed here by the table's word (D-045)"
+                            )))
+                            .await;
+                    }
+                    let kicked = t.tox_sink.kicked_out();
+                    if kicked > t.kicked_out_said {
+                        t.kicked_out_said = kicked;
+                        let _ = events
+                            .send(NodeEvent::Warning(
+                                "this client was removed from the table's group by the table's word; it holds no group now, and is invited again when it returns (D-045)".into(),
+                            ))
+                            .await;
+                    }
                     let dropped = t.tox_sink.inbox_dropped();
                     if dropped > t.inbox_dropped_said {
                         t.inbox_dropped_said = dropped;
@@ -5456,6 +5587,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                         }
                     }
+                    // fault-harness: `P2P_POKER_KICK_WITHOUT_WORD_AT=<s>`: the founder kicks its
+                    // first other seat without the table's word, for measuring that no
+                    // member honours it (`D-045`).
+                    if kick_without_word_due() {
+                        if let Some(f) = t.table.as_ref().filter(|f| f.is_founder()) {
+                            let me = f.my_seat();
+                            let target = f.roster().seats().iter().find(|e| Some(e.seat) != me).and_then(|e| e.tox_key);
+                            if let Some(k) = target {
+                                println!("fault-harness: kicking a seat without the table's word, as P2P_POKER_KICK_WITHOUT_WORD_AT asked");
+                                t.tox_sink.tell(super::toxsink::Seat::KickWithoutWord(k));
+                            }
+                        }
+                    }
                     // fault-harness: `P2P_POKER_LEAVE_TABLE_AT=<s>` leaves the table at
                     // that second, as the window's button would -- for measuring how
                     // the others' lobbies learn that a table is gone (D-040).
@@ -5670,9 +5814,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // that does not name the table. The founder is in the lobby
                             // and offers it no more; seen within one asking (thirty
                             // seconds) whether or not the group ever held it.
-                            let withdrawn = answers
-                                .get(f.founder_peer_id())
-                                .is_some_and(|(named, at)| !named.contains(&f.table_id()) && *at > f.advert_time());
+                            // Only while the founder is not a confirmed member of this
+                            // client's group: a table that dealt is answered without
+                            // its advert too, and the founder deals only once the group
+                            // holds everybody -- so a founder in the group that answers
+                            // without the table has dealt, not left.
+                            let withdrawn = !founder_line.is_some_and(|k| t.tox_sink.in_group_line(&k))
+                                && answers
+                                    .get(f.founder_peer_id())
+                                    .is_some_and(|(named, at)| !named.contains(&f.table_id()) && *at > f.advert_time());
                             if f.released_before_the_first_hand() {
                                 Some(
                                     "the founder gave this seat away before the first hand -- this client had answered nothing for a while, or had left -- so there is nothing to sit at; join again from the lobby"
@@ -5687,7 +5837,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 })
                             } else if withdrawn {
                                 Some(
-                                    "the founder no longer offers this table before the first hand: the table is gone"
+                                    "the founder no longer offers this table before the first hand: it left, or went on without this client; back to the lobby"
                                         .to_string(),
                                 )
                             } else if quiet {
@@ -5714,6 +5864,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    // `D-045`: and on the tick, for a word the moment missed.
+                    if let Some(h) = t.hand.as_ref() {
+                        remove_by_the_word!(t, h);
+                    }
                     // `D-041`: every seat's link as the table's group knows it. On a
                     // Tox table the group carries the hand and the felt reads presence
                     // from it; a libp2p ping is a figure beside that reading, and a
@@ -8034,6 +8188,10 @@ fn seat_on_tox(f: &Formation, tox: &super::toxsink::TableSink) {
     // names as well as taking the new ones -- a joiner's driver had never
     // been told a seat was gone (`run130909-3`).
     let keys: Vec<[u8; 32]> = f.roster().seats().iter().filter_map(|e| e.tox_key).collect();
+    // `D-045`: a roster with no seat is not the table's word (`run140845-3`).
+    if keys.is_empty() {
+        return;
+    }
     tox.tell(super::toxsink::Seat::Roster(keys));
 }
 
@@ -8733,6 +8891,27 @@ fn leave_table_due() -> bool {
     // `S1-DV`: once. It used to fire on every tick past the second while the
     // client was seated, and a client that asked for its table again was
     // out again two seconds later.
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match (at, PROCESS_STARTED.get()) {
+        (Some(s), Some(since)) => {
+            since.elapsed().as_secs() >= *s && !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        }
+        _ => false,
+    }
+}
+
+/// fault-harness: whether `P2P_POKER_KICK_WITHOUT_WORD_AT` names a second this loop
+/// has reached, once; `false` in every build without the feature (`D-045`).
+fn kick_without_word_due() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let at = AT.get_or_init(|| {
+        std::env::var("P2P_POKER_KICK_WITHOUT_WORD_AT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
     static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     match (at, PROCESS_STARTED.get()) {
         (Some(s), Some(since)) => {

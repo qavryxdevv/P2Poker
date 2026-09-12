@@ -530,6 +530,15 @@ int gc_founder_set_max_peers(GC_Chat *_Nonnull chat, uint16_t max_peers);
  */
 int gc_kick_peer(const Messenger *_Nonnull m, int group_number, GC_Peer_Id peer_id);
 
+/* p2p-poker (patch 0034): remove the member with this group key from this
+ * client's view of the chat as a kicked one, and with `for_good` refuse it
+ * for the chat's life. Returns whether a member was there to remove. */
+bool gc_peer_drop(GC_Chat *_Nonnull chat, const uint8_t *_Nonnull public_key, bool for_good);
+
+/* p2p-poker (patch 0034): the table's word allows the founder to kick this
+ * key; a kick of any other key is ignored here. */
+void gc_allow_kick(GC_Chat *_Nonnull chat, const uint8_t *_Nonnull public_key);
+
 /** @brief Copies the chat_id to dest. If dest is null this function has no effect.
  *
  * `dest` should have room for at least CHAT_ID_SIZE bytes.
