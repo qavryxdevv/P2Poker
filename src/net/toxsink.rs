@@ -509,6 +509,24 @@ impl TableSink {
 
     /// `D-041`: whether the friend connection to this Tox key is up right
     /// now -- on the line, whether or not it has spoken in the group yet.
+    /// `S1-DS`: whether the group has taught this table who this application
+    /// key is -- a seat that has spoken there. Such a seat not in the group
+    /// now is gone, whatever its friend link says.
+    pub fn known(&self, app_key: &[u8; 32]) -> bool {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().known.lock().map(|k| k.contains(app_key)).unwrap_or(false),
+                None => false,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            let _ = app_key;
+            false
+        }
+    }
+
     pub fn friend_up(&self, tox_key: &[u8; 32]) -> bool {
         #[cfg(feature = "tox")]
         {

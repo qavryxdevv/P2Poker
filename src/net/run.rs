@@ -5410,8 +5410,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .iter()
                                 .filter(|e| Some(e.seat) != me)
                                 .map(|e| {
+                                    // `S1-DS`: the friend link stands in only for a seat the
+                                    // group has not yet taught; one it has taught and does not
+                                    // hold now has left, and its friendship lingering two
+                                    // minutes past the table (D-042) says nothing.
                                     let group = t.tox_sink.in_group(&e.app_public_key)
-                                        || e.tox_key.is_some_and(|k| t.tox_sink.friend_up(&k));
+                                        || (!t.tox_sink.known(&e.app_public_key)
+                                            && e.tox_key.is_some_and(|k| t.tox_sink.friend_up(&k)));
                                     let rtt = libp2p::PeerId::from_bytes(&e.peer_id)
                                         .ok()
                                         .and_then(|p| alive.get(&p).copied())

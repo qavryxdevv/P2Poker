@@ -311,6 +311,11 @@ pub struct Trouble {
     /// by Tox key -- a seat that has not spoken in the group yet is still
     /// on the line by this.
     pub friends_on: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// `S1-DS`: every application key this table's group has taught the
+    /// driver (`Command::KnownAs`). A seat here that is not `present` has
+    /// spoken in the group and is not in it now: gone, whatever its friend
+    /// link says -- a friendship lingers two minutes past a table (D-042).
+    pub known: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
     /// `D-035`: seats whose client left the group since the node last
     /// asked, by application key, each with whether it quit on purpose.
     pub gone: std::sync::Mutex<Vec<([u8; 32], bool)>>,
@@ -739,6 +744,11 @@ struct TableState {
     roster: Vec<[u8; 32]>,
     /// Group key -> application key, learned from verified traffic (`S1-I`).
     known_as: HashMap<[u8; 32], [u8; 32]>,
+    /// `S1-DS`: peer number -> group key, remembered as each peer is seen,
+    /// so an exit is mapped to its seat even when the key cannot be read at
+    /// that moment (run095833-2: a joiner's leave reached the founder as
+    /// *deleting group peer 1, exit type 0* and never as a seat gone).
+    peer_keys: HashMap<u32, [u8; 32]>,
     group: Option<u32>,
     invited: Vec<u32>,
     confirmed: std::collections::HashSet<u32>,
@@ -1039,6 +1049,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                             setup,
                             roster,
                             known_as: HashMap::new(),
+                            peer_keys: HashMap::new(),
                             group,
                             invited: Vec::new(),
                             confirmed: std::collections::HashSet::new(),
@@ -1121,6 +1132,22 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                         // between the two key spaces (`S1-I`).
                         Command::KnownAs { group_key, app_key } => {
                             t.known_as.insert(group_key, app_key);
+                            if let Ok(mut known) = t.trouble.known.lock() {
+                                known.insert(app_key);
+                            }
+                            // `S1-DS`: present at once if the group holds it now, not
+                            // at the next sweep -- the friend link no longer stands
+                            // in for a taught seat, and five seconds of *not on the
+                            // line* at every deal would be its price.
+                            if let Some(g) = t.group {
+                                let member = (0..Tox::PEER_SCAN)
+                                    .find(|p| tox.peer_key(g, *p).ok().as_ref() == Some(&group_key));
+                                if member.is_some_and(|p| t.confirmed.contains(&p)) {
+                                    if let Ok(mut present) = t.trouble.present.lock() {
+                                        present.insert(app_key);
+                                    }
+                                }
+                            }
                         }
                         Command::Unseated(key) => {
                             t.roster.retain(|k| *k != key);
@@ -1290,8 +1317,12 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                     }
                 }
                 Event::GroupPeerJoin { group: g, peer } => {
+                    let key = tox.peer_key(g, peer).ok();
                     if let Some(t) = by_group(&mut tables, g) {
                         t.confirmed.insert(peer);
+                        if let Some(k) = key {
+                            t.peer_keys.insert(peer, k);
+                        }
                     }
                 }
                 Event::GroupPeerExit {
@@ -1303,7 +1334,10 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                     if let Some(t) = by_group(&mut tables, g) {
                         t.confirmed.remove(&peer);
                         // `D-035`: a seat this driver knows by its group key is
-                        // reported gone, on purpose or by timing out.
+                        // reported gone, on purpose or by timing out. `S1-DS`: by
+                        // the key remembered for the peer when the callback
+                        // could not read one.
+                        let key = key.or_else(|| t.peer_keys.remove(&peer));
                         if let Some(app) = key.and_then(|k| t.known_as.get(&k).copied()) {
                             if let Ok(mut present) = t.trouble.present.lock() {
                                 present.remove(&app);
@@ -1325,8 +1359,12 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                                 // thing that says who spoke. Carried out so
                                 // the node loop can pair it with the signing
                                 // key (`S1-I`).
+                                let claimed = tox.peer_key(g, peer).ok();
+                                if let Some(k) = claimed {
+                                    t.peer_keys.insert(peer, k);
+                                }
                                 let item = FromTable {
-                                    claimed: tox.peer_key(g, peer).ok(),
+                                    claimed,
                                     bytes: message,
                                 };
                                 if t.inbox.try_send(item).is_err() {

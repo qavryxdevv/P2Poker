@@ -58,6 +58,8 @@ param(
     [switch]$NoJoin,
     [ValidateRange(0, 8)][int]$Watchers = 0,
     [ValidateRange(0, 3600)][int]$LeaveTableAt = 0,
+    # `-LeaveTableNode <i>`: which node leaves at `-LeaveTableAt` (n0 unless said).
+    [ValidateRange(0, 9)][int]$LeaveTableNode = 0,
     # `-ThinkMs <ms>`: every seat waits that long before it acts (`--autoplay <ms>`);
     # above the table's own thirty seconds the seat's OWN clock acts first, which
     # is how the check/fold's timing is measured from the other seats' side
@@ -371,7 +373,7 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
         if ($TwoTables -and $i -eq 1) { $nodeArgs += @('--also-join', "$table-B", '--also-at', "$AlsoAt") }
     }
     # Otherwise a watcher: the lobby only, joining nothing.
-    $leaveAt = if ($LeaveTableAt -gt 0 -and $i -eq 0) { $LeaveTableAt } else { 0 }
+    $leaveAt = if ($LeaveTableAt -gt 0 -and $i -eq $LeaveTableNode) { $LeaveTableAt } else { 0 }
 
     $diverge = if ($DivergeAt -gt 0 -and $i -eq $DivergeNode) { $DivergeAt } else { 0 }
     $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
@@ -517,7 +519,7 @@ if (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $LeaverSeconds -eq 0) {
 if ($NoJoin -or $Watchers -gt 0) {
     Write-Host "==> $($nodeCount - 1 - $(if ($NoJoin) { 0 } else { $Seats - 1 })) watcher(s) join nothing and only watch the lobby; the founder offers $founderSeats seat(s)"
 }
-if ($LeaveTableAt -gt 0) { Write-Host "==> n0 leaves its table at $LeaveTableAt s" }
+if ($LeaveTableAt -gt 0) { Write-Host "==> n$LeaveTableNode leaves its table at $LeaveTableAt s" }
 if ($RehostAt -gt 0) { Write-Host "==> at $RehostAt s n0 leaves and hosts $table-2; the joiners follow five seconds later" }
 if ($StartStack -gt 0) { Write-Host "==> every seat starts with $StartStack chips, so the tournament ends inside the run" }
 if ($TwoTables) { Write-Host "==> a second table $table-B: hosted by n$($Seats + $Watchers), joined by n$($Seats + $Watchers + 1), and by n1 as well at $AlsoAt s" }

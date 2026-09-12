@@ -7120,7 +7120,13 @@ static bool peer_delete(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat, ui
     assert(nick_length <= MAX_GC_NICK_SIZE);
     memcpy(nick, peer->nick, nick_length);
 
-    if (exit_info.exit_type == GC_EXIT_TYPE_KICKED) {
+    /* p2p-poker (patch 0031): a peer that left on purpose is forgotten as a
+     * kicked one is. Kept, its address was re-seeded from the saved list
+     * whenever the group ran empty (LOAD_PEERS_TIMEOUT) and greeted every
+     * three seconds for ever -- run095833-2, a founder left alone at its
+     * table after the other seat quit. A client of ours that comes back to
+     * a table joins with fresh keys and an invitation, never by this list. */
+    if (exit_info.exit_type == GC_EXIT_TYPE_KICKED || exit_info.exit_type == GC_EXIT_TYPE_QUIT) {
         saved_peers_remove_entry(chat, gconn->addr.public_key.enc);
     }
 

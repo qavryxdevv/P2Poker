@@ -1,0 +1,37 @@
+# 0031 - a peer that left on purpose is not kept for reconnection.
+#
+# run095833-2 (2026-09-12): two seats, the joiner leaves the table at 60 s
+# by the client's own leave (tox_group_leave, the part message sent). The
+# founder logged "deleting group peer 1, exit type 0 (quit), confirmed 1,
+# handshaked 1" at 63.5 s -- and at 63.6 s "handshake request attempt 1"
+# to the same peer, then attempts 2..7 every three seconds, UDP and TCP in
+# turn, to a chat that no longer existed. Its group read "1 seen/0
+# confirmed" for the rest of the run. peer_delete forgets a KICKED peer's
+# saved address and kept a QUIT one; a group left with no peers re-seeds
+# every saved address (load_gc_peers at LOAD_PEERS_TIMEOUT), so the seat
+# that had left was greeted for ever.
+#
+# The saved list exists so a group that lost its peers by an outage finds
+# them again. A peer that said it was leaving is not that case, and a
+# client of ours that comes back to a table does so with fresh keys and an
+# invitation, never by this list. Local behaviour; nothing on the wire.
+
+diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
+index 22020fd..af3494b 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.c
++++ b/vendor/c-toxcore/toxcore/group_chats.c
+@@ -7120,7 +7120,13 @@ static bool peer_delete(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat, ui
+     assert(nick_length <= MAX_GC_NICK_SIZE);
+     memcpy(nick, peer->nick, nick_length);
+ 
+-    if (exit_info.exit_type == GC_EXIT_TYPE_KICKED) {
++    /* p2p-poker (patch 0031): a peer that left on purpose is forgotten as a
++     * kicked one is. Kept, its address was re-seeded from the saved list
++     * whenever the group ran empty (LOAD_PEERS_TIMEOUT) and greeted every
++     * three seconds for ever -- run095833-2, a founder left alone at its
++     * table after the other seat quit. A client of ours that comes back to
++     * a table joins with fresh keys and an invitation, never by this list. */
++    if (exit_info.exit_type == GC_EXIT_TYPE_KICKED || exit_info.exit_type == GC_EXIT_TYPE_QUIT) {
+         saved_peers_remove_entry(chat, gconn->addr.public_key.enc);
+     }
+ 

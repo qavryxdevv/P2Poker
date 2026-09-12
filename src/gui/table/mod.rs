@@ -577,7 +577,8 @@ fn felt_and_people(
         if let Some(left) = seat.clock {
             paint::clock(p, slot.avatar, left);
         }
-        if let Some(link) = seat.link.as_ref() {
+        // `S1-DS`: a seat that left the table has no line to read.
+        if let Some(link) = seat.link.as_ref().filter(|_| !seat.left) {
             paint::link(p, slot.avatar, slot.plate, link);
         }
         // `S1-CS`: a right-click on another seat offers to mute it, or to
