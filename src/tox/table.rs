@@ -902,6 +902,8 @@ fn sweep_table(
                     present.insert(*app_key);
                     // `S1-DT`: and how long the group has heard nothing from it.
                     if let Some(q) = tox.peer_quiet_secs(g, group_key) {
+                        // `S1-DU`: a seat is as quiet as its most recent entry.
+                        let q = quiet.get(app_key).map_or(q, |cur| (*cur).min(q));
                         quiet.insert(*app_key, q);
                     }
                 }
@@ -926,8 +928,9 @@ fn sweep_table(
     if let (Role::Joiner { founder, .. }, Some(g)) = (&t.setup.role, t.group) {
         if t.self_joined {
             if let Some(n) = friend_number(friends, founder) {
-                let absent =
-                    !peer_for(tox, g, founder, &t.known_as).is_some_and(|p| t.confirmed.contains(&p));
+                let absent = !entries_of(founder, scan_pairs(tox, g), &t.known_as)
+                    .iter()
+                    .any(|(p, _)| t.confirmed.contains(p));
                 if absent && connected.contains(&n) && !t.invited.contains(&n) {
                     if tox.invite(g, n).is_ok() {
                         t.invited.push(n);
@@ -1114,11 +1117,20 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                             // Tox lock up to 576 times a tick (measured: the
                             // table dropped from 44 hands in 900 s to 18).
                             if let Some(g) = t.group {
-                                let group_key = t
-                                    .known_as
-                                    .iter()
-                                    .find(|(_, a)| **a == app_key)
-                                    .map(|(gk, _)| *gk);
+                                // `S1-DU`: the seat's freshest entry among the
+                                // confirmed ones `peer_keys` remembers (no scan),
+                                // or failing that any key taught for it.
+                                let live = entries_of(
+                                    &app_key,
+                                    t.peer_keys
+                                        .iter()
+                                        .filter(|(p, _)| t.confirmed.contains(p))
+                                        .map(|(p, k)| (*p, *k)),
+                                    &t.known_as,
+                                );
+                                let group_key = freshest(&live, |gk| tox.peer_quiet_secs(g, gk)).or_else(|| {
+                                    t.known_as.iter().find(|(_, a)| **a == app_key).map(|(gk, _)| *gk)
+                                });
                                 if let Some(group_key) = group_key {
                                     tox.request_missing(g, &group_key);
                                     let bit = 1u32 << u32::from(seat.min(31));
@@ -1168,7 +1180,8 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                             // refused.
                             if matches!(t.setup.role, Role::Host) {
                                 if let Some(g) = t.group {
-                                    if let Some(peer) = peer_for(&tox, g, &key, &t.known_as) {
+                                    // `S1-DU`: every entry the seat has.
+                                    for (peer, _) in entries_of(&key, scan_pairs(&tox, g), &t.known_as) {
                                         let _ = tox.kick(g, peer);
                                     }
                                 }
@@ -1345,17 +1358,30 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                 } => {
                     if let Some(t) = by_group(&mut tables, g) {
                         t.confirmed.remove(&peer);
+                        let remembered = t.peer_keys.remove(&peer);
                         // `D-035`: a seat this driver knows by its group key is
                         // reported gone, on purpose or by timing out. `S1-DS`: by
                         // the key remembered for the peer when the callback
                         // could not read one.
-                        let key = key.or_else(|| t.peer_keys.remove(&peer));
+                        let key = key.or(remembered);
                         if let Some(app) = key.and_then(|k| t.known_as.get(&k).copied()) {
-                            if let Ok(mut present) = t.trouble.present.lock() {
-                                present.remove(&app);
-                            }
-                            if let Ok(mut gone) = t.trouble.gone.lock() {
-                                gone.push((app, quit));
+                            // `S1-DU`: a seat back under a fresh key is still here
+                            // by that entry -- the one that timed out is gone, the
+                            // seat is not. A quit is the live process saying so,
+                            // and any other entry of that seat is the stale one.
+                            // The library has dropped the leaving peer before
+                            // this, so the scan holds the others.
+                            let still = !quit
+                                && entries_of(&app, scan_pairs(&tox, g), &t.known_as)
+                                    .iter()
+                                    .any(|(p, _)| t.confirmed.contains(p));
+                            if !still {
+                                if let Ok(mut present) = t.trouble.present.lock() {
+                                    present.remove(&app);
+                                }
+                                if let Ok(mut gone) = t.trouble.gone.lock() {
+                                    gone.push((app, quit));
+                                }
                             }
                         }
                     }
@@ -1642,8 +1668,7 @@ fn announce(
     }
 }
 
-/// Which group peer holds this Tox public key, if any.
-/// Which group peer is the seat holding this **application** key.
+/// The group entries a seat speaks from, as (peer number, group key) pairs.
 ///
 /// **Two key spaces, and comparing across them was `S1-I`.** This used to test
 /// `tox_group_peer_get_public_key` against the roster's key directly, and
@@ -1659,20 +1684,48 @@ fn announce(
 /// trusted — a wrong pairing can only fail to find a peer, and the roster
 /// remains the only authority on who is seated.
 ///
-/// Peer ids are small and dense and a table is at most ten seats, so scanning
-/// beats keeping a second map in step with joins and parts.
-fn peer_for(
-    tox: &Tox,
-    group: u32,
+/// **All of them, not the first (`S1-DU`).** One as a rule; two while the entry
+/// a client that died left behind lingers beside the fresh one its restart
+/// made: the library keeps a confirmed member for 58 s after its last packet,
+/// and a restarted instance enters the group under a new key pair, since it
+/// boots from its secret key alone and carries no group state. A reader that
+/// took the first entry let the stale one answer for the live seat: read quiet
+/// for 58 s, nudged for a message it could not send, and reported gone when the
+/// library dropped it. Each reader chooses by its own evidence instead -- the
+/// freshest entry for a nudge (`freshest`), any confirmed one for presence,
+/// every one for a kick.
+fn entries_of(
     app_key: &[u8; 32],
-    known_as: &std::collections::HashMap<[u8; 32], [u8; 32]>,
-) -> Option<u32> {
-    (0..Tox::PEER_SCAN).find(|p| {
-        tox.peer_key(group, *p)
-            .ok()
-            .and_then(|g| known_as.get(&g))
-            .is_some_and(|a| a == app_key)
-    })
+    pairs: impl IntoIterator<Item = (u32, [u8; 32])>,
+    known_as: &HashMap<[u8; 32], [u8; 32]>,
+) -> Vec<(u32, [u8; 32])> {
+    pairs
+        .into_iter()
+        .filter(|(_, group_key)| known_as.get(group_key) == Some(app_key))
+        .collect()
+}
+
+/// The group's members as (peer number, group key) pairs, read from the
+/// library. Peer ids are small and dense and a table is at most ten seats, so
+/// a scan beats keeping a second map in step with joins and parts -- except
+/// per nudge, where `TableState::peer_keys` is the cheap copy (see `Nudge`).
+fn scan_pairs(tox: &Tox, group: u32) -> Vec<(u32, [u8; 32])> {
+    (0..Tox::PEER_SCAN)
+        .filter_map(|p| tox.peer_key(group, p).ok().map(|k| (p, k)))
+        .collect()
+}
+
+/// `S1-DU`: of a seat's entries, the group key the group heard from most
+/// recently. An entry with no reading (`None`) counts as never heard from, so
+/// one that has spoken wins over one that has not.
+fn freshest(
+    entries: &[(u32, [u8; 32])],
+    quiet_of: impl Fn(&[u8; 32]) -> Option<u64>,
+) -> Option<[u8; 32]> {
+    entries
+        .iter()
+        .map(|(_, group_key)| *group_key)
+        .min_by_key(|group_key| quiet_of(group_key).unwrap_or(u64::MAX))
 }
 
 /// Milliseconds for the reassembler's timers.
@@ -1736,6 +1789,49 @@ mod tests {
             pending_invites(&set(&[1, 2, 3]), &friends, &[[2u8; 32]], &[]),
             vec![2]
         );
+    }
+
+    /// `S1-DU`: a seat's entries are all of them, and each reader chooses by
+    /// evidence. A client that died leaves a confirmed entry behind for 58 s;
+    /// its restart enters the group under a fresh key, and once that key is
+    /// taught the seat has two. Before this the sweep's quiet was whichever
+    /// entry the map iterated last, a nudge went to whichever `find` met
+    /// first, and the stale entry's timeout was reported as the seat leaving
+    /// -- a seat that was back and dealing.
+    #[test]
+    fn a_seat_back_under_a_fresh_key_is_read_by_its_freshest_entry() {
+        let seat = [7u8; 32];
+        let stale = [1u8; 32];
+        let fresh = [2u8; 32];
+        let other = [3u8; 32];
+        let known_as: HashMap<[u8; 32], [u8; 32]> =
+            [(stale, seat), (fresh, seat), (other, [9u8; 32])].into_iter().collect();
+        let pairs = vec![(1u32, stale), (2u32, fresh), (3u32, other)];
+
+        // Both entries are the seat's; the other seat's is not.
+        let mine = entries_of(&seat, pairs.clone(), &known_as);
+        assert_eq!(mine.len(), 2);
+        assert!(mine.contains(&(1, stale)) && mine.contains(&(2, fresh)));
+        assert_eq!(entries_of(&[5u8; 32], pairs.clone(), &known_as), Vec::new());
+
+        // The freshest speaks: the stale entry is 40 s quiet, the fresh one 1 s.
+        let quiet = |gk: &[u8; 32]| match *gk {
+            k if k == stale => Some(40),
+            k if k == fresh => Some(1),
+            _ => None,
+        };
+        assert_eq!(freshest(&mine, quiet), Some(fresh));
+        // An entry with no reading counts as never heard from.
+        assert_eq!(freshest(&mine, |gk| (*gk == stale).then_some(40)), Some(stale));
+        assert_eq!(freshest(&[], quiet), None);
+
+        // After the stale entry's timeout the seat is still held by the fresh
+        // one, so it is not reported gone ...
+        let confirmed: std::collections::HashSet<u32> = [2u32, 3].into_iter().collect();
+        let after: Vec<(u32, [u8; 32])> = pairs.iter().copied().filter(|(p, _)| *p != 1).collect();
+        assert!(entries_of(&seat, after, &known_as).iter().any(|(p, _)| confirmed.contains(p)));
+        // ... and with no entry of its left, it is.
+        assert!(!entries_of(&seat, vec![(3, other)], &known_as).iter().any(|(p, _)| confirmed.contains(p)));
     }
 
     /// **The whole stack, between two real Tox instances**: a nine-kilobyte

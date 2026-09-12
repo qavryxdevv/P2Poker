@@ -66,6 +66,11 @@ param(
     # is a clean stop by `--for`, which says goodbye to the group.
     [ValidateRange(0, 3600)][int]$KillAt = 0,
     [ValidateRange(0, 9)][int]$KillNode = 1,
+    # `-KillFor <s>`: the killed node is started again that many seconds after
+    # the kill, same profile (`--resume`), the way `-DropFor` brings a dropper
+    # back -- a client that crashed and was started again (S1-DU). Zero: it
+    # stays dead.
+    [ValidateRange(0, 600)][int]$KillFor = 0,
     # `-ThinkMs <ms>`: every seat waits that long before it acts (`--autoplay <ms>`);
     # above the table's own thirty seconds the seat's OWN clock acts first, which
     # is how the check/fold's timing is measured from the other seats' side
@@ -536,6 +541,23 @@ if ($KillAt -gt 0) {
             Where-Object { $_.CommandLine -like "*$profile*" } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
     }
+    if ($KillFor -gt 0) {
+        Write-Host "==> n$KillNode is started again at $($KillAt + $KillFor) s, same profile"
+        $spent = $KillAt + $KillFor
+        $jobs += Start-Job -Name 'killed-again' -ArgumentList $Exe, $work, $table, $Seconds, $spent, $KillNode -ScriptBlock {
+            param($exe, $work, $table, $seconds, $spent, $dn)
+            Start-Sleep -Seconds $spent
+            $p = Join-Path $work "n$dn"
+            $log = Join-Path $work "n$dn-again.log"
+            $start = Get-Date
+            $inv = [System.Globalization.CultureInfo]::InvariantCulture
+            $left = $seconds - $spent
+            if ($left -lt 30) { $left = 30 }
+            & $exe --headless --autoplay --for "$left" --profile $p --join $table --resume 2>&1 |
+                ForEach-Object { ((((Get-Date) - $start).TotalSeconds).ToString('F1', $inv)).PadLeft(7) + '  ' + $_ } |
+                Out-File -FilePath $log -Encoding utf8
+        }
+    }
 }
 if ($RehostAt -gt 0) { Write-Host "==> at $RehostAt s n0 leaves and hosts $table-2; the joiners follow five seconds later" }
 if ($StartStack -gt 0) { Write-Host "==> every seat starts with $StartStack chips, so the tournament ends inside the run" }
@@ -568,6 +590,7 @@ for ($i = 0; $i -lt $nodeCount; $i++) { $logs += @{ Name = "n$i"; Path = (Join-P
 if ($LeaverSeconds -gt 0) { $logs += @{ Name = 'nR'; Path = (Join-Path $work 'nR.log') } }
 if (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $LeaverSeconds -eq 0) {
     foreach ($dn in $droppers) { $logs += @{ Name = "n$dn-again"; Path = (Join-Path $work "n$dn-again.log") } }
+    if ($KillAt -gt 0 -and $KillFor -gt 0) { $logs += @{ Name = "n$KillNode-again"; Path = (Join-Path $work "n$KillNode-again.log") } }
 }
 
 $nodes = @()
