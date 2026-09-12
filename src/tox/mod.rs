@@ -928,6 +928,17 @@ impl Tox {
         unsafe { sys::tox_group_peer_recv_pending(self.ptr, group, peer_key.as_ptr()) }
     }
 
+    /// `S1-DT`: how many seconds ago this peer's last packet arrived, by
+    /// the group's own clock; `None` when the group or the peer is not found
+    /// or nothing has arrived yet. Members ping each other every
+    /// `GC_PING_TIMEOUT` (twelve seconds), so a live one is never quiet for
+    /// long.
+    pub fn peer_quiet_secs(&self, group: u32, peer_key: &[u8; 32]) -> Option<u64> {
+        // SAFETY: as above; the call only reads.
+        let q = unsafe { sys::tox_group_peer_quiet_secs(self.ptr, group, peer_key.as_ptr()) };
+        (q != u64::MAX).then_some(q)
+    }
+
     pub fn peer_key(&self, group: u32, peer: u32) -> Result<[u8; 32], Failed> {
         let mut out = [0u8; 32];
         let mut err: c_int = 0;

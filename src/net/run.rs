@@ -5414,7 +5414,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // group has not yet taught; one it has taught and does not
                                     // hold now has left, and its friendship lingering two
                                     // minutes past the table (D-042) says nothing.
-                                    let group = t.tox_sink.in_group(&e.app_public_key)
+                                    // `S1-DT`: a member the group has heard nothing from for
+                                    // `QUIET_LIMIT_S` is off the line, though the library keeps
+                                    // it a member for 58 s -- a client that died says nothing.
+                                    let quiet = t
+                                        .tox_sink
+                                        .quiet_secs(&e.app_public_key)
+                                        .is_some_and(|q| q >= QUIET_LIMIT_S);
+                                    let group = (t.tox_sink.in_group(&e.app_public_key) && !quiet)
                                         || (!t.tox_sink.known(&e.app_public_key)
                                             && e.tox_key.is_some_and(|k| t.tox_sink.friend_up(&k)));
                                     let rtt = libp2p::PeerId::from_bytes(&e.peer_id)
@@ -7881,6 +7888,12 @@ pub const MAX_TABLES: usize = 4;
 /// rounds of the five-second resend loop, so a seat that missed the terminal
 /// message hears it again before anybody is gone.
 pub const TOURNAMENT_LEAVE_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `S1-DT`: how long a member of the table's group may be silent before the
+/// felt says it is off the line. Members ping each other every twelve
+/// seconds, so a live one is never this quiet; a client that died is, long
+/// before the library gives it up at 58 s.
+pub const QUIET_LIMIT_S: u64 = 20;
 
 /// Cut a string to at most `max` bytes, without cutting a character in half.
 ///

@@ -4186,6 +4186,39 @@ uint16_t tox_group_peer_recv_pending(const Tox *_Nonnull tox, uint32_t group_num
     return pending;
 }
 
+uint64_t tox_group_peer_quiet_secs(const Tox *_Nonnull tox, uint32_t group_number,
+                                   const uint8_t *_Nonnull peer_public_key)
+{
+    assert(tox != nullptr);
+
+    tox_lock(tox);
+    const GC_Chat *chat = gc_get_group(tox->m->group_handler, group_number);
+
+    if (chat == nullptr) {
+        tox_unlock(tox);
+        return UINT64_MAX;
+    }
+
+    const int peer_number = get_peer_number_of_enc_pk(chat, peer_public_key, false);
+
+    if (peer_number < 0) {
+        tox_unlock(tox);
+        return UINT64_MAX;
+    }
+
+    const GC_Connection *gconn = get_gc_connection(chat, peer_number);
+
+    if (gconn == nullptr) {
+        tox_unlock(tox);
+        return UINT64_MAX;
+    }
+
+    const uint64_t last = gconn->last_received_packet_time;
+    const uint64_t now = mono_time_get(chat->mono_time);
+    tox_unlock(tox);
+    return (last == 0 || now < last) ? UINT64_MAX : now - last;
+}
+
 bool tox_group_send_custom_packet(const Tox *_Nonnull tox, uint32_t group_number, bool lossless, const uint8_t *_Nonnull data,
                                   size_t length, Tox_Err_Group_Send_Custom_Packet *_Nullable error)
 {

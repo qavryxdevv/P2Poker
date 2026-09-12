@@ -1,0 +1,78 @@
+# 0032 - a peer's silence can be read: seconds since its last packet.
+#
+# S1-DT (2026-09-12): the owner killed one client to stand in for an
+# internet outage, and the other's felt kept the seat green, "on the line",
+# because the library keeps a confirmed member for GC_CONFIRMED_PEER_TIMEOUT
+# (58 s) after its last packet, and the felt's word came from membership.
+# Members ping each other every GC_PING_TIMEOUT (12 s), so a live member is
+# never quiet for long and a dead one is quiet at once; nothing in the
+# public API said how long. This adds an accessor, tox_group_peer_quiet_secs:
+# seconds since the peer's last packet by the group's clock, UINT64_MAX
+# when the group or the peer is not found. It reads local memory and sends
+# nothing; the client draws "offline" past twenty seconds of silence and
+# leaves the library's own timeout alone.
+
+diff --git a/vendor/c-toxcore/toxcore/tox.c b/vendor/c-toxcore/toxcore/tox.c
+index 53d94de..37f1e17 100644
+--- a/vendor/c-toxcore/toxcore/tox.c
++++ b/vendor/c-toxcore/toxcore/tox.c
+@@ -4186,6 +4186,39 @@ uint16_t tox_group_peer_recv_pending(const Tox *_Nonnull tox, uint32_t group_num
+     return pending;
+ }
+ 
++uint64_t tox_group_peer_quiet_secs(const Tox *_Nonnull tox, uint32_t group_number,
++                                   const uint8_t *_Nonnull peer_public_key)
++{
++    assert(tox != nullptr);
++
++    tox_lock(tox);
++    const GC_Chat *chat = gc_get_group(tox->m->group_handler, group_number);
++
++    if (chat == nullptr) {
++        tox_unlock(tox);
++        return UINT64_MAX;
++    }
++
++    const int peer_number = get_peer_number_of_enc_pk(chat, peer_public_key, false);
++
++    if (peer_number < 0) {
++        tox_unlock(tox);
++        return UINT64_MAX;
++    }
++
++    const GC_Connection *gconn = get_gc_connection(chat, peer_number);
++
++    if (gconn == nullptr) {
++        tox_unlock(tox);
++        return UINT64_MAX;
++    }
++
++    const uint64_t last = gconn->last_received_packet_time;
++    const uint64_t now = mono_time_get(chat->mono_time);
++    tox_unlock(tox);
++    return (last == 0 || now < last) ? UINT64_MAX : now - last;
++}
++
+ bool tox_group_send_custom_packet(const Tox *_Nonnull tox, uint32_t group_number, bool lossless, const uint8_t *_Nonnull data,
+                                   size_t length, Tox_Err_Group_Send_Custom_Packet *_Nullable error)
+ {
+diff --git a/vendor/c-toxcore/toxcore/tox.h b/vendor/c-toxcore/toxcore/tox.h
+index c72221b..ac502a5 100644
+--- a/vendor/c-toxcore/toxcore/tox.h
++++ b/vendor/c-toxcore/toxcore/tox.h
+@@ -4524,6 +4524,15 @@ uint16_t tox_group_peer_recv_pending(
+     const Tox *tox, Tox_Group_Number group_number,
+     const uint8_t peer_public_key[]);
+ 
++/**
++ * p2p-poker (patch 0032): how many seconds ago the last packet from this peer
++ * arrived, by the group's own clock. UINT64_MAX when the group or the peer is
++ * not found or nothing has arrived yet. Reads local memory and sends nothing.
++ */
++uint64_t tox_group_peer_quiet_secs(
++    const Tox *tox, Tox_Group_Number group_number,
++    const uint8_t peer_public_key[]);
++
+ typedef enum Tox_Err_Group_Send_Custom_Private_Packet {
+ 
+     /**

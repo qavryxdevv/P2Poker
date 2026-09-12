@@ -4524,6 +4524,15 @@ uint16_t tox_group_peer_recv_pending(
     const Tox *tox, Tox_Group_Number group_number,
     const uint8_t peer_public_key[]);
 
+/**
+ * p2p-poker (patch 0032): how many seconds ago the last packet from this peer
+ * arrived, by the group's own clock. UINT64_MAX when the group or the peer is
+ * not found or nothing has arrived yet. Reads local memory and sends nothing.
+ */
+uint64_t tox_group_peer_quiet_secs(
+    const Tox *tox, Tox_Group_Number group_number,
+    const uint8_t peer_public_key[]);
+
 typedef enum Tox_Err_Group_Send_Custom_Private_Packet {
 
     /**

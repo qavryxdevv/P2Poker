@@ -316,6 +316,10 @@ pub struct Trouble {
     /// spoken in the group and is not in it now: gone, whatever its friend
     /// link says -- a friendship lingers two minutes past a table (D-042).
     pub known: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// `S1-DT`: how many seconds ago each present seat's last packet arrived,
+    /// by application key -- read every sweep, so a seat whose client died
+    /// is quiet here long before the library gives it up (58 s).
+    pub quiet: std::sync::Mutex<HashMap<[u8; 32], u64>>,
     /// `D-035`: seats whose client left the group since the node last
     /// asked, by application key, each with whether it quit on purpose.
     pub gone: std::sync::Mutex<Vec<([u8; 32], bool)>>,
@@ -889,14 +893,22 @@ fn sweep_table(
     // APPLICATION key through the bridge `known_as` holds.
     if let Ok(mut present) = t.trouble.present.lock() {
         present.clear();
+        let mut quiet: HashMap<[u8; 32], u64> = HashMap::new();
         if let Some(g) = t.group {
             for (group_key, app_key) in t.known_as.iter() {
                 let member =
                     (0..Tox::PEER_SCAN).find(|p| tox.peer_key(g, *p).ok().as_ref() == Some(group_key));
                 if member.is_some_and(|p| t.confirmed.contains(&p)) {
                     present.insert(*app_key);
+                    // `S1-DT`: and how long the group has heard nothing from it.
+                    if let Some(q) = tox.peer_quiet_secs(g, group_key) {
+                        quiet.insert(*app_key, q);
+                    }
                 }
             }
+        }
+        if let Ok(mut q) = t.trouble.quiet.lock() {
+            *q = quiet;
         }
     }
     // `D-041`: and the friend connections that are up, by Tox key.

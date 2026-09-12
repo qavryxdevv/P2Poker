@@ -332,8 +332,9 @@ pub fn link(p: &Painter, avatar: Rect, plate: Rect, link: &super::Link) {
         (Some(ms), false, false) => (theme::DANGER, format!("{ms} ms")),
         (Some(ms), false, true) => (theme::WARN, format!("{ms} ms")),
         (_, _, true) => (theme::OK, "on the line".to_string()),
-        (None, _, false) => (theme::DANGER, "offline".to_string()),
-        (Some(_), true, false) => (theme::TEXT_DIM, "no ping".to_string()),
+        // `S1-DT`: off the line by the group's word and no fresh ping either
+        // -- offline, in red, whether or not a ping ever answered.
+        (None, _, false) | (Some(_), true, false) => (theme::DANGER, "offline".to_string()),
     };
     let r = (avatar.width() * 0.13).clamp(3.0, 6.0);
     let at = pos2(avatar.left() + r + 1.0, avatar.top() + r + 1.0);

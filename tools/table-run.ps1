@@ -60,6 +60,12 @@ param(
     [ValidateRange(0, 3600)][int]$LeaveTableAt = 0,
     # `-LeaveTableNode <i>`: which node leaves at `-LeaveTableAt` (n0 unless said).
     [ValidateRange(0, 9)][int]$LeaveTableNode = 0,
+    # `-KillAt <s>` and `-KillNode <i>`: the node's process is killed outright
+    # at that second -- no part message, no clean exit -- which is what a client
+    # that died or lost its internet looks like to the others (S1-DT). `-DropAt`
+    # is a clean stop by `--for`, which says goodbye to the group.
+    [ValidateRange(0, 3600)][int]$KillAt = 0,
+    [ValidateRange(0, 9)][int]$KillNode = 1,
     # `-ThinkMs <ms>`: every seat waits that long before it acts (`--autoplay <ms>`);
     # above the table's own thirty seconds the seat's OWN clock acts first, which
     # is how the check/fold's timing is measured from the other seats' side
@@ -520,6 +526,17 @@ if ($NoJoin -or $Watchers -gt 0) {
     Write-Host "==> $($nodeCount - 1 - $(if ($NoJoin) { 0 } else { $Seats - 1 })) watcher(s) join nothing and only watch the lobby; the founder offers $founderSeats seat(s)"
 }
 if ($LeaveTableAt -gt 0) { Write-Host "==> n$LeaveTableNode leaves its table at $LeaveTableAt s" }
+if ($KillAt -gt 0) {
+    Write-Host "==> n$KillNode is killed outright at $KillAt s"
+    $killProfile = Join-Path $work "n$KillNode"
+    $null = Start-Job -Name 'killer' -ArgumentList $KillAt, $killProfile -ScriptBlock {
+        param($at, $profile)
+        Start-Sleep -Seconds $at
+        Get-CimInstance Win32_Process -Filter "Name = 'p2p-poker.exe'" |
+            Where-Object { $_.CommandLine -like "*$profile*" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    }
+}
 if ($RehostAt -gt 0) { Write-Host "==> at $RehostAt s n0 leaves and hosts $table-2; the joiners follow five seconds later" }
 if ($StartStack -gt 0) { Write-Host "==> every seat starts with $StartStack chips, so the tournament ends inside the run" }
 if ($TwoTables) { Write-Host "==> a second table $table-B: hosted by n$($Seats + $Watchers), joined by n$($Seats + $Watchers + 1), and by n1 as well at $AlsoAt s" }

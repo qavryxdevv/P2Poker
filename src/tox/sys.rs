@@ -249,6 +249,13 @@ extern "C" {
         group_number: u32,
         peer_public_key: *const u8,
     ) -> u16;
+    /// **`patches/0032`.** Seconds since this peer's last packet, by the
+    /// group's clock; `u64::MAX` when unknown. Reads local memory only.
+    pub fn tox_group_peer_quiet_secs(
+        tox: *const Tox,
+        group_number: u32,
+        peer_public_key: *const u8,
+    ) -> u64;
     /// `tox.h:4475`
     pub fn tox_group_send_custom_packet(
         tox: *const Tox,

@@ -527,6 +527,23 @@ impl TableSink {
         }
     }
 
+    /// `S1-DT`: how many seconds ago the group last heard from this seat,
+    /// `None` when it is not a present member.
+    pub fn quiet_secs(&self, app_key: &[u8; 32]) -> Option<u64> {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().quiet.lock().ok().and_then(|q| q.get(app_key).copied()),
+                None => None,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            let _ = app_key;
+            None
+        }
+    }
+
     pub fn friend_up(&self, tox_key: &[u8; 32]) -> bool {
         #[cfg(feature = "tox")]
         {
