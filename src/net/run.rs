@@ -5973,11 +5973,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // and offers it no more; seen within one asking (thirty
                             // seconds) whether or not the group ever held it.
                             // Only while the founder is not a confirmed member of this
-                            // client's group: a table that dealt is answered without
-                            // its advert too, and the founder deals only once the group
-                            // holds everybody -- so a founder in the group that answers
-                            // without the table has dealt, not left.
-                            let withdrawn = !founder_line.is_some_and(|k| t.tox_sink.in_group_line(&k))
+                            // client's group, and only while the table is not set here
+                            // (`S1-EM`): a table that dealt is answered without its
+                            // advert too, and the founder deals only once the table is
+                            // set and its group holds everybody -- so a founder that
+                            // answers without the table once this client holds the
+                            // session has dealt, not left. The group's word alone was
+                            // not enough: a joiner confirms its founder a round trip
+                            // after the founder confirmed it, and on the far box's
+                            // relayed lines that round trip outlasted the founder's
+                            // deal and its next answer (the far seat's log, 2026-09-12
+                            // 20:27 UTC: *the table is set* at 46.7 s, the founder's
+                            // hand #1 to seats [0, 1, 2] and its answer with no table
+                            // at 47.4 s, and this rule sent the seat back to the lobby
+                            // at 48.0 s with the deal on its way). A founder gone after
+                            // the set is still read by its exit, its group silence,
+                            // `GROUP_JOIN_GRACE` and `SEAT_SILENCE_MS`.
+                            let withdrawn = f.session().is_none()
+                                && !founder_line.is_some_and(|k| t.tox_sink.in_group_line(&k))
                                 && answers
                                     .get(f.founder_peer_id())
                                     .is_some_and(|(named, at)| !named.contains(&f.table_id()) && *at > f.advert_time());
