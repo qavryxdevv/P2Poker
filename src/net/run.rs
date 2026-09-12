@@ -425,6 +425,10 @@ struct TableRun {
     /// When the slot was opened: one that never gets its table goes a minute
     /// later, once the window has turned elsewhere.
     opened_at: tokio::time::Instant,
+    /// `S1-DV`: when each seat of the roster was first seen there by this
+    /// client -- the grace a seat gets to join the table's group before its
+    /// line being down reads as gone (`GROUP_JOIN_GRACE`).
+    seat_since: std::collections::HashMap<u8, tokio::time::Instant>,
     /// The table this client is forming or sitting at, and the mesh it is formed
     /// on. One `TableRun` per table; the loop holds one of them until `D-043`'s
     /// stage 2 holds up to `MAX_TABLES`. (Until 2026-09-12 multi-tabling was
@@ -764,6 +768,7 @@ impl TableRun {
         TableRun {
             slot,
             opened_at: tokio::time::Instant::now(),
+            seat_since: std::collections::HashMap::new(),
             table: None,
             hand: None,
             hand_reported: false,
@@ -2027,7 +2032,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // The player's own leave, from the window or from the fault knob below:
     // the group, the topic, the table, every local fact, the record.
     macro_rules! leave_table_now {
-        ($t:ident) => {{
+        ($t:ident) => {
+            leave_table_now!($t, "left the table".to_string())
+        };
+        // `S1-DV`: with the reason the window shows -- a joiner taken back to
+        // the lobby is told why.
+        ($t:ident, $why:expr) => {{
             // The Tox group goes with the table: dropping the handle tells
             // the driver to leave and joins its thread, which flushes what it
             // still holds -- the last message of a hand sits in that queue.
@@ -2044,9 +2054,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             let _ = crate::storage::session::forget(&profile_dir);
             $t.resume = None;
             $t.resuming = false;
-            let _ = events.send(NodeEvent::LeftTable {
-                why: "left the table".into(),
-            }).await;
+            let _ = events.send(NodeEvent::LeftTable { why: $why }).await;
         }};
     }
     macro_rules! rejoin_from_copies {
@@ -2142,6 +2150,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.checkpoint_said = false;
             $t.frozen = None;
             $t.link_said.clear();
+            $t.seat_since.clear();
             $t.ahead.clear();
             $t.adrift = None;
             // **Its own doc says *cleared when the freeze is*, and the line
@@ -5395,6 +5404,244 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         println!("fault-harness: leaving the table, as P2P_POKER_LEAVE_TABLE_AT asked");
                         leave_table_now!(t);
                     }
+                    // **Give back the seat of anybody who has stopped answering,
+                    // and only before the first hand.** `S1-DV`: on the two-second
+                    // tick, and by the group's word first -- a seat that left, timed
+                    // out or fell silent in the group, or never joined it and lost
+                    // its line -- with the ninety seconds of ping silence last.
+                    // `-LeaveTableAt` before the deal had held the seat for the run,
+                    // a client back in the lobby answering every ping.
+                    //
+                    // A player who sits down at a tournament and leaves before it
+                    // fills is ordinary. Nothing used to notice: `LeaveTable` clears
+                    // local state and tells the founder nothing, there is no message
+                    // that could tell it — `PLAYER_LEAVE` is a boundary-window event
+                    // of a chain that does not exist yet — and D-022's *held for two
+                    // hands* is counted in hands, of which there are none. So the
+                    // seat was held for ever and the replacement was refused with
+                    // *the table is full*, measured twice in one run.
+                    //
+                    // **Liveness is asked for rather than assumed.** `alive` is the
+                    // last time each peer answered a **ping**; a connection being up
+                    // is not evidence that anybody is behind it. `SEAT_SILENCE_MS`
+                    // is six ping intervals, so a seat is given back only by a peer
+                    // that has missed every one of them.
+                    //
+                    // `!ever_dealt` is the whole of what makes this not an eviction,
+                    // and it is checked here because `Formation` cannot see it.
+                    if !t.ever_dealt {
+                        // `S1-DV`: the group's word, by the Tox key each member's
+                        // invitation came over (`patches/0033`): who quit or timed
+                        // out since the last tick and, read below, who is present
+                        // and how quiet. Taught by nobody, known from the join. (The
+                        // topic's unsubscribe was tried first and read this client's
+                        // own re-announcement, an unsubscribe and a subscribe a
+                        // moment apart, as a leave: `run115253-3`.)
+                        let gone_lines = t.tox_sink.take_gone_lines();
+                        // How long each seat has been on the roster here.
+                        let now_tick = tokio::time::Instant::now();
+                        if let Some(f) = t.table.as_ref() {
+                            let seats: Vec<u8> = f.roster().seats().iter().map(|e| e.seat).collect();
+                            t.seat_since.retain(|s, _| seats.contains(s));
+                            for s in seats {
+                                t.seat_since.entry(s).or_insert(now_tick);
+                            }
+                        }
+                        if let Some(f) = t.table.as_mut().filter(|f| f.is_founder()) {
+                            let silent: Vec<(u8, Vec<u8>, Option<[u8; 32]>, String)> = f
+                                .roster()
+                                .seats()
+                                .iter()
+                                .filter(|e| Some(e.seat) != f.my_seat())
+                                .filter_map(|e| {
+                                    // Answered no ping for `SEAT_SILENCE_MS`. Seated and
+                                    // never once heard from counts: it reached the join
+                                    // RPC over a connection, so `ConnectionEstablished`
+                                    // recorded it, and no entry at all means that
+                                    // connection and this client's memory of it are both
+                                    // gone. A `peer_id` that will not parse cannot be
+                                    // pinged and cannot be judged: §4.3 admitted it.
+                                    let by_ping = match PeerId::from_bytes(&e.peer_id) {
+                                        Ok(p) => alive
+                                            .get(&p)
+                                            .map(|(at, _)| {
+                                                at.elapsed()
+                                                    >= std::time::Duration::from_millis(SEAT_SILENCE_MS)
+                                            })
+                                            .unwrap_or(true),
+                                        Err(_) => false,
+                                    };
+                                    // `S1-DV`: the group's word about the line this
+                                    // seat's invitation went over.
+                                    let line = e.tox_key;
+                                    let exit = line.and_then(|k| {
+                                        gone_lines.iter().find(|(l, _)| *l == k).map(|(_, quit)| *quit)
+                                    });
+                                    let quiet = line
+                                        .and_then(|k| t.tox_sink.quiet_line(&k))
+                                        .is_some_and(|q| q >= QUIET_LIMIT_S);
+                                    let never_in = line.is_some_and(|k| {
+                                        !t.tox_sink.in_group_line(&k) && !t.tox_sink.friend_up(&k)
+                                    }) && t
+                                        .seat_since
+                                        .get(&e.seat)
+                                        .is_some_and(|since| since.elapsed() >= GROUP_JOIN_GRACE);
+                                    let why = if let Some(quit) = exit {
+                                        Some(if quit {
+                                            "left the table before the first hand".to_string()
+                                        } else {
+                                            "timed out of the table's group before the first hand".to_string()
+                                        })
+                                    } else if quiet {
+                                        Some(format!("has been silent in the table's group for {QUIET_LIMIT_S} s"))
+                                    } else if never_in {
+                                        Some(format!(
+                                            "never joined the table's group and its line is down, {} s after sitting down",
+                                            GROUP_JOIN_GRACE.as_secs()
+                                        ))
+                                    } else if by_ping {
+                                        Some(format!("has answered nothing for {} s", SEAT_SILENCE_MS / 1000))
+                                    } else {
+                                        None
+                                    };
+                                    // The Tox key travels with the seat, because it is
+                                    // read from the roster **before** the release takes
+                                    // the entry out of it. D-019's kick needs it and it
+                                    // is gone a line later.
+                                    why.map(|w| (e.seat, e.peer_id.clone(), e.tox_key, w))
+                                })
+                                .collect();
+
+                            for (seat, peer, tox_key, why) in silent {
+                                match f.release_seat_before_the_first_hand(&peer, now) {
+                                    Ok(sends) if !sends.is_empty() => {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "seat {seat} {why} and the seat is free again"
+                                            )))
+                                            .await;
+                                        // **D-019: out of the roster is out of the
+                                        // group.** `Seat::Left` was constructed
+                                        // NOWHERE — only its match arm existed — so
+                                        // `Command::Unseated` was never sent and
+                                        // the kick was dead twice over: nothing
+                                        // asked for it, and `peer_for` could not
+                                        // have answered if anything had (`S1-I`).
+                                        //
+                                        // It is asked for here, at the one place a
+                                        // seat leaves a roster. Whether the driver
+                                        // can find the peer is a second question:
+                                        // the group-key pairing is learned from
+                                        // signed hand traffic, and before hand one
+                                        // there is none — so a seat released during
+                                        // formation is removed from the roster,
+                                        // which is the authority, and left in the
+                                        // group until it is rebuilt. Said here
+                                        // rather than discovered later.
+                                        if let Some(k) = tox_key {
+                                            t.tox_sink.tell(super::toxsink::Seat::Left(k));
+                                        }
+                                        // Only broadcasts come out of a release:
+                                        // there is nobody to reply to, because
+                                        // nothing asked. A `Reply` here would be a
+                                        // response to a request that does not
+                                        // exist, so it is dropped and said rather
+                                        // than sent nowhere quietly.
+                                        for s in sends {
+                                            match s {
+                                                Send::Broadcast(bytes) => {
+                                                    if let Some(tt) = &t.table_topic {
+                                                        let _ = swarm
+                                                            .behaviour_mut()
+                                                            .gossipsub
+                                                            .publish(tt.clone(), bytes);
+                                                    }
+                                                }
+                                                Send::Reply(_) => {
+                                                    let _ = events
+                                                        .send(NodeEvent::Warning(
+                                                            "releasing a seat produced a reply, which has no request to answer"
+                                                                .into(),
+                                                        ))
+                                                        .await;
+                                                }
+                                            }
+                                        }
+                                        seat_on_tox(f, &t.tox_sink);
+                                        report_roster(&events, f).await;
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "could not free seat {seat}: {e:?}"
+                                            )))
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                        // `S1-DV`, the other side: a joiner whose founder left the
+                        // table by its own word, or has answered nothing for
+                        // `SEAT_SILENCE_MS`, or said the roster again without this
+                        // client, has nothing to sit at. Back to the lobby, and the
+                        // note says which. Before this a joiner waited for ever.
+                        let gone: Option<String> = t.table.as_ref().filter(|f| !f.is_founder()).and_then(|f| {
+                            let founder_peer = PeerId::from_bytes(f.founder_peer_id()).ok();
+                            let founder_line = f
+                                .roster()
+                                .seats()
+                                .iter()
+                                .find(|e| e.peer_id.as_slice() == f.founder_peer_id())
+                                .and_then(|e| e.tox_key);
+                            let by_ping = founder_peer.and_then(|p| alive.get(&p)).is_some_and(|(at, _)| {
+                                at.elapsed() >= std::time::Duration::from_millis(SEAT_SILENCE_MS)
+                            });
+                            let exit = founder_line.and_then(|k| {
+                                gone_lines.iter().find(|(l, _)| *l == k).map(|(_, quit)| *quit)
+                            });
+                            let quiet = founder_line
+                                .and_then(|k| t.tox_sink.quiet_line(&k))
+                                .is_some_and(|q| q >= QUIET_LIMIT_S);
+                            let never_in = founder_line.is_some_and(|k| {
+                                !t.tox_sink.in_group_line(&k) && !t.tox_sink.friend_up(&k)
+                            }) && t.opened_at.elapsed() >= GROUP_JOIN_GRACE;
+                            if f.released_before_the_first_hand() {
+                                Some(
+                                    "the founder gave this seat away before the first hand -- this client had answered nothing for a while, or had left -- so there is nothing to sit at; join again from the lobby"
+                                        .to_string(),
+                                )
+                            } else if let Some(quit) = exit {
+                                Some(if quit {
+                                    "the founder left the table before the first hand: the table is gone".to_string()
+                                } else {
+                                    "the founder timed out of the table's group before the first hand: the table is gone"
+                                        .to_string()
+                                })
+                            } else if quiet {
+                                Some(format!(
+                                    "the founder has been silent in the table's group for {QUIET_LIMIT_S} s before the first hand: the table is gone"
+                                ))
+                            } else if never_in {
+                                Some(format!(
+                                    "the founder never joined the table's group and its line is down, {} s after this client sat down: the table is gone",
+                                    GROUP_JOIN_GRACE.as_secs()
+                                ))
+                            } else if by_ping {
+                                Some(format!(
+                                    "the founder has answered nothing for {} s before the first hand: the table is gone",
+                                    SEAT_SILENCE_MS / 1000
+                                ))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(why) = gone {
+                            let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                            leave_table_now!(t, why);
+                        }
+                    }
+
                     // `D-041`: every seat's link as the table's group knows it. On a
                     // Tox table the group carries the hand and the felt reads presence
                     // from it; a libp2p ping is a figure beside that reading, and a
@@ -7362,135 +7609,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // **Give back the seat of anybody who has stopped answering,
-                    // and only before the first hand.**
-                    //
-                    // A player who sits down at a tournament and leaves before it
-                    // fills is ordinary. Nothing used to notice: `LeaveTable` clears
-                    // local state and tells the founder nothing, there is no message
-                    // that could tell it — `PLAYER_LEAVE` is a boundary-window event
-                    // of a chain that does not exist yet — and D-022's *held for two
-                    // hands* is counted in hands, of which there are none. So the
-                    // seat was held for ever and the replacement was refused with
-                    // *the table is full*, measured twice in one run.
-                    //
-                    // **Liveness is asked for rather than assumed.** `alive` is the
-                    // last time each peer answered a **ping**; a connection being up
-                    // is not evidence that anybody is behind it. `SEAT_SILENCE_MS`
-                    // is six ping intervals, so a seat is given back only by a peer
-                    // that has missed every one of them.
-                    //
-                    // `!ever_dealt` is the whole of what makes this not an eviction,
-                    // and it is checked here because `Formation` cannot see it.
-                    if !t.ever_dealt {
-                        if let Some(f) = t.table.as_mut().filter(|f| f.is_founder()) {
-                            let silent: Vec<(u8, Vec<u8>, Option<[u8; 32]>)> = f
-                                .roster()
-                                .seats()
-                                .iter()
-                                .filter(|e| Some(e.seat) != f.my_seat())
-                                .filter(|e| {
-                                    match PeerId::from_bytes(&e.peer_id) {
-                                        // Answered, and recently enough.
-                                        Ok(p) => alive
-                                            .get(&p)
-                                            .map(|(at, _)| {
-                                                at.elapsed()
-                                                    >= std::time::Duration::from_millis(SEAT_SILENCE_MS)
-                                            })
-                                            // Seated and never once heard from. It
-                                            // reached the join RPC over a connection,
-                                            // so `ConnectionEstablished` recorded it;
-                                            // no entry at all means that connection
-                                            // and this client's memory of it are both
-                                            // gone.
-                                            .unwrap_or(true),
-                                        // A `peer_id` that will not parse cannot be
-                                        // pinged and cannot be judged. Left alone:
-                                        // §4.3 admitted it, and refusing to seat it
-                                        // is that check's business rather than this
-                                        // one's.
-                                        Err(_) => false,
-                                    }
-                                })
-                                // The Tox key travels with the seat, because it is
-                                // read from the roster **before** the release takes
-                                // the entry out of it. D-019's kick needs it and it
-                                // is gone a line later.
-                                .map(|e| (e.seat, e.peer_id.clone(), e.tox_key))
-                                .collect();
-
-                            for (seat, peer, tox_key) in silent {
-                                match f.release_seat_before_the_first_hand(&peer, now) {
-                                    Ok(sends) if !sends.is_empty() => {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(format!(
-                                                "seat {seat} has answered nothing for {} s and the seat is free again",
-                                                SEAT_SILENCE_MS / 1000
-                                            )))
-                                            .await;
-                                        // **D-019: out of the roster is out of the
-                                        // group.** `Seat::Left` was constructed
-                                        // NOWHERE — only its match arm existed — so
-                                        // `Command::Unseated` was never sent and
-                                        // the kick was dead twice over: nothing
-                                        // asked for it, and `peer_for` could not
-                                        // have answered if anything had (`S1-I`).
-                                        //
-                                        // It is asked for here, at the one place a
-                                        // seat leaves a roster. Whether the driver
-                                        // can find the peer is a second question:
-                                        // the group-key pairing is learned from
-                                        // signed hand traffic, and before hand one
-                                        // there is none — so a seat released during
-                                        // formation is removed from the roster,
-                                        // which is the authority, and left in the
-                                        // group until it is rebuilt. Said here
-                                        // rather than discovered later.
-                                        if let Some(k) = tox_key {
-                                            t.tox_sink.tell(super::toxsink::Seat::Left(k));
-                                        }
-                                        // Only broadcasts come out of a release:
-                                        // there is nobody to reply to, because
-                                        // nothing asked. A `Reply` here would be a
-                                        // response to a request that does not
-                                        // exist, so it is dropped and said rather
-                                        // than sent nowhere quietly.
-                                        for s in sends {
-                                            match s {
-                                                Send::Broadcast(bytes) => {
-                                                    if let Some(tt) = &t.table_topic {
-                                                        let _ = swarm
-                                                            .behaviour_mut()
-                                                            .gossipsub
-                                                            .publish(tt.clone(), bytes);
-                                                    }
-                                                }
-                                                Send::Reply(_) => {
-                                                    let _ = events
-                                                        .send(NodeEvent::Warning(
-                                                            "releasing a seat produced a reply, which has no request to answer"
-                                                                .into(),
-                                                        ))
-                                                        .await;
-                                                }
-                                            }
-                                        }
-                                        seat_on_tox(f, &t.tox_sink);
-                                        report_roster(&events, f).await;
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        let _ = events
-                                            .send(NodeEvent::Warning(format!(
-                                                "could not free seat {seat}: {e:?}"
-                                            )))
-                                            .await;
-                                    }
-                                }
-                            }
-                        }
-                    }
                     // **Who this client can actually reach on the lobby topic.**
                     // A publish that returns `Ok` says only that it went somewhere.
                     // Measured on three clients on one machine, all discovered by
@@ -8526,8 +8644,14 @@ fn leave_table_due() -> bool {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
     });
+    // `S1-DV`: once. It used to fire on every tick past the second while the
+    // client was seated, and a client that asked for its table again was
+    // out again two seconds later.
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     match (at, PROCESS_STARTED.get()) {
-        (Some(s), Some(since)) => since.elapsed().as_secs() >= *s,
+        (Some(s), Some(since)) => {
+            since.elapsed().as_secs() >= *s && !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        }
         _ => false,
     }
 }
@@ -10668,6 +10792,12 @@ async fn say_why_no_hand_one(f: &Formation, said: &mut bool, events: &Events) {
 /// has gone, which is the whole point: until this existed a tournament that
 /// lost one player before it started could not be completed by anybody.
 const SEAT_SILENCE_MS: u64 = 90_000;
+
+/// `S1-DV`: how long a seat may sit on the roster outside the table's group
+/// before its line being down reads as gone. The invitation dance takes ten
+/// to fifteen seconds on one machine (D-042's measurements); forty leaves
+/// room for a far seat and a slow relay.
+const GROUP_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(40);
 
 /// How long hand 1 waits after the group **stops filling**.
 ///

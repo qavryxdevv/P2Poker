@@ -715,6 +715,16 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     ) {
                         join_asked = None;
                     }
+                    // `S1-DV`: a client that left a table by its own choice does
+                    // not ask for it again -- the name is spent, as a player who
+                    // pressed Leave is in the lobby and stays there. A leave with
+                    // another reason (the founder gone, the seat given away)
+                    // leaves the ask alone. Measured: `run113830-2`, the leaver
+                    // back in its seat within a second and out again at the next
+                    // tick, four times, and hand #1 dealt to a seat that was gone.
+                    if matches!(&event, NodeEvent::LeftTable { why } if why == "left the table") {
+                        join = None;
+                    }
                     // What the log had before, so only new lines are printed.
                     // Most events add none — a re-broadcast this client already
                     // holds, a peer count — and printing `log.back()` after

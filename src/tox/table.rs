@@ -323,6 +323,13 @@ pub struct Trouble {
     /// `D-035`: seats whose client left the group since the node last
     /// asked, by application key, each with whether it quit on purpose.
     pub gone: std::sync::Mutex<Vec<([u8; 32], bool)>>,
+    /// `S1-DV`: the same three by the TOX key of the friend a member's
+    /// invitation came over (`patches/0033`) -- known from the join, so
+    /// they say something before the first hand, when the group has taught
+    /// no application key yet: present members, their silence, and exits.
+    pub present_lines: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    pub quiet_lines: std::sync::Mutex<HashMap<[u8; 32], u64>>,
+    pub gone_lines: std::sync::Mutex<Vec<([u8; 32], bool)>>,
     /// Whether every other seat on the roster is in the group right now.
     ///
     /// **Here because a table whose group is not complete deals a hand nobody
@@ -753,6 +760,17 @@ struct TableState {
     /// that moment (run095833-2: a joiner's leave reached the founder as
     /// *deleting group peer 1, exit type 0* and never as a seat gone).
     peer_keys: HashMap<u32, [u8; 32]>,
+    /// `S1-DV`: peer number -> the Tox key of the friend its invitation
+    /// came over (`patches/0033`): for the founder every seat it invited,
+    /// for a joiner its founder. Known from the join, so an exit or a
+    /// silence maps to a seat before the group has taught anything --
+    /// before the first hand.
+    peer_lines: HashMap<u32, [u8; 32]>,
+    /// `S1-DV`: whether this table's group ever held another member. A
+    /// host's `self_joined` never turns true (the library says self-join
+    /// only for a join, not for a group it created), so this is what says a
+    /// table got into its group at all -- and whether its friendships linger.
+    had_members: bool,
     group: Option<u32>,
     invited: Vec<u32>,
     confirmed: std::collections::HashSet<u32>,
@@ -841,7 +859,16 @@ fn close_table(
             continue;
         }
         if let Some(n) = friend_number(friends, &key) {
-            idle.entry(n).or_insert_with(Instant::now);
+            // `S1-DV`: a table that never got into its group has nothing to
+            // linger for; its friendships go at the next sweep, so the others
+            // see this client's line drop within the library's friend timeout
+            // rather than two minutes later.
+            let since = if t.self_joined || t.had_members {
+                Instant::now()
+            } else {
+                Instant::now().checked_sub(FRIEND_LINGER).unwrap_or_else(Instant::now)
+            };
+            idle.entry(n).or_insert(since);
         }
     }
 }
@@ -910,6 +937,27 @@ fn sweep_table(
             }
         }
         if let Ok(mut q) = t.trouble.quiet.lock() {
+            *q = quiet;
+        }
+    }
+    // `S1-DV`: the same by the Tox key of the friend each member came in
+    // through -- taught by nobody, known from the join.
+    if let Ok(mut present) = t.trouble.present_lines.lock() {
+        present.clear();
+        let mut quiet: HashMap<[u8; 32], u64> = HashMap::new();
+        if let Some(g) = t.group {
+            for (peer, line) in t.peer_lines.iter() {
+                if !t.confirmed.contains(peer) {
+                    continue;
+                }
+                present.insert(*line);
+                if let Some(q) = t.peer_keys.get(peer).and_then(|k| tox.peer_quiet_secs(g, k)) {
+                    let q = quiet.get(line).map_or(q, |cur| (*cur).min(q));
+                    quiet.insert(*line, q);
+                }
+            }
+        }
+        if let Ok(mut q) = t.trouble.quiet_lines.lock() {
             *q = quiet;
         }
     }
@@ -1065,6 +1113,8 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                             roster,
                             known_as: HashMap::new(),
                             peer_keys: HashMap::new(),
+                            peer_lines: HashMap::new(),
+                            had_members: false,
                             group,
                             invited: Vec::new(),
                             confirmed: std::collections::HashSet::new(),
@@ -1343,10 +1393,21 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                 }
                 Event::GroupPeerJoin { group: g, peer } => {
                     let key = tox.peer_key(g, peer).ok();
+                    // `S1-DV`: the friend this member came in through, if any.
+                    let line = key
+                        .and_then(|k| tox.peer_friend_number(g, &k))
+                        .and_then(|n| friends.get(&n).copied());
                     if let Some(t) = by_group(&mut tables, g) {
                         t.confirmed.insert(peer);
+                        t.had_members = true;
                         if let Some(k) = key {
                             t.peer_keys.insert(peer, k);
+                        }
+                        if let Some(l) = line {
+                            t.peer_lines.insert(peer, l);
+                            if let Ok(mut present) = t.trouble.present_lines.lock() {
+                                present.insert(l);
+                            }
                         }
                     }
                 }
@@ -1359,6 +1420,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                     if let Some(t) = by_group(&mut tables, g) {
                         t.confirmed.remove(&peer);
                         let remembered = t.peer_keys.remove(&peer);
+                        let line = t.peer_lines.remove(&peer);
                         // `D-035`: a seat this driver knows by its group key is
                         // reported gone, on purpose or by timing out. `S1-DS`: by
                         // the key remembered for the peer when the callback
@@ -1381,6 +1443,19 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                                 }
                                 if let Ok(mut gone) = t.trouble.gone.lock() {
                                     gone.push((app, quit));
+                                }
+                            }
+                        }
+                        // `S1-DV`: and by the line it came in over, taught or not.
+                        if let Some(l) = line {
+                            let still = !quit
+                                && t.peer_lines.iter().any(|(p, k)| *k == l && t.confirmed.contains(p));
+                            if !still {
+                                if let Ok(mut present) = t.trouble.present_lines.lock() {
+                                    present.remove(&l);
+                                }
+                                if let Ok(mut gone) = t.trouble.gone_lines.lock() {
+                                    gone.push((l, quit));
                                 }
                             }
                         }

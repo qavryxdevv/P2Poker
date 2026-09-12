@@ -544,6 +544,68 @@ impl TableSink {
         }
     }
 
+    /// `S1-DV`: seats whose client left the table's group since the last
+    /// call, by the TOX key their invitation came over (`patches/0033`),
+    /// each with whether it quit on purpose -- said before the group has
+    /// taught any application key, so before the first hand.
+    pub fn take_gone_lines(&self) -> Vec<([u8; 32], bool)> {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t
+                    .trouble()
+                    .gone_lines
+                    .lock()
+                    .map(|mut g| std::mem::take(&mut *g))
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// `S1-DV`: whether the friend with this Tox key is a confirmed member
+    /// of the table's group right now, by the line its invitation came over.
+    pub fn in_group_line(&self, tox_key: &[u8; 32]) -> bool {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t
+                    .trouble()
+                    .present_lines
+                    .lock()
+                    .map(|p| p.contains(tox_key))
+                    .unwrap_or(false),
+                None => false,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            let _ = tox_key;
+            false
+        }
+    }
+
+    /// `S1-DV`: how many seconds ago the group last heard from the member
+    /// that came in over this Tox key, `None` when it is not a present member.
+    pub fn quiet_line(&self, tox_key: &[u8; 32]) -> Option<u64> {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().quiet_lines.lock().ok().and_then(|q| q.get(tox_key).copied()),
+                None => None,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            let _ = tox_key;
+            None
+        }
+    }
+
     pub fn friend_up(&self, tox_key: &[u8; 32]) -> bool {
         #[cfg(feature = "tox")]
         {

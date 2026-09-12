@@ -235,6 +235,18 @@ $patched = @(
     @{ File   = 'toxcore/group_chats.h'
        Marker = 'p2p-poker (patch 0029): an unconfirmed peer gets thirty seconds, not twelve.'
        Why    = '0029: S1-AA join phase. Twelve seconds hold four handshake attempts, two of them by TCP, and a peer on another network needs the TCP ones; the far seat reaped three seats at +12 s while their own requests were in flight and then answered them on deleted entries (runs/split140414-9). Thirty seconds hold five TCP attempts; a dead entry lingers eighteen seconds longer, which nothing depends on.' }
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker (patch 0030): the same greeting heard again'
+       Why    = '0030: S1-DQ. A second table in the same client heard the greeting into its group twice and the second reading reset the first; a repeated request is answered again and a repeated response dropped, nothing reset.' }
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker (patch 0031): a peer that left on purpose is forgotten'
+       Why    = '0031: S1-DS. A member that quit was kept for reconnection like one that timed out and greeted again for ever; a QUIT is forgotten like a KICK.' }
+    @{ File   = 'toxcore/tox.h'
+       Marker = 'p2p-poker (patch 0032): how many seconds ago the last packet from this peer'
+       Why    = '0032: S1-DT. The library keeps a confirmed member for 58 s after its last packet and the public API did not say how long it had been quiet; the felt reads a member quiet for twenty seconds as off the line.' }
+    @{ File   = 'toxcore/tox.h'
+       Marker = 'p2p-poker (patch 0033): the friend this member came into the group through'
+       Why    = '0033: S1-DV. Before the first hand the group has taught no application key, so an exit or a silence mapped to no seat; the friend number the invitation travelled over is known to the library on both sides and this reads it, so a founder knows every seat it invited from the join.' }
 )
 
 Step 'checking the patches are in the vendored source'

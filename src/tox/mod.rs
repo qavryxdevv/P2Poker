@@ -939,6 +939,15 @@ impl Tox {
         (q != u64::MAX).then_some(q)
     }
 
+    /// `patches/0033`: the friend this member came into the group through --
+    /// the friend number its invitation travelled over, on either side of it
+    /// -- or `None` when it came some other way.
+    pub fn peer_friend_number(&self, group: u32, peer_key: &[u8; 32]) -> Option<u32> {
+        // SAFETY: as above; the call only reads.
+        let n = unsafe { sys::tox_group_peer_friend_number(self.ptr, group, peer_key.as_ptr()) };
+        (n != u32::MAX).then_some(n)
+    }
+
     pub fn peer_key(&self, group: u32, peer: u32) -> Result<[u8; 32], Failed> {
         let mut out = [0u8; 32];
         let mut err: c_int = 0;

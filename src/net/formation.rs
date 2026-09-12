@@ -237,6 +237,12 @@ pub struct Formation {
     /// The recorded ratification did not fit the roster the founder said
     /// again, and this client ratified anew; the node says so.
     recorded_refused: bool,
+    /// `S1-DV`: a roster the founder said again no longer names this
+    /// client, which an earlier one did -- the seat was given back before
+    /// the first hand (silent for `SEAT_SILENCE_MS`, or left and came
+    /// back). The node reads it and leaves the table: there is nothing to
+    /// sit at, and the player joins again from the lobby.
+    released: bool,
 }
 
 /// What this client may need to say again.
@@ -306,6 +312,7 @@ impl Formation {
             early: VecDeque::new(),
             recorded_ready: None,
             recorded_refused: false,
+            released: false,
         })
     }
 
@@ -360,6 +367,7 @@ impl Formation {
             early: VecDeque::new(),
             recorded_ready,
             recorded_refused: false,
+            released: false,
         };
         f.said.list = Some(list_bytes.to_vec());
         let out = f.adopt(&list, now_ms)?;
@@ -461,6 +469,7 @@ impl Formation {
                 early: VecDeque::new(),
                 recorded_ready: None,
                 recorded_refused: false,
+                released: false,
             },
             bytes,
         ))
@@ -563,6 +572,17 @@ impl Formation {
             }
         }
         out
+    }
+
+    /// `S1-DV`: whether a roster the founder said again dropped this client's
+    /// seat, which an earlier one held -- given back before the first hand.
+    pub fn released_before_the_first_hand(&self) -> bool {
+        self.released
+    }
+
+    /// The founder's peer id, from the advert this table was formed under.
+    pub fn founder_peer_id(&self) -> &[u8] {
+        &self.under.ad.founder_peer_id
     }
 
     /// Whether this client founded the table, and therefore answers joins and
@@ -1135,7 +1155,15 @@ impl Formation {
         }
         let held = if self.serial == 0 { None } else { Some(self.serial) };
         let roster = admit_list(&list, &sender, held, &self.under).map_err(Failed::List)?;
+        // `S1-DV`: named by the roster held until now, and not by this one.
+        // A first list that does not name a joiner still joining says
+        // nothing, as before; one that drops a seat this client held does.
+        let me = self.app.verifying_key().to_bytes();
+        let named_before = self.my_seat.is_some_and(|s| self.roster.seat_of(&me) == Some(s));
         self.roster = roster;
+        if named_before && self.roster.seat_of(&me).is_none() {
+            self.released = true;
+        }
         self.adopt(&list, now_ms)
     }
 
@@ -2298,6 +2326,89 @@ mod tests {
                 .any(|e| e.peer_id == peer(7) && e.seat == seat),
             "and the replacement has the number the leaver gave back"
         );
+    }
+
+    /// `S1-DV`: a joiner whose seat the founder gave back learns it from the
+    /// roster said again -- named by the one it held, not by the next -- and
+    /// the node takes it to the lobby. A first list that does not name a
+    /// joiner still joining says nothing, as before.
+    #[test]
+    fn a_joiner_given_back_before_the_first_hand_knows_it_from_the_next_roster() {
+        let (mut t, _, a, hash) = found(6, 2);
+        let table_id = t.founder.table_id();
+        let (mut j, req) = Formation::join(
+            key(2),
+            a.clone(),
+            hash,
+            table_id,
+            peer(2),
+            "leaver".into(),
+            1_000,
+            None,
+            None,
+            [2u8; 32],
+            NOW,
+            None,
+        )
+        .unwrap();
+        let out = t
+            .founder
+            .on_join_request(&req, &peer(2), false, NOW)
+            .expect("the seat is given");
+        let mut list = None;
+        for s in out {
+            match s {
+                Send::Reply(bytes) => {
+                    j.on_join_answer(&bytes, NOW).expect("the acceptance holds");
+                }
+                Send::Broadcast(bytes) => {
+                    if joinwire::receive_player_list(&bytes).is_ok() {
+                        list = Some(bytes);
+                    }
+                }
+            }
+        }
+        let list = list.expect("a roster change is announced");
+        j.on_player_list(&list, NOW).expect("the list holds");
+        assert!(j.my_seat().is_some(), "seated");
+        assert!(!j.released_before_the_first_hand(), "named by this roster");
+        assert_eq!(j.founder_peer_id(), peer(1).as_slice(), "the founder is the advert's");
+
+        // A list arriving at a joiner that is still joining, which does not
+        // name it: nothing to complain about.
+        let (mut late, _) = Formation::join(
+            key(3),
+            a.clone(),
+            hash,
+            table_id,
+            peer(3),
+            "late".into(),
+            1_000,
+            None,
+            None,
+            [3u8; 32],
+            NOW,
+            None,
+        )
+        .unwrap();
+        late.on_player_list(&list, NOW + 1)
+            .expect("a list naming a table this client is still joining holds");
+        assert!(!late.released_before_the_first_hand(), "never named, so never given back");
+
+        // The founder gives the seat back, and the roster it says again drops it.
+        let out = t
+            .founder
+            .release_seat_before_the_first_hand(&peer(2), NOW + 2)
+            .expect("the founder may give a seat back");
+        let again = out
+            .into_iter()
+            .find_map(|s| match s {
+                Send::Broadcast(b) if joinwire::receive_player_list(&b).is_ok() => Some(b),
+                _ => None,
+            })
+            .expect("a fresh list says so");
+        j.on_player_list(&again, NOW + 2).expect("the list holds");
+        assert!(j.released_before_the_first_hand(), "named before and not now: given back");
     }
 
     /// The founder never gives away its own seat, and an unknown peer is a no-op.

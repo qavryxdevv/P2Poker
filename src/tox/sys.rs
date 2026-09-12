@@ -256,6 +256,13 @@ extern "C" {
         group_number: u32,
         peer_public_key: *const u8,
     ) -> u64;
+    /// **`patches/0033`.** The friend number this member's invitation
+    /// travelled over; `u32::MAX` when unknown. Reads local memory only.
+    pub fn tox_group_peer_friend_number(
+        tox: *const Tox,
+        group_number: u32,
+        peer_public_key: *const u8,
+    ) -> u32;
     /// `tox.h:4475`
     pub fn tox_group_send_custom_packet(
         tox: *const Tox,

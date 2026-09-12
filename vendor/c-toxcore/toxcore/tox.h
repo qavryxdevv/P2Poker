@@ -4533,6 +4533,16 @@ uint64_t tox_group_peer_quiet_secs(
     const Tox *tox, Tox_Group_Number group_number,
     const uint8_t peer_public_key[]);
 
+/**
+ * p2p-poker (patch 0033): the friend this member came into the group through
+ * -- the friend number its invitation travelled over, on either side of it --
+ * or UINT32_MAX when the group or the peer is not found or the member came
+ * some other way. Reads local memory and sends nothing.
+ */
+uint32_t tox_group_peer_friend_number(
+    const Tox *tox, Tox_Group_Number group_number,
+    const uint8_t peer_public_key[]);
+
 typedef enum Tox_Err_Group_Send_Custom_Private_Packet {
 
     /**
