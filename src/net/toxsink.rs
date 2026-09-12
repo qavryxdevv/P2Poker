@@ -81,9 +81,10 @@ pub enum Seat {
 /// feature.
 pub struct TableSink {
     /// `D-042`: the client's one Tox instance, started with the client and
-    /// kept for its life; every table is a group on it.
+    /// kept for its life; every table is a group on it. `D-043`: shared by
+    /// every table's sink, so a second table rides the same instance.
     #[cfg(feature = "tox")]
-    driver: Option<crate::tox::table::Driver>,
+    driver: Option<std::sync::Arc<crate::tox::table::Driver>>,
     #[cfg(feature = "tox")]
     inner: Option<crate::tox::table::ToxTable>,
     /// This client's own Tox public key, once an instance is running.
@@ -263,13 +264,28 @@ impl TableSink {
                 relays,
                 refreshed,
             };
-            self.driver = Some(table::Driver::start(tox));
+            self.driver = Some(std::sync::Arc::new(table::Driver::start(tox)));
             self.mine = Some(mine);
             Ok(Some(mine))
         }
         #[cfg(not(feature = "tox"))]
         {
             Ok(None)
+        }
+    }
+
+    /// `D-043`: a sink for another table on the same instance -- the driver,
+    /// this client's key and the reach shared, no table yet.
+    pub fn share(&self) -> TableSink {
+        TableSink {
+            #[cfg(feature = "tox")]
+            driver: self.driver.clone(),
+            #[cfg(feature = "tox")]
+            inner: None,
+            #[cfg(feature = "tox")]
+            mine: self.mine,
+            reach: self.reach,
+            wants_tox: false,
         }
     }
 

@@ -748,7 +748,12 @@ struct TableRun {
 }
 
 impl TableRun {
-    fn new(profile_dir: &std::path::Path) -> TableRun {
+    fn new(
+        profile_dir: &std::path::Path,
+        resume: Option<crate::storage::session::Record>,
+        tox_sink: super::toxsink::TableSink,
+    ) -> TableRun {
+        let _ = profile_dir;
         TableRun {
             table: None,
             hand: None,
@@ -796,7 +801,7 @@ impl TableRun {
             taught: std::collections::HashSet::new(),
             readmitted: Vec::new(),
             sit_ins: SitIns::default(),
-            resume: crate::storage::session::load_recent(profile_dir, super::node::now_unix_ms()),
+            resume,
             resuming: false,
             resume_since_ms: 0,
             resume_last_peer_ms: None,
@@ -822,7 +827,7 @@ impl TableRun {
             hand_one_forced_said: false,
             why_no_hand_one_said: false,
             table_topic: None,
-            tox_sink: super::toxsink::TableSink::none(),
+            tox_sink,
             tox_group_said: false,
             tox_refused_said: 0,
             tox_invites_said: 0,
@@ -954,7 +959,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // key: stable, theirs, and never confusable with somebody else's.
     let mut nickname = crate::storage::profile::short_name(&my_app_key);
 
-    let mut t = TableRun::new(&profile_dir);
+    // `D-043`: every table this client sits at, up to `MAX_TABLES`; the first
+    // slot always exists, and `active` is the one the window is at.
+    let mut tables: Vec<TableRun> = vec![TableRun::new(
+        &profile_dir,
+        crate::storage::session::load_recent(&profile_dir, super::node::now_unix_ms()),
+        super::toxsink::TableSink::none(),
+    )];
+    let mut active: usize = 0;
+    // The join requests in flight, by the table each was sent for.
+    let mut join_pending: std::collections::HashMap<libp2p::request_response::OutboundRequestId, usize> =
+        std::collections::HashMap::new();
+    let first = &mut tables[0];
     // Arm the boundary: fire now for phase 1, deal after the pause.
     macro_rules! arm_boundary {
         ($t:ident, $pause:expr) => {{
@@ -1020,7 +1036,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // read it without borrowing the swarm.
     let bogons = swarm.behaviour().ipfs_kad.dropped();
     let mut bogons_said = 0u64;
-    if let Some(r) = t.resume.as_ref() {
+    if let Some(r) = first.resume.as_ref() {
         let _ = events
             .send(NodeEvent::UnfinishedSession {
                 key: r.table_key,
@@ -1103,9 +1119,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // first table it founds or joins finds the DHT warm and its relays up; a
     // table is a group on it. A failure here is a warning and not the end:
     // `start` tries again when a table comes.
-    match t.tox_sink.boot(&profile_dir) {
+    match first.tox_sink.boot(&profile_dir) {
         Ok(Some(mine)) => {
-            let r = t.tox_sink.reach();
+            let r = first.tox_sink.reach();
             let _ = events
                 .send(NodeEvent::Warning(format!(
                     "tox: this client's instance is up from the start, key {}; of {} known nodes, {} bootstrapped and {} TCP relays were accepted{}",
@@ -2141,8 +2157,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     loop {
+        // `D-043`: the earliest own clock and the earliest deal among the
+        // tables, read before the select so the timers own their instants
+        // and borrow no table while the group's messages are awaited.
+        let act_deadline = earliest(&tables, |x| x.act_by);
+        let deal_deadline = earliest(&tables, |x| x.next_hand_at);
         tokio::select! {
             event = SwarmStreamExt::select_next_some(&mut swarm) => {
+                // `D-043`: which table this event is for -- by its topic, by the
+                // table its join request names, by the request its join answer
+                // answers -- and the active table for everything else.
+                let which = table_for_event(&tables, &event, active, &join_pending);
+                let t = &mut tables[which];
                 match event {
                     SwarmEvent::NewListenAddr { address, .. }
                         if address
@@ -2366,9 +2392,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // is the source of its advert, and a table that has dealt
                                 // is not offered (D-037).
                                 let mut adverts: Vec<Vec<u8>> = Vec::new();
-                                if let Some(f) = t.table.as_ref().filter(|f| f.is_founder() && !t.ever_dealt) {
-                                    if let Some(b) = f.current_advert() {
-                                        adverts.push(b);
+                                // `D-043`: every table this client founded and has not dealt at.
+                                for x in tables.iter() {
+                                    if let Some(f) = x.table.as_ref().filter(|f| f.is_founder() && !x.ever_dealt) {
+                                        if let Some(b) = f.current_advert() {
+                                            adverts.push(b);
+                                        }
                                     }
                                 }
                                 adverts.truncate(usize::from(ask.max_tables).min(SNAPSHOT_MAX_ADS));
@@ -3907,12 +3936,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // The roster moves between ticks - somebody sits, somebody
                 // stands - so the answer is recomputed rather than remembered
                 // from the moment it first became true.
-                let closed = t.table
-                    .as_ref()
-                    .is_some_and(|f| table_is_closed(f, &mut t.tournament_started));
-                if closed != t.table_closed {
-                    t.table_closed = closed;
-                    dht_effort(&mut swarm, closed);
+                // `D-043`: every table's answer, and the DHT's effort follows any
+                // closed one.
+                let mut any_closed = false;
+                let mut changed = false;
+                for x in tables.iter_mut() {
+                    let closed = x
+                        .table
+                        .as_ref()
+                        .is_some_and(|f| table_is_closed(f, &mut x.tournament_started));
+                    if closed != x.table_closed {
+                        x.table_closed = closed;
+                        changed = true;
+                    }
+                    any_closed |= closed;
+                }
+                if changed {
+                    dht_effort(&mut swarm, any_closed);
                 }
 
                 // The public lobby: announce, then read.
@@ -4020,6 +4060,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             Some(command) = commands.recv() => {
+                // `D-043`: a table founded or joined while this client sits at
+                // another opens a new slot, up to `MAX_TABLES`; everything else
+                // goes to the active table.
+                let opening = matches!(
+                    command,
+                    NodeCommand::CreateTable { .. } | NodeCommand::JoinTable { .. }
+                );
+                if opening && tables[active].table.is_some() && tables.len() < MAX_TABLES {
+                    let sink = tables[0].tox_sink.share();
+                    tables.push(TableRun::new(&profile_dir, None, sink));
+                    active = tables.len() - 1;
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "a second table: slot {} of {MAX_TABLES}",
+                            active + 1
+                        )))
+                        .await;
+                }
+                let which = active;
+                let mut close_slot = false;
+                let t = &mut tables[which];
                 let now = super::node::now_unix_ms();
                 match command {
                     NodeCommand::SayAtTable(text) => {
@@ -4492,7 +4553,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .ipfs_kad
                                         .get_closest_peers(founder);
                                 }
-                                swarm.behaviour_mut().join.send_request(&founder, request);
+                                let asked = swarm.behaviour_mut().join.send_request(&founder, request);
+                                join_pending.insert(asked, which);
                             }
                             Err(e) => {
                         leave_the_table!(t);
@@ -4711,8 +4773,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     NodeCommand::LeaveTable => {
+                        close_slot = true;
                         leave_table_now!(t);
                     }
+                }
+                // `D-043`: a slot left while another table is open is closed.
+                if close_slot && tables.len() > 1 {
+                    tables.remove(which);
+                    active = tables.iter().position(|x| x.table.is_some()).unwrap_or(0);
                 }
             }
 
@@ -4734,7 +4802,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // Inert in a build without the feature: `TableSink::next` is a
             // future that never resolves when there is no Tox table, so this
             // branch contributes nothing to the `select!`.
-            Some(item) = t.tox_sink.next() => {
+            Some((which, item)) = next_from_tables(&mut tables) => {
+                let t = &mut tables[which];
                 // **Learn who this group peer is, once, from a signature.**
                 // The driver reports a sender by its group key and cannot get
                 // further; the roster is keyed by application key. Pairing them
@@ -5000,254 +5069,257 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             _ = resend.tick() => {
-                if !t.tox_group_said {
-                    if let Some(chat) = t.tox_sink.chat_id() {
-                        t.tox_group_said = true;
+                for which in 0..tables.len() {
+                    let t = &mut tables[which];
+                    if !t.tox_group_said {
+                        if let Some(chat) = t.tox_sink.chat_id() {
+                            t.tox_group_said = true;
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "in the table's Tox group {}; the hand rides it from here",
+                                    short_hash(&chat)
+                                )))
+                                .await;
+                        }
+                    }
+                    // **Say when the transport is behind, once it is.** A seat
+                    // certified late for something it did say looks, from every log
+                    // this client writes, like a seat that said nothing. The
+                    // difference is here.
+                    // **A dropped hand event is a seat diverging, so it is said
+                    // the moment it is not zero.** It is not in the line below
+                    // because that one is about the transport being behind, and
+                    // this is about an event that reached this client and was
+                    // thrown away inside it.
+                    let dropped = t.tox_sink.inbox_dropped();
+                    if dropped > t.inbox_dropped_said {
+                        t.inbox_dropped_said = dropped;
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "in the table's Tox group {}; the hand rides it from here",
-                                short_hash(&chat)
+                                "{dropped} hand event(s) were received and dropped because this                              client was not draining; a seat that loses one diverges"
                             )))
                             .await;
                     }
-                }
-                // **Say when the transport is behind, once it is.** A seat
-                // certified late for something it did say looks, from every log
-                // this client writes, like a seat that said nothing. The
-                // difference is here.
-                // **A dropped hand event is a seat diverging, so it is said
-                // the moment it is not zero.** It is not in the line below
-                // because that one is about the transport being behind, and
-                // this is about an event that reached this client and was
-                // thrown away inside it.
-                let dropped = t.tox_sink.inbox_dropped();
-                if dropped > t.inbox_dropped_said {
-                    t.inbox_dropped_said = dropped;
-                    let _ = events
-                        .send(NodeEvent::Warning(format!(
-                            "{dropped} hand event(s) were received and dropped because this                              client was not draining; a seat that loses one diverges"
-                        )))
-                        .await;
-                }
 
-                let (refused, waiting, sent) = t.tox_sink.trouble();
-                if waiting > 0 || refused > t.tox_refused_said {
-                    t.tox_refused_said = refused;
-                    // Which refusal, because the remedies have nothing in
-                    // common: code 4 is this client's own group connection
-                    // being down, decided before any peer is consulted, while
-                    // code 5 comes from the peer loop.
-                    let why = t.tox_sink.refused_why();
-                    let named = [
-                        (1usize, "group-not-found"),
-                        (2, "too-long"),
-                        (3, "empty"),
-                        (4, "disconnected"),
-                        (5, "fail-send"),
-                    ]
-                    .iter()
-                    .filter(|(i, _)| why[*i] > 0)
-                    .map(|(i, name)| format!("{} {name}", why[*i]))
-                    .collect::<Vec<_>>();
-                    let breakdown = if named.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", named.join(", "))
-                    };
-                    let _ = events
-                        .send(NodeEvent::Warning(format!(
-                            "the table's transport is behind: {waiting} message(s) queued, \
-                             {refused} fragment(s) refused of {} offered{breakdown}",
-                            refused + sent
-                        )))
-                        .await;
-                }
-
-                // **And when a seat is outside the group, which is not the same
-                // thing.** A refused invitation leaves a player seated, counted
-                // in the roster and never dealt to; the transport counters above
-                // are all zero while it happens, because there is nothing wrong
-                // with the transport.
-                let invites = t.tox_sink.invites_refused();
-                if invites > t.tox_invites_said {
-                    t.tox_invites_said = invites;
-                    let _ = events
-                        .send(NodeEvent::Warning(format!(
-                            "a seat is not in the table's group yet: {invites} invitation(s) refused so far"
-                        )))
-                        .await;
-                }
-
-                // **While a table is forming, keep saying what we subscribe
-                // to.** The per-peer check above fires once, when a peer
-                // arrives; a subscription lost after that is a subscription
-                // nothing repairs, and the window that matters is exactly the
-                // few seconds between seating and ratifying. A formed table
-                // that is playing does not need it and does not do it.
-                // **The table's topic only, and only a few times.** The
-                // first version said all three every five seconds for as long
-                // as a table was forming, and that churn cost more than it
-                // bought: every re-announce prunes this client from every
-                // peer's lobby mesh, and adverts started coming back
-                // `RateLimited` — at the founder, against its own.
-                //
-                // The lobby is not what is missing during formation. The
-                // table's topic is, and re-announcing that one disturbs only
-                // the seats already at the table.
-                if let (Some(topic), true, true) =
-                    (t.table_topic.as_ref(), t.table.is_some(), t.hand.is_none())
-                {
-                    let hash = topic.hash();
-                    let missing = poker_peers.iter().any(|p| {
-                        !swarm.behaviour().gossipsub.all_peers().any(|(q, subs)| {
-                            q == p && subs.contains(&&hash)
-                        })
-                    });
-                    if missing && t.table_announces < MAX_TABLE_ANNOUNCES {
-                        t.table_announces += 1;
-                        announce_topics(&mut swarm, &[topic]);
+                    let (refused, waiting, sent) = t.tox_sink.trouble();
+                    if waiting > 0 || refused > t.tox_refused_said {
+                        t.tox_refused_said = refused;
+                        // Which refusal, because the remedies have nothing in
+                        // common: code 4 is this client's own group connection
+                        // being down, decided before any peer is consulted, while
+                        // code 5 comes from the peer loop.
+                        let why = t.tox_sink.refused_why();
+                        let named = [
+                            (1usize, "group-not-found"),
+                            (2, "too-long"),
+                            (3, "empty"),
+                            (4, "disconnected"),
+                            (5, "fail-send"),
+                        ]
+                        .iter()
+                        .filter(|(i, _)| why[*i] > 0)
+                        .map(|(i, name)| format!("{} {name}", why[*i]))
+                        .collect::<Vec<_>>();
+                        let breakdown = if named.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", named.join(", "))
+                        };
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "the table's transport is behind: {waiting} message(s) queued, \
+                                 {refused} fragment(s) refused of {} offered{breakdown}",
+                                refused + sent
+                            )))
+                            .await;
                     }
-                }
 
-                // **The third road into hand 1, and the gate needs it.** The
-                // other two fire on a table message, and a table whose roster
-                // has ratified may send none at all while it waits for the Tox
-                // group to fill. Without this the wait could only end when
-                // something else happened to arrive, which on a quiet table is
-                // never. Idempotent for the same reason the other two are:
-                // `ever_dealt`.
-                if !t.ever_dealt {
-                    if let Some(f) = t.table.as_ref() {
-                        if !t.resuming && hand_one_may_open(
-                            &t.tox_sink,
-                            &mut t.hand_one_held_since,
-                            &mut t.hand_one_progress,
-                            &mut t.hand_one_forced_said,
-                            &events,
-                        )
-                        .await
-                        {
-                            say_why_no_hand_one(f, &mut t.why_no_hand_one_said, &events).await;
-                            if let Some(o) = opening_for_hand_one(f) {
-                                t.ever_dealt = true;
-                                begin_hand(
-                                    o,
-                                    &app_key,
-                                    &mut t.hand,
-                                    &mut t.said,
-                                    &mut swarm,
-                                    &events,
-                                    &t.tox_sink,
-                                )
-                                .await;
+                    // **And when a seat is outside the group, which is not the same
+                    // thing.** A refused invitation leaves a player seated, counted
+                    // in the roster and never dealt to; the transport counters above
+                    // are all zero while it happens, because there is nothing wrong
+                    // with the transport.
+                    let invites = t.tox_sink.invites_refused();
+                    if invites > t.tox_invites_said {
+                        t.tox_invites_said = invites;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "a seat is not in the table's group yet: {invites} invitation(s) refused so far"
+                            )))
+                            .await;
+                    }
+
+                    // **While a table is forming, keep saying what we subscribe
+                    // to.** The per-peer check above fires once, when a peer
+                    // arrives; a subscription lost after that is a subscription
+                    // nothing repairs, and the window that matters is exactly the
+                    // few seconds between seating and ratifying. A formed table
+                    // that is playing does not need it and does not do it.
+                    // **The table's topic only, and only a few times.** The
+                    // first version said all three every five seconds for as long
+                    // as a table was forming, and that churn cost more than it
+                    // bought: every re-announce prunes this client from every
+                    // peer's lobby mesh, and adverts started coming back
+                    // `RateLimited` — at the founder, against its own.
+                    //
+                    // The lobby is not what is missing during formation. The
+                    // table's topic is, and re-announcing that one disturbs only
+                    // the seats already at the table.
+                    if let (Some(topic), true, true) =
+                        (t.table_topic.as_ref(), t.table.is_some(), t.hand.is_none())
+                    {
+                        let hash = topic.hash();
+                        let missing = poker_peers.iter().any(|p| {
+                            !swarm.behaviour().gossipsub.all_peers().any(|(q, subs)| {
+                                q == p && subs.contains(&&hash)
+                            })
+                        });
+                        if missing && t.table_announces < MAX_TABLE_ANNOUNCES {
+                            t.table_announces += 1;
+                            announce_topics(&mut swarm, &[topic]);
+                        }
+                    }
+
+                    // **The third road into hand 1, and the gate needs it.** The
+                    // other two fire on a table message, and a table whose roster
+                    // has ratified may send none at all while it waits for the Tox
+                    // group to fill. Without this the wait could only end when
+                    // something else happened to arrive, which on a quiet table is
+                    // never. Idempotent for the same reason the other two are:
+                    // `ever_dealt`.
+                    if !t.ever_dealt {
+                        if let Some(f) = t.table.as_ref() {
+                            if !t.resuming && hand_one_may_open(
+                                &t.tox_sink,
+                                &mut t.hand_one_held_since,
+                                &mut t.hand_one_progress,
+                                &mut t.hand_one_forced_said,
+                                &events,
+                            )
+                            .await
+                            {
+                                say_why_no_hand_one(f, &mut t.why_no_hand_one_said, &events).await;
+                                if let Some(o) = opening_for_hand_one(f) {
+                                    t.ever_dealt = true;
+                                    begin_hand(
+                                        o,
+                                        &app_key,
+                                        &mut t.hand,
+                                        &mut t.said,
+                                        &mut swarm,
+                                        &events,
+                                        &t.tox_sink,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
-                }
 
-                let Some(h) = t.hand.as_ref() else { continue };
-                // A hand that is over is a hand nobody is waiting on.
-                if h.over() || t.said.is_empty() {
-                    continue;
-                }
-                // **Through whichever transport the table has, which this loop
-                // did not do and had to.** It published to the mesh only, so a
-                // table on Tox re-sent nothing at all - and a Tox group keeps no
-                // history exactly as GossipSub keeps none, which is the whole
-                // reason this loop exists.
-                //
-                // Measured at three seats, which is where it showed: one seat's
-                // messages did not reach the other two, it was certified late
-                // twice, its grace ran out and the roster dropped it. A seat
-                // lost to a transport that never repeated itself. Heads-up hid
-                // it, because two peers both in the group before the first hand
-                // have nothing to re-send.
-                // **Backed off, and narrowed.** Blindly repeating every event
-                // of the hand every five seconds is spam, and it is spam that
-                // grows with the table: at six seats `said` holds about fourteen
-                // messages, several of them nine kilobytes, so each client was
-                // pushing roughly fifty fragments per tick to five peers - three
-                // hundred deliveries a second across the group, without pause,
-                // for as long as the hand lasted. Measured at six seats: the
-                // deck chain completed and the betting then stalled with **no
-                // send refused by toxcore at all**, which is what a transport
-                // that is being drowned rather than blocked looks like.
-                //
-                // Two changes, both conservative:
-                //
-                // * **Back off while nothing moves, reset when it does.** A
-                //   stuck table gets its first repeat after five seconds, then
-                //   ten, twenty, forty - bounded, and it stops growing at the
-                //   hand's own deadline anyway.
-                //
-                //   **An advancing table re-sends on every tick, and this
-                //   sentence used to claim it re-sent nothing.** The reset puts
-                //   `resend_ticks` at 0 and the increment immediately after puts
-                //   it at 1, which **is** a power of two - so a position that
-                //   changes every tick is due every tick. That is not a defect
-                //   and the code is left alone: `said` is **drained and
-                //   refilled by kind** at every boundary - the block above
-                //   `match next` keeps the terminal and the checkpoint frames
-                //   and discards the stage ones. This said *"cleared between
-                //   hands"*, which a reader would have had to open the code to
-                //   disbelieve, and `S1-CD` acquired a false premise from it
-                //   that survived four independent designs. So what an advancing
-                //   table repeats is the last three stages of the hand it is
-                //   playing, which is exactly the peer that is one or two stages
-                //   behind. The wrong half was the claim, and a reader who
-                //   believed it would either mis-measure the bandwidth or
-                //   "correct" the code and delete a working safety net.
-                // * **Only the recent stages.** A peer more than a few stages
-                //   behind is not going to be caught up by repetition; that is
-                //   what a catch-up request is for, and it does not exist yet.
-                //   Repeating the whole hand on its behalf costs every other
-                //   seat the bandwidth.
-                let here = h.slot().sequence;
-                // **Keyed on the hand as well as the sequence** (`S1-BU`). A
-                // run of hands that all end at sequence 0 — a table waiting
-                // for one seat's `HAND_INIT`, sixty seconds a hand — left
-                // `here` at 0 across every boundary, so the counter never
-                // reset and the new hand's terminal and `HAND_INIT` went out
-                // at ticks 32, 64, 128: once a hand at best, then never.
-                let stamp = (h.hand_id() << 20) | (here & 0xF_FFFF);
-                if stamp != t.resend_at {
-                    t.resend_at = stamp;
-                    t.resend_ticks = 0;
-                }
-                t.resend_ticks = t.resend_ticks.saturating_add(1);
-                // 1, 2, 4, 8, ... ticks: a power of two and nothing between.
-                let due = t.resend_ticks.is_power_of_two();
-                if due {
-                    let window = here.saturating_sub(RESEND_STAGES);
-                    let recent: Vec<&Vec<u8>> = t.said
-                        .iter()
-                        .filter(|b| {
-                            crate::net::chained::peek(b, TABLE_FRAME_PEEK)
-                                .map(|(_, _, seq)| seq >= window)
-                                .unwrap_or(true)
-                        })
-                        .collect();
-                    // **Tox or nothing.** This re-send used to fall back to the
-                    // per-table GossipSub topic when there was no Tox carrier,
-                    // which put hand bytes on a circuit relay reserved for
-                    // 131 072 bytes per 120 s — less than one hand, and the
-                    // client's own log already called it *“NOT enough to carry
-                    // a hand”*. The owner's instruction is that a hand never
-                    // travels on libp2p; the capacity is the reason.
+                    let Some(h) = t.hand.as_ref() else { continue };
+                    // A hand that is over is a hand nobody is waiting on.
+                    if h.over() || t.said.is_empty() {
+                        continue;
+                    }
+                    // **Through whichever transport the table has, which this loop
+                    // did not do and had to.** It published to the mesh only, so a
+                    // table on Tox re-sent nothing at all - and a Tox group keeps no
+                    // history exactly as GossipSub keeps none, which is the whole
+                    // reason this loop exists.
                     //
-                    // **And it asks whether anything may leave at all, which it
-                    // did not.** `link_is_down`'s own doc says it drops *every*
-                    // table message this client would send; this site is the
-                    // one that got away, so a seat with its link down went on
-                    // broadcasting the last `RESEND_STAGES` stages on every
-                    // power-of-two tick for the whole outage. The knob was
-                    // therefore measuring something quieter than a link that is
-                    // down, and every run taken with it — `split220636-9` among
-                    // them, one of `S1-BW`'s two failed reproductions — was
-                    // taken against a seat that was still speaking.
-                    if t.tox_sink.is_on_tox() && !nothing_leaves() {
-                        for out in recent {
-                            t.tox_sink.try_broadcast(out);
+                    // Measured at three seats, which is where it showed: one seat's
+                    // messages did not reach the other two, it was certified late
+                    // twice, its grace ran out and the roster dropped it. A seat
+                    // lost to a transport that never repeated itself. Heads-up hid
+                    // it, because two peers both in the group before the first hand
+                    // have nothing to re-send.
+                    // **Backed off, and narrowed.** Blindly repeating every event
+                    // of the hand every five seconds is spam, and it is spam that
+                    // grows with the table: at six seats `said` holds about fourteen
+                    // messages, several of them nine kilobytes, so each client was
+                    // pushing roughly fifty fragments per tick to five peers - three
+                    // hundred deliveries a second across the group, without pause,
+                    // for as long as the hand lasted. Measured at six seats: the
+                    // deck chain completed and the betting then stalled with **no
+                    // send refused by toxcore at all**, which is what a transport
+                    // that is being drowned rather than blocked looks like.
+                    //
+                    // Two changes, both conservative:
+                    //
+                    // * **Back off while nothing moves, reset when it does.** A
+                    //   stuck table gets its first repeat after five seconds, then
+                    //   ten, twenty, forty - bounded, and it stops growing at the
+                    //   hand's own deadline anyway.
+                    //
+                    //   **An advancing table re-sends on every tick, and this
+                    //   sentence used to claim it re-sent nothing.** The reset puts
+                    //   `resend_ticks` at 0 and the increment immediately after puts
+                    //   it at 1, which **is** a power of two - so a position that
+                    //   changes every tick is due every tick. That is not a defect
+                    //   and the code is left alone: `said` is **drained and
+                    //   refilled by kind** at every boundary - the block above
+                    //   `match next` keeps the terminal and the checkpoint frames
+                    //   and discards the stage ones. This said *"cleared between
+                    //   hands"*, which a reader would have had to open the code to
+                    //   disbelieve, and `S1-CD` acquired a false premise from it
+                    //   that survived four independent designs. So what an advancing
+                    //   table repeats is the last three stages of the hand it is
+                    //   playing, which is exactly the peer that is one or two stages
+                    //   behind. The wrong half was the claim, and a reader who
+                    //   believed it would either mis-measure the bandwidth or
+                    //   "correct" the code and delete a working safety net.
+                    // * **Only the recent stages.** A peer more than a few stages
+                    //   behind is not going to be caught up by repetition; that is
+                    //   what a catch-up request is for, and it does not exist yet.
+                    //   Repeating the whole hand on its behalf costs every other
+                    //   seat the bandwidth.
+                    let here = h.slot().sequence;
+                    // **Keyed on the hand as well as the sequence** (`S1-BU`). A
+                    // run of hands that all end at sequence 0 — a table waiting
+                    // for one seat's `HAND_INIT`, sixty seconds a hand — left
+                    // `here` at 0 across every boundary, so the counter never
+                    // reset and the new hand's terminal and `HAND_INIT` went out
+                    // at ticks 32, 64, 128: once a hand at best, then never.
+                    let stamp = (h.hand_id() << 20) | (here & 0xF_FFFF);
+                    if stamp != t.resend_at {
+                        t.resend_at = stamp;
+                        t.resend_ticks = 0;
+                    }
+                    t.resend_ticks = t.resend_ticks.saturating_add(1);
+                    // 1, 2, 4, 8, ... ticks: a power of two and nothing between.
+                    let due = t.resend_ticks.is_power_of_two();
+                    if due {
+                        let window = here.saturating_sub(RESEND_STAGES);
+                        let recent: Vec<&Vec<u8>> = t.said
+                            .iter()
+                            .filter(|b| {
+                                crate::net::chained::peek(b, TABLE_FRAME_PEEK)
+                                    .map(|(_, _, seq)| seq >= window)
+                                    .unwrap_or(true)
+                            })
+                            .collect();
+                        // **Tox or nothing.** This re-send used to fall back to the
+                        // per-table GossipSub topic when there was no Tox carrier,
+                        // which put hand bytes on a circuit relay reserved for
+                        // 131 072 bytes per 120 s — less than one hand, and the
+                        // client's own log already called it *“NOT enough to carry
+                        // a hand”*. The owner's instruction is that a hand never
+                        // travels on libp2p; the capacity is the reason.
+                        //
+                        // **And it asks whether anything may leave at all, which it
+                        // did not.** `link_is_down`'s own doc says it drops *every*
+                        // table message this client would send; this site is the
+                        // one that got away, so a seat with its link down went on
+                        // broadcasting the last `RESEND_STAGES` stages on every
+                        // power-of-two tick for the whole outage. The knob was
+                        // therefore measuring something quieter than a link that is
+                        // down, and every run taken with it — `split220636-9` among
+                        // them, one of `S1-BW`'s two failed reproductions — was
+                        // taken against a seat that was still speaking.
+                        if t.tox_sink.is_on_tox() && !nothing_leaves() {
+                            for out in recent {
+                                t.tox_sink.try_broadcast(out);
+                            }
                         }
                     }
                 }
@@ -5257,532 +5329,535 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // the answer changes every time a stage opens or closes, and the
             // cryptographic ones are bounded per stage rather than per hand.
             _ = stall.tick() => {
-                let now = super::node::now_unix_ms();
-                // `D-042`, the owner's rule: when the tournament is over, the
-                // group it was played in is left and the friends it was played
-                // with go (after `FRIEND_LINGER`, at the driver). A little after
-                // the end, so the resend loop gives a slow seat the terminal
-                // message twice more; the table itself stays on the felt until
-                // the player leaves it. On this two-second tick: the thirty-second
-                // one missed a whole run's end (`run212648-3`).
-                if let Some(since) = t.table_over_at {
-                    if since.elapsed() >= TOURNAMENT_LEAVE_GRACE && t.tox_sink.is_on_tox() {
-                        t.tox_sink.clear();
-                        let _ = events
-                            .send(NodeEvent::Warning(
-                                "the tournament is over: this client left the table's group, and the friends it played with go once no other table needs them".into(),
-                            ))
-                            .await;
-                    }
-                }
-                // fault-harness: `P2P_POKER_LEAVE_TABLE_AT=<s>` leaves the table at
-                // that second, as the window's button would -- for measuring how
-                // the others' lobbies learn that a table is gone (D-040).
-                if t.table.is_some() && leave_table_due() {
-                    println!("fault-harness: leaving the table, as P2P_POKER_LEAVE_TABLE_AT asked");
-                    leave_table_now!(t);
-                }
-                // `D-041`: every seat's link as the table's group knows it. On a
-                // Tox table the group carries the hand and the felt reads presence
-                // from it; a libp2p ping is a figure beside that reading, and a
-                // seat reached only through a relay never answers one -- the
-                // owner saw the far seat drawn *offline* through a whole game, and
-                // the far seat saw everybody so.
-                if t.tox_sink.is_on_tox() {
-                    if let Some(f) = t.table.as_ref() {
-                        let me = f.my_seat();
-                        let fresh: Vec<(u8, Option<u64>, bool)> = f
-                            .roster()
-                            .seats()
-                            .iter()
-                            .filter(|e| Some(e.seat) != me)
-                            .map(|e| {
-                                let group = t.tox_sink.in_group(&e.app_public_key)
-                                    || e.tox_key.is_some_and(|k| t.tox_sink.friend_up(&k));
-                                let rtt = libp2p::PeerId::from_bytes(&e.peer_id)
-                                    .ok()
-                                    .and_then(|p| alive.get(&p).copied())
-                                    .and_then(|(at, rtt)| rtt.filter(|_| at.elapsed() < std::time::Duration::from_secs(15)))
-                                    .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-                                (e.seat, rtt, group)
-                            })
-                            .collect();
-                        for (seat, rtt, group) in fresh {
-                            let (changed, again) = match t.link_said.get(&seat) {
-                                Some((r, g, at)) => (
-                                    *r != rtt || *g != group,
-                                    at.elapsed() >= std::time::Duration::from_secs(10),
-                                ),
-                                None => (true, true),
-                            };
-                            if changed || again {
-                                t.link_said.insert(seat, (rtt, group, tokio::time::Instant::now()));
-                                let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: rtt, group }).await;
-                            }
-                            if changed {
-                                let _ = events
-                                    .send(NodeEvent::Warning(format!(
-                                        "seat {seat} link: {}{}",
-                                        if group { "on the line by the table's group" } else { "not on the line by the table's group" },
-                                        match rtt {
-                                            Some(ms) => format!(", ping {ms} ms"),
-                                            None => String::new(),
-                                        }
-                                    )))
-                                    .await;
-                            }
-                        }
-                    }
-                }
-                // fault-harness: parked certificate copies that are due.
-                if !t.delayed_certs.is_empty() {
-                    let at_now = tokio::time::Instant::now();
-                    let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut t.delayed_certs)
-                        .into_iter()
-                        .partition(|(at, _)| *at <= at_now);
-                    t.delayed_certs = later;
-                    if !due.is_empty() {
-                        t.releasing_certs = true;
-                        if let Some(h) = t.hand.as_mut() {
-                            for (_, b) in due {
-                                let _ = hand_event!(t, h, &b);
-                            }
-                        }
-                        t.releasing_certs = false;
-                    }
-                }
-                // `S1-CR`: the rejoin's clock. With no table in hand, a fresh
-                // advert of the recorded key (a hash the record does not hold)
-                // means the table exists; a Tox peer of the session answering
-                // means it may; ten minutes of neither and the record is dropped.
-                // Meanwhile the recorded advert is kept on offer, because the
-                // lobby's sweep expires it as the stale thing it is.
-                if t.resuming && t.table.is_none() {
-                    if let Some(r) = t.resume.as_ref() {
-                        let now = super::node::now_unix_ms();
-                        if t.tox_sink.is_on_tox() || t.tox_sink.group_seen().0 > 0 {
-                            t.resume_last_peer_ms = Some(now);
-                        }
-                        let advert_seen = state
-                            .lobby
-                            .get(&r.table_key)
-                            .is_some_and(|h| h.advert_hash != r.advert_hash && h.received_at_ms >= t.resume_since_ms);
-                        if crate::storage::session::give_up(now, advert_seen, t.resume_last_peer_ms, t.resume_since_ms) {
-                            let _ = crate::storage::session::forget(&profile_dir);
-                            t.resume = None;
-                            t.resuming = false;
+                for which in 0..tables.len() {
+                    let t = &mut tables[which];
+                    let now = super::node::now_unix_ms();
+                    // `D-042`, the owner's rule: when the tournament is over, the
+                    // group it was played in is left and the friends it was played
+                    // with go (after `FRIEND_LINGER`, at the driver). A little after
+                    // the end, so the resend loop gives a slow seat the terminal
+                    // message twice more; the table itself stays on the felt until
+                    // the player leaves it. On this two-second tick: the thirty-second
+                    // one missed a whole run's end (`run212648-3`).
+                    if let Some(since) = t.table_over_at {
+                        if since.elapsed() >= TOURNAMENT_LEAVE_GRACE && t.tox_sink.is_on_tox() {
+                            t.tox_sink.clear();
                             let _ = events
-                                .send(NodeEvent::SessionGaveUp {
-                                    why: "no advertisement and no peer of the session for ten minutes".into(),
+                                .send(NodeEvent::Warning(
+                                    "the tournament is over: this client left the table's group, and the friends it played with go once no other table needs them".into(),
+                                ))
+                                .await;
+                        }
+                    }
+                    // fault-harness: `P2P_POKER_LEAVE_TABLE_AT=<s>` leaves the table at
+                    // that second, as the window's button would -- for measuring how
+                    // the others' lobbies learn that a table is gone (D-040).
+                    if t.table.is_some() && leave_table_due() {
+                        println!("fault-harness: leaving the table, as P2P_POKER_LEAVE_TABLE_AT asked");
+                        leave_table_now!(t);
+                    }
+                    // `D-041`: every seat's link as the table's group knows it. On a
+                    // Tox table the group carries the hand and the felt reads presence
+                    // from it; a libp2p ping is a figure beside that reading, and a
+                    // seat reached only through a relay never answers one -- the
+                    // owner saw the far seat drawn *offline* through a whole game, and
+                    // the far seat saw everybody so.
+                    if t.tox_sink.is_on_tox() {
+                        if let Some(f) = t.table.as_ref() {
+                            let me = f.my_seat();
+                            let fresh: Vec<(u8, Option<u64>, bool)> = f
+                                .roster()
+                                .seats()
+                                .iter()
+                                .filter(|e| Some(e.seat) != me)
+                                .map(|e| {
+                                    let group = t.tox_sink.in_group(&e.app_public_key)
+                                        || e.tox_key.is_some_and(|k| t.tox_sink.friend_up(&k));
+                                    let rtt = libp2p::PeerId::from_bytes(&e.peer_id)
+                                        .ok()
+                                        .and_then(|p| alive.get(&p).copied())
+                                        .and_then(|(at, rtt)| rtt.filter(|_| at.elapsed() < std::time::Duration::from_secs(15)))
+                                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+                                    (e.seat, rtt, group)
                                 })
-                                .await;
-                        } else if let Ok(ad) = super::advert::from_body_bytes(&r.advert) {
-                            let params = super::advert::table_params_hash(&ad);
-                            let _ = state.lobby.offer(r.table_key, ad, params, r.advert_hash, now);
-                        }
-                    }
-                }
-                // `S1-CR`: the record's first write, once the table is set, and
-                // again if the session changes under it. Not while resuming:
-                // the record on disk is the one this client came back from,
-                // and this write replaced its hand and stack with hand #0 and
-                // the buy-in (`run202634-3`); the next boundary writes it.
-                // `D-037`: the founder's record too. The gate read `joined_key`
-                // alone, so the founder wrote nothing and came back to no
-                // record (`run160631-3`).
-                let founder_here = t.table.as_ref().is_some_and(|f| f.is_founder());
-                if (t.joined_key.is_some() || founder_here) && !t.resuming {
-                    if let Some(f) = t.table.as_ref() {
-                        if f.session().is_some() && f.session() != t.recorded_session {
-                            let stack = f
-                                .my_seat()
-                                .and_then(|s| f.roster().seats().iter().find(|e| e.seat == s).map(|e| e.buyin))
-                                .unwrap_or(0);
-                            remember_session!(t, 0, [0; 32], stack);
-                        }
-                    }
-                }
-                // `D-038`: a hand nobody else has, still waiting at some stage,
-                // never arms `next_hand_at`, so the latch is read here as well.
-                if let Some((theirs, mine)) = t.adrift {
-                    rejoin_from_copies!(t, theirs, mine);
-                }
-                // `S1-CR`: a resumed bystander whose adopted hand did not follow --
-                // the table has moved on to a hand it holds a majority of copies
-                // for -- abandons it and adopts again; the hand it had was never
-                // one it could act in, and nothing of the table's rests on it.
-                if t.resuming {
-                    let stuck = t.hand.as_ref().and_then(|h| {
-                        let me = h.my_seat();
-                        let bystander = !h.required().contains(&me) && !h.returned().contains(&me);
-                        // `S1-CX`: a member's adopted hand in which nothing was dealt
-                        // is abandoned for a newer hand a majority has opened -- the
-                        // table has moved on (`run085603-2`: the returning seat sat in
-                        // a hand the survivor had given up, while the survivor opened
-                        // four more). Heads-up before `D-039`, any size since: a seat
-                        // the table deals in adopts at stage 0, and a table that gave
-                        // that hand up on its budget meanwhile has dealt on without it.
-                        let undealt = h.street().is_none() && !h.over();
-                        (bystander || undealt).then_some(h.hand_id())
-                    });
-                    if let (Some(current), Some(f)) = (stuck, t.table.as_ref()) {
-                        let occupied = f.roster().len();
-                        let newer = t.resume_inits
-                            .iter()
-                            .any(|(hid, copies)| *hid > current && copies.len() * 2 > occupied.saturating_sub(1));
-                        if newer {
-                            let _ = events
-                                .send(NodeEvent::Warning(format!(
-                                    "adopted hand #{current} did not follow the table, which has dealt on; abandoning it for the next hand's copies"
-                                )))
-                                .await;
-                            t.previous = t.hand.take();
-                        }
-                    }
-                }
-                // `D-033`: the running hand's card material goes into the session
-                // record the moment the deck stage begins, so a restart inside the
-                // hand can take it up again and play it out.
-                let material = t.hand.as_ref().and_then(|h| {
-                    let s = h.secret()?;
-                    if t.material_recorded == Some(h.hand_id()) {
-                        return None;
-                    }
-                    let stack = h.stack_at_boundary(h.my_seat());
-                    Some((h.hand_id(), stack, s.keep()))
-                });
-                if let Some((hid, stack, kept)) = material {
-                    t.material_recorded = Some(hid);
-                    remember_session!(t, hid, [0; 32], stack, Some(kept));
-                }
-                // `D-033`: a seat back without its material cannot play the hand on;
-                // at its turn it folds, as the owner's rule says.
-                let folded = match t.hand.as_mut() {
-                    Some(h) if !h.can_play_on() && h.turn().is_some_and(|t| t.mine) => {
-                        let now = super::node::now_unix_ms();
-                        Some(h.act(crate::poker::actions::Action::Fold, &app_key, now))
-                    }
-                    _ => None,
-                };
-                match folded {
-                    Some(Ok(sends)) => {
-                        publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
-                        let _ = events
-                            .send(NodeEvent::Warning(
-                                "folded: this seat's card material was lost with the client that stopped, so the hand cannot be played on (D-033)".into(),
-                            ))
-                            .await;
-                    }
-                    Some(Err(e)) => {
-                        let _ = events.send(NodeEvent::Warning(format!("could not fold: {e}"))).await;
-                    }
-                    None => {}
-                }
-                // `D-035`: seats whose client left the table's group.
-                for (app, quit) in t.tox_sink.take_gone() {
-                    if let Some(seat) = t.table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
-                        let _ = events.send(NodeEvent::SeatLeft { seat, quit }).await;
-                        let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false }).await;
-                        let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "seat {seat} left the table's group{}",
-                                if quit { " on purpose" } else { ": its connection timed out" }
-                            )))
-                            .await;
-                    }
-                }
-                // `S1-CS`: the group count, the moment it changes.
-                if t.table.is_some() {
-                    let group = t.tox_sink.group_seen();
-                    if t.carrier_reported != Some(group) {
-                        t.carrier_reported = Some(group);
-                        let _ = events
-                            .send(NodeEvent::Carrier {
-                                seen: u16::try_from(group.0).unwrap_or(u16::MAX),
-                                want: u16::try_from(group.1).unwrap_or(u16::MAX),
-                            })
-                            .await;
-                    }
-                }
-                // `S1-CX`: heads-up, give up a hand nothing was dealt in when the
-                // other seat has opened the next one from exactly that give-up.
-                // After a line outage the two seats were one hand apart and chased
-                // each other, each giving its hand up on the budget after the other
-                // had moved on (`run080531-2`); no chips are at stake before the
-                // deal, an abort's terminal follows from the genesis, and the other
-                // seat's copy names the parent, so the two open the same hand.
-                if let Some((next, parent)) = t.give_up_for.take() {
-                    let mut given_up: Option<Result<(u64, Vec<crate::table::hand::Send>), (u64, crate::table::hand::Failed)>> = None;
-                    if let (Some(h), Some(f)) = (t.hand.as_mut(), t.table.as_ref()) {
-                        if f.roster().len() == 2
-                            && h.hand_id() + 1 == next
-                            && h.street().is_none()
-                            && !h.over()
-                            && h.genesis_if_given_up() == Some(parent)
-                        {
-                            let current = h.hand_id();
-                            let now = super::node::now_unix_ms();
-                            given_up = Some(
-                                h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now)
-                                    .map(|sends| (current, sends))
-                                    .map_err(|e| (current, e)),
-                            );
-                        }
-                    }
-                    match given_up {
-                        Some(Ok((current, sends))) => {
-                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
-                            let _ = events
-                                .send(NodeEvent::Warning(format!(
-                                    "gave up hand #{current}, in which nothing was dealt: the other seat has opened hand #{next} from that give-up, and this client opens it too"
-                                )))
-                                .await;
-                        }
-                        Some(Err((current, e))) => {
-                            let _ = events
-                                .send(NodeEvent::Warning(format!("could not give hand #{current} up: {e}")))
-                                .await;
-                        }
-                        None => {}
-                    }
-                }
-                // `S1-CR`: the recorded ratification did not fit the roster the
-                // founder said again; this client ratified anew, and the session
-                // it computes is then its own. Said once, so the log can tell
-                // this from the members' answer never arriving.
-                if t.resuming && !t.recorded_refused_said {
-                    if let Some(f) = t.table.as_ref().filter(|f| f.recorded_ratification_refused()) {
-                        t.recorded_refused_said = true;
-                        let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "the recorded ratification did not fit the roster the founder said again (serial {}); ratified anew, and the session this client computes may not be the table's",
-                                f.serial()
-                            )))
-                            .await;
-                    }
-                }
-                // `S1-CR`: a resuming client in the group with a roster and no
-                // session asks for the ratifications the way the protocol allows
-                // -- by saying its own again -- and a member answers with its own.
-                if t.resuming && t.hand.is_none() {
-                    if let Some(f) = t.table.as_ref() {
-                        if f.session().is_none() && f.my_seat().is_some() && t.tox_sink.is_on_tox() {
-                            let now = super::node::now_unix_ms();
-                            if now.saturating_sub(t.ratification_asked_ms) >= 5_000 {
-                                t.ratification_asked_ms = now;
-                                for bytes in f.say_again(now) {
-                                    t.tox_sink.try_broadcast(&bytes);
+                                .collect();
+                            for (seat, rtt, group) in fresh {
+                                let (changed, again) = match t.link_said.get(&seat) {
+                                    Some((r, g, at)) => (
+                                        *r != rtt || *g != group,
+                                        at.elapsed() >= std::time::Duration::from_secs(10),
+                                    ),
+                                    None => (true, true),
+                                };
+                                if changed || again {
+                                    t.link_said.insert(seat, (rtt, group, tokio::time::Instant::now()));
+                                    let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: rtt, group }).await;
                                 }
-                                if !t.ratification_asked_said {
-                                    t.ratification_asked_said = true;
+                                if changed {
                                     let _ = events
-                                        .send(NodeEvent::Warning(
-                                            "in the group with the roster and no session yet; saying my ratification again every five seconds until the others' come".into(),
-                                        ))
+                                        .send(NodeEvent::Warning(format!(
+                                            "seat {seat} link: {}{}",
+                                            if group { "on the line by the table's group" } else { "not on the line by the table's group" },
+                                            match rtt {
+                                                Some(ms) => format!(", ping {ms} ms"),
+                                                None => String::new(),
+                                            }
+                                        )))
                                         .await;
                                 }
                             }
                         }
                     }
-                }
-                // `S1-CR`: a resumed client with no hand adopts the running one
-                // from the members' own copies -- a strict majority of the
-                // occupied seats at one genesis, and stage 0 closed elsewhere
-                // (every seat's copy in, or a later stage of that hand seen), so
-                // the set that signed is the required set. Then it follows the
-                // hand as a bystander; at its settled boundary it asks to sit in
-                // (`S1-BM`).
-                if t.resuming && t.hand.is_none() {
-                    if let Some(f) = t.table.as_ref() {
-                        if f.session().is_some() {
+                    // fault-harness: parked certificate copies that are due.
+                    if !t.delayed_certs.is_empty() {
+                        let at_now = tokio::time::Instant::now();
+                        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut t.delayed_certs)
+                            .into_iter()
+                            .partition(|(at, _)| *at <= at_now);
+                        t.delayed_certs = later;
+                        if !due.is_empty() {
+                            t.releasing_certs = true;
+                            if let Some(h) = t.hand.as_mut() {
+                                for (_, b) in due {
+                                    let _ = hand_event!(t, h, &b);
+                                }
+                            }
+                            t.releasing_certs = false;
+                        }
+                    }
+                    // `S1-CR`: the rejoin's clock. With no table in hand, a fresh
+                    // advert of the recorded key (a hash the record does not hold)
+                    // means the table exists; a Tox peer of the session answering
+                    // means it may; ten minutes of neither and the record is dropped.
+                    // Meanwhile the recorded advert is kept on offer, because the
+                    // lobby's sweep expires it as the stale thing it is.
+                    if t.resuming && t.table.is_none() {
+                        if let Some(r) = t.resume.as_ref() {
+                            let now = super::node::now_unix_ms();
+                            if t.tox_sink.is_on_tox() || t.tox_sink.group_seen().0 > 0 {
+                                t.resume_last_peer_ms = Some(now);
+                            }
+                            let advert_seen = state
+                                .lobby
+                                .get(&r.table_key)
+                                .is_some_and(|h| h.advert_hash != r.advert_hash && h.received_at_ms >= t.resume_since_ms);
+                            if crate::storage::session::give_up(now, advert_seen, t.resume_last_peer_ms, t.resume_since_ms) {
+                                let _ = crate::storage::session::forget(&profile_dir);
+                                t.resume = None;
+                                t.resuming = false;
+                                let _ = events
+                                    .send(NodeEvent::SessionGaveUp {
+                                        why: "no advertisement and no peer of the session for ten minutes".into(),
+                                    })
+                                    .await;
+                            } else if let Ok(ad) = super::advert::from_body_bytes(&r.advert) {
+                                let params = super::advert::table_params_hash(&ad);
+                                let _ = state.lobby.offer(r.table_key, ad, params, r.advert_hash, now);
+                            }
+                        }
+                    }
+                    // `S1-CR`: the record's first write, once the table is set, and
+                    // again if the session changes under it. Not while resuming:
+                    // the record on disk is the one this client came back from,
+                    // and this write replaced its hand and stack with hand #0 and
+                    // the buy-in (`run202634-3`); the next boundary writes it.
+                    // `D-037`: the founder's record too. The gate read `joined_key`
+                    // alone, so the founder wrote nothing and came back to no
+                    // record (`run160631-3`).
+                    let founder_here = t.table.as_ref().is_some_and(|f| f.is_founder());
+                    if (t.joined_key.is_some() || founder_here) && !t.resuming {
+                        if let Some(f) = t.table.as_ref() {
+                            if f.session().is_some() && f.session() != t.recorded_session {
+                                let stack = f
+                                    .my_seat()
+                                    .and_then(|s| f.roster().seats().iter().find(|e| e.seat == s).map(|e| e.buyin))
+                                    .unwrap_or(0);
+                                remember_session!(t, 0, [0; 32], stack);
+                            }
+                        }
+                    }
+                    // `D-038`: a hand nobody else has, still waiting at some stage,
+                    // never arms `next_hand_at`, so the latch is read here as well.
+                    if let Some((theirs, mine)) = t.adrift {
+                        rejoin_from_copies!(t, theirs, mine);
+                    }
+                    // `S1-CR`: a resumed bystander whose adopted hand did not follow --
+                    // the table has moved on to a hand it holds a majority of copies
+                    // for -- abandons it and adopts again; the hand it had was never
+                    // one it could act in, and nothing of the table's rests on it.
+                    if t.resuming {
+                        let stuck = t.hand.as_ref().and_then(|h| {
+                            let me = h.my_seat();
+                            let bystander = !h.required().contains(&me) && !h.returned().contains(&me);
+                            // `S1-CX`: a member's adopted hand in which nothing was dealt
+                            // is abandoned for a newer hand a majority has opened -- the
+                            // table has moved on (`run085603-2`: the returning seat sat in
+                            // a hand the survivor had given up, while the survivor opened
+                            // four more). Heads-up before `D-039`, any size since: a seat
+                            // the table deals in adopts at stage 0, and a table that gave
+                            // that hand up on its budget meanwhile has dealt on without it.
+                            let undealt = h.street().is_none() && !h.over();
+                            (bystander || undealt).then_some(h.hand_id())
+                        });
+                        if let (Some(current), Some(f)) = (stuck, t.table.as_ref()) {
                             let occupied = f.roster().len();
-                            // `S1-CX`: at two seats the one other seat's opening is the
-                            // whole table's, and a hand waiting at stage 0 for this seat
-                            // has no later frame to show -- so its opening alone is enough.
-                            // Before this, only a hand the survivor had already given up
-                            // could be adopted (`run085603-2`).
-                            let heads_up = occupied == 2;
-                            let pick = t.resume_inits
+                            let newer = t.resume_inits
                                 .iter()
-                                .rev()
-                                .find(|(_, copies)| copies.len() * 2 > occupied.saturating_sub(1))
-                                .map(|(h, c)| (*h, c.clone()));
-                            if let Some((hid, copies)) = pick {
-                                // `D-039`: whether the set that signed is exact is asked
-                                // after the adoption, which reads the table's own word on
-                                // who is dealt in. A seat the table deals in signs the hand
-                                // as a member whatever stage 0 is at -- its copy may be the
-                                // one the table is waiting for. A bystander still needs
-                                // stage 0 closed elsewhere (every copy in, or a later frame
-                                // seen), because it follows the signers' set and nobody
-                                // waits for it.
-                                let exact = heads_up
-                                    || copies.len() >= occupied
-                                    || t.resume_early.iter().any(|(h, _)| *h == hid);
-                                if let Some(base) = crate::table::hand::Opening::from_formation(f, hid) {
-                                    let now = super::node::now_unix_ms();
-                                    match crate::table::hand::Opening::adopt_with_signers(base, &copies) {
-                                        Ok((mut o, signers)) => {
-                                            // `D-033`: a copy of this seat's own opening among
-                                            // the table's means the previous life signed this
-                                            // hand: it is taken up where it stood, not opened anew.
-                                            let signed_before = signers.contains(&o.my_seat);
-                                            let kept: Option<[u8; 32]> = t.resume
-                                                .as_ref()
-                                                .filter(|r| r.secret_hand_id == hid && r.hand_secret != [0u8; 32])
-                                                .map(|r| r.hand_secret);
-                                            // `S1-CX`: heads-up there is no certificate to
-                                            // come back by (D-007), and the one other seat
-                                            // is the whole table. A returning seat that is
-                                            // in the roster with chips signs the hand it
-                                            // adopts and is dealt in, as a member; the
-                                            // other seat's copy names what it plays for.
-                                            if f.roster().len() == 2 {
-                                                let me = o.my_seat;
-                                                if o.seats.iter().any(|(s, _, st)| *s == me && *st > 0)
-                                                    && !o.required.contains(&me)
-                                                {
-                                                    o.required.push(me);
-                                                    o.required.sort_unstable();
-                                                }
-                                            }
-                                            let deadline = o.crypto_step_timeout_ms;
-                                            let seat = o.my_seat;
-                                            // A member's opening goes out; a bystander's
-                                            // `open` says nothing the table may hear.
-                                            let member = o.required.contains(&seat);
-                                            let opened = if !member && !exact {
-                                                Err(crate::table::hand::Failed::NotYet)
-                                            } else if signed_before {
-                                                crate::table::hand::Hand::open_restoring(o, &app_key, now, deadline, kept.as_ref())
-                                                    .map(|h| (h, Vec::new()))
-                                            } else {
-                                                crate::table::hand::Hand::open(o, &app_key, now, deadline)
-                                            };
-                                            match opened {
-                                                Ok((mut h, opening_sends)) => {
-                                                    if member && !signed_before {
-                                                        publish_hand(opening_sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                .any(|(hid, copies)| *hid > current && copies.len() * 2 > occupied.saturating_sub(1));
+                            if newer {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "adopted hand #{current} did not follow the table, which has dealt on; abandoning it for the next hand's copies"
+                                    )))
+                                    .await;
+                                t.previous = t.hand.take();
+                            }
+                        }
+                    }
+                    // `D-033`: the running hand's card material goes into the session
+                    // record the moment the deck stage begins, so a restart inside the
+                    // hand can take it up again and play it out.
+                    let material = t.hand.as_ref().and_then(|h| {
+                        let s = h.secret()?;
+                        if t.material_recorded == Some(h.hand_id()) {
+                            return None;
+                        }
+                        let stack = h.stack_at_boundary(h.my_seat());
+                        Some((h.hand_id(), stack, s.keep()))
+                    });
+                    if let Some((hid, stack, kept)) = material {
+                        t.material_recorded = Some(hid);
+                        remember_session!(t, hid, [0; 32], stack, Some(kept));
+                    }
+                    // `D-033`: a seat back without its material cannot play the hand on;
+                    // at its turn it folds, as the owner's rule says.
+                    let folded = match t.hand.as_mut() {
+                        Some(h) if !h.can_play_on() && h.turn().is_some_and(|t| t.mine) => {
+                            let now = super::node::now_unix_ms();
+                            Some(h.act(crate::poker::actions::Action::Fold, &app_key, now))
+                        }
+                        _ => None,
+                    };
+                    match folded {
+                        Some(Ok(sends)) => {
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                            let _ = events
+                                .send(NodeEvent::Warning(
+                                    "folded: this seat's card material was lost with the client that stopped, so the hand cannot be played on (D-033)".into(),
+                                ))
+                                .await;
+                        }
+                        Some(Err(e)) => {
+                            let _ = events.send(NodeEvent::Warning(format!("could not fold: {e}"))).await;
+                        }
+                        None => {}
+                    }
+                    // `D-035`: seats whose client left the table's group.
+                    for (app, quit) in t.tox_sink.take_gone() {
+                        if let Some(seat) = t.table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
+                            let _ = events.send(NodeEvent::SeatLeft { seat, quit }).await;
+                            let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false }).await;
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "seat {seat} left the table's group{}",
+                                    if quit { " on purpose" } else { ": its connection timed out" }
+                                )))
+                                .await;
+                        }
+                    }
+                    // `S1-CS`: the group count, the moment it changes.
+                    if t.table.is_some() {
+                        let group = t.tox_sink.group_seen();
+                        if t.carrier_reported != Some(group) {
+                            t.carrier_reported = Some(group);
+                            let _ = events
+                                .send(NodeEvent::Carrier {
+                                    seen: u16::try_from(group.0).unwrap_or(u16::MAX),
+                                    want: u16::try_from(group.1).unwrap_or(u16::MAX),
+                                })
+                                .await;
+                        }
+                    }
+                    // `S1-CX`: heads-up, give up a hand nothing was dealt in when the
+                    // other seat has opened the next one from exactly that give-up.
+                    // After a line outage the two seats were one hand apart and chased
+                    // each other, each giving its hand up on the budget after the other
+                    // had moved on (`run080531-2`); no chips are at stake before the
+                    // deal, an abort's terminal follows from the genesis, and the other
+                    // seat's copy names the parent, so the two open the same hand.
+                    if let Some((next, parent)) = t.give_up_for.take() {
+                        let mut given_up: Option<Result<(u64, Vec<crate::table::hand::Send>), (u64, crate::table::hand::Failed)>> = None;
+                        if let (Some(h), Some(f)) = (t.hand.as_mut(), t.table.as_ref()) {
+                            if f.roster().len() == 2
+                                && h.hand_id() + 1 == next
+                                && h.street().is_none()
+                                && !h.over()
+                                && h.genesis_if_given_up() == Some(parent)
+                            {
+                                let current = h.hand_id();
+                                let now = super::node::now_unix_ms();
+                                given_up = Some(
+                                    h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now)
+                                        .map(|sends| (current, sends))
+                                        .map_err(|e| (current, e)),
+                                );
+                            }
+                        }
+                        match given_up {
+                            Some(Ok((current, sends))) => {
+                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "gave up hand #{current}, in which nothing was dealt: the other seat has opened hand #{next} from that give-up, and this client opens it too"
+                                    )))
+                                    .await;
+                            }
+                            Some(Err((current, e))) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!("could not give hand #{current} up: {e}")))
+                                    .await;
+                            }
+                            None => {}
+                        }
+                    }
+                    // `S1-CR`: the recorded ratification did not fit the roster the
+                    // founder said again; this client ratified anew, and the session
+                    // it computes is then its own. Said once, so the log can tell
+                    // this from the members' answer never arriving.
+                    if t.resuming && !t.recorded_refused_said {
+                        if let Some(f) = t.table.as_ref().filter(|f| f.recorded_ratification_refused()) {
+                            t.recorded_refused_said = true;
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "the recorded ratification did not fit the roster the founder said again (serial {}); ratified anew, and the session this client computes may not be the table's",
+                                    f.serial()
+                                )))
+                                .await;
+                        }
+                    }
+                    // `S1-CR`: a resuming client in the group with a roster and no
+                    // session asks for the ratifications the way the protocol allows
+                    // -- by saying its own again -- and a member answers with its own.
+                    if t.resuming && t.hand.is_none() {
+                        if let Some(f) = t.table.as_ref() {
+                            if f.session().is_none() && f.my_seat().is_some() && t.tox_sink.is_on_tox() {
+                                let now = super::node::now_unix_ms();
+                                if now.saturating_sub(t.ratification_asked_ms) >= 5_000 {
+                                    t.ratification_asked_ms = now;
+                                    for bytes in f.say_again(now) {
+                                        t.tox_sink.try_broadcast(&bytes);
+                                    }
+                                    if !t.ratification_asked_said {
+                                        t.ratification_asked_said = true;
+                                        let _ = events
+                                            .send(NodeEvent::Warning(
+                                                "in the group with the roster and no session yet; saying my ratification again every five seconds until the others' come".into(),
+                                            ))
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // `S1-CR`: a resumed client with no hand adopts the running one
+                    // from the members' own copies -- a strict majority of the
+                    // occupied seats at one genesis, and stage 0 closed elsewhere
+                    // (every seat's copy in, or a later stage of that hand seen), so
+                    // the set that signed is the required set. Then it follows the
+                    // hand as a bystander; at its settled boundary it asks to sit in
+                    // (`S1-BM`).
+                    if t.resuming && t.hand.is_none() {
+                        if let Some(f) = t.table.as_ref() {
+                            if f.session().is_some() {
+                                let occupied = f.roster().len();
+                                // `S1-CX`: at two seats the one other seat's opening is the
+                                // whole table's, and a hand waiting at stage 0 for this seat
+                                // has no later frame to show -- so its opening alone is enough.
+                                // Before this, only a hand the survivor had already given up
+                                // could be adopted (`run085603-2`).
+                                let heads_up = occupied == 2;
+                                let pick = t.resume_inits
+                                    .iter()
+                                    .rev()
+                                    .find(|(_, copies)| copies.len() * 2 > occupied.saturating_sub(1))
+                                    .map(|(h, c)| (*h, c.clone()));
+                                if let Some((hid, copies)) = pick {
+                                    // `D-039`: whether the set that signed is exact is asked
+                                    // after the adoption, which reads the table's own word on
+                                    // who is dealt in. A seat the table deals in signs the hand
+                                    // as a member whatever stage 0 is at -- its copy may be the
+                                    // one the table is waiting for. A bystander still needs
+                                    // stage 0 closed elsewhere (every copy in, or a later frame
+                                    // seen), because it follows the signers' set and nobody
+                                    // waits for it.
+                                    let exact = heads_up
+                                        || copies.len() >= occupied
+                                        || t.resume_early.iter().any(|(h, _)| *h == hid);
+                                    if let Some(base) = crate::table::hand::Opening::from_formation(f, hid) {
+                                        let now = super::node::now_unix_ms();
+                                        match crate::table::hand::Opening::adopt_with_signers(base, &copies) {
+                                            Ok((mut o, signers)) => {
+                                                // `D-033`: a copy of this seat's own opening among
+                                                // the table's means the previous life signed this
+                                                // hand: it is taken up where it stood, not opened anew.
+                                                let signed_before = signers.contains(&o.my_seat);
+                                                let kept: Option<[u8; 32]> = t.resume
+                                                    .as_ref()
+                                                    .filter(|r| r.secret_hand_id == hid && r.hand_secret != [0u8; 32])
+                                                    .map(|r| r.hand_secret);
+                                                // `S1-CX`: heads-up there is no certificate to
+                                                // come back by (D-007), and the one other seat
+                                                // is the whole table. A returning seat that is
+                                                // in the roster with chips signs the hand it
+                                                // adopts and is dealt in, as a member; the
+                                                // other seat's copy names what it plays for.
+                                                if f.roster().len() == 2 {
+                                                    let me = o.my_seat;
+                                                    if o.seats.iter().any(|(s, _, st)| *s == me && *st > 0)
+                                                        && !o.required.contains(&me)
+                                                    {
+                                                        o.required.push(me);
+                                                        o.required.sort_unstable();
                                                     }
-                                                    for c in &copies {
-                                                        match h.on_event(c, &app_key, now) {
-                                                            // `D-039`: a member's stage 0 may close on the last
-                                                            // copy, and what the hand then owes the next stage
-                                                            // comes out here. Dropped, seat 3 of `run182312-4`
-                                                            // never said its deck contribution and was certified
-                                                            // out of the hand it had just been dealt into, while
-                                                            // seat 1, whose stage 0 closed on a frame that came
-                                                            // through the ordinary road, played on. A restored hand
-                                                            // (D-033) says its part from `restore_done` below.
-                                                            Ok(sends) if member && !signed_before => {
-                                                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
-                                                            }
-                                                            Ok(_) => {}
-                                                            Err(e) => {
-                                                                let _ = events
-                                                                    .send(NodeEvent::Warning(format!("the adopted hand #{hid} refused one of its copies: {e}")))
-                                                                    .await;
+                                                }
+                                                let deadline = o.crypto_step_timeout_ms;
+                                                let seat = o.my_seat;
+                                                // A member's opening goes out; a bystander's
+                                                // `open` says nothing the table may hear.
+                                                let member = o.required.contains(&seat);
+                                                let opened = if !member && !exact {
+                                                    Err(crate::table::hand::Failed::NotYet)
+                                                } else if signed_before {
+                                                    crate::table::hand::Hand::open_restoring(o, &app_key, now, deadline, kept.as_ref())
+                                                        .map(|h| (h, Vec::new()))
+                                                } else {
+                                                    crate::table::hand::Hand::open(o, &app_key, now, deadline)
+                                                };
+                                                match opened {
+                                                    Ok((mut h, opening_sends)) => {
+                                                        if member && !signed_before {
+                                                            publish_hand(opening_sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                                        }
+                                                        for c in &copies {
+                                                            match h.on_event(c, &app_key, now) {
+                                                                // `D-039`: a member's stage 0 may close on the last
+                                                                // copy, and what the hand then owes the next stage
+                                                                // comes out here. Dropped, seat 3 of `run182312-4`
+                                                                // never said its deck contribution and was certified
+                                                                // out of the hand it had just been dealt into, while
+                                                                // seat 1, whose stage 0 closed on a frame that came
+                                                                // through the ordinary road, played on. A restored hand
+                                                                // (D-033) says its part from `restore_done` below.
+                                                                Ok(sends) if member && !signed_before => {
+                                                                    publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                                                }
+                                                                Ok(_) => {}
+                                                                Err(e) => {
+                                                                    let _ = events
+                                                                        .send(NodeEvent::Warning(format!("the adopted hand #{hid} refused one of its copies: {e}")))
+                                                                        .await;
+                                                                }
                                                             }
                                                         }
-                                                    }
-                                                    let carried: Vec<Vec<u8>> = t.resume_early
-                                                        .iter()
-                                                        .filter(|(x, _)| *x == hid)
-                                                        .map(|(_, b)| b.clone())
-                                                        .collect();
-                                                    let n = carried.len();
-                                                    for b in carried {
-                                                        let _ = h.hold(b);
-                                                    }
-                                                    let (more, failures) = h.replay_early(&app_key, now);
-                                                    publish_hand(more, &mut swarm, &mut t.said, &t.tox_sink);
-                                                    for e in failures {
-                                                        let _ = events
-                                                            .send(NodeEvent::Warning(format!("a held frame was refused by the adopted hand #{hid}: {e}")))
-                                                            .await;
-                                                    }
-                                                    // `D-033`: the table's frames are in; whatever the
-                                                    // stage still wants from this seat is made now.
-                                                    if signed_before {
-                                                        match h.restore_done(&app_key, now) {
-                                                            Ok(sends) => publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink),
-                                                            Err(e) => {
-                                                                let _ = events
-                                                                    .send(NodeEvent::Warning(format!("the taken-up hand #{hid} could not go on: {e}")))
-                                                                    .await;
+                                                        let carried: Vec<Vec<u8>> = t.resume_early
+                                                            .iter()
+                                                            .filter(|(x, _)| *x == hid)
+                                                            .map(|(_, b)| b.clone())
+                                                            .collect();
+                                                        let n = carried.len();
+                                                        for b in carried {
+                                                            let _ = h.hold(b);
+                                                        }
+                                                        let (more, failures) = h.replay_early(&app_key, now);
+                                                        publish_hand(more, &mut swarm, &mut t.said, &t.tox_sink);
+                                                        for e in failures {
+                                                            let _ = events
+                                                                .send(NodeEvent::Warning(format!("a held frame was refused by the adopted hand #{hid}: {e}")))
+                                                                .await;
+                                                        }
+                                                        // `D-033`: the table's frames are in; whatever the
+                                                        // stage still wants from this seat is made now.
+                                                        if signed_before {
+                                                            match h.restore_done(&app_key, now) {
+                                                                Ok(sends) => publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink),
+                                                                Err(e) => {
+                                                                    let _ = events
+                                                                        .send(NodeEvent::Warning(format!("the taken-up hand #{hid} could not go on: {e}")))
+                                                                        .await;
+                                                                }
                                                             }
                                                         }
-                                                    }
-                                                    let first = h.first_held().and_then(|b| {
-                                                        let (kind, _, seq) = crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok()?;
-                                                        let o = crate::net::chained::open_in_hand(b, crate::table::hand::FRAME_CAP, kind, &h.table_id(), hid).ok()?;
-                                                        Some(format!("{:?} at sequence {seq} chained from {}", kind, short_hash(&o.envelope.previous_event_hash)))
-                                                    });
-                                                    let _ = events
-                                                        .send(NodeEvent::Warning(format!(
-                                                            "adopted hand #{hid} is at sequence {} chained from {}, waiting for {:?} with {} frame(s) still held; the oldest held is {}",
-                                                            h.slot().sequence,
-                                                            short_hash(&h.slot().previous_event_hash),
-                                                            h.waiting_for(),
-                                                            h.held(),
-                                                            first.unwrap_or_else(|| "none".into())
-                                                        )))
-                                                        .await;
-                                                    let _ = events
-                                                        .send(NodeEvent::Warning(format!(
-                                                            "resumed at hand #{hid} as {} (seat {seat}) from {} copies, {n} frame(s) replayed; {}",
-                                                            if member { "a member" } else { "a bystander" },
-                                                            copies.len(),
-                                                            if signed_before && h.can_play_on() {
-                                                                "this seat's previous life signed it, and with the kept card material it plays on where it stood (D-033)"
-                                                            } else if signed_before {
-                                                                "this seat's previous life signed it; without its card material it can only follow and fold (D-033)"
-                                                            } else if member {
-                                                                "this seat signed it and is dealt in"
-                                                            } else {
-                                                                "it asks to sit in at this hand's boundary"
-                                                            }
-                                                        )))
-                                                        .await;
-                                                    let _ = events.send(NodeEvent::SessionResumed { hand_id: hid }).await;
-                                                    t.hand = Some(h);
-                                                    t.resume_inits.retain(|k, _| *k > hid);
-                                                    t.resume_early.retain(|(k, _)| *k > hid);
-                                                    t.hand_reported = false;
-                                                    t.deck_reported = None;
-                                                    t.cards_reported = false;
-                                                    t.turn_reported = None;
-                                                    t.abort_reported = false;
-                                                    t.resume_said = None;
-                                                }
-                                                Err(crate::table::hand::Failed::NotYet) => {
-                                                    if t.resume_said != Some(hid) {
-                                                        t.resume_said = Some(hid);
+                                                        let first = h.first_held().and_then(|b| {
+                                                            let (kind, _, seq) = crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok()?;
+                                                            let o = crate::net::chained::open_in_hand(b, crate::table::hand::FRAME_CAP, kind, &h.table_id(), hid).ok()?;
+                                                            Some(format!("{:?} at sequence {seq} chained from {}", kind, short_hash(&o.envelope.previous_event_hash)))
+                                                        });
                                                         let _ = events
                                                             .send(NodeEvent::Warning(format!(
-                                                                "hand #{hid}: {} copies, and they do not deal this seat in; stage 0 is still open there, so this seat follows once it closes or takes the next hand (D-039)",
-                                                                copies.len()
+                                                                "adopted hand #{hid} is at sequence {} chained from {}, waiting for {:?} with {} frame(s) still held; the oldest held is {}",
+                                                                h.slot().sequence,
+                                                                short_hash(&h.slot().previous_event_hash),
+                                                                h.waiting_for(),
+                                                                h.held(),
+                                                                first.unwrap_or_else(|| "none".into())
                                                             )))
                                                             .await;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    if t.resume_said != Some(hid) {
-                                                        t.resume_said = Some(hid);
                                                         let _ = events
-                                                            .send(NodeEvent::Warning(format!("the adopted hand #{hid} would not open: {e}")))
+                                                            .send(NodeEvent::Warning(format!(
+                                                                "resumed at hand #{hid} as {} (seat {seat}) from {} copies, {n} frame(s) replayed; {}",
+                                                                if member { "a member" } else { "a bystander" },
+                                                                copies.len(),
+                                                                if signed_before && h.can_play_on() {
+                                                                    "this seat's previous life signed it, and with the kept card material it plays on where it stood (D-033)"
+                                                                } else if signed_before {
+                                                                    "this seat's previous life signed it; without its card material it can only follow and fold (D-033)"
+                                                                } else if member {
+                                                                    "this seat signed it and is dealt in"
+                                                                } else {
+                                                                    "it asks to sit in at this hand's boundary"
+                                                                }
+                                                            )))
                                                             .await;
+                                                        let _ = events.send(NodeEvent::SessionResumed { hand_id: hid }).await;
+                                                        t.hand = Some(h);
+                                                        t.resume_inits.retain(|k, _| *k > hid);
+                                                        t.resume_early.retain(|(k, _)| *k > hid);
+                                                        t.hand_reported = false;
+                                                        t.deck_reported = None;
+                                                        t.cards_reported = false;
+                                                        t.turn_reported = None;
+                                                        t.abort_reported = false;
+                                                        t.resume_said = None;
+                                                    }
+                                                    Err(crate::table::hand::Failed::NotYet) => {
+                                                        if t.resume_said != Some(hid) {
+                                                            t.resume_said = Some(hid);
+                                                            let _ = events
+                                                                .send(NodeEvent::Warning(format!(
+                                                                    "hand #{hid}: {} copies, and they do not deal this seat in; stage 0 is still open there, so this seat follows once it closes or takes the next hand (D-039)",
+                                                                    copies.len()
+                                                                )))
+                                                                .await;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        if t.resume_said != Some(hid) {
+                                                            t.resume_said = Some(hid);
+                                                            let _ = events
+                                                                .send(NodeEvent::Warning(format!("the adopted hand #{hid} would not open: {e}")))
+                                                                .await;
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                        Err(crate::table::hand::Failed::NotYet) => {}
-                                        Err(e) => {
-                                            if t.resume_said != Some(hid) {
-                                                t.resume_said = Some(hid);
-                                                let _ = events
-                                                    .send(NodeEvent::Warning(format!("hand #{hid} cannot be adopted from the copies held: {e}")))
-                                                    .await;
+                                            Err(crate::table::hand::Failed::NotYet) => {}
+                                            Err(e) => {
+                                                if t.resume_said != Some(hid) {
+                                                    t.resume_said = Some(hid);
+                                                    let _ = events
+                                                        .send(NodeEvent::Warning(format!("hand #{hid} cannot be adopted from the copies held: {e}")))
+                                                        .await;
+                                                }
                                             }
                                         }
                                     }
@@ -5790,370 +5865,369 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                }
-                // `S1-BM`: return votes, cast on the evidence the boundary
-                // gathered by the hand the boundary belongs to -- the live hand
-                // while it is still hand k, the retained one once k+1 has
-                // opened. A certificate that completes here banks its subject;
-                // on the retained hand `take_late_roster` below then re-derives
-                // hand k+1, which is READMISSION.md section 4's settled-path
-                // late-roster repair, on `S1-BS`'s road.
-                if let Some(h) = t.hand.as_mut() {
-                    vote_on_returns!(t, h);
-                }
-                if let Some(p) = t.previous.as_mut() {
-                    vote_on_returns!(t, p);
-                }
-                // `S1-BS`: the retained hand replays what it holds, and a
-                // certificate that banked there re-derives the running hand.
-                if let Some(p) = t.previous.as_mut() {
-                    let _ = p.replay_early(&app_key, now);
-                    if let Some(n) = p.take_cert_note() {
-                        let _ = events
-                            .send(NodeEvent::Warning(format!("hand #{} (over): {n}", p.hand_id())))
-                            .await;
+                    // `S1-BM`: return votes, cast on the evidence the boundary
+                    // gathered by the hand the boundary belongs to -- the live hand
+                    // while it is still hand k, the retained one once k+1 has
+                    // opened. A certificate that completes here banks its subject;
+                    // on the retained hand `take_late_roster` below then re-derives
+                    // hand k+1, which is READMISSION.md section 4's settled-path
+                    // late-roster repair, on `S1-BS`'s road.
+                    if let Some(h) = t.hand.as_mut() {
+                        vote_on_returns!(t, h);
                     }
-                    if p.take_late_roster() {
-                        t.late_banked_for = Some(p.hand_id());
-                        t.pending_repair = p.next_hand();
+                    if let Some(p) = t.previous.as_mut() {
+                        vote_on_returns!(t, p);
                     }
-                }
-                // Retention ends when the running hand leaves stage 0: from
-                // there its genesis is what the table chained from.
-                if t.hand.as_ref().is_some_and(|h| h.slot().sequence >= 1) {
-                    t.previous = None;
-                }
-                if let Some(o) = t.pending_repair.take() {
-                    if t.frozen.is_some() {
-                        // Kept until the freeze lifts: a repair is not lost to it.
-                        t.pending_repair = Some(o);
-                    } else if t.adrift.is_none() {
-                        // **And when this client has latched itself out the
-                        // repair is dropped, deliberately.** The arm above
-                        // keeps a repair through a freeze and says so; this
-                        // one lets it go, because a latched client is about to
-                        // drop the branch the repair is for and rejoin from the
-                        // table's copies (`D-038`), which is the repair.
-                        let reopened = reopen_hand(
-                            o,
-                            &mut t.hand,
-                            &mut t.said,
-                            &mut swarm,
-                            &events,
-                            &t.tox_sink,
-                            &app_key,
-                        )
-                        .await;
-                        if reopened {
-                            // A timer armed about the old hand must not fire
-                            // about the new one.
-                            t.next_hand_at = None;
-                            t.deal_at = None;
-                            t.act_by = None;
-                            t.hand_reported = false;
-                            t.deck_reported = None;
-                            t.cards_reported = false;
-                            t.turn_reported = None;
-                            t.abort_reported = false;
+                    // `S1-BS`: the retained hand replays what it holds, and a
+                    // certificate that banked there re-derives the running hand.
+                    if let Some(p) = t.previous.as_mut() {
+                        let _ = p.replay_early(&app_key, now);
+                        if let Some(n) = p.take_cert_note() {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("hand #{} (over): {n}", p.hand_id())))
+                                .await;
+                        }
+                        if p.take_late_roster() {
+                            t.late_banked_for = Some(p.hand_id());
+                            t.pending_repair = p.next_hand();
                         }
                     }
-                }
-                // A quiet hand speaks once the table is counted at its genesis:
-                // as many seats at this genesis as at any other, or nobody
-                // anywhere else.
-                if let Some(h) = t.hand.as_mut() {
-                    // Whatever the sequence: a `HAND_INIT` at (k+1, 0) is as
-                    // valid sent late, and a quiet hand whose stage 0 completed
-                    // between two ticks still owes the table its copy.
-                    if h.voice() == crate::table::hand::Voice::Quiet {
-                        let foreign = h.foreign_genesis_named().map(|(_, s)| s.len()).unwrap_or(0);
-                        let counted = h.counted_at_stage_zero().len();
-                        if counted >= foreign.max(1) {
-                            if let Some(s) = h.speak() {
-                                let _ = events
-                                    .send(NodeEvent::Warning(format!(
-                                        "hand #{}: signed after all — {counted} seat(s) counted at this genesis, {foreign} at another",
-                                        h.hand_id()
-                                    )))
-                                    .await;
-                                publish_hand(vec![s], &mut swarm, &mut t.said, &t.tox_sink);
+                    // Retention ends when the running hand leaves stage 0: from
+                    // there its genesis is what the table chained from.
+                    if t.hand.as_ref().is_some_and(|h| h.slot().sequence >= 1) {
+                        t.previous = None;
+                    }
+                    if let Some(o) = t.pending_repair.take() {
+                        if t.frozen.is_some() {
+                            // Kept until the freeze lifts: a repair is not lost to it.
+                            t.pending_repair = Some(o);
+                        } else if t.adrift.is_none() {
+                            // **And when this client has latched itself out the
+                            // repair is dropped, deliberately.** The arm above
+                            // keeps a repair through a freeze and says so; this
+                            // one lets it go, because a latched client is about to
+                            // drop the branch the repair is for and rejoin from the
+                            // table's copies (`D-038`), which is the repair.
+                            let reopened = reopen_hand(
+                                o,
+                                &mut t.hand,
+                                &mut t.said,
+                                &mut swarm,
+                                &events,
+                                &t.tox_sink,
+                                &app_key,
+                            )
+                            .await;
+                            if reopened {
+                                // A timer armed about the old hand must not fire
+                                // about the new one.
+                                t.next_hand_at = None;
+                                t.deal_at = None;
+                                t.act_by = None;
+                                t.hand_reported = false;
+                                t.deck_reported = None;
+                                t.cards_reported = false;
+                                t.turn_reported = None;
+                                t.abort_reported = false;
                             }
                         }
                     }
-                }
-                let Some(h) = t.hand.as_mut() else { continue };
-
-                // **A message parked on a clock has to be re-judged by a
-                // clock.** `replay_early` had exactly one caller in the tree —
-                // the `Ok` arm of `hand_event!` — so anything held with
-                // `Failed::NotYet` was reconsidered only when some *other*
-                // event happened to arrive and be accepted. Most held events
-                // are waiting for a stage this client has not reached, and for
-                // those an incoming event is the right trigger. A `HAND_ABORT`
-                // held because this receiver's own deadline has not passed is
-                // waiting for **time**, and nothing here made time a trigger.
-                //
-                // In `split173908-10` the fix above would have fired anyway,
-                // by luck: the eight stranded seats re-sent their votes for 293
-                // seconds and a duplicate vote returns `Ok`, which ran the
-                // replay. A quieter table has no such accident, and the whole
-                // point of the gate widening is that the moment it opens is a
-                // moment when nothing else is happening.
-                let (replayed, held_failures) = h.replay_early(&app_key, now);
-                for e in held_failures {
-                    let _ = events
-                        .send(NodeEvent::Warning(format!("a held event: {e}")))
-                        .await;
-                }
-                publish_hand(replayed, &mut swarm, &mut t.said, &t.tox_sink);
-                // `S1-CW`: a held certificate replayed here can end the hand too.
-                hand_may_have_ended!(t, h);
-                let Some(h) = t.hand.as_mut() else { continue };
-
-                // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
-                // and the carrier's blind repair ladder puts its attempts in
-                // the seconds T+3, T+5, T+9, T+17 and T+33, so a message whose
-                // early sends the wire refused arrives after the stage waiting
-                // for it has expired, and its sender is voted out for a message
-                // that was in flight. The carrier has a fast path — one round
-                // trip, 36 to 326 ms — but it fires only when the receiver can
-                // SEE a hole, which needs a later message to have arrived. A
-                // stage waiting on one seat has nothing later to reveal it.
-                //
-                // This client does know. So before it says anybody is late, it
-                // asks each seat it is waiting for to re-send. A request for a
-                // message the peer never sent is looked up in that peer's send
-                // array and quietly does nothing, so a seat that is genuinely
-                // silent is neither helped nor disturbed and gains nothing by
-                // stalling — which is what keeps `D-026` intact.
-                for seat in h.waiting_for() {
-                    if let Some(key) = h.key_of(seat) {
-                        t.tox_sink.nudge(key, seat);
-                    }
-                }
-                // `D-033`: a seat this hand has waited on for twenty seconds that is
-                // back on the line -- after an outage longer than the carrier's memory
-                // -- holds none of this hand's frames since; say them again, its own
-                // with them, once a minute at most.
-                if t.stage_waiting.0 != h.slot().sequence {
-                    t.stage_waiting = (h.slot().sequence, now);
-                }
-                if now.saturating_sub(t.stage_waiting.1) >= 20_000
-                    && now.saturating_sub(t.hand_said_again_ms) >= 60_000
-                {
-                    let back: Vec<u8> = h
-                        .waiting_for()
-                        .into_iter()
-                        .filter(|s| {
-                            t.table
-                                .as_ref()
-                                .and_then(|f| f.roster().seats().iter().find(|e| e.seat == *s).map(|e| e.peer_id.clone()))
-                                .and_then(|b| libp2p::PeerId::from_bytes(&b).ok())
-                                .and_then(|p| alive.get(&p).copied())
-                                .is_some_and(|(at, rtt)| rtt.is_some() && at.elapsed() < std::time::Duration::from_secs(15))
-                        })
-                        .collect();
-                    if !back.is_empty() {
-                        t.hand_said_again_ms = now;
-                        let hid = h.hand_id();
-                        let mut frames = 0usize;
-                        for b in h.transcript() {
-                            t.tox_sink.try_broadcast(b);
-                            frames += 1;
+                    // A quiet hand speaks once the table is counted at its genesis:
+                    // as many seats at this genesis as at any other, or nobody
+                    // anywhere else.
+                    if let Some(h) = t.hand.as_mut() {
+                        // Whatever the sequence: a `HAND_INIT` at (k+1, 0) is as
+                        // valid sent late, and a quiet hand whose stage 0 completed
+                        // between two ticks still owes the table its copy.
+                        if h.voice() == crate::table::hand::Voice::Quiet {
+                            let foreign = h.foreign_genesis_named().map(|(_, s)| s.len()).unwrap_or(0);
+                            let counted = h.counted_at_stage_zero().len();
+                            if counted >= foreign.max(1) {
+                                if let Some(s) = h.speak() {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "hand #{}: signed after all — {counted} seat(s) counted at this genesis, {foreign} at another",
+                                            h.hand_id()
+                                        )))
+                                        .await;
+                                    publish_hand(vec![s], &mut swarm, &mut t.said, &t.tox_sink);
+                                }
+                            }
                         }
-                        for b in t.said.iter() {
-                            if crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok().map(|(_, x, _)| x) == Some(hid) {
+                    }
+                    let Some(h) = t.hand.as_mut() else { continue };
+
+                    // **A message parked on a clock has to be re-judged by a
+                    // clock.** `replay_early` had exactly one caller in the tree —
+                    // the `Ok` arm of `hand_event!` — so anything held with
+                    // `Failed::NotYet` was reconsidered only when some *other*
+                    // event happened to arrive and be accepted. Most held events
+                    // are waiting for a stage this client has not reached, and for
+                    // those an incoming event is the right trigger. A `HAND_ABORT`
+                    // held because this receiver's own deadline has not passed is
+                    // waiting for **time**, and nothing here made time a trigger.
+                    //
+                    // In `split173908-10` the fix above would have fired anyway,
+                    // by luck: the eight stranded seats re-sent their votes for 293
+                    // seconds and a duplicate vote returns `Ok`, which ran the
+                    // replay. A quieter table has no such accident, and the whole
+                    // point of the gate widening is that the moment it opens is a
+                    // moment when nothing else is happening.
+                    let (replayed, held_failures) = h.replay_early(&app_key, now);
+                    for e in held_failures {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!("a held event: {e}")))
+                            .await;
+                    }
+                    publish_hand(replayed, &mut swarm, &mut t.said, &t.tox_sink);
+                    // `S1-CW`: a held certificate replayed here can end the hand too.
+                    hand_may_have_ended!(t, h);
+                    let Some(h) = t.hand.as_mut() else { continue };
+
+                    // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
+                    // and the carrier's blind repair ladder puts its attempts in
+                    // the seconds T+3, T+5, T+9, T+17 and T+33, so a message whose
+                    // early sends the wire refused arrives after the stage waiting
+                    // for it has expired, and its sender is voted out for a message
+                    // that was in flight. The carrier has a fast path — one round
+                    // trip, 36 to 326 ms — but it fires only when the receiver can
+                    // SEE a hole, which needs a later message to have arrived. A
+                    // stage waiting on one seat has nothing later to reveal it.
+                    //
+                    // This client does know. So before it says anybody is late, it
+                    // asks each seat it is waiting for to re-send. A request for a
+                    // message the peer never sent is looked up in that peer's send
+                    // array and quietly does nothing, so a seat that is genuinely
+                    // silent is neither helped nor disturbed and gains nothing by
+                    // stalling — which is what keeps `D-026` intact.
+                    for seat in h.waiting_for() {
+                        if let Some(key) = h.key_of(seat) {
+                            t.tox_sink.nudge(key, seat);
+                        }
+                    }
+                    // `D-033`: a seat this hand has waited on for twenty seconds that is
+                    // back on the line -- after an outage longer than the carrier's memory
+                    // -- holds none of this hand's frames since; say them again, its own
+                    // with them, once a minute at most.
+                    if t.stage_waiting.0 != h.slot().sequence {
+                        t.stage_waiting = (h.slot().sequence, now);
+                    }
+                    if now.saturating_sub(t.stage_waiting.1) >= 20_000
+                        && now.saturating_sub(t.hand_said_again_ms) >= 60_000
+                    {
+                        let back: Vec<u8> = h
+                            .waiting_for()
+                            .into_iter()
+                            .filter(|s| {
+                                t.table
+                                    .as_ref()
+                                    .and_then(|f| f.roster().seats().iter().find(|e| e.seat == *s).map(|e| e.peer_id.clone()))
+                                    .and_then(|b| libp2p::PeerId::from_bytes(&b).ok())
+                                    .and_then(|p| alive.get(&p).copied())
+                                    .is_some_and(|(at, rtt)| rtt.is_some() && at.elapsed() < std::time::Duration::from_secs(15))
+                            })
+                            .collect();
+                        if !back.is_empty() {
+                            t.hand_said_again_ms = now;
+                            let hid = h.hand_id();
+                            let mut frames = 0usize;
+                            for b in h.transcript() {
                                 t.tox_sink.try_broadcast(b);
                                 frames += 1;
                             }
-                        }
-                        let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "hand #{hid} has waited on seat(s) {back:?} that are back on the line: said its {frames} frame(s) again (D-033)"
-                            )))
-                            .await;
-                    }
-                }
-
-                // Say so first, if this client's own timer has run out on
-                // somebody. A vote is not an accusation and does nothing
-                // alone; only a complete set becomes a certificate, and only a
-                // certificate moves anything. Where there are three seats or
-                // more this is the answer, and the abort below is what happens
-                // when it is not available — heads-up, where "unanimity" would
-                // be the one opponent.
-                match h.vote_on_timeouts(&app_key, now, t.tox_sink.mid_delivery()) {
-                    Ok(sends) if !sends.is_empty() => {
-                        // Said out loud, because a table that is waiting on
-                        // somebody looks exactly like one that is stuck, and
-                        // this is the line that tells them apart. It is also
-                        // the only visible sign the mechanism exists at all: a
-                        // healthy table never reaches it, because every client
-                        // acts for its own owner first.
-                        let who: Vec<String> =
-                            h.waiting_for().iter().map(|s| s.to_string()).collect();
-                        let mine = h
-                            .take_tally()
-                            .map(|(s, held, need, d)| {
-                                format!("seat {s} @{}: {held}/{need} agree", short_hash(&d))
-                            })
-                            .unwrap_or_default();
-                        // **And what was last heard from each of them**, which
-                        // is the fact that tells a lost message from a
-                        // divergence. `S1-BB`: a seat was certified out for
-                        // letting its clock run when it had answered every
-                        // prompt in the same millisecond it arrived, and the
-                        // run could not say which of the two it was because
-                        // nothing recorded where that seat was last heard.
-                        //
-                        // Equal to this client's own stage means the seat spoke
-                        // at the very stage it is accused of ignoring, which is
-                        // a divergence. Lower means it never spoke there, which
-                        // is a message that did not arrive.
-                        let at = h.stage_sequence();
-                        let seen: Vec<String> = h
-                            .waiting_for()
-                            .iter()
-                            .map(|s| match h.last_heard_at(*s) {
-                                Some(l) => format!("{s} last heard at stage {l}"),
-                                None => format!("{s} never heard this hand"),
-                            })
-                            .collect();
-                        let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "my clock has run out on seat {} — {mine}; I am at stage {at}, {}",
-                                who.join(", "),
-                                seen.join(", ")
-                            )))
-                            .await;
-                        // The same reading as at the macro's site, because a
-                        // vote cast on this tick must not go unsampled just
-                        // because the tick reports differently (`S1-BB`).
-                        for (subject, mid, long_past) in h.take_vote_carrier() {
+                            for b in t.said.iter() {
+                                if crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok().map(|(_, x, _)| x) == Some(hid) {
+                                    t.tox_sink.try_broadcast(b);
+                                    frames += 1;
+                                }
+                            }
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
-                                    "voted about seat {subject}: mid-delivery {mid}, \
-                                     long past {long_past}"
+                                    "hand #{hid} has waited on seat(s) {back:?} that are back on the line: said its {frames} frame(s) again (D-033)"
                                 )))
                                 .await;
                         }
-                        if let Some(n) = h.take_cert_note() {
-                            let _ = events.send(NodeEvent::Warning(n)).await;
-                        }
-                        publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
-                        // `S1-CW`: this vote completed a certificate whose stage a
-                        // peer's copy had opened, and the hand ended here -- before
-                        // any card was out, at the client that voted last. Said and
-                        // succeeded like a hand ended by any event; before this the
-                        // founder of a three-seat table sat on an ended hand for the
-                        // rest of the run (`run195623-3`, `run131730-3`).
-                        hand_may_have_ended!(t, h);
                     }
-                    Ok(_) => {
-                        if let Some(n) = h.take_cert_note() {
-                            let _ = events.send(NodeEvent::Warning(n)).await;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = events
-                            .send(NodeEvent::Warning(format!("the clock: {e}")))
-                            .await;
-                    }
-                }
-                // Two seats have signed this hand at a genesis this client
-                // does not hold. Said once per hand (`S1-BS`).
-                if let Some(n) = h.take_genesis_note() {
-                    let _ = events.send(NodeEvent::Warning(n)).await;
-                }
-                // A vote that is owed and not cast, with every gate's value.
-                // Measured before this: eight seats waiting on one for 370 s,
-                // four votes, and no line saying what held the other four.
-                if let Some(line) = h.vote_state(now, t.tox_sink.mid_delivery()) {
-                    if now.saturating_sub(t.vote_state_said) >= 30_000 {
-                        t.vote_state_said = now;
-                        let _ = events.send(NodeEvent::Warning(line)).await;
-                    }
-                }
 
-                let Some(h) = t.hand.as_mut() else { continue };
-                if !h.may_abandon(now) {
-                    continue;
-                }
-                t.act_by = None;
-                // Which clock, taken before the abort resets the phase. Two
-                // budgets can produce this abort and they send a reader to
-                // completely different places -- see `Hand::expired_budget`.
-                let budget = h.expired_budget(now);
-                match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
-                    Ok(sends) => {
-                        publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
-                        // **And name the cause when the transport is the cause.**
-                        // A player reading "the hand ran out of time" looks for
-                        // a slow opponent. Across two networks the opponent was
-                        // not slow: the only path to it was a relay circuit
-                        // limited to 128 KB and two minutes, which is less than
-                        // one hand, and the hand stopped at the deal.
-                        //
-                        // **But only when the hand is actually on that relay.**
-                        // D-019 puts a formed table's game traffic on a Tox
-                        // group, and `publish_hand` honours it: Tox first, the
-                        // per-table GossipSub topic only when there is no Tox
-                        // carrier. So on a table that rides Tox this clause
-                        // named a libp2p relay for bytes that never touched
-                        // libp2p — and it was believed. Measured
-                        // `split215815-2`: both seats printed it, both were on
-                        // the Tox group with one peer confirmed, and the real
-                        // failure was that the joiner lost a table it had
-                        // already set (session `af7beef3` at 64.9 s) and formed
-                        // a second one (`d648ec85`) at 388.5 s, so the two
-                        // opened hand 1 at different genesis values and each
-                        // waited for a seat that was playing another table.
-                        // The relay sentence hid that for a whole reading.
-                        //
-                        // A diagnosis that can be right for the wrong reason is
-                        // worse than none, so it now asks whether this table is
-                        // on Tox before blaming the wire underneath it.
-                        let stranded: Vec<&libp2p::PeerId> =
-                            relayed_peers.intersection(&poker_peers).collect();
-                        let why = if relay_inadequate
-                            && !stranded.is_empty()
-                            && !t.tox_sink.is_on_tox()
-                        {
-                            format!(
-                                ". {} of the poker peers here {} reachable only through a relay                                  whose reservation this client already reported as too small to                                  carry a hand - that is the likely cause, and it is not the                                  opponent being slow",
-                                stranded.len(),
-                                if stranded.len() == 1 { "is" } else { "are" }
-                            )
-                        } else {
-                            String::new()
-                        };
-                        let which = budget
-                            .map(|b| format!(" -- {b}"))
-                            .unwrap_or_default();
-                        let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "the hand ran out of time{which}; every stack is restored{why}"
-                            )))
-                            .await;
-                        // Straight on: an abort has nothing to look at, so
-                        // D-020's hold has nothing to hold.
-                        arm_boundary!(t, std::time::Duration::from_millis(800));
+                    // Say so first, if this client's own timer has run out on
+                    // somebody. A vote is not an accusation and does nothing
+                    // alone; only a complete set becomes a certificate, and only a
+                    // certificate moves anything. Where there are three seats or
+                    // more this is the answer, and the abort below is what happens
+                    // when it is not available — heads-up, where "unanimity" would
+                    // be the one opponent.
+                    match h.vote_on_timeouts(&app_key, now, t.tox_sink.mid_delivery()) {
+                        Ok(sends) if !sends.is_empty() => {
+                            // Said out loud, because a table that is waiting on
+                            // somebody looks exactly like one that is stuck, and
+                            // this is the line that tells them apart. It is also
+                            // the only visible sign the mechanism exists at all: a
+                            // healthy table never reaches it, because every client
+                            // acts for its own owner first.
+                            let who: Vec<String> =
+                                h.waiting_for().iter().map(|s| s.to_string()).collect();
+                            let mine = h
+                                .take_tally()
+                                .map(|(s, held, need, d)| {
+                                    format!("seat {s} @{}: {held}/{need} agree", short_hash(&d))
+                                })
+                                .unwrap_or_default();
+                            // **And what was last heard from each of them**, which
+                            // is the fact that tells a lost message from a
+                            // divergence. `S1-BB`: a seat was certified out for
+                            // letting its clock run when it had answered every
+                            // prompt in the same millisecond it arrived, and the
+                            // run could not say which of the two it was because
+                            // nothing recorded where that seat was last heard.
+                            //
+                            // Equal to this client's own stage means the seat spoke
+                            // at the very stage it is accused of ignoring, which is
+                            // a divergence. Lower means it never spoke there, which
+                            // is a message that did not arrive.
+                            let at = h.stage_sequence();
+                            let seen: Vec<String> = h
+                                .waiting_for()
+                                .iter()
+                                .map(|s| match h.last_heard_at(*s) {
+                                    Some(l) => format!("{s} last heard at stage {l}"),
+                                    None => format!("{s} never heard this hand"),
+                                })
+                                .collect();
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "my clock has run out on seat {} — {mine}; I am at stage {at}, {}",
+                                    who.join(", "),
+                                    seen.join(", ")
+                                )))
+                                .await;
+                            // The same reading as at the macro's site, because a
+                            // vote cast on this tick must not go unsampled just
+                            // because the tick reports differently (`S1-BB`).
+                            for (subject, mid, long_past) in h.take_vote_carrier() {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "voted about seat {subject}: mid-delivery {mid}, \
+                                         long past {long_past}"
+                                    )))
+                                    .await;
+                            }
+                            if let Some(n) = h.take_cert_note() {
+                                let _ = events.send(NodeEvent::Warning(n)).await;
+                            }
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                            // `S1-CW`: this vote completed a certificate whose stage a
+                            // peer's copy had opened, and the hand ended here -- before
+                            // any card was out, at the client that voted last. Said and
+                            // succeeded like a hand ended by any event; before this the
+                            // founder of a three-seat table sat on an ended hand for the
+                            // rest of the run (`run195623-3`, `run131730-3`).
+                            hand_may_have_ended!(t, h);
+                        }
+                        Ok(_) => {
+                            if let Some(n) = h.take_cert_note() {
+                                let _ = events.send(NodeEvent::Warning(n)).await;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("the clock: {e}")))
+                                .await;
+                        }
                     }
-                    Err(e) => {
-                        let _ = events
-                            .send(NodeEvent::Warning(format!("the hand could not be ended: {e}")))
-                            .await;
+                    // Two seats have signed this hand at a genesis this client
+                    // does not hold. Said once per hand (`S1-BS`).
+                    if let Some(n) = h.take_genesis_note() {
+                        let _ = events.send(NodeEvent::Warning(n)).await;
+                    }
+                    // A vote that is owed and not cast, with every gate's value.
+                    // Measured before this: eight seats waiting on one for 370 s,
+                    // four votes, and no line saying what held the other four.
+                    if let Some(line) = h.vote_state(now, t.tox_sink.mid_delivery()) {
+                        if now.saturating_sub(t.vote_state_said) >= 30_000 {
+                            t.vote_state_said = now;
+                            let _ = events.send(NodeEvent::Warning(line)).await;
+                        }
+                    }
+
+                    let Some(h) = t.hand.as_mut() else { continue };
+                    if !h.may_abandon(now) {
+                        continue;
+                    }
+                    t.act_by = None;
+                    // Which clock, taken before the abort resets the phase. Two
+                    // budgets can produce this abort and they send a reader to
+                    // completely different places -- see `Hand::expired_budget`.
+                    let budget = h.expired_budget(now);
+                    match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
+                        Ok(sends) => {
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                            // **And name the cause when the transport is the cause.**
+                            // A player reading "the hand ran out of time" looks for
+                            // a slow opponent. Across two networks the opponent was
+                            // not slow: the only path to it was a relay circuit
+                            // limited to 128 KB and two minutes, which is less than
+                            // one hand, and the hand stopped at the deal.
+                            //
+                            // **But only when the hand is actually on that relay.**
+                            // D-019 puts a formed table's game traffic on a Tox
+                            // group, and `publish_hand` honours it: Tox first, the
+                            // per-table GossipSub topic only when there is no Tox
+                            // carrier. So on a table that rides Tox this clause
+                            // named a libp2p relay for bytes that never touched
+                            // libp2p — and it was believed. Measured
+                            // `split215815-2`: both seats printed it, both were on
+                            // the Tox group with one peer confirmed, and the real
+                            // failure was that the joiner lost a table it had
+                            // already set (session `af7beef3` at 64.9 s) and formed
+                            // a second one (`d648ec85`) at 388.5 s, so the two
+                            // opened hand 1 at different genesis values and each
+                            // waited for a seat that was playing another table.
+                            // The relay sentence hid that for a whole reading.
+                            //
+                            // A diagnosis that can be right for the wrong reason is
+                            // worse than none, so it now asks whether this table is
+                            // on Tox before blaming the wire underneath it.
+                            let stranded: Vec<&libp2p::PeerId> =
+                                relayed_peers.intersection(&poker_peers).collect();
+                            let why = if relay_inadequate
+                                && !stranded.is_empty()
+                                && !t.tox_sink.is_on_tox()
+                            {
+                                format!(
+                                    ". {} of the poker peers here {} reachable only through a relay                                  whose reservation this client already reported as too small to                                  carry a hand - that is the likely cause, and it is not the                                  opponent being slow",
+                                    stranded.len(),
+                                    if stranded.len() == 1 { "is" } else { "are" }
+                                )
+                            } else {
+                                String::new()
+                            };
+                            let which = budget
+                                .map(|b| format!(" -- {b}"))
+                                .unwrap_or_default();
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "the hand ran out of time{which}; every stack is restored{why}"
+                                )))
+                                .await;
+                            // Straight on: an abort has nothing to look at, so
+                            // D-020's hold has nothing to hold.
+                            arm_boundary!(t, std::time::Duration::from_millis(800));
+                        }
+                        Err(e) => {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("the hand could not be ended: {e}")))
+                                .await;
+                        }
                     }
                 }
             }
 
             // This client's own clock ran out on its own turn.
-            () = async {
-                match t.act_by {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
-                }
-            }, if t.act_by.is_some() => {
+            () = tokio::time::sleep_until(
+                act_deadline.map(|d| d.1).unwrap_or_else(tokio::time::Instant::now)
+            ), if act_deadline.is_some() => {
+                let which = act_deadline.map(|d| d.0).unwrap_or(active);
+                let t = &mut tables[which];
                 t.act_by = None;
                 let Some(h) = t.hand.as_mut() else { continue };
                 let Some(turn) = h.turn().filter(|t| t.mine) else { continue };
@@ -6212,15 +6286,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // D-020's hold has run out: deal the next hand.
-            () = async {
-                match t.next_hand_at {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    // Nothing pending. `pending()` never completes, so this arm
-                    // is simply not in the race — which is what an `Option`
-                    // timer means in a `select!`.
-                    None => std::future::pending().await,
-                }
-            }, if t.next_hand_at.is_some() => {
+            // `D-043`: the earliest deal among the tables; a slot with nothing
+            // pending is simply not in the race.
+            () = tokio::time::sleep_until(
+                deal_deadline.map(|d| d.1).unwrap_or_else(tokio::time::Instant::now)
+            ), if deal_deadline.is_some() => {
+                let which = deal_deadline.map(|d| d.0).unwrap_or(active);
+                let t = &mut tables[which];
                 t.next_hand_at = None;
                 // **Never succeed a hand that is not over.** This arm rested
                 // on an invariant — the timer fires only about a hand that
@@ -6989,580 +7061,584 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // that is thinking from one that is gone — and this client has
                 // been pinging four times a minute since the beginning and
                 // discarding every reply.
-                if let Some(f) = t.table.as_ref() {
-                    let mut line: Vec<String> = Vec::new();
-                    for e in f.roster().seats() {
-                        if Some(e.seat) == f.my_seat() {
-                            continue;
-                        }
-                        let Ok(p) = PeerId::from_bytes(&e.peer_id) else {
-                            line.push(format!("{} ?", e.seat));
-                            continue;
-                        };
-                        line.push(match alive.get(&p) {
-                            Some((at, Some(rtt)))
-                                if at.elapsed() < std::time::Duration::from_secs(30) =>
-                            {
-                                format!("{} {}ms", e.seat, rtt.as_millis())
+                // `D-043`: what follows is every table's.
+                for which in 0..tables.len() {
+                    let t = &mut tables[which];
+                    if let Some(f) = t.table.as_ref() {
+                        let mut line: Vec<String> = Vec::new();
+                        for e in f.roster().seats() {
+                            if Some(e.seat) == f.my_seat() {
+                                continue;
                             }
-                            Some((at, None))
-                                if at.elapsed() < std::time::Duration::from_secs(30) =>
-                            {
-                                format!("{} connected", e.seat)
-                            }
-                            Some((at, _)) => {
-                                format!("{} silent {}s", e.seat, at.elapsed().as_secs())
-                            }
-                            None => format!("{} never", e.seat),
-                        });
-                    }
-                    if !line.is_empty() {
-                        let (sent, refused, up) = t.tox_sink.invite_counts();
-                        let (rejoins, join_fails, confirmed, founder_link) = t.tox_sink.join_trouble();
-                        let (seen, want) = t.tox_sink.group_seen();
-                        // The same numbers, as a fact rather than a sentence:
-                        // the line below is advisory and may be dropped, and
-                        // what the client tells its user must not be.
-                        let _ = events
-                            .send(NodeEvent::Carrier {
-                                seen: u16::try_from(seen).unwrap_or(u16::MAX),
-                                want: u16::try_from(want).unwrap_or(u16::MAX),
-                            })
-                            .await;
-                        let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "seats on the line: {}; tox self {}, group {seen} seen/{confirmed} confirmed/{want} wanted, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}{}",
-                                line.join(", "),
-                                match t.tox_sink.tox_connection() {
-                                    0 => "offline",
-                                    1 => "tcp",
-                                    _ => "udp",
-                                },
-                                // **Only while the table has not settled.** A
-                                // ratification count is the difference between
-                                // "they never arrive" and "they arrive and are
-                                // refused", and it is the number missing from
-                                // every line this client printed while it sat at
-                                // a table it could not start a hand at. Once
-                                // there is a session it is answered and saying
-                                // it every thirty seconds is noise.
-                                if f.session().is_none() {
-                                    format!(
-                                        ", ratified {}/{}, {} held",
-                                        f.ratifiers().len(),
-                                        f.roster().len(),
-                                        f.held()
-                                    )
-                                } else if let Some(b) = t.boundaries.newest() {
-                                    // Where the boundary checkpoint has got to.
-                                    // A stage that never closes is silent, and
-                                    // so is one that closes and agrees.
-                                    format!(
-                                        ", checkpoint hand {} waiting for {:?}{}",
-                                        b.hand_id(),
-                                        b.waiting_for(),
-                                        if b.ack_stage_complete() {
-                                            ", agreed".to_string()
-                                        } else if b.hash_stage_complete() {
-                                            format!(
-                                                ", hashes in, acks waiting for {:?}",
-                                                b.acks_waiting_for()
-                                            )
-                                        } else {
-                                            String::new()
-                                        }
-                                    )
-                                } else {
-                                    String::new()
-                                },
-                                // **What the hand itself thinks, which nothing
-                                // used to say.**
-                                //
-                                // `Failed::NotYet` is not an error and is not
-                                // logged -- correctly, since an event for a
-                                // stage this client has not reached is ordinary
-                                // weather on a mesh that does not order. But it
-                                // means a client can fall behind in complete
-                                // silence, and in `split182531-10` that is
-                                // exactly what happened: zero dropped packets,
-                                // zero refusals, and `n0` still voted that seat
-                                // 1 was late while the other nine voted that
-                                // seat 7 was, because `n0` believed seat 8 was
-                                // on the clock and they believed seat 6 was.
-                                // Two subjects, both stuck at 8/9, and no
-                                // certificate possible from either.
-                                //
-                                // A held count and whose action this client is
-                                // waiting for would have said so in one line.
-                                // Printed only while a hand is open, and only
-                                // when there is something to say.
-                                match t.hand.as_ref() {
-                                    Some(h) if !h.over() => {
-                                        let held = h.held();
-                                        let owed = h.waiting_for();
-                                        if held > 0 || !owed.is_empty() {
-                                            format!(", hand waiting for {owed:?}, {held} event(s) held")
-                                        } else {
-                                            String::new()
-                                        }
-                                    }
-                                    _ => String::new(),
-                                },
-                                // **Said only when it changes.** A count that
-                                // repeats every thirty seconds is a number
-                                // nobody reads; one that appears when it moves
-                                // is the measurement (`S1-AC`).
+                            let Ok(p) = PeerId::from_bytes(&e.peer_id) else {
+                                line.push(format!("{} ?", e.seat));
+                                continue;
+                            };
+                            line.push(match alive.get(&p) {
+                                Some((at, Some(rtt)))
+                                    if at.elapsed() < std::time::Duration::from_secs(30) =>
                                 {
-                                    let now = bogons.load(std::sync::atomic::Ordering::Relaxed);
-                                    if now > bogons_said {
-                                        let since = now - bogons_said;
-                                        bogons_said = now;
-                                        format!(", {since} private address(es) from the DHT refused ({now} this run)")
+                                    format!("{} {}ms", e.seat, rtt.as_millis())
+                                }
+                                Some((at, None))
+                                    if at.elapsed() < std::time::Duration::from_secs(30) =>
+                                {
+                                    format!("{} connected", e.seat)
+                                }
+                                Some((at, _)) => {
+                                    format!("{} silent {}s", e.seat, at.elapsed().as_secs())
+                                }
+                                None => format!("{} never", e.seat),
+                            });
+                        }
+                        if !line.is_empty() {
+                            let (sent, refused, up) = t.tox_sink.invite_counts();
+                            let (rejoins, join_fails, confirmed, founder_link) = t.tox_sink.join_trouble();
+                            let (seen, want) = t.tox_sink.group_seen();
+                            // The same numbers, as a fact rather than a sentence:
+                            // the line below is advisory and may be dropped, and
+                            // what the client tells its user must not be.
+                            let _ = events
+                                .send(NodeEvent::Carrier {
+                                    seen: u16::try_from(seen).unwrap_or(u16::MAX),
+                                    want: u16::try_from(want).unwrap_or(u16::MAX),
+                                })
+                                .await;
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "seats on the line: {}; tox self {}, group {seen} seen/{confirmed} confirmed/{want} wanted, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}{}",
+                                    line.join(", "),
+                                    match t.tox_sink.tox_connection() {
+                                        0 => "offline",
+                                        1 => "tcp",
+                                        _ => "udp",
+                                    },
+                                    // **Only while the table has not settled.** A
+                                    // ratification count is the difference between
+                                    // "they never arrive" and "they arrive and are
+                                    // refused", and it is the number missing from
+                                    // every line this client printed while it sat at
+                                    // a table it could not start a hand at. Once
+                                    // there is a session it is answered and saying
+                                    // it every thirty seconds is noise.
+                                    if f.session().is_none() {
+                                        format!(
+                                            ", ratified {}/{}, {} held",
+                                            f.ratifiers().len(),
+                                            f.roster().len(),
+                                            f.held()
+                                        )
+                                    } else if let Some(b) = t.boundaries.newest() {
+                                        // Where the boundary checkpoint has got to.
+                                        // A stage that never closes is silent, and
+                                        // so is one that closes and agrees.
+                                        format!(
+                                            ", checkpoint hand {} waiting for {:?}{}",
+                                            b.hand_id(),
+                                            b.waiting_for(),
+                                            if b.ack_stage_complete() {
+                                                ", agreed".to_string()
+                                            } else if b.hash_stage_complete() {
+                                                format!(
+                                                    ", hashes in, acks waiting for {:?}",
+                                                    b.acks_waiting_for()
+                                                )
+                                            } else {
+                                                String::new()
+                                            }
+                                        )
+                                    } else {
+                                        String::new()
+                                    },
+                                    // **What the hand itself thinks, which nothing
+                                    // used to say.**
+                                    //
+                                    // `Failed::NotYet` is not an error and is not
+                                    // logged -- correctly, since an event for a
+                                    // stage this client has not reached is ordinary
+                                    // weather on a mesh that does not order. But it
+                                    // means a client can fall behind in complete
+                                    // silence, and in `split182531-10` that is
+                                    // exactly what happened: zero dropped packets,
+                                    // zero refusals, and `n0` still voted that seat
+                                    // 1 was late while the other nine voted that
+                                    // seat 7 was, because `n0` believed seat 8 was
+                                    // on the clock and they believed seat 6 was.
+                                    // Two subjects, both stuck at 8/9, and no
+                                    // certificate possible from either.
+                                    //
+                                    // A held count and whose action this client is
+                                    // waiting for would have said so in one line.
+                                    // Printed only while a hand is open, and only
+                                    // when there is something to say.
+                                    match t.hand.as_ref() {
+                                        Some(h) if !h.over() => {
+                                            let held = h.held();
+                                            let owed = h.waiting_for();
+                                            if held > 0 || !owed.is_empty() {
+                                                format!(", hand waiting for {owed:?}, {held} event(s) held")
+                                            } else {
+                                                String::new()
+                                            }
+                                        }
+                                        _ => String::new(),
+                                    },
+                                    // **Said only when it changes.** A count that
+                                    // repeats every thirty seconds is a number
+                                    // nobody reads; one that appears when it moves
+                                    // is the measurement (`S1-AC`).
+                                    {
+                                        let now = bogons.load(std::sync::atomic::Ordering::Relaxed);
+                                        if now > bogons_said {
+                                            let since = now - bogons_said;
+                                            bogons_said = now;
+                                            format!(", {since} private address(es) from the DHT refused ({now} this run)")
+                                        } else {
+                                            String::new()
+                                        }
+                                    },
+                                    // **Said only when it is not zero.** A healthy
+                                    // run never prints this, so its presence is the
+                                    // whole message: `S1-AA` shape (i) happened and
+                                    // was survived rather than sat through.
+                                    if rejoins > 0 || join_fails > 0 {
+                                        format!(
+                                            ", group join restarted {rejoins} time(s), {join_fails} abandoned by toxcore, founder link {}",
+                                            match founder_link {
+                                                0 => "down",
+                                                1 => "over a TCP relay",
+                                                2 => "direct over UDP",
+                                                _ => "n/a (this client is the founder)",
+                                            }
+                                        )
                                     } else {
                                         String::new()
                                     }
-                                },
-                                // **Said only when it is not zero.** A healthy
-                                // run never prints this, so its presence is the
-                                // whole message: `S1-AA` shape (i) happened and
-                                // was survived rather than sat through.
-                                if rejoins > 0 || join_fails > 0 {
-                                    format!(
-                                        ", group join restarted {rejoins} time(s), {join_fails} abandoned by toxcore, founder link {}",
-                                        match founder_link {
-                                            0 => "down",
-                                            1 => "over a TCP relay",
-                                            2 => "direct over UDP",
-                                            _ => "n/a (this client is the founder)",
-                                        }
-                                    )
-                                } else {
-                                    String::new()
-                                }
-                            )))
-                            .await;
-                    }
+                                )))
+                                .await;
+                        }
 
-                    // **When the group will not fill, say how far this client
-                    // reached at all.**
-                    //
-                    // The owner's rule is that a TCP relay is a **fallback that
-                    // must work**, not a fault to report — it is why the node
-                    // list is refreshed over HTTPS and why every node is added
-                    // to toxcore's relay list as well as its DHT. So the useful
-                    // sentence is not *"UDP is blocked, check your firewall"*,
-                    // which tells a player to fix what the client is supposed to
-                    // survive. It is **which half of the fallback failed**.
-                    //
-                    // Every one of those calls was `let _ =`, so when an evening
-                    // of runs died with `tox self tcp, tox friends up 0, invites
-                    // 0 sent`, nothing could say whether zero relays had been
-                    // added or all of them had and the friendships failed
-                    // anyway. Those are different faults. `S1-U`.
-                    if !t.udp_warned && {
-                        let (seen, want) = t.tox_sink.group_seen();
-                        want > 0 && seen < want
-                    } {
-                        t.udp_warned = true;
-                        let r = t.tox_sink.reach();
-                        let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "the table's group is not filling. Tox is {}; of {} known nodes, {} bootstrapped and {} TCP relays were accepted{}. Game traffic rides that group, so nothing can be dealt until it fills.",
-                                match t.tox_sink.tox_connection() {
-                                    0 => "offline",
-                                    1 => "reachable only through a TCP relay",
-                                    _ => "on UDP",
-                                },
-                                r.nodes,
-                                r.booted,
-                                r.relays,
-                                if r.refreshed {
-                                    ", from a list refreshed on this start"
-                                } else {
-                                    ", from the stored list"
-                                }
-                            )))
-                            .await;
-                    }
+                        // **When the group will not fill, say how far this client
+                        // reached at all.**
+                        //
+                        // The owner's rule is that a TCP relay is a **fallback that
+                        // must work**, not a fault to report — it is why the node
+                        // list is refreshed over HTTPS and why every node is added
+                        // to toxcore's relay list as well as its DHT. So the useful
+                        // sentence is not *"UDP is blocked, check your firewall"*,
+                        // which tells a player to fix what the client is supposed to
+                        // survive. It is **which half of the fallback failed**.
+                        //
+                        // Every one of those calls was `let _ =`, so when an evening
+                        // of runs died with `tox self tcp, tox friends up 0, invites
+                        // 0 sent`, nothing could say whether zero relays had been
+                        // added or all of them had and the friendships failed
+                        // anyway. Those are different faults. `S1-U`.
+                        if !t.udp_warned && {
+                            let (seen, want) = t.tox_sink.group_seen();
+                            want > 0 && seen < want
+                        } {
+                            t.udp_warned = true;
+                            let r = t.tox_sink.reach();
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "the table's group is not filling. Tox is {}; of {} known nodes, {} bootstrapped and {} TCP relays were accepted{}. Game traffic rides that group, so nothing can be dealt until it fills.",
+                                    match t.tox_sink.tox_connection() {
+                                        0 => "offline",
+                                        1 => "reachable only through a TCP relay",
+                                        _ => "on UDP",
+                                    },
+                                    r.nodes,
+                                    r.booted,
+                                    r.relays,
+                                    if r.refreshed {
+                                        ", from a list refreshed on this start"
+                                    } else {
+                                        ", from the stored list"
+                                    }
+                                )))
+                                .await;
+                        }
 
-                    // **Everything this seat has to say, said again, while the
-                    // table has not settled.**
-                    //
-                    // A ratification is published once, into a mesh the last
-                    // joiner may not be grafted into yet, and **nothing ever
-                    // sends it again**: `say_again` fires on `Subscribed`, which
-                    // for a peer that is already subscribed never fires a second
-                    // time. So one lost `TABLE_READY` costs its receiver the
-                    // whole tournament — it holds a full roster, cannot compute
-                    // a `session_id` without every ratification, and
-                    // `Opening::from_formation` then returns `None` for ever.
-                    //
-                    // Measured: a seat reporting `ratified 3/4, 0 held` for a
-                    // whole run — nothing refused, nothing waiting, one
-                    // ratification simply never delivered — while the other
-                    // three played fifteen hands without it.
-                    //
-                    // Inside `duplicate_cache_time` (120 s) a seat's repeat is
-                    // still refused as a duplicate and only the founder's
-                    // re-signed roster goes out; after it, the repeat is carried.
-                    // That makes the gap two minutes rather than for ever, which
-                    // is the whole of what this can do without the wire decision
-                    // `S1-P` leaves open.
-                    // **`!ever_dealt`, not `session().is_none()`.** A seat
-                    // whose own table has settled still holds a `TABLE_READY`
-                    // that a neighbour may be missing — and the gate that used
-                    // to stand here shut exactly when that seat became able to
-                    // help. Measured: `n1` sat at `ratified 3/4, 0 held` for a
-                    // whole run while three settled seats beside it held the
-                    // copy it lacked and said nothing (`S1-P`).
-                    //
-                    // It still ends: a table that has dealt has no formation
-                    // left to repair, and after that the repeat would be noise.
-                    if !t.ever_dealt {
-                        if let Some(topic) = t.table_topic.as_ref() {
-                            for bytes in f.say_again(super::node::now_unix_ms()) {
-                                // The same second path as the `Subscribed`
-                                // repeat above, for the same reason (`S1-P`).
-                                t.tox_sink.try_broadcast(&bytes);
-                                let _ = swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .publish(topic.clone(), bytes);
+                        // **Everything this seat has to say, said again, while the
+                        // table has not settled.**
+                        //
+                        // A ratification is published once, into a mesh the last
+                        // joiner may not be grafted into yet, and **nothing ever
+                        // sends it again**: `say_again` fires on `Subscribed`, which
+                        // for a peer that is already subscribed never fires a second
+                        // time. So one lost `TABLE_READY` costs its receiver the
+                        // whole tournament — it holds a full roster, cannot compute
+                        // a `session_id` without every ratification, and
+                        // `Opening::from_formation` then returns `None` for ever.
+                        //
+                        // Measured: a seat reporting `ratified 3/4, 0 held` for a
+                        // whole run — nothing refused, nothing waiting, one
+                        // ratification simply never delivered — while the other
+                        // three played fifteen hands without it.
+                        //
+                        // Inside `duplicate_cache_time` (120 s) a seat's repeat is
+                        // still refused as a duplicate and only the founder's
+                        // re-signed roster goes out; after it, the repeat is carried.
+                        // That makes the gap two minutes rather than for ever, which
+                        // is the whole of what this can do without the wire decision
+                        // `S1-P` leaves open.
+                        // **`!ever_dealt`, not `session().is_none()`.** A seat
+                        // whose own table has settled still holds a `TABLE_READY`
+                        // that a neighbour may be missing — and the gate that used
+                        // to stand here shut exactly when that seat became able to
+                        // help. Measured: `n1` sat at `ratified 3/4, 0 held` for a
+                        // whole run while three settled seats beside it held the
+                        // copy it lacked and said nothing (`S1-P`).
+                        //
+                        // It still ends: a table that has dealt has no formation
+                        // left to repair, and after that the repeat would be noise.
+                        if !t.ever_dealt {
+                            if let Some(topic) = t.table_topic.as_ref() {
+                                for bytes in f.say_again(super::node::now_unix_ms()) {
+                                    // The same second path as the `Subscribed`
+                                    // repeat above, for the same reason (`S1-P`).
+                                    t.tox_sink.try_broadcast(&bytes);
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .gossipsub
+                                        .publish(topic.clone(), bytes);
+                                }
                             }
                         }
                     }
-                }
 
-                // **Give back the seat of anybody who has stopped answering,
-                // and only before the first hand.**
-                //
-                // A player who sits down at a tournament and leaves before it
-                // fills is ordinary. Nothing used to notice: `LeaveTable` clears
-                // local state and tells the founder nothing, there is no message
-                // that could tell it — `PLAYER_LEAVE` is a boundary-window event
-                // of a chain that does not exist yet — and D-022's *held for two
-                // hands* is counted in hands, of which there are none. So the
-                // seat was held for ever and the replacement was refused with
-                // *the table is full*, measured twice in one run.
-                //
-                // **Liveness is asked for rather than assumed.** `alive` is the
-                // last time each peer answered a **ping**; a connection being up
-                // is not evidence that anybody is behind it. `SEAT_SILENCE_MS`
-                // is six ping intervals, so a seat is given back only by a peer
-                // that has missed every one of them.
-                //
-                // `!ever_dealt` is the whole of what makes this not an eviction,
-                // and it is checked here because `Formation` cannot see it.
-                if !t.ever_dealt {
-                    if let Some(f) = t.table.as_mut().filter(|f| f.is_founder()) {
-                        let silent: Vec<(u8, Vec<u8>, Option<[u8; 32]>)> = f
-                            .roster()
-                            .seats()
-                            .iter()
-                            .filter(|e| Some(e.seat) != f.my_seat())
-                            .filter(|e| {
-                                match PeerId::from_bytes(&e.peer_id) {
-                                    // Answered, and recently enough.
-                                    Ok(p) => alive
-                                        .get(&p)
-                                        .map(|(at, _)| {
-                                            at.elapsed()
-                                                >= std::time::Duration::from_millis(SEAT_SILENCE_MS)
-                                        })
-                                        // Seated and never once heard from. It
-                                        // reached the join RPC over a connection,
-                                        // so `ConnectionEstablished` recorded it;
-                                        // no entry at all means that connection
-                                        // and this client's memory of it are both
-                                        // gone.
-                                        .unwrap_or(true),
-                                    // A `peer_id` that will not parse cannot be
-                                    // pinged and cannot be judged. Left alone:
-                                    // §4.3 admitted it, and refusing to seat it
-                                    // is that check's business rather than this
-                                    // one's.
-                                    Err(_) => false,
-                                }
-                            })
-                            // The Tox key travels with the seat, because it is
-                            // read from the roster **before** the release takes
-                            // the entry out of it. D-019's kick needs it and it
-                            // is gone a line later.
-                            .map(|e| (e.seat, e.peer_id.clone(), e.tox_key))
-                            .collect();
-
-                        for (seat, peer, tox_key) in silent {
-                            match f.release_seat_before_the_first_hand(&peer, now) {
-                                Ok(sends) if !sends.is_empty() => {
-                                    let _ = events
-                                        .send(NodeEvent::Warning(format!(
-                                            "seat {seat} has answered nothing for {} s and the seat is free again",
-                                            SEAT_SILENCE_MS / 1000
-                                        )))
-                                        .await;
-                                    // **D-019: out of the roster is out of the
-                                    // group.** `Seat::Left` was constructed
-                                    // NOWHERE — only its match arm existed — so
-                                    // `Command::Unseated` was never sent and
-                                    // the kick was dead twice over: nothing
-                                    // asked for it, and `peer_for` could not
-                                    // have answered if anything had (`S1-I`).
-                                    //
-                                    // It is asked for here, at the one place a
-                                    // seat leaves a roster. Whether the driver
-                                    // can find the peer is a second question:
-                                    // the group-key pairing is learned from
-                                    // signed hand traffic, and before hand one
-                                    // there is none — so a seat released during
-                                    // formation is removed from the roster,
-                                    // which is the authority, and left in the
-                                    // group until it is rebuilt. Said here
-                                    // rather than discovered later.
-                                    if let Some(k) = tox_key {
-                                        t.tox_sink.tell(super::toxsink::Seat::Left(k));
+                    // **Give back the seat of anybody who has stopped answering,
+                    // and only before the first hand.**
+                    //
+                    // A player who sits down at a tournament and leaves before it
+                    // fills is ordinary. Nothing used to notice: `LeaveTable` clears
+                    // local state and tells the founder nothing, there is no message
+                    // that could tell it — `PLAYER_LEAVE` is a boundary-window event
+                    // of a chain that does not exist yet — and D-022's *held for two
+                    // hands* is counted in hands, of which there are none. So the
+                    // seat was held for ever and the replacement was refused with
+                    // *the table is full*, measured twice in one run.
+                    //
+                    // **Liveness is asked for rather than assumed.** `alive` is the
+                    // last time each peer answered a **ping**; a connection being up
+                    // is not evidence that anybody is behind it. `SEAT_SILENCE_MS`
+                    // is six ping intervals, so a seat is given back only by a peer
+                    // that has missed every one of them.
+                    //
+                    // `!ever_dealt` is the whole of what makes this not an eviction,
+                    // and it is checked here because `Formation` cannot see it.
+                    if !t.ever_dealt {
+                        if let Some(f) = t.table.as_mut().filter(|f| f.is_founder()) {
+                            let silent: Vec<(u8, Vec<u8>, Option<[u8; 32]>)> = f
+                                .roster()
+                                .seats()
+                                .iter()
+                                .filter(|e| Some(e.seat) != f.my_seat())
+                                .filter(|e| {
+                                    match PeerId::from_bytes(&e.peer_id) {
+                                        // Answered, and recently enough.
+                                        Ok(p) => alive
+                                            .get(&p)
+                                            .map(|(at, _)| {
+                                                at.elapsed()
+                                                    >= std::time::Duration::from_millis(SEAT_SILENCE_MS)
+                                            })
+                                            // Seated and never once heard from. It
+                                            // reached the join RPC over a connection,
+                                            // so `ConnectionEstablished` recorded it;
+                                            // no entry at all means that connection
+                                            // and this client's memory of it are both
+                                            // gone.
+                                            .unwrap_or(true),
+                                        // A `peer_id` that will not parse cannot be
+                                        // pinged and cannot be judged. Left alone:
+                                        // §4.3 admitted it, and refusing to seat it
+                                        // is that check's business rather than this
+                                        // one's.
+                                        Err(_) => false,
                                     }
-                                    // Only broadcasts come out of a release:
-                                    // there is nobody to reply to, because
-                                    // nothing asked. A `Reply` here would be a
-                                    // response to a request that does not
-                                    // exist, so it is dropped and said rather
-                                    // than sent nowhere quietly.
-                                    for s in sends {
-                                        match s {
-                                            Send::Broadcast(bytes) => {
-                                                if let Some(tt) = &t.table_topic {
-                                                    let _ = swarm
-                                                        .behaviour_mut()
-                                                        .gossipsub
-                                                        .publish(tt.clone(), bytes);
+                                })
+                                // The Tox key travels with the seat, because it is
+                                // read from the roster **before** the release takes
+                                // the entry out of it. D-019's kick needs it and it
+                                // is gone a line later.
+                                .map(|e| (e.seat, e.peer_id.clone(), e.tox_key))
+                                .collect();
+
+                            for (seat, peer, tox_key) in silent {
+                                match f.release_seat_before_the_first_hand(&peer, now) {
+                                    Ok(sends) if !sends.is_empty() => {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "seat {seat} has answered nothing for {} s and the seat is free again",
+                                                SEAT_SILENCE_MS / 1000
+                                            )))
+                                            .await;
+                                        // **D-019: out of the roster is out of the
+                                        // group.** `Seat::Left` was constructed
+                                        // NOWHERE — only its match arm existed — so
+                                        // `Command::Unseated` was never sent and
+                                        // the kick was dead twice over: nothing
+                                        // asked for it, and `peer_for` could not
+                                        // have answered if anything had (`S1-I`).
+                                        //
+                                        // It is asked for here, at the one place a
+                                        // seat leaves a roster. Whether the driver
+                                        // can find the peer is a second question:
+                                        // the group-key pairing is learned from
+                                        // signed hand traffic, and before hand one
+                                        // there is none — so a seat released during
+                                        // formation is removed from the roster,
+                                        // which is the authority, and left in the
+                                        // group until it is rebuilt. Said here
+                                        // rather than discovered later.
+                                        if let Some(k) = tox_key {
+                                            t.tox_sink.tell(super::toxsink::Seat::Left(k));
+                                        }
+                                        // Only broadcasts come out of a release:
+                                        // there is nobody to reply to, because
+                                        // nothing asked. A `Reply` here would be a
+                                        // response to a request that does not
+                                        // exist, so it is dropped and said rather
+                                        // than sent nowhere quietly.
+                                        for s in sends {
+                                            match s {
+                                                Send::Broadcast(bytes) => {
+                                                    if let Some(tt) = &t.table_topic {
+                                                        let _ = swarm
+                                                            .behaviour_mut()
+                                                            .gossipsub
+                                                            .publish(tt.clone(), bytes);
+                                                    }
+                                                }
+                                                Send::Reply(_) => {
+                                                    let _ = events
+                                                        .send(NodeEvent::Warning(
+                                                            "releasing a seat produced a reply, which has no request to answer"
+                                                                .into(),
+                                                        ))
+                                                        .await;
                                                 }
                                             }
-                                            Send::Reply(_) => {
-                                                let _ = events
-                                                    .send(NodeEvent::Warning(
-                                                        "releasing a seat produced a reply, which has no request to answer"
-                                                            .into(),
-                                                    ))
-                                                    .await;
-                                            }
                                         }
+                                        seat_on_tox(f, &t.tox_sink);
+                                        report_roster(&events, f).await;
                                     }
-                                    seat_on_tox(f, &t.tox_sink);
-                                    report_roster(&events, f).await;
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    let _ = events
-                                        .send(NodeEvent::Warning(format!(
-                                            "could not free seat {seat}: {e:?}"
-                                        )))
-                                        .await;
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "could not free seat {seat}: {e:?}"
+                                            )))
+                                            .await;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                // **Who this client can actually reach on the lobby topic.**
-                // A publish that returns `Ok` says only that it went somewhere.
-                // Measured on three clients on one machine, all discovered by
-                // mDNS within a second: `0 mesh peer(s) of 2` — both peers
-                // subscribed, neither grafted, so an advert reaches them only
-                // as an explicit peer or by gossip pull, and a table that
-                // should form in seconds took minutes. Nothing in the log
-                // distinguished that from "nobody is there" before this line.
-                {
-                    let g = &swarm.behaviour().gossipsub;
-                    let hash = topics.lobby.hash();
-                    let mesh = g.mesh_peers(&hash).count();
-                    let known = g
-                        .all_peers()
-                        .filter(|(_, subscribed)| subscribed.contains(&&hash))
-                        .count();
-                    // **Two different quantities, and the line used to read as
-                    // if they were one.** `mesh` counts peers GRAFTED into the
-                    // gossipsub mesh for this topic; `known` and `who` count and
-                    // name the peers SUBSCRIBED to it. The message was
-                    // `"{mesh} of {known} subscribed {who:?}"`, which reads as
-                    // *none of the eight are subscribed* and then lists eight
-                    // subscribers — the opposite of what it measures. A
-                    // nine-seat run on the libp2p path was read that way, as a
-                    // subscription failure, when what it says is that all eight
-                    // are subscribed and **none is grafted**: adverts then
-                    // arrive only by gossip pull, which is the "a table that
-                    // should form in seconds took minutes" symptom above.
-                    //
-                    // Named, not counted. The founder reporting one subscriber
-                    // while both joiners report two is the standing clue, and a
-                    // count cannot say WHICH peer is missing.
-                    let who: Vec<String> = g
-                        .all_peers()
-                        .filter(|(_, subscribed)| subscribed.contains(&&hash))
-                        .map(|(p, _)| p.to_string().chars().rev().take(6).collect::<String>())
-                        .collect();
-                    // **Both sides of the comparison, named.** A table forms
-                    // exactly when the founder sees every joiner subscribed to
-                    // the lobby topic, and fails when it sees one of two while
-                    // reporting both connected — measured, five runs. A count
-                    // cannot say WHICH peer is connected and not subscribed,
-                    // and that is the whole question.
-                    // **Which protocol gossipsub thinks each subscriber
-                    // speaks, because that decides whether it can be grafted at
-                    // all.** `all_peers` — which `known` and `who` are built
-                    // from — does not filter on `PeerKind`, while
-                    // `get_random_peers_dynamic`, which is what the heartbeat
-                    // fills the mesh from, requires `p.kind.is_gossipsub()`
-                    // (`libp2p-gossipsub-0.49.5/src/behaviour.rs:3541` and
-                    // `types.rs:166`). A peer whose protocol is not yet
-                    // negotiated, or is Floodsub, or is NotSupported, therefore
-                    // counts as subscribed here and is invisible to the mesh.
-                    //
-                    // That is two different failures with one appearance, which
-                    // is the shape this project keeps paying for. Non-zero means
-                    // the protocol; zero means backoff or score.
-                    //
-                    // **Compared as text, because `PeerKind` is not exported.**
-                    // `peer_protocol()` returns `&PeerKind` publicly and the
-                    // type is absent from the crate's `pub use` list
-                    // (`lib.rs:119`), so the variants cannot be matched. The
-                    // three names below are `types.rs:126–137`. The polarity is
-                    // deliberate: they are the **healthy** kinds, so a library
-                    // that renames one makes this line shout about every peer
-                    // rather than fall silent about a broken one.
-                    const GRAFTABLE: [&str; 3] = ["Gossipsubv1_2", "Gossipsubv1_1", "Gossipsub"];
-                    let subscribed: std::collections::HashSet<libp2p::PeerId> = g
-                        .all_peers()
-                        .filter(|(_, subs)| subs.contains(&&hash))
-                        .map(|(p, _)| *p)
-                        .collect();
-                    let not_gossipsub = g
-                        .peer_protocol()
-                        .filter(|(p, _)| subscribed.contains(p))
-                        .filter(|(_, kind)| !GRAFTABLE.contains(&format!("{kind:?}").as_str()))
-                        .count();
-                    let connected: Vec<String> = poker_peers
-                        .iter()
-                        .map(|p| p.to_string().chars().rev().take(6).collect::<String>())
-                        .collect();
-                    // **A table nobody can see is worth saying out loud.**
-                    // Measured: one run in five, the founder found no local peer
-                    // at all — no mDNS discovery, no connection — while the two
-                    // joiners found each other. Its log said `hosting T`, then
-                    // `public lobby: nobody else yet`, and nothing else for the
-                    // rest of the run. From the outside that is
-                    // indistinguishable from a table waiting for players, and
-                    // it is the opposite: the players are there and this client
-                    // is alone.
-                    if connected.is_empty() && !t.alone_said {
-                        t.alone_said = true;
-                        let _ = events
-                            .send(NodeEvent::Warning(
-                                "no other poker client has been reached yet — a table hosted now is one nobody can see. On one machine that is local discovery failing; across networks it is the relay."
-                                    .into(),
-                            ))
-                            .await;
+                    // **Who this client can actually reach on the lobby topic.**
+                    // A publish that returns `Ok` says only that it went somewhere.
+                    // Measured on three clients on one machine, all discovered by
+                    // mDNS within a second: `0 mesh peer(s) of 2` — both peers
+                    // subscribed, neither grafted, so an advert reaches them only
+                    // as an explicit peer or by gossip pull, and a table that
+                    // should form in seconds took minutes. Nothing in the log
+                    // distinguished that from "nobody is there" before this line.
+                    {
+                        let g = &swarm.behaviour().gossipsub;
+                        let hash = topics.lobby.hash();
+                        let mesh = g.mesh_peers(&hash).count();
+                        let known = g
+                            .all_peers()
+                            .filter(|(_, subscribed)| subscribed.contains(&&hash))
+                            .count();
+                        // **Two different quantities, and the line used to read as
+                        // if they were one.** `mesh` counts peers GRAFTED into the
+                        // gossipsub mesh for this topic; `known` and `who` count and
+                        // name the peers SUBSCRIBED to it. The message was
+                        // `"{mesh} of {known} subscribed {who:?}"`, which reads as
+                        // *none of the eight are subscribed* and then lists eight
+                        // subscribers — the opposite of what it measures. A
+                        // nine-seat run on the libp2p path was read that way, as a
+                        // subscription failure, when what it says is that all eight
+                        // are subscribed and **none is grafted**: adverts then
+                        // arrive only by gossip pull, which is the "a table that
+                        // should form in seconds took minutes" symptom above.
+                        //
+                        // Named, not counted. The founder reporting one subscriber
+                        // while both joiners report two is the standing clue, and a
+                        // count cannot say WHICH peer is missing.
+                        let who: Vec<String> = g
+                            .all_peers()
+                            .filter(|(_, subscribed)| subscribed.contains(&&hash))
+                            .map(|(p, _)| p.to_string().chars().rev().take(6).collect::<String>())
+                            .collect();
+                        // **Both sides of the comparison, named.** A table forms
+                        // exactly when the founder sees every joiner subscribed to
+                        // the lobby topic, and fails when it sees one of two while
+                        // reporting both connected — measured, five runs. A count
+                        // cannot say WHICH peer is connected and not subscribed,
+                        // and that is the whole question.
+                        // **Which protocol gossipsub thinks each subscriber
+                        // speaks, because that decides whether it can be grafted at
+                        // all.** `all_peers` — which `known` and `who` are built
+                        // from — does not filter on `PeerKind`, while
+                        // `get_random_peers_dynamic`, which is what the heartbeat
+                        // fills the mesh from, requires `p.kind.is_gossipsub()`
+                        // (`libp2p-gossipsub-0.49.5/src/behaviour.rs:3541` and
+                        // `types.rs:166`). A peer whose protocol is not yet
+                        // negotiated, or is Floodsub, or is NotSupported, therefore
+                        // counts as subscribed here and is invisible to the mesh.
+                        //
+                        // That is two different failures with one appearance, which
+                        // is the shape this project keeps paying for. Non-zero means
+                        // the protocol; zero means backoff or score.
+                        //
+                        // **Compared as text, because `PeerKind` is not exported.**
+                        // `peer_protocol()` returns `&PeerKind` publicly and the
+                        // type is absent from the crate's `pub use` list
+                        // (`lib.rs:119`), so the variants cannot be matched. The
+                        // three names below are `types.rs:126–137`. The polarity is
+                        // deliberate: they are the **healthy** kinds, so a library
+                        // that renames one makes this line shout about every peer
+                        // rather than fall silent about a broken one.
+                        const GRAFTABLE: [&str; 3] = ["Gossipsubv1_2", "Gossipsubv1_1", "Gossipsub"];
+                        let subscribed: std::collections::HashSet<libp2p::PeerId> = g
+                            .all_peers()
+                            .filter(|(_, subs)| subs.contains(&&hash))
+                            .map(|(p, _)| *p)
+                            .collect();
+                        let not_gossipsub = g
+                            .peer_protocol()
+                            .filter(|(p, _)| subscribed.contains(p))
+                            .filter(|(_, kind)| !GRAFTABLE.contains(&format!("{kind:?}").as_str()))
+                            .count();
+                        let connected: Vec<String> = poker_peers
+                            .iter()
+                            .map(|p| p.to_string().chars().rev().take(6).collect::<String>())
+                            .collect();
+                        // **A table nobody can see is worth saying out loud.**
+                        // Measured: one run in five, the founder found no local peer
+                        // at all — no mDNS discovery, no connection — while the two
+                        // joiners found each other. Its log said `hosting T`, then
+                        // `public lobby: nobody else yet`, and nothing else for the
+                        // rest of the run. From the outside that is
+                        // indistinguishable from a table waiting for players, and
+                        // it is the opposite: the players are there and this client
+                        // is alone.
+                        if connected.is_empty() && !t.alone_said {
+                            t.alone_said = true;
+                            let _ = events
+                                .send(NodeEvent::Warning(
+                                    "no other poker client has been reached yet — a table hosted now is one nobody can see. On one machine that is local discovery failing; across networks it is the relay."
+                                        .into(),
+                                ))
+                                .await;
+                        }
+                        if !connected.is_empty() {
+                            t.alone_said = false;
+                        }
+                        if known > 0 || mesh > 0 || !connected.is_empty() {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "lobby topic: {mesh} of {known} subscribed peers grafted ({not_gossipsub} cannot be, wrong or unnegotiated protocol); subscribed {who:?}; connected {connected:?}"
+                                )))
+                                .await;
+                        }
                     }
-                    if !connected.is_empty() {
-                        t.alone_said = false;
-                    }
-                    if known > 0 || mesh > 0 || !connected.is_empty() {
+                    // Nothing is dropped silently. "No warnings" and "the warnings
+                    // were thrown away" must not look the same in a log.
+                    let lost = events.take_dropped();
+                    if lost > 0 {
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "lobby topic: {mesh} of {known} subscribed peers grafted ({not_gossipsub} cannot be, wrong or unnegotiated protocol); subscribed {who:?}; connected {connected:?}"
+                                "{lost} advisory event(s) dropped: the log could not keep up, and the node did not wait for it"
                             )))
                             .await;
                     }
-                }
-                // Nothing is dropped silently. "No warnings" and "the warnings
-                // were thrown away" must not look the same in a log.
-                let lost = events.take_dropped();
-                if lost > 0 {
-                    let _ = events
-                        .send(NodeEvent::Warning(format!(
-                            "{lost} advisory event(s) dropped: the log could not keep up, and the node did not wait for it"
-                        )))
-                        .await;
-                }
-                // Told to the interface as well, which keeps its own copy and
-                // cannot see this clock.
-                let _ = events.send(NodeEvent::Swept { now_ms: now }).await;
+                    // Told to the interface as well, which keeps its own copy and
+                    // cannot see this clock.
+                    let _ = events.send(NodeEvent::Swept { now_ms: now }).await;
 
-                // Re-broadcast this node's own table.
-                //
-                // Through the `Formation`, which owns the table key and the
-                // advertisement together. It used to be published from a
-                // separate copy here, and the founder's own record of what it
-                // had signed then went stale: a joiner naming the copy it heard
-                // was refused with "the advertisement has expired", which is the
-                // defect the first two-instance run found and which no unit test
-                // could have, because it needs thirty seconds to appear.
-                // **A closed table is advertised too, and the sentence that
-                // used to stand here is why it was not.** It read: *a full
-                // tournament under way has nobody to attract — it is a closed
-                // group now — and a lobby listing it is a lobby listing a door
-                // that does not open.* True of strangers, and false of the one
-                // person who needs it most.
-                //
-                // The advert is **how a seat that was disconnected finds its way
-                // back**. Stop it and the advert expires at `AD_TTL_MS`, and a
-                // player whose client restarts ninety seconds later has no way
-                // to find the table at all: no advert, no address, nothing.
-                // Measured, twice — a client back after twenty seconds ran out
-                // its whole remaining life reporting `NO TABLE` while the table
-                // played thirty hands without it. D-022 gives that seat two
-                // hands of allowance and the transport gave it no way to spend
-                // them.
-                //
-                // **That reason is gone and so is the advertising, once a hand
-                // has been dealt.** The owner has ruled the restarting client
-                // out of scope — *“ten peer má smůlu”* — and a client whose link
-                // merely dropped never lost its table and never looks in the
-                // lobby for it. What the advert did keep open was a door for
-                // strangers: `S1-T`, where the paragraph above was wrong on its
-                // own terms. *“A stranger's `JOIN_REQUEST` is refused as the
-                // table is full”* is false for any table that started at
-                // `min_players_to_start` below `max_players` — this client's own
-                // default — and accepting one un-ratifies a table in the middle
-                // of a tournament. §7.3 withdraws a table's advert when it
-                // starts, `reason = 1`, and this is that withdrawal by omission.
-                if let Some(f) = t.table
-                    .as_mut()
-                    .filter(|f| f.is_founder() && !t.ever_dealt)
-                {
-                    match f.readvertise(now, AD_TTL_MS) {
-                        Ok(bytes) => {
-                            let n = bytes.len();
-                            match swarm
-                                .behaviour_mut()
-                                .gossipsub
-                                .publish(topics.lobby.clone(), bytes.clone())
-                            {
-                                Ok(_) => {
-                                    let _ = events.send(NodeEvent::Published { bytes: n }).await;
-                                    // And into this node's own lobby, so a
-                                    // founder sees the table it is sitting at.
-                                    show_own_table(
-                                        &bytes,
-                                        &my_app_key,
-                                        now,
-                                        &mut state.limits,
-                                        &mut state.lobby,
-                                        &events,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    // No mesh peer yet is the ordinary case at
-                                    // start-up, not a fault.
-                                    let _ = events
-                                        .send(NodeEvent::Warning(format!("not published: {e}")))
+                    // Re-broadcast this node's own table.
+                    //
+                    // Through the `Formation`, which owns the table key and the
+                    // advertisement together. It used to be published from a
+                    // separate copy here, and the founder's own record of what it
+                    // had signed then went stale: a joiner naming the copy it heard
+                    // was refused with "the advertisement has expired", which is the
+                    // defect the first two-instance run found and which no unit test
+                    // could have, because it needs thirty seconds to appear.
+                    // **A closed table is advertised too, and the sentence that
+                    // used to stand here is why it was not.** It read: *a full
+                    // tournament under way has nobody to attract — it is a closed
+                    // group now — and a lobby listing it is a lobby listing a door
+                    // that does not open.* True of strangers, and false of the one
+                    // person who needs it most.
+                    //
+                    // The advert is **how a seat that was disconnected finds its way
+                    // back**. Stop it and the advert expires at `AD_TTL_MS`, and a
+                    // player whose client restarts ninety seconds later has no way
+                    // to find the table at all: no advert, no address, nothing.
+                    // Measured, twice — a client back after twenty seconds ran out
+                    // its whole remaining life reporting `NO TABLE` while the table
+                    // played thirty hands without it. D-022 gives that seat two
+                    // hands of allowance and the transport gave it no way to spend
+                    // them.
+                    //
+                    // **That reason is gone and so is the advertising, once a hand
+                    // has been dealt.** The owner has ruled the restarting client
+                    // out of scope — *“ten peer má smůlu”* — and a client whose link
+                    // merely dropped never lost its table and never looks in the
+                    // lobby for it. What the advert did keep open was a door for
+                    // strangers: `S1-T`, where the paragraph above was wrong on its
+                    // own terms. *“A stranger's `JOIN_REQUEST` is refused as the
+                    // table is full”* is false for any table that started at
+                    // `min_players_to_start` below `max_players` — this client's own
+                    // default — and accepting one un-ratifies a table in the middle
+                    // of a tournament. §7.3 withdraws a table's advert when it
+                    // starts, `reason = 1`, and this is that withdrawal by omission.
+                    if let Some(f) = t.table
+                        .as_mut()
+                        .filter(|f| f.is_founder() && !t.ever_dealt)
+                    {
+                        match f.readvertise(now, AD_TTL_MS) {
+                            Ok(bytes) => {
+                                let n = bytes.len();
+                                match swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .publish(topics.lobby.clone(), bytes.clone())
+                                {
+                                    Ok(_) => {
+                                        let _ = events.send(NodeEvent::Published { bytes: n }).await;
+                                        // And into this node's own lobby, so a
+                                        // founder sees the table it is sitting at.
+                                        show_own_table(
+                                            &bytes,
+                                            &my_app_key,
+                                            now,
+                                            &mut state.limits,
+                                            &mut state.lobby,
+                                            &events,
+                                        )
                                         .await;
+                                    }
+                                    Err(e) => {
+                                        // No mesh peer yet is the ordinary case at
+                                        // start-up, not a fault.
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!("not published: {e}")))
+                                            .await;
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            let _ = events
-                                .send(NodeEvent::Warning(format!("own advert: {e:?}")))
-                                .await;
+                            Err(e) => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!("own advert: {e:?}")))
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -7570,6 +7646,81 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
+
+/// `D-043`: which table a swarm event is for. A gossip message, a
+/// subscription: the table whose topic it names. A join request: the table
+/// whose id it names (the founder of several answers for the right one). A
+/// join answer: the table whose request it answers. Everything else: the
+/// active table, which is where a lobby event or a connection lands as it
+/// always did.
+fn table_for_event(
+    tables: &[TableRun],
+    event: &SwarmEvent<PokerBehaviourEvent>,
+    active: usize,
+    join_pending: &std::collections::HashMap<libp2p::request_response::OutboundRequestId, usize>,
+) -> usize {
+    let by_topic = |topic: &gossipsub::TopicHash| {
+        tables
+            .iter()
+            .position(|t| t.table_topic.as_ref().is_some_and(|x| *topic == x.hash()))
+    };
+    let found = match event {
+        SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            message,
+            ..
+        })) => by_topic(&message.topic),
+        SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
+            gossipsub::Event::Subscribed { topic, .. } | gossipsub::Event::Unsubscribed { topic, .. },
+        )) => by_topic(topic),
+        SwarmEvent::Behaviour(PokerBehaviourEvent::Join(request_response::Event::Message {
+            message: request_response::Message::Request { request, .. },
+            ..
+        })) => super::joinwire::receive_join_request(request)
+            .ok()
+            .and_then(|(req, _, _)| {
+                tables
+                    .iter()
+                    .position(|t| t.table.as_ref().is_some_and(|f| f.table_id() == req.table_id))
+            }),
+        SwarmEvent::Behaviour(PokerBehaviourEvent::Join(request_response::Event::Message {
+            message: request_response::Message::Response { request_id, .. },
+            ..
+        })) => join_pending.get(request_id).copied(),
+        _ => None,
+    };
+    found.unwrap_or(active).min(tables.len().saturating_sub(1))
+}
+
+/// `D-043`: the earliest of one timer across the tables, with its table.
+fn earliest(
+    tables: &[TableRun],
+    at: impl Fn(&TableRun) -> Option<tokio::time::Instant>,
+) -> Option<(usize, tokio::time::Instant)> {
+    tables
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| at(t).map(|when| (i, when)))
+        .min_by_key(|(_, when)| *when)
+}
+
+/// `D-043`: the next message from any table's group, with the table it came
+/// from. A slot without a group never answers; a closed transport is waited
+/// on for ever rather than reported, as one table's `next` always was.
+async fn next_from_tables(
+    tables: &mut [TableRun],
+) -> Option<(usize, crate::table::transport::FromTable)> {
+    let futures: Vec<_> = tables
+        .iter_mut()
+        .enumerate()
+        .map(|(i, t)| Box::pin(async move { (i, t.tox_sink.next().await) }))
+        .collect();
+    let ((i, item), _, _) = futures::future::select_all(futures).await;
+    match item {
+        Some(item) => Some((i, item)),
+        None => std::future::pending().await,
+    }
+}
+
 
 /// Tell the interface what table this is.
 ///
@@ -7665,6 +7816,9 @@ fn advert_hash_of(bytes: &[u8]) -> [u8; 32] {
 
 /// §7.2's bound on a table name, in **bytes**.
 pub const TABLE_NAME_MAX: usize = 64;
+
+/// `D-043`: how many tables one client sits at, at most -- the owner's four.
+pub const MAX_TABLES: usize = 4;
 
 /// `D-042`: how long after a tournament's end its group is left. Two
 /// rounds of the five-second resend loop, so a seat that missed the terminal

@@ -3854,14 +3854,24 @@ so that a single table never stops working while the second is being built.
    a table's. Nothing else moves and nothing behaves differently: the transformation was mechanical (a script that
    took each local's declaration and its comment into the struct and renamed the uses), the compiler's word on it
    was nine shadowed bindings named `t`, and the bed's word is in point 4.
-2. **Stage 2 (next): the loop holds a vector of tables.** `tables: Vec<TableRun>`, at most `MAX_TABLES` (four);
-   each arm of the loop picks its table -- a gossip message by its topic, a join answer by its request, a Tox
-   message by the sink it came from, a command and a tick for every table -- and the driver's `Driver` is shared by
-   every table's sink. `CreateTable` and `JoinTable` open a new slot while the others play; `LeaveTable`, `Act` and
-   the table chat carry the table's key.
+2. **Stage 2 (built the same day): the loop holds a vector of tables.** `tables: Vec<TableRun>`, at most
+   `MAX_TABLES` (four), the first slot always there and `active` the one the window is at. Each arm of the loop
+   picks its table before it touches one: a swarm event by `table_for_event` -- a gossip message or a subscription
+   by its topic, a join request by the table id it names (a founder of several answers for the right one), a
+   join answer by the request it answers (`join_pending`) -- and the active table for everything else; a Tox
+   message by the sink it came from (`next_from_tables`, one future over every sink); the two timers, the own
+   clock and the deal, by the earliest deadline among the tables, read before the select so the timers own
+   their instants and borrow no table; the resend, stall and housekeeping ticks for every table in turn, the
+   housekeeping's lobby questions once. The driver underneath is one `Arc` shared by every table's sink
+   (`TableSink::share`). A `CreateTable` or `JoinTable` while this client sits at a table opens a new slot and
+   makes it active; `LeaveTable` closes the slot when another is open. The discover tick's closed-table reading
+   is every table's, and the DHT's effort follows any closed one; a founder's lobby answer offers every table
+   it founded and has not dealt at. Commands and events still name no table: an `Act` goes to the active
+   table, and every event reaches the window as before -- which is why stage 3 comes before a client is
+   dealt at two tables at once.
 3. **Stage 3: the window.** Every per-table event carries the table's key; the app keeps one state per table and
    the window shows them as tabs, the felt drawing the one in front; a turn at a table behind brings its tab
    forward, as every multitabling client does.
-4. **Measured.** On the bed, run C's scenario again (`tools/table-run.ps1 -Seats 3 -StartStack 200 -RehostAt 120 -Seconds 330`, `run081126-3`) on the `TableRun` build: the second table's first hand 15.7 s after the hosting (15.4 s in `run213600-3`), the joiners in its group 0.1 s and 5.1 s after asking, the tournament over at 149.2-152.8 s and every seat out of its group 10.1-11.1 s later, fifteen hands opened and fifteen finished on every seat, one genesis per hand per table, no certificate, 7.7 s per hand in the steady state.
+4. **Measured.** On the bed, run C's scenario again (`tools/table-run.ps1 -Seats 3 -StartStack 200 -RehostAt 120 -Seconds 330`, `run081126-3`) on the `TableRun` build: the second table's first hand 15.7 s after the hosting (15.4 s in `run213600-3`), the joiners in its group 0.1 s and 5.1 s after asking, the tournament over at 149.2-152.8 s and every seat out of its group 10.1-11.1 s later, fifteen hands opened and fifteen finished on every seat, one genesis per hand per table, no certificate, 7.7 s per hand in the steady state. Stage 2: run C's scenario on the stage-2 build (`run082901-3`): 17 hands opened and 17 finished on every seat, one genesis per hand per table; the first tournament over at 98-102 s and every seat out of its group 10.3-11.6 s later; the second table's first hand 15.4 s after the hosting, both joiners in its group 0.1 s after asking; 10.8 s per hand in the steady state.
 
 **Guard.** The library's tests unchanged (865), the bed's runs named in point 4, and the S1-DN row's tools.
