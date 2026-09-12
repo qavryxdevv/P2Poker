@@ -2842,6 +2842,13 @@ per D-005"** and rested half on a status nothing sets (J5). The sitting-out half
 survives, in the form that names the chained event rather than the status it
 produces; the absent half is gone with the status.
 
+**D-047 (2026-09-12).** A seat certified absent that has already come back `MAX_RETURNS`
+times is out of the table for good at that hand's boundary: its chips leave the table
+(`stack_at_hand_start` is zero from hand `k+1`), so every rule in this section treats it
+as busted -- not dealt in, no blinds, no return -- and every client removes it from the
+table's group for good (D-045). Every seat derives the same from the same certificates;
+nothing new is said on the wire. The paragraph below is the dead seat short of that limit.
+
 A seat outside `dealt_in` keeps its stack, pays its blinds and antes as dead money,
 takes no cards, and is not a party to the cryptography. That is D-005 and it is
 unchanged. It cannot win the blind it posts — a documented, forced deviation from

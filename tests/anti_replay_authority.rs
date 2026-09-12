@@ -396,6 +396,7 @@ fn opening3(my_seat: u8) -> Opening {
         grace: vec![GRACE_HANDS; 3],
         present_run: vec![0; 3],
         returns: vec![0; 3],
+        out: Vec::new(),
         button: None,
     }
 }

@@ -187,6 +187,10 @@ param(
     [ValidateRange(0, 100000)][int]$OfflineAt = 0,
     [ValidateRange(0, 3600)][int]$OfflineFor = 75,
     [ValidateRange(0, 32)][int]$OfflineNode = 1,
+    # `-OfflineEvery <s>`: the outage again every that many seconds from the
+    # first, the same length each time; four absences in one run is how D-047
+    # (the fourth absence is the last) is measured. Zero cuts once.
+    [ValidateRange(0, 3600)][int]$OfflineEvery = 0,
     # `-StallJoin <seconds> -StallJoinNode <n>` starves one joiner's **group
     # handshake** for that long, right after it accepts the invitation.
     #
@@ -422,11 +426,12 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # The founder alone, and handed to the job like the stack: the job sees
     # nothing of this scope (the first run printed the banner and kicked nobody).
     $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery)
         if ($offAt -gt 0) {
             $env:P2P_POKER_OFFLINE_AT = "$offAt"
             $env:P2P_POKER_OFFLINE_FOR = "$offFor"
+            if ($offEvery -gt 0) { $env:P2P_POKER_OFFLINE_EVERY = "$offEvery" }
         }
         if ($diverge -gt 0) { $env:P2P_POKER_DIVERGE_AT_HAND = "$diverge" }
         if ($downAt -gt 0) {
@@ -502,7 +507,7 @@ if ($StallJoin -gt 0) {
     Write-Host "     expect a leave-and-rejoin, counted on the status line. Needs --features fault-harness)"
 }
 if ($OfflineAt -gt 0) {
-    Write-Host "==> n$OfflineNode's INTERNET goes away at $OfflineAt s for $OfflineFor s, at the socket; the process lives on"
+    Write-Host "==> n$OfflineNode's INTERNET goes away at $OfflineAt s for $OfflineFor s, at the socket; the process lives on$(if ($OfflineEvery -gt 0) { " -- and again every $OfflineEvery s" })"
     Write-Host "    (needs a binary built with --features fault-harness; expect the library's 58 s timeout at every member)"
 }
 if ($LinkDownAt -gt 0) {

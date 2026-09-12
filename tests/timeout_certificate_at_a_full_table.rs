@@ -348,6 +348,7 @@ fn opening_at_max_seats(my_seat: u8) -> Opening {
         grace: vec![GRACE_HANDS; n],
         present_run: vec![0; n],
         returns: vec![0; n],
+        out: Vec::new(),
         button: None,
     }
 }

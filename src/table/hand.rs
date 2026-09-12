@@ -274,6 +274,11 @@ pub struct Opening {
     /// this receiver's own; at `MAX_RETURNS` this client votes for no further
     /// return of that seat, and a certificate needs every voter.
     pub returns: Vec<u8>,
+    /// `D-047`: the seats out of the table for good -- certified absent with
+    /// `MAX_RETURNS` returns behind them. Their chips left the table at the
+    /// boundary that put them here, so every rule treats them as busted:
+    /// not dealt in, no blinds, no return. Carried like `returns`.
+    pub out: Vec<SeatIdx>,
     /// How long the whole hand may take before any peer may end it.
     ///
     /// `PROTOCOL.md` §8: the only terminus a stalled **cryptographic** stage
@@ -363,6 +368,7 @@ impl Opening {
             grace: vec![GRACE_HANDS; usize::from(ad.max_players)],
             present_run: vec![0; usize::from(ad.max_players)],
             returns: vec![0; usize::from(ad.max_players)],
+            out: Vec::new(),
             // The first hand of a table: nothing has decided the button yet.
             button: None,
         })
@@ -519,6 +525,7 @@ impl Opening {
             grace: vec![GRACE_HANDS; usize::from(base.max_players)],
             present_run: vec![0; usize::from(base.max_players)],
             returns: vec![0; usize::from(base.max_players)],
+            out: Vec::new(),
             ..base
         };
         Ok((opening, signers))
@@ -8305,6 +8312,18 @@ impl Hand {
 
     /// Hand `k+1` from a terminal and the stacks everybody holds at it.
     fn next_hand_with(&self, terminal: Hash, stacks: Vec<Chips>) -> Option<Opening> {
+        // `D-047`: a seat certified absent with `MAX_RETURNS` returns behind it
+        // is out of the table for good. Its chips leave the table here, so it
+        // is busted in every rule below -- not dealt in, no blinds, no return
+        // (a busted seat cannot return) -- and every seat computes the same
+        // from the same certificates: nothing new is said on the wire.
+        let out = self.out_for_good();
+        let mut stacks = stacks;
+        for seat in &out {
+            if let Some(s) = stacks.get_mut(usize::from(*seat)) {
+                *s = 0;
+            }
+        }
         let stacks = &stacks;
         let alive: Vec<bool> = (0..usize::from(self.open.max_players))
             .map(|i| stacks.get(i).copied().unwrap_or(0) > 0)
@@ -8601,6 +8620,7 @@ impl Hand {
             grace,
             present_run,
             returns,
+            out,
             button: Some(positions.button),
         })
     }
@@ -9218,6 +9238,22 @@ impl Hand {
     /// `D-032`: how many times each seat has come back, indexed by seat.
     pub fn returns(&self) -> &[u8] {
         &self.open.returns
+    }
+
+    /// `D-047`: the seats out of the table for good -- certified absent with
+    /// `MAX_RETURNS` returns behind them, this hand or before. Their chips
+    /// leave the table at the next boundary; the node removes them from the
+    /// table's group for good and a client that finds itself here leaves.
+    pub fn out_for_good(&self) -> Vec<SeatIdx> {
+        let mut out = self.open.out.clone();
+        for seat in &self.certified {
+            let came_back = self.open.returns.get(usize::from(*seat)).copied().unwrap_or(0);
+            if came_back >= crate::protocol::constants::MAX_RETURNS && !out.contains(seat) {
+                out.push(*seat);
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     pub fn returned(&self) -> &[SeatIdx] {
@@ -9920,6 +9956,7 @@ mod tests {
             grace: vec![GRACE_HANDS; 3],
             present_run: vec![0; 3],
             returns: vec![0; 3],
+            out: Vec::new(),
             button: None,
         }
     }
@@ -9962,6 +9999,7 @@ mod tests {
             grace: vec![GRACE_HANDS; 5],
             present_run: vec![0; 5],
             returns: vec![0; 5],
+            out: Vec::new(),
             button: None,
         }
     }
@@ -10057,6 +10095,7 @@ mod tests {
             grace: vec![GRACE_HANDS; 3],
             present_run: vec![0; 3],
             returns: vec![0; 3],
+            out: Vec::new(),
             button: None,
         }
     }
@@ -14839,6 +14878,36 @@ mod tests {
         assert!(certs_in(&from_b, &table_id, 1).is_empty(), "one vote seals nothing");
         assert!(hands[0].returned().is_empty(), "the seat stays out");
         assert!(hands[1].returned().is_empty());
+    }
+
+    /// `D-047`: the fourth absence is the last. A seat certified absent with
+    /// `MAX_RETURNS` returns behind it is out of the table: its chips leave
+    /// the table at the boundary, so it is dealt in no more and cannot return.
+    #[test]
+    fn the_fourth_absence_takes_the_seat_out() {
+        use crate::protocol::constants::MAX_RETURNS;
+        let (mut hands, _keys) = a_settled_hand_with_a_bystander();
+        for h in hands.iter_mut() {
+            h.open.returns[2] = MAX_RETURNS;
+            h.certified.push(2);
+        }
+        for (i, h) in hands.iter().enumerate() {
+            assert_eq!(h.out_for_good(), vec![2], "seat {i}: the fourth absence puts seat 2 out");
+            let next = h.next_hand().expect("a successor: two seats with chips remain");
+            assert_eq!(next.out, vec![2], "seat {i}: carried");
+            assert_eq!(next.seats.iter().find(|s| s.0 == 2).map(|s| s.2), Some(0), "seat {i}: its chips left the table");
+            assert!(!next.required.contains(&2), "seat {i}: and it is required no more");
+        }
+        // Short of the limit, a certified seat keeps its chips: D-032's dead seat.
+        let (mut hands, _keys) = a_settled_hand_with_a_bystander();
+        hands[0].open.returns[2] = MAX_RETURNS - 1;
+        hands[0].certified.push(2);
+        assert!(hands[0].out_for_good().is_empty());
+        // What it holds at the boundary: the bystander posted its blind as dead money.
+        let kept = hands[0].stack_at_boundary(2);
+        assert!(kept > 0);
+        let next = hands[0].next_hand().expect("a successor");
+        assert_eq!(next.seats.iter().find(|s| s.0 == 2).map(|s| s.2), Some(kept));
     }
 
     /// `D-033`: a table of two, dealt to the first bet, seen from a third

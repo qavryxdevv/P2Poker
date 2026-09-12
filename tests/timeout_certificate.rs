@@ -60,6 +60,7 @@ fn opening3_with_bank(my_seat: u8, time_bank_ms: u32) -> Opening {
         grace: vec![GRACE_HANDS; 3],
         present_run: vec![0; 3],
         returns: vec![0; 3],
+        out: Vec::new(),
         button: None,
     }
 }

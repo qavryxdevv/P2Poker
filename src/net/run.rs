@@ -2146,6 +2146,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         .map(|e| (e.app_public_key, e.tox_key))
                 });
                 if let Some((app, line)) = entry {
+                    // `D-047`: the fourth absence is the last. Out of the table's
+                    // group for good, never invited again, and out of the table:
+                    // its chips leave at the boundary (the engine), so what the
+                    // felt shows is a seat that left. Silence is no condition here:
+                    // a seat certified four times over is out whether its line is
+                    // bad or its play is.
+                    let at_the_limit = $h.returns().get(usize::from(seat)).copied().unwrap_or(0)
+                        >= crate::protocol::constants::MAX_RETURNS;
+                    if at_the_limit {
+                        $t.tox_sink.tell(super::toxsink::Seat::Remove {
+                            app_key: Some(app),
+                            tox_key: line,
+                            for_good: true,
+                        });
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "seat {seat} is out of the table for good after its fourth absence (D-047): removed from the table's group by the table's word, never to be invited again; its chips leave the table at the boundary"
+                            )))
+                            .await;
+                        let _ = events.send(NodeEvent::SeatLeft { seat, quit: true }).await;
+                        continue;
+                    }
                     let quiet = [
                         $t.tox_sink.quiet_secs(&app),
                         line.and_then(|k| $t.tox_sink.quiet_line(&k)),
@@ -5880,6 +5902,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // `D-045`: and on the tick, for a word the moment missed.
                     if let Some(h) = t.hand.as_ref() {
                         remove_by_the_word!(t, h);
+                    }
+                    // `D-047`: this seat itself, certified out for the fourth time, is
+                    // out of the table; the client leaves, as D-032's heads-up client
+                    // does at its fourth absence.
+                    let out_myself = t.hand.as_ref().and_then(|h| {
+                        let me = h.my_seat();
+                        h.out_for_good().contains(&me).then_some(me)
+                    });
+                    if let Some(me) = out_myself {
+                        let why = format!(
+                            "seat {me} -- this client -- is out of the table for good after its fourth absence (D-047): leaving"
+                        );
+                        let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                        leave_table_now!(t, why);
                     }
                     // `D-041`: every seat's link as the table's group knows it. On a
                     // Tox table the group carries the hand and the felt reads presence

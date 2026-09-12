@@ -118,10 +118,14 @@ fn stall_join_secs() -> u64 {
 /// mid-hand, both sides choosing to wait, and no way back once the line
 /// returned (`S1-EB`) -- lives entirely past the library's timeout, where
 /// that knob cannot reach. Compiled out without `--features fault-harness`.
+///
+/// `P2P_POKER_OFFLINE_EVERY=<s>`: the outage again every that many seconds
+/// from the first, for the same length each time -- four absences in one run
+/// is how `D-047` is measured. Zero, the default, cuts once.
 #[cfg(feature = "fault-harness")]
-fn offline_window() -> Option<(Duration, Duration)> {
+fn offline_window() -> Option<(Duration, Duration, Duration)> {
     use std::sync::OnceLock;
-    static WINDOW: OnceLock<Option<(Duration, Duration)>> = OnceLock::new();
+    static WINDOW: OnceLock<Option<(Duration, Duration, Duration)>> = OnceLock::new();
     *WINDOW.get_or_init(|| {
         let read = |name: &str| {
             std::env::var(name)
@@ -131,7 +135,9 @@ fn offline_window() -> Option<(Duration, Duration)> {
         };
         let at = read("P2P_POKER_OFFLINE_AT");
         let dur = read("P2P_POKER_OFFLINE_FOR");
-        (at > 0 && dur > 0).then(|| (Duration::from_secs(at), Duration::from_secs(dur)))
+        let every = read("P2P_POKER_OFFLINE_EVERY");
+        (at > 0 && dur > 0)
+            .then(|| (Duration::from_secs(at), Duration::from_secs(dur), Duration::from_secs(every)))
     })
 }
 
@@ -999,12 +1005,26 @@ fn sweep_table(
     // needs asking again even though it does. Only while the group is short;
     // the invitations themselves go one at a time from the loop.
     if matches!(t.setup.role, Role::Host) && t.last_reinvite.elapsed() >= REINVITE_EVERY {
-        let short = match t.group {
-            Some(g) => tox.peer_count(g) < t.roster.len(),
-            None => false,
-        };
+        // `S1-EG`: CONFIRMED members against the roster, this client among
+        // them -- the library's count holds unconfirmed entries too, and a
+        // dropped seat's old key comes back as one every forty seconds by the
+        // library's own reconnection, reaped after thirty (run180223-3: the
+        // group looked whole from 105 s to 175 s and the seat that needed the
+        // offer got none until its next outage).
+        let short = t.group.is_some() && 1 + t.confirmed.len() < t.roster.len();
         if short {
-            t.invited.clear();
+            // `S1-EG`: only the seats NOT in the group are asked again. Clearing
+            // the record wholesale invited the confirmed members too, each such
+            // invitation swallowed at its end and each costing the seat that
+            // needed one an `INVITE_GAP` (run180223-3: back on its line at 90 s,
+            // the seat took the founder's invitation at 210 s).
+            let in_group: std::collections::HashSet<[u8; 32]> = t
+                .peer_lines
+                .iter()
+                .filter(|(p, _)| t.confirmed.contains(p))
+                .map(|(_, l)| *l)
+                .collect();
+            t.invited.retain(|f| friends.get(f).is_some_and(|k| in_group.contains(k)));
             t.last_invite = None;
         }
         t.last_reinvite = Instant::now();
@@ -1123,8 +1143,10 @@ fn sweep_table(
     // vacuously true at zero, and the roster reaches this thread one turn
     // behind the node loop that sets it. Measured, `split001316-2`: hand 1
     // opened into a group the joiner did not enter for another thirty seconds.
+    // `S1-DZ`, `S1-EG`: complete when every seat is a CONFIRMED member, this
+    // client among them; the library's count holds unconfirmed entries.
     t.trouble.complete.store(
-        t.group.is_some() && !t.roster.is_empty() && seen >= t.roster.len(),
+        t.group.is_some() && !t.roster.is_empty() && 1 + t.confirmed.len() >= t.roster.len(),
         Ordering::Relaxed,
     );
 
@@ -1413,6 +1435,15 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                                         t.trouble.removed.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
+                                // `D-047`: for good is for good -- off this table's roster
+                                // too, so the founder never offers the group to it again
+                                // (a fresh key needs an invitation) and its friendship
+                                // idles out with the others no table needs.
+                                if for_good {
+                                    if let Some(k) = tox_key {
+                                        t.roster.retain(|r| *r != k);
+                                    }
+                                }
                             }
                         }
                         Command::KickWithoutWord(key) => {
@@ -1457,9 +1488,13 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
 
         // `patches/0035`: the harness's outage, applied on its edges.
         #[cfg(feature = "fault-harness")]
-        if let Some((at, dur)) = offline_window() {
+        if let Some((at, dur, every)) = offline_window() {
             let now = started.elapsed();
-            let cut = now >= at && now < at + dur;
+            let cut = match now.checked_sub(at) {
+                None => false,
+                Some(since) if every.is_zero() => since < dur,
+                Some(since) => since.as_secs() % every.as_secs() < dur.as_secs(),
+            };
             if cut != line_cut {
                 tox.cut_line(cut);
                 line_cut = cut;
