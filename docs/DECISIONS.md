@@ -3836,3 +3836,32 @@ default, needs the network; its fragment count was a stale number and is a bound
 `tools/fold-rehost.py` over the runs named in point 7. Harness: `-StartStack` in `tools/table-run.ps1`
 (`P2P_POKER_START_STACK`, fault-harness only) so a tournament ends inside a run, and the summary's genesis check
 compares within a table, since a `-RehostAt` run holds two tables in one log and read a clean run as forked.
+
+## D-043 — several tables in one client, in stages
+
+**Decided 2026-09-12, on the project owner's ruling** (*up to four tables at once in one client -- multitabling*),
+after D-042 gave the driver underneath the means to carry any number of groups. The node loop held one table in
+some ninety locals, its window one table in some thirty fields, and every event and command named no table because
+there was only ever one. The change is made in stages, each built, tested and measured on the bed before the next,
+so that a single table never stops working while the second is being built.
+
+1. **Stage 1 (built the same day): the node's table is one struct.** Every per-table local of `net::run`'s loop --
+   the formation, the hand, what was said, the boundaries, the clocks, the flags that keep a line from being said
+   twice, the Tox sink -- is a field of `TableRun`, built once by `TableRun::new` and used as `t.field`; the loop's
+   macros take the table as their first argument, because a macro's bare names resolve where the macro is defined
+   and not where it is used (`leave_the_table!(t)`, `hand_event!(t, h, bytes)`). The timers, the fault-harness
+   knobs, the peers' pings, the lobby, the swarm and the relay state stay the loop's own: they are the client's, not
+   a table's. Nothing else moves and nothing behaves differently: the transformation was mechanical (a script that
+   took each local's declaration and its comment into the struct and renamed the uses), the compiler's word on it
+   was nine shadowed bindings named `t`, and the bed's word is in point 4.
+2. **Stage 2 (next): the loop holds a vector of tables.** `tables: Vec<TableRun>`, at most `MAX_TABLES` (four);
+   each arm of the loop picks its table -- a gossip message by its topic, a join answer by its request, a Tox
+   message by the sink it came from, a command and a tick for every table -- and the driver's `Driver` is shared by
+   every table's sink. `CreateTable` and `JoinTable` open a new slot while the others play; `LeaveTable`, `Act` and
+   the table chat carry the table's key.
+3. **Stage 3: the window.** Every per-table event carries the table's key; the app keeps one state per table and
+   the window shows them as tabs, the felt drawing the one in front; a turn at a table behind brings its tab
+   forward, as every multitabling client does.
+4. **Measured.** On the bed, run C's scenario again (`tools/table-run.ps1 -Seats 3 -StartStack 200 -RehostAt 120 -Seconds 330`, `run081126-3`) on the `TableRun` build: the second table's first hand 15.7 s after the hosting (15.4 s in `run213600-3`), the joiners in its group 0.1 s and 5.1 s after asking, the tournament over at 149.2-152.8 s and every seat out of its group 10.1-11.1 s later, fifteen hands opened and fifteen finished on every seat, one genesis per hand per table, no certificate, 7.7 s per hand in the steady state.
+
+**Guard.** The library's tests unchanged (865), the bed's runs named in point 4, and the S1-DN row's tools.

@@ -411,6 +411,432 @@ pub struct Run {
     pub stay_out: bool,
 }
 
+/// **One table this client sits at, as the node loop runs it** (`D-043`,
+/// stage 1). Every field was a local of the loop until 2026-09-12; the
+/// comments are the ones those locals carried. The loop reads and writes
+/// them as `t.field`, and its macros take the table as their first
+/// argument -- a macro's bare names resolve where the macro is defined,
+/// not where it is used. One table still; the driver underneath already
+/// carries several (`D-042`), and the node's turn is the next stage.
+struct TableRun {
+    /// The table this client is forming or sitting at, and the mesh it is formed
+    /// on. One `TableRun` per table; the loop holds one of them until `D-043`'s
+    /// stage 2 holds up to `MAX_TABLES`. (Until 2026-09-12 multi-tabling was
+    /// meant to be more than one client, which §4.3's per-roster `peer_id`
+    /// rule allows; the owner wants it in one.)
+    table: Option<Formation>,
+    /// The hand in progress, if any.
+    ///
+    /// Started once, at the moment the roster settles. `TableReal` is emitted
+    /// from more than one place and fires again on later table traffic, so the
+    /// start has to be idempotent, or two `HAND_INIT`s would go out under one
+    /// seat and read as equivocation to everybody else.
+    hand: Option<crate::table::hand::Hand>,
+    hand_reported: bool,
+    /// Said once while this client has reached nobody, and again if it is ever
+    /// alone a second time.
+    alone_said: bool,
+    /// The last deck state told to the interface, so that `2m` chain stages do
+    /// not become `2m` identical lines in a player's log.
+    deck_reported: Option<(Option<u8>, bool)>,
+    /// Whether this hand's own cards have been handed to the interface.
+    cards_reported: bool,
+    /// **The abort is a standing property, not an event.** `aborted()` stays
+    /// `Some` for the rest of the hand, and this block had no once-flag while
+    /// `deck_reported`, `cards_reported` and `turn_reported` all do -- so every
+    /// further event accepted before `next_hand_at` replaced the hand reprinted
+    /// the sentence. Measured in `split163641-10`: `far-n3` printed the void
+    /// four times, `far-n1` four, `far-n0` three. A reader counting seats from
+    /// a grep over-counts them, which is a bad property in the one message that
+    /// says a hand died.
+    abort_reported: bool,
+    /// Hand events dropped for want of a draining reader, said when it moves.
+    inbox_dropped_said: u64,
+    /// The last turn told to the interface, so a stage per action does not
+    /// become a redraw per action.
+    turn_reported: Option<HandReport>,
+    /// When the next hand may start. D-020's hold, and the only timer in this
+    /// loop that is about a person rather than about the network.
+    next_hand_at: Option<tokio::time::Instant>,
+    /// `S1-BM`: the boundary tick is two-phase. The timer fires at the
+    /// terminal -- phase 1: the window, the checkpoint, this seat's sit-in
+    /// request -- and the next hand is dealt from `deal_at` on, D-020's pause
+    /// later, so a returning seat's request and checkpoint are on the wire for
+    /// the whole pause instead of going out in the tick that deals over them
+    /// (`run164337-3`: nine requests, no return).
+    deal_at: Option<tokio::time::Instant>,
+    /// The hold for a return in flight: the hand it is about, when it began,
+    /// and whether it has been given up on.
+    return_hold: Option<(u64, tokio::time::Instant, bool)>,
+    /// The hand whose boundary phase 1 -- window, checkpoint, sit-in request --
+    /// has run. Once per boundary: the arm fires at the terminal and again at
+    /// `deal_at`, and on every re-arm the repair, the freeze and the boundary
+    /// wait make, while `state_hash_event` seals afresh each call with a new
+    /// timestamp and so a new event hash. Every receiver in `run170442-3`
+    /// logged *put two different events in one checkpoint stage* at every
+    /// boundary -- an equivocation by an honest peer, which D-009 rule 1
+    /// forbids -- and `boundaries.open` re-inserted the stage and dropped the
+    /// copies it had already heard. Keyed by hand id, so a re-opened hand
+    /// (`S1-BS`) does not run its predecessor's boundary again either.
+    boundary_done_for: Option<u64>,
+    /// When this client stops waiting for its own player and acts for them.
+    ///
+    /// Version 1's whole answer to a stalled betting stage (D-015): there is no
+    /// `TIMEOUT_VOTE` and no `TIMEOUT_CERT`, so a seat that goes quiet is
+    /// answered by **its own client** folding for it and by nothing else. A
+    /// seat that goes quiet in a *cryptographic* stage has no answer here at
+    /// all, and that is `hand_deadline_ms`, which is not built.
+    act_by: Option<tokio::time::Instant>,
+    /// This client's own contribution to the stage now open, and the sequence
+    /// it belongs to.
+    ///
+    /// GossipSub has no history: a peer that joins the topic mesh after a
+    /// publish never sees it, and nothing re-sends. At two seats that rarely
+    /// bites, because both are meshed before either speaks. At three it is the
+    /// ordinary case - the last joiner missed the first two seats' `HAND_INIT`
+    /// and sat at "waiting for seats 0, 1" for ever, with no error anywhere and
+    /// every other line of its log identical to a healthy one.
+    ///
+    /// So this client re-sends what it already said, until the stage it said it
+    /// in has moved. **The stored bytes, never a re-signature**: re-signing
+    /// would change `emitted_at_unix_ms` and produce a second distinct body at
+    /// one slot, which is an equivocation proof against an honest peer
+    /// (`PROTOCOL.md` §5.2).
+    /// **Every** message this client has emitted for the hand in progress, not
+    /// just the newest. A peer that missed stage 0 is not helped by stage 1: it
+    /// is stuck at 0 and holding everything after it, and only the stage-0 bytes
+    /// release it. Capped, because it is a buffer and every buffer here is.
+    said: Vec<Vec<u8>>,
+    /// Whether this table has ever dealt a hand.
+    ///
+    /// The two roads into the first hand fire again on **every later table
+    /// message**, and they are idempotent only because `hand.is_some()` guards
+    /// them. Between hands, and after the last one, `hand` is `None` and that
+    /// guard is open — so without this the next table message would deal hand
+    /// one again, on a table that has already played it, with stacks from the
+    /// roster rather than from the chain.
+    ever_dealt: bool,
+    /// **Hand 1 waits for the Tox group to hold every seat**, bounded by
+    /// `GROUP_WAIT_MS`, after which it deals anyway — which is what this client
+    /// did before the gate existed. See `hand_one_may_open`.
+    /// **The boundary checkpoint's retained values, and the readmission set they
+    /// write** (§4.9). `boundaries` holds each retained hand's checkpoint — its
+    /// two stages and the comparison — and `readmitted` is `A`, read and cleared
+    /// at the next hand init and nowhere else.
+    ///
+    /// Held here rather than in `Hand`, because both outlive the hand they are
+    /// about: §4.9 admits a checkpoint-8 `STATE_HASH` of hand `k` until
+    /// `TERMINAL(k+1)` is fixed, and by then hand `k+1` is live.
+    boundaries: crate::table::boundary::Boundaries,
+    /// Which hand's `HAND_INIT` stage has already moved the previous hand's
+    /// checkpoint down. T47 fires once per hand and `dealt()` stays true after
+    /// it, so without this the transition would run on every later event.
+    crossed_for: Option<u64>,
+    /// Whether this node has said that its checkpoints agree. Said once; see the
+    /// `Took::Agreed` arm of `checkpoint_event`.
+    checkpoint_said: bool,
+    /// **§6.3 step 1's freeze, and it is a latch.** `Some((k, sequence))` while
+    /// this peer has observed two distinct `state_hash` values at one checkpoint.
+    /// While it is set this client accepts no hand event and emits none: no card
+    /// opens, no action is applied, no chips move. §6.3: *"silently continuing is
+    /// what §15 forbids"*.
+    ///
+    /// **Released by exactly one thing** — a reconciliation stage that completes
+    /// over `R(c) ∪ W` with every value in it agreeing. Not a timer; not the
+    /// abort of the hand it froze in; not `TERMINAL(k)`; not a later hand's
+    /// checkpoint; not the table closing. The corpus lists those exclusions
+    /// because the previous revision left the release to be inferred and the
+    /// inference was wrong.
+    frozen: Option<(u64, u64)>,
+    /// Every occupied seat, which is the accepted set of a checkpoint stage and
+    /// of a reconciliation round. Refreshed where a boundary is opened.
+    roster_seats: Vec<u8>,
+    /// Said once: why the table has stopped. Cleared when the freeze is.
+    frozen_said: bool,
+    /// When a vote was last reported as owed and not cast (`vote_state`).
+    vote_state_said: u64,
+    /// The hand whose "a certificate about the previous hand arrived too late
+    /// to be kept" line has been said.
+    late_cert_said: Option<u64>,
+    /// `S1-CN`: the hand during which "a settlement of the previous hand arrived
+    /// after the late path closed" has been said.
+    late_settle_said: Option<u64>,
+    /// `S1-CN`: the hand this client last ended by an abort that no late
+    /// settlement closed, kept past the retained hand's own lifetime so a
+    /// settlement of it arriving after retention ended is still counted as one
+    /// the late path missed.
+    unsettled_abort_here: Option<u64>,
+    /// `S1-BS`: hand k, retained until hand k+1 leaves stage 0, so a
+    /// certificate about it arriving late still banks its roster half and
+    /// re-derives hand k+1.
+    previous: Option<crate::table::hand::Hand>,
+    /// `HAND_INIT`s of the next hand that arrived during this one: drained into
+    /// the next hand's held queue when it opens, and read for whether its
+    /// parent is contested before this client signs.
+    next_inits: Vec<(u8, Vec<u8>)>,
+    /// Everything else of the next hand that arrives before this client opens
+    /// it (`S1-BW`), with the seat that signed it so no one seat can fill it.
+    /// Kept apart from the `HAND_INIT`s because those decide the genesis and
+    /// this must not reach that decision.
+    next_early: Vec<(u8, Vec<u8>)>,
+    /// What the pre-open buffer **lost**, as `(refused, evicted)`.
+    ///
+    /// **The open line reported what survived and never what was thrown away**,
+    /// which is why it took two runs to see one bug: a frame refused at a full
+    /// buffer and a frame that never arrived produced the same log. Cleared at
+    /// each boundary with the buffers themselves.
+    next_early_lost: (u32, u32),
+    /// A re-derived opening for the running hand, applied by the stall tick
+    /// outside the hand borrow.
+    pending_repair: Option<crate::table::hand::Opening>,
+    /// The hand whose boundary wait has been said.
+    genesis_wait_said: Option<u64>,
+    /// The hand a certificate banked late for, so a redelivery of that
+    /// certificate after the hand was dropped is not reported as a repair
+    /// missed.
+    late_banked_for: Option<u64>,
+    delayed_certs: Vec<(tokio::time::Instant, Vec<u8>)>,
+    releasing_certs: bool,
+    delay_said: bool,
+    /// Said once: why no reconciliation round could be opened. Its causes are
+    /// permanent ones only — a stage that has not closed yet is retried in
+    /// silence, because it is the ordinary case and not a fault.
+    no_round_said: bool,
+    /// **Which roster seats have signed an event of a hand this client has not
+    /// reached, and the furthest each named.** Evidence that the table is
+    /// somewhere this client is not.
+    ahead: std::collections::HashMap<u8, u64>,
+    /// Set once that evidence is conclusive: `(the table's hand, this client's)`.
+    /// A latch, and terminal — see `note_a_hand_ahead`.
+    adrift: Option<(u64, u64)>,
+    /// Said once: this client is on a TCP relay and the group is not filling.
+    udp_warned: bool,
+    /// **A checkpoint copy that arrived before this client opened its own
+    /// boundary, held rather than dropped.**
+    ///
+    /// Peers finish a hand milliseconds apart and open their boundaries in that
+    /// order, so a faster seat's `STATE_HASH` routinely reaches a slower one
+    /// before there is a boundary to put it in. `checkpoint_event` answered that
+    /// with `return None` and the copy was gone — and the sender does not repeat
+    /// it on demand, because nothing tells it to. The slower seat then waits for
+    /// a value that was delivered and discarded, which reads from every side as
+    /// a message that never arrived.
+    ///
+    /// Bounded on both axes: two hands, and one copy per seat per hand. A hold
+    /// queue that grows is a way to be attacked, and a copy older than two hands
+    /// belongs to a boundary the store has already released anyway.
+    early_checkpoints: std::collections::HashMap<u64, Vec<Vec<u8>>>,
+    /// `S1-BM`: the same for section 4.10's boundary events. A sit-in request
+    /// from a seat that ended hand k before this client did arrives before this
+    /// client's window for k exists, and `boundary_event` used to consume it
+    /// with no line (`split172616-9`: seat 3 asked, none of eight voters took
+    /// it). Held under the same two bounds, admitted at phase 1.
+    early_boundary: std::collections::HashMap<u64, Vec<Vec<u8>>>,
+    /// How many §6.3 disputes this client has verified. Reported with the freeze,
+    /// because "none arrived" and "several arrived and agreed with me" are
+    /// different states and were the same silence.
+    disputes_seen: usize,
+    /// Group keys this client has already paired with an application key. One
+    /// pairing per peer per run; see `signer_of`.
+    taught: std::collections::HashSet<[u8; 32]>,
+    readmitted: Vec<u8>,
+    /// `S1-BM`: the evidence a return vote is cast on, by boundary and by
+    /// subject. Written by `boundary_event` (the subject's `PLAYER_SIT_IN`)
+    /// and `checkpoint_event` (its agreeing checkpoint-8 `STATE_HASH`), read
+    /// by `vote_on_returns!` at the stall tick, released at the hand-over.
+    sit_ins: SitIns,
+    /// `S1-CR`: the unfinished session on record, if any, said once at start
+    /// so the window can ask and a headless client can answer. `resuming` is
+    /// set by `ResumeSession` and cleared when this seat is dealt in again,
+    /// when the session is forgotten, or when the rejoin gives up.
+    resume: Option<crate::storage::session::Record>,
+    resuming: bool,
+    resume_since_ms: u64,
+    resume_last_peer_ms: Option<u64>,
+    /// The members' `HAND_INIT` copies of the running table's hands, and the
+    /// rest of that traffic, kept while this client holds no hand of it:
+    /// `Opening::adopt` reads the first, the adopted hand replays the second.
+    resume_inits: std::collections::BTreeMap<u64, Vec<Vec<u8>>>,
+    resume_early: Vec<(u64, Vec<u8>)>,
+    resume_said: Option<u64>,
+    /// What this client joined by, for the record: the table key of the
+    /// advert, the advert itself and its hash. `None` for a founder, whose
+    /// table does not survive its own restart and gets no record.
+    joined_key: Option<[u8; 32]>,
+    joined_ad: Option<super::lobby::TableAd>,
+    joined_advert_hash: Option<[u8; 32]>,
+    /// `S1-CR`: the session the record on disk names, so the record is written
+    /// when the table is set and again whenever the session changes under it
+    /// (a roster change before the first deal settles the table again).
+    recorded_session: Option<[u8; 32]>,
+    recorded_refused_said: bool,
+    /// `S1-CR`: when this client last said its ratification again over the
+    /// group -- in answer to a copy after the table was set, or asking for
+    /// the others' while it holds a roster and no session.
+    ratification_echo_ms: u64,
+    ratification_asked_ms: u64,
+    ratification_asked_said: bool,
+    /// `S1-CS`: one line per two seconds per seat of table chat.
+    chat_limits: super::tabletalk::SeatLimiter,
+    /// `S1-CS`: the group count the window was last told, so the felt can
+    /// say *the players are joining the group* as they do and not on the
+    /// thirty-second status line.
+    carrier_reported: Option<(u64, u64)>,
+    /// `D-033`: the hand whose card material the session record holds.
+    material_recorded: Option<u64>,
+    /// `D-033`: when the running hand was last said again to a seat back from a restart.
+    hand_said_again_ms: u64,
+    /// `D-033`: the stage the running hand is at, and since when, for the re-say above.
+    stage_waiting: (u64, u64),
+    /// `S1-CX`: the other seat's next hand, seen while this one is still
+    /// inside a hand nothing was dealt in -- the hand id and the parent it
+    /// carries -- for the stall tick to give this hand up on, if the parent
+    /// is what this hand's own give-up opens at.
+    give_up_for: Option<(u64, [u8; 32])>,
+    hand_one_held_since: Option<std::time::Instant>,
+    /// How many seats the group held when it last grew, and when that was. The
+    /// wait is on progress rather than on a deadline; see `hand_one_may_open`.
+    /// **`None` until a table exists, because a clock started at process launch
+    /// measures the wrong thing.** This used to be `(0, Instant::now())` at
+    /// start-up, so `GROUP_STALL_MS` had already elapsed for any client that had
+    /// been running two minutes before its table formed — which is the ordinary
+    /// case, not an exotic one — and the stall arm dealt hand 1 the instant the
+    /// roster ratified. Anchored on first use instead, exactly as `held_since`
+    /// is.
+    hand_one_progress: Option<(u64, std::time::Instant)>,
+    hand_one_forced_said: bool,
+    /// Said once per node: the reason hand one cannot be built from the roster
+    /// this client holds. See `say_why_no_hand_one`.
+    why_no_hand_one_said: bool,
+    table_topic: Option<gossipsub::IdentTopic>,
+    /// Empty unless this table's game traffic rides a Tox group (D-019), and
+    /// empty for ever in a build without `--features tox`. The lobby, the join
+    /// RPC and the ratification stay on the mesh either way; what moves is the
+    /// hand. See `net::toxsink` for why the cfg lives there and not here.
+    tox_sink: super::toxsink::TableSink,
+    /// Said once, when the group is really joined. On the founder that is
+    /// immediate; on a joiner it is after an invitation arrives **and** its chat
+    /// id matches the advertisement's, which is the one moment worth reporting -
+    /// before it, the hand has a transport that reaches nobody.
+    tox_group_said: bool,
+    tox_refused_said: u64,
+    tox_invites_said: u64,
+    /// **How the re-send loop backs off.** `at` is the chain position it last
+    /// saw, and `ticks` counts five-second ticks since that position moved. A
+    /// table that is advancing re-sends almost nothing; a stuck one still gets
+    /// its first repeat after five seconds.
+    /// How many times the table's topic has been said again while forming.
+    /// Bounded, because the primitive is not free: a peer that has still not
+    /// heard after this many tries has a problem re-announcing will not fix.
+    table_announces: u32,
+    resend_at: u64,
+    resend_ticks: u32,
+    /// `D-041`: the last link reading told to the window per seat -- the ping,
+    /// the group's word, and when -- so the stall tick says it again only on a
+    /// change or every ten seconds.
+    link_said: std::collections::HashMap<u8, (Option<u64>, bool, tokio::time::Instant)>,
+    /// Whether the table this client is at has closed to newcomers. Drives
+    /// `dht_effort`, stops the lobby being polled by somebody who is not reading
+    /// it, and stops the advertisement of a table nobody can join.
+    table_closed: bool,
+    /// A tournament that has once been full has started, and does not reopen.
+    tournament_started: bool,
+    /// `D-042`: when the tournament ended here, so the table's group can be
+    /// left `TOURNAMENT_LEAVE_GRACE` after -- long enough for the resend loop
+    /// to give a slow seat the terminal message again, and no longer.
+    table_over_at: Option<std::time::Instant>,
+}
+
+impl TableRun {
+    fn new(profile_dir: &std::path::Path) -> TableRun {
+        TableRun {
+            table: None,
+            hand: None,
+            hand_reported: false,
+            alone_said: false,
+            deck_reported: None,
+            cards_reported: false,
+            abort_reported: false,
+            inbox_dropped_said: 0,
+            turn_reported: None,
+            next_hand_at: None,
+            deal_at: None,
+            return_hold: None,
+            boundary_done_for: None,
+            act_by: None,
+            said: Vec::new(),
+            ever_dealt: false,
+            boundaries: crate::table::boundary::Boundaries::new(),
+            crossed_for: None,
+            checkpoint_said: false,
+            frozen: None,
+            roster_seats: Vec::new(),
+            frozen_said: false,
+            vote_state_said: 0,
+            late_cert_said: None,
+            late_settle_said: None,
+            unsettled_abort_here: None,
+            previous: None,
+            next_inits: Vec::new(),
+            next_early: Vec::new(),
+            next_early_lost: (0, 0),
+            pending_repair: None,
+            genesis_wait_said: None,
+            late_banked_for: None,
+            delayed_certs: Vec::new(),
+            releasing_certs: false,
+            delay_said: false,
+            no_round_said: false,
+            ahead: std::collections::HashMap::new(),
+            adrift: None,
+            udp_warned: false,
+            early_checkpoints: std::collections::HashMap::new(),
+            early_boundary: std::collections::HashMap::new(),
+            disputes_seen: 0usize,
+            taught: std::collections::HashSet::new(),
+            readmitted: Vec::new(),
+            sit_ins: SitIns::default(),
+            resume: crate::storage::session::load_recent(profile_dir, super::node::now_unix_ms()),
+            resuming: false,
+            resume_since_ms: 0,
+            resume_last_peer_ms: None,
+            resume_inits: std::collections::BTreeMap::new(),
+            resume_early: Vec::new(),
+            resume_said: None,
+            joined_key: None,
+            joined_ad: None,
+            joined_advert_hash: None,
+            recorded_session: None,
+            recorded_refused_said: false,
+            ratification_echo_ms: 0,
+            ratification_asked_ms: 0,
+            ratification_asked_said: false,
+            chat_limits: super::tabletalk::SeatLimiter::default(),
+            carrier_reported: None,
+            material_recorded: None,
+            hand_said_again_ms: 0,
+            stage_waiting: (u64::MAX, 0),
+            give_up_for: None,
+            hand_one_held_since: None,
+            hand_one_progress: None,
+            hand_one_forced_said: false,
+            why_no_hand_one_said: false,
+            table_topic: None,
+            tox_sink: super::toxsink::TableSink::none(),
+            tox_group_said: false,
+            tox_refused_said: 0,
+            tox_invites_said: 0,
+            table_announces: 0,
+            resend_at: u64::MAX,
+            resend_ticks: 0,
+            link_said: std::collections::HashMap::new(),
+            table_closed: false,
+            tournament_started: false,
+            table_over_at: None,
+        }
+    }
+}
+
 pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let Run {
         identity,
@@ -528,81 +954,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // key: stable, theirs, and never confusable with somebody else's.
     let mut nickname = crate::storage::profile::short_name(&my_app_key);
 
-    // The table this client is forming or sitting at, and the mesh it is formed
-    // on. One table at a time in this loop; multi-tabling is more than one
-    // client, which is what §4.3's per-roster `peer_id` rule already allows and
-    // what the lobby's own rules are written for.
-    let mut table: Option<Formation> = None;
-    // The hand in progress, if any.
-    //
-    // Started once, at the moment the roster settles. `TableReal` is emitted
-    // from more than one place and fires again on later table traffic, so the
-    // start has to be idempotent, or two `HAND_INIT`s would go out under one
-    // seat and read as equivocation to everybody else.
-    let mut hand: Option<crate::table::hand::Hand> = None;
-    let mut hand_reported = false;
-    // Said once while this client has reached nobody, and again if it is ever
-    // alone a second time.
-    let mut alone_said = false;
-    // The last deck state told to the interface, so that `2m` chain stages do
-    // not become `2m` identical lines in a player's log.
-    let mut deck_reported: Option<(Option<u8>, bool)> = None;
-    // Whether this hand's own cards have been handed to the interface.
-    let mut cards_reported = false;
-    // **The abort is a standing property, not an event.** `aborted()` stays
-    // `Some` for the rest of the hand, and this block had no once-flag while
-    // `deck_reported`, `cards_reported` and `turn_reported` all do -- so every
-    // further event accepted before `next_hand_at` replaced the hand reprinted
-    // the sentence. Measured in `split163641-10`: `far-n3` printed the void
-    // four times, `far-n1` four, `far-n0` three. A reader counting seats from
-    // a grep over-counts them, which is a bad property in the one message that
-    // says a hand died.
-    let mut abort_reported = false;
-    // Hand events dropped for want of a draining reader, said when it moves.
-    let mut inbox_dropped_said: u64 = 0;
-    // The last turn told to the interface, so a stage per action does not
-    // become a redraw per action.
-    let mut turn_reported: Option<HandReport> = None;
-    // When the next hand may start. D-020's hold, and the only timer in this
-    // loop that is about a person rather than about the network.
-    let mut next_hand_at: Option<tokio::time::Instant> = None;
-    // `S1-BM`: the boundary tick is two-phase. The timer fires at the
-    // terminal -- phase 1: the window, the checkpoint, this seat's sit-in
-    // request -- and the next hand is dealt from `deal_at` on, D-020's pause
-    // later, so a returning seat's request and checkpoint are on the wire for
-    // the whole pause instead of going out in the tick that deals over them
-    // (`run164337-3`: nine requests, no return).
-    let mut deal_at: Option<tokio::time::Instant> = None;
-    // The hold for a return in flight: the hand it is about, when it began,
-    // and whether it has been given up on.
-    let mut return_hold: Option<(u64, tokio::time::Instant, bool)> = None;
-    // The hand whose boundary phase 1 -- window, checkpoint, sit-in request --
-    // has run. Once per boundary: the arm fires at the terminal and again at
-    // `deal_at`, and on every re-arm the repair, the freeze and the boundary
-    // wait make, while `state_hash_event` seals afresh each call with a new
-    // timestamp and so a new event hash. Every receiver in `run170442-3`
-    // logged *put two different events in one checkpoint stage* at every
-    // boundary -- an equivocation by an honest peer, which D-009 rule 1
-    // forbids -- and `boundaries.open` re-inserted the stage and dropped the
-    // copies it had already heard. Keyed by hand id, so a re-opened hand
-    // (`S1-BS`) does not run its predecessor's boundary again either.
-    let mut boundary_done_for: Option<u64> = None;
+    let mut t = TableRun::new(&profile_dir);
     // Arm the boundary: fire now for phase 1, deal after the pause.
     macro_rules! arm_boundary {
-        ($pause:expr) => {{
+        ($t:ident, $pause:expr) => {{
             let now = tokio::time::Instant::now();
-            next_hand_at = Some(now);
-            deal_at = Some(now + $pause);
+            $t.next_hand_at = Some(now);
+            $t.deal_at = Some(now + $pause);
         }};
     }
-    // When this client stops waiting for its own player and acts for them.
-    //
-    // Version 1's whole answer to a stalled betting stage (D-015): there is no
-    // `TIMEOUT_VOTE` and no `TIMEOUT_CERT`, so a seat that goes quiet is
-    // answered by **its own client** folding for it and by nothing else. A
-    // seat that goes quiet in a *cryptographic* stage has no answer here at
-    // all, and that is `hand_deadline_ms`, which is not built.
-    let mut act_by: Option<tokio::time::Instant> = None;
 
     /// Bring this client's own turn forward, for a measurement run.
     ///
@@ -625,117 +985,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // until that receiver's own timer agrees.
     let mut stall = tokio::time::interval(std::time::Duration::from_secs(2));
     stall.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // This client's own contribution to the stage now open, and the sequence
-    // it belongs to.
-    //
-    // GossipSub has no history: a peer that joins the topic mesh after a
-    // publish never sees it, and nothing re-sends. At two seats that rarely
-    // bites, because both are meshed before either speaks. At three it is the
-    // ordinary case - the last joiner missed the first two seats' `HAND_INIT`
-    // and sat at "waiting for seats 0, 1" for ever, with no error anywhere and
-    // every other line of its log identical to a healthy one.
-    //
-    // So this client re-sends what it already said, until the stage it said it
-    // in has moved. **The stored bytes, never a re-signature**: re-signing
-    // would change `emitted_at_unix_ms` and produce a second distinct body at
-    // one slot, which is an equivocation proof against an honest peer
-    // (`PROTOCOL.md` §5.2).
-    // **Every** message this client has emitted for the hand in progress, not
-    // just the newest. A peer that missed stage 0 is not helped by stage 1: it
-    // is stuck at 0 and holding everything after it, and only the stage-0 bytes
-    // release it. Capped, because it is a buffer and every buffer here is.
-    let mut said: Vec<Vec<u8>> = Vec::new();
     let mut resend = tokio::time::interval(std::time::Duration::from_secs(5));
     resend.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Whether this table has ever dealt a hand.
-    //
-    // The two roads into the first hand fire again on **every later table
-    // message**, and they are idempotent only because `hand.is_some()` guards
-    // them. Between hands, and after the last one, `hand` is `None` and that
-    // guard is open — so without this the next table message would deal hand
-    // one again, on a table that has already played it, with stacks from the
-    // roster rather than from the chain.
-    let mut ever_dealt = false;
-    // **Hand 1 waits for the Tox group to hold every seat**, bounded by
-    // `GROUP_WAIT_MS`, after which it deals anyway — which is what this client
-    // did before the gate existed. See `hand_one_may_open`.
-    // **The boundary checkpoint's retained values, and the readmission set they
-    // write** (§4.9). `boundaries` holds each retained hand's checkpoint — its
-    // two stages and the comparison — and `readmitted` is `A`, read and cleared
-    // at the next hand init and nowhere else.
-    //
-    // Held here rather than in `Hand`, because both outlive the hand they are
-    // about: §4.9 admits a checkpoint-8 `STATE_HASH` of hand `k` until
-    // `TERMINAL(k+1)` is fixed, and by then hand `k+1` is live.
-    let mut boundaries = crate::table::boundary::Boundaries::new();
-    // Which hand's `HAND_INIT` stage has already moved the previous hand's
-    // checkpoint down. T47 fires once per hand and `dealt()` stays true after
-    // it, so without this the transition would run on every later event.
-    let mut crossed_for: Option<u64> = None;
-    // Whether this node has said that its checkpoints agree. Said once; see the
-    // `Took::Agreed` arm of `checkpoint_event`.
-    let mut checkpoint_said = false;
-    // **§6.3 step 1's freeze, and it is a latch.** `Some((k, sequence))` while
-    // this peer has observed two distinct `state_hash` values at one checkpoint.
-    // While it is set this client accepts no hand event and emits none: no card
-    // opens, no action is applied, no chips move. §6.3: *"silently continuing is
-    // what §15 forbids"*.
-    //
-    // **Released by exactly one thing** — a reconciliation stage that completes
-    // over `R(c) ∪ W` with every value in it agreeing. Not a timer; not the
-    // abort of the hand it froze in; not `TERMINAL(k)`; not a later hand's
-    // checkpoint; not the table closing. The corpus lists those exclusions
-    // because the previous revision left the release to be inferred and the
-    // inference was wrong.
-    let mut frozen: Option<(u64, u64)> = None;
-    // Every occupied seat, which is the accepted set of a checkpoint stage and
-    // of a reconciliation round. Refreshed where a boundary is opened.
-    let mut roster_seats: Vec<u8> = Vec::new();
-    // Said once: why the table has stopped. Cleared when the freeze is.
-    let mut frozen_said = false;
-    // When a vote was last reported as owed and not cast (`vote_state`).
-    let mut vote_state_said: u64 = 0;
-    // The hand whose "a certificate about the previous hand arrived too late
-    // to be kept" line has been said.
-    let mut late_cert_said: Option<u64> = None;
-    // `S1-CN`: the hand during which "a settlement of the previous hand arrived
-    // after the late path closed" has been said.
-    let mut late_settle_said: Option<u64> = None;
-    // `S1-CN`: the hand this client last ended by an abort that no late
-    // settlement closed, kept past the retained hand's own lifetime so a
-    // settlement of it arriving after retention ended is still counted as one
-    // the late path missed.
-    let mut unsettled_abort_here: Option<u64> = None;
-    // `S1-BS`: hand k, retained until hand k+1 leaves stage 0, so a
-    // certificate about it arriving late still banks its roster half and
-    // re-derives hand k+1.
-    let mut previous: Option<crate::table::hand::Hand> = None;
-    // `HAND_INIT`s of the next hand that arrived during this one: drained into
-    // the next hand's held queue when it opens, and read for whether its
-    // parent is contested before this client signs.
-    let mut next_inits: Vec<(u8, Vec<u8>)> = Vec::new();
-    // Everything else of the next hand that arrives before this client opens
-    // it (`S1-BW`), with the seat that signed it so no one seat can fill it.
-    // Kept apart from the `HAND_INIT`s because those decide the genesis and
-    // this must not reach that decision.
-    let mut next_early: Vec<(u8, Vec<u8>)> = Vec::new();
-    // What the pre-open buffer **lost**, as `(refused, evicted)`.
-    //
-    // **The open line reported what survived and never what was thrown away**,
-    // which is why it took two runs to see one bug: a frame refused at a full
-    // buffer and a frame that never arrived produced the same log. Cleared at
-    // each boundary with the buffers themselves.
-    let mut next_early_lost: (u32, u32) = (0, 0);
-    // A re-derived opening for the running hand, applied by the stall tick
-    // outside the hand borrow.
-    let mut pending_repair: Option<crate::table::hand::Opening> = None;
-    // The hand whose boundary wait has been said.
-    let mut genesis_wait_said: Option<u64> = None;
-    // The hand a certificate banked late for, so a redelivery of that
-    // certificate after the hand was dropped is not reported as a repair
-    // missed.
-    let mut late_banked_for: Option<u64> = None;
     // **fault-harness only.** `P2P_POKER_DELAY_CERTS_MS=<ms>` parks every
     // `TIMEOUT_CERT` this seat receives for that long before it is judged —
     // the shape `S1-BS` measured (the copies twenty-odd seconds late at one
@@ -761,45 +1013,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     };
     let delay_since = tokio::time::Instant::now();
     let _ = PROCESS_STARTED.get_or_init(std::time::Instant::now);
-    let mut delayed_certs: Vec<(tokio::time::Instant, Vec<u8>)> = Vec::new();
-    let mut releasing_certs = false;
-    let mut delay_said = false;
-    // Said once: why no reconciliation round could be opened. Its causes are
-    // permanent ones only — a stage that has not closed yet is retried in
-    // silence, because it is the ordinary case and not a fault.
-    let mut no_round_said = false;
-    // **Which roster seats have signed an event of a hand this client has not
-    // reached, and the furthest each named.** Evidence that the table is
-    // somewhere this client is not.
-    let mut ahead: std::collections::HashMap<u8, u64> = std::collections::HashMap::new();
-    // Set once that evidence is conclusive: `(the table's hand, this client's)`.
-    // A latch, and terminal — see `note_a_hand_ahead`.
-    let mut adrift: Option<(u64, u64)> = None;
-    // Said once: this client is on a TCP relay and the group is not filling.
-    let mut udp_warned = false;
-    // **A checkpoint copy that arrived before this client opened its own
-    // boundary, held rather than dropped.**
-    //
-    // Peers finish a hand milliseconds apart and open their boundaries in that
-    // order, so a faster seat's `STATE_HASH` routinely reaches a slower one
-    // before there is a boundary to put it in. `checkpoint_event` answered that
-    // with `return None` and the copy was gone — and the sender does not repeat
-    // it on demand, because nothing tells it to. The slower seat then waits for
-    // a value that was delivered and discarded, which reads from every side as
-    // a message that never arrived.
-    //
-    // Bounded on both axes: two hands, and one copy per seat per hand. A hold
-    // queue that grows is a way to be attacked, and a copy older than two hands
-    // belongs to a boundary the store has already released anyway.
-    let mut early_checkpoints: std::collections::HashMap<u64, Vec<Vec<u8>>> =
-        std::collections::HashMap::new();
-    // `S1-BM`: the same for section 4.10's boundary events. A sit-in request
-    // from a seat that ended hand k before this client did arrives before this
-    // client's window for k exists, and `boundary_event` used to consume it
-    // with no line (`split172616-9`: seat 3 asked, none of eight voters took
-    // it). Held under the same two bounds, admitted at phase 1.
-    let mut early_boundary: std::collections::HashMap<u64, Vec<Vec<u8>>> =
-        std::collections::HashMap::new();
     // **The number nobody has: how many private addresses the real Amino DHT
     // hands this client.** `S1-AC`'s filter counts what it refuses, so the
     // figure arrives as a byproduct of the defence instead of needing a second
@@ -807,70 +1020,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // read it without borrowing the swarm.
     let bogons = swarm.behaviour().ipfs_kad.dropped();
     let mut bogons_said = 0u64;
-    // How many §6.3 disputes this client has verified. Reported with the freeze,
-    // because "none arrived" and "several arrived and agreed with me" are
-    // different states and were the same silence.
-    let mut disputes_seen = 0usize;
-    // Group keys this client has already paired with an application key. One
-    // pairing per peer per run; see `signer_of`.
-    let mut taught: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-    let mut readmitted: Vec<u8> = Vec::new();
-    // `S1-BM`: the evidence a return vote is cast on, by boundary and by
-    // subject. Written by `boundary_event` (the subject's `PLAYER_SIT_IN`)
-    // and `checkpoint_event` (its agreeing checkpoint-8 `STATE_HASH`), read
-    // by `vote_on_returns!` at the stall tick, released at the hand-over.
-    let mut sit_ins = SitIns::default();
-    // `S1-CR`: the unfinished session on record, if any, said once at start
-    // so the window can ask and a headless client can answer. `resuming` is
-    // set by `ResumeSession` and cleared when this seat is dealt in again,
-    // when the session is forgotten, or when the rejoin gives up.
-    let mut resume: Option<crate::storage::session::Record> =
-        crate::storage::session::load_recent(&profile_dir, super::node::now_unix_ms());
-    let mut resuming = false;
-    let mut resume_since_ms: u64 = 0;
-    let mut resume_last_peer_ms: Option<u64> = None;
-    // The members' `HAND_INIT` copies of the running table's hands, and the
-    // rest of that traffic, kept while this client holds no hand of it:
-    // `Opening::adopt` reads the first, the adopted hand replays the second.
-    let mut resume_inits: std::collections::BTreeMap<u64, Vec<Vec<u8>>> =
-        std::collections::BTreeMap::new();
-    let mut resume_early: Vec<(u64, Vec<u8>)> = Vec::new();
-    let mut resume_said: Option<u64> = None;
-    // What this client joined by, for the record: the table key of the
-    // advert, the advert itself and its hash. `None` for a founder, whose
-    // table does not survive its own restart and gets no record.
-    let mut joined_key: Option<[u8; 32]> = None;
-    let mut joined_ad: Option<super::lobby::TableAd> = None;
-    let mut joined_advert_hash: Option<[u8; 32]> = None;
-    // `S1-CR`: the session the record on disk names, so the record is written
-    // when the table is set and again whenever the session changes under it
-    // (a roster change before the first deal settles the table again).
-    let mut recorded_session: Option<[u8; 32]> = None;
-    let mut recorded_refused_said = false;
-    // `S1-CR`: when this client last said its ratification again over the
-    // group -- in answer to a copy after the table was set, or asking for
-    // the others' while it holds a roster and no session.
-    let mut ratification_echo_ms: u64 = 0;
-    let mut ratification_asked_ms: u64 = 0;
-    let mut ratification_asked_said = false;
-    // `S1-CS`: one line per two seconds per seat of table chat.
-    let mut chat_limits = super::tabletalk::SeatLimiter::default();
-    // `S1-CS`: the group count the window was last told, so the felt can
-    // say *the players are joining the group* as they do and not on the
-    // thirty-second status line.
-    let mut carrier_reported: Option<(u64, u64)> = None;
-    // `D-033`: the hand whose card material the session record holds.
-    let mut material_recorded: Option<u64> = None;
-    // `D-033`: when the running hand was last said again to a seat back from a restart.
-    let mut hand_said_again_ms: u64 = 0;
-    // `D-033`: the stage the running hand is at, and since when, for the re-say above.
-    let mut stage_waiting: (u64, u64) = (u64::MAX, 0);
-    // `S1-CX`: the other seat's next hand, seen while this one is still
-    // inside a hand nothing was dealt in -- the hand id and the parent it
-    // carries -- for the stall tick to give this hand up on, if the parent
-    // is what this hand's own give-up opens at.
-    let mut give_up_for: Option<(u64, [u8; 32])> = None;
-    if let Some(r) = resume.as_ref() {
+    if let Some(r) = t.resume.as_ref() {
         let _ = events
             .send(NodeEvent::UnfinishedSession {
                 key: r.table_key,
@@ -884,20 +1034,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // Write the session record: the table as joined, this seat, the boundary
     // reached. A no-op for a founder.
     macro_rules! remember_session {
-        ($hand_id:expr, $terminal:expr, $stack:expr) => {
-            remember_session!($hand_id, $terminal, $stack, None::<[u8; 32]>)
+        ($t:ident, $hand_id:expr, $terminal:expr, $stack:expr) => {
+            remember_session!($t, $hand_id, $terminal, $stack, None::<[u8; 32]>)
         };
-        ($hand_id:expr, $terminal:expr, $stack:expr, $kept:expr) => {{
+        ($t:ident, $hand_id:expr, $terminal:expr, $stack:expr, $kept:expr) => {{
             let kept: Option<[u8; 32]> = $kept;
             // `D-037`: the founder's record too -- its own table, advert and
             // hash, with the table key's seed and its last signed roster, so
             // that it can come back as the founder. A seat that joined records
             // what it joined under.
-            let who = table.as_ref().and_then(|f| {
+            let who = $t.table.as_ref().and_then(|f| {
                 if f.is_founder() {
                     Some((f.table_id(), f.ad().clone(), f.advert_hash(), f))
                 } else {
-                    Some((joined_key?, joined_ad.as_ref()?.clone(), joined_advert_hash?, f))
+                    Some(($t.joined_key?, $t.joined_ad.as_ref()?.clone(), $t.joined_advert_hash?, f))
                 }
             });
             if let Some((key, ad, advert_hash, f)) = who {
@@ -943,40 +1093,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                         }
                     }
-                    recorded_session = f.session();
+                    $t.recorded_session = f.session();
                 }
             }
         }};
     }
-    let mut hand_one_held_since: Option<std::time::Instant> = None;
-    // How many seats the group held when it last grew, and when that was. The
-    // wait is on progress rather than on a deadline; see `hand_one_may_open`.
-    // **`None` until a table exists, because a clock started at process launch
-    // measures the wrong thing.** This used to be `(0, Instant::now())` at
-    // start-up, so `GROUP_STALL_MS` had already elapsed for any client that had
-    // been running two minutes before its table formed — which is the ordinary
-    // case, not an exotic one — and the stall arm dealt hand 1 the instant the
-    // roster ratified. Anchored on first use instead, exactly as `held_since`
-    // is.
-    let mut hand_one_progress: Option<(u64, std::time::Instant)> = None;
-    let mut hand_one_forced_said = false;
 
-    // Said once per node: the reason hand one cannot be built from the roster
-    // this client holds. See `say_why_no_hand_one`.
-    let mut why_no_hand_one_said = false;
-    let mut table_topic: Option<gossipsub::IdentTopic> = None;
-    // Empty unless this table's game traffic rides a Tox group (D-019), and
-    // empty for ever in a build without `--features tox`. The lobby, the join
-    // RPC and the ratification stay on the mesh either way; what moves is the
-    // hand. See `net::toxsink` for why the cfg lives there and not here.
-    let mut tox_sink = super::toxsink::TableSink::none();
     // `D-042`: the client's one Tox instance starts with the client, so the
     // first table it founds or joins finds the DHT warm and its relays up; a
     // table is a group on it. A failure here is a warning and not the end:
     // `start` tries again when a table comes.
-    match tox_sink.boot(&profile_dir) {
+    match t.tox_sink.boot(&profile_dir) {
         Ok(Some(mine)) => {
-            let r = tox_sink.reach();
+            let r = t.tox_sink.reach();
             let _ = events
                 .send(NodeEvent::Warning(format!(
                     "tox: this client's instance is up from the start, key {}; of {} known nodes, {} bootstrapped and {} TCP relays were accepted{}",
@@ -1001,11 +1130,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 .await;
         }
     }
-    // Said once, when the group is really joined. On the founder that is
-    // immediate; on a joiner it is after an invitation arrives **and** its chat
-    // id matches the advertisement's, which is the one moment worth reporting -
-    // before it, the hand has a transport that reaches nobody.
-    let mut tox_group_said = false;
     // The last refusal count reported, so a steady state says nothing and a
     // rising one says it every five seconds.
     // When each peer last **answered**, and how long the round trip took. See
@@ -1029,18 +1153,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         PeerId,
         (std::time::Instant, Option<std::time::Duration>),
     > = std::collections::HashMap::new();
-    let mut tox_refused_said: u64 = 0;
-    let mut tox_invites_said: u64 = 0;
-    // **How the re-send loop backs off.** `at` is the chain position it last
-    // saw, and `ticks` counts five-second ticks since that position moved. A
-    // table that is advancing re-sends almost nothing; a stuck one still gets
-    // its first repeat after five seconds.
-    // How many times the table's topic has been said again while forming.
-    // Bounded, because the primitive is not free: a peer that has still not
-    // heard after this many tries has a problem re-announcing will not fix.
-    let mut table_announces: u32 = 0;
-    let mut resend_at: u64 = u64::MAX;
-    let mut resend_ticks: u32 = 0;
 
     // Who mDNS has already told us about.
     //
@@ -1071,11 +1183,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         ([u8; 32], libp2p::PeerId),
     > = std::collections::HashMap::new();
     let mut snapshot_answered: std::collections::HashMap<libp2p::PeerId, tokio::time::Instant> =
-        std::collections::HashMap::new();
-    // `D-041`: the last link reading told to the window per seat -- the ping,
-    // the group's word, and when -- so the stall tick says it again only on a
-    // change or every ten seconds.
-    let mut link_said: std::collections::HashMap<u8, (Option<u64>, bool, tokio::time::Instant)> =
         std::collections::HashMap::new();
 
     // When each lobby provider was last dialled, so a record for a client that
@@ -1203,16 +1310,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // arrivals is one publish rather than one each.
     let mut last_lobby_shout: Option<tokio::time::Instant> = None;
 
-    // Whether the table this client is at has closed to newcomers. Drives
-    // `dht_effort`, stops the lobby being polled by somebody who is not reading
-    // it, and stops the advertisement of a table nobody can join.
-    let mut table_closed = false;
-    // A tournament that has once been full has started, and does not reopen.
-    let mut tournament_started = false;
-    // `D-042`: when the tournament ended here, so the table's group can be
-    // left `TOURNAMENT_LEAVE_GRACE` after -- long enough for the resend loop
-    // to give a slow seat the terminal message again, and no longer.
-    let mut table_over_at: Option<std::time::Instant> = None;
     let mut have_reservation = false;
     // **Whether the reservation this client holds can carry a hand, and which
     // poker peers are reachable only through it.**
@@ -1296,29 +1393,29 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // the hand before any card is out, and both survivors of a three-seat
     // table sat on the ended hand for the rest of the run.
     macro_rules! hand_may_have_ended {
-        ($h:expr) => {{
-            if let Some(why) = $h.aborted().filter(|_| !abort_reported) {
-                abort_reported = true;
-                act_by = None;
+        ($t:ident, $h:expr) => {{
+            if let Some(why) = $h.aborted().filter(|_| !$t.abort_reported) {
+                $t.abort_reported = true;
+                $t.act_by = None;
                 let _ = events.send(NodeEvent::Warning(abort_words(why))).await;
-                arm_boundary!(std::time::Duration::from_millis(800));
+                arm_boundary!($t, std::time::Duration::from_millis(800));
             }
-            let report = report_hand($h, &events, &mut turn_reported).await;
+            let report = report_hand($h, &events, &mut $t.turn_reported).await;
             if let Some(end) = report.ended {
-                arm_boundary!(end.pause());
+                arm_boundary!($t, end.pause());
             }
-            act_by = hurry(report.clock.apply(act_by, $h.action_deadline()), autoplay);
+            $t.act_by = hurry(report.clock.apply($t.act_by, $h.action_deadline()), autoplay);
         }};
     }
     macro_rules! hand_event {
-        ($h:expr, $bytes:expr) => {{
+        ($t:ident, $h:expr, $bytes:expr) => {{
             use crate::table::hand::Failed;
             let now = super::node::now_unix_ms();
             // fault-harness: a certificate copy is parked, not judged (see
             // `delay_certs_ms`). Accepted for the mesh — it is a peer's
             // honest copy — and released by the stall tick when due.
             if delay_certs_ms.is_some()
-                && !releasing_certs
+                && !$t.releasing_certs
                 && delay_certs_until.map_or(true, |u| delay_since.elapsed() < u)
                 && matches!(
                     crate::net::chained::peek($bytes, TABLE_FRAME_PEEK),
@@ -1334,12 +1431,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // and banks it, so the odd seat of `S1-BS` is one that missed
                 // the votes as well as the copies.
                 let ms = delay_certs_ms.unwrap_or(0);
-                delayed_certs.push((
+                $t.delayed_certs.push((
                     tokio::time::Instant::now() + std::time::Duration::from_millis(ms),
                     $bytes.to_vec(),
                 ));
-                if !delay_said {
-                    delay_said = true;
+                if !$t.delay_said {
+                    $t.delay_said = true;
                     let _ = events
                         .send(NodeEvent::Warning(format!(
                             "fault-harness: every TIMEOUT_VOTE and TIMEOUT_CERT this seat receives is parked for {ms} ms before it is judged"
@@ -1368,20 +1465,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         )))
                                         .await;
                                 }
-                                publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                                publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);
                                 // `D-033`: the hand's card material goes into the
                                 // record the moment the deck stage begins -- not on
                                 // the next tick, which a stop at the deal beat by a
                                 // second (`run110811-2`).
                                 let material = $h.secret().and_then(|s| {
-                                    if material_recorded == Some($h.hand_id()) {
+                                    if $t.material_recorded == Some($h.hand_id()) {
                                         return None;
                                     }
                                     Some(($h.hand_id(), $h.stack_at_boundary($h.my_seat()), s.keep()))
                                 });
                                 if let Some((hid, stack, kept)) = material {
-                                    material_recorded = Some(hid);
-                                    remember_session!(hid, [0; 32], stack, Some(kept));
+                                    $t.material_recorded = Some(hid);
+                                    remember_session!($t, hid, [0; 32], stack, Some(kept));
                                 }
                                 // Outside `dealt()`: a certificate is
                                 // decided at cryptographic stages too, and
@@ -1411,8 +1508,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .await;
                                 }
                                 if $h.dealt() {
-                                    if !hand_reported {
-                                        hand_reported = true;
+                                    if !$t.hand_reported {
+                                        $t.hand_reported = true;
                                         let init = $h.init();
                                         let _ = events
                                             .send(NodeEvent::HandBegan {
@@ -1423,8 +1520,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             .await;
                                     }
                                     let deck = ($h.shuffler(), $h.shuffled());
-                                    if deck_reported != Some(deck) {
-                                        deck_reported = Some(deck);
+                                    if $t.deck_reported != Some(deck) {
+                                        $t.deck_reported = Some(deck);
                                         let _ = events
                                             .send(NodeEvent::DeckProgress {
                                                 hand_id: $h.hand_id(),
@@ -1490,10 +1587,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .await;
                                 }
                                 if let Some(why) =
-                                    $h.aborted().filter(|_| !abort_reported)
+                                    $h.aborted().filter(|_| !$t.abort_reported)
                                 {
-                                    abort_reported = true;
-                                    act_by = None;
+                                    $t.abort_reported = true;
+                                    $t.act_by = None;
                                     // **Which abort, and not one
                                     // sentence for all of them.** This
                                     // said "a peer ended the hand on
@@ -1506,20 +1603,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // nothing to do with anybody's
                                     // clock. A player told the wrong
                                     // reason looks for the wrong fault.
-                                    let said = abort_words(why);
+                                    let words = abort_words(why);
                                     let _ = events
-                                        .send(NodeEvent::Warning(said))
+                                        .send(NodeEvent::Warning(words))
                                         .await;
-                                    arm_boundary!(std::time::Duration::from_millis(800));
+                                    arm_boundary!($t, std::time::Duration::from_millis(800));
                                 }
                                 let report =
-                                    report_hand($h, &events, &mut turn_reported).await;
+                                    report_hand($h, &events, &mut $t.turn_reported).await;
                                 if let Some(end) = report.ended {
-                                    arm_boundary!(end.pause());
+                                    arm_boundary!($t, end.pause());
                                 }
-                                act_by = hurry(report.clock.apply(act_by, $h.action_deadline()), autoplay);
-                                if let Some(cards) = $h.cards().filter(|_| !cards_reported) {
-                                    cards_reported = true;
+                                $t.act_by = hurry(report.clock.apply($t.act_by, $h.action_deadline()), autoplay);
+                                if let Some(cards) = $h.cards().filter(|_| !$t.cards_reported) {
+                                    $t.cards_reported = true;
                                     let _ = events
                                         .send(NodeEvent::CardsDealt {
                                             hand_id: $h.hand_id(),
@@ -1579,11 +1676,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         // other frames -- so an ordinary table's pause skew costs
                                         // a few frames of memory and nothing else.
                                         if hand_id > $h.hand_id() {
-                                            let _ = stash_for_resume($bytes, &mut resume_inits, &mut resume_early);
+                                            let _ = stash_for_resume($bytes, &mut $t.resume_inits, &mut $t.resume_early);
                                         }
                                         // `S1-CX`: the next hand's opening from a seat one
                                         // hand ahead, while nothing has been dealt here.
-                                        if !resuming && hand_id == $h.hand_id() + 1 && $h.street().is_none() && !$h.over() {
+                                        if !$t.resuming && hand_id == $h.hand_id() + 1 && $h.street().is_none() && !$h.over() {
                                             if let Ok((crate::protocol::messages::EventType::HandInit, _, 0)) =
                                                 crate::net::chained::peek($bytes, TABLE_FRAME_PEEK)
                                             {
@@ -1594,7 +1691,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     &$h.table_id(),
                                                     hand_id,
                                                 ) {
-                                                    give_up_for = Some((hand_id, o.envelope.previous_event_hash));
+                                                    $t.give_up_for = Some((hand_id, o.envelope.previous_event_hash));
                                                 }
                                             }
                                         }
@@ -1602,8 +1699,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             $h,
                                             hand_id,
                                             seat,
-                                            &mut ahead,
-                                            &mut adrift,
+                                            &mut $t.ahead,
+                                            &mut $t.adrift,
                                         );
                                         // **A certificate about the hand just
                                         // finished, arriving during the next
@@ -1638,7 +1735,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 )
                                             )
                                         {
-                                            match previous.as_mut() {
+                                            match $t.previous.as_mut() {
                                                 // The hand it is about is still held: it
                                                 // banks there, and a new bank re-derives
                                                 // the running hand (`S1-BS`).
@@ -1658,12 +1755,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         // certificate, sealed by the
                                                         // retained hand; it still goes out.
                                                         Ok(sends) => {
-                                                            publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                                                            publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);
                                                         }
                                                         Err(_) => {}
                                                     }
                                                     let (more, _) = p.replay_early(&app_key, now);
-                                                    publish_hand(more, &mut swarm, &mut said, &tox_sink);
+                                                    publish_hand(more, &mut swarm, &mut $t.said, &$t.tox_sink);
                                                     if let Some(n) = p.take_cert_note() {
                                                         let _ = events
                                                             .send(NodeEvent::Warning(format!(
@@ -1672,20 +1769,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                             .await;
                                                     }
                                                     if p.take_late_roster() {
-                                                        late_banked_for = Some(p.hand_id());
-                                                        pending_repair = p.next_hand();
+                                                        $t.late_banked_for = Some(p.hand_id());
+                                                        $t.pending_repair = p.next_hand();
                                                     }
                                                 }
                                                 _ => {
-                                                    if late_cert_said != Some($h.hand_id()) {
-                                                        late_cert_said = Some($h.hand_id());
+                                                    if $t.late_cert_said != Some($h.hand_id()) {
+                                                        $t.late_cert_said = Some($h.hand_id());
                                                         // **What the node knows, and not a word more.**
                                                         // Banking is keyed on the subject digest and a
                                                         // hand can certify two seats, so "an earlier
                                                         // copy of this certificate" is more than the
                                                         // hand id can prove — the same false second
                                                         // clause `S1-BV` was opened for.
-                                                        let line = if late_banked_for == Some(hand_id) {
+                                                        let line = if $t.late_banked_for == Some(hand_id) {
                                                             format!(
                                                                 "a {what} about hand #{hand_id} from seat {seat:?} arrived during hand #{}; hand #{hand_id} is no longer held here, and a certificate about it did bank here before retention ended",
                                                                 $h.hand_id()
@@ -1716,14 +1813,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // abort that no settlement closed -- a copy of a settlement this
                                             // client reached itself is the emitters' ordinary re-send of their
                                             // terminal and costs nothing.
-                                            let unsettled_abort = match previous.as_ref() {
+                                            let unsettled_abort = match $t.previous.as_ref() {
                                                 Some(p) if p.hand_id() == hand_id => {
                                                     p.aborted().is_some() && !p.late_settled()
                                                 }
-                                                _ => unsettled_abort_here == Some(hand_id),
+                                                _ => $t.unsettled_abort_here == Some(hand_id),
                                             };
-                                            if unsettled_abort && late_settle_said != Some($h.hand_id()) {
-                                                late_settle_said = Some($h.hand_id());
+                                            if unsettled_abort && $t.late_settle_said != Some($h.hand_id()) {
+                                                $t.late_settle_said = Some($h.hand_id());
                                                 let _ = events
                                                     .send(NodeEvent::Warning(format!(
                                                         "a settlement of hand #{hand_id} from seat {seat:?} arrived during hand #{}: not applied, because the late path closes 800 ms after an abort and hand #{hand_id} ended here by one; hand #{} was derived from the abort, which is a branch the settlement's emitters do not share",
@@ -1742,29 +1839,29 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // inside it (`S1-BW`).
                                             match keep_for_next_hand(kind, hand_id, $h.hand_id()) {
                                                 Keep::Init
-                                                    if next_inits.len() < NEXT_INITS_CAP
+                                                    if $t.next_inits.len() < NEXT_INITS_CAP
                                                         && seat.is_some_and(|s| {
-                                                            next_inits
+                                                            $t.next_inits
                                                                 .iter()
                                                                 .filter(|(f, _)| *f == s)
                                                                 .count()
                                                                 < NEXT_INITS_PER_SEAT
                                                         })
-                                                        && !next_inits
+                                                        && !$t.next_inits
                                                             .iter()
                                                             .any(|(_, b)| b[..] == $bytes[..]) =>
                                                 {
                                                     if let Some(s) = seat {
-                                                        next_inits.push((s, $bytes.to_vec()));
+                                                        $t.next_inits.push((s, $bytes.to_vec()));
                                                     }
                                                 }
                                                 Keep::Early => {
                                                     if let Some(s) = seat {
                                                         keep_early(
-                                                            &mut next_early,
+                                                            &mut $t.next_early,
                                                             s,
                                                             $bytes,
-                                                            &mut next_early_lost,
+                                                            &mut $t.next_early_lost,
                                                         );
                                                     }
                                                 }
@@ -1863,13 +1960,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // it holds a value of its own, whether each subject's evidence opens and
     // agrees -- and answers with nothing when there is nothing to say.
     macro_rules! vote_on_returns {
-        ($h:expr) => {{
-            let evidence = sit_ins.complete($h.hand_id());
+        ($t:ident, $h:expr) => {{
+            let evidence = $t.sit_ins.complete($h.hand_id());
             if !evidence.is_empty() {
                 match $h.vote_on_returns(&evidence, &app_key, super::node::now_unix_ms()) {
                     Ok(sends) => {
                         if !sends.is_empty() {
-                            publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                            publish_hand(sends, &mut swarm, &mut $t.said, &$t.tox_sink);
                         }
                         if let Some(n) = $h.take_cert_note() {
                             let _ = events
@@ -1901,30 +1998,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // The player's own leave, from the window or from the fault knob below:
     // the group, the topic, the table, every local fact, the record.
     macro_rules! leave_table_now {
-        () => {{
+        ($t:ident) => {{
             // The Tox group goes with the table: dropping the handle tells
             // the driver to leave and joins its thread, which flushes what it
             // still holds -- the last message of a hand sits in that queue.
-            tox_sink.clear();
-            tox_group_said = false;
-            table_announces = 0;
-            if let Some(t) = table_topic.take() {
+            $t.tox_sink.clear();
+            $t.tox_group_said = false;
+            $t.table_announces = 0;
+            if let Some(t) = $t.table_topic.take() {
                 let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
             }
-            table = None;
-            leave_the_table!();
+            $t.table = None;
+            leave_the_table!($t);
             dht_effort(&mut swarm, false);
             // `S1-CR`: a seat that leaves by its own choice has no session to come back to.
             let _ = crate::storage::session::forget(&profile_dir);
-            resume = None;
-            resuming = false;
+            $t.resume = None;
+            $t.resuming = false;
             let _ = events.send(NodeEvent::LeftTable {
                 why: "left the table".into(),
             }).await;
         }};
     }
     macro_rules! rejoin_from_copies {
-        ($theirs:expr, $mine:expr) => {{
+        ($t:ident, $theirs:expr, $mine:expr) => {{
             let dead: u64 = $mine;
             let _ = events
                 .send(NodeEvent::Warning(format!(
@@ -1932,41 +2029,41 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     $theirs
                 )))
                 .await;
-            previous = None;
-            hand = None;
-            pending_repair = None;
-            give_up_for = None;
-            next_inits.clear();
-            next_early.clear();
-            resume_inits.retain(|k, _| *k > dead);
-            resume_early.retain(|(k, _)| *k > dead);
-            resume_said = None;
-            ahead.clear();
-            adrift = None;
-            frozen = None;
-            genesis_wait_said = None;
-            late_cert_said = None;
-            late_banked_for = None;
-            unsettled_abort_here = None;
-            late_settle_said = None;
-            next_hand_at = None;
-            deal_at = None;
-            return_hold = None;
-            boundary_done_for = None;
-            act_by = None;
-            stage_waiting = (u64::MAX, 0);
-            boundaries = crate::table::boundary::Boundaries::new();
-            early_checkpoints.clear();
-            early_boundary.clear();
-            crossed_for = None;
-            checkpoint_said = false;
-            purge_hand_from_said(&mut said, dead);
-            hand_reported = false;
-            deck_reported = None;
-            cards_reported = false;
-            turn_reported = None;
-            abort_reported = false;
-            resuming = true;
+            $t.previous = None;
+            $t.hand = None;
+            $t.pending_repair = None;
+            $t.give_up_for = None;
+            $t.next_inits.clear();
+            $t.next_early.clear();
+            $t.resume_inits.retain(|k, _| *k > dead);
+            $t.resume_early.retain(|(k, _)| *k > dead);
+            $t.resume_said = None;
+            $t.ahead.clear();
+            $t.adrift = None;
+            $t.frozen = None;
+            $t.genesis_wait_said = None;
+            $t.late_cert_said = None;
+            $t.late_banked_for = None;
+            $t.unsettled_abort_here = None;
+            $t.late_settle_said = None;
+            $t.next_hand_at = None;
+            $t.deal_at = None;
+            $t.return_hold = None;
+            $t.boundary_done_for = None;
+            $t.act_by = None;
+            $t.stage_waiting = (u64::MAX, 0);
+            $t.boundaries = crate::table::boundary::Boundaries::new();
+            $t.early_checkpoints.clear();
+            $t.early_boundary.clear();
+            $t.crossed_for = None;
+            $t.checkpoint_said = false;
+            purge_hand_from_said(&mut $t.said, dead);
+            $t.hand_reported = false;
+            $t.deck_reported = None;
+            $t.cards_reported = false;
+            $t.turn_reported = None;
+            $t.abort_reported = false;
+            $t.resuming = true;
         }};
     }
     // `D-040`: ask one poker peer what it offers (§7.5). A fresh nonce per
@@ -1984,62 +2081,62 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
     macro_rules! leave_the_table {
-        () => {{
-            table_closed = false;
-            tournament_started = false;
-            table_over_at = None;
-            ever_dealt = false;
-            hand = None;
-            late_cert_said = None;
-            previous = None;
-            next_inits.clear();
-            next_early.clear();
-            pending_repair = None;
-            genesis_wait_said = None;
-            late_banked_for = None;
-            hand_reported = false;
-            deck_reported = None;
-            cards_reported = false;
-            abort_reported = false;
-            turn_reported = None;
-            said.clear();
-            next_hand_at = None;
-            deal_at = None;
-            return_hold = None;
-            boundary_done_for = None;
-            act_by = None;
+        ($t:ident) => {{
+            $t.table_closed = false;
+            $t.tournament_started = false;
+            $t.table_over_at = None;
+            $t.ever_dealt = false;
+            $t.hand = None;
+            $t.late_cert_said = None;
+            $t.previous = None;
+            $t.next_inits.clear();
+            $t.next_early.clear();
+            $t.pending_repair = None;
+            $t.genesis_wait_said = None;
+            $t.late_banked_for = None;
+            $t.hand_reported = false;
+            $t.deck_reported = None;
+            $t.cards_reported = false;
+            $t.abort_reported = false;
+            $t.turn_reported = None;
+            $t.said.clear();
+            $t.next_hand_at = None;
+            $t.deal_at = None;
+            $t.return_hold = None;
+            $t.boundary_done_for = None;
+            $t.act_by = None;
             // Keyed by hand id, and the next table starts again at 1.
-            boundaries = crate::table::boundary::Boundaries::new();
-            early_checkpoints.clear();
-            early_boundary.clear();
-            crossed_for = None;
-            checkpoint_said = false;
-            frozen = None;
-            link_said.clear();
-            ahead.clear();
-            adrift = None;
+            $t.boundaries = crate::table::boundary::Boundaries::new();
+            $t.early_checkpoints.clear();
+            $t.early_boundary.clear();
+            $t.crossed_for = None;
+            $t.checkpoint_said = false;
+            $t.frozen = None;
+            $t.link_said.clear();
+            $t.ahead.clear();
+            $t.adrift = None;
             // **Its own doc says *cleared when the freeze is*, and the line
             // above clears the freeze.** Left behind, the next table's first
             // freeze would be silent — the one state that stops a client
             // dealing, with nothing said about why.
-            frozen_said = false;
+            $t.frozen_said = false;
             // Both hang off the freeze and the reconciliation round, which are
             // per table: `no_round_said` reports why no round could be opened,
             // and `disputes_seen` is counted so that "none arrived" and
             // "several arrived and agreed" are not the same silence.
-            no_round_said = false;
-            disputes_seen = 0;
+            $t.no_round_said = false;
+            $t.disputes_seen = 0;
             // Per table by their own meaning.
-            roster_seats.clear();
-            readmitted.clear();
-            sit_ins = SitIns::default();
-            resume_inits.clear();
-            resume_early.clear();
-            recorded_session = None;
-            hand_one_held_since = None;
-            hand_one_progress = None;
-            hand_one_forced_said = false;
-            why_no_hand_one_said = false;
+            $t.roster_seats.clear();
+            $t.readmitted.clear();
+            $t.sit_ins = SitIns::default();
+            $t.resume_inits.clear();
+            $t.resume_early.clear();
+            $t.recorded_session = None;
+            $t.hand_one_held_since = None;
+            $t.hand_one_progress = None;
+            $t.hand_one_forced_said = false;
+            $t.why_no_hand_one_said = false;
         }};
     }
 
@@ -2143,26 +2240,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     })) => {
                         alive.insert(peer, (std::time::Instant::now(), Some(rtt)));
                         // `S1-CS`: the window shows each seat's link.
-                        if let Some(seat) = seat_of_peer(table.as_ref(), &peer) {
+                        if let Some(seat) = seat_of_peer(t.table.as_ref(), &peer) {
                             // `D-035`: a ping answered from the lobby is not a seat
                             // at the table. Once the hand rides the group, the
                             // reading is the seat's membership there: a client that
                             // left the group gets no reading, whatever its lobby
                             // connection says, and the window's link goes stale.
                             // `D-041`: and the group's word rides with the figure.
-                            let in_group = table
+                            let in_group = t.table
                                 .as_ref()
                                 .and_then(|f| {
                                     f.roster().seats().iter().find(|e| e.seat == seat).map(|e| e.app_public_key)
                                 })
-                                .is_some_and(|k| tox_sink.in_group(&k));
-                            let at_the_table = !tox_sink.is_on_tox() || in_group;
+                                .is_some_and(|k| t.tox_sink.in_group(&k));
+                            let at_the_table = !t.tox_sink.is_on_tox() || in_group;
                             if at_the_table {
                                 let _ = events
                                     .send(NodeEvent::SeatLink {
                                         seat,
                                         rtt_ms: Some(u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX)),
-                                        group: tox_sink.is_on_tox() && in_group,
+                                        group: t.tox_sink.is_on_tox() && in_group,
                                     })
                                     .await;
                             }
@@ -2194,16 +2291,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let _ = events.send(NodeEvent::PeerDisconnected(peer_id)).await;
                         // `S1-CS`: a seat whose last connection closed is shown so.
                         if num_established == 0 {
-                            if let Some(seat) = seat_of_peer(table.as_ref(), &peer_id) {
+                            if let Some(seat) = seat_of_peer(t.table.as_ref(), &peer_id) {
                                 // `D-041`: on a Tox table a libp2p connection closing
                                 // says nothing about the seat; the group does.
-                                let group = tox_sink.is_on_tox()
-                                    && table
+                                let group = t.tox_sink.is_on_tox()
+                                    && t.table
                                         .as_ref()
                                         .and_then(|f| {
                                             f.roster().seats().iter().find(|e| e.seat == seat).map(|e| e.app_public_key)
                                         })
-                                        .is_some_and(|k| tox_sink.in_group(&k));
+                                        .is_some_and(|k| t.tox_sink.in_group(&k));
                                 let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None, group }).await;
                             }
                         }
@@ -2269,7 +2366,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // is the source of its advert, and a table that has dealt
                                 // is not offered (D-037).
                                 let mut adverts: Vec<Vec<u8>> = Vec::new();
-                                if let Some(f) = table.as_ref().filter(|f| f.is_founder() && !ever_dealt) {
+                                if let Some(f) = t.table.as_ref().filter(|f| f.is_founder() && !t.ever_dealt) {
                                     if let Some(b) = f.current_advert() {
                                         adverts.push(b);
                                     }
@@ -2409,7 +2506,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // one seat — rests on using this and not the
                                 // value in the payload.
                                 let authenticated = peer.to_bytes();
-                                let Some(f) = table.as_mut() else {
+                                let Some(f) = t.table.as_mut() else {
                                     // No table here to join. Saying nothing is
                                     // right: an answer would confirm that this
                                     // client is a founder of something.
@@ -2438,9 +2535,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .find(|e| e.peer_id == authenticated)
                                     .and_then(|e| e.tox_key);
                                 if let Some(k) = returning {
-                                    tox_sink.tell(super::toxsink::Seat::Back(k));
+                                    t.tox_sink.tell(super::toxsink::Seat::Back(k));
                                 }
-                                match f.on_join_request(&request, &authenticated, ever_dealt, now) {
+                                match f.on_join_request(&request, &authenticated, t.ever_dealt, now) {
                                     Ok(sends) => {
                                         // The channel is consumed by the one
                                         // reply and the rest of the sends go to
@@ -2463,7 +2560,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     }
                                                 }
                                                 Send::Broadcast(bytes) => {
-                                                    if let Some(t) = &table_topic {
+                                                    if let Some(t) = &t.table_topic {
                                                         let _ = swarm
                                                             .behaviour_mut()
                                                             .gossipsub
@@ -2473,7 +2570,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                         report_roster(&events, f).await;
-                                seat_on_tox(f, &tox_sink);
+                                seat_on_tox(f, &t.tox_sink);
                                         if let Some(session) = f.session() {
                                             let _ = events.send(NodeEvent::TableReal {
                                                 key: f.table_id(),
@@ -2482,8 +2579,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // Only once every seat is taken.
                                             // A table that is still filling
                                             // must stay as findable as it was.
-                                            table_closed = table_is_closed(f, &mut tournament_started);
-                                            dht_effort(&mut swarm, table_closed);
+                                            t.table_closed = table_is_closed(f, &mut t.tournament_started);
+                                            dht_effort(&mut swarm, t.table_closed);
                                             // The opening first, and the flag
                                             // only if there was one. Setting
                                             // the flag before asking closed the
@@ -2494,27 +2591,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // what a three-seat run showed:
                                             // the table formed and one seat's
                                             // HAND_INIT never came.
-                                            if !ever_dealt
-                                                && !resuming && hand_one_may_open(
-                                                    &tox_sink,
-                                                    &mut hand_one_held_since,
-                                                    &mut hand_one_progress,
-                                                    &mut hand_one_forced_said,
+                                            if !t.ever_dealt
+                                                && !t.resuming && hand_one_may_open(
+                                                    &t.tox_sink,
+                                                    &mut t.hand_one_held_since,
+                                                    &mut t.hand_one_progress,
+                                                    &mut t.hand_one_forced_said,
                                                     &events,
                                                 )
                                                 .await
                                             {
-                                                say_why_no_hand_one(f, &mut why_no_hand_one_said, &events).await;
+                                                say_why_no_hand_one(f, &mut t.why_no_hand_one_said, &events).await;
                                                 if let Some(o) = opening_for_hand_one(f) {
-                                                    ever_dealt = true;
+                                                    t.ever_dealt = true;
                                                     begin_hand(
                                                         o,
                                                         &app_key,
-                                                        &mut hand,
-                                                                                            &mut said,
+                                                        &mut t.hand,
+                                                                                            &mut t.said,
                                                         &mut swarm,
                                                         &events,
-                                                        &tox_sink,
+                                                        &t.tox_sink,
                                                     )
                                                     .await;
                                                 }
@@ -2531,7 +2628,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             request_response::Message::Response { response, .. } => {
-                                let Some(f) = table.as_mut() else { continue };
+                                let Some(f) = t.table.as_mut() else { continue };
                                 match f.on_join_answer(&response, now) {
                                     Ok(_) => {
                                         if let Some(seat) = f.my_seat() {
@@ -2542,7 +2639,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         report_params(&events, f).await;
                                         report_roster(&events, f).await;
-                                seat_on_tox(f, &tox_sink);
+                                seat_on_tox(f, &t.tox_sink);
                                     }
                                     // **`AlreadySeated` is not a refusal like the
                                     // others, and treating it like one is what
@@ -2626,15 +2723,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             .await;
                                     }
                                     Err(Failed::Refused { reason, .. }) => {
-                                        table = None;
+                                        t.table = None;
                                         // The Tox group goes with the table. Dropping the handle
                                         // tells the driver to leave and joins its thread, which
                                         // flushes what it still holds - the last message of a hand
                                         // is exactly what sits in that queue.
-                                        tox_sink.clear();
-                            tox_group_said = false;
-                            table_announces = 0;
-                                        if let Some(t) = table_topic.take() {
+                                        t.tox_sink.clear();
+                            t.tox_group_said = false;
+                            t.table_announces = 0;
+                                        if let Some(t) = t.table_topic.take() {
                                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                                         }
                                         let _ = events
@@ -2642,12 +2739,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             .await;
                                         // `S1-CR`: the founder answered, and not with *already
                                         // seated*: the session this record names is gone.
-                                        if resuming
+                                        if t.resuming
                                             && reason != crate::table::join::RejectReason::AlreadySeated.code()
                                         {
                                             let _ = crate::storage::session::forget(&profile_dir);
-                                            resume = None;
-                                            resuming = false;
+                                            t.resume = None;
+                                            t.resuming = false;
                                             let _ = events
                                                 .send(NodeEvent::SessionGaveUp {
                                                     why: format!("the founder refused the rejoin (reason {reason})"),
@@ -2656,8 +2753,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                     Err(e) => {
-                                        table = None;
-                        leave_the_table!();
+                                        t.table = None;
+                        leave_the_table!(t);
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                             why: format!("the acceptance did not hold: {e:?}"),
@@ -2673,18 +2770,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // A join that goes unanswered has to say so. Silence
                         // here is a player looking at a button that appears to
                         // have done nothing.
-                        table = None;
+                        t.table = None;
                         // The Tox group goes with the table. Dropping the handle
                         // tells the driver to leave and joins its thread, which
                         // flushes what it still holds - the last message of a hand
                         // is exactly what sits in that queue.
-                        tox_sink.clear();
-                            tox_group_said = false;
-                            table_announces = 0;
-                        if let Some(t) = table_topic.take() {
+                        t.tox_sink.clear();
+                            t.tox_group_said = false;
+                            t.table_announces = 0;
+                        if let Some(t) = t.table_topic.take() {
                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                         }
-                        leave_the_table!();
+                        leave_the_table!(t);
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                             why: format!("the founder did not answer: {error}"),
@@ -2696,7 +2793,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             propagation_source,
                             message_id,
                         },
-                    )) if table_topic
+                    )) if t.table_topic
                         .as_ref()
                         .is_some_and(|t| message.topic == t.hash()) =>
                     {
@@ -2724,7 +2821,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // verdict, because the `Some` arm's verdict was read by
                         // nothing — and a verdict computed and not reported is
                         // exactly the bug this whole path was repaired for.
-                        if table.is_none() {
+                        if t.table.is_none() {
                             let _ = swarm.behaviour_mut().gossipsub
                                 .report_message_validation_result(
                                     &message_id,
@@ -2741,20 +2838,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             crate::net::chained::peek(&message.data, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
                         {
                             let now = super::node::now_unix_ms();
-                            let verdict = match table.as_ref() {
+                            let verdict = match t.table.as_ref() {
                                 Some(f) => match super::tabletalk::receive(
                                     &message.data,
                                     &f.table_id(),
                                     |k| f.roster().seat_of(k),
                                     now,
-                                    &mut chat_limits,
+                                    &mut t.chat_limits,
                                 ) {
-                                    Ok(said) => {
+                                    Ok(spoken) => {
                                         let _ = events
                                             .send(NodeEvent::TableSaid {
-                                                seat: said.seat,
-                                                nickname: said.nickname,
-                                                text: said.text,
+                                                seat: spoken.seat,
+                                                nickname: spoken.nickname,
+                                                text: spoken.text,
                                             })
                                             .await;
                                         gossipsub::MessageAcceptance::Accept
@@ -2775,7 +2872,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // decodes as neither a player list nor a ratification,
                         // so without this it would fall through to the
                         // formation and be refused as malformed.
-                        if let Some(h) = hand.as_mut() {
+                        if let Some(h) = t.hand.as_mut() {
                             // The hand, through the shared handling. The macro is
                             // defined above the loop and this is one of its two call
                             // sites; the other is the Tox group's. See there for why it
@@ -2790,20 +2887,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             if link_is_down() {
                                 continue;
                             }
-                            cross_boundary_at_t47(h, &mut boundaries, &mut crossed_for);
+                            cross_boundary_at_t47(h, &mut t.boundaries, &mut t.crossed_for);
                             let verdict: Option<gossipsub::MessageAcceptance> =
                                 match checkpoint_event(
                                     &message.data,
                                     h,
-                                    &mut boundaries,
-                                    &mut readmitted,
-                                    &mut sit_ins,
+                                    &mut t.boundaries,
+                                    &mut t.readmitted,
+                                    &mut t.sit_ins,
                                     &app_key,
-                                    &mut checkpoint_said,
-                                    &mut frozen,
-                                    &roster_seats,
-                                    &mut no_round_said,
-                                    &mut early_checkpoints,
+                                    &mut t.checkpoint_said,
+                                    &mut t.frozen,
+                                    &t.roster_seats,
+                                    &mut t.no_round_said,
+                                    &mut t.early_checkpoints,
                                     &profile_dir,
                                     &events,
                                 )
@@ -2817,9 +2914,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     None if dispute_event(
                                         &message.data,
                                         h,
-                                        &mut boundaries,
-                                        &mut frozen,
-                                        &mut disputes_seen,
+                                        &mut t.boundaries,
+                                        &mut t.frozen,
+                                        &mut t.disputes_seen,
                                         &events,
                                     )
                                     .await =>
@@ -2832,7 +2929,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // its message is not invalid; this receiver
                                     // has stopped, which is a different thing
                                     // and must not cost anybody peer score.
-                                    None if frozen.is_some() => {
+                                    None if t.frozen.is_some() => {
                                         Some(gossipsub::MessageAcceptance::Ignore)
                                     }
                                     // §4.10's hand boundary window, for the same
@@ -2852,36 +2949,36 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     None if boundary_event(
                                         &message.data,
                                         h,
-                                        &mut boundaries,
-                                        &mut readmitted,
-                                        &mut sit_ins,
-                                        &mut early_boundary,
+                                        &mut t.boundaries,
+                                        &mut t.readmitted,
+                                        &mut t.sit_ins,
+                                        &mut t.early_boundary,
                                         &events,
                                     )
                                     .await =>
                                     {
                                         Some(gossipsub::MessageAcceptance::Accept)
                                     }
-                                    None => hand_event!(h, &message.data),
+                                    None => hand_event!(t, h, &message.data),
                                     Some(out) => {
                                         if !out.is_empty() {
                                             publish_and_hear(
                                                 out,
                                                 h,
-                                                &mut boundaries,
-                                                &mut readmitted,
-                                                &mut sit_ins,
+                                                &mut t.boundaries,
+                                                &mut t.readmitted,
+                                                &mut t.sit_ins,
                                                 &app_key,
-                                                &mut checkpoint_said,
-                                                &mut frozen,
-                                                &roster_seats,
-                                                &mut no_round_said,
-                                                &mut early_checkpoints,
+                                                &mut t.checkpoint_said,
+                                                &mut t.frozen,
+                                                &t.roster_seats,
+                                                &mut t.no_round_said,
+                                                &mut t.early_checkpoints,
                                                 &profile_dir,
                                                 &events,
                                                 &mut swarm,
-                                                &mut said,
-                                                &tox_sink,
+                                                &mut t.said,
+                                                &t.tox_sink,
                                             )
                                             .await;
                                         }
@@ -2908,10 +3005,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if link_is_down() {
                             continue;
                         }
-                        if resuming && hand.is_none() {
-                            let _ = stash_for_resume(&message.data, &mut resume_inits, &mut resume_early);
+                        if t.resuming && t.hand.is_none() {
+                            let _ = stash_for_resume(&message.data, &mut t.resume_inits, &mut t.resume_early);
                         }
-                        let Some(f) = table.as_mut() else { continue };
+                        let Some(f) = t.table.as_mut() else { continue };
                         let now = super::node::now_unix_ms();
                         let result = if joinwire::receive_player_list(&message.data).is_ok() {
                             f.on_player_list(&message.data, now)
@@ -2921,7 +3018,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let refused = result.is_err();
                         match result {
                             Ok(sends) => {
-                                if let Some(t) = &table_topic {
+                                if let Some(t) = &t.table_topic {
                                     for send in sends {
                                         if let Send::Broadcast(bytes) = send {
                                             let _ = swarm
@@ -2932,7 +3029,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 report_roster(&events, f).await;
-                                seat_on_tox(f, &tox_sink);
+                                seat_on_tox(f, &t.tox_sink);
                                 if let Some(session) = f.session() {
                                     let _ = events
                                         .send(NodeEvent::TableReal {
@@ -2945,27 +3042,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // idempotent, because this one fires again
                                     // on every later table message.
                                     // See the note at the other road in.
-                                    if !ever_dealt
-                                        && !resuming && hand_one_may_open(
-                                            &tox_sink,
-                                            &mut hand_one_held_since,
-                                            &mut hand_one_progress,
-                                            &mut hand_one_forced_said,
+                                    if !t.ever_dealt
+                                        && !t.resuming && hand_one_may_open(
+                                            &t.tox_sink,
+                                            &mut t.hand_one_held_since,
+                                            &mut t.hand_one_progress,
+                                            &mut t.hand_one_forced_said,
                                             &events,
                                         )
                                         .await
                                     {
-                                        say_why_no_hand_one(f, &mut why_no_hand_one_said, &events).await;
+                                        say_why_no_hand_one(f, &mut t.why_no_hand_one_said, &events).await;
                                         if let Some(o) = opening_for_hand_one(f) {
-                                            ever_dealt = true;
+                                            t.ever_dealt = true;
                                             begin_hand(
                                                 o,
                                                 &app_key,
-                                                &mut hand,
-                                                                            &mut said,
+                                                &mut t.hand,
+                                                                            &mut t.said,
                                                 &mut swarm,
                                                 &events,
-                                                &tox_sink,
+                                                &t.tox_sink,
                                             )
                                             .await;
                                         }
@@ -3220,11 +3317,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // two direct connections. The other two formed the
                             // table without it and played seventeen hands as
                             // seats [1, 2].
-                            if !peer_has_our_topics(&swarm, &peer_id, &topics, table_topic.as_ref())
+                            if !peer_has_our_topics(&swarm, &peer_id, &topics, t.table_topic.as_ref())
                             {
                                 let mut which: Vec<&gossipsub::IdentTopic> =
                                     vec![&topics.lobby, &topics.lobby_chat];
-                                which.extend(table_topic.as_ref());
+                                which.extend(t.table_topic.as_ref());
                                 announce_topics(&mut swarm, &which);
                             }
                             let _ = events
@@ -3594,15 +3691,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
-                        gossipsub::Event::Subscribed { peer_id, topic: t },
+                        gossipsub::Event::Subscribed { peer_id, topic: subscribed },
                     )) => {
                         // Somebody new on this table's topic. GossipSub
                         // delivers to whoever is on a topic when a message is
                         // published and to nobody afterwards, so a roster
                         // announced a moment before they arrived was never sent
                         // to them at all. Say it again.
-                        if let (Some(f), Some(mine)) = (table.as_ref(), table_topic.as_ref()) {
-                            if t == mine.hash() {
+                        if let (Some(f), Some(mine)) = (t.table.as_ref(), t.table_topic.as_ref()) {
+                            if subscribed == mine.hash() {
                                 // **Said out loud, because the silent version of
                                 // this could not be told from not firing at
                                 // all.** A rejoining client sat at `ratified
@@ -3624,7 +3721,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // the single publish needs it in. The Tox
                                     // group has no content-addressed cache and
                                     // carries the same bytes.
-                                    tox_sink.try_broadcast(&bytes);
+                                    t.tox_sink.try_broadcast(&bytes);
                                     match swarm
                                         .behaviour_mut()
                                         .gossipsub
@@ -3659,8 +3756,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // nothing. The failure was "no peers subscribed", so the
                         // repair is "publish when one subscribes", and it is the
                         // moment rather than a shorter timer.
-                        if t == topics.lobby.hash() {
-                            if let Some(f) = table.as_mut().filter(|f| f.is_founder()) {
+                        if subscribed == topics.lobby.hash() {
+                            if let Some(f) = t.table.as_mut().filter(|f| f.is_founder()) {
                                 let now = super::node::now_unix_ms();
                                 // For **every** arrival, not only the first.
                                 //
@@ -3713,7 +3810,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // who had done nothing of the kind, and the lines that
                         // mattered were pushed out of a bounded log before
                         // anyone could read them.
-                        if t == topics.lobby.hash() || Some(&t) == table_topic.as_ref().map(|x| x.hash()).as_ref() {
+                        if subscribed == topics.lobby.hash()
+                            || Some(&subscribed) == t.table_topic.as_ref().map(|x| x.hash()).as_ref()
+                        {
                             let _ = events.send(NodeEvent::MeshPeer(peer_id)).await;
                         }
                     }
@@ -3808,11 +3907,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // The roster moves between ticks - somebody sits, somebody
                 // stands - so the answer is recomputed rather than remembered
                 // from the moment it first became true.
-                let closed = table
+                let closed = t.table
                     .as_ref()
-                    .is_some_and(|f| table_is_closed(f, &mut tournament_started));
-                if closed != table_closed {
-                    table_closed = closed;
+                    .is_some_and(|f| table_is_closed(f, &mut t.tournament_started));
+                if closed != t.table_closed {
+                    t.table_closed = closed;
                     dht_effort(&mut swarm, closed);
                 }
 
@@ -3928,7 +4027,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // its seats; the table's GossipSub topic only where the
                         // table has no group. Said to this client's own window
                         // directly, as the lobby's line is.
-                        let Some(f) = table.as_ref() else {
+                        let Some(f) = t.table.as_ref() else {
                             let _ = events.send(NodeEvent::Warning("not at a table".into())).await;
                             continue;
                         };
@@ -3939,9 +4038,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let now = super::node::now_unix_ms();
                         match super::tabletalk::say(&app_key, &f.table_id(), &nickname, &text, now) {
                             Ok(bytes) => {
-                                if tox_sink.is_on_tox() {
-                                    tox_sink.try_broadcast(&bytes);
-                                } else if let Some(topic) = table_topic.as_ref() {
+                                if t.tox_sink.is_on_tox() {
+                                    t.tox_sink.try_broadcast(&bytes);
+                                } else if let Some(topic) = t.table_topic.as_ref() {
                                     let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes);
                                 }
                                 let _ = events
@@ -4073,7 +4172,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // table forms on the mesh exactly as it did before and
                         // the advert names no group, which is what a build
                         // without the feature always says.
-                        let ad = match tox_sink.start(
+                        let ad = match t.tox_sink.start(
                             &profile_dir,
                             super::toxsink::Role::Host,
                             &ad.table_name,
@@ -4081,7 +4180,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             Vec::new(),
                         ) {
                             Ok(Some(mine)) => {
-                                match tox_sink
+                                match t.tox_sink
                                     // **This await blocks the loop, so it is
                                     // short.** The driver creates the group as
                                     // soon as it is asked, so the wait is
@@ -4107,9 +4206,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         // advertise a table whose group nobody
                                         // can check, the sink is given up and
                                         // the table rides the mesh.
-                                        tox_sink.clear();
-                                        tox_group_said = false;
-                                        table_announces = 0;
+                                        t.tox_sink.clear();
+                                        t.tox_group_said = false;
+                                        t.table_announces = 0;
                                         let _ = events
                                             .send(NodeEvent::Warning(
                                                 "the Tox group did not come up; this table stays on the mesh"
@@ -4149,12 +4248,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         let key = f.table_id();
                                         let topic = joinrpc::table_topic(&key);
                                         let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
-                                        table_topic = Some(topic);
-                                        table = Some(f);
+                                        t.table_topic = Some(topic);
+                                        t.table = Some(f);
                                         let _ = events.send(NodeEvent::Hosting { key }).await;
-                                        report_params(&events, table.as_ref().unwrap()).await;
-                                        report_roster(&events, table.as_ref().unwrap()).await;
-                        if let Some(f) = table.as_ref() { seat_on_tox(f, &tox_sink); }
+                                        report_params(&events, t.table.as_ref().unwrap()).await;
+                                        report_roster(&events, t.table.as_ref().unwrap()).await;
+                        if let Some(f) = t.table.as_ref() { seat_on_tox(f, &t.tox_sink); }
                                         // Published first, shown second: a table
                                         // appears in its founder's own lobby when
                                         // the network has taken it, and not when
@@ -4228,12 +4327,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `ResumeSession`; the `JoinTable` the window and the
                         // headless client send after it has nobody to ask, and
                         // is not a fault.
-                        if resume.as_ref().is_some_and(|r| r.founder_seed != [0u8; 32] && r.table_key == key)
-                            && table.as_ref().is_some_and(|f| f.is_founder())
+                        if t.resume.as_ref().is_some_and(|r| r.founder_seed != [0u8; 32] && r.table_key == key)
+                            && t.table.as_ref().is_some_and(|f| f.is_founder())
                         {
                             continue;
                         }
-                        if table.is_some() {
+                        if t.table.is_some() {
                             let _ = events
                                 .send(NodeEvent::Warning(
                                     "already joining or seated at a table; leave it before joining another"
@@ -4251,12 +4350,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // any more -- the recorded ratification is the old table's,
                         // and a resuming client adopts hands rather than deriving
                         // hand 1. The record stays until the new table's replaces it.
-                        if resuming && resume.as_ref().is_some_and(|r| r.table_key != key) {
-                            resuming = false;
+                        if t.resuming && t.resume.as_ref().is_some_and(|r| r.table_key != key) {
+                            t.resuming = false;
                         }
-                        joined_key = Some(key);
-                        joined_ad = Some(held.ad.clone());
-                        joined_advert_hash = Some(held.advert_hash);
+                        t.joined_key = Some(key);
+                        t.joined_ad = Some(held.ad.clone());
+                        t.joined_advert_hash = Some(held.advert_hash);
                         // The founder's PeerId comes from the advert, which was
                         // signed by the table key. Dialling anything else would
                         // be taking routing advice from whoever spoke last.
@@ -4291,7 +4390,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let my_tox_key = match held.ad.founder_tox_key {
                             None => None,
                             Some(founder_tox) => {
-                                match tox_sink.start(
+                                match t.tox_sink.start(
                                     &profile_dir,
                                     super::toxsink::Role::Joiner {
                                         founder: founder_tox,
@@ -4350,14 +4449,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // bytes it recorded, verbatim; a new ratification is
                                 // a new `event_hash` and so a session identity nobody
                                 // else computes (`run202634-3`).
-                                let f = match resume.as_ref().filter(|r| resuming && !r.ratification.is_empty()) {
+                                let f = match t.resume.as_ref().filter(|r| t.resuming && !r.ratification.is_empty()) {
                                     Some(r) => f.with_recorded_ratification(r.ratification.clone()),
                                     None => f,
                                 };
                                 let topic = joinrpc::table_topic(&key);
                                 let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
-                                table_topic = Some(topic);
-                                table = Some(f);
+                                t.table_topic = Some(topic);
+                                t.table = Some(f);
                                 // **Ask the DHT for the founder before asking
                                 // the founder for a seat.**
                                 //
@@ -4396,7 +4495,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 swarm.behaviour_mut().join.send_request(&founder, request);
                             }
                             Err(e) => {
-                        leave_the_table!();
+                        leave_the_table!(t);
                         dht_effort(&mut swarm, false);
                         let _ = events.send(NodeEvent::LeftTable {
                                     why: format!("cannot ask to join: {e:?}"),
@@ -4406,11 +4505,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     NodeCommand::ResumeSession => {
-                        let Some(r) = resume.as_ref() else {
+                        let Some(r) = t.resume.as_ref() else {
                             let _ = events.send(NodeEvent::Warning("no unfinished session is on record".into())).await;
                             continue;
                         };
-                        if table.is_some() {
+                        if t.table.is_some() {
                             let _ = events.send(NodeEvent::Warning("already at a table; leave it before rejoining another".into())).await;
                             continue;
                         }
@@ -4433,7 +4532,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 Ok(ad) => ad,
                                 Err(e) => {
                                     let _ = crate::storage::session::forget(&profile_dir);
-                                    resume = None;
+                                    t.resume = None;
                                     let _ = events
                                         .send(NodeEvent::SessionGaveUp { why: format!("the recorded advert does not read: {e:?}") })
                                         .await;
@@ -4447,7 +4546,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .map(|(l, _, _)| l.roster.iter().filter(|e| e.seat != 0).filter_map(|e| e.tox_key).collect())
                                 .unwrap_or_default();
                             if ad.founder_tox_key.is_some() {
-                                match tox_sink.start(
+                                match t.tox_sink.start(
                                     &profile_dir,
                                     super::toxsink::Role::Back { chat_id: ad.tox_chat_id },
                                     &ad.table_name,
@@ -4482,13 +4581,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     let key = f.table_id();
                                     let topic = joinrpc::table_topic(&key);
                                     let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
-                                    table_topic = Some(topic.clone());
-                                    table = Some(f);
+                                    t.table_topic = Some(topic.clone());
+                                    t.table = Some(f);
                                     // A table that is set is not advertised again.
-                                    ever_dealt = true;
-                                    resuming = true;
-                                    resume_since_ms = now;
-                                    resume_last_peer_ms = None;
+                                    t.ever_dealt = true;
+                                    t.resuming = true;
+                                    t.resume_since_ms = now;
+                                    t.resume_last_peer_ms = None;
                                     let _ = events
                                         .send(NodeEvent::Warning(format!(
                                             "rejoining {} as its founder (seat 0, stack {stack}, last at hand #{hand_id}) from the session record",
@@ -4496,21 +4595,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         )))
                                         .await;
                                     let _ = events.send(NodeEvent::Hosting { key }).await;
-                                    report_params(&events, table.as_ref().unwrap()).await;
-                                    report_roster(&events, table.as_ref().unwrap()).await;
-                                    if let Some(f) = table.as_ref() {
-                                        seat_on_tox(f, &tox_sink);
+                                    report_params(&events, t.table.as_ref().unwrap()).await;
+                                    report_roster(&events, t.table.as_ref().unwrap()).await;
+                                    if let Some(f) = t.table.as_ref() {
+                                        seat_on_tox(f, &t.tox_sink);
                                     }
                                     for send in sends {
                                         if let Send::Broadcast(bytes) = send {
                                             let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes.clone());
-                                            tox_sink.try_broadcast(&bytes);
+                                            t.tox_sink.try_broadcast(&bytes);
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     let _ = crate::storage::session::forget(&profile_dir);
-                                    resume = None;
+                                    t.resume = None;
                                     let _ = events
                                         .send(NodeEvent::SessionGaveUp { why: format!("the founder's record does not rebuild the table: {e:?}") })
                                         .await;
@@ -4528,9 +4627,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let now = super::node::now_unix_ms();
                                 let params = super::advert::table_params_hash(&ad);
                                 let _ = state.lobby.offer(r.table_key, ad.clone(), params, r.advert_hash, now);
-                                resuming = true;
-                                resume_since_ms = now;
-                                resume_last_peer_ms = None;
+                                t.resuming = true;
+                                t.resume_since_ms = now;
+                                t.resume_last_peer_ms = None;
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
                                         "rejoining {} (seat {}, stack {}, last at hand #{}) from the session record",
@@ -4548,7 +4647,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             Err(e) => {
                                 let _ = crate::storage::session::forget(&profile_dir);
-                                resume = None;
+                                t.resume = None;
                                 let _ = events
                                     .send(NodeEvent::SessionGaveUp { why: format!("the recorded advert does not read: {e:?}") })
                                     .await;
@@ -4557,8 +4656,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     NodeCommand::ForgetSession => {
                         let _ = crate::storage::session::forget(&profile_dir);
-                        resume = None;
-                        resuming = false;
+                        t.resume = None;
+                        t.resuming = false;
                         // `S1-DE`: said as the record going, which is what the
                         // window acts on; a warning left its question standing.
                         let _ = events
@@ -4580,7 +4679,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     NodeCommand::Act(action) => {
-                        let Some(h) = hand.as_mut() else {
+                        let Some(h) = t.hand.as_mut() else {
                             let _ = events
                                 .send(NodeEvent::Warning(
                                     "there is no hand to act in".into(),
@@ -4591,13 +4690,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let now = super::node::now_unix_ms();
                         match h.act(action, &app_key, now) {
                             Ok(sends) => {
-                                publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
                                 let report =
-                                    report_hand(h, &events, &mut turn_reported).await;
+                                    report_hand(h, &events, &mut t.turn_reported).await;
                                 if let Some(end) = report.ended {
-                                    arm_boundary!(end.pause());
+                                    arm_boundary!(t, end.pause());
                                 }
-                                act_by = hurry(report.clock.apply(act_by, h.action_deadline()), autoplay);
+                                t.act_by = hurry(report.clock.apply(t.act_by, h.action_deadline()), autoplay);
                             }
                             // The player's own engine refused it, which means
                             // the window offered something it should not have.
@@ -4612,7 +4711,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     NodeCommand::LeaveTable => {
-                        leave_table_now!();
+                        leave_table_now!(t);
                     }
                 }
             }
@@ -4635,23 +4734,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // Inert in a build without the feature: `TableSink::next` is a
             // future that never resolves when there is no Tox table, so this
             // branch contributes nothing to the `select!`.
-            Some(item) = tox_sink.next() => {
+            Some(item) = t.tox_sink.next() => {
                 // **Learn who this group peer is, once, from a signature.**
                 // The driver reports a sender by its group key and cannot get
                 // further; the roster is keyed by application key. Pairing them
                 // here — where the event is opened anyway — is what makes
                 // D-019's removal able to find its target at all (`S1-I`), and
                 // it costs one open per peer per run.
-                if let (Some(gk), Some(h)) = (item.claimed, hand.as_ref()) {
-                    if !taught.contains(&gk) {
+                if let (Some(gk), Some(h)) = (item.claimed, t.hand.as_ref()) {
+                    if !t.taught.contains(&gk) {
                         if let Some(app) = signer_of(&item.bytes, h) {
-                            taught.insert(gk);
-                            tox_sink.tell(super::toxsink::Seat::KnownAs {
+                            t.taught.insert(gk);
+                            t.tox_sink.tell(super::toxsink::Seat::KnownAs {
                                 group_key: gk,
                                 app_key: app,
                             });
                             // `D-041`: said, because the felt's *on the line* rests on it.
-                            let seat = table.as_ref().and_then(|f| f.roster().seat_of(&app));
+                            let seat = t.table.as_ref().and_then(|f| f.roster().seat_of(&app));
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
                                     "group member {} is seat {:?} (application key {})",
@@ -4676,7 +4775,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `ever_dealt`: before the first deal every seat repeats its
                 // ratification on the housekeeping tick anyway, and answering
                 // those would be every seat echoing every seat.
-                if let Some(f) = table.as_ref().filter(|_| ever_dealt) {
+                if let Some(f) = t.table.as_ref().filter(|_| t.ever_dealt) {
                     if f.session().is_some()
                         && matches!(
                             crate::net::chained::peek(&item.bytes, TABLE_FRAME_PEEK),
@@ -4684,11 +4783,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         )
                     {
                         let now = super::node::now_unix_ms();
-                        if now.saturating_sub(ratification_echo_ms) >= 5_000 {
-                            ratification_echo_ms = now;
+                        if now.saturating_sub(t.ratification_echo_ms) >= 5_000 {
+                            t.ratification_echo_ms = now;
                             let mut n = 0usize;
                             for bytes in f.say_again(now) {
-                                tox_sink.try_broadcast(&bytes);
+                                t.tox_sink.try_broadcast(&bytes);
                                 n += 1;
                             }
                             // `D-033`: and the running hand -- every frame accepted
@@ -4697,17 +4796,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // Once a minute at most: a seat back from a restart repeats its
                             // ratification every thirty seconds until it has dealt, and a
                             // dealt hand is a hundred kilobytes of frames.
-                            if let Some(h) = hand.as_ref().filter(|_| now.saturating_sub(hand_said_again_ms) >= 60_000) {
-                                hand_said_again_ms = now;
+                            if let Some(h) = t.hand.as_ref().filter(|_| now.saturating_sub(t.hand_said_again_ms) >= 60_000) {
+                                t.hand_said_again_ms = now;
                                 let hid = h.hand_id();
                                 let mut frames = 0usize;
                                 for b in h.transcript() {
-                                    tox_sink.try_broadcast(b);
+                                    t.tox_sink.try_broadcast(b);
                                     frames += 1;
                                 }
-                                for b in said.iter() {
+                                for b in t.said.iter() {
                                     if crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok().map(|(_, h, _)| h) == Some(hid) {
-                                        tox_sink.try_broadcast(b);
+                                        t.tox_sink.try_broadcast(b);
                                         frames += 1;
                                     }
                                 }
@@ -4730,20 +4829,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok((crate::protocol::messages::EventType::TableChat, _, _)) =
                     crate::net::chained::peek(&item.bytes, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
                 {
-                    if let Some(f) = table.as_ref() {
+                    if let Some(f) = t.table.as_ref() {
                         let now = super::node::now_unix_ms();
-                        if let Ok(said) = super::tabletalk::receive(
+                        if let Ok(heard) = super::tabletalk::receive(
                             &item.bytes,
                             &f.table_id(),
                             |k| f.roster().seat_of(k),
                             now,
-                            &mut chat_limits,
+                            &mut t.chat_limits,
                         ) {
                             let _ = events
                                 .send(NodeEvent::TableSaid {
-                                    seat: said.seat,
-                                    nickname: said.nickname,
-                                    text: said.text,
+                                    seat: heard.seat,
+                                    nickname: heard.nickname,
+                                    text: heard.text,
                                 })
                                 .await;
                         }
@@ -4774,14 +4873,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // hashes rather than bytes, so no peer can repair a third
                 // party's missing copy. A seat that never enters the group at
                 // all is `S1-AA` shape (i) and is untouched by this.
-                if hand.is_none() {
+                if t.hand.is_none() {
                     // `S1-CR`: the running table's hand traffic, kept for the
                     // adoption at the stall tick. The formation handler below
                     // refuses it quietly either way.
-                    if resuming {
-                        let _ = stash_for_resume(&item.bytes, &mut resume_inits, &mut resume_early);
+                    if t.resuming {
+                        let _ = stash_for_resume(&item.bytes, &mut t.resume_inits, &mut t.resume_early);
                     }
-                    if let Some(f) = table.as_mut() {
+                    if let Some(f) = t.table.as_mut() {
                         let now = super::node::now_unix_ms();
                         let took = if joinwire::receive_player_list(&item.bytes).is_ok() {
                             f.on_player_list(&item.bytes, now)
@@ -4795,8 +4894,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if let Ok(sends) = took {
                             for send in sends {
                                 if let super::formation::Send::Broadcast(bytes) = send {
-                                    if !tox_sink.try_broadcast(&bytes) {
-                                        if let Some(t) = &table_topic {
+                                    if !t.tox_sink.try_broadcast(&bytes) {
+                                        if let Some(t) = &t.table_topic {
                                             let _ = swarm
                                                 .behaviour_mut()
                                                 .gossipsub
@@ -4806,7 +4905,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             report_roster(&events, f).await;
-                            seat_on_tox(f, &tox_sink);
+                            seat_on_tox(f, &t.tox_sink);
                             if let Some(session) = f.session() {
                                 // `TableReal` is idempotent and is emitted from
                                 // more than one place already; see `begin_hand`.
@@ -4820,20 +4919,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                if let Some(h) = hand.as_mut() {
-                    cross_boundary_at_t47(h, &mut boundaries, &mut crossed_for);
+                if let Some(h) = t.hand.as_mut() {
+                    cross_boundary_at_t47(h, &mut t.boundaries, &mut t.crossed_for);
                     match checkpoint_event(
                         &item.bytes,
                         h,
-                        &mut boundaries,
-                        &mut readmitted,
-                        &mut sit_ins,
+                        &mut t.boundaries,
+                        &mut t.readmitted,
+                        &mut t.sit_ins,
                         &app_key,
-                        &mut checkpoint_said,
-                        &mut frozen,
-                        &roster_seats,
-                        &mut no_round_said,
-                        &mut early_checkpoints,
+                        &mut t.checkpoint_said,
+                        &mut t.frozen,
+                        &t.roster_seats,
+                        &mut t.no_round_said,
+                        &mut t.early_checkpoints,
                         &profile_dir,
                         &events,
                     )
@@ -4852,25 +4951,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             if !dispute_event(
                                 &item.bytes,
                                 h,
-                                &mut boundaries,
-                                &mut frozen,
-                                &mut disputes_seen,
+                                &mut t.boundaries,
+                                &mut t.frozen,
+                                &mut t.disputes_seen,
                                 &events,
                             )
                             .await
-                                && frozen.is_none()
+                                && t.frozen.is_none()
                                 && !boundary_event(
                                     &item.bytes,
                                     h,
-                                    &mut boundaries,
-                                    &mut readmitted,
-                                    &mut sit_ins,
-                                    &mut early_boundary,
+                                    &mut t.boundaries,
+                                    &mut t.readmitted,
+                                    &mut t.sit_ins,
+                                    &mut t.early_boundary,
                                     &events,
                                 )
                                 .await
                             {
-                                let _ = hand_event!(h, &item.bytes);
+                                let _ = hand_event!(t, h, &item.bytes);
                             }
                         }
                         // Taken, and this peer's own `STATE_ACK` is due.
@@ -4878,20 +4977,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             publish_and_hear(
                                 out,
                                 h,
-                                &mut boundaries,
-                                &mut readmitted,
-                                &mut sit_ins,
+                                &mut t.boundaries,
+                                &mut t.readmitted,
+                                &mut t.sit_ins,
                                 &app_key,
-                                &mut checkpoint_said,
-                                &mut frozen,
-                                &roster_seats,
-                                &mut no_round_said,
-                                &mut early_checkpoints,
+                                &mut t.checkpoint_said,
+                                &mut t.frozen,
+                                &t.roster_seats,
+                                &mut t.no_round_said,
+                                &mut t.early_checkpoints,
                                 &profile_dir,
                                 &events,
                                 &mut swarm,
-                                &mut said,
-                                &tox_sink,
+                                &mut t.said,
+                                &t.tox_sink,
                             )
                             .await;
                         }
@@ -4901,9 +5000,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             _ = resend.tick() => {
-                if !tox_group_said {
-                    if let Some(chat) = tox_sink.chat_id() {
-                        tox_group_said = true;
+                if !t.tox_group_said {
+                    if let Some(chat) = t.tox_sink.chat_id() {
+                        t.tox_group_said = true;
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "in the table's Tox group {}; the hand rides it from here",
@@ -4921,9 +5020,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // because that one is about the transport being behind, and
                 // this is about an event that reached this client and was
                 // thrown away inside it.
-                let dropped = tox_sink.inbox_dropped();
-                if dropped > inbox_dropped_said {
-                    inbox_dropped_said = dropped;
+                let dropped = t.tox_sink.inbox_dropped();
+                if dropped > t.inbox_dropped_said {
+                    t.inbox_dropped_said = dropped;
                     let _ = events
                         .send(NodeEvent::Warning(format!(
                             "{dropped} hand event(s) were received and dropped because this                              client was not draining; a seat that loses one diverges"
@@ -4931,14 +5030,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         .await;
                 }
 
-                let (refused, waiting, sent) = tox_sink.trouble();
-                if waiting > 0 || refused > tox_refused_said {
-                    tox_refused_said = refused;
+                let (refused, waiting, sent) = t.tox_sink.trouble();
+                if waiting > 0 || refused > t.tox_refused_said {
+                    t.tox_refused_said = refused;
                     // Which refusal, because the remedies have nothing in
                     // common: code 4 is this client's own group connection
                     // being down, decided before any peer is consulted, while
                     // code 5 comes from the peer loop.
-                    let why = tox_sink.refused_why();
+                    let why = t.tox_sink.refused_why();
                     let named = [
                         (1usize, "group-not-found"),
                         (2, "too-long"),
@@ -4969,9 +5068,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // in the roster and never dealt to; the transport counters above
                 // are all zero while it happens, because there is nothing wrong
                 // with the transport.
-                let invites = tox_sink.invites_refused();
-                if invites > tox_invites_said {
-                    tox_invites_said = invites;
+                let invites = t.tox_sink.invites_refused();
+                if invites > t.tox_invites_said {
+                    t.tox_invites_said = invites;
                     let _ = events
                         .send(NodeEvent::Warning(format!(
                             "a seat is not in the table's group yet: {invites} invitation(s) refused so far"
@@ -4995,18 +5094,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // The lobby is not what is missing during formation. The
                 // table's topic is, and re-announcing that one disturbs only
                 // the seats already at the table.
-                if let (Some(t), true, true) =
-                    (table_topic.as_ref(), table.is_some(), hand.is_none())
+                if let (Some(topic), true, true) =
+                    (t.table_topic.as_ref(), t.table.is_some(), t.hand.is_none())
                 {
-                    let hash = t.hash();
+                    let hash = topic.hash();
                     let missing = poker_peers.iter().any(|p| {
                         !swarm.behaviour().gossipsub.all_peers().any(|(q, subs)| {
                             q == p && subs.contains(&&hash)
                         })
                     });
-                    if missing && table_announces < MAX_TABLE_ANNOUNCES {
-                        table_announces += 1;
-                        announce_topics(&mut swarm, &[t]);
+                    if missing && t.table_announces < MAX_TABLE_ANNOUNCES {
+                        t.table_announces += 1;
+                        announce_topics(&mut swarm, &[topic]);
                     }
                 }
 
@@ -5017,28 +5116,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // something else happened to arrive, which on a quiet table is
                 // never. Idempotent for the same reason the other two are:
                 // `ever_dealt`.
-                if !ever_dealt {
-                    if let Some(f) = table.as_ref() {
-                        if !resuming && hand_one_may_open(
-                            &tox_sink,
-                            &mut hand_one_held_since,
-                            &mut hand_one_progress,
-                            &mut hand_one_forced_said,
+                if !t.ever_dealt {
+                    if let Some(f) = t.table.as_ref() {
+                        if !t.resuming && hand_one_may_open(
+                            &t.tox_sink,
+                            &mut t.hand_one_held_since,
+                            &mut t.hand_one_progress,
+                            &mut t.hand_one_forced_said,
                             &events,
                         )
                         .await
                         {
-                            say_why_no_hand_one(f, &mut why_no_hand_one_said, &events).await;
+                            say_why_no_hand_one(f, &mut t.why_no_hand_one_said, &events).await;
                             if let Some(o) = opening_for_hand_one(f) {
-                                ever_dealt = true;
+                                t.ever_dealt = true;
                                 begin_hand(
                                     o,
                                     &app_key,
-                                    &mut hand,
-                                    &mut said,
+                                    &mut t.hand,
+                                    &mut t.said,
                                     &mut swarm,
                                     &events,
-                                    &tox_sink,
+                                    &t.tox_sink,
                                 )
                                 .await;
                             }
@@ -5046,9 +5145,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                let Some(h) = hand.as_ref() else { continue };
+                let Some(h) = t.hand.as_ref() else { continue };
                 // A hand that is over is a hand nobody is waiting on.
-                if h.over() || said.is_empty() {
+                if h.over() || t.said.is_empty() {
                     continue;
                 }
                 // **Through whichever transport the table has, which this loop
@@ -5111,16 +5210,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // reset and the new hand's terminal and `HAND_INIT` went out
                 // at ticks 32, 64, 128: once a hand at best, then never.
                 let stamp = (h.hand_id() << 20) | (here & 0xF_FFFF);
-                if stamp != resend_at {
-                    resend_at = stamp;
-                    resend_ticks = 0;
+                if stamp != t.resend_at {
+                    t.resend_at = stamp;
+                    t.resend_ticks = 0;
                 }
-                resend_ticks = resend_ticks.saturating_add(1);
+                t.resend_ticks = t.resend_ticks.saturating_add(1);
                 // 1, 2, 4, 8, ... ticks: a power of two and nothing between.
-                let due = resend_ticks.is_power_of_two();
+                let due = t.resend_ticks.is_power_of_two();
                 if due {
                     let window = here.saturating_sub(RESEND_STAGES);
-                    let recent: Vec<&Vec<u8>> = said
+                    let recent: Vec<&Vec<u8>> = t.said
                         .iter()
                         .filter(|b| {
                             crate::net::chained::peek(b, TABLE_FRAME_PEEK)
@@ -5146,9 +5245,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // down, and every run taken with it — `split220636-9` among
                     // them, one of `S1-BW`'s two failed reproductions — was
                     // taken against a seat that was still speaking.
-                    if tox_sink.is_on_tox() && !nothing_leaves() {
+                    if t.tox_sink.is_on_tox() && !nothing_leaves() {
                         for out in recent {
-                            tox_sink.try_broadcast(out);
+                            t.tox_sink.try_broadcast(out);
                         }
                     }
                 }
@@ -5166,9 +5265,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // message twice more; the table itself stays on the felt until
                 // the player leaves it. On this two-second tick: the thirty-second
                 // one missed a whole run's end (`run212648-3`).
-                if let Some(since) = table_over_at {
-                    if since.elapsed() >= TOURNAMENT_LEAVE_GRACE && tox_sink.is_on_tox() {
-                        tox_sink.clear();
+                if let Some(since) = t.table_over_at {
+                    if since.elapsed() >= TOURNAMENT_LEAVE_GRACE && t.tox_sink.is_on_tox() {
+                        t.tox_sink.clear();
                         let _ = events
                             .send(NodeEvent::Warning(
                                 "the tournament is over: this client left the table's group, and the friends it played with go once no other table needs them".into(),
@@ -5179,9 +5278,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // fault-harness: `P2P_POKER_LEAVE_TABLE_AT=<s>` leaves the table at
                 // that second, as the window's button would -- for measuring how
                 // the others' lobbies learn that a table is gone (D-040).
-                if table.is_some() && leave_table_due() {
+                if t.table.is_some() && leave_table_due() {
                     println!("fault-harness: leaving the table, as P2P_POKER_LEAVE_TABLE_AT asked");
-                    leave_table_now!();
+                    leave_table_now!(t);
                 }
                 // `D-041`: every seat's link as the table's group knows it. On a
                 // Tox table the group carries the hand and the felt reads presence
@@ -5189,8 +5288,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // seat reached only through a relay never answers one -- the
                 // owner saw the far seat drawn *offline* through a whole game, and
                 // the far seat saw everybody so.
-                if tox_sink.is_on_tox() {
-                    if let Some(f) = table.as_ref() {
+                if t.tox_sink.is_on_tox() {
+                    if let Some(f) = t.table.as_ref() {
                         let me = f.my_seat();
                         let fresh: Vec<(u8, Option<u64>, bool)> = f
                             .roster()
@@ -5198,8 +5297,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .iter()
                             .filter(|e| Some(e.seat) != me)
                             .map(|e| {
-                                let group = tox_sink.in_group(&e.app_public_key)
-                                    || e.tox_key.is_some_and(|k| tox_sink.friend_up(&k));
+                                let group = t.tox_sink.in_group(&e.app_public_key)
+                                    || e.tox_key.is_some_and(|k| t.tox_sink.friend_up(&k));
                                 let rtt = libp2p::PeerId::from_bytes(&e.peer_id)
                                     .ok()
                                     .and_then(|p| alive.get(&p).copied())
@@ -5209,7 +5308,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             })
                             .collect();
                         for (seat, rtt, group) in fresh {
-                            let (changed, again) = match link_said.get(&seat) {
+                            let (changed, again) = match t.link_said.get(&seat) {
                                 Some((r, g, at)) => (
                                     *r != rtt || *g != group,
                                     at.elapsed() >= std::time::Duration::from_secs(10),
@@ -5217,7 +5316,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 None => (true, true),
                             };
                             if changed || again {
-                                link_said.insert(seat, (rtt, group, tokio::time::Instant::now()));
+                                t.link_said.insert(seat, (rtt, group, tokio::time::Instant::now()));
                                 let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: rtt, group }).await;
                             }
                             if changed {
@@ -5236,20 +5335,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 // fault-harness: parked certificate copies that are due.
-                if !delayed_certs.is_empty() {
+                if !t.delayed_certs.is_empty() {
                     let at_now = tokio::time::Instant::now();
-                    let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut delayed_certs)
+                    let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut t.delayed_certs)
                         .into_iter()
                         .partition(|(at, _)| *at <= at_now);
-                    delayed_certs = later;
+                    t.delayed_certs = later;
                     if !due.is_empty() {
-                        releasing_certs = true;
-                        if let Some(h) = hand.as_mut() {
+                        t.releasing_certs = true;
+                        if let Some(h) = t.hand.as_mut() {
                             for (_, b) in due {
-                                let _ = hand_event!(h, &b);
+                                let _ = hand_event!(t, h, &b);
                             }
                         }
-                        releasing_certs = false;
+                        t.releasing_certs = false;
                     }
                 }
                 // `S1-CR`: the rejoin's clock. With no table in hand, a fresh
@@ -5258,20 +5357,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // means it may; ten minutes of neither and the record is dropped.
                 // Meanwhile the recorded advert is kept on offer, because the
                 // lobby's sweep expires it as the stale thing it is.
-                if resuming && table.is_none() {
-                    if let Some(r) = resume.as_ref() {
+                if t.resuming && t.table.is_none() {
+                    if let Some(r) = t.resume.as_ref() {
                         let now = super::node::now_unix_ms();
-                        if tox_sink.is_on_tox() || tox_sink.group_seen().0 > 0 {
-                            resume_last_peer_ms = Some(now);
+                        if t.tox_sink.is_on_tox() || t.tox_sink.group_seen().0 > 0 {
+                            t.resume_last_peer_ms = Some(now);
                         }
                         let advert_seen = state
                             .lobby
                             .get(&r.table_key)
-                            .is_some_and(|h| h.advert_hash != r.advert_hash && h.received_at_ms >= resume_since_ms);
-                        if crate::storage::session::give_up(now, advert_seen, resume_last_peer_ms, resume_since_ms) {
+                            .is_some_and(|h| h.advert_hash != r.advert_hash && h.received_at_ms >= t.resume_since_ms);
+                        if crate::storage::session::give_up(now, advert_seen, t.resume_last_peer_ms, t.resume_since_ms) {
                             let _ = crate::storage::session::forget(&profile_dir);
-                            resume = None;
-                            resuming = false;
+                            t.resume = None;
+                            t.resuming = false;
                             let _ = events
                                 .send(NodeEvent::SessionGaveUp {
                                     why: "no advertisement and no peer of the session for ten minutes".into(),
@@ -5291,29 +5390,29 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `D-037`: the founder's record too. The gate read `joined_key`
                 // alone, so the founder wrote nothing and came back to no
                 // record (`run160631-3`).
-                let founder_here = table.as_ref().is_some_and(|f| f.is_founder());
-                if (joined_key.is_some() || founder_here) && !resuming {
-                    if let Some(f) = table.as_ref() {
-                        if f.session().is_some() && f.session() != recorded_session {
+                let founder_here = t.table.as_ref().is_some_and(|f| f.is_founder());
+                if (t.joined_key.is_some() || founder_here) && !t.resuming {
+                    if let Some(f) = t.table.as_ref() {
+                        if f.session().is_some() && f.session() != t.recorded_session {
                             let stack = f
                                 .my_seat()
                                 .and_then(|s| f.roster().seats().iter().find(|e| e.seat == s).map(|e| e.buyin))
                                 .unwrap_or(0);
-                            remember_session!(0, [0; 32], stack);
+                            remember_session!(t, 0, [0; 32], stack);
                         }
                     }
                 }
                 // `D-038`: a hand nobody else has, still waiting at some stage,
                 // never arms `next_hand_at`, so the latch is read here as well.
-                if let Some((theirs, mine)) = adrift {
-                    rejoin_from_copies!(theirs, mine);
+                if let Some((theirs, mine)) = t.adrift {
+                    rejoin_from_copies!(t, theirs, mine);
                 }
                 // `S1-CR`: a resumed bystander whose adopted hand did not follow --
                 // the table has moved on to a hand it holds a majority of copies
                 // for -- abandons it and adopts again; the hand it had was never
                 // one it could act in, and nothing of the table's rests on it.
-                if resuming {
-                    let stuck = hand.as_ref().and_then(|h| {
+                if t.resuming {
+                    let stuck = t.hand.as_ref().and_then(|h| {
                         let me = h.my_seat();
                         let bystander = !h.required().contains(&me) && !h.returned().contains(&me);
                         // `S1-CX`: a member's adopted hand in which nothing was dealt
@@ -5326,9 +5425,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let undealt = h.street().is_none() && !h.over();
                         (bystander || undealt).then_some(h.hand_id())
                     });
-                    if let (Some(current), Some(f)) = (stuck, table.as_ref()) {
+                    if let (Some(current), Some(f)) = (stuck, t.table.as_ref()) {
                         let occupied = f.roster().len();
-                        let newer = resume_inits
+                        let newer = t.resume_inits
                             .iter()
                             .any(|(hid, copies)| *hid > current && copies.len() * 2 > occupied.saturating_sub(1));
                         if newer {
@@ -5337,28 +5436,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     "adopted hand #{current} did not follow the table, which has dealt on; abandoning it for the next hand's copies"
                                 )))
                                 .await;
-                            previous = hand.take();
+                            t.previous = t.hand.take();
                         }
                     }
                 }
                 // `D-033`: the running hand's card material goes into the session
                 // record the moment the deck stage begins, so a restart inside the
                 // hand can take it up again and play it out.
-                let material = hand.as_ref().and_then(|h| {
+                let material = t.hand.as_ref().and_then(|h| {
                     let s = h.secret()?;
-                    if material_recorded == Some(h.hand_id()) {
+                    if t.material_recorded == Some(h.hand_id()) {
                         return None;
                     }
                     let stack = h.stack_at_boundary(h.my_seat());
                     Some((h.hand_id(), stack, s.keep()))
                 });
                 if let Some((hid, stack, kept)) = material {
-                    material_recorded = Some(hid);
-                    remember_session!(hid, [0; 32], stack, Some(kept));
+                    t.material_recorded = Some(hid);
+                    remember_session!(t, hid, [0; 32], stack, Some(kept));
                 }
                 // `D-033`: a seat back without its material cannot play the hand on;
                 // at its turn it folds, as the owner's rule says.
-                let folded = match hand.as_mut() {
+                let folded = match t.hand.as_mut() {
                     Some(h) if !h.can_play_on() && h.turn().is_some_and(|t| t.mine) => {
                         let now = super::node::now_unix_ms();
                         Some(h.act(crate::poker::actions::Action::Fold, &app_key, now))
@@ -5367,7 +5466,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 match folded {
                     Some(Ok(sends)) => {
-                        publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                        publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
                         let _ = events
                             .send(NodeEvent::Warning(
                                 "folded: this seat's card material was lost with the client that stopped, so the hand cannot be played on (D-033)".into(),
@@ -5380,8 +5479,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     None => {}
                 }
                 // `D-035`: seats whose client left the table's group.
-                for (app, quit) in tox_sink.take_gone() {
-                    if let Some(seat) = table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
+                for (app, quit) in t.tox_sink.take_gone() {
+                    if let Some(seat) = t.table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
                         let _ = events.send(NodeEvent::SeatLeft { seat, quit }).await;
                         let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false }).await;
                         let _ = events
@@ -5393,10 +5492,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 // `S1-CS`: the group count, the moment it changes.
-                if table.is_some() {
-                    let group = tox_sink.group_seen();
-                    if carrier_reported != Some(group) {
-                        carrier_reported = Some(group);
+                if t.table.is_some() {
+                    let group = t.tox_sink.group_seen();
+                    if t.carrier_reported != Some(group) {
+                        t.carrier_reported = Some(group);
                         let _ = events
                             .send(NodeEvent::Carrier {
                                 seen: u16::try_from(group.0).unwrap_or(u16::MAX),
@@ -5412,9 +5511,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // had moved on (`run080531-2`); no chips are at stake before the
                 // deal, an abort's terminal follows from the genesis, and the other
                 // seat's copy names the parent, so the two open the same hand.
-                if let Some((next, parent)) = give_up_for.take() {
+                if let Some((next, parent)) = t.give_up_for.take() {
                     let mut given_up: Option<Result<(u64, Vec<crate::table::hand::Send>), (u64, crate::table::hand::Failed)>> = None;
-                    if let (Some(h), Some(f)) = (hand.as_mut(), table.as_ref()) {
+                    if let (Some(h), Some(f)) = (t.hand.as_mut(), t.table.as_ref()) {
                         if f.roster().len() == 2
                             && h.hand_id() + 1 == next
                             && h.street().is_none()
@@ -5432,7 +5531,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     match given_up {
                         Some(Ok((current, sends))) => {
-                            publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
                                     "gave up hand #{current}, in which nothing was dealt: the other seat has opened hand #{next} from that give-up, and this client opens it too"
@@ -5451,9 +5550,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // founder said again; this client ratified anew, and the session
                 // it computes is then its own. Said once, so the log can tell
                 // this from the members' answer never arriving.
-                if resuming && !recorded_refused_said {
-                    if let Some(f) = table.as_ref().filter(|f| f.recorded_ratification_refused()) {
-                        recorded_refused_said = true;
+                if t.resuming && !t.recorded_refused_said {
+                    if let Some(f) = t.table.as_ref().filter(|f| f.recorded_ratification_refused()) {
+                        t.recorded_refused_said = true;
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "the recorded ratification did not fit the roster the founder said again (serial {}); ratified anew, and the session this client computes may not be the table's",
@@ -5465,17 +5564,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `S1-CR`: a resuming client in the group with a roster and no
                 // session asks for the ratifications the way the protocol allows
                 // -- by saying its own again -- and a member answers with its own.
-                if resuming && hand.is_none() {
-                    if let Some(f) = table.as_ref() {
-                        if f.session().is_none() && f.my_seat().is_some() && tox_sink.is_on_tox() {
+                if t.resuming && t.hand.is_none() {
+                    if let Some(f) = t.table.as_ref() {
+                        if f.session().is_none() && f.my_seat().is_some() && t.tox_sink.is_on_tox() {
                             let now = super::node::now_unix_ms();
-                            if now.saturating_sub(ratification_asked_ms) >= 5_000 {
-                                ratification_asked_ms = now;
+                            if now.saturating_sub(t.ratification_asked_ms) >= 5_000 {
+                                t.ratification_asked_ms = now;
                                 for bytes in f.say_again(now) {
-                                    tox_sink.try_broadcast(&bytes);
+                                    t.tox_sink.try_broadcast(&bytes);
                                 }
-                                if !ratification_asked_said {
-                                    ratification_asked_said = true;
+                                if !t.ratification_asked_said {
+                                    t.ratification_asked_said = true;
                                     let _ = events
                                         .send(NodeEvent::Warning(
                                             "in the group with the roster and no session yet; saying my ratification again every five seconds until the others' come".into(),
@@ -5493,8 +5592,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // the set that signed is the required set. Then it follows the
                 // hand as a bystander; at its settled boundary it asks to sit in
                 // (`S1-BM`).
-                if resuming && hand.is_none() {
-                    if let Some(f) = table.as_ref() {
+                if t.resuming && t.hand.is_none() {
+                    if let Some(f) = t.table.as_ref() {
                         if f.session().is_some() {
                             let occupied = f.roster().len();
                             // `S1-CX`: at two seats the one other seat's opening is the
@@ -5503,7 +5602,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // Before this, only a hand the survivor had already given up
                             // could be adopted (`run085603-2`).
                             let heads_up = occupied == 2;
-                            let pick = resume_inits
+                            let pick = t.resume_inits
                                 .iter()
                                 .rev()
                                 .find(|(_, copies)| copies.len() * 2 > occupied.saturating_sub(1))
@@ -5519,7 +5618,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // waits for it.
                                 let exact = heads_up
                                     || copies.len() >= occupied
-                                    || resume_early.iter().any(|(h, _)| *h == hid);
+                                    || t.resume_early.iter().any(|(h, _)| *h == hid);
                                 if let Some(base) = crate::table::hand::Opening::from_formation(f, hid) {
                                     let now = super::node::now_unix_ms();
                                     match crate::table::hand::Opening::adopt_with_signers(base, &copies) {
@@ -5528,7 +5627,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             // the table's means the previous life signed this
                                             // hand: it is taken up where it stood, not opened anew.
                                             let signed_before = signers.contains(&o.my_seat);
-                                            let kept: Option<[u8; 32]> = resume
+                                            let kept: Option<[u8; 32]> = t.resume
                                                 .as_ref()
                                                 .filter(|r| r.secret_hand_id == hid && r.hand_secret != [0u8; 32])
                                                 .map(|r| r.hand_secret);
@@ -5563,7 +5662,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             match opened {
                                                 Ok((mut h, opening_sends)) => {
                                                     if member && !signed_before {
-                                                        publish_hand(opening_sends, &mut swarm, &mut said, &tox_sink);
+                                                        publish_hand(opening_sends, &mut swarm, &mut t.said, &t.tox_sink);
                                                     }
                                                     for c in &copies {
                                                         match h.on_event(c, &app_key, now) {
@@ -5576,7 +5675,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                             // through the ordinary road, played on. A restored hand
                                                             // (D-033) says its part from `restore_done` below.
                                                             Ok(sends) if member && !signed_before => {
-                                                                publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                                                                publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
                                                             }
                                                             Ok(_) => {}
                                                             Err(e) => {
@@ -5586,7 +5685,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                             }
                                                         }
                                                     }
-                                                    let carried: Vec<Vec<u8>> = resume_early
+                                                    let carried: Vec<Vec<u8>> = t.resume_early
                                                         .iter()
                                                         .filter(|(x, _)| *x == hid)
                                                         .map(|(_, b)| b.clone())
@@ -5596,7 +5695,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         let _ = h.hold(b);
                                                     }
                                                     let (more, failures) = h.replay_early(&app_key, now);
-                                                    publish_hand(more, &mut swarm, &mut said, &tox_sink);
+                                                    publish_hand(more, &mut swarm, &mut t.said, &t.tox_sink);
                                                     for e in failures {
                                                         let _ = events
                                                             .send(NodeEvent::Warning(format!("a held frame was refused by the adopted hand #{hid}: {e}")))
@@ -5606,7 +5705,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     // stage still wants from this seat is made now.
                                                     if signed_before {
                                                         match h.restore_done(&app_key, now) {
-                                                            Ok(sends) => publish_hand(sends, &mut swarm, &mut said, &tox_sink),
+                                                            Ok(sends) => publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink),
                                                             Err(e) => {
                                                                 let _ = events
                                                                     .send(NodeEvent::Warning(format!("the taken-up hand #{hid} could not go on: {e}")))
@@ -5646,19 +5745,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                         )))
                                                         .await;
                                                     let _ = events.send(NodeEvent::SessionResumed { hand_id: hid }).await;
-                                                    hand = Some(h);
-                                                    resume_inits.retain(|k, _| *k > hid);
-                                                    resume_early.retain(|(k, _)| *k > hid);
-                                                    hand_reported = false;
-                                                    deck_reported = None;
-                                                    cards_reported = false;
-                                                    turn_reported = None;
-                                                    abort_reported = false;
-                                                    resume_said = None;
+                                                    t.hand = Some(h);
+                                                    t.resume_inits.retain(|k, _| *k > hid);
+                                                    t.resume_early.retain(|(k, _)| *k > hid);
+                                                    t.hand_reported = false;
+                                                    t.deck_reported = None;
+                                                    t.cards_reported = false;
+                                                    t.turn_reported = None;
+                                                    t.abort_reported = false;
+                                                    t.resume_said = None;
                                                 }
                                                 Err(crate::table::hand::Failed::NotYet) => {
-                                                    if resume_said != Some(hid) {
-                                                        resume_said = Some(hid);
+                                                    if t.resume_said != Some(hid) {
+                                                        t.resume_said = Some(hid);
                                                         let _ = events
                                                             .send(NodeEvent::Warning(format!(
                                                                 "hand #{hid}: {} copies, and they do not deal this seat in; stage 0 is still open there, so this seat follows once it closes or takes the next hand (D-039)",
@@ -5668,8 +5767,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    if resume_said != Some(hid) {
-                                                        resume_said = Some(hid);
+                                                    if t.resume_said != Some(hid) {
+                                                        t.resume_said = Some(hid);
                                                         let _ = events
                                                             .send(NodeEvent::Warning(format!("the adopted hand #{hid} would not open: {e}")))
                                                             .await;
@@ -5679,8 +5778,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         Err(crate::table::hand::Failed::NotYet) => {}
                                         Err(e) => {
-                                            if resume_said != Some(hid) {
-                                                resume_said = Some(hid);
+                                            if t.resume_said != Some(hid) {
+                                                t.resume_said = Some(hid);
                                                 let _ = events
                                                     .send(NodeEvent::Warning(format!("hand #{hid} cannot be adopted from the copies held: {e}")))
                                                     .await;
@@ -5699,15 +5798,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // on the retained hand `take_late_roster` below then re-derives
                 // hand k+1, which is READMISSION.md section 4's settled-path
                 // late-roster repair, on `S1-BS`'s road.
-                if let Some(h) = hand.as_mut() {
-                    vote_on_returns!(h);
+                if let Some(h) = t.hand.as_mut() {
+                    vote_on_returns!(t, h);
                 }
-                if let Some(p) = previous.as_mut() {
-                    vote_on_returns!(p);
+                if let Some(p) = t.previous.as_mut() {
+                    vote_on_returns!(t, p);
                 }
                 // `S1-BS`: the retained hand replays what it holds, and a
                 // certificate that banked there re-derives the running hand.
-                if let Some(p) = previous.as_mut() {
+                if let Some(p) = t.previous.as_mut() {
                     let _ = p.replay_early(&app_key, now);
                     if let Some(n) = p.take_cert_note() {
                         let _ = events
@@ -5715,20 +5814,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                     }
                     if p.take_late_roster() {
-                        late_banked_for = Some(p.hand_id());
-                        pending_repair = p.next_hand();
+                        t.late_banked_for = Some(p.hand_id());
+                        t.pending_repair = p.next_hand();
                     }
                 }
                 // Retention ends when the running hand leaves stage 0: from
                 // there its genesis is what the table chained from.
-                if hand.as_ref().is_some_and(|h| h.slot().sequence >= 1) {
-                    previous = None;
+                if t.hand.as_ref().is_some_and(|h| h.slot().sequence >= 1) {
+                    t.previous = None;
                 }
-                if let Some(o) = pending_repair.take() {
-                    if frozen.is_some() {
+                if let Some(o) = t.pending_repair.take() {
+                    if t.frozen.is_some() {
                         // Kept until the freeze lifts: a repair is not lost to it.
-                        pending_repair = Some(o);
-                    } else if adrift.is_none() {
+                        t.pending_repair = Some(o);
+                    } else if t.adrift.is_none() {
                         // **And when this client has latched itself out the
                         // repair is dropped, deliberately.** The arm above
                         // keeps a repair through a freeze and says so; this
@@ -5737,32 +5836,32 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // table's copies (`D-038`), which is the repair.
                         let reopened = reopen_hand(
                             o,
-                            &mut hand,
-                            &mut said,
+                            &mut t.hand,
+                            &mut t.said,
                             &mut swarm,
                             &events,
-                            &tox_sink,
+                            &t.tox_sink,
                             &app_key,
                         )
                         .await;
                         if reopened {
                             // A timer armed about the old hand must not fire
                             // about the new one.
-                            next_hand_at = None;
-                            deal_at = None;
-                            act_by = None;
-                            hand_reported = false;
-                            deck_reported = None;
-                            cards_reported = false;
-                            turn_reported = None;
-                            abort_reported = false;
+                            t.next_hand_at = None;
+                            t.deal_at = None;
+                            t.act_by = None;
+                            t.hand_reported = false;
+                            t.deck_reported = None;
+                            t.cards_reported = false;
+                            t.turn_reported = None;
+                            t.abort_reported = false;
                         }
                     }
                 }
                 // A quiet hand speaks once the table is counted at its genesis:
                 // as many seats at this genesis as at any other, or nobody
                 // anywhere else.
-                if let Some(h) = hand.as_mut() {
+                if let Some(h) = t.hand.as_mut() {
                     // Whatever the sequence: a `HAND_INIT` at (k+1, 0) is as
                     // valid sent late, and a quiet hand whose stage 0 completed
                     // between two ticks still owes the table its copy.
@@ -5777,12 +5876,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         h.hand_id()
                                     )))
                                     .await;
-                                publish_hand(vec![s], &mut swarm, &mut said, &tox_sink);
+                                publish_hand(vec![s], &mut swarm, &mut t.said, &t.tox_sink);
                             }
                         }
                     }
                 }
-                let Some(h) = hand.as_mut() else { continue };
+                let Some(h) = t.hand.as_mut() else { continue };
 
                 // **A message parked on a clock has to be re-judged by a
                 // clock.** `replay_early` had exactly one caller in the tree —
@@ -5806,10 +5905,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         .send(NodeEvent::Warning(format!("a held event: {e}")))
                         .await;
                 }
-                publish_hand(replayed, &mut swarm, &mut said, &tox_sink);
+                publish_hand(replayed, &mut swarm, &mut t.said, &t.tox_sink);
                 // `S1-CW`: a held certificate replayed here can end the hand too.
-                hand_may_have_ended!(h);
-                let Some(h) = hand.as_mut() else { continue };
+                hand_may_have_ended!(t, h);
+                let Some(h) = t.hand.as_mut() else { continue };
 
                 // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
                 // and the carrier's blind repair ladder puts its attempts in
@@ -5829,24 +5928,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // stalling — which is what keeps `D-026` intact.
                 for seat in h.waiting_for() {
                     if let Some(key) = h.key_of(seat) {
-                        tox_sink.nudge(key, seat);
+                        t.tox_sink.nudge(key, seat);
                     }
                 }
                 // `D-033`: a seat this hand has waited on for twenty seconds that is
                 // back on the line -- after an outage longer than the carrier's memory
                 // -- holds none of this hand's frames since; say them again, its own
                 // with them, once a minute at most.
-                if stage_waiting.0 != h.slot().sequence {
-                    stage_waiting = (h.slot().sequence, now);
+                if t.stage_waiting.0 != h.slot().sequence {
+                    t.stage_waiting = (h.slot().sequence, now);
                 }
-                if now.saturating_sub(stage_waiting.1) >= 20_000
-                    && now.saturating_sub(hand_said_again_ms) >= 60_000
+                if now.saturating_sub(t.stage_waiting.1) >= 20_000
+                    && now.saturating_sub(t.hand_said_again_ms) >= 60_000
                 {
                     let back: Vec<u8> = h
                         .waiting_for()
                         .into_iter()
                         .filter(|s| {
-                            table
+                            t.table
                                 .as_ref()
                                 .and_then(|f| f.roster().seats().iter().find(|e| e.seat == *s).map(|e| e.peer_id.clone()))
                                 .and_then(|b| libp2p::PeerId::from_bytes(&b).ok())
@@ -5855,16 +5954,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .collect();
                     if !back.is_empty() {
-                        hand_said_again_ms = now;
+                        t.hand_said_again_ms = now;
                         let hid = h.hand_id();
                         let mut frames = 0usize;
                         for b in h.transcript() {
-                            tox_sink.try_broadcast(b);
+                            t.tox_sink.try_broadcast(b);
                             frames += 1;
                         }
-                        for b in said.iter() {
+                        for b in t.said.iter() {
                             if crate::net::chained::peek(b, TABLE_FRAME_PEEK).ok().map(|(_, x, _)| x) == Some(hid) {
-                                tox_sink.try_broadcast(b);
+                                t.tox_sink.try_broadcast(b);
                                 frames += 1;
                             }
                         }
@@ -5883,7 +5982,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // more this is the answer, and the abort below is what happens
                 // when it is not available — heads-up, where "unanimity" would
                 // be the one opponent.
-                match h.vote_on_timeouts(&app_key, now, tox_sink.mid_delivery()) {
+                match h.vote_on_timeouts(&app_key, now, t.tox_sink.mid_delivery()) {
                     Ok(sends) if !sends.is_empty() => {
                         // Said out loud, because a table that is waiting on
                         // somebody looks exactly like one that is stuck, and
@@ -5941,14 +6040,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(n) = h.take_cert_note() {
                             let _ = events.send(NodeEvent::Warning(n)).await;
                         }
-                        publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                        publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
                         // `S1-CW`: this vote completed a certificate whose stage a
                         // peer's copy had opened, and the hand ended here -- before
                         // any card was out, at the client that voted last. Said and
                         // succeeded like a hand ended by any event; before this the
                         // founder of a three-seat table sat on an ended hand for the
                         // rest of the run (`run195623-3`, `run131730-3`).
-                        hand_may_have_ended!(h);
+                        hand_may_have_ended!(t, h);
                     }
                     Ok(_) => {
                         if let Some(n) = h.take_cert_note() {
@@ -5969,25 +6068,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // A vote that is owed and not cast, with every gate's value.
                 // Measured before this: eight seats waiting on one for 370 s,
                 // four votes, and no line saying what held the other four.
-                if let Some(line) = h.vote_state(now, tox_sink.mid_delivery()) {
-                    if now.saturating_sub(vote_state_said) >= 30_000 {
-                        vote_state_said = now;
+                if let Some(line) = h.vote_state(now, t.tox_sink.mid_delivery()) {
+                    if now.saturating_sub(t.vote_state_said) >= 30_000 {
+                        t.vote_state_said = now;
                         let _ = events.send(NodeEvent::Warning(line)).await;
                     }
                 }
 
-                let Some(h) = hand.as_mut() else { continue };
+                let Some(h) = t.hand.as_mut() else { continue };
                 if !h.may_abandon(now) {
                     continue;
                 }
-                act_by = None;
+                t.act_by = None;
                 // Which clock, taken before the abort resets the phase. Two
                 // budgets can produce this abort and they send a reader to
                 // completely different places -- see `Hand::expired_budget`.
                 let budget = h.expired_budget(now);
                 match h.abort_now(crate::table::hand::Abort::Deadline, &app_key, now) {
                     Ok(sends) => {
-                        publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                        publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
                         // **And name the cause when the transport is the cause.**
                         // A player reading "the hand ran out of time" looks for
                         // a slow opponent. Across two networks the opponent was
@@ -6018,7 +6117,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             relayed_peers.intersection(&poker_peers).collect();
                         let why = if relay_inadequate
                             && !stranded.is_empty()
-                            && !tox_sink.is_on_tox()
+                            && !t.tox_sink.is_on_tox()
                         {
                             format!(
                                 ". {} of the poker peers here {} reachable only through a relay                                  whose reservation this client already reported as too small to                                  carry a hand - that is the likely cause, and it is not the                                  opponent being slow",
@@ -6038,7 +6137,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                         // Straight on: an abort has nothing to look at, so
                         // D-020's hold has nothing to hold.
-                        arm_boundary!(std::time::Duration::from_millis(800));
+                        arm_boundary!(t, std::time::Duration::from_millis(800));
                     }
                     Err(e) => {
                         let _ = events
@@ -6050,13 +6149,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
 
             // This client's own clock ran out on its own turn.
             () = async {
-                match act_by {
+                match t.act_by {
                     Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
                 }
-            }, if act_by.is_some() => {
-                act_by = None;
-                let Some(h) = hand.as_mut() else { continue };
+            }, if t.act_by.is_some() => {
+                t.act_by = None;
+                let Some(h) = t.hand.as_mut() else { continue };
                 let Some(turn) = h.turn().filter(|t| t.mine) else { continue };
                 // fault-harness: `P2P_POKER_STOP_ON_TURN_AFTER=<s>` stops this process
                 // at its first own turn at or after that second -- a client that
@@ -6090,7 +6189,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let now = super::node::now_unix_ms();
                 match h.act(action, &app_key, now) {
                     Ok(sends) => {
-                        publish_hand(sends, &mut swarm, &mut said, &tox_sink);
+                        publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
                         let _ = events
                             .send(NodeEvent::Warning(if autoplay.is_some() {
                                 format!("autoplay: {action:?}")
@@ -6098,11 +6197,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 format!("your clock ran out — {action:?} for you")
                             }))
                             .await;
-                        let report = report_hand(h, &events, &mut turn_reported).await;
+                        let report = report_hand(h, &events, &mut t.turn_reported).await;
                         if let Some(end) = report.ended {
-                            arm_boundary!(end.pause());
+                            arm_boundary!(t, end.pause());
                         }
-                        act_by = hurry(report.clock.apply(act_by, h.action_deadline()), autoplay);
+                        t.act_by = hurry(report.clock.apply(t.act_by, h.action_deadline()), autoplay);
                     }
                     Err(e) => {
                         let _ = events
@@ -6114,15 +6213,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
 
             // D-020's hold has run out: deal the next hand.
             () = async {
-                match next_hand_at {
+                match t.next_hand_at {
                     Some(at) => tokio::time::sleep_until(at).await,
                     // Nothing pending. `pending()` never completes, so this arm
                     // is simply not in the race — which is what an `Option`
                     // timer means in a `select!`.
                     None => std::future::pending().await,
                 }
-            }, if next_hand_at.is_some() => {
-                next_hand_at = None;
+            }, if t.next_hand_at.is_some() => {
+                t.next_hand_at = None;
                 // **Never succeed a hand that is not over.** This arm rested
                 // on an invariant — the timer fires only about a hand that
                 // ended — that a re-open (`S1-BS`) broke: a repair can put a
@@ -6130,7 +6229,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `next_hand()` is `None` for a running hand, which used to
                 // end here with `hand = None` and a seat that had no hand for
                 // the rest of the table. Found by the refuters, not the run.
-                if hand.as_ref().is_some_and(|h| !h.over()) {
+                if t.hand.as_ref().is_some_and(|h| !h.over()) {
                     continue;
                 }
                 // **No further hand while frozen.** §6.3's freeze stops emission
@@ -6151,10 +6250,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // Reset where the latch is read, not where it is cleared:
                 // `checkpoint_event` releases the freeze and has no business
                 // knowing what this loop has said out loud.
-                if frozen.is_none() {
-                    frozen_said = false;
+                if t.frozen.is_none() {
+                    t.frozen_said = false;
                 }
-                if let Some((k, _)) = frozen {
+                if let Some((k, _)) = t.frozen {
                     // **Re-armed, not consumed.** The line above cleared the
                     // timer before this branch was reached, and nothing puts it
                     // back: `*frozen = None` on reconciliation sends its warning
@@ -6170,14 +6269,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // and deals on the first tick after the freeze lifts, with no
                     // plumbing between `§6.3`'s reconciliation and this loop's
                     // locals.
-                    next_hand_at =
+                    t.next_hand_at =
                         Some(tokio::time::Instant::now() + FROZEN_RECHECK);
-                    if !frozen_said {
-                        frozen_said = true;
+                    if !t.frozen_said {
+                        t.frozen_said = true;
                         let _ = events
                             .send(NodeEvent::Warning(format!(
-                                "no further hand is dealt: this peer is frozen at hand {k}'s checkpoint and section 6.3 releases that by a reconciliation round alone. {disputes_seen} dispute(s) verified from other seats; W is {:?}",
-                                boundaries.contradicted(k)
+                                "no further hand is dealt: this peer is frozen at hand {k}'s checkpoint and section 6.3 releases that by a reconciliation round alone. {} dispute(s) verified from other seats; W is {:?}",
+                                t.disputes_seen,
+                                t.boundaries.contradicted(k)
                             )))
                             .await;
                     }
@@ -6196,10 +6296,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // the value every other seat compares against, and it is the
                 // door back for a seat that missed this hand: §4.9's
                 // readmission set is written by exactly this event agreeing.
-                let phase1 = hand
+                let phase1 = t.hand
                     .as_ref()
-                    .is_some_and(|h| boundary_done_for != Some(h.hand_id()));
-                if let Some(h) = hand.as_ref().filter(|_| phase1) {
+                    .is_some_and(|h| t.boundary_done_for != Some(h.hand_id()));
+                if let Some(h) = t.hand.as_ref().filter(|_| phase1) {
                     // **§4.10's window, on BOTH terminal paths, and this is
                     // separate from the checkpoint below for exactly that
                     // reason** (`S1-BZ`). The block that follows is gated on
@@ -6214,7 +6314,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // needs nothing the aborted checkpoint needs:
                     // `ABORT_TERMINAL(k)` is a function of `GENESIS(k)` alone.
                     if let Some(terminal) = h.terminal() {
-                        let roster: Vec<u8> = table
+                        let roster: Vec<u8> = t.table
                             .as_ref()
                             .map(|f| f.roster().seats().iter().map(|e| e.seat).collect())
                             .unwrap_or_default();
@@ -6227,7 +6327,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // about. `split174002-9`: eight voters refused it as
                         // deciding nothing. Opened here first, so the checkpoint's
                         // `open` below, which carries `P(k)`, finds it already open.
-                        boundaries.open_window(
+                        t.boundaries.open_window(
                             h.hand_id(),
                             terminal,
                             h.required(),
@@ -6239,8 +6339,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // admission path, and before anything of this boundary is
                         // published, so a request already here is taken before
                         // the deal is decided.
-                        let waiting = early_boundary.remove(&h.hand_id()).unwrap_or_default();
-                        early_boundary.retain(|k, _| *k > h.hand_id());
+                        let waiting = t.early_boundary.remove(&h.hand_id()).unwrap_or_default();
+                        t.early_boundary.retain(|k, _| *k > h.hand_id());
                         if !waiting.is_empty() {
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
@@ -6254,10 +6354,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = boundary_event(
                                 &b,
                                 h,
-                                &mut boundaries,
-                                &mut readmitted,
-                                &mut sit_ins,
-                                &mut early_boundary,
+                                &mut t.boundaries,
+                                &mut t.readmitted,
+                                &mut t.sit_ins,
+                                &mut t.early_boundary,
                                 &events,
                             )
                             .await;
@@ -6279,12 +6379,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // place that already needs it and a reconciliation round
                         // — the only other reader — can only open after a
                         // checkpoint this site opened.
-                        roster_seats = table
+                        t.roster_seats = t.table
                             .as_ref()
                             .map(|f| f.roster().seats().iter().map(|e| e.seat).collect())
                             .unwrap_or_default();
-                        let roster = roster_seats.clone();
-                        if boundaries
+                        let roster = t.roster_seats.clone();
+                        if t.boundaries
                             .open(
                                 h.hand_id(),
                                 h.table_id(),
@@ -6317,24 +6417,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         //
                         // Taken out of the map first, because the call needs
                         // `&mut` on it.
-                        let waiting = early_checkpoints.remove(&h.hand_id()).unwrap_or_default();
+                        let waiting = t.early_checkpoints.remove(&h.hand_id()).unwrap_or_default();
                         // Anything older than the boundary now opening is for a
                         // hand the store has released. Dropped here rather than
                         // left to grow.
-                        early_checkpoints.retain(|k, _| *k > h.hand_id());
+                        t.early_checkpoints.retain(|k, _| *k > h.hand_id());
                         for held in waiting {
                             if let Some(next) = checkpoint_event(
                                 &held,
                                 h,
-                                &mut boundaries,
-                                &mut readmitted,
-                                &mut sit_ins,
+                                &mut t.boundaries,
+                                &mut t.readmitted,
+                                &mut t.sit_ins,
                                 &app_key,
-                                &mut checkpoint_said,
-                                &mut frozen,
-                                &roster_seats,
-                                &mut no_round_said,
-                                &mut early_checkpoints,
+                                &mut t.checkpoint_said,
+                                &mut t.frozen,
+                                &t.roster_seats,
+                                &mut t.no_round_said,
+                                &mut t.early_checkpoints,
                                 &profile_dir,
                                 &events,
                             )
@@ -6344,20 +6444,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     publish_and_hear(
                                         next,
                                         h,
-                                        &mut boundaries,
-                                        &mut readmitted,
-                                        &mut sit_ins,
+                                        &mut t.boundaries,
+                                        &mut t.readmitted,
+                                        &mut t.sit_ins,
                                         &app_key,
-                                        &mut checkpoint_said,
-                                        &mut frozen,
-                                        &roster_seats,
-                                        &mut no_round_said,
-                                        &mut early_checkpoints,
+                                        &mut t.checkpoint_said,
+                                        &mut t.frozen,
+                                        &t.roster_seats,
+                                        &mut t.no_round_said,
+                                        &mut t.early_checkpoints,
                                         &profile_dir,
                                         &events,
                                         &mut swarm,
-                                        &mut said,
-                                        &tox_sink,
+                                        &mut t.said,
+                                        &t.tox_sink,
                                     )
                                     .await;
                                 }
@@ -6370,7 +6470,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // bytes, so a peer whose own copies all agreed
                                 // can **verify** a second value at this
                                 // checkpoint rather than believe an accusation.
-                                boundaries.remember_own_event(h.hand_id(), &bytes);
+                                t.boundaries.remember_own_event(h.hand_id(), &bytes);
                                 // **Published and heard.** A stage counts its
                                 // own seat like every other, and neither
                                 // GossipSub nor the Tox group delivers a message
@@ -6389,20 +6489,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 publish_and_hear(
                                     bytes,
                                     h,
-                                    &mut boundaries,
-                                    &mut readmitted,
-                                    &mut sit_ins,
+                                    &mut t.boundaries,
+                                    &mut t.readmitted,
+                                    &mut t.sit_ins,
                                     &app_key,
-                                    &mut checkpoint_said,
-                                    &mut frozen,
-                                    &roster_seats,
-                                    &mut no_round_said,
-                                    &mut early_checkpoints,
+                                    &mut t.checkpoint_said,
+                                    &mut t.frozen,
+                                    &t.roster_seats,
+                                    &mut t.no_round_said,
+                                    &mut t.early_checkpoints,
                                     &profile_dir,
                                     &events,
                                     &mut swarm,
-                                    &mut said,
-                                    &tox_sink,
+                                    &mut t.said,
+                                    &t.tox_sink,
                                 )
                                 .await;
                             }
@@ -6427,7 +6527,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // window records that its seat spoke, and `A` gets the seat the
                 // way it gets any other.
                 if !stay_out && phase1 {
-                    let asked = match hand.as_mut() {
+                    let asked = match t.hand.as_mut() {
                         Some(h) => h.sit_in_request(&app_key, super::node::now_unix_ms()),
                         None => Ok(None),
                     };
@@ -6436,17 +6536,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             publish_hand(
                                 vec![crate::table::hand::Send::Broadcast(bytes.clone())],
                                 &mut swarm,
-                                &mut said,
-                                &tox_sink,
+                                &mut t.said,
+                                &t.tox_sink,
                             );
-                            if let Some(h) = hand.as_ref() {
+                            if let Some(h) = t.hand.as_ref() {
                                 let _ = boundary_event(
                                     &bytes,
                                     h,
-                                    &mut boundaries,
-                                    &mut readmitted,
-                                    &mut sit_ins,
-                                    &mut early_boundary,
+                                    &mut t.boundaries,
+                                    &mut t.readmitted,
+                                    &mut t.sit_ins,
+                                    &mut t.early_boundary,
                                     &events,
                                 )
                                 .await;
@@ -6471,22 +6571,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if phase1 {
-                    boundary_done_for = hand.as_ref().map(|h| h.hand_id());
+                    t.boundary_done_for = t.hand.as_ref().map(|h| h.hand_id());
                 }
 
                 // `S1-BM`: phase 2 is not due yet. The terminal fired this arm so
                 // that the window, the checkpoint and the sit-in request above
                 // went out at once; the deal itself waits for D-020's pause.
-                if let Some(at) = deal_at {
+                if let Some(at) = t.deal_at {
                     if tokio::time::Instant::now() < at {
-                        next_hand_at = Some(at);
+                        t.next_hand_at = Some(at);
                         continue;
                     }
                 }
                 // `S1-BM`: votes cast here as well as at the stall tick, so a
                 // hold below is over as soon as the evidence is, not a tick later.
-                if let Some(h) = hand.as_mut() {
-                    vote_on_returns!(h);
+                if let Some(h) = t.hand.as_mut() {
+                    vote_on_returns!(t, h);
                 }
                 // `S1-BM`: a return is in flight at this boundary -- a seat outside
                 // the roster asked to sit in (this client, or one whose request
@@ -6496,15 +6596,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // certificate a moment later could only re-open a stage 0 that a
                 // heads-up hand leaves in a tenth of a second (`run164337-3`: nine
                 // requests at nine boundaries, no return).
-                if let Some(h) = hand.as_ref() {
-                    let waiting_for = returning_seats(h, &sit_ins);
+                if let Some(h) = t.hand.as_ref() {
+                    let waiting_for = returning_seats(h, &t.sit_ins);
                     if !waiting_for.is_empty() {
                         let hid = h.hand_id();
-                        let (since, gave_up) = match return_hold {
+                        let (since, gave_up) = match t.return_hold {
                             Some((id, s, g)) if id == hid => (s, g),
                             _ => {
                                 let s = tokio::time::Instant::now();
-                                return_hold = Some((hid, s, false));
+                                t.return_hold = Some((hid, s, false));
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
                                         "hand #{hid}: holding the next deal for up to {} s while seat(s) {waiting_for:?} return; a certificate is owed first",
@@ -6524,16 +6624,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // `split172616-9` held six seconds after the table had dealt,
                             // opened hand #3 sixty-four buffered frames late, reached
                             // stage 37 and sat there for the rest of the run (`S1-BW`).
-                            let peers_dealt = !next_inits.is_empty();
+                            let peers_dealt = !t.next_inits.is_empty();
                             if !peers_dealt
                                 && since.elapsed() < std::time::Duration::from_millis(RETURN_GRACE_MS)
                             {
-                                next_hand_at = Some(
+                                t.next_hand_at = Some(
                                     tokio::time::Instant::now() + std::time::Duration::from_millis(250),
                                 );
                                 continue;
                             }
-                            return_hold = Some((hid, since, true));
+                            t.return_hold = Some((hid, since, true));
                             let line = if peers_dealt {
                                 format!(
                                     "hand #{hid}: a peer has dealt hand #{} while seat(s) {waiting_for:?} were returning; following it, and the seat asks again at the next boundary",
@@ -6549,7 +6649,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                deal_at = None;
+                t.deal_at = None;
 
                 // **This client is on a branch nobody shares.** It cannot
                 // catch up and it must not deal on: a private tournament is
@@ -6577,8 +6677,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `D-038`: and it is no longer a terminus. The checkpoint above
                 // has gone out, so the others are not held up; this client
                 // drops its branch and rejoins from the table's copies.
-                if let Some((theirs, mine)) = adrift {
-                    rejoin_from_copies!(theirs, mine);
+                if let Some((theirs, mine)) = t.adrift {
+                    rejoin_from_copies!(t, theirs, mine);
                     continue;
                 }
 
@@ -6587,8 +6687,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // timer 800 ms ahead and the tick is two seconds; succeeding
                 // here dropped hand k and the tick's re-open then refused on
                 // the id (found by reading, not by a run).
-                if pending_repair.is_some() {
-                    next_hand_at = Some(
+                if t.pending_repair.is_some() {
+                    t.next_hand_at = Some(
                         tokio::time::Instant::now() + std::time::Duration::from_secs(2),
                     );
                     continue;
@@ -6600,13 +6700,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // shares: it waits — a late certificate about the previous
                 // hand can still repair this one, and the adrift latch above
                 // ends the wait when the table is two hands on.
-                if let Some(h) = hand.as_ref() {
+                if let Some(h) = t.hand.as_ref() {
                     if h.slot().sequence == 0 {
                         if let Some((g, seats)) = h.foreign_genesis_named() {
                             let counted = h.counted_at_stage_zero();
                             if wait_at_boundary(seats.len(), counted.len()) {
-                                if genesis_wait_said != Some(h.hand_id()) {
-                                    genesis_wait_said = Some(h.hand_id());
+                                if t.genesis_wait_said != Some(h.hand_id()) {
+                                    t.genesis_wait_said = Some(h.hand_id());
                                     let _ = events
                                         .send(NodeEvent::Warning(format!(
                                             "hand #{} ended with no peer at its genesis: seat(s) {:?} hold {} and this client holds {} with {:?} counted; hand #{} is not dealt here until a certificate about hand #{} repairs it, or the table is two hands on and this seat rejoins it (D-038)",
@@ -6620,7 +6720,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         )))
                                         .await;
                                 }
-                                next_hand_at = Some(
+                                t.next_hand_at = Some(
                                     tokio::time::Instant::now() + std::time::Duration::from_secs(30),
                                 );
                                 continue;
@@ -6630,7 +6730,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // `S1-CR`: the boundary reached, on record; a busted seat has
                 // nothing to come back to.
-                if let Some(h) = hand.as_ref() {
+                if let Some(h) = t.hand.as_ref() {
                     let me = h.my_seat();
                     // The boundary stack, on both terminal paths. `stacks()` is empty
                     // after an abort, and reading it here forgot the session at every
@@ -6638,12 +6738,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let stack = h.stack_at_boundary(me);
                     if stack == 0 && h.checkpoint8().is_some() {
                         let _ = crate::storage::session::forget(&profile_dir);
-                        resume = None;
+                        t.resume = None;
                         let _ = events
                             .send(NodeEvent::Warning(format!("hand #{}: seat {me} busted; the session record is forgotten", h.hand_id())))
                             .await;
                     } else {
-                        remember_session!(h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);
+                        remember_session!(t, h.hand_id(), h.terminal().unwrap_or([0; 32]), stack);
                     }
                 }
                 // `S1-CR`: a resumed client still outside the roster derives
@@ -6653,8 +6753,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // table's own copies of the next hand are the safe source until
                 // a return certificate has put this seat back, when the
                 // checkpoint that earned it has already said the set was exact.
-                if resuming {
-                    if let Some(h) = hand.as_ref() {
+                if t.resuming {
+                    if let Some(h) = t.hand.as_ref() {
                         let me = h.my_seat();
                         if !h.required().contains(&me) && !h.returned().contains(&me) {
                             let _ = events
@@ -6663,10 +6763,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     h.hand_id()
                                 )))
                                 .await;
-                            previous = hand.take();
+                            t.previous = t.hand.take();
                             continue;
                         }
-                        resuming = false;
+                        t.resuming = false;
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "back in the roster from hand #{} on; deriving hands again",
@@ -6675,16 +6775,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                     }
                 }
-                let next = hand.as_ref().and_then(|h| h.next_hand());
+                let next = t.hand.as_ref().and_then(|h| h.next_hand());
                 // The derivation just made holds every certificate banked so
                 // far, of either direction (`S1-BM`), so the late-roster flag a
                 // bank on the live hand raised is spent here: re-derived from
                 // the retained copy it would name the genesis this client
                 // already holds and be refused as such, one log line later.
-                if let Some(h) = hand.as_mut() {
+                if let Some(h) = t.hand.as_mut() {
                     let _ = h.take_late_roster();
                 }
-                if let (Some(h), Some(o)) = (hand.as_ref(), next.as_ref()) {
+                if let (Some(h), Some(o)) = (t.hand.as_ref(), next.as_ref()) {
                     if o.required != h.required_now() {
                         let _ = events
                             .send(NodeEvent::Warning(format!(
@@ -6699,18 +6799,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `S1-CN`: remembered past retention, so a settlement of this
                 // hand arriving after the retained copy is gone is still
                 // counted as one the late path missed.
-                if let Some(h) = hand.as_ref() {
-                    unsettled_abort_here =
+                if let Some(h) = t.hand.as_ref() {
+                    t.unsettled_abort_here =
                         (h.aborted().is_some() && !h.late_settled()).then_some(h.hand_id());
                 }
                 // Retained, not dropped: a certificate about this hand that
                 // arrives during the next one still banks here (`S1-BS`).
-                previous = hand.take();
-                hand_reported = false;
-                deck_reported = None;
-                cards_reported = false;
-                turn_reported = None;
-                abort_reported = false;
+                t.previous = t.hand.take();
+                t.hand_reported = false;
+                t.deck_reported = None;
+                t.cards_reported = false;
+                t.turn_reported = None;
+                t.abort_reported = false;
                 // **All of hand k goes, except the one event hand k ended
                 // with.** The five-second loop re-broadcasts this client's own
                 // events because GossipSub keeps no history and a peer grafted
@@ -6737,7 +6837,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     use crate::protocol::messages::EventType;
                     let mut terminal: Option<Vec<u8>> = None;
                     let mut checkpoint: Vec<Vec<u8>> = Vec::new();
-                    for b in said.drain(..) {
+                    for b in t.said.drain(..) {
                         match crate::net::chained::peek(&b, TABLE_FRAME_PEEK) {
                             Ok((EventType::HandComplete | EventType::HandAbort, _, _)) => {
                                 terminal = Some(b)
@@ -6755,18 +6855,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             _ => {}
                         }
                     }
-                    said.extend(terminal);
-                    said.extend(checkpoint);
+                    t.said.extend(terminal);
+                    t.said.extend(checkpoint);
                 }
                 match next {
                     Some(mut opening) => {
                         // **Read here and cleared here, which is the whole of
                         // `A`'s life** (§4.9). A set read anywhere else is a set
                         // two peers can come to disagree about.
-                        opening.readmitted = std::mem::take(&mut readmitted);
+                        opening.readmitted = std::mem::take(&mut t.readmitted);
                         // `S1-BM`: the boundary before the retained hand's is over
                         // for good; hand k's evidence stays while `previous` does.
-                        sit_ins.release_below(opening.hand_id.saturating_sub(1));
+                        t.sit_ins.release_below(opening.hand_id.saturating_sub(1));
                         // **Said about other seats, and never about this
                         // one.** The `Bystander` arm writes `A` for any roster
                         // seat the checkpoint stage did not count, and this
@@ -6825,19 +6925,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         // Quiet if two seats already signed this hand at one
                         // other genesis and none at this one (`S1-BS`).
-                        let voice = quiet_if_contested(&opening, &next_inits);
+                        let voice = quiet_if_contested(&opening, &t.next_inits);
                         begin_hand_with(
                             opening,
                             voice,
-                            &mut next_inits,
-                            &mut next_early,
-                            &mut next_early_lost,
+                            &mut t.next_inits,
+                            &mut t.next_early,
+                            &mut t.next_early_lost,
                             &app_key,
-                            &mut hand,
-                            &mut said,
+                            &mut t.hand,
+                            &mut t.said,
                             &mut swarm,
                             &events,
-                            &tox_sink,
+                            &t.tox_sink,
                         )
                         .await;
                     }
@@ -6854,8 +6954,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `D-042`: the tournament is over. Its group is left
                         // once the terminal message has had time to arrive
                         // everywhere; see the housekeeping tick.
-                        if table_over_at.is_none() {
-                            table_over_at = Some(std::time::Instant::now());
+                        if t.table_over_at.is_none() {
+                            t.table_over_at = Some(std::time::Instant::now());
                         }
                     }
                 }
@@ -6889,7 +6989,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // that is thinking from one that is gone — and this client has
                 // been pinging four times a minute since the beginning and
                 // discarding every reply.
-                if let Some(f) = table.as_ref() {
+                if let Some(f) = t.table.as_ref() {
                     let mut line: Vec<String> = Vec::new();
                     for e in f.roster().seats() {
                         if Some(e.seat) == f.my_seat() {
@@ -6917,9 +7017,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                     if !line.is_empty() {
-                        let (sent, refused, up) = tox_sink.invite_counts();
-                        let (rejoins, join_fails, confirmed, founder_link) = tox_sink.join_trouble();
-                        let (seen, want) = tox_sink.group_seen();
+                        let (sent, refused, up) = t.tox_sink.invite_counts();
+                        let (rejoins, join_fails, confirmed, founder_link) = t.tox_sink.join_trouble();
+                        let (seen, want) = t.tox_sink.group_seen();
                         // The same numbers, as a fact rather than a sentence:
                         // the line below is advisory and may be dropped, and
                         // what the client tells its user must not be.
@@ -6933,7 +7033,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .send(NodeEvent::Warning(format!(
                                 "seats on the line: {}; tox self {}, group {seen} seen/{confirmed} confirmed/{want} wanted, tox friends up {up}, invites {sent} sent {refused} refused{}{}{}{}",
                                 line.join(", "),
-                                match tox_sink.tox_connection() {
+                                match t.tox_sink.tox_connection() {
                                     0 => "offline",
                                     1 => "tcp",
                                     _ => "udp",
@@ -6953,7 +7053,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         f.roster().len(),
                                         f.held()
                                     )
-                                } else if let Some(b) = boundaries.newest() {
+                                } else if let Some(b) = t.boundaries.newest() {
                                     // Where the boundary checkpoint has got to.
                                     // A stage that never closes is silent, and
                                     // so is one that closes and agrees.
@@ -6996,7 +7096,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // waiting for would have said so in one line.
                                 // Printed only while a hand is open, and only
                                 // when there is something to say.
-                                match hand.as_ref() {
+                                match t.hand.as_ref() {
                                     Some(h) if !h.over() => {
                                         let held = h.held();
                                         let owed = h.waiting_for();
@@ -7059,16 +7159,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // 0 sent`, nothing could say whether zero relays had been
                     // added or all of them had and the friendships failed
                     // anyway. Those are different faults. `S1-U`.
-                    if !udp_warned && {
-                        let (seen, want) = tox_sink.group_seen();
+                    if !t.udp_warned && {
+                        let (seen, want) = t.tox_sink.group_seen();
                         want > 0 && seen < want
                     } {
-                        udp_warned = true;
-                        let r = tox_sink.reach();
+                        t.udp_warned = true;
+                        let r = t.tox_sink.reach();
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "the table's group is not filling. Tox is {}; of {} known nodes, {} bootstrapped and {} TCP relays were accepted{}. Game traffic rides that group, so nothing can be dealt until it fills.",
-                                match tox_sink.tox_connection() {
+                                match t.tox_sink.tox_connection() {
                                     0 => "offline",
                                     1 => "reachable only through a TCP relay",
                                     _ => "on UDP",
@@ -7118,12 +7218,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     //
                     // It still ends: a table that has dealt has no formation
                     // left to repair, and after that the repeat would be noise.
-                    if !ever_dealt {
-                        if let Some(topic) = table_topic.as_ref() {
+                    if !t.ever_dealt {
+                        if let Some(topic) = t.table_topic.as_ref() {
                             for bytes in f.say_again(super::node::now_unix_ms()) {
                                 // The same second path as the `Subscribed`
                                 // repeat above, for the same reason (`S1-P`).
-                                tox_sink.try_broadcast(&bytes);
+                                t.tox_sink.try_broadcast(&bytes);
                                 let _ = swarm
                                     .behaviour_mut()
                                     .gossipsub
@@ -7153,8 +7253,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 //
                 // `!ever_dealt` is the whole of what makes this not an eviction,
                 // and it is checked here because `Formation` cannot see it.
-                if !ever_dealt {
-                    if let Some(f) = table.as_mut().filter(|f| f.is_founder()) {
+                if !t.ever_dealt {
+                    if let Some(f) = t.table.as_mut().filter(|f| f.is_founder()) {
                         let silent: Vec<(u8, Vec<u8>, Option<[u8; 32]>)> = f
                             .roster()
                             .seats()
@@ -7219,7 +7319,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // group until it is rebuilt. Said here
                                     // rather than discovered later.
                                     if let Some(k) = tox_key {
-                                        tox_sink.tell(super::toxsink::Seat::Left(k));
+                                        t.tox_sink.tell(super::toxsink::Seat::Left(k));
                                     }
                                     // Only broadcasts come out of a release:
                                     // there is nobody to reply to, because
@@ -7230,7 +7330,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     for s in sends {
                                         match s {
                                             Send::Broadcast(bytes) => {
-                                                if let Some(tt) = &table_topic {
+                                                if let Some(tt) = &t.table_topic {
                                                     let _ = swarm
                                                         .behaviour_mut()
                                                         .gossipsub
@@ -7247,7 +7347,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                     }
-                                    seat_on_tox(f, &tox_sink);
+                                    seat_on_tox(f, &t.tox_sink);
                                     report_roster(&events, f).await;
                                 }
                                 Ok(_) => {}
@@ -7352,8 +7452,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // indistinguishable from a table waiting for players, and
                     // it is the opposite: the players are there and this client
                     // is alone.
-                    if connected.is_empty() && !alone_said {
-                        alone_said = true;
+                    if connected.is_empty() && !t.alone_said {
+                        t.alone_said = true;
                         let _ = events
                             .send(NodeEvent::Warning(
                                 "no other poker client has been reached yet — a table hosted now is one nobody can see. On one machine that is local discovery failing; across networks it is the relay."
@@ -7362,7 +7462,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .await;
                     }
                     if !connected.is_empty() {
-                        alone_said = false;
+                        t.alone_said = false;
                     }
                     if known > 0 || mesh > 0 || !connected.is_empty() {
                         let _ = events
@@ -7424,9 +7524,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // default — and accepting one un-ratifies a table in the middle
                 // of a tournament. §7.3 withdraws a table's advert when it
                 // starts, `reason = 1`, and this is that withdrawal by omission.
-                if let Some(f) = table
+                if let Some(f) = t.table
                     .as_mut()
-                    .filter(|f| f.is_founder() && !ever_dealt)
+                    .filter(|f| f.is_founder() && !t.ever_dealt)
                 {
                     match f.readvertise(now, AD_TTL_MS) {
                         Ok(bytes) => {
