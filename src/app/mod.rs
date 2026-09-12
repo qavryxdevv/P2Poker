@@ -161,6 +161,7 @@ pub struct TableApp {
     pub opponent_was_reachable: bool,
     pub out_for_good: Option<String>,
     pub ever_on_line: bool,
+    pub certified: std::collections::BTreeSet<u8>,
     pub opponent_returns: u8,
     pub opponent_out: bool,
     pub gone: std::collections::BTreeSet<u8>,
@@ -257,6 +258,8 @@ pub struct AppState {
     /// `S1-EH`: whether any other seat has been on the line at this table
     /// once -- before that, nobody reachable is a group still forming.
     pub ever_on_line: bool,
+    /// `S1-EI`: the seats the table certified out of the running hand.
+    pub certified: std::collections::BTreeSet<u8>,
     /// `D-032`: how many absences worth asking about ended with the
     /// opponent back; at `MAX_RETURNS` the next absence is final.
     pub opponent_returns: u8,
@@ -390,6 +393,10 @@ pub struct OpponentGone {
     /// decide -- D-007's other case, asked about with the same question and
     /// said as what it is. Ends when they act; no absence and no return.
     pub slow: bool,
+    /// `S1-EI`: not one opponent but everybody else, at a bigger table --
+    /// heads-up's question with more chairs, since nobody can certify
+    /// anybody alone (D-036).
+    pub alone: bool,
 }
 
 /// How long an opponent must be unreachable before it is said: longer
@@ -479,6 +486,7 @@ impl AppState {
         std::mem::swap(&mut self.opponent_was_reachable, &mut other.opponent_was_reachable);
         std::mem::swap(&mut self.out_for_good, &mut other.out_for_good);
         std::mem::swap(&mut self.ever_on_line, &mut other.ever_on_line);
+        std::mem::swap(&mut self.certified, &mut other.certified);
         std::mem::swap(&mut self.opponent_returns, &mut other.opponent_returns);
         std::mem::swap(&mut self.opponent_out, &mut other.opponent_out);
         std::mem::swap(&mut self.gone, &mut other.gone);
@@ -719,6 +727,7 @@ impl AppState {
                         said: true,
                         dismissed_at: None,
                         slow: false,
+                        alone: false,
                     });
                     self.note("your opponent left the table (D-035): the game is over -- leave the table".into());
                 }
@@ -755,6 +764,7 @@ impl AppState {
                 });
                 self.strength = None;
                 self.waiting_for.clear();
+                self.certified.clear();
                 self.note(format!("hand #{hand_id} has begun"));
             }
             NodeEvent::DeckProgress {
@@ -923,6 +933,13 @@ impl AppState {
                 self.refresh_strength();
                 self.log
                     .push_back(format!("hand #{hand_id}: your cards are dealt"));
+            }
+            // `S1-EI`: the table certified a seat out of the running hand.
+            NodeEvent::SeatCertified { seat } => {
+                self.certified.insert(seat);
+                self.note(format!(
+                    "seat {seat} certified out of this hand: the hand goes on among the seats on the line"
+                ));
             }
             NodeEvent::HandWaiting { hand_id, seats } => {
                 // Said once per set, not once per arriving copy: a table
@@ -1206,6 +1223,7 @@ impl AppState {
         self.opponent_was_reachable = false;
         self.out_for_good = None;
         self.ever_on_line = false;
+        self.certified.clear();
         self.opponent_returns = 0;
         self.opponent_out = false;
         self.gone.clear();
@@ -1261,13 +1279,97 @@ impl AppState {
                 said: false,
                 dismissed_at: None,
                 slow: false,
+                alone: false,
             });
         }
     }
 
     /// Called every frame and on every sweep: an opponent unreachable for
     /// `OPPONENT_GONE_MS` is said once, in D-007's words.
+    /// `S1-EI`: at three seats or more, whether every other seat is off the
+    /// line at once, once one was on it -- nobody can certify anybody alone,
+    /// so it is heads-up's question (D-007) with more chairs.
+    fn alone_at_table(&self) -> bool {
+        let Some(s) = self.seated.as_ref() else {
+            return false;
+        };
+        if s.session.is_none() || s.roster.len() < 3 || !self.ever_on_line {
+            return false;
+        }
+        let Some(me) = s.seat else {
+            return false;
+        };
+        let others: Vec<u8> = s.roster.iter().map(|(n, _, _)| *n).filter(|n| *n != me).collect();
+        !others.is_empty()
+            && others
+                .iter()
+                .all(|n| self.links.get(n).is_some_and(|(_, group, _, _)| !*group))
+    }
+
+    /// `S1-EI`: the other seats off the line during a running hand, with what
+    /// happens about each -- so a table that waits does not look frozen.
+    pub fn absent_seats(&self) -> Vec<crate::gui::table::AbsentSeat> {
+        let Some(s) = self.seated.as_ref() else {
+            return Vec::new();
+        };
+        let Some(h) = self.hand.as_ref() else {
+            return Vec::new();
+        };
+        if s.session.is_none() || !self.ever_on_line || h.over {
+            return Vec::new();
+        }
+        let Some(me) = s.seat else {
+            return Vec::new();
+        };
+        s.roster
+            .iter()
+            .filter(|(n, _, _)| *n != me && h.dealt_in.contains(n))
+            .filter_map(|(n, name, _)| {
+                let (_, group, quiet_s, _) = self.links.get(n)?;
+                if *group {
+                    return None;
+                }
+                Some(crate::gui::table::AbsentSeat {
+                    seat: *n,
+                    name: name.clone(),
+                    certified: self.certified.contains(n),
+                    waited: self.waiting_for.contains(n),
+                    on_clock_s: if self.turn_seat == Some(*n) {
+                        self.turn_since.map(|t| t.elapsed().as_secs())
+                    } else {
+                        None
+                    },
+                    quiet_s: *quiet_s,
+                })
+            })
+            .collect()
+    }
+
     pub fn tick_opponent(&mut self) {
+        // `S1-EI`: alone at a bigger table -- everybody else off the line at
+        // once -- is heads-up's question with more chairs: nobody can certify
+        // anybody alone (D-036), so the table waits, and the player is asked
+        // the one question that has an answer. No returns are counted here:
+        // at three seats or more a return is the table's certificate (D-032).
+        if self.heads_up_opponent().is_none() && self.seated.as_ref().is_some_and(|s| s.roster.len() >= 3) {
+            let alone = self.alone_at_table();
+            match (alone, self.opponent_gone.as_ref()) {
+                (true, None) => {
+                    self.opponent_gone = Some(OpponentGone {
+                        since: std::time::Instant::now(),
+                        said: false,
+                        dismissed_at: None,
+                        slow: false,
+                        alone: true,
+                    });
+                }
+                (false, Some(g)) if g.alone => {
+                    self.opponent_gone = None;
+                    self.note("a seat of the table can be reached again: the question is withdrawn".into());
+                }
+                _ => {}
+            }
+        }
         // `D-034`: a present opponent long past their time to decide is asked
         // about too -- heads-up nobody can fold for them (D-007), and the
         // question is the same. The episode ends when they act.
@@ -1290,6 +1392,7 @@ impl AppState {
                     said: false,
                     dismissed_at: None,
                     slow: true,
+                    alone: false,
                 });
             }
         }
@@ -1339,6 +1442,10 @@ impl AppState {
                 let allowance = self.seated.as_ref().map(|s| s.action_ms / 1_000).unwrap_or(0);
                 self.note(format!(
                     "your opponent has been on the clock for {past} s, past their {allowance} s to decide; heads-up, nobody can fold a hand for them (D-007): wait for them, or leave the table"
+                ));
+            } else if self.opponent_gone.as_ref().is_some_and(|g| g.alone) {
+                self.note(format!(
+                    "nobody at the table has been reachable for {secs} s; alone, nobody can certify anybody (D-036): wait for them, or leave the table"
                 ));
             } else {
                 self.note(format!(
@@ -2090,6 +2197,38 @@ mod tests {
         s.apply(NodeEvent::SessionGaveUp { why: "no advertisement and no peer of the session for ten minutes".into() });
         let j = s.view().joining.expect("the ordinary join goes on");
         assert!(!j.rejoin && !j.gone && j.failed.is_none(), "{j:?}");
+    }
+
+    /// `S1-EI`: at a bigger table the seats off the line are listed with what happens
+    /// about each, and everybody off the line at once is heads-up's question.
+    #[test]
+    fn seats_off_the_line_are_said_and_everybody_off_is_the_question() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "a".into(), 1_000), (2, "b".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0) });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0) });
+        assert!(s.absent_seats().is_empty(), "everybody on the line");
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: Some(25) });
+        s.apply(NodeEvent::HandWaiting { hand_id: 3, seats: vec![2] });
+        let absent = s.absent_seats();
+        assert_eq!(absent.len(), 1);
+        assert!(absent[0].seat == 2 && absent[0].waited && !absent[0].certified, "{absent:?}");
+        s.apply(NodeEvent::SeatCertified { seat: 2 });
+        assert!(s.absent_seats()[0].certified, "certified out, said so");
+        s.tick_opponent();
+        assert!(s.opponent_gone.is_none(), "one seat off is not the question");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(21) });
+        s.tick_opponent();
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.alone), "everybody off: the question, about everybody");
+        assert_eq!(s.opponent_returns, 0, "no returns counted at three seats");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(1) });
+        s.tick_opponent();
+        assert!(s.opponent_gone.is_none(), "a seat back: withdrawn");
+        s.apply(NodeEvent::HandBegan { hand_id: 4, button: 1, dealt_in: vec![0, 1] });
+        assert!(s.certified.is_empty(), "the next hand starts clean");
     }
 
     /// `S1-EE`: a seat-left about the player's own seat marks nothing -- the felt

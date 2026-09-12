@@ -2158,6 +2158,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             let fresh: Vec<u8> = cert.iter().copied().filter(|s| !$t.required_seen.1.contains(s)).collect();
             $t.required_seen.1 = cert;
             for seat in fresh {
+                // `S1-EI`: the window says what happens about a certified seat.
+                let _ = events.send(NodeEvent::SeatCertified { seat }).await;
                 let entry = $t.table.as_ref().and_then(|f| {
                     f.roster()
                         .seats()

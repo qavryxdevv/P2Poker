@@ -148,6 +148,8 @@ impl AppState {
             opponent_left: self.opponent_left,
             out_for_good: self.out_for_good.clone(),
             line: self.line_message(),
+            absent: self.absent_seats(),
+            opponent_alone: self.opponent_gone.as_ref().is_some_and(|g| g.alone),
             chat: self
                 .table_chat
                 .iter()

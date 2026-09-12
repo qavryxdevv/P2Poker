@@ -166,6 +166,11 @@ pub struct TableView {
     /// `S1-EH`: a word over the felt about this client's own line, while it
     /// is gone: which network is unavailable.
     pub line: Option<String>,
+    /// `S1-EI`: the seats off the line during the hand, and what happens
+    /// about each.
+    pub absent: Vec<AbsentSeat>,
+    /// `S1-EI`: the question is about everybody else, not one opponent.
+    pub opponent_alone: bool,
 }
 
 /// The smallest table window the client allows, which every row of the
@@ -249,6 +254,20 @@ pub enum TableAction {
     /// `D-047`: this seat is out of the table for good; the player closes
     /// the table.
     CloseOut,
+}
+
+/// `S1-EI`: a seat off the line during the hand, and what happens about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbsentSeat {
+    pub seat: SeatIdx,
+    pub name: String,
+    /// The table certified it out of this hand.
+    pub certified: bool,
+    /// The hand waits on it.
+    pub waited: bool,
+    /// On the clock, for this long.
+    pub on_clock_s: Option<u64>,
+    pub quiet_s: Option<u64>,
 }
 
 /// `S1-CS`: a line of table chat as the window shows it.
@@ -389,6 +408,8 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
             "Opponent is out"
         } else if view.opponent_slow {
             "Opponent is taking too long"
+        } else if view.opponent_alone {
+            "Nobody can be reached"
         } else {
             "Opponent disconnected"
         };
@@ -402,6 +423,8 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
                     ui.label("Your opponent left the table.");
                 } else if view.opponent_slow {
                     ui.label(format!("Your opponent has been on the clock for {secs} s past their time to decide."));
+                } else if view.opponent_alone {
+                    ui.label(format!("Nobody at the table has been reachable for {secs} s."));
                 } else {
                     ui.label(format!("Your opponent has been unreachable for {secs} s."));
                 }
@@ -414,8 +437,12 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
                     );
                 } else {
                     ui.label(
-                        RichText::new("Heads-up, nobody can fold a hand for an absent player: the table waits for them.")
-                            .color(theme::TEXT_DIM),
+                        RichText::new(if view.opponent_alone {
+                            "Alone at the table, nobody can certify anybody: the table waits for them."
+                        } else {
+                            "Heads-up, nobody can fold a hand for an absent player: the table waits for them."
+                        })
+                        .color(theme::TEXT_DIM),
                     );
                     ui.label("Wait for them to come back, or end the game and leave the table.");
                 }
@@ -502,6 +529,44 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
                         egui::pos2(rect.center().x, rect.top() + 36.0 + 17.0 * i as f32),
                         &text,
                         12.5,
+                        theme::TEXT,
+                    );
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+            }
+            // `S1-EI`: seats off the line during the hand, and what happens about
+            // each -- so a table that waits does not look frozen.
+            if view.line.is_none() && !view.absent.is_empty() {
+                let p = ui.painter();
+                let mut lines: Vec<String> = Vec::new();
+                for a in &view.absent {
+                    let quiet = a.quiet_s.map(|q| format!(", silent {q} s")).unwrap_or_default();
+                    lines.push(if a.certified {
+                        format!("{} is off the line{quiet}: certified out of this hand; the hand goes on among the seats on the line.", a.name)
+                    } else if a.waited {
+                        match a.on_clock_s {
+                            Some(s) => format!("{} is off the line{quiet}: the hand waits on it, {s} s on its clock; when the clock runs out the other seats certify it out and play on.", a.name),
+                            None => format!("{} is off the line{quiet}: the hand waits on it; when its clock runs out the other seats certify it out and play on.", a.name),
+                        }
+                    } else {
+                        format!("{} is off the line{quiet}: certified out when its turn comes; it rejoins at a later hand if it comes back.", a.name)
+                    });
+                }
+                lines.push("The hand finishes when the seats it waits on are back on the line or certified out; nothing here is stuck.".to_string());
+                let w = (area.width() * 0.84).max(380.0);
+                let h = 28.0 + 16.0 * lines.len() as f32;
+                let rect = egui::Rect::from_center_size(
+                    egui::pos2(area.center().x, area.top() + h * 0.5 + 6.0),
+                    egui::vec2(w, h),
+                );
+                p.rect_filled(rect, 10.0, egui::Color32::from_black_alpha(185));
+                paint::centred(p, egui::pos2(rect.center().x, rect.top() + 13.0), "Seats off the line", 13.5, theme::STACK);
+                for (i, s) in lines.iter().enumerate() {
+                    paint::centred(
+                        p,
+                        egui::pos2(rect.center().x, rect.top() + 31.0 + 16.0 * i as f32),
+                        s,
+                        11.5,
                         theme::TEXT,
                     );
                 }
@@ -1156,6 +1221,8 @@ impl TableView {
             opponent_left: false,
             out_for_good: None,
             line: None,
+            absent: Vec::new(),
+            opponent_alone: false,
         }
     }
 }
