@@ -2433,8 +2433,10 @@ listed seat signs `TABLE_READY` over it.
 
 *Direction:* **collective stage 0 of the setup chain (`hand_id = 0`)**. Every
 seated participant emits exactly one, to every other.
-*Legal:* once `PLAYER_LIST` names a roster of at least `min_players_to_start` and
-this client has an established connection to every other listed seat.
+*Legal:* once `PLAYER_LIST` names a roster of at least `min_players_to_start` -- or, after
+one that size was named, a roster the founder says again of at least two seats (D-044: a
+seat given back before the first hand does not un-set the table; the floor is heads-up) --
+and this client has an established connection to every other listed seat.
 *Envelope:* `hand_id = 0`, `sequence = 0`, `previous_event_hash = GENESIS(0)`.
 
 | Field | Type | Limit / rule |

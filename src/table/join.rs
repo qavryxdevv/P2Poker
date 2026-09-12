@@ -459,13 +459,18 @@ pub fn admit_ready(
     roster: &Roster,
     list_serial: u64,
     under: &JoinedUnder,
+    floor: usize,
 ) -> Result<(), ReadyRefused> {
     // `TABLE_READY` is where a proposal becomes a fact, and it is therefore the
     // one place `min_players_to_start` can be enforced. Nothing enforced it.
-    if roster.len() < under.ad.min_players_to_start as usize {
+    // `D-044`: `floor` is what the caller may ratify at -- the advert's
+    // `min_players_to_start`, or two once a roster at that minimum was named
+    // here (the table was set to start and a seat was given back before the
+    // first hand). The caller knows which; a ratification does not say.
+    if roster.len() < floor {
         return Err(ReadyRefused::TooFewToStart {
             seated: roster.len(),
-            need: under.ad.min_players_to_start,
+            need: u8::try_from(floor).unwrap_or(u8::MAX),
         });
     }
     match roster.seat_of(sender_public_key) {
@@ -1080,7 +1085,7 @@ mod tests {
             my_seat: 1,
             capability_set: vec![b"nlhe/2-6".to_vec()],
         };
-        assert_eq!(admit_ready(&ready, &[1u8; 32], &roster, 7, &u), Ok(()));
+        assert_eq!(admit_ready(&ready, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize), Ok(()));
     }
 
 
@@ -1131,9 +1136,12 @@ mod tests {
             capability_set: Vec::new(),
         };
         assert_eq!(
-            admit_ready(&ready, &[1u8; 32], &roster, 7, &u),
+            admit_ready(&ready, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize),
             Err(ReadyRefused::TooFewToStart { seated: 2, need: 4 })
         );
+        // `D-044`: once the table was set to start, the caller's floor is two
+        // and the same two seats ratify.
+        assert_eq!(admit_ready(&ready, &[1u8; 32], &roster, 7, &u, 2), Ok(()));
     }
 
     /// Every way a ratification can fail to be about the same table, one at a
@@ -1155,19 +1163,19 @@ mod tests {
         let mut wrong_seat = good.clone();
         wrong_seat.my_seat = 0;
         assert_eq!(
-            admit_ready(&wrong_seat, &[1u8; 32], &roster, 7, &u),
+            admit_ready(&wrong_seat, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize),
             Err(ReadyRefused::NotAtThatSeat { seat: 0 })
         );
 
         // Not in the roster at all.
         assert_eq!(
-            admit_ready(&good, &[7u8; 32], &roster, 7, &u),
+            admit_ready(&good, &[7u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize),
             Err(ReadyRefused::NotAtThatSeat { seat: 1 })
         );
 
         // A different list.
         assert_eq!(
-            admit_ready(&good, &[1u8; 32], &roster, 8, &u),
+            admit_ready(&good, &[1u8; 32], &roster, 8, &u, u.ad.min_players_to_start as usize),
             Err(ReadyRefused::WrongList { got: 7, held: 8 })
         );
 
@@ -1175,7 +1183,7 @@ mod tests {
         let mut wrong_params = good.clone();
         wrong_params.table_params_hash = [0xEE; 32];
         assert_eq!(
-            admit_ready(&wrong_params, &[1u8; 32], &roster, 7, &u),
+            admit_ready(&wrong_params, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize),
             Err(ReadyRefused::ParametersMismatch)
         );
 
@@ -1183,7 +1191,7 @@ mod tests {
         let mut wrong_roster = good;
         wrong_roster.roster_hash = [0xEE; 32];
         assert_eq!(
-            admit_ready(&wrong_roster, &[1u8; 32], &roster, 7, &u),
+            admit_ready(&wrong_roster, &[1u8; 32], &roster, 7, &u, u.ad.min_players_to_start as usize),
             Err(ReadyRefused::RosterMismatch)
         );
     }

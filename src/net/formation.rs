@@ -243,6 +243,12 @@ pub struct Formation {
     /// back). The node reads it and leaves the table: there is nothing to
     /// sit at, and the player joins again from the lobby.
     released: bool,
+    /// `D-044`: a roster of at least `min_players_to_start` was adopted here
+    /// once -- the table was set to start. From then on a roster the founder
+    /// says again may be smaller, down to two seats (the owner's floor:
+    /// heads-up), and is ratified like any other: a seat given back before
+    /// the first hand does not un-set the table.
+    started: bool,
 }
 
 /// What this client may need to say again.
@@ -313,6 +319,7 @@ impl Formation {
             recorded_ready: None,
             recorded_refused: false,
             released: false,
+            started: false,
         })
     }
 
@@ -368,6 +375,7 @@ impl Formation {
             recorded_ready,
             recorded_refused: false,
             released: false,
+            started: false,
         };
         f.said.list = Some(list_bytes.to_vec());
         let out = f.adopt(&list, now_ms)?;
@@ -470,6 +478,7 @@ impl Formation {
                 recorded_ready: None,
                 recorded_refused: false,
                 released: false,
+                started: false,
             },
             bytes,
         ))
@@ -572,6 +581,18 @@ impl Formation {
             }
         }
         out
+    }
+
+    /// `D-044`: the fewest seats a roster may be ratified at here -- the
+    /// advert's `min_players_to_start`, or two once a roster at that minimum
+    /// was adopted (the table was set to start; a seat given back before the
+    /// first hand does not un-set it). The owner's floor is heads-up.
+    fn floor(&self) -> usize {
+        if self.started {
+            2
+        } else {
+            self.under.ad.min_players_to_start as usize
+        }
     }
 
     /// `S1-DV`: whether a roster the founder said again dropped this client's
@@ -1189,7 +1210,15 @@ impl Formation {
             _ => return Ok(vec![]),
         };
 
-        if self.sent_ready || self.roster.len() < self.under.ad.min_players_to_start as usize {
+        if self.roster.len() >= self.under.ad.min_players_to_start as usize {
+            self.started = true;
+        }
+        // `D-044`: a table that was set to start goes on with the seats that
+        // remain, two at the least, when the founder says its roster again
+        // without a seat given back before the first hand -- `floor`, on
+        // both the saying and the taking of a ratification.
+        let short = self.roster.len() < self.floor();
+        if self.sent_ready || short {
             self.replay_early();
             return Ok(vec![]);
         }
@@ -1304,7 +1333,7 @@ impl Formation {
     fn take_ratification(&mut self, bytes: &[u8]) -> Result<(), Failed> {
         let (ready, sender, event_hash) =
             joinwire::receive_table_ready(bytes, &self.under.table_id, &self.genesis())?;
-        admit_ready(&ready, &sender, &self.roster, self.serial, &self.under)
+        admit_ready(&ready, &sender, &self.roster, self.serial, &self.under, self.floor())
             .map_err(Failed::Ready)?;
         // **First copy wins, and a second differing one is named.** This was
         // `insert`, which overwrote.
@@ -2409,6 +2438,135 @@ mod tests {
             .expect("a fresh list says so");
         j.on_player_list(&again, NOW + 2).expect("the list holds");
         assert!(j.released_before_the_first_hand(), "named before and not now: given back");
+    }
+
+    /// The founder's answer to one step, delivered: the reply to `j`, the list
+    /// to every joiner and to `j`, and every ratification to every other seat.
+    fn deliver(t: &mut Table, j: &mut Formation, out: Vec<Send>, table_id: Hash, now: u64) {
+        let mut list_bytes = None;
+        let mut readies = vec![];
+        for s in out {
+            match s {
+                Send::Reply(bytes) => {
+                    j.on_join_answer(&bytes, now).expect("the acceptance holds");
+                }
+                Send::Broadcast(bytes) => {
+                    if joinwire::receive_player_list(&bytes).is_ok() {
+                        list_bytes = Some(bytes);
+                    } else {
+                        readies.push(bytes);
+                    }
+                }
+            }
+        }
+        if let Some(list) = list_bytes {
+            for other in t.joiners.iter_mut() {
+                for s in other.on_player_list(&list, now).expect("the list holds") {
+                    if let Send::Broadcast(b) = s {
+                        readies.push(b);
+                    }
+                }
+            }
+            for s in j.on_player_list(&list, now).expect("the list holds") {
+                if let Send::Broadcast(b) = s {
+                    readies.push(b);
+                }
+            }
+        }
+        let mut everyone: Vec<&mut Formation> = vec![&mut t.founder];
+        everyone.extend(t.joiners.iter_mut());
+        everyone.push(j);
+        for bytes in &readies {
+            let (r, sender, _) =
+                joinwire::receive_table_ready(bytes, &table_id, &everyone[0].genesis()).unwrap();
+            for who in everyone.iter_mut() {
+                if who.roster().seat_of(&sender) == Some(r.my_seat) && who.my_seat() != Some(r.my_seat) {
+                    who.on_table_ready(bytes).expect("a ratification holds");
+                }
+            }
+        }
+    }
+
+    /// `D-044`, the owner's ruling: a table set to start goes on with the seats
+    /// that remain, two at the least, when a seat is given back before the
+    /// first hand. Three seats on a table that starts at three; one given
+    /// back; the other two ratify the roster of two and agree on one session.
+    /// A table never set stays short: nothing starts below the minimum that
+    /// was not at it once.
+    #[test]
+    fn a_table_set_to_start_goes_on_with_the_seats_that_remain() {
+        let (mut t, _, a, hash) = found(6, 3);
+        let table_id = t.founder.table_id();
+        for (n, seed) in [(2u8, 2u8), (3, 3)] {
+            let (mut j, request) = Formation::join(
+                key(seed),
+                a.clone(),
+                hash,
+                table_id,
+                peer(n),
+                format!("player {n}"),
+                1_000,
+                None,
+                None,
+                [seed; 32],
+                NOW,
+                None,
+            )
+            .unwrap();
+            let out = t
+                .founder
+                .on_join_request(&request, &peer(n), false, NOW)
+                .expect("seated");
+            deliver(&mut t, &mut j, out, table_id, NOW);
+            t.joiners.push(j);
+        }
+        let session = t.founder.session().expect("set at three");
+        assert!(t.joiners.iter().all(|j| j.session() == Some(session)), "all three agree");
+
+        // The second joiner's client is gone before the first hand; the founder
+        // gives its seat back, and the roster said again holds two.
+        let out = t
+            .founder
+            .release_seat_before_the_first_hand(&peer(3), NOW + 5)
+            .expect("given back");
+        let _gone = t.joiners.pop().expect("the second joiner");
+        let mut stay = t.joiners.pop().expect("the first joiner");
+        deliver(&mut t, &mut stay, out, table_id, NOW + 5);
+        assert_eq!(t.founder.roster().len(), 2, "two seats remain");
+        let again = t.founder.session().expect("set again, at two");
+        assert_ne!(again, session, "a new roster is a new session");
+        assert_eq!(stay.session(), Some(again), "the joiner that stayed agrees");
+    }
+
+    /// And a table that was never set does not start short: two seats on a
+    /// table that starts at three ratify nothing.
+    #[test]
+    fn a_table_never_set_does_not_start_below_its_minimum() {
+        let (mut t, _, a, hash) = found(6, 3);
+        let table_id = t.founder.table_id();
+        let (mut j, request) = Formation::join(
+            key(2),
+            a,
+            hash,
+            table_id,
+            peer(2),
+            "player 2".into(),
+            1_000,
+            None,
+            None,
+            [2u8; 32],
+            NOW,
+            None,
+        )
+        .unwrap();
+        let out = t
+            .founder
+            .on_join_request(&request, &peer(2), false, NOW)
+            .expect("seated");
+        deliver(&mut t, &mut j, out, table_id, NOW);
+        assert_eq!(t.founder.roster().len(), 2);
+        assert!(t.founder.session().is_none(), "two of three: not set");
+        assert!(j.session().is_none());
     }
 
     /// The founder never gives away its own seat, and an unknown peer is a no-op.

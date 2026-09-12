@@ -186,6 +186,9 @@ pub enum Command {
     /// and pretending otherwise would put a second membership answer beside
     /// the roster's.
     Unseated([u8; 32]),
+    /// `D-044`: the roster as the formation holds it now, by Tox key; seats
+    /// it no longer names leave this table's roster here.
+    Roster(Vec<[u8; 32]>),
     /// **`patches/0011`. Ask this seat for the message a stage is waiting on.**
     ///
     /// A lost group message is normally repaired in one round trip: the
@@ -303,6 +306,11 @@ pub struct Trouble {
     /// every log this client writes. Which is the same defect as reading a
     /// zero that was never measured.
     pub inbox_dropped: AtomicU64,
+    /// `S1-DW`: claims refused -- a member's signed traffic said it is a
+    /// seat that another confirmed member holds and has spoken from within
+    /// the last twenty seconds: that seat's message said again, not a seat
+    /// back under a fresh key (S1-DU), whose old entry has been quiet.
+    pub claims_refused: AtomicU64,
     /// `D-035`: the roster seats whose client is a confirmed member of the
     /// group right now, by application key -- recomputed every sweep, for
     /// the window's link indicator.
@@ -830,6 +838,24 @@ fn befriend(
     }
 }
 
+/// `D-019`, by the line an invitation went over (`patches/0033`): where this
+/// client is the admin, every member that came in through the friend with
+/// this Tox key is removed from the group; elsewhere it is impossible rather
+/// than refused. (Before `S1-DV` the kick looked the Tox key up as an
+/// application key, and found nothing.)
+fn unseat(tox: &mut Tox, t: &TableState, key: &[u8; 32]) {
+    if !matches!(t.setup.role, Role::Host) {
+        return;
+    }
+    let Some(g) = t.group else {
+        return;
+    };
+    let peers: Vec<u32> = t.peer_lines.iter().filter(|(_, l)| *l == key).map(|(p, _)| *p).collect();
+    for p in peers {
+        let _ = tox.kick(g, p);
+    }
+}
+
 fn by_group(tables: &mut HashMap<TableId, TableState>, g: u32) -> Option<&mut TableState> {
     tables.values_mut().find(|t| t.group == Some(g))
 }
@@ -1205,6 +1231,25 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                         // is who in the group: the only authenticated bridge
                         // between the two key spaces (`S1-I`).
                         Command::KnownAs { group_key, app_key } => {
+                            // `S1-DW`: a claim to a seat that is here and speaking
+                            // is refused -- a member's first word could be another
+                            // seat's signed message said again, and the pairing
+                            // would make that member's exit read as the seat's. A
+                            // seat back under a fresh key (S1-DU) passes: its old
+                            // entry has been quiet.
+                            const CLAIM_QUIET_S: u64 = 20;
+                            let refused = t.group.is_some_and(|g| {
+                                let entries = t.known_as.iter().map(|(gk, a)| {
+                                    let confirmed =
+                                        t.peer_keys.iter().any(|(p, k)| k == gk && t.confirmed.contains(p));
+                                    (*gk, *a, confirmed, tox.peer_quiet_secs(g, gk))
+                                });
+                                claim_refused(&group_key, &app_key, entries, CLAIM_QUIET_S)
+                            });
+                            if refused {
+                                t.trouble.claims_refused.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                             t.known_as.insert(group_key, app_key);
                             if let Ok(mut known) = t.trouble.known.lock() {
                                 known.insert(app_key);
@@ -1225,16 +1270,29 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                         }
                         Command::Unseated(key) => {
                             t.roster.retain(|k| *k != key);
-                            // Removed from the group where this client is the
-                            // admin; elsewhere it is impossible rather than
-                            // refused.
-                            if matches!(t.setup.role, Role::Host) {
-                                if let Some(g) = t.group {
-                                    // `S1-DU`: every entry the seat has.
-                                    for (peer, _) in entries_of(&key, scan_pairs(&tox, g), &t.known_as) {
-                                        let _ = tox.kick(g, peer);
-                                    }
+                            unseat(&mut tox, t, &key);
+                        }
+                        Command::Roster(keys) => {
+                            // `D-044`: the roster as the formation holds it now. A
+                            // seat it no longer names leaves this table's roster
+                            // here, so the group gate wants the seats that remain
+                            // -- a joiner's driver had never been told a seat was
+                            // gone, and waited for it (`run130909-3`: *2 wanted*
+                            // ninety seconds after the founder said two).
+                            let gone: Vec<[u8; 32]> =
+                                t.roster.iter().filter(|k| !keys.contains(k)).copied().collect();
+                            for key in gone {
+                                t.roster.retain(|k| *k != key);
+                                unseat(&mut tox, t, &key);
+                            }
+                            for key in keys {
+                                if key == me {
+                                    continue;
                                 }
+                                if !t.roster.contains(&key) {
+                                    t.roster.push(key);
+                                }
+                                befriend(&mut tox, &mut friends, &mut idle, &key);
                             }
                         }
                         Command::Rejoined(key) if key != me => {
@@ -1780,6 +1838,23 @@ fn entries_of(
         .collect()
 }
 
+/// `S1-DW`: whether a claim that `group_key` speaks for `app_key` is refused:
+/// another group key holds that application key, is a confirmed member, and
+/// has spoken within `quiet_limit` seconds. A seat back under a fresh key
+/// (S1-DU) passes, its old entry having been quiet; a member saying another
+/// seat's message again as its own first word does not, that seat being here
+/// and speaking. No member can make another read as gone by it.
+fn claim_refused(
+    group_key: &[u8; 32],
+    app_key: &[u8; 32],
+    entries: impl IntoIterator<Item = ([u8; 32], [u8; 32], bool, Option<u64>)>,
+    quiet_limit: u64,
+) -> bool {
+    entries.into_iter().any(|(gk, a, confirmed, quiet)| {
+        a == *app_key && gk != *group_key && confirmed && quiet.is_some_and(|q| q < quiet_limit)
+    })
+}
+
 /// The group's members as (peer number, group key) pairs, read from the
 /// library. Peer ids are small and dense and a table is at most ten seats, so
 /// a scan beats keeping a second map in step with joins and parts -- except
@@ -1907,6 +1982,30 @@ mod tests {
         assert!(entries_of(&seat, after, &known_as).iter().any(|(p, _)| confirmed.contains(p)));
         // ... and with no entry of its left, it is.
         assert!(!entries_of(&seat, vec![(3, other)], &known_as).iter().any(|(p, _)| confirmed.contains(p)));
+    }
+
+    /// `S1-DW`: a claim to a seat that is here and speaking is refused; a seat
+    /// back under a fresh key is not. The owner's question: can a member say
+    /// another has left? Only by first being taken for it, and this is the
+    /// gate.
+    #[test]
+    fn a_claim_to_a_seat_that_is_here_and_speaking_is_refused() {
+        let seat = [7u8; 32];
+        let held_by = [1u8; 32];
+        let claimant = [2u8; 32];
+        // Held by a confirmed member that spoke a second ago: refused.
+        assert!(claim_refused(&claimant, &seat, [(held_by, seat, true, Some(1))], 20));
+        // The holder has been quiet forty seconds (a client that died; S1-DU's
+        // return under a fresh key): the claim stands.
+        assert!(!claim_refused(&claimant, &seat, [(held_by, seat, true, Some(40))], 20));
+        // The holder is not a confirmed member now: stands.
+        assert!(!claim_refused(&claimant, &seat, [(held_by, seat, false, Some(1))], 20));
+        // The holder's silence is unknown to the library: stands.
+        assert!(!claim_refused(&claimant, &seat, [(held_by, seat, true, None)], 20));
+        // The same key taught again for the same seat: not a claim against anybody.
+        assert!(!claim_refused(&held_by, &seat, [(held_by, seat, true, Some(1))], 20));
+        // Another seat's entry says nothing about this one.
+        assert!(!claim_refused(&claimant, &seat, [(held_by, [9u8; 32], true, Some(1))], 20));
     }
 
     /// **The whole stack, between two real Tox instances**: a nine-kilobyte

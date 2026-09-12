@@ -59,6 +59,10 @@ pub enum Seat {
     Took([u8; 32]),
     /// It no longer does: remove it from the group, where this client may.
     Left([u8; 32]),
+    /// `D-044`: the roster as the formation holds it now, by Tox key. The
+    /// driver takes the seats it did not have and drops the ones no longer
+    /// named, so its group gate wants the seats that remain.
+    Roster(Vec<[u8; 32]>),
     /// It is back after a restart and needs the group offered again. See
     /// `tox::table::Command::Rejoined` for why nothing else notices.
     Back([u8; 32]),
@@ -641,6 +645,25 @@ impl TableSink {
         }
     }
 
+    /// `S1-DW`: claims refused by the table's group -- a member's signed
+    /// traffic saying it is a seat that another confirmed member holds and
+    /// has spoken from lately. Any non-zero value is a member saying another
+    /// seat's message again as its own first word.
+    pub fn claims_refused(&self) -> u64 {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().claims_refused.load(Ordering::Relaxed),
+                None => 0,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            0
+        }
+    }
+
     /// **Why** the refusals happened, by `Tox_Err_Group_Send_Custom_Packet`:
     /// index 1 group-not-found, 2 too-long, 3 empty, 4 disconnected,
     /// 5 fail-send. Index 0 is unused.
@@ -782,6 +805,7 @@ impl TableSink {
                 t.tell(match seat {
                     Seat::Took(k) => Command::Seated(k),
                     Seat::Left(k) => Command::Unseated(k),
+                    Seat::Roster(keys) => Command::Roster(keys),
                     Seat::Back(k) => Command::Rejoined(k),
                     Seat::KnownAs {
                         group_key,

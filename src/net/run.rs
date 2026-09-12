@@ -462,6 +462,9 @@ struct TableRun {
     abort_reported: bool,
     /// Hand events dropped for want of a draining reader, said when it moves.
     inbox_dropped_said: u64,
+    /// `S1-DW`: the claims the table's group had refused when this client
+    /// last said so.
+    claims_refused_said: u64,
     /// The last turn told to the interface, so a stage per action does not
     /// become a redraw per action.
     turn_reported: Option<HandReport>,
@@ -777,6 +780,7 @@ impl TableRun {
             cards_reported: false,
             abort_reported: false,
             inbox_dropped_said: 0,
+            claims_refused_said: 0,
             turn_reported: None,
             next_hand_at: None,
             deal_at: None,
@@ -5138,6 +5142,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // because that one is about the transport being behind, and
                     // this is about an event that reached this client and was
                     // thrown away inside it.
+                    // `S1-DW`: a member said another seat's message again as its
+                    // own first word and the group refused the pairing. Said, and
+                    // the group is taught again so the member's own next word
+                    // pairs it with itself.
+                    let claims = t.tox_sink.claims_refused();
+                    if claims > t.claims_refused_said {
+                        t.claims_refused_said = claims;
+                        t.taught.clear();
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "the table's group refused {claims} claim(s) by a member to be a seat that is here and speaking (S1-DW); the group is taught again"
+                            )))
+                            .await;
+                    }
                     let dropped = t.tox_sink.inbox_dropped();
                     if dropped > t.inbox_dropped_said {
                         t.inbox_dropped_said = dropped;
@@ -7944,11 +7962,11 @@ fn seat_on_tox(f: &Formation, tox: &super::toxsink::TableSink) {
     if !tox.is_on_tox() {
         return;
     }
-    for e in f.roster().seats() {
-        if let Some(k) = e.tox_key {
-            tox.tell(super::toxsink::Seat::Took(k));
-        }
-    }
+    // `D-044`: the whole roster, so the driver drops the seats it no longer
+    // names as well as taking the new ones -- a joiner's driver had never
+    // been told a seat was gone (`run130909-3`).
+    let keys: Vec<[u8; 32]> = f.roster().seats().iter().filter_map(|e| e.tox_key).collect();
+    tox.tell(super::toxsink::Seat::Roster(keys));
 }
 
 async fn report_roster(events: &Events, f: &Formation) {
