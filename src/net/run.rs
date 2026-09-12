@@ -5808,7 +5808,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .is_some_and(|q| q >= QUIET_LIMIT_S);
                             let never_in = founder_line.is_some_and(|k| {
                                 !t.tox_sink.in_group_line(&k) && !t.tox_sink.friend_up(&k)
-                            }) && t.opened_at.elapsed() >= GROUP_JOIN_GRACE;
+                            }) && f
+                                // Since this client's seat first appeared on the roster
+                                // here -- not since the slot opened, which for a window
+                                // is the client's start: a client long in the lobby read
+                                // its founder as gone at the first tick after sitting down.
+                                .my_seat()
+                                .and_then(|s| t.seat_since.get(&s))
+                                .is_some_and(|since| since.elapsed() >= GROUP_JOIN_GRACE);
                             // `D-044`: the founder's own word over the lobby's question
                             // (D-040): an answer from it, made after this table's advert,
                             // that does not name the table. The founder is in the lobby

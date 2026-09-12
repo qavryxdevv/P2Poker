@@ -75,6 +75,10 @@ param(
     # table's word at that second (D-045), for measuring that no member honours
     # it. Needs --features fault-harness.
     [ValidateRange(0, 3600)][int]$KickWithoutWordAt = 0,
+    # `-JoinAt <s>`: n1 sits in the lobby and asks for the table at that second,
+    # as a window's client that has been open a while does (D-045's joiner
+    # rules count from the seat, not from the client's start).
+    [ValidateRange(0, 3600)][int]$JoinAt = 0,
     # `-ThinkMs <ms>`: every seat waits that long before it acts (`--autoplay <ms>`);
     # above the table's own thirty seconds the seat's OWN clock acts first, which
     # is how the check/fold's timing is measured from the other seats' side
@@ -383,7 +387,11 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     } elseif ($TwoTables -and $i -eq $Seats + $Watchers + 1) {
         $nodeArgs += @('--join', "$table-B")
     } elseif ($i -lt $Seats -and -not $NoJoin) {
-        $nodeArgs += @('--join', $table)
+        if ($JoinAt -gt 0 -and $i -eq 1) {
+            $nodeArgs += @('--then-join', $table, '--then-at', "$JoinAt")
+        } else {
+            $nodeArgs += @('--join', $table)
+        }
         if ($RehostAt -gt 0) { $nodeArgs += @('--then-join', "$table-2", '--then-at', "$($RehostAt + 5)") }
         if ($TwoTables -and $i -eq 1) { $nodeArgs += @('--also-join', "$table-B", '--also-at', "$AlsoAt") }
     }
