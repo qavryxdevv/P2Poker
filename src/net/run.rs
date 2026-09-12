@@ -4986,7 +4986,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // it costs one open per peer per run.
                 if let (Some(gk), Some(h)) = (item.claimed, t.hand.as_ref()) {
                     if !t.taught.contains(&gk) {
-                        if let Some(app) = signer_of(&item.bytes, h) {
+                        // `S1-EE`: a frame signed by this client that arrives from a
+                        // member is that member saying it again (D-033, a copy at a
+                        // rejoin), never the member being this client. Paired, the
+                        // member's exit would report this client's own seat gone,
+                        // and the felt drew *left the table* behind the player's own
+                        // cards with nothing ever clearing it.
+                        if let Some(app) = signer_of(&item.bytes, h).filter(|a| *a != my_app_key) {
                             t.taught.insert(gk);
                             t.tox_sink.tell(super::toxsink::Seat::KnownAs {
                                 group_key: gk,
@@ -6086,6 +6092,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // `D-035`: seats whose client left the table's group.
                     for (app, quit) in t.tox_sink.take_gone() {
+                        // `S1-EE`: never about this client's own seat -- it is here.
+                        if app == my_app_key {
+                            continue;
+                        }
                         if let Some(seat) = t.table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
                             let _ = events.send(NodeEvent::SeatLeft { seat, quit }).await;
                             let _ = events
@@ -6107,7 +6117,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // and ratification again over the group, so the newcomer is
                             // taught who this client is at once rather than at the next
                             // thirty-second repeat.
-                            if group.0 > t.carrier_reported.map_or(0, |(seen, _)| seen) && !t.ever_dealt {
+                            // `S1-EE`: after the first deal as well -- a seat back under a
+                            // fresh group key (S1-EB) is paired by its own word, not by
+                            // whatever it happens to relay first.
+                            if group.0 > t.carrier_reported.map_or(0, |(seen, _)| seen) {
                                 if let Some(f) = t.table.as_ref() {
                                     for bytes in f.say_again(super::node::now_unix_ms()) {
                                         t.tox_sink.try_broadcast(&bytes);

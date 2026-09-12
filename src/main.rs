@@ -1071,7 +1071,7 @@ fn windowed(player: Player, run: Run) -> Started {
                 join,
                 resume,
                 table_closed: false,
-                confirm_exit: false,
+                confirm_exit: None,
                 ui: render::LobbyUi::new(settings),
                 table_ui: Default::default(),
                 profile_dir,
@@ -1257,14 +1257,15 @@ struct Client {
     /// The player shut the table window. It does not re-open by itself until
     /// they sit down somewhere else, or ask for it.
     table_closed: bool,
-    /// `S1-DR`: the table window is asking whether to leave.
-    confirm_exit: bool,
+    /// `S1-DR`: a table window is asking whether to leave -- which slot's.
+    confirm_exit: Option<u8>,
     /// Where the settings are saved, and the key their defaults come from.
     profile_dir: std::path::PathBuf,
     app_key: ed25519_dalek::SigningKey,
     /// What the user is typing, which must survive the snapshot being replaced.
     ui: p2p_poker::gui::render::LobbyUi,
-    table_ui: p2p_poker::gui::table::TableUi,
+    /// `S1-EF`: what each table window is typing or sliding, by slot.
+    table_ui: std::collections::BTreeMap<u8, p2p_poker::gui::table::TableUi>,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
     commands: tokio::sync::mpsc::Sender<NodeCommand>,
     bounded: Option<u64>,
@@ -1279,6 +1280,36 @@ impl Client {
     /// `try_send` and not `send`: this runs on the paint thread, and a paint
     /// thread that blocks on a channel is a frozen window. A full queue means
     /// the node is busy, which is worth saying and is not worth stopping for.
+    /// `S1-EF`: one window per table this client sits at, every frame.
+    ///
+    /// The client used to draw one table window, the active slot's, and a
+    /// second game joined from the lobby while it was open ran in the
+    /// background with no window at all (the owner, 2026-09-12: *the GUI must
+    /// keep checking whether a game runs without a window*). Every seated
+    /// slot gets its window here, so a game without one cannot last a frame;
+    /// a slot left stops being drawn and its window closes with it.
+    fn table_windows(&mut self, ctx: &eframe::egui::Context) {
+        let slots: Vec<u8> = self.state.slots().into_iter().map(|s| s.slot).collect();
+        for slot in slots {
+            if slot == self.state.active_slot && self.table_closed {
+                continue;
+            }
+            self.table_window(ctx, slot);
+        }
+    }
+
+    /// `D-043`, `S1-EF`: turn to one of this client's tables -- the window's
+    /// state and the node's active slot together. A click in a table's
+    /// window turns to that table first, so what follows is about it.
+    fn turn_to(&mut self, slot: u8) {
+        if slot != self.state.active_slot {
+            self.state.switch_to(slot);
+            self.tell(NodeCommand::Focus(slot));
+        }
+        self.screen = Screen::Table;
+        self.table_closed = false;
+    }
+
     /// The table, in its own operating-system window.
     ///
     /// `show_viewport_immediate` and not the deferred form: the deferred one
@@ -1304,29 +1335,34 @@ impl Client {
         false
     }
 
-    fn table_window(&mut self, ctx: &eframe::egui::Context) {
+    fn table_window(&mut self, ctx: &eframe::egui::Context, slot: u8) {
         use eframe::egui::{ViewportBuilder, ViewportId};
 
-        let title = self
-            .state
-            .seated
-            .as_ref()
-            .map(|s| format!("p2p-poker — table {}", short_key(&s.key)))
+        let is_active = slot == self.state.active_slot;
+        let key = if is_active {
+            self.state.seated.as_ref().map(|s| s.key)
+        } else {
+            self.state.slot_keys.get(&slot).copied().flatten()
+        };
+        let title = key
+            .map(|k| format!("p2p-poker — table {}", short_key(&k)))
             .unwrap_or_else(|| "p2p-poker — table".into());
 
-        let view = self.table_view();
+        let view = self.state.table_view_of(slot);
+        let mut table_ui = self.table_ui.remove(&slot).unwrap_or_default();
         let mut action = p2p_poker::gui::table::TableAction::None;
         let mut close_asked = false;
         let mut answer: Option<bool> = None;
-        let asking = self.confirm_exit;
+        let asking = self.confirm_exit == Some(slot);
         // `S1-CR`, `S1-CY`: the question about an unfinished game is asked
         // here as well as in the lobby -- the player looking at the table
         // window never saw the lobby's.
-        let unfinished = self.state.unfinished.clone();
+        // `S1-EF`: in the active table's window only, so it is asked once.
+        let unfinished = if is_active { self.state.unfinished.clone() } else { None };
         let mut answered: Option<render::LobbyAction> = None;
 
         ctx.show_viewport_immediate(
-            ViewportId::from_hash_of("p2p-poker-table"),
+            ViewportId::from_hash_of(("p2p-poker-table", slot)),
             ViewportBuilder::default()
                 .with_title(title)
                 .with_icon(window_icon())
@@ -1340,7 +1376,7 @@ impl Client {
                 eframe::egui::CentralPanel::default()
                     .frame(eframe::egui::Frame::NONE)
                     .show(ctx, |ui| {
-                        action = p2p_poker::gui::table::draw(ui, &view, &mut self.table_ui);
+                        action = p2p_poker::gui::table::draw(ui, &view, &mut table_ui);
                     });
                 if let Some(u) = unfinished.as_ref() {
                     answered = render::unfinished_window(ctx, u);
@@ -1356,6 +1392,7 @@ impl Client {
                 }
             },
         );
+        self.table_ui.insert(slot, table_ui);
 
         match answered {
             Some(render::LobbyAction::Resume) => self.rejoin_unfinished(),
@@ -1363,19 +1400,30 @@ impl Client {
             _ => {}
         }
         if close_asked || matches!(action, p2p_poker::gui::table::TableAction::Exit) {
-            self.confirm_exit = true;
+            self.confirm_exit = Some(slot);
         }
         match answer {
             Some(true) => {
                 // Leave for good: the seat is given up (a founder's table ends with
                 // it), the record forgotten, the window closed.
-                self.confirm_exit = false;
+                self.confirm_exit = None;
+                self.turn_to(slot);
                 self.tell(NodeCommand::LeaveTable);
                 self.screen = Screen::Lobby;
                 self.table_closed = true;
             }
-            Some(false) => self.confirm_exit = false,
+            Some(false) => self.confirm_exit = None,
             None => {}
+        }
+        // `S1-EF`: an action in this window is about this table -- turned to
+        // first, in the window's state and at the node.
+        if !is_active
+            && !matches!(
+                action,
+                p2p_poker::gui::table::TableAction::None | p2p_poker::gui::table::TableAction::Exit
+            )
+        {
+            self.turn_to(slot);
         }
         // The button, straight to the engine. The action is checked by this
         // client's own `BettingRound` before anything is sealed and by every
@@ -1424,12 +1472,6 @@ impl Client {
         if let Some(a) = played {
             self.tell(p2p_poker::net::node::NodeCommand::Act(a));
         }
-    }
-
-    /// What the table window draws: `AppState::table_view`, which lives in
-    /// the library so that every claim the window makes has a test (`S1-CS`).
-    fn table_view(&self) -> p2p_poker::gui::table::TableView {
-        self.state.table_view()
     }
 
     /// `S1-CR`: rejoin the unfinished game on record, from either window.
@@ -1533,9 +1575,9 @@ impl eframe::App for Client {
             self.screen = Screen::Lobby;
             self.table_closed = false;
         }
-        if self.screen == Screen::Table {
-            self.table_window(&ctx);
-        }
+        // `S1-EF`: every table this client sits at has its window, whatever
+        // the lobby is showing.
+        self.table_windows(&ctx);
 
         {
             {
@@ -1545,12 +1587,7 @@ impl eframe::App for Client {
                     render::LobbyAction::None => {}
                     // `D-043`: turn to another of this client's tables -- the
                     // window's state and the node's active slot together.
-                    render::LobbyAction::Focus(slot) => {
-                        self.state.switch_to(slot);
-                        self.tell(NodeCommand::Focus(slot));
-                        self.screen = Screen::Table;
-                        self.table_closed = false;
-                    }
+                    render::LobbyAction::Focus(slot) => self.turn_to(slot),
                     render::LobbyAction::Create(t) => self.tell(NodeCommand::CreateTable {
                         kind: t.kind,
                         name: t.name,

@@ -673,6 +673,12 @@ impl AppState {
             // heads-up, that is the end of the game; by a timeout it is an
             // absence the seat may come back from (D-031, D-032).
             NodeEvent::SeatLeft { seat, quit } => {
+                // `S1-EE`: never the player's own seat -- the player is here, and no
+                // reading about their own seat would ever clear it.
+                if self.seated.as_ref().and_then(|s| s.seat) == Some(seat) {
+                    self.note(format!("a seat-left about this seat itself ({seat}) is ignored (S1-EE)"));
+                    return;
+                }
                 self.gone.insert(seat);
                 self.note(format!(
                     "seat {seat} left the table{}",
@@ -2013,6 +2019,22 @@ mod tests {
         s.apply(NodeEvent::SessionGaveUp { why: "no advertisement and no peer of the session for ten minutes".into() });
         let j = s.view().joining.expect("the ordinary join goes on");
         assert!(!j.rejoin && !j.gone && j.failed.is_none(), "{j:?}");
+    }
+
+    /// `S1-EE`: a seat-left about the player's own seat marks nothing -- the felt
+    /// drew *left the table* behind the player's own cards after a reconnection,
+    /// and no reading about one's own seat ever clears it.
+    #[test]
+    fn a_seat_left_about_the_players_own_seat_marks_nothing() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 2 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "a".into(), 1_000), (2, "me".into(), 1_000), (8, "b".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLeft { seat: 2, quit: false });
+        assert!(!s.gone.contains(&2), "the player is here");
+        assert!(!s.table_view().seats.iter().any(|v| v.seat == 2 && v.left), "and is not drawn as left");
+        s.apply(NodeEvent::SeatLeft { seat: 8, quit: false });
+        assert!(s.gone.contains(&8), "another seat still is");
     }
 
     /// `S1-CX`: a heads-up opponent that cannot be reached is said once and
