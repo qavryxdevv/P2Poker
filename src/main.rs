@@ -928,6 +928,9 @@ fn windowed(player: Player, run: Run) -> Started {
         profile_dir,
         settings,
     } = player;
+    // `S1-EK`: the window's log, on disk beside the profile, so a report of
+    // *the window closed, I do not know why* can be read afterwards.
+    p2p_poker::app::log_to(profile_dir.join("client.log"));
     let Run {
         join,
         hosted,

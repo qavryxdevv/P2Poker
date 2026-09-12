@@ -840,6 +840,11 @@ struct TableState {
     /// only for a join, not for a group it created), so this is what says a
     /// table got into its group at all -- and whether its friendships linger.
     had_members: bool,
+    /// `S1-EK`: whether THIS copy of the group has confirmed a member. A copy
+    /// still settling -- self-joined, its founder a round trip from confirmed
+    /// -- is not an emptied one, and an invitation that lands then is not
+    /// taken by leaving it.
+    settled: bool,
     group: Option<u32>,
     invited: Vec<u32>,
     confirmed: std::collections::HashSet<u32>,
@@ -1177,6 +1182,7 @@ fn sweep_table(
                     let _ = tox.leave(g);
                 }
                 t.accepted_at = None;
+                t.settled = false;
                 t.confirmed.clear();
                 t.rejoins += 1;
                 t.trouble.rejoins.store(t.rejoins as u64, Ordering::Relaxed);
@@ -1260,6 +1266,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                             peer_keys: HashMap::new(),
                             peer_lines: HashMap::new(),
                             had_members: false,
+                            settled: false,
                             group,
                             invited: Vec::new(),
                             confirmed: std::collections::HashSet::new(),
@@ -1558,7 +1565,11 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                     let from = friends.get(&friend).copied();
                     let mut left_one = false;
                     for t in tables.values_mut() {
-                        if !(t.self_joined && t.confirmed.is_empty() && t.closing.is_none()) {
+                        // `S1-EK`: and settled once -- a copy whose founder is a round
+                        // trip from confirmed is not an emptied one; leaving it said
+                        // goodbye, the founder freed the seat before the first hand,
+                        // and the window closed while joining.
+                        if !(t.self_joined && t.settled && t.confirmed.is_empty() && t.closing.is_none()) {
                             continue;
                         }
                         if !invitation_fits(t, from) {
@@ -1567,6 +1578,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                         if let Some(g) = t.group.take() {
                             let _ = tox.leave(g);
                             t.self_joined = false;
+                            t.settled = false;
                             t.accepted_at = None;
                             t.peer_keys.clear();
                             t.peer_lines.clear();
@@ -1600,6 +1612,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                         t.group = None;
                         t.accepted_at = None;
                         t.self_joined = false;
+                        t.settled = false;
                         t.confirmed.clear();
                         t.trouble.join_fails.fetch_add(1, Ordering::Relaxed);
                         let _ = reason;
@@ -1614,6 +1627,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                     if let Some(t) = by_group(&mut tables, g) {
                         t.confirmed.insert(peer);
                         t.had_members = true;
+                        t.settled = true;
                         if let Some(k) = key {
                             t.peer_keys.insert(peer, k);
                         }
@@ -1679,6 +1693,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                         let _ = tox.leave(g);
                         t.group = None;
                         t.self_joined = false;
+                        t.settled = false;
                         t.confirmed.clear();
                         t.peer_keys.clear();
                         t.peer_lines.clear();

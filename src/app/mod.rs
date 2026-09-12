@@ -35,6 +35,35 @@ fn app_link_stale_ms() -> u64 {
 /// Two of the eight are never sent by this client because nothing in the corpus
 /// gives them a mechanism; they are named here anyway, because another
 /// implementation may send them and "reason 6" tells a player nothing.
+/// `S1-EK`: where the window client writes every line of its log, once told.
+/// The headless client prints the same lines; the window had nowhere to
+/// keep them, and a report of *the window closed, I do not know why* could
+/// not be read afterwards.
+static LOG_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// `S1-EK`: write the log to this file from now on -- appended, started
+/// afresh past eight megabytes.
+pub fn log_to(path: std::path::PathBuf) {
+    let _ = LOG_FILE.set(path);
+}
+
+fn log_line(line: &str) {
+    let Some(path) = LOG_FILE.get() else {
+        return;
+    };
+    use std::io::Write;
+    let over = std::fs::metadata(path).map(|m| m.len() > 8 * 1024 * 1024).unwrap_or(false);
+    let file = std::fs::OpenOptions::new().create(true).append(!over).write(true).truncate(over).open(path);
+    if let Ok(mut f) = file {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let secs = (now / 1000) % 86_400;
+        let _ = writeln!(f, "{:02}:{:02}:{:02}.{:03} {line}", secs / 3600, (secs / 60) % 60, secs % 60, now % 1000);
+    }
+}
+
 fn refusal(code: u16) -> &'static str {
     match code {
         1 => "the table is full",
@@ -165,6 +194,7 @@ pub struct TableApp {
     pub opponent_returns: u8,
     pub opponent_out: bool,
     pub gone: std::collections::BTreeSet<u8>,
+    pub left_for_good: std::collections::BTreeSet<u8>,
     pub opponent_left: bool,
 }
 
@@ -269,6 +299,7 @@ pub struct AppState {
     /// `D-035`: seats whose client left the table's group, until seen there
     /// again.
     pub gone: std::collections::BTreeSet<u8>,
+    pub left_for_good: std::collections::BTreeSet<u8>,
     /// `D-035`: the heads-up opponent quit the table on purpose; the game is
     /// over, and the one thing left to do is leave.
     pub opponent_left: bool,
@@ -490,6 +521,7 @@ impl AppState {
         std::mem::swap(&mut self.opponent_returns, &mut other.opponent_returns);
         std::mem::swap(&mut self.opponent_out, &mut other.opponent_out);
         std::mem::swap(&mut self.gone, &mut other.gone);
+        std::mem::swap(&mut self.left_for_good, &mut other.left_for_good);
         std::mem::swap(&mut self.opponent_left, &mut other.opponent_left);
     }
 
@@ -712,12 +744,18 @@ impl AppState {
                     self.note(format!("a seat-left about this seat itself ({seat}) is ignored (S1-EE)"));
                     return;
                 }
+                // `S1-EJ`: read before the seat is marked, since a seat left for
+                // good is no longer in the game the reading is about.
+                let was_opponent = self.heads_up_opponent() == Some(seat);
                 self.gone.insert(seat);
+                if quit {
+                    self.left_for_good.insert(seat);
+                }
                 self.note(format!(
                     "seat {seat} left the table{}",
                     if quit { "" } else { " (its connection timed out)" }
                 ));
-                if quit && self.heads_up_opponent() == Some(seat) && !self.opponent_out {
+                if quit && was_opponent && !self.opponent_out {
                     self.opponent_out = true;
                     self.opponent_left = true;
                     self.opponent_gone = Some(OpponentGone {
@@ -1203,6 +1241,7 @@ impl AppState {
         if self.log.len() >= MAX_LOG_LINES {
             self.log.pop_front();
         }
+        log_line(&line);
         self.log.push_back(line);
         // Counted, and this is not bookkeeping for its own sake. A reader that
         // works out what is new from `log.len()` gets nothing at all once the
@@ -1227,6 +1266,7 @@ impl AppState {
         self.opponent_returns = 0;
         self.opponent_out = false;
         self.gone.clear();
+        self.left_for_good.clear();
         self.opponent_left = false;
         self.clock_for(None, 0);
         self.table_chat.clear();
@@ -1241,11 +1281,25 @@ impl AppState {
     /// `S1-CX`: the other seat, when this table is heads-up and set.
     fn heads_up_opponent(&self) -> Option<u8> {
         let s = self.seated.as_ref()?;
-        if s.session.is_none() || s.roster.len() != 2 {
+        if s.session.is_none() {
             return None;
         }
         let me = s.seat?;
-        s.roster.iter().map(|(n, _, _)| *n).find(|n| *n != me)
+        // `S1-EJ`: the seats still in the game -- not left for good, not out of
+        // chips -- and not how many the table was founded for: a table founded
+        // for more is heads-up once the others are gone (the owner: the question
+        // never came at a table with dead seats).
+        let live: Vec<u8> = s
+            .roster
+            .iter()
+            .filter(|(n, _, stack)| {
+                *n != me
+                    && !self.left_for_good.contains(n)
+                    && self.last_stacks.get(usize::from(*n)).copied().unwrap_or(*stack) > 0
+            })
+            .map(|(n, _, _)| *n)
+            .collect();
+        (live.len() == 1).then(|| live[0])
     }
 
     /// A reading about the heads-up opponent: reachable clears the episode,
@@ -1270,7 +1324,10 @@ impl AppState {
                     crate::protocol::constants::MAX_RETURNS
                 ));
             }
-        } else if self.opponent_gone.is_none() && self.opponent_was_reachable {
+        // `S1-EJ`: or any seat was -- the opponent may have become the opponent
+        // only when the others left for good, having been on the line before
+        // it was one (S1-EC's guard is against a group still forming).
+        } else if self.opponent_gone.is_none() && (self.opponent_was_reachable || self.ever_on_line) {
             // `S1-EC`: only an opponent that has been on the line can be out of
             // reach; before that the seat is still joining (S1-CX said so for
             // the group's count, and this reading needed the same rule).
@@ -2197,6 +2254,27 @@ mod tests {
         s.apply(NodeEvent::SessionGaveUp { why: "no advertisement and no peer of the session for ten minutes".into() });
         let j = s.view().joining.expect("the ordinary join goes on");
         assert!(!j.rejoin && !j.gone && j.failed.is_none(), "{j:?}");
+    }
+
+    /// `S1-EJ`: a table founded for three is heads-up once one seat has left for good,
+    /// and the question about the other -- and *Opponent left* -- comes as at a table
+    /// founded for two.
+    #[test]
+    fn a_table_founded_for_three_is_heads_up_once_one_left_for_good() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "a".into(), 1_000), (2, "b".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0) });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0) });
+        assert!(s.heads_up_opponent().is_none(), "three in the game: no heads-up");
+        s.apply(NodeEvent::SeatLeft { seat: 2, quit: true });
+        assert_eq!(s.heads_up_opponent(), Some(1), "one left for good: heads-up against the other");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(21) });
+        assert!(s.opponent_gone.is_some(), "the opponent out of reach opens the question");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0) });
+        s.apply(NodeEvent::SeatLeft { seat: 1, quit: true });
+        assert!(s.opponent_left && s.opponent_out, "the opponent left: the game is over, said as at two seats");
     }
 
     /// `S1-EI`: at a bigger table the seats off the line are listed with what happens
