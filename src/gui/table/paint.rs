@@ -331,7 +331,14 @@ pub fn link(p: &Painter, avatar: Rect, plate: Rect, link: &super::Link) {
         (Some(ms), false, _) if ms <= 500 => (theme::WARN, format!("{ms} ms")),
         (Some(ms), false, false) => (theme::DANGER, format!("{ms} ms")),
         (Some(ms), false, true) => (theme::WARN, format!("{ms} ms")),
-        (_, _, true) => (theme::OK, "on the line".to_string()),
+        // `S1-DX`: the group's figure -- how long ago it last heard the seat.
+        // A member pings every twelve seconds, so past that the figure is
+        // amber, and past `QUIET_LIMIT_S` the node has already said offline.
+        (_, _, true) => match link.quiet_s {
+            Some(q) if q < 12 => (theme::OK, format!("{q} s")),
+            Some(q) => (theme::WARN, format!("{q} s")),
+            None => (theme::OK, "on the line".to_string()),
+        },
         // `S1-DT`: off the line by the group's word and no fresh ping either
         // -- offline, in red, whether or not a ping ever answered.
         (None, _, false) | (Some(_), true, false) => (theme::DANGER, "offline".to_string()),

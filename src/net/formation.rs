@@ -606,6 +606,13 @@ impl Formation {
         &self.under.ad.founder_peer_id
     }
 
+    /// When the advert this table was formed under was made, on the
+    /// founder's clock -- what a founder's later answer to the lobby's
+    /// question is compared against (`D-044`).
+    pub fn advert_time(&self) -> u64 {
+        self.under.ad.timestamp_unix_ms
+    }
+
     /// Whether this client founded the table, and therefore answers joins and
     /// re-signs the advertisement.
     pub fn is_founder(&self) -> bool {

@@ -747,7 +747,7 @@ struct TableRun {
     /// `D-041`: the last link reading told to the window per seat -- the ping,
     /// the group's word, and when -- so the stall tick says it again only on a
     /// change or every ten seconds.
-    link_said: std::collections::HashMap<u8, (Option<u64>, bool, tokio::time::Instant)>,
+    link_said: std::collections::HashMap<u8, (bool, Option<u64>, tokio::time::Instant)>,
     /// Whether the table this client is at has closed to newcomers. Drives
     /// `dht_effort`, stops the lobby being polled by somebody who is not reading
     /// it, and stops the advertisement of a table nobody can join.
@@ -1187,6 +1187,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // `None` is *connected and not yet pinged*: the first ping is fifteen
     // seconds after the connection, and a sentinel duration would be
     // indistinguishable from the sub-millisecond answers a local peer gives.
+    // `D-044`: the last answer each poker peer gave to the lobby's question
+    // (D-040), by its peer id: the tables it named, and when on its own
+    // clock. A joiner before the first hand reads its founder's: an answer
+    // made after the table's advert that does not name the table is the
+    // founder's own word that it offers the table no more -- it left, its
+    // client lives on in the lobby answering every ping, its friendship
+    // lingers, and the group may never have held it.
+    let mut answers: std::collections::HashMap<Vec<u8>, (Vec<[u8; 32]>, u64)> =
+        std::collections::HashMap::new();
     let mut alive: std::collections::HashMap<
         PeerId,
         (std::time::Instant, Option<std::time::Duration>),
@@ -2306,13 +2315,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     f.roster().seats().iter().find(|e| e.seat == seat).map(|e| e.app_public_key)
                                 })
                                 .is_some_and(|k| t.tox_sink.in_group(&k));
-                            let at_the_table = !t.tox_sink.is_on_tox() || in_group;
+                            // `S1-DX`, the owner's rule: on a Tox table the felt's line
+                            // is the group's alone -- the reading every two seconds on
+                            // the stall tick -- and a libp2p ping says nothing there.
+                            let at_the_table = !t.tox_sink.is_on_tox();
                             if at_the_table {
                                 let _ = events
                                     .send(NodeEvent::SeatLink {
                                         seat,
                                         rtt_ms: Some(u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX)),
                                         group: t.tox_sink.is_on_tox() && in_group,
+                                        quiet_s: None,
                                     })
                                     .await;
                             }
@@ -2345,16 +2358,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `S1-CS`: a seat whose last connection closed is shown so.
                         if num_established == 0 {
                             if let Some(seat) = seat_of_peer(t.table.as_ref(), &peer_id) {
-                                // `D-041`: on a Tox table a libp2p connection closing
-                                // says nothing about the seat; the group does.
-                                let group = t.tox_sink.is_on_tox()
-                                    && t.table
-                                        .as_ref()
-                                        .and_then(|f| {
-                                            f.roster().seats().iter().find(|e| e.seat == seat).map(|e| e.app_public_key)
-                                        })
-                                        .is_some_and(|k| t.tox_sink.in_group(&k));
-                                let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None, group }).await;
+                                // `D-041`, `S1-DX`: on a Tox table a libp2p connection
+                                // closing says nothing about the seat; the group's
+                                // reading does, every two seconds, and this says nothing.
+                                if !t.tox_sink.is_on_tox() {
+                                    let _ = events
+                                        .send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false, quiet_s: None })
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -2516,6 +2527,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // (`run192317-3`: the first question beat the hosting by a
                                 // second, and its empty answer withdrew the table for 29 s).
                                 let pb = peer.to_bytes();
+                                answers.insert(pb.clone(), (named.clone(), answered_at));
                                 let gone: Vec<([u8; 32], String)> = state
                                     .lobby
                                     .tables()
@@ -4999,6 +5011,35 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if t.resuming {
                         let _ = stash_for_resume(&item.bytes, &mut t.resume_inits, &mut t.resume_early);
                     }
+                    // `S1-DX`: a ratification or a roster over the group teaches who
+                    // the member that carried it is, before any hand does -- a
+                    // signed message either way (`S1-I`), and the driver refuses a
+                    // claim to a seat that is here and speaking (`S1-DW`).
+                    if let (Some(gk), Some(f)) = (item.claimed, t.table.as_ref()) {
+                        if !t.taught.contains(&gk) {
+                            let signer = super::joinwire::receive_table_ready(&item.bytes, &f.table_id(), &f.genesis())
+                                .ok()
+                                .map(|(_, s, _)| s)
+                                .or_else(|| super::joinwire::receive_player_list(&item.bytes).ok().map(|(_, s)| s));
+                            // Only a signer that holds a seat: a roster is signed by the
+                            // table's key, and pairing a member with that would stand in
+                            // the way of the hand's traffic teaching the seat itself
+                            // (`run135355-3`: *is seat None*).
+                            if let Some(app) = signer.filter(|a| f.roster().seat_of(a).is_some()) {
+                                t.taught.insert(gk);
+                                t.tox_sink.tell(super::toxsink::Seat::KnownAs { group_key: gk, app_key: app });
+                                let seat = f.roster().seat_of(&app);
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "group member {} is seat {:?} (application key {}), by its ratification",
+                                        short_hash(&gk),
+                                        seat,
+                                        short_hash(&app)
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
                     if let Some(f) = t.table.as_mut() {
                         let now = super::node::now_unix_ms();
                         let took = if joinwire::receive_player_list(&item.bytes).is_ok() {
@@ -5624,6 +5665,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let never_in = founder_line.is_some_and(|k| {
                                 !t.tox_sink.in_group_line(&k) && !t.tox_sink.friend_up(&k)
                             }) && t.opened_at.elapsed() >= GROUP_JOIN_GRACE;
+                            // `D-044`: the founder's own word over the lobby's question
+                            // (D-040): an answer from it, made after this table's advert,
+                            // that does not name the table. The founder is in the lobby
+                            // and offers it no more; seen within one asking (thirty
+                            // seconds) whether or not the group ever held it.
+                            let withdrawn = answers
+                                .get(f.founder_peer_id())
+                                .is_some_and(|(named, at)| !named.contains(&f.table_id()) && *at > f.advert_time());
                             if f.released_before_the_first_hand() {
                                 Some(
                                     "the founder gave this seat away before the first hand -- this client had answered nothing for a while, or had left -- so there is nothing to sit at; join again from the lobby"
@@ -5636,6 +5685,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     "the founder timed out of the table's group before the first hand: the table is gone"
                                         .to_string()
                                 })
+                            } else if withdrawn {
+                                Some(
+                                    "the founder no longer offers this table before the first hand: the table is gone"
+                                        .to_string(),
+                                )
                             } else if quiet {
                                 Some(format!(
                                     "the founder has been silent in the table's group for {QUIET_LIMIT_S} s before the first hand: the table is gone"
@@ -5669,53 +5723,54 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if t.tox_sink.is_on_tox() {
                         if let Some(f) = t.table.as_ref() {
                             let me = f.my_seat();
-                            let fresh: Vec<(u8, Option<u64>, bool)> = f
+                            let fresh: Vec<(u8, bool, Option<u64>)> = f
                                 .roster()
                                 .seats()
                                 .iter()
                                 .filter(|e| Some(e.seat) != me)
                                 .map(|e| {
-                                    // `S1-DS`: the friend link stands in only for a seat the
-                                    // group has not yet taught; one it has taught and does not
-                                    // hold now has left, and its friendship lingering two
-                                    // minutes past the table (D-042) says nothing.
-                                    // `S1-DT`: a member the group has heard nothing from for
-                                    // `QUIET_LIMIT_S` is off the line, though the library keeps
-                                    // it a member for 58 s -- a client that died says nothing.
-                                    let quiet = t
-                                        .tox_sink
-                                        .quiet_secs(&e.app_public_key)
-                                        .is_some_and(|q| q >= QUIET_LIMIT_S);
-                                    let group = (t.tox_sink.in_group(&e.app_public_key) && !quiet)
-                                        || (!t.tox_sink.known(&e.app_public_key)
-                                            && e.tox_key.is_some_and(|k| t.tox_sink.friend_up(&k)));
-                                    let rtt = libp2p::PeerId::from_bytes(&e.peer_id)
-                                        .ok()
-                                        .and_then(|p| alive.get(&p).copied())
-                                        .and_then(|(at, rtt)| rtt.filter(|_| at.elapsed() < std::time::Duration::from_secs(15)))
-                                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-                                    (e.seat, rtt, group)
+                                    // `S1-DX`, the owner's rule: the line is the group's
+                                    // alone. A seat is on it when the group holds it -- by
+                                    // the application key the group taught (`known_as`) or
+                                    // by the line its invitation went over (`patches/0033`)
+                                    // -- and has heard from it within `QUIET_LIMIT_S`; the
+                                    // figure is how long ago that was. No friend link and
+                                    // no libp2p ping: a client in the lobby answers both.
+                                    let by_app = t.tox_sink.in_group(&e.app_public_key);
+                                    let by_line = e.tox_key.is_some_and(|k| t.tox_sink.in_group_line(&k));
+                                    let quiet_s = [
+                                        t.tox_sink.quiet_secs(&e.app_public_key),
+                                        e.tox_key.and_then(|k| t.tox_sink.quiet_line(&k)),
+                                    ]
+                                    .into_iter()
+                                    .flatten()
+                                    .min();
+                                    let group = (by_app || by_line) && quiet_s.map_or(true, |q| q < QUIET_LIMIT_S);
+                                    (e.seat, group, quiet_s)
                                 })
                                 .collect();
-                            for (seat, rtt, group) in fresh {
-                                let (changed, again) = match t.link_said.get(&seat) {
-                                    Some((r, g, at)) => (
-                                        *r != rtt || *g != group,
+                            for (seat, group, quiet_s) in fresh {
+                                let (changed, moved, again) = match t.link_said.get(&seat) {
+                                    Some((g, q, at)) => (
+                                        *g != group,
+                                        *q != quiet_s,
                                         at.elapsed() >= std::time::Duration::from_secs(10),
                                     ),
-                                    None => (true, true),
+                                    None => (true, true, true),
                                 };
-                                if changed || again {
-                                    t.link_said.insert(seat, (rtt, group, tokio::time::Instant::now()));
-                                    let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: rtt, group }).await;
+                                if changed || moved || again {
+                                    t.link_said.insert(seat, (group, quiet_s, tokio::time::Instant::now()));
+                                    let _ = events
+                                        .send(NodeEvent::SeatLink { seat, rtt_ms: None, group, quiet_s })
+                                        .await;
                                 }
                                 if changed {
                                     let _ = events
                                         .send(NodeEvent::Warning(format!(
                                             "seat {seat} link: {}{}",
                                             if group { "on the line by the table's group" } else { "not on the line by the table's group" },
-                                            match rtt {
-                                                Some(ms) => format!(", ping {ms} ms"),
+                                            match quiet_s {
+                                                Some(q) => format!(", heard {q} s ago"),
                                                 None => String::new(),
                                             }
                                         )))
@@ -5872,7 +5927,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     for (app, quit) in t.tox_sink.take_gone() {
                         if let Some(seat) = t.table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
                             let _ = events.send(NodeEvent::SeatLeft { seat, quit }).await;
-                            let _ = events.send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false }).await;
+                            let _ = events
+                                .send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false, quiet_s: None })
+                                .await;
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
                                     "seat {seat} left the table's group{}",
@@ -5885,6 +5942,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if t.table.is_some() {
                         let group = t.tox_sink.group_seen();
                         if t.carrier_reported != Some(group) {
+                            // `S1-DX`: a member arrived -- this client says its own list
+                            // and ratification again over the group, so the newcomer is
+                            // taught who this client is at once rather than at the next
+                            // thirty-second repeat.
+                            if group.0 > t.carrier_reported.map_or(0, |(seen, _)| seen) && !t.ever_dealt {
+                                if let Some(f) = t.table.as_ref() {
+                                    for bytes in f.say_again(super::node::now_unix_ms()) {
+                                        t.tox_sink.try_broadcast(&bytes);
+                                    }
+                                }
+                            }
                             t.carrier_reported = Some(group);
                             let _ = events
                                 .send(NodeEvent::Carrier {

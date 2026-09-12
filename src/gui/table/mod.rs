@@ -260,6 +260,9 @@ pub struct Link {
     /// `D-041`: the table's group holds the seat as a confirmed member --
     /// on the line whatever the ping says.
     pub group: bool,
+    /// `S1-DX`: how many seconds ago the table's group last heard the seat
+    /// -- the figure beside the dot on a Tox table, where no ping is shown.
+    pub quiet_s: Option<u64>,
 }
 
 /// What the player is holding in the action bar between frames, and the

@@ -358,7 +358,10 @@ pub enum NodeEvent {
     /// now. On a Tox table the group carries the hand, so `group` is the
     /// reading that says *on the line*; the ping is a figure beside it that a
     /// seat reached only through a relay never answers.
-    SeatLink { seat: u8, rtt_ms: Option<u64>, group: bool },
+    /// `S1-DX`: `quiet_s` is how many seconds ago the table's group last
+    /// heard the seat -- the figure beside the dot on a Tox table, where
+    /// `rtt_ms` is never sent and the line is the group's alone.
+    SeatLink { seat: u8, rtt_ms: Option<u64>, group: bool, quiet_s: Option<u64> },
     /// `D-035`: a seat's client left the table's group -- on purpose
     /// (`quit`) or by timing out. The seat is shown gone; heads-up a quit
     /// ends the game.

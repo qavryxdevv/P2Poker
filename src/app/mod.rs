@@ -155,7 +155,7 @@ pub struct TableApp {
     pub turn_since: Option<std::time::Instant>,
     pub table_chat: VecDeque<TableLine>,
     pub muted: std::collections::BTreeSet<u8>,
-    pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, std::time::Instant)>,
+    pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, Option<u64>, std::time::Instant)>,
     pub opponent_gone: Option<OpponentGone>,
     pub opponent_returns: u8,
     pub opponent_out: bool,
@@ -237,7 +237,7 @@ pub struct AppState {
     /// `S1-CS`: seats this player does not want to hear. Local, never sent.
     pub muted: std::collections::BTreeSet<u8>,
     /// `S1-CS`: each seat's last link reading and when it arrived.
-    pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, std::time::Instant)>,
+    pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, Option<u64>, std::time::Instant)>,
     /// `S1-CS`: the join in progress, if one is.
     pub joining: Option<Joining>,
     /// `S1-CX`: the heads-up opponent this client cannot reach, if any.
@@ -640,12 +640,12 @@ impl AppState {
                     said: text,
                 });
             }
-            NodeEvent::SeatLink { seat, rtt_ms, group } => {
+            NodeEvent::SeatLink { seat, rtt_ms, group, quiet_s } => {
                 // `D-041`: on the line when the table's group holds the seat,
                 // or when a ping answered; the group is the reading that
                 // matters where the hand rides it.
                 let reachable = rtt_ms.is_some() || group;
-                self.links.insert(seat, (rtt_ms, group, std::time::Instant::now()));
+                self.links.insert(seat, (rtt_ms, group, quiet_s, std::time::Instant::now()));
                 // `D-035`: a reading from the table's group is a seat back in it.
                 if reachable {
                     self.gone.remove(&seat);
@@ -1240,7 +1240,7 @@ impl AppState {
             let stale = self
                 .links
                 .get(&opponent)
-                .is_some_and(|(_, _, at)| at.elapsed().as_millis() as u64 > app_link_stale_ms());
+                .is_some_and(|(_, _, _, at)| at.elapsed().as_millis() as u64 > app_link_stale_ms());
             if stale {
                 self.opponent_reachable(false);
             }
@@ -1884,8 +1884,8 @@ mod tests {
         assert_eq!(last.seat, 2);
         assert!(last.who.contains("Carol") && last.who.contains("seat 2"));
         assert_eq!(last.said, format!("line {}", MAX_CHAT_LINES + 4));
-        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: Some(120), group: false });
-        assert_eq!(s.links.get(&2).map(|(r, _, _)| *r), Some(Some(120)));
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: Some(120), group: false, quiet_s: None });
+        assert_eq!(s.links.get(&2).map(|(r, _, _, _)| *r), Some(Some(120)));
         s.apply(NodeEvent::LeftTable { why: "left the table".into() });
         assert!(s.table_chat.is_empty() && s.links.is_empty(), "the chat and the links went with the table");
     }
@@ -1991,7 +1991,7 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
         assert!(s.opponent_gone.is_some(), "the closed connection opens an episode");
         assert_eq!(s.opponent_gone_for_s(), None, "not worth asking about yet");
         s.tick_opponent();
@@ -2007,19 +2007,19 @@ mod tests {
 
         s.dismiss_opponent_gone();
         assert_eq!(s.opponent_gone_for_s(), None, "the player chose to wait");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
         assert!(s.opponent_gone.is_none(), "a ping ends the episode");
         s.apply(NodeEvent::Carrier { seen: 0, want: 1 });
         assert!(s.opponent_gone.is_none(), "an empty group is the other seat still joining it, not an opponent out of reach");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
         assert!(s.opponent_gone.as_ref().is_some_and(|g| !g.dismissed), "a closed connection is a new episode, asked anew");
         s.apply(NodeEvent::Carrier { seen: 1, want: 1 });
         assert!(s.opponent_gone.is_some(), "a seat the group merely sees is not one this client can reach");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false, quiet_s: None });
         assert!(s.opponent_gone.is_none(), "a ping is");
         // And a reading gone stale -- no ping for longer than the window doubts --
         // starts an episode by itself.
-        s.links.insert(1, (Some(30), false, std::time::Instant::now() - std::time::Duration::from_millis(app_link_stale_ms() + 1_000)));
+        s.links.insert(1, (Some(30), false, None, std::time::Instant::now() - std::time::Duration::from_millis(app_link_stale_ms() + 1_000)));
         s.tick_opponent();
         assert!(s.opponent_gone.is_some(), "a stale link is an unreachable opponent");
     }
@@ -2035,7 +2035,7 @@ mod tests {
             seats: vec![(0, "a".into(), 1_000), (1, "b".into(), 1_000), (2, "c".into(), 1_000)],
         });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
         s.apply(NodeEvent::Carrier { seen: 0, want: 2 });
         assert!(s.opponent_gone.is_none());
     }
@@ -2051,20 +2051,20 @@ mod tests {
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
         for n in 1..=MAX_RETURNS {
-            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
+            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
             s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
             s.tick_opponent();
             assert!(!s.opponent_out, "absence {n} is not the last");
-            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false });
+            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
             assert_eq!(s.opponent_returns, n, "return {n} counted");
             assert!(s.log.back().unwrap().contains("D-032"), "and said");
         }
         // A blip shorter than the question does not count.
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
         assert_eq!(s.opponent_returns, MAX_RETURNS, "a blip is no return");
         // The fourth absence is final.
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
         s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
         s.tick_opponent();
         assert!(s.opponent_out, "the fourth absence ends the game");
@@ -2072,7 +2072,7 @@ mod tests {
         assert!(line.contains("D-032") && line.contains("limit"), "{line}");
         assert!(s.table_view().opponent_out, "the window is told");
         assert!(s.table_view().opponent_gone_s.is_some(), "and still shows how long");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
         assert!(s.opponent_out, "and nothing reachable undoes it");
         assert_eq!(s.opponent_returns, MAX_RETURNS);
     }
@@ -2114,7 +2114,7 @@ mod tests {
         s.turn_since = Some(std::time::Instant::now() - std::time::Duration::from_millis(30_000 + OPPONENT_GONE_MS + 1_000));
         s.tick_opponent();
         assert!(s.opponent_gone.as_ref().is_some_and(|g| g.slow));
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false, quiet_s: None });
         assert!(s.opponent_gone.is_none(), "a reading that reaches them ends any episode");
         assert_eq!(s.opponent_returns, 0, "but a slow one was no absence");
     }
@@ -2128,13 +2128,13 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(20), group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(20), group: false, quiet_s: None });
         // A timeout: gone from the felt, not the end of the game.
         s.apply(NodeEvent::SeatLeft { seat: 1, quit: false });
         assert!(s.gone.contains(&1));
         assert!(s.table_view().seats.iter().any(|v| v.seat == 1 && v.left), "drawn as left");
         assert!(!s.opponent_out && !s.opponent_left);
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false, quiet_s: None });
         assert!(!s.gone.contains(&1), "seen in the group again: back");
         assert!(!s.table_view().seats.iter().any(|v| v.seat == 1 && v.left));
         // A quit ends a game of two, at once.
@@ -2143,7 +2143,7 @@ mod tests {
         let v = s.table_view();
         assert!(v.opponent_left && v.opponent_gone_s.is_some(), "the window is told at once");
         assert!(s.log.back().unwrap().contains("left the table"), "{}", s.log.back().unwrap());
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false, quiet_s: None });
         assert!(s.opponent_out && s.opponent_left, "nothing on the line undoes a quit");
         assert_eq!(s.opponent_returns, 0, "a quit is no return");
     }

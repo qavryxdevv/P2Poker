@@ -68,10 +68,11 @@ impl AppState {
                     won: hand.and_then(|h| h.won.get(i).copied()).unwrap_or(0),
                     muted: self.muted.contains(n),
                     left: self.gone.contains(n),
-                    link: self.links.get(n).map(|(rtt, group, at)| Link {
+                    link: self.links.get(n).map(|(rtt, group, quiet, at)| Link {
                         rtt_ms: *rtt,
                         stale: at.elapsed().as_millis() as u64 > LINK_STALE_MS,
                         group: *group,
+                        quiet_s: *quiet,
                     }),
                     shown_hand: shown_name(hand, *n, hero),
                 }
@@ -677,14 +678,14 @@ mod tests {
         let mut s = seated(0);
         s.apply(NodeEvent::TableSaid { seat: 1, nickname: "Bob".into(), text: "hi".into() });
         s.apply(NodeEvent::TableSaid { seat: 2, nickname: "Carol".into(), text: "hello".into() });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(80), group: false });
-        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(80), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: None });
         let v = s.table_view();
         assert_eq!(v.chat.len(), 2);
         assert_eq!(v.chat[0].seat, 1);
         assert!(v.chat[1].who.contains("Carol"));
-        assert_eq!(v.seats[1].link, Some(Link { rtt_ms: Some(80), stale: false, group: false }));
-        assert_eq!(v.seats[2].link, Some(Link { rtt_ms: None, stale: false, group: false }));
+        assert_eq!(v.seats[1].link, Some(Link { rtt_ms: Some(80), stale: false, group: false, quiet_s: None }));
+        assert_eq!(v.seats[2].link, Some(Link { rtt_ms: None, stale: false, group: false, quiet_s: None }));
         assert_eq!(v.seats[0].link, None, "nobody pings themselves");
 
         s.muted.insert(1);
