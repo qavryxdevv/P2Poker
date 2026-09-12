@@ -142,12 +142,21 @@ impl AppState {
             improve_by,
             turn_id: self.turns,
             hand_over: hand.map(|h| h.over).unwrap_or(false),
-            opponent_gone_s: self.opponent_gone_for_s(),
+            // `S1-EL`: while this client's own line is gone by the library's
+            // verdict, the question about the others is not asked -- the cause is
+            // this line, and *Line down* says so. The episode runs on underneath,
+            // so the question comes the moment the line is back and they are not.
+            opponent_gone_s: if self.tox_line_gone() { None } else { self.opponent_gone_for_s() },
             opponent_out: self.opponent_out,
             opponent_slow: self.opponent_gone.as_ref().is_some_and(|g| g.slow),
             opponent_left: self.opponent_left,
             out_for_good: self.out_for_good.clone(),
-            line: self.line_message(),
+            // `S1-EL`: and the group's softer *the line may be down* yields to the
+            // question when that stands, which says the same with the choice.
+            line: match self.line_message() {
+                Some(_) if !self.tox_line_gone() && self.opponent_gone_for_s().is_some() => None,
+                other => other,
+            },
             absent: self.absent_seats(),
             opponent_alone: self.opponent_gone.as_ref().is_some_and(|g| g.alone),
             chat: self

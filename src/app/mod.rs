@@ -1512,6 +1512,12 @@ impl AppState {
         }
     }
 
+    /// `S1-EL`: this client's own line to the Tox network is gone by the
+    /// library's verdict, once a seat was on the line here.
+    pub fn tox_line_gone(&self) -> bool {
+        self.ever_on_line && self.status.tox == Some("offline")
+    }
+
     /// `S1-EH`: what to say over the felt about this client's own line, if
     /// anything: the Tox network gone (the library's own verdict), with the
     /// lobby network's state beside it; or, before the library says so, a
@@ -1525,7 +1531,7 @@ impl AppState {
         if !self.ever_on_line {
             return None;
         }
-        if self.status.tox == Some("offline") {
+        if self.tox_line_gone() {
             let lobby = if self.status.peers == 0 {
                 "The lobby network is unreachable too: the internet is down."
             } else {
@@ -2254,6 +2260,28 @@ mod tests {
         s.apply(NodeEvent::SessionGaveUp { why: "no advertisement and no peer of the session for ten minutes".into() });
         let j = s.view().joining.expect("the ordinary join goes on");
         assert!(!j.rejoin && !j.gone && j.failed.is_none(), "{j:?}");
+    }
+
+    /// `S1-EL`: *Line down* by the library's verdict hides the question about the
+    /// others; the question, when it stands, hides the group's softer overlay.
+    #[test]
+    fn the_line_down_word_and_the_question_are_not_shown_together() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(21) });
+        s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
+        let v = s.table_view();
+        assert!(v.opponent_gone_s.is_some(), "the question stands");
+        assert!(v.line.is_none(), "and the softer overlay yields to it: {:?}", v.line);
+        s.apply(NodeEvent::ToxLine { how: "offline" });
+        let v = s.table_view();
+        assert!(v.line.as_deref().is_some_and(|l| l.contains("Tox network")), "the line is down by the library's verdict");
+        assert!(v.opponent_gone_s.is_none(), "and the question is not asked beside it");
+        s.apply(NodeEvent::ToxLine { how: "udp" });
+        assert!(s.table_view().opponent_gone_s.is_some(), "the line back, the others still gone: the question again");
     }
 
     /// `S1-EJ`: a table founded for three is heads-up once one seat has left for good,
