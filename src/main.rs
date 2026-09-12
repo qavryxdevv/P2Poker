@@ -1061,6 +1061,7 @@ fn windowed(player: Player, run: Run) -> Started {
                 join,
                 resume,
                 table_closed: false,
+                confirm_exit: false,
                 ui: render::LobbyUi::new(settings),
                 table_ui: Default::default(),
                 profile_dir,
@@ -1246,6 +1247,8 @@ struct Client {
     /// The player shut the table window. It does not re-open by itself until
     /// they sit down somewhere else, or ask for it.
     table_closed: bool,
+    /// `S1-DR`: the table window is asking whether to leave.
+    confirm_exit: bool,
     /// Where the settings are saved, and the key their defaults come from.
     profile_dir: std::path::PathBuf,
     app_key: ed25519_dalek::SigningKey,
@@ -1303,7 +1306,9 @@ impl Client {
 
         let view = self.table_view();
         let mut action = p2p_poker::gui::table::TableAction::None;
-        let mut closed = false;
+        let mut close_asked = false;
+        let mut answer: Option<bool> = None;
+        let asking = self.confirm_exit;
         // `S1-CR`, `S1-CY`: the question about an unfinished game is asked
         // here as well as in the lobby -- the player looking at the table
         // window never saw the lobby's.
@@ -1330,8 +1335,14 @@ impl Client {
                 if let Some(u) = unfinished.as_ref() {
                     answered = render::unfinished_window(ctx, u);
                 }
+                // `S1-DR`: closing the table is leaving the game here for good,
+                // so the close is held and the window asks first.
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    closed = true;
+                    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::CancelClose);
+                    close_asked = true;
+                }
+                if asking {
+                    answer = render::exit_window(ctx);
                 }
             },
         );
@@ -1341,9 +1352,20 @@ impl Client {
             Some(render::LobbyAction::Forget) => self.forget_unfinished(),
             _ => {}
         }
-        if closed || matches!(action, p2p_poker::gui::table::TableAction::BackToLobby) {
-            self.screen = Screen::Lobby;
-            self.table_closed = true;
+        if close_asked || matches!(action, p2p_poker::gui::table::TableAction::Exit) {
+            self.confirm_exit = true;
+        }
+        match answer {
+            Some(true) => {
+                // Leave for good: the seat is given up (a founder's table ends with
+                // it), the record forgotten, the window closed.
+                self.confirm_exit = false;
+                self.tell(NodeCommand::LeaveTable);
+                self.screen = Screen::Lobby;
+                self.table_closed = true;
+            }
+            Some(false) => self.confirm_exit = false,
+            None => {}
         }
         // The button, straight to the engine. The action is checked by this
         // client's own `BettingRound` before anything is sealed and by every
@@ -1387,7 +1409,7 @@ impl Client {
                 self.tell(NodeCommand::LeaveTable);
                 None
             }
-            Ta::None | Ta::BackToLobby => None,
+            Ta::None | Ta::Exit => None,
         };
         if let Some(a) = played {
             self.tell(p2p_poker::net::node::NodeCommand::Act(a));
@@ -1511,10 +1533,6 @@ impl eframe::App for Client {
                 match render::lobby(ui, &view, &mut self.ui) {
                     render::LobbyAction::Select(key) => self.state.selected = Some(key),
                     render::LobbyAction::None => {}
-                    render::LobbyAction::OpenTableWindow => {
-                        self.screen = Screen::Table;
-                        self.table_closed = false;
-                    }
                     // `D-043`: turn to another of this client's tables -- the
                     // window's state and the node's active slot together.
                     render::LobbyAction::Focus(slot) => {

@@ -229,7 +229,8 @@ pub enum TableAction {
     Check,
     Call,
     Raise(Chips),
-    BackToLobby,
+    /// `S1-DR`: leave the game here for good -- the window asks first.
+    Exit,
     /// `S1-CS`: a line for the seats of this table.
     Say(String),
     /// `S1-CS`: stop hearing this seat, or hear it again. Local.
@@ -330,8 +331,8 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> TableAc
         )
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("< Lobby").clicked() {
-                    action = TableAction::BackToLobby;
+                if ui.button("Exit").clicked() {
+                    action = TableAction::Exit;
                 }
                 ui.add_space(8.0);
                 ui.label(RichText::new(&view.name).color(theme::TEXT).size(20.0).strong());

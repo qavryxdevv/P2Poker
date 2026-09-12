@@ -65,7 +65,6 @@ pub enum LobbyAction {
         buyin: u64,
         password: Option<Vec<u8>>,
     },
-    OpenTableWindow,
     /// `D-043`: turn to one of this client's tables, by slot.
     Focus(u8),
     LeaveTable,
@@ -417,6 +416,37 @@ pub fn unfinished_window(ctx: &egui::Context, u: &crate::app::Unfinished) -> Opt
 /// said as such; a failed one offers to try again, to leave it for now and
 /// to forget the record; one the node has given up on says why, and its one
 /// button closes it.
+/// `S1-DR`: the question the table window asks before it closes. `Some(true)`
+/// is *leave*, `Some(false)` is *stay*, `None` is no answer yet.
+pub fn exit_window(ctx: &egui::Context) -> Option<bool> {
+    let mut answer = None;
+    egui::Window::new("Leave the game?")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .frame(frame())
+        .show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.label(
+                RichText::new("Closing the table ends your game here. There is no way back to this seat.")
+                    .color(theme::TEXT),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new("Leave").color(theme::TEXT)).fill(theme::DANGER))
+                    .clicked()
+                {
+                    answer = Some(true);
+                }
+                if ui.button("Stay").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+    answer
+}
+
 pub fn joining_window(ctx: &egui::Context, j: &super::lobby::JoiningView) -> Option<LobbyAction> {
     let mut action = None;
     let (title, verb) = if j.rejoin { ("Rejoining", "rejoin") } else { ("Connecting", "join") };
@@ -937,14 +967,8 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
                 });
                 ui.add_space(4.0);
             }
-            ui.horizontal(|ui| {
-                if ui.button("Show table window").clicked() {
-                    action = LobbyAction::OpenTableWindow;
-                }
-                if ui.button("Leave table").clicked() {
-                    action = LobbyAction::LeaveTable;
-                }
-            });
+            // `S1-DR`: no buttons for the table here. The table window opens
+            // with the seat, and closing it is leaving -- the window asks.
         });
 
     egui::CentralPanel::default()
