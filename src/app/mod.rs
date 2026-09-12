@@ -132,9 +132,51 @@ pub struct MyTurn {
     pub max_raise_to: u64,
 }
 
+/// `D-043`: one of this client's tables, as the lobby lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotView {
+    pub slot: u8,
+    pub name: String,
+    pub turn: bool,
+    pub active: bool,
+}
+
+/// `D-043`: one table's state, for a slot the window is not looking at.
+/// The same fields `AppState` holds for the active slot; see `swap_slot`.
+#[derive(Debug, Default)]
+pub struct TableApp {
+    pub seated: Option<Seat>,
+    pub hand: Option<HandInProgress>,
+    pub waiting_for: Vec<u8>,
+    pub last_stacks: Vec<u64>,
+    pub turns: u64,
+    pub strength: Option<crate::poker::strength::Strength>,
+    pub turn_seat: Option<u8>,
+    pub turn_since: Option<std::time::Instant>,
+    pub table_chat: VecDeque<TableLine>,
+    pub muted: std::collections::BTreeSet<u8>,
+    pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, std::time::Instant)>,
+    pub opponent_gone: Option<OpponentGone>,
+    pub opponent_returns: u8,
+    pub opponent_out: bool,
+    pub gone: std::collections::BTreeSet<u8>,
+    pub opponent_left: bool,
+}
+
 /// Everything the client knows, in the form the panes read it.
 #[derive(Debug, Default)]
 pub struct AppState {
+    /// `D-043`: the other tables this client sits at, by slot; the active
+    /// slot's state is this struct's own fields.
+    pub background: std::collections::BTreeMap<u8, TableApp>,
+    /// The slot whose state the fields hold and the window shows.
+    pub active_slot: u8,
+    /// The slot the node's last `AtTable` named: where the next event lands.
+    pub current_slot: u8,
+    /// Every slot's table key, once it has one.
+    pub slot_keys: std::collections::BTreeMap<u8, Option<[u8; 32]>>,
+    /// The slots where it is this client's turn.
+    pub turn_at: std::collections::BTreeSet<u8>,
     pub lobby: LobbyStore,
     pub status: NetworkStatus,
     /// What has happened, newest last. Capped at [`MAX_LOG_LINES`].
@@ -357,8 +399,120 @@ impl AppState {
     /// canonical state derived from a per-receiver quantity, and every value in
     /// this struct is exactly that: how many peers *this* client has, what *this*
     /// client heard, when.
+    /// `D-043`: every event lands on the slot the node's last `AtTable`
+    /// named. The active slot's state is this struct's own fields, as it
+    /// always was; another slot's is swapped in for the event and out
+    /// again, so the rest of this file never learns there is more than one.
     pub fn apply(&mut self, event: NodeEvent) {
+        if let NodeEvent::AtTable { slot, key } = event {
+            self.current_slot = slot;
+            self.slot_keys.insert(slot, key);
+            if slot != self.active_slot && !self.background.contains_key(&slot) {
+                self.background.insert(slot, TableApp::default());
+            }
+            return;
+        }
+        match &event {
+            NodeEvent::YourTurn { .. } => {
+                self.turn_at.insert(self.current_slot);
+            }
+            NodeEvent::NotYourTurn { .. } | NodeEvent::HandEnded { .. } | NodeEvent::LeftTable { .. } => {
+                self.turn_at.remove(&self.current_slot);
+            }
+            _ => {}
+        }
+        let left = matches!(event, NodeEvent::LeftTable { .. });
+        let slot = self.current_slot;
+        if slot == self.active_slot || !self.background.contains_key(&slot) {
+            self.apply_here(event);
+            return;
+        }
+        self.swap_slot(slot);
+        self.apply_here(event);
+        self.swap_slot(slot);
+        if left {
+            self.background.remove(&slot);
+            self.slot_keys.remove(&slot);
+        }
+    }
+
+    /// Exchange the fields with a background slot's state.
+    fn swap_slot(&mut self, slot: u8) {
+        let Some(other) = self.background.get_mut(&slot) else {
+            return;
+        };
+        std::mem::swap(&mut self.seated, &mut other.seated);
+        std::mem::swap(&mut self.hand, &mut other.hand);
+        std::mem::swap(&mut self.waiting_for, &mut other.waiting_for);
+        std::mem::swap(&mut self.last_stacks, &mut other.last_stacks);
+        std::mem::swap(&mut self.turns, &mut other.turns);
+        std::mem::swap(&mut self.strength, &mut other.strength);
+        std::mem::swap(&mut self.turn_seat, &mut other.turn_seat);
+        std::mem::swap(&mut self.turn_since, &mut other.turn_since);
+        std::mem::swap(&mut self.table_chat, &mut other.table_chat);
+        std::mem::swap(&mut self.muted, &mut other.muted);
+        std::mem::swap(&mut self.links, &mut other.links);
+        std::mem::swap(&mut self.opponent_gone, &mut other.opponent_gone);
+        std::mem::swap(&mut self.opponent_returns, &mut other.opponent_returns);
+        std::mem::swap(&mut self.opponent_out, &mut other.opponent_out);
+        std::mem::swap(&mut self.gone, &mut other.gone);
+        std::mem::swap(&mut self.opponent_left, &mut other.opponent_left);
+    }
+
+    /// `D-043`: turn to another of this client's tables: its state becomes
+    /// the fields, the fields become its background entry.
+    pub fn switch_to(&mut self, slot: u8) {
+        if slot == self.active_slot || !self.background.contains_key(&slot) {
+            return;
+        }
+        self.swap_slot(slot);
+        if let Some(was_active) = self.background.remove(&slot) {
+            self.background.insert(self.active_slot, was_active);
+        }
+        self.active_slot = slot;
+    }
+
+    /// `D-043`: the felt of one slot, the active one or another.
+    pub fn table_view_of(&mut self, slot: u8) -> crate::gui::table::TableView {
+        if slot == self.active_slot || !self.background.contains_key(&slot) {
+            return self.table_view();
+        }
+        self.swap_slot(slot);
+        let view = self.table_view();
+        self.swap_slot(slot);
+        view
+    }
+
+    /// `D-043`: every slot this client sits at -- the number, the table's
+    /// name, whether it is this client's turn there, whether it is the active
+    /// one -- the active slot first.
+    pub fn slots(&self) -> Vec<SlotView> {
+        let mut out = Vec::new();
+        if let Some(s) = self.seated.as_ref() {
+            out.push(SlotView {
+                slot: self.active_slot,
+                name: s.name.clone(),
+                turn: self.turn_at.contains(&self.active_slot),
+                active: true,
+            });
+        }
+        for (slot, other) in self.background.iter() {
+            if let Some(s) = other.seated.as_ref() {
+                out.push(SlotView {
+                    slot: *slot,
+                    name: s.name.clone(),
+                    turn: self.turn_at.contains(slot),
+                    active: false,
+                });
+            }
+        }
+        out
+    }
+
+    fn apply_here(&mut self, event: NodeEvent) {
         match event {
+            // Taken in `apply`, before anything lands anywhere.
+            NodeEvent::AtTable { .. } => {}
             NodeEvent::Listening(addr) => {
                 self.status.listening.push(addr.to_string());
                 self.note(format!("listening on {addr}"));
@@ -1258,6 +1412,8 @@ impl AppState {
         // Name and key together, because a name is decoration. Sorted by name
         // so the pane does not reshuffle every time somebody says they are
         // still here.
+        // `D-043`: every table this client sits at, the turn marked.
+        v.my_tables = self.slots();
         v.seated = {
             let mut who: Vec<String> = self
                 .players

@@ -3871,9 +3871,22 @@ so that a single table never stops working while the second is being built.
    it founded and has not dealt at. Commands and events still name no table: an `Act` goes to the active
    table, and every event reaches the window as before -- which is why stage 3 comes before a client is
    dealt at two tables at once.
-3. **Stage 3: the window.** Every per-table event carries the table's key; the app keeps one state per table and
-   the window shows them as tabs, the felt drawing the one in front; a turn at a table behind brings its tab
-   forward, as every multitabling client does.
+3. **Stage 3 (built the same day): the window.** The node says which slot what follows is about --
+   `NodeEvent::AtTable { slot, key }`, sent whenever it turns from one slot to another, before that slot's
+   events, and never dropped -- so no other event had to change. Every slot has a stable number for as long as
+   the client sits there. The app keeps one state per slot: the active slot's is `AppState`'s own fields, as
+   they always were, and another slot's is a `TableApp` kept aside and swapped in for its events and out again
+   (`swap_slot`), so the two thousand lines that read those fields never learn there is more than one table.
+   `switch_to` turns the window to another slot; `table_view_of` looks at one without turning; `slots` lists
+   them with the turn marked (`turn_at`, from `YourTurn`). The lobby shows *Your tables* once there are two,
+   the active one lit and *your turn* on the one that waits; a click is `LobbyAction::Focus`, which turns the
+   app's state and tells the node `NodeCommand::Focus`, and the table window then shows that table. The node
+   keeps the active slot until the window turns: a table founded or joined while seated takes its command in
+   its new slot but does not become active on its own, and a slot that never gets its table -- a join refused
+   -- goes a minute after it was opened once the window has turned elsewhere. The headless client needs none
+   of this: its play is the node's own. Not done: one window per table (the felt shows the active table; the
+   lobby's strip is where the player turns), and the turn's own pull of the window, which the owner can ask
+   for once the strip has been seen.
 4. **Measured.** On the bed, run C's scenario again (`tools/table-run.ps1 -Seats 3 -StartStack 200 -RehostAt 120 -Seconds 330`, `run081126-3`) on the `TableRun` build: the second table's first hand 15.7 s after the hosting (15.4 s in `run213600-3`), the joiners in its group 0.1 s and 5.1 s after asking, the tournament over at 149.2-152.8 s and every seat out of its group 10.1-11.1 s later, fifteen hands opened and fifteen finished on every seat, one genesis per hand per table, no certificate, 7.7 s per hand in the steady state. Stage 2: run C's scenario on the stage-2 build (`run082901-3`): 17 hands opened and 17 finished on every seat, one genesis per hand per table; the first tournament over at 98-102 s and every seat out of its group 10.3-11.6 s later; the second table's first hand 15.4 s after the hosting, both joiners in its group 0.1 s after asking; 10.8 s per hand in the steady state. **One client at two tables** (`tools/table-run.ps1 -Seats 3 -TwoTables -AlsoAt 60 -Seconds 300`: five
    nodes, n0 hosting A with n1 and n2, n3 hosting A-B with n4, and n1 asking to join A-B at 60 s without
    leaving A; the node's own autoplay acts at both): `run084503-3` -- n1 asked at 60.0 s, the node opened *slot 2
@@ -3882,6 +3895,6 @@ so that a single table never stops working while the second is being built.
    pace at each -- with 59 hands opened across the two while both ran. `run083639-3`, the first attempt, is
    the S1-DQ row: the greeting into B's group tangled, B counted n1 out at 90.8 s, the second attempt at 120 s
    went through and the return road (D-031) took n1 back for B's hand #9; it played 21 hands there and 36 at
-   A. `run085331-3`, the same scenario on the library with patch 0030: n1 in B's group at 65.1 s and dealt at 70.1 s, 37 hands at A and 31 at B (144 and 120 turns, 7.7 s and 7.5 s between hands, 61 hands across the two while both ran), no certificate; no greeting was heard twice in that run, so the patch's guard fired nowhere -- its proof is the tangle's mechanism read to the line and the whole-stack test through the patched library.
+   A. `run085331-3`, the same scenario on the library with patch 0030: n1 in B's group at 65.1 s and dealt at 70.1 s, 37 hands at A and 31 at B (144 and 120 turns, 7.7 s and 7.5 s between hands, 61 hands across the two while both ran), no certificate; no greeting was heard twice in that run, so the patch's guard fired nowhere -- its proof is the tangle's mechanism read to the line and the whole-stack test through the patched library. **Stage 3:** `run091015-3`, the two-table scenario on the stage-3 build, the headless app routing every event by the node's markers: n1 asked to join B at 60 s, was in its group at 65.1 s and dealt at 70.1 s, and played 36 hands at A and 30 at B (144 and 120 turns, 7.7 s and 7.6 s between hands), no certificate, no panic. The lobby's strip itself is for the owner's eyes: two windows on one machine, one of them at both tables.
 
 **Guard.** The library's tests unchanged (865), the bed's runs named in point 4, and the S1-DN row's tools.

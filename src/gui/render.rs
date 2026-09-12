@@ -66,6 +66,8 @@ pub enum LobbyAction {
         password: Option<Vec<u8>>,
     },
     OpenTableWindow,
+    /// `D-043`: turn to one of this client's tables, by slot.
+    Focus(u8),
     LeaveTable,
     /// `S1-CR`: rejoin the unfinished game on record. The app state holds
     /// the record's table and stack; the founder answers *already seated*
@@ -915,6 +917,26 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
                 }
             });
             ui.add_space(6.0);
+            // `D-043`: every table this client sits at, the active one lit, the
+            // one whose turn it is marked; a click turns the table window to it.
+            if view.my_tables.len() > 1 {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Your tables").color(theme::TEXT_DIM));
+                    for s in &view.my_tables {
+                        let label = if s.turn { format!("{} \u{25cf} your turn", s.name) } else { s.name.clone() };
+                        let button = egui::Button::new(RichText::new(label).color(if s.turn {
+                            theme::OK
+                        } else {
+                            theme::TEXT
+                        }))
+                        .selected(s.active);
+                        if ui.add(button).clicked() {
+                            action = LobbyAction::Focus(s.slot);
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+            }
             ui.horizontal(|ui| {
                 if ui.button("Show table window").clicked() {
                     action = LobbyAction::OpenTableWindow;

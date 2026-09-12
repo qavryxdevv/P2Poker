@@ -363,6 +363,8 @@ pub struct LobbyView {
     pub selected: Option<[u8; 32]>,
     pub chat: Vec<ChatLine>,
     pub seated: Vec<String>,
+    /// `D-043`: every table this client sits at, the active one first.
+    pub my_tables: Vec<crate::app::SlotView>,
     /// What has happened, newest last. A local view and never canonical state.
     pub log: Vec<String>,
     /// `S1-CR`: an unfinished game on record, for the window to ask about.
@@ -384,6 +386,7 @@ pub struct ChatLine {
 impl LobbyView {
     pub fn from(store: &LobbyStore, status: NetworkStatus) -> Self {
         LobbyView {
+            my_tables: Vec::new(),
             me: String::new(),
             tables: rows(store),
             status,

@@ -419,6 +419,12 @@ pub struct Run {
 /// not where it is used. One table still; the driver underneath already
 /// carries several (`D-042`), and the node's turn is the next stage.
 struct TableRun {
+    /// `D-043`: this slot's number, stable while the client sits here; the
+    /// window's name for the table's state (`NodeEvent::AtTable`).
+    slot: u8,
+    /// When the slot was opened: one that never gets its table goes a minute
+    /// later, once the window has turned elsewhere.
+    opened_at: tokio::time::Instant,
     /// The table this client is forming or sitting at, and the mesh it is formed
     /// on. One `TableRun` per table; the loop holds one of them until `D-043`'s
     /// stage 2 holds up to `MAX_TABLES`. (Until 2026-09-12 multi-tabling was
@@ -749,12 +755,15 @@ struct TableRun {
 
 impl TableRun {
     fn new(
+        slot: u8,
         profile_dir: &std::path::Path,
         resume: Option<crate::storage::session::Record>,
         tox_sink: super::toxsink::TableSink,
     ) -> TableRun {
         let _ = profile_dir;
         TableRun {
+            slot,
+            opened_at: tokio::time::Instant::now(),
             table: None,
             hand: None,
             hand_reported: false,
@@ -962,11 +971,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // `D-043`: every table this client sits at, up to `MAX_TABLES`; the first
     // slot always exists, and `active` is the one the window is at.
     let mut tables: Vec<TableRun> = vec![TableRun::new(
+        0,
         &profile_dir,
         crate::storage::session::load_recent(&profile_dir, super::node::now_unix_ms()),
         super::toxsink::TableSink::none(),
     )];
     let mut active: usize = 0;
+    // The next slot's number, and the last `AtTable` the window was told.
+    let mut next_slot: u8 = 1;
+    let mut marked: Option<(u8, Option<[u8; 32]>)> = None;
     // The join requests in flight, by the table each was sent for.
     let mut join_pending: std::collections::HashMap<libp2p::request_response::OutboundRequestId, usize> =
         std::collections::HashMap::new();
@@ -2169,6 +2182,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // answers -- and the active table for everything else.
                 let which = table_for_event(&tables, &event, active, &join_pending);
                 let t = &mut tables[which];
+                mark_table(&events, &mut marked, t).await;
                 match event {
                     SwarmEvent::NewListenAddr { address, .. }
                         if address
@@ -4067,20 +4081,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     command,
                     NodeCommand::CreateTable { .. } | NodeCommand::JoinTable { .. }
                 );
+                // The new slot takes the command; the active one stays the window's
+                // until it turns there (`NodeCommand::Focus`).
+                let mut opened: Option<usize> = None;
                 if opening && tables[active].table.is_some() && tables.len() < MAX_TABLES {
                     let sink = tables[0].tox_sink.share();
-                    tables.push(TableRun::new(&profile_dir, None, sink));
-                    active = tables.len() - 1;
+                    tables.push(TableRun::new(next_slot, &profile_dir, None, sink));
+                    next_slot = next_slot.saturating_add(1);
+                    opened = Some(tables.len() - 1);
                     let _ = events
                         .send(NodeEvent::Warning(format!(
-                            "a second table: slot {} of {MAX_TABLES}",
-                            active + 1
+                            "another table: {} of {MAX_TABLES} slots open",
+                            tables.len()
                         )))
                         .await;
                 }
-                let which = active;
+                let which = opened.unwrap_or(active);
                 let mut close_slot = false;
                 let t = &mut tables[which];
+                mark_table(&events, &mut marked, t).await;
                 let now = super::node::now_unix_ms();
                 match command {
                     NodeCommand::SayAtTable(text) => {
@@ -4726,6 +4745,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .send(NodeEvent::SessionGaveUp { why: "forgotten at the player's word".into() })
                             .await;
                     }
+                    NodeCommand::Focus(slot) => {
+                        // `D-043`: the window turned to another of its tables.
+                        if let Some(i) = tables.iter().position(|x| x.slot == slot) {
+                            active = i;
+                        }
+                    }
                     NodeCommand::SetNickname(name) => {
                         // Bounded here as well as where it is chosen. §4.3's
                         // limit is on what a roster will take, and the roster is
@@ -4782,6 +4807,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     tables.remove(which);
                     active = tables.iter().position(|x| x.table.is_some()).unwrap_or(0);
                 }
+                // And a slot that never got its table -- a join refused -- goes
+                // once the window has turned elsewhere.
+                if tables.len() > 1 {
+                    let keep = tables[active].slot;
+                    tables.retain(|x| {
+                        x.table.is_some()
+                            || x.slot == keep
+                            || x.opened_at.elapsed() < std::time::Duration::from_secs(60)
+                    });
+                    active = tables.iter().position(|x| x.slot == keep).unwrap_or(0);
+                }
             }
 
             // Say again what this client already said, while the stage it
@@ -4804,6 +4840,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // branch contributes nothing to the `select!`.
             Some((which, item)) = next_from_tables(&mut tables) => {
                 let t = &mut tables[which];
+                mark_table(&events, &mut marked, t).await;
                 // **Learn who this group peer is, once, from a signature.**
                 // The driver reports a sender by its group key and cannot get
                 // further; the roster is keyed by application key. Pairing them
@@ -5071,6 +5108,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             _ = resend.tick() => {
                 for which in 0..tables.len() {
                     let t = &mut tables[which];
+                    mark_table(&events, &mut marked, t).await;
                     if !t.tox_group_said {
                         if let Some(chat) = t.tox_sink.chat_id() {
                             t.tox_group_said = true;
@@ -5331,6 +5369,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             _ = stall.tick() => {
                 for which in 0..tables.len() {
                     let t = &mut tables[which];
+                    mark_table(&events, &mut marked, t).await;
                     let now = super::node::now_unix_ms();
                     // `D-042`, the owner's rule: when the tournament is over, the
                     // group it was played in is left and the friends it was played
@@ -6228,6 +6267,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             ), if act_deadline.is_some() => {
                 let which = act_deadline.map(|d| d.0).unwrap_or(active);
                 let t = &mut tables[which];
+                mark_table(&events, &mut marked, t).await;
                 t.act_by = None;
                 let Some(h) = t.hand.as_mut() else { continue };
                 let Some(turn) = h.turn().filter(|t| t.mine) else { continue };
@@ -6293,6 +6333,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             ), if deal_deadline.is_some() => {
                 let which = deal_deadline.map(|d| d.0).unwrap_or(active);
                 let t = &mut tables[which];
+                mark_table(&events, &mut marked, t).await;
                 t.next_hand_at = None;
                 // **Never succeed a hand that is not over.** This arm rested
                 // on an invariant — the timer fires only about a hand that
@@ -7064,6 +7105,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `D-043`: what follows is every table's.
                 for which in 0..tables.len() {
                     let t = &mut tables[which];
+                    mark_table(&events, &mut marked, t).await;
                     if let Some(f) = t.table.as_ref() {
                         let mut line: Vec<String> = Vec::new();
                         for e in f.roster().seats() {
@@ -7689,6 +7731,16 @@ fn table_for_event(
         _ => None,
     };
     found.unwrap_or(active).min(tables.len().saturating_sub(1))
+}
+
+/// `D-043`: tell the window which table what follows is about, when that
+/// changes -- the slot's number and the table's key once it has one.
+async fn mark_table(events: &Events, marked: &mut Option<(u8, Option<[u8; 32]>)>, t: &TableRun) {
+    let key = t.table.as_ref().map(|f| f.table_id());
+    if *marked != Some((t.slot, key)) {
+        *marked = Some((t.slot, key));
+        let _ = events.send(NodeEvent::AtTable { slot: t.slot, key }).await;
+    }
 }
 
 /// `D-043`: the earliest of one timer across the tables, with its table.

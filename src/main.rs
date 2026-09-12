@@ -1515,6 +1515,14 @@ impl eframe::App for Client {
                         self.screen = Screen::Table;
                         self.table_closed = false;
                     }
+                    // `D-043`: turn to another of this client's tables -- the
+                    // window's state and the node's active slot together.
+                    render::LobbyAction::Focus(slot) => {
+                        self.state.switch_to(slot);
+                        self.tell(NodeCommand::Focus(slot));
+                        self.screen = Screen::Table;
+                        self.table_closed = false;
+                    }
                     render::LobbyAction::Create(t) => self.tell(NodeCommand::CreateTable {
                         kind: t.kind,
                         name: t.name,

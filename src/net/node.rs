@@ -45,6 +45,10 @@ use crate::protocol::constants::AD_REBROADCAST_MS;
 /// [`NodeEvent`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCommand {
+    /// `D-043`: make this slot the active table -- the one an `Act`, a
+    /// `SayAtTable` or a `LeaveTable` is for. The window sends it when the
+    /// player turns to another of their tables.
+    Focus(u8),
     /// Act on this client's own turn.
     ///
     /// The action is the player's, and it is checked twice: once here by the
@@ -101,6 +105,12 @@ pub enum NodeCommand {
 /// What the loop reports upwards, for the GUI and the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeEvent {
+    /// `D-043`: what follows is about this table -- the slot's number, stable
+    /// for as long as the client sits there, and the table's key once it has
+    /// one. Sent whenever the node turns from one slot to another, before
+    /// that slot's events; the window keeps one state per slot and routes by
+    /// the last of these.
+    AtTable { slot: u8, key: Option<[u8; 32]> },
     /// A transport address this node is reachable on.
     Listening(Multiaddr),
     /// Somebody joined or left the network this client is on.
@@ -485,7 +495,8 @@ impl NodeEvent {
     pub fn changes_more_than_the_log(&self) -> bool {
         match self {
             // The table, and everything a player watches while sitting at it.
-            Self::Hosting { .. }
+            Self::AtTable { .. }
+            | Self::Hosting { .. }
             | Self::TableParams { .. }
             | Self::Seated { .. }
             | Self::Roster { .. }

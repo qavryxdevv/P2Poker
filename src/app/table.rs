@@ -713,4 +713,50 @@ mod tests {
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
         assert!(!s.table_view().note.unwrap().contains("joining"), "a hand on the felt says the hand");
     }
+
+    /// `D-043`: the node's `AtTable` says which slot what follows is about;
+    /// the active slot's state is the fields, another slot's is kept aside
+    /// and swapped in for its events; the window turns between them.
+    #[test]
+    fn two_tables_keep_their_own_state_and_the_window_turns_between_them() {
+        let mut s = seated(1);
+        assert_eq!(s.seated.as_ref().map(|x| x.key), Some([7u8; 32]));
+        // The node turns to a second slot and seats this client there.
+        s.apply(NodeEvent::AtTable { slot: 1, key: None });
+        s.apply(NodeEvent::Seated { key: [9u8; 32], seat: 0 });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::YourTurn {
+            hand_id: 1,
+            street: 0,
+            to_call: 100,
+            pot: 150,
+            can_check: false,
+            can_call: true,
+            can_bet: false,
+            can_raise: true,
+            min_raise_to: 200,
+            max_raise_to: 1_000,
+            elapsed_ms: 0,
+        });
+        // The window still shows the first table, untouched.
+        assert_eq!(s.seated.as_ref().map(|x| x.key), Some([7u8; 32]));
+        assert!(s.hand.is_none(), "the second table's hand is not the first's");
+        let slots = s.slots();
+        assert_eq!(slots.len(), 2, "{slots:?}");
+        assert!(slots[0].active && !slots[1].active);
+        assert!(slots[1].turn && !slots[0].turn, "it is this client's turn at the second table");
+        // The felt of the second slot can be looked at without turning.
+        assert_eq!(s.table_view_of(1).hand, 1);
+        assert_eq!(s.seated.as_ref().map(|x| x.key), Some([7u8; 32]), "looking did not turn");
+        // The window turns: the second table's state is the fields now.
+        s.switch_to(1);
+        assert_eq!(s.active_slot, 1);
+        assert_eq!(s.seated.as_ref().map(|x| x.key), Some([9u8; 32]));
+        assert!(s.hand.as_ref().is_some_and(|h| h.hand_id == 1));
+        // And events for the first slot land on its state aside.
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some([7u8; 32]) });
+        s.apply(NodeEvent::LeftTable { why: "left".into() });
+        assert_eq!(s.seated.as_ref().map(|x| x.key), Some([9u8; 32]), "leaving the first did not touch the second");
+        assert_eq!(s.slots().len(), 1, "the first table is gone from the list");
+    }
 }
