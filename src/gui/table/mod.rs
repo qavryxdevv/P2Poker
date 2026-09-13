@@ -566,12 +566,36 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi, settings: 
         preview_banner(&p, zone);
     }
 
+    let bar_rect = bar::rect(full, zone, &l);
+    // The chat beside the bar, unless the big chat panel is open: one place
+    // to type in at a time. What it shows is read.
+    let chat_corner = if settings.show_chat() && !state.chat_open { chat_rect(full, bar_rect, &l) } else { None };
+    if chat_corner.is_some() {
+        state.chat_read = view.chat.len();
+    }
     if let Some(a) = panels::draw(ui, zone, view, state) {
         action = a;
     }
-    let bar_rect = bar::rect(full, zone, &l);
     if let Some(a) = bar::draw(ui, bar_rect, view, state, now) {
         action = a;
+    }
+    if settings.show_odds() {
+        // Under the log panel while it is open, not behind it.
+        let rect = odds_rect(full, bar_rect, &l).and_then(|r| {
+            if !state.log_open {
+                return Some(r);
+            }
+            let top = r.top().max(panels::side_panel_bottom(zone) + 6.0);
+            (r.bottom() - top >= ODDS_MIN_H).then(|| Rect::from_min_max(pos2(r.left(), top), r.max))
+        });
+        if let Some(rect) = rect {
+            odds_corner(&p, rect, view);
+        }
+    }
+    if let Some(rect) = chat_corner {
+        if let Some(a) = panels::chat_corner(ui, rect, view, state) {
+            action = a;
+        }
     }
     if let Some(a) = windows(ui, view, state, settings) {
         action = a;
@@ -585,6 +609,144 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi, settings: 
         ui.ctx().request_repaint();
     }
     action
+}
+
+/// Which side of the action bar a corner panel takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Corner {
+    /// The chat.
+    Left,
+    /// The odds.
+    Right,
+}
+
+/// A corner beside the action bar (the owner, 2026-09-13: the odds *in the
+/// bottom right corner*, *it must follow the window's size so it stays in that
+/// area*, and *in the same way the chat in the left corner*): from the bar to
+/// the window's edge, down to the bottom, reaching up past the bar's top only
+/// where no seat, bet or puck is. A seat in the way lowers the top and the
+/// panel grows shorter (*shrink its height so it does not cover the seated
+/// players*); `None` when the corner is narrower than `MIN_W` or shorter than
+/// `min_h`.
+pub fn corner_rect(full: Rect, bar: Rect, l: &Seats, corner: Corner, min_h: f32) -> Option<Rect> {
+    const GAP: f32 = 14.0;
+    const MARGIN: f32 = 8.0;
+    const MIN_W: f32 = 150.0;
+    const MAX_W: f32 = 380.0;
+    const RISE: f32 = 36.0;
+    let (left, right) = match corner {
+        Corner::Right => {
+            let right = full.right() - MARGIN;
+            ((bar.right() + GAP).max(right - MAX_W), right)
+        }
+        Corner::Left => {
+            let left = full.left() + MARGIN;
+            (left, (bar.left() - GAP).min(left + MAX_W))
+        }
+    };
+    let bottom = full.bottom() - MARGIN;
+    if right - left < MIN_W {
+        return None;
+    }
+    let mut top = (bar.top() - RISE).max(full.top());
+    let mut keep_clear: Vec<Rect> = l.others.iter().map(|b| b.rect).collect();
+    keep_clear.push(l.hero);
+    for seat in l.others.iter().map(|b| b.seat).chain(std::iter::once(l.hero_seat)) {
+        if let Some(puck) = l.puck(seat) {
+            // A seat can hold two pucks side by side, either way.
+            let step = puck.width() + 2.0;
+            keep_clear.push(puck.expand2(vec2(step, 0.0)));
+        }
+    }
+    for r in keep_clear {
+        let r = r.expand(6.0);
+        if r.right() > left && r.left() < right && r.bottom() > top && r.top() < bottom {
+            top = r.bottom();
+        }
+    }
+    (bottom - top >= min_h).then(|| Rect::from_min_max(pos2(left, top), pos2(right, bottom)))
+}
+
+/// The least height of the odds beside the bar: the hand's name, and its frame.
+pub const ODDS_MIN_H: f32 = 34.0;
+
+/// The odds' corner, right of the bar: room for at least the hand's name.
+pub fn odds_rect(full: Rect, bar: Rect, l: &Seats) -> Option<Rect> {
+    corner_rect(full, bar, l, Corner::Right, ODDS_MIN_H)
+}
+
+/// The chat's corner, left of the bar: room for at least the line to say
+/// something in.
+pub fn chat_rect(full: Rect, bar: Rect, l: &Seats) -> Option<Rect> {
+    corner_rect(full, bar, l, Corner::Left, panels::CORNER_CHAT_MIN_H)
+}
+
+/// The hero's hand and the chances of improving it, as the log's *Odds* tab
+/// says them, fitted to `rect`: the more room, the more improvements and the
+/// larger the words. Nothing before the hero holds cards.
+fn odds_corner(p: &egui::Painter, rect: Rect, view: &TableView) {
+    let Some(name) = view.hero_hand.as_deref() else {
+        return;
+    };
+    let folded = view.seats.iter().any(|s| s.seat == view.hero && s.folded);
+    style::shadow(p, rect, 10.0, 2.0, 10.0, Color32::from_black_alpha(110));
+    p.rect_filled(rect, 10.0, style::faded(style::PANEL_BG, 0.92));
+    p.rect_stroke(rect, 10.0, Stroke::new(1.0, style::PANEL_BORDER), StrokeKind::Inside);
+
+    let pad = (rect.height() * 0.07).clamp(7.0, 12.0);
+    let inner = rect.shrink(pad);
+    let improvements = match view.improve_by {
+        Some(_) => likeliest(&view.improve, 6),
+        None => Vec::new(),
+    };
+    let title_size = (inner.height() / 7.5).clamp(11.0, 16.0);
+    let sub_size = (title_size * 0.82).max(9.5);
+    let gap = 3.0;
+
+    let mut y = inner.top();
+    // The owner, 2026-09-13: no *Odds* heading, the hand's name leads.
+    let label = if folded { format!("{name} — folded") } else { name.to_string() };
+    let title = style::elided(p, &label, title_size, Weight::DemiBold, inner.width());
+    style::text(p, pos2(inner.left(), y), Align2::LEFT_TOP, &title, title_size, Weight::DemiBold, style::PANEL_TEXT);
+    y += title_size * 1.3;
+    if let Some(by) = view.improve_by.filter(|_| y + sub_size * 1.2 <= inner.bottom()) {
+        let line = if improvements.is_empty() { "nothing to improve to".to_string() } else { format!("improves {by}: {}", pct(view.improve_total)) };
+        let line = style::elided(p, &line, sub_size, Weight::Regular, inner.width());
+        style::text(p, pos2(inner.left(), y), Align2::LEFT_TOP, &line, sub_size, Weight::Regular, style::PANEL_TEXT_2);
+        y += sub_size * 1.35;
+    }
+    if improvements.is_empty() {
+        return;
+    }
+    let room = inner.bottom() - y;
+    // As many rows as fit at 14 points or more, each at most 24.
+    let fits = ((room + gap) / (14.0 + gap)).floor().max(0.0) as usize;
+    let rows = improvements.len().min(fits);
+    if rows == 0 {
+        return;
+    }
+    let row_h = ((room + gap) / rows as f32 - gap).clamp(14.0, 24.0);
+    let text_size = (row_h * 0.6).clamp(9.5, 13.5).min(title_size);
+    for (label, chance) in improvements.iter().take(rows) {
+        let row = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), row_h));
+        p.rect_filled(row, 3.0, style::faded(style::PANEL_BORDER, 0.22));
+        let filled = Rect::from_min_size(row.min, vec2(row.width() * chance.clamp(0.0, 1.0), row.height()));
+        p.rect_filled(filled, 3.0, style::faded(style::COLOR_ACCENT, 0.42));
+        let figure = pct(*chance);
+        let figure_w = style::text_width(p, &figure, text_size, Weight::Bold);
+        let words = style::elided(p, label, text_size, Weight::Regular, (row.width() - figure_w - 22.0).max(10.0));
+        style::text(p, pos2(row.left() + 7.0, row.center().y), Align2::LEFT_CENTER, &words, text_size, Weight::Regular, style::PANEL_TEXT);
+        style::text(
+            p,
+            pos2(row.right() - 7.0, row.center().y),
+            Align2::RIGHT_CENTER,
+            &figure,
+            text_size,
+            if *chance >= 0.5 { Weight::Bold } else { Weight::Regular },
+            style::PANEL_TEXT,
+        );
+        y += row_h + gap;
+    }
 }
 
 /// `table.png`, PreserveAspectCrop around the board's centre, over the zone
@@ -1197,7 +1359,9 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
         let mut open = true;
         let mut changed = false;
         let mut sound = draft.sound();
-        egui::Window::new("Sound")
+        let mut show_odds = draft.show_odds();
+        let mut show_chat = draft.show_chat();
+        egui::Window::new("Settings")
             .id(egui::Id::new("table-sound"))
             .title_bar(false)
             .collapsible(false)
@@ -1207,7 +1371,7 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
             .show(&ctx, |ui| {
                 ui.set_min_width(320.0);
                 ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
-                if window_heading(ui, "Sound", true) {
+                if window_heading(ui, "Settings", true) {
                     open = false;
                 }
                 ui.label(RichText::new("Sound effects").color(style::BOX_ACCENT).strong());
@@ -1229,9 +1393,19 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                     changed |= ui.checkbox(&mut sound.network_game, "Network game notifications").changed();
                     changed |= ui.checkbox(&mut sound.blind_raise, "Blind raise notification").changed();
                 });
+                ui.add_space(6.0);
+                ui.label(RichText::new("Table").color(style::BOX_ACCENT).strong());
+                changed |= ui.checkbox(&mut show_odds, "Show the odds beside the action bar").changed();
+                changed |= ui.checkbox(&mut show_chat, "Show the chat beside the action bar").changed();
             });
         if draft.sound() != sound {
             draft.sound = Some(sound);
+        }
+        if draft.show_odds() != show_odds {
+            draft.show_odds = Some(show_odds);
+        }
+        if draft.show_chat() != show_chat {
+            draft.show_chat = Some(show_chat);
         }
         if changed {
             action = Some(TableAction::SaveSettings(draft.clone()));
@@ -1621,6 +1795,84 @@ mod tests {
     }
 
     /// PokerTH's badge pop settles at its own size.
+    #[test]
+    fn both_corners_stay_in_their_corners_at_every_size() {
+        let mut shown = [0, 0];
+        for &(w, h) in &[(760.0, 560.0), (1000.0, 720.0), (1280.0, 800.0), (1600.0, 900.0), (1920.0, 1040.0), (2560.0, 1400.0), (900.0, 1000.0)] {
+            for seats in 2..=10u8 {
+                let full = Rect::from_min_size(pos2(0.0, 0.0), vec2(w, h));
+                let status_bottom = APP_BAR_H + STATUS_BAR_H;
+                let zone = Rect::from_min_max(pos2(0.0, status_bottom), pos2(w, (h - bar::HEIGHT).max(status_bottom + 120.0)));
+                let ids: Vec<u8> = (0..seats).collect();
+                let l = seats::layout(zone, &ids, 0);
+                let bar_rect = bar::rect(full, zone, &l);
+                for (i, (corner, r)) in [(Corner::Right, odds_rect(full, bar_rect, &l)), (Corner::Left, chat_rect(full, bar_rect, &l))].into_iter().enumerate() {
+                    let Some(r) = r else {
+                        continue;
+                    };
+                    shown[i] += 1;
+                    let at = format!("{corner:?} at {w}x{h}, {seats} seats: {r:?}");
+                    assert!(full.contains_rect(r), "inside the window: {at}");
+                    match corner {
+                        Corner::Right => {
+                            assert!(r.left() >= bar_rect.right() + 12.0, "right of the bar: {at}");
+                            assert!((r.right() - (w - 8.0)).abs() < 0.5, "at the right edge: {at}");
+                        }
+                        Corner::Left => {
+                            assert!(r.right() <= bar_rect.left() - 12.0, "left of the bar: {at}");
+                            assert!((r.left() - 8.0).abs() < 0.5, "at the left edge: {at}");
+                        }
+                    }
+                    assert!((r.bottom() - (h - 8.0)).abs() < 0.5, "at the bottom: {at}");
+                    assert!(r.width() >= 150.0 && r.width() <= 380.0, "a readable width: {at}");
+                    assert!(r.top() >= bar_rect.top() - 36.0, "no higher than a little over the bar: {at}");
+                    for b in l.others.iter().map(|b| b.rect).chain(std::iter::once(l.hero)) {
+                        assert!(!b.intersects(r), "clear of every seat: {at}, seat {b:?}");
+                    }
+                }
+            }
+        }
+        assert!(shown[0] > 40 && shown[1] > 40, "the corners are there at ordinary sizes ({shown:?})");
+        // The owner's window: a heads-up table at about a thousand by seven hundred.
+        let full = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 720.0));
+        let zone = Rect::from_min_max(pos2(0.0, APP_BAR_H + STATUS_BAR_H), pos2(1000.0, 720.0 - bar::HEIGHT));
+        let l = seats::layout(zone, &[0, 1], 0);
+        let bar_rect = bar::rect(full, zone, &l);
+        for r in [odds_rect(full, bar_rect, &l), chat_rect(full, bar_rect, &l)] {
+            let r = r.expect("the owner's window has both corners");
+            assert!(r.width() > 250.0 && r.height() > 110.0, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn a_seat_in_a_corner_makes_the_panel_shorter_not_hidden() {
+        let full = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 720.0));
+        let zone = Rect::from_min_max(pos2(0.0, APP_BAR_H + STATUS_BAR_H), pos2(1000.0, 720.0 - bar::HEIGHT));
+        for corner in [Corner::Right, Corner::Left] {
+            let mut l = seats::layout(zone, &[0, 1, 2], 0);
+            let bar_rect = bar::rect(full, zone, &l);
+            let rect = |l: &Seats| match corner {
+                Corner::Right => odds_rect(full, bar_rect, l),
+                Corner::Left => chat_rect(full, bar_rect, l),
+            };
+            let tall = rect(&l).expect("room at first");
+            // Move a seat's box down into the corner's upper part.
+            let x = match corner {
+                Corner::Right => full.right() - 200.0,
+                Corner::Left => full.left() + 60.0,
+            };
+            let intruder = Rect::from_min_size(pos2(x, bar_rect.top() - 60.0), vec2(114.0, 84.0));
+            l.others[0].rect = intruder;
+            let short = rect(&l).expect("shorter, still there");
+            assert!(short.top() >= intruder.bottom(), "{corner:?}: {short:?} under {intruder:?}");
+            assert!(short.height() < tall.height());
+            assert!(!short.intersects(intruder));
+            // A seat down to the window's edge leaves no room at all.
+            l.others[0].rect = Rect::from_min_size(pos2(x, full.bottom() - 30.0), vec2(114.0, 84.0));
+            assert_eq!(rect(&l), None, "{corner:?}");
+        }
+    }
+
     #[test]
     fn the_pop_settles() {
         assert_eq!(pop_scale(1.0), 1.0);

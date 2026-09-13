@@ -52,7 +52,7 @@ pub fn draw(ui: &mut egui::Ui, zone: Rect, view: &TableView, state: &mut TableUi
 
     let w = panel_width(zone);
     let top = zone.top() + 50.0;
-    let bottom = (zone.bottom() - 10.0).max(top + 120.0);
+    let bottom = side_panel_bottom(zone);
     if state.chat_open {
         let rect = Rect::from_min_max(pos2(zone.left() + 10.0, top), pos2(zone.left() + 10.0 + w, bottom));
         if let Some(line) = panel(ui, rect, "chat-panel", |ui| chat(ui, view, state)) {
@@ -69,8 +69,30 @@ pub fn draw(ui: &mut egui::Ui, zone: Rect, view: &TableView, state: &mut TableUi
     action
 }
 
+/// Where the chat and log panels end.
+pub fn side_panel_bottom(zone: Rect) -> f32 {
+    (zone.bottom() - 10.0).max(zone.top() + 50.0 + 120.0)
+}
+
+/// The least height of the chat beside the bar: the line to type in, and its
+/// frame.
+pub const CORNER_CHAT_MIN_H: f32 = 44.0;
+
+/// The chat in the corner left of the action bar (the owner, 2026-09-13), in
+/// the odds' frame on the other side: what was said, as many lines as the
+/// corner holds, and the line to say something.
+pub fn chat_corner(ui: &egui::Ui, rect: Rect, view: &TableView, state: &mut TableUi) -> Option<TableAction> {
+    framed(ui, rect, "chat-corner", 10.0, 8.0, 0.92, |ui| chat(ui, view, state)).map(TableAction::Say)
+}
+
 /// A side panel: the rounded, shadowed Green Casino box, over the table.
 fn panel<R>(ui: &egui::Ui, rect: Rect, id: &str, add: impl FnOnce(&mut egui::Ui) -> Option<R>) -> Option<R> {
+    framed(ui, rect, id, 16.0, 12.0, 0.95, add)
+}
+
+/// The Green Casino box over the table, with `radius`, `pad` and the fill's
+/// `opacity`.
+fn framed<R>(ui: &egui::Ui, rect: Rect, id: &str, radius: f32, pad: f32, opacity: f32, add: impl FnOnce(&mut egui::Ui) -> Option<R>) -> Option<R> {
     let mut out = None;
     egui::Area::new(ui.id().with(id))
         .order(egui::Order::Foreground)
@@ -79,12 +101,12 @@ fn panel<R>(ui: &egui::Ui, rect: Rect, id: &str, add: impl FnOnce(&mut egui::Ui)
             ui.set_min_size(rect.size());
             ui.set_max_size(rect.size());
             let p = ui.painter();
-            style::shadow(p, rect, 16.0, 3.0, 18.0, Color32::from_black_alpha(140));
-            p.rect_filled(rect, 16.0, style::faded(style::PANEL_BG, 0.95));
-            p.rect_stroke(rect, 16.0, Stroke::new(1.0, style::PANEL_BORDER), StrokeKind::Inside);
+            style::shadow(p, rect, radius, 3.0, radius + 2.0, Color32::from_black_alpha(140));
+            p.rect_filled(rect, radius, style::faded(style::PANEL_BG, opacity));
+            p.rect_stroke(rect, radius, Stroke::new(1.0, style::PANEL_BORDER), StrokeKind::Inside);
             // Clicks on the panel stay in the panel.
             let _ = ui.interact(rect, ui.id().with("eat"), egui::Sense::click());
-            let inner = rect.shrink(12.0);
+            let inner = rect.shrink(pad);
             ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
                 ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
                 ui.visuals_mut().extreme_bg_color = style::PANEL_SURFACE;
@@ -98,29 +120,31 @@ fn panel<R>(ui: &egui::Ui, rect: Rect, id: &str, add: impl FnOnce(&mut egui::Ui)
 /// `ChatBox`: what was said, newest at the bottom, and a line to say
 /// something; Enter or the arrow sends it.
 fn chat(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Option<String> {
-    let input_h = 28.0;
-    let history_h = (ui.available_height() - input_h - 8.0).max(40.0);
+    let input_h = (ui.available_height() / 5.0).clamp(24.0, 28.0);
+    let history_h = ui.available_height() - input_h - ui.spacing().item_spacing.y;
     let width = ui.available_width();
-    ui.allocate_ui(vec2(width, history_h), |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("table-chat-history")
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                ui.set_width(width - 14.0);
-                if view.chat.is_empty() {
-                    ui.label(egui::RichText::new("the table is quiet").italics().color(style::PANEL_MUTED).font(style::font(13.0, Weight::Regular)));
-                }
-                for line in &view.chat {
-                    let mut job = LayoutJob::default();
-                    job.wrap.max_width = width - 14.0;
-                    job.append(&format!("{}:", line.who), 0.0, TextFormat::simple(style::font(13.0, Weight::Bold), style::PANEL_TEXT));
-                    // Untrusted display data, rendered as data.
-                    job.append(&line.said, 6.0, TextFormat::simple(style::font(13.0, Weight::Regular), style::PANEL_TEXT_2));
-                    ui.label(job);
-                }
-            });
-    });
+    if history_h >= 16.0 {
+        ui.allocate_ui(vec2(width, history_h), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("table-chat-history")
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.set_width(width - 14.0);
+                    if view.chat.is_empty() {
+                        ui.label(egui::RichText::new("the table is quiet").italics().color(style::PANEL_MUTED).font(style::font(13.0, Weight::Regular)));
+                    }
+                    for line in &view.chat {
+                        let mut job = LayoutJob::default();
+                        job.wrap.max_width = width - 14.0;
+                        job.append(&format!("{}:", line.who), 0.0, TextFormat::simple(style::font(13.0, Weight::Bold), style::PANEL_TEXT));
+                        // Untrusted display data, rendered as data.
+                        job.append(&line.said, 6.0, TextFormat::simple(style::font(13.0, Weight::Regular), style::PANEL_TEXT_2));
+                        ui.label(job);
+                    }
+                });
+        });
+    }
     let mut said = None;
     ui.horizontal(|ui| {
         let send_w = input_h;
@@ -144,7 +168,8 @@ fn chat(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Option<Stri
         );
         let (send_rect, send) = ui.allocate_exact_size(vec2(send_w, input_h), egui::Sense::click());
         let ready = !state.chat_draft.trim().is_empty();
-        style::icon(ui.painter(), Rect::from_center_size(send_rect.center(), vec2(18.0, 18.0)), Icon::Send, if ready { style::SEND } else { style::faded(style::SEND, 0.4) });
+        let icon = (input_h * 0.64).round();
+        style::icon(ui.painter(), Rect::from_center_size(send_rect.center(), vec2(icon, icon)), Icon::Send, if ready { style::SEND } else { style::faded(style::SEND, 0.4) });
         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if (entered || send.clicked()) && ready {
             said = Some(std::mem::take(&mut state.chat_draft));

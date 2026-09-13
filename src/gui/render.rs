@@ -715,6 +715,19 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                         f.sound = Some(sound);
                     }
 
+                    // The owner, 2026-09-13: the odds beside the table's action
+                    // bar, shown or hidden here, shown by default.
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Table").color(theme::TEXT).strong());
+                    let mut show_odds = f.show_odds();
+                    if ui.checkbox(&mut show_odds, "Show the odds beside the action bar").changed() {
+                        f.show_odds = Some(show_odds);
+                    }
+                    let mut show_chat = f.show_chat();
+                    if ui.checkbox(&mut show_chat, "Show the chat beside the action bar").changed() {
+                        f.show_chat = Some(show_chat);
+                    }
+
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui

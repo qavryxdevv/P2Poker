@@ -64,6 +64,16 @@ pub struct Settings {
     /// which reads as PokerTH's defaults: everything on, volume eight.
     #[n(2)]
     pub sound: Option<SoundSettings>,
+    /// The odds beside the table's action bar (the owner, 2026-09-13: shown
+    /// or hidden in the settings, shown by default). `None` in a file written
+    /// before the switch existed, which reads as shown.
+    #[n(3)]
+    pub show_odds: Option<bool>,
+    /// The table chat beside the action bar, on its other side (the owner,
+    /// 2026-09-13: *in the same way, the chat in the left corner*). `None`
+    /// reads as shown.
+    #[n(4)]
+    pub show_chat: Option<bool>,
 }
 
 /// PokerTH's sound settings (`SoundSettings.qml`, `configfile.cpp`'s defaults):
@@ -130,12 +140,26 @@ impl Settings {
             nickname: super::profile::short_name(&app_key.verifying_key().to_bytes()),
             text_percent: 100,
             sound: None,
+            show_odds: None,
+            show_chat: None,
         }
     }
 
     /// The sound switches in force: the player's, or PokerTH's defaults.
     pub fn sound(&self) -> SoundSettings {
         self.sound.unwrap_or_default()
+    }
+
+    /// Whether the table shows the odds beside its action bar: yes unless the
+    /// player said no.
+    pub fn show_odds(&self) -> bool {
+        self.show_odds.unwrap_or(true)
+    }
+
+    /// Whether the table shows its chat beside the action bar: yes unless the
+    /// player said no.
+    pub fn show_chat(&self) -> bool {
+        self.show_chat.unwrap_or(true)
     }
 
     /// The scale as egui wants it.
@@ -231,9 +255,41 @@ mod tests {
             nickname: "Alice".into(),
             text_percent: 130,
             sound: None,
+            show_odds: None,
+            show_chat: None,
         };
         save(&dir, &s, &k).unwrap();
         assert_eq!(load(&dir, &k), s);
+    }
+
+    /// A file written before the odds switch existed still reads, and reads as
+    /// the odds shown.
+    #[test]
+    fn a_file_from_before_the_odds_switch_shows_the_odds() {
+        #[derive(minicbor::Encode)]
+        #[cbor(array)]
+        struct Before {
+            #[n(0)]
+            nickname: String,
+            #[n(1)]
+            text_percent: u16,
+            #[n(2)]
+            sound: Option<SoundSettings>,
+        }
+        let dir = scratch("before-odds");
+        let k = key();
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = Before { nickname: "Alice".into(), text_percent: 110, sound: Some(SoundSettings { volume: 3, ..Default::default() }) };
+        std::fs::write(settings_path(&dir), minicbor::to_vec(&old).unwrap()).unwrap();
+        let s = load(&dir, &k);
+        assert_eq!(s.nickname, "Alice");
+        assert_eq!(s.sound().volume, 3);
+        assert_eq!(s.show_odds, None);
+        assert!(s.show_odds());
+        assert!(s.show_chat());
+        let hidden = Settings { show_odds: Some(false), ..s };
+        save(&dir, &hidden, &k).unwrap();
+        assert!(!load(&dir, &k).show_odds());
     }
 
     /// A first run has no file and is not an error.
@@ -243,6 +299,8 @@ mod tests {
         let k = key();
         let s = load(&dir, &k);
         assert_eq!(s.text_percent, 100);
+        assert!(s.show_odds(), "the odds are shown by default");
+        assert!(s.show_chat(), "and so is the chat beside the bar");
         assert_eq!(s.nickname.len(), 8, "eight characters of the player's key");
         assert!(!settings_path(&dir).exists(), "loading writes nothing");
     }
@@ -270,6 +328,8 @@ mod tests {
             nickname: "x".repeat(64),
             text_percent: 100,
             sound: None,
+            show_odds: None,
+            show_chat: None,
         };
         s.repair(&k);
         assert!(s.nickname.len() <= NAME_MAX);
@@ -278,6 +338,8 @@ mod tests {
             nickname: "a\u{7}b\nc".into(),
             text_percent: 100,
             sound: None,
+            show_odds: None,
+            show_chat: None,
         };
         s.repair(&k);
         assert!(!s.nickname.chars().any(|c| c.is_control()));
@@ -288,6 +350,8 @@ mod tests {
             nickname: "   ".into(),
             text_percent: 100,
             sound: None,
+            show_odds: None,
+            show_chat: None,
         };
         s.repair(&k);
         assert_eq!(s.nickname, Settings::defaults(&k).nickname);
@@ -304,6 +368,8 @@ mod tests {
                 nickname: "\u{1F0A1}".repeat(n),
                 text_percent: 100,
                 sound: None,
+                show_odds: None,
+                show_chat: None,
             };
             s.repair(&k);
             assert!(s.nickname.len() <= NAME_MAX, "{n}");
@@ -324,6 +390,8 @@ mod tests {
             nickname: "Alice".into(),
             text_percent: 5_000,
             sound: None,
+            show_odds: None,
+            show_chat: None,
         };
         // Written past `save`'s own repair, the way a person editing the file
         // would.
@@ -335,6 +403,8 @@ mod tests {
             nickname: "Alice".into(),
             text_percent: 1,
             sound: None,
+            show_odds: None,
+            show_chat: None,
         };
         std::fs::write(settings_path(&dir), minicbor::to_vec(&tiny).unwrap()).unwrap();
         assert_eq!(load(&dir, &k).text_percent, SCALE_MIN);
@@ -347,6 +417,8 @@ mod tests {
             nickname: "Alice".into(),
             text_percent: 100,
             sound: None,
+            show_odds: None,
+            show_chat: None,
         };
         assert_eq!(s.zoom(), 1.0);
     }
@@ -363,6 +435,8 @@ mod tests {
                 nickname: "First".into(),
                 text_percent: 100,
                 sound: None,
+                show_odds: None,
+                show_chat: None,
             },
             &k,
         )
@@ -373,6 +447,8 @@ mod tests {
                 nickname: "Second".into(),
                 text_percent: 120,
                 sound: None,
+                show_odds: None,
+                show_chat: None,
             },
             &k,
         )

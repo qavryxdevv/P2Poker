@@ -4145,10 +4145,23 @@ style and its `preview.png` for the look. `assets/pokerth/PROVENANCE.md` names e
     *Mute* and *Unmute*.
 11. **Not taken, because nothing here stands behind them:** PokerTH's emoji reactions, spectators, private messages,
     forum news, the web table statistics and the zoom.
+12. **The odds and the chat beside the action bar** (the owner, the same day, on a screenshot of a live table: the
+    odds *in the bottom right corner*, *shown or hidden in the settings, shown by default*, *it must follow the
+    window's size so it stays in that area*, *shrink its height so it does not cover the seated players*, no *Odds*
+    heading, and *in the same way the chat in the left corner*). `corner_rect` gives each corner from the bar to the
+    window's edge and down to the bottom, at most 380 points wide and at least 150, reaching up to 36 points past the
+    bar's top; every seat's box and puck in the way lowers its top, so the panel grows shorter instead of covering a
+    seat, and it is left out only when not even its first line fits. The right corner holds the hero's hand and its
+    likeliest improvements, as many rows as fit; the left one holds the table chat with its line to type in, and
+    stands down while the big chat panel is open, so there is one place to type. Two switches in both settings
+    dialogs, `show_odds` and `show_chat`, optional fields an older settings file reads as shown.
 
 **Guard.** `gui::table::seats`, `gui::table::style`, `gui::table::bar`, `gui::table::icons`, `gui::table` (the view, the
-phases, the blind seats, the badge's pop), `app::tablelog`, `sound`, `storage::notes`, `storage::settings`,
+phases, the blind seats, the badge's pop, `both_corners_stay_in_their_corners_at_every_size` over seven window sizes
+and two to ten seats, `a_seat_in_a_corner_makes_the_panel_shorter_not_hidden`), `app::tablelog`, `sound`,
+`storage::notes`, `storage::settings` (`a_file_from_before_the_odds_switch_shows_the_odds`),
 `gui::render::both_themes_get_the_same_palette`; `p2p-poker --table-preview` draws the window from the sample hand with no
 node (`--preview-seats N`, `--preview-panels`, `--preview-over`, `--preview-note`, `--preview-gone`, `--preview-out`,
-`--preview-line`, `--preview-absent`, `--preview-sound`, `--preview-ranking`, `--preview-player-note`), each photographed
-against `preview.png`.
+`--preview-line`, `--preview-absent`, `--preview-sound`, `--preview-ranking`, `--preview-player-note`, `--preview-odds`,
+`--preview-chat`), each photographed against `preview.png`, and the corners at 760 by 560, 1000 by 720, 900 by 1000 and
+1800 by 980 with two, six and ten seats.

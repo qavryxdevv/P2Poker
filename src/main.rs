@@ -169,7 +169,9 @@ fn main() {
     // the heads-up question. The rest open one window or message each:
     // `--preview-out` (out of the game), `--preview-line` (line down),
     // `--preview-absent` (seats off the line), `--preview-sound`,
-    // `--preview-ranking` and `--preview-player-note`.
+    // `--preview-ranking` and `--preview-player-note`; `--preview-odds` puts the
+    // sample hand on the flop, so the odds have something to say, and
+    // `--preview-chat` gives the table something said.
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -1288,6 +1290,20 @@ fn preview_table(args: &[String]) {
     if has("--preview-gone") {
         view.opponent_gone_s = Some(21);
     }
+    if has("--preview-odds") {
+        view.board[3] = Facing::Empty;
+        view.board[4] = Facing::Empty;
+        view.street = "flop".into();
+        view.hero_hand = Some("a pair of eights".into());
+        view.improve_by = Some("by the river");
+        view.improve_total = 0.35;
+        view.improve = vec![
+            ("two pair".into(), 0.2146),
+            ("three of a kind".into(), 0.0842),
+            ("a full house".into(), 0.0333),
+            ("four of a kind".into(), 0.0009),
+        ];
+    }
     if has("--preview-out") {
         view.out_for_good = Some("certified out after the fourth absence (hand 128)".into());
     }
@@ -1298,6 +1314,14 @@ fn preview_table(args: &[String]) {
         view.absent = vec![
             table::AbsentSeat { seat: 2, name: "Carol".into(), certified: false, waited: true, on_clock_s: Some(14), quiet_s: Some(9) },
             table::AbsentSeat { seat: 4, name: "Erin".into(), certified: true, waited: false, on_clock_s: None, quiet_s: Some(31) },
+        ];
+    }
+    if has("--preview-chat") {
+        view.chat = vec![
+            table::TableChatLine { seat: 2, who: "Carol".into(), said: "nice hand".into() },
+            table::TableChatLine { seat: 0, who: "Alice".into(), said: "thanks, gl".into() },
+            table::TableChatLine { seat: 1, who: "Bob".into(), said: "that river was cruel, I had the flush draw all the way".into() },
+            table::TableChatLine { seat: 2, who: "Carol".into(), said: "next one".into() },
         ];
     }
     let mut ui_state = table::TableUi::default();
