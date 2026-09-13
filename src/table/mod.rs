@@ -22,4 +22,7 @@ pub mod dispute;
 /// Carrying a message over a transport whose packets are smaller than it
 /// (D-019: every Tox channel caps at about 1372 bytes).
 pub mod fragment;
+/// `D-051`: who a member of the table's carrier group is, and whether it
+/// floods the group.
+pub mod membership;
 pub mod join;

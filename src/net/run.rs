@@ -681,6 +681,15 @@ struct TableRun {
     out_keys: std::collections::BTreeSet<[u8; 32]>,
     /// `D-047`: this client's own seat has been told it is out.
     out_told: bool,
+    /// `D-051`: the seats this client cut off for flooding the table's group,
+    /// with when -- its votes about them carry the flood cause, it votes for no
+    /// return of theirs, and one still in the game `UNSAFE_AFTER_MS` later
+    /// makes the table not safe.
+    flooders: std::collections::BTreeMap<u8, std::time::Instant>,
+    /// `D-051`: when members that are no seat were cut off here.
+    strangers: Vec<std::time::Instant>,
+    /// `D-051`: why the window was last told the table is not safe, and when.
+    unsafe_said: Option<(String, std::time::Instant)>,
     /// `S1-EH`: whether another seat was ever on the line here, and whether
     /// the last word about this client's own line was *nobody reachable*.
     ever_on_line: bool,
@@ -860,6 +869,9 @@ impl TableRun {
             out_words: Vec::new(),
             out_keys: std::collections::BTreeSet::new(),
             out_told: false,
+            flooders: std::collections::BTreeMap::new(),
+            strangers: Vec::new(),
+            unsafe_said: None,
             ever_on_line: false,
             nobody_said: false,
             readmitted: Vec::new(),
@@ -2108,6 +2120,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         ($t:ident, $h:expr) => {{
             let evidence = $t.sit_ins.complete($h.hand_id());
             if !evidence.is_empty() {
+                // `D-051`: no return for a seat cut off here for flooding.
+                let flooders: Vec<u8> = $t.flooders.keys().copied().collect();
+                $h.note_flooders(&flooders);
                 match $h.vote_on_returns(&evidence, &app_key, super::node::now_unix_ms()) {
                     Ok(sends) => {
                         if !sends.is_empty() {
@@ -2271,8 +2286,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // felt shows is a seat that left. Silence is no condition here:
                     // a seat certified four times over is out whether its line is
                     // bad or its play is.
-                    let at_the_limit = $h.returns().get(usize::from(seat)).copied().unwrap_or(0)
-                        >= crate::protocol::constants::MAX_RETURNS;
+                    // `D-051`: or certified with the flood cause by every voter --
+                    // out for good the same way.
+                    let flooded = $h.named_for_flooding(seat);
+                    let at_the_limit = flooded
+                        || $h.returns().get(usize::from(seat)).copied().unwrap_or(0)
+                            >= crate::protocol::constants::MAX_RETURNS;
                     if at_the_limit {
                         // The word for the seat's own client, kept for this
                         // client's lobby answers; and no request from that key
@@ -2304,9 +2323,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             for_good: true,
                         });
                         let _ = events
-                            .send(NodeEvent::Warning(format!(
-                                "seat {seat} is out of the table for good after its fourth absence (D-047): removed from the table's group by the table's word, never to be invited again; its chips leave the table at the boundary"
-                            )))
+                            .send(NodeEvent::Warning(if flooded {
+                                format!(
+                                    "seat {seat} is out of the table for good for flooding the table's group (D-051): every voter's client cut it off, the certificate says so, it is removed from the group by the table's word and never invited again; its chips leave the table at the boundary"
+                                )
+                            } else {
+                                format!(
+                                    "seat {seat} is out of the table for good after its fourth absence (D-047): removed from the table's group by the table's word, never to be invited again; its chips leave the table at the boundary"
+                                )
+                            }))
                             .await;
                         let _ = events.send(NodeEvent::SeatLeft { seat, quit: true }).await;
                         continue;
@@ -2774,7 +2799,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // leaves, a window holds the table for its player to close.
                                 for w in out_words.iter().filter(|w| w.app_key == my_app_key) {
                                     for i in 0..tables.len() {
-                                        let verdict: Option<String> = (|| {
+                                        let verdict: Option<(String, bool)> = (|| {
                                             let t = &tables[i];
                                             let f = t.table.as_ref()?;
                                             if t.out_told || f.table_id() != w.table_id || f.my_seat() != Some(w.seat) {
@@ -2794,17 +2819,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             {
                                                 return None;
                                             }
-                                            Some(format!(
-                                                "seat {} -- this client -- is out of the table for good after its fourth absence (D-047): the table's word, certified by seats {:?} at hand #{}, carried in the lobby answer of {peer}",
-                                                w.seat, voters, w.hand_id
+                                            // `D-051`: the votes say why.
+                                            let flooded = crate::table::hand::certificate_cause(&w.cert, &w.table_id, w.hand_id, w.seat)
+                                                == Some(crate::table::handwire::CAUSE_FLOOD);
+                                            Some((
+                                                if flooded {
+                                                    format!(
+                                                        "seat {} -- this client -- is out of the table for good for flooding the table's group (D-051): the table's word, certified by seats {:?} at hand #{}, carried in the lobby answer of {peer}",
+                                                        w.seat, voters, w.hand_id
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "seat {} -- this client -- is out of the table for good after its fourth absence (D-047): the table's word, certified by seats {:?} at hand #{}, carried in the lobby answer of {peer}",
+                                                        w.seat, voters, w.hand_id
+                                                    )
+                                                },
+                                                flooded,
                                             ))
                                         })();
-                                        if let Some(why) = verdict {
+                                        if let Some((why, flooded)) = verdict {
                                             let t = &mut tables[i];
                                             t.out_told = true;
                                             let _ = events.send(NodeEvent::Warning(why.clone())).await;
                                             let _ = events
-                                                .send(NodeEvent::OutForGood { key: w.table_id, why: why.clone() })
+                                                .send(NodeEvent::OutForGood { key: w.table_id, why: why.clone(), flooded })
                                                 .await;
                                             if autoplay.is_some() {
                                                 leave_table_now!(t, why);
@@ -4643,6 +4681,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             &ad.table_name,
                             &nickname,
                             Vec::new(),
+                            // `D-051`: the seat's key, for its member binding.
+                            Some(app_key.clone()),
                         ) {
                             Ok(Some(mine)) => {
                                 match t.tox_sink
@@ -4868,6 +4908,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &held.ad.table_name,
                                     &nickname,
                                     vec![founder_tox],
+                                    Some(app_key.clone()),
                                 ) {
                                     Ok(k) => {
                                         match k {
@@ -5018,6 +5059,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     &ad.table_name,
                                     &nickname,
                                     members,
+                                    Some(app_key.clone()),
                                 ) {
                                     Ok(_) => {
                                         let _ = events
@@ -5256,6 +5298,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             Some((which, item)) = next_from_tables(&mut tables) => {
                 let t = &mut tables[which];
                 mark_table(&events, &mut marked, t).await;
+                // `D-051`: bytes that are no signed event, or whose signature does
+                // not verify under the key inside them, are noise no client of this
+                // build sends -- counted against the member that carried them, and
+                // read no further.
+                if let Some(gk) = item.claimed {
+                    if crate::net::chained::noise(&item.bytes, crate::table::fragment::MAX_MESSAGE).is_some() {
+                        t.tox_sink.tell(super::toxsink::Seat::Noise { member_key: gk });
+                        continue;
+                    }
+                }
                 // **Learn who this group peer is, once, from a signature.**
                 // The driver reports a sender by its group key and cannot get
                 // further; the roster is keyed by application key. Pairing them
@@ -5857,6 +5909,57 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if !t.tox_sink.is_on_tox() {
                         continue;
                     }
+                    // `D-051`: the members the carrier cut off, said at once and
+                    // remembered: a flooder's seat by seat, a stranger by when.
+                    let cuts = t.tox_sink.take_cut_offs();
+                    if !cuts.is_empty() {
+                        mark_table(&events, &mut marked, t).await;
+                        for c in cuts {
+                            let seat = c
+                                .app_key
+                                .and_then(|a| t.table.as_ref().and_then(|f| f.roster().seat_of(&a)));
+                            let member = short_hash(&c.member_key);
+                            match (&c.flood, seat) {
+                                (Some(what), Some(seat)) => {
+                                    let fresh = !t.flooders.contains_key(&seat);
+                                    t.flooders.entry(seat).or_insert_with(std::time::Instant::now);
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "seat {seat} flooded the table's group ({what}): group member {member} is cut off here for good, and so is every entry that seat takes; this client votes about it with the flood cause and for no return of it (D-051)"
+                                        )))
+                                        .await;
+                                    if fresh {
+                                        let _ = events.send(NodeEvent::SeatFlooded { seat }).await;
+                                    }
+                                }
+                                (Some(what), None) => {
+                                    t.strangers.push(std::time::Instant::now());
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "group member {member}, no seat of this table, flooded the table's group ({what}) and is cut off here for good (D-051)"
+                                        )))
+                                        .await;
+                                }
+                                (None, Some(seat)) => {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "group member {member}, bound to seat {seat}, is cut off here: {} (D-051)",
+                                            c.why
+                                        )))
+                                        .await;
+                                }
+                                (None, None) => {
+                                    t.strangers.push(std::time::Instant::now());
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "group member {member} is no seat of this table and is removed from the group here: {} (D-051)",
+                                            c.why
+                                        )))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
                     let Some(f) = t.table.as_ref() else {
                         continue;
                     };
@@ -5910,6 +6013,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let t = &mut tables[which];
                     mark_table(&events, &mut marked, t).await;
                     let now = super::node::now_unix_ms();
+                    // `D-051`: the seats, said again, so the carrier's list is never
+                    // older than this tick; and whether the table is safe.
+                    if let Some(f) = t.table.as_ref() {
+                        seats_on_tox(f, &t.tox_sink);
+                    }
+                    let unsafe_now = unsafe_reason(t);
+                    let say = match (&unsafe_now, &t.unsafe_said) {
+                        (Some(why), Some((said, at))) => why != said || at.elapsed() >= UNSAFE_ASK_AGAIN,
+                        (Some(_), None) => true,
+                        (None, Some(_)) => true,
+                        (None, None) => false,
+                    };
+                    if say {
+                        t.unsafe_said = unsafe_now.clone().map(|w| (w, std::time::Instant::now()));
+                        if let Some(why) = &unsafe_now {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!("this table is not safe: {why} (D-051)")))
+                                .await;
+                        }
+                        let _ = events.send(NodeEvent::TableUnsafe { why: unsafe_now }).await;
+                    }
                     // `D-042`, the owner's rule: when the tournament is over, the
                     // group it was played in is left and the friends it was played
                     // with go (after `FRIEND_LINGER`, at the driver). A little after
@@ -6239,17 +6363,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // does at its fourth absence.
                     let out_myself = t.hand.as_ref().and_then(|h| {
                         let me = h.my_seat();
-                        h.out_for_good().contains(&me).then_some(me)
+                        h.out_for_good().contains(&me).then_some((me, h.named_for_flooding(me)))
                     });
-                    if let Some(me) = out_myself {
+                    if let Some((me, flooded)) = out_myself {
                         if !t.out_told {
                             t.out_told = true;
-                            let why = format!(
-                                "seat {me} -- this client -- is out of the table for good after its fourth absence (D-047): the table certified it four times over"
-                            );
+                            let why = if flooded {
+                                format!(
+                                    "seat {me} -- this client -- is out of the table for good for flooding the table's group (D-051): every other voter's client cut it off"
+                                )
+                            } else {
+                                format!(
+                                    "seat {me} -- this client -- is out of the table for good after its fourth absence (D-047): the table certified it four times over"
+                                )
+                            };
                             let key = t.table.as_ref().map(|f| f.table_id()).unwrap_or([0; 32]);
                             let _ = events.send(NodeEvent::Warning(why.clone())).await;
-                            let _ = events.send(NodeEvent::OutForGood { key, why: why.clone() }).await;
+                            let _ = events.send(NodeEvent::OutForGood { key, why: why.clone(), flooded }).await;
                             // A headless client leaves at once; a window holds the
                             // table until its player closes it.
                             if autoplay.is_some() {
@@ -7072,6 +7202,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // more this is the answer, and the abort below is what happens
                     // when it is not available — heads-up, where "unanimity" would
                     // be the one opponent.
+                    // `D-051`: a seat cut off here for flooding is voted about with
+                    // the flood cause.
+                    let flooders: Vec<u8> = t.flooders.keys().copied().collect();
+                    h.note_flooders(&flooders);
                     match h.vote_on_timeouts(&app_key, now, t.tox_sink.mid_delivery()) {
                         Ok(sends) if !sends.is_empty() => {
                             // Said out loud, because a table that is waiting on
@@ -8726,6 +8860,93 @@ fn seat_on_tox(f: &Formation, tox: &super::toxsink::TableSink) {
         return;
     }
     tox.tell(super::toxsink::Seat::Roster(keys));
+    seats_on_tox(f, tox);
+}
+
+/// `D-051`: how long a seat cut off for flooding may stay in the game before
+/// the table is not safe -- a certificate about it comes at its next stage,
+/// thirty seconds out, and this is four of those.
+const UNSAFE_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `D-051`: how often the window is asked again about a table still not safe.
+const UNSAFE_ASK_AGAIN: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `D-051`: strangers removed within this long ...
+const STRANGERS_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+/// ... this many times make the table not safe: a player keeps letting them in.
+const STRANGERS_LIMIT: usize = 3;
+
+/// `D-051`, the owner's fallback: why this table is not safe, when the table
+/// cannot deal with what floods it -- or `None`.
+///
+/// * heads-up, the other seat flooded: nothing at two seats puts a player out;
+/// * the seats cut off for flooding are half the seats in the hand or more:
+///   no certificate forms about them (D-036);
+/// * a seat cut off here is still in the game `UNSAFE_AFTER` later: the other
+///   seats do not put it out -- it floods only some of them, or a player does
+///   not vote;
+/// * `STRANGERS_LIMIT` strangers removed within `STRANGERS_WINDOW`.
+fn unsafe_reason(t: &TableRun) -> Option<String> {
+    let now = std::time::Instant::now();
+    if let Some(h) = t.hand.as_ref() {
+        let out = h.out_for_good();
+        let in_game: Vec<u8> = t
+            .flooders
+            .keys()
+            .copied()
+            .filter(|s| h.required().contains(s) && !h.certified_seats().contains(s) && !out.contains(s))
+            .collect();
+        if !in_game.is_empty() {
+            let seats = h.required().len();
+            if seats <= 2 {
+                return Some(
+                    "your opponent flooded the table's connection with junk traffic. It is cut off here, but at two seats nothing can put a player out of the game."
+                        .to_string(),
+                );
+            }
+            if in_game.len() * 2 >= seats {
+                return Some(format!(
+                    "{} of the {seats} players flooded the table's connection with junk traffic. They are cut off here, but too few other players are left to put them out of the game.",
+                    in_game.len()
+                ));
+            }
+            let oldest = in_game.iter().filter_map(|s| t.flooders.get(s)).min();
+            if oldest.is_some_and(|at| now.duration_since(*at) >= UNSAFE_AFTER) {
+                return Some(format!(
+                    "{} flooded the table's connection with junk traffic and {} still in the game {} s later: the other players do not put {} out.",
+                    if in_game.len() == 1 { format!("seat {}", in_game[0]) } else { format!("seats {in_game:?}") },
+                    if in_game.len() == 1 { "is" } else { "are" },
+                    UNSAFE_AFTER.as_secs(),
+                    if in_game.len() == 1 { "it" } else { "them" }
+                ));
+            }
+        }
+    }
+    let strangers = t.strangers.iter().filter(|at| now.duration_since(**at) < STRANGERS_WINDOW).count();
+    if strangers >= STRANGERS_LIMIT {
+        return Some(format!(
+            "{strangers} strangers who are no players entered the table's connection within {} minutes and were removed: somebody at the table keeps letting them in.",
+            STRANGERS_WINDOW.as_secs() / 60
+        ));
+    }
+    None
+}
+
+/// `D-051`: the seats' application keys, which a member's binding must name,
+/// and whether the roster is ratified -- said with every roster, and again on
+/// the stall tick so the driver's list is never older than that.
+fn seats_on_tox(f: &Formation, tox: &super::toxsink::TableSink) {
+    if !tox.is_on_tox() {
+        return;
+    }
+    let apps: Vec<[u8; 32]> = f.roster().seats().iter().map(|e| e.app_public_key).collect();
+    if apps.is_empty() {
+        return;
+    }
+    tox.tell(super::toxsink::Seat::Seats {
+        apps,
+        fixed: f.session().is_some(),
+    });
 }
 
 async fn report_roster(events: &Events, f: &Formation) {

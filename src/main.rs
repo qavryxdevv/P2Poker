@@ -173,7 +173,9 @@ fn main() {
     // sample hand on the flop, so the odds have something to say, and
     // `--preview-chat` gives the table something said; `--preview-sitout` sits
     // the hero and seat 2 out, `--preview-bust` has the hero finish fourth and
-    // `--preview-won` win the tournament; `--preview-show` offers *Show cards*.
+    // `--preview-won` win the tournament; `--preview-show` offers *Show cards*;
+    // `--preview-flooded` is out for flooding the group and `--preview-unsafe`
+    // says the table is not safe (D-051).
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -1337,6 +1339,17 @@ fn preview_table(args: &[String]) {
     }
     if has("--preview-out") {
         view.out_for_good = Some("certified out after the fourth absence (hand 128)".into());
+    }
+    // `D-051`: out for flooding the table's group, and the table not safe.
+    if has("--preview-flooded") {
+        view.out_for_good = Some("certified out for flooding the table's group (hand 128)".into());
+        view.out_flooded = true;
+    }
+    if has("--preview-unsafe") {
+        view.unsafe_note = Some((
+            "2 of the 4 players flooded the table's connection with junk traffic. They are cut off here, but too few other players are left to put them out of the game.".into(),
+            1,
+        ));
     }
     if has("--preview-line") {
         view.line = Some("This client has heard nobody at the table for 12 s. Your seat keeps its cards; the hand goes on when the line is back".into());

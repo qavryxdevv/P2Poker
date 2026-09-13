@@ -747,6 +747,7 @@ change; changing or removing one is a major change.
 | `p2p-poker v1 table-id` | reserved; see §4.1 — `table_id` is currently the table public key itself |
 | `p2p-poker v1 advert` | reserved; unused in version 1. `advert_hash` is everywhere the `event_hash` of the `LOBBY_TABLE_AD`, never a separate digest. Since **D-013** it is a **lobby-layer pointer only**: it names which advertisement a joiner is answering, and it enters no chained hash — not `GENESIS(0)`, not `session_id`, not `ctx`, not `roster_hash`, not `state_hash`. `table_params_hash` (§3.1) carries what it used to be there for. |
 | `p2p-poker v1 timeout-cert` | the certificate subject digest (§8.3) |
+| `p2p-poker v1 member-binding` | what a seat's client signs to say which member of the table's carrier group it is: `h(domain, [chat_id, member_key])`, signed with the seat's application key and carried as the member's name in the group (D-051) |
 
 **This register is the single register for the whole corpus.** A document that
 needs a domain string takes it from here; a document that invents one has a bug.
@@ -2842,6 +2843,14 @@ per D-005"** and rested half on a status nothing sets (J5). The sitting-out half
 survives, in the form that names the chained event rather than the status it
 produces; the absent half is gone with the status.
 
+**D-051 (2026-09-13).** A seat that a certificate names with `cause = 1` -- every voter's own
+client cut it off for flooding the table's carrier group, and the subject digest commits to
+it -- is out of the table for good at that hand's boundary in the way D-047's paragraph below
+states: its chips leave the table, and every client removes it from the carrier group for good.
+The flooding seats' own votes are never needed, because they are the seats named; one voter's
+cause alone completes nothing, because a vote with a cause and a vote without one are about two
+subjects.
+
 **D-047 (2026-09-12).** A seat certified absent that has already come back `MAX_RETURNS`
 times is out of the table for good at that hand's boundary: its chips leave the table
 (`stack_at_hand_start` is zero from hand `k+1`), so every rule in this section treats it
@@ -3380,6 +3389,7 @@ in this paragraph, which records its withdrawal.
 | `n(3) parent_event_hash` | `bytes[32]` | `stage_hash(subject_sequence - 1)` |
 | `n(4) deadline_ms` | `u32` | the `next_deadline_ms` carried by the parent stage's events |
 | `n(5) kind` | `u16` | `1` = action deadline, `2` = cryptographic-step deadline |
+| `n(6) cause` | `Option<u16>` | **D-051.** Absent: the deadline passed, and nothing more is said. `1`: and the voter's own client cut the seat off for flooding the table's carrier group. Any other value, `0` included, is refused. Absent it is not encoded, so a vote without a cause is byte for byte a vote without the field; present, it is part of the subject (`subject_digest` below) |
 
 *Envelope:* `sequence = subject_sequence`,
 `previous_event_hash = parent_event_hash`, `chain_scope = 1` and
@@ -3406,6 +3416,9 @@ remaining field of a vote is a function of `(subject_sequence, subject_seat)`:
 is the parent's `next_deadline_ms`, and `n(5) kind` is fixed by the stage — a
 stage is either a betting stage or a cryptographic stage, never both, so one
 voter can never legitimately hold both kinds against one subject at one stage.
+`n(6) cause` (D-051) is fixed by the voter with its first vote about that seat at
+that stage: a client votes once about one seat at one stage, and a seat it cut off
+after voting is voted about with the cause at its next stage.
 The one field that varies freely is the advisory `emitted_at_unix_ms`, which is
 why §5.2's re-emission rule is normative: a peer that must send its vote again
 sends the stored bytes and never re-signs.
@@ -3452,7 +3465,7 @@ belongs in the key*, and for a certificate that field is the subject.
 
 | Field | Type | Limit / rule |
 |---|---|---|
-| `n(0) subject_digest` | `bytes[32]` | `h("p2p-poker v1 timeout-cert", [u64_be(subject_sequence), bytes(subject_seats), u16_be(subject_event_type), parent_event_hash, u32_be(deadline_ms), u16_be(kind)])` — `subject_seats` the seats named, ascending, one byte each; for one seat this is `u8(subject_seat)` as before (D-036) |
+| `n(0) subject_digest` | `bytes[32]` | `h("p2p-poker v1 timeout-cert", [u64_be(subject_sequence), bytes(subject_seats), u16_be(subject_event_type), parent_event_hash, u32_be(deadline_ms), u16_be(kind)])` — `subject_seats` the seats named, ascending, one byte each; for one seat this is `u8(subject_seat)` as before (D-036) — and, only when a seat is named with a cause (D-051), one more part: every named seat's `cause` as `u16_be`, zero for none, in the seats' order. A subject with no cause hashes exactly as before |
 | `n(1) votes` | `Vec<bytes>` | for every seat named, ascending, one complete `SignedEvent` of a `TIMEOUT_VOTE` about it from every seat of `V(S)`, ascending by voter; ≤ `MAX_SEATS² / 4` entries (D-036: `\|V(S)\| > \|S\|` and `\|S\| + \|V(S)\| <= MAX_SEATS`) |
 
 *Receiver must validate:* every embedded vote independently passes §4.0 steps
@@ -3463,6 +3476,7 @@ from one and the same voter set, no seat of `S` is in it, and that set is exactl
 absent because it is named by this certificate or by a completed, valid
 certificate earlier in this hand** — a `V` shrunk by bare votes is not a `V`;
 `|V(S)| >= 2` and `|V(S)| > |S|`; a `kind = 1` certificate names one seat;
+every vote about one seat names one `cause`, and a defined one (D-051);
 `subject_digest` recomputes; the emitter is itself a member of `V(S)`.
 
 **The certificate stage is collective.** The required emitter set is `V(subject)`;

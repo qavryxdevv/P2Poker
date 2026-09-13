@@ -422,8 +422,15 @@ pub enum NodeEvent {
     SeatLeft { seat: u8, quit: bool },
     /// `D-047`: this client's own seat is out of the table for good -- the
     /// table's word about its fourth absence, verified. The window says so
-    /// and holds the table until the player closes it.
-    OutForGood { key: [u8; 32], why: String },
+    /// and holds the table until the player closes it. `D-051`: `flooded`
+    /// when the word is that it flooded the table's group.
+    OutForGood { key: [u8; 32], why: String, flooded: bool },
+    /// `D-051`: this client cut a seat off for flooding the table's group.
+    SeatFlooded { seat: u8 },
+    /// `D-051`: this table is not safe, and why -- flooders the table cannot put
+    /// out, or strangers let in again and again -- or `None` once it is safe
+    /// again. The window recommends leaving.
+    TableUnsafe { why: Option<String> },
     /// A peer was found in the public lobby, through the DHT.
     ///
     /// Separate from [`LocalPeer`](NodeEvent::LocalPeer) on purpose. The two
@@ -581,6 +588,8 @@ impl NodeEvent {
             | Self::JoinRefused { .. }
             | Self::LeftTable { .. }
             | Self::OutForGood { .. }
+            | Self::SeatFlooded { .. }
+            | Self::TableUnsafe { .. }
             // The lobby list and the counters above it.
             | Self::TableSeen { .. }
             | Self::TableGone { .. }

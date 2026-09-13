@@ -351,6 +351,13 @@ impl<S: Ord + Clone> Reassembler<S> {
         });
     }
 
+    /// `D-051`: forget what this sender had in flight -- it is gone, and the
+    /// transport may give its name to the next sender (a group peer id is
+    /// reused), whose first message must not meet the partial it left.
+    pub fn forget(&mut self, from: &S) {
+        self.senders.remove(from);
+    }
+
     /// How many part-built messages are held, over every sender. For tests and
     /// for a status line; nothing decides anything on it.
     pub fn outstanding(&self) -> usize {

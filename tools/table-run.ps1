@@ -207,6 +207,29 @@ param(
     # log says *showdown: this hand may muck and waits N ms* and what came of it.
     # Needs a binary built with `--features fault-harness`.
     [ValidateSet('', 'show', 'muck')][string]$HoldMuck = '',
+    # `-FloodAt <s> -FloodNodes <list> [-FloodRate <packets/s>] [-FloodKind
+    # noise|lossless|frames|halves]` (D-051): those nodes flood every table's
+    # group from that second of their driver's life -- lossy junk longer than a
+    # fragment, lossless junk a fragment long, well-framed messages of junk, or
+    # first halves of messages that never finish. Every other node's log says
+    # *seat N flooded the table's group (...)* when its own meter says so, and
+    # *out of the table for good for flooding* when the table's certificate does.
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateRange(0, 100000)][int]$FloodAt = 0,
+    [string]$FloodNodes = '',
+    [ValidateRange(1, 100000)][int]$FloodRate = 500,
+    [ValidateSet('noise', 'lossless', 'frames', 'halves')][string]$FloodKind = 'noise',
+    # `-StrangerAt <s> -StrangerNode <n> [-StrangerFlood] [-StrangerName copy]`
+    # (D-051): that node makes a second Tox instance in its own process -- a
+    # stranger, no seat of any table -- and invites it into its table's group,
+    # as any member of a private group can. `-StrangerFlood` has the stranger
+    # flood once it is in; `-StrangerName copy` names it with a copy of a seat's
+    # binding. Every node's log says when it removed the stranger, and why.
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateRange(0, 100000)][int]$StrangerAt = 0,
+    [ValidateRange(0, 32)][int]$StrangerNode = 1,
+    [switch]$StrangerFlood,
+    [ValidateSet('', 'copy')][string]$StrangerName = '',
     # `-StallJoin <seconds> -StallJoinNode <n>` starves one joiner's **group
     # handshake** for that long, right after it accepts the invitation.
     #
@@ -436,6 +459,10 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     $offAt = if ($OfflineAt -gt 0 -and $i -eq $OfflineNode) { $OfflineAt } else { 0 }
     $afkForNode = if ($AfkAt -gt 0 -and $i -eq $AfkNode) { $AfkAt } else { 0 }
     $backForNode = if ($BackAt -gt 0 -and $i -eq $AfkNode) { $BackAt } else { 0 }
+    # `D-051`. Not `$floodNodes`: a local of that name IS the parameter.
+    $floodList = @("$FloodNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+    $floodForNode = if ($FloodAt -gt 0 -and ($floodList -contains $i)) { $FloodAt } else { 0 }
+    $strangerForNode = if ($StrangerAt -gt 0 -and $i -eq $StrangerNode) { $StrangerAt } else { 0 }
     $stall = if ($StallJoin -gt 0 -and $i -eq $StallJoinNode) { $StallJoin } else { 0 }
     $mute = if ($MuteFor -gt 0 -and $i -eq $MuteNode) { $MuteFor } else { 0 }
     # Not `$startStack`: PowerShell's names are case-insensitive and that IS
@@ -444,9 +471,19 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # The founder alone, and handed to the job like the stack: the job sees
     # nothing of this scope (the first run printed the banner and kicked nobody).
     $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, [bool]$StrangerFlood, $StrangerName -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName)
         if ($holdMuck) { $env:P2P_POKER_HOLD_MUCK = "$holdMuck" }
+        $env:P2P_POKER_FLOOD_RATE = "$floodRate"
+        if ($floodAt -gt 0) {
+            $env:P2P_POKER_FLOOD_AT = "$floodAt"
+            $env:P2P_POKER_FLOOD_KIND = "$floodKind"
+        }
+        if ($strangerAt -gt 0) {
+            $env:P2P_POKER_STRANGER_AT = "$strangerAt"
+            if ($strangerFlood) { $env:P2P_POKER_STRANGER_FLOOD = '1' }
+            if ($strangerName) { $env:P2P_POKER_STRANGER_NAME = "$strangerName" }
+        }
         if ($afkAt -gt 0) { $env:P2P_POKER_AFK_AT = "$afkAt" }
         if ($backAt -gt 0) { $env:P2P_POKER_BACK_AT = "$backAt" }
         if ($offAt -gt 0) {
@@ -530,6 +567,12 @@ if ($StallJoin -gt 0) {
 if ($HoldMuck) {
     Write-Host "==> every node's hand that may muck waits at the showdown, then $(if ($HoldMuck -eq 'show') { 'shows at once' } else { 'mucks when the window runs out' })"
     Write-Host "    (needs a binary built with --features fault-harness; D-050)"
+}
+if ($FloodAt -gt 0) {
+    Write-Host "==> n$(("$FloodNodes" -split '[,\s]+' | Where-Object { $_ -ne '' }) -join ', n') flood(s) the table's group from $FloodAt s, $FloodRate packets a second of $FloodKind (D-051)"
+}
+if ($StrangerAt -gt 0) {
+    Write-Host "==> n$StrangerNode lets a stranger into its table's group at $StrangerAt s$(if ($StrangerFlood) { ', and the stranger floods' })$(if ($StrangerName) { ", named with a copy of a seat's binding" }) (D-051)"
 }
 if ($AfkAt -gt 0) {
     Write-Host "==> n$AfkNode stops playing at $AfkAt s and sits out when its clock runs out$(if ($BackAt -gt 0) { "; back at $BackAt s" })"

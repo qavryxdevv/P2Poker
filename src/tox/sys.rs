@@ -372,6 +372,86 @@ extern "C" {
     pub fn tox_callback_group_peer_exit(tox: *mut Tox, callback: tox_group_peer_exit_cb);
     /// `tox.h:5513`
     pub fn tox_callback_group_moderation(tox: *mut Tox, callback: tox_group_moderation_cb);
+
+    /// `tox.h:3615`. `D-051`: this member's name in the group, which a seat's
+    /// client sets to its member binding (`table::membership`). A lossless
+    /// broadcast, and part of the peer information every member exchanges
+    /// with each peer it connects to.
+    pub fn tox_group_self_set_name(
+        tox: *mut Tox,
+        group_number: u32,
+        name: *const u8,
+        length: usize,
+        error: *mut c_int,
+    ) -> bool;
+    /// `tox.h:3717`. `D-051`: this client's own member key in the group -- the
+    /// key the other members read for it, and the one its binding signs.
+    pub fn tox_group_self_get_public_key(
+        tox: *const Tox,
+        group_number: u32,
+        public_key: *mut u8,
+        error: *mut c_int,
+    ) -> bool;
+    /// `tox.h:3760`
+    pub fn tox_group_peer_get_name_size(
+        tox: *const Tox,
+        group_number: u32,
+        peer_id: u32,
+        error: *mut c_int,
+    ) -> usize;
+    /// `tox.h:3781`
+    pub fn tox_group_peer_get_name(
+        tox: *const Tox,
+        group_number: u32,
+        peer_id: u32,
+        name: *mut u8,
+        error: *mut c_int,
+    ) -> bool;
+    /// `tox.h:3860`. `D-051`: a member changed its name.
+    pub fn tox_callback_group_peer_name(tox: *mut Tox, callback: tox_group_peer_name_cb);
+    /// `tox.h:4663`. `D-051`: no client of ours sends a group text message.
+    pub fn tox_callback_group_message(tox: *mut Tox, callback: tox_group_message_cb);
+    /// `tox.h:4684`. `D-051`: nor a private message.
+    pub fn tox_callback_group_private_message(tox: *mut Tox, callback: tox_group_message_cb);
+    /// `tox.h:4719`. `D-051`: nor a private packet.
+    pub fn tox_callback_group_custom_private_packet(tox: *mut Tox, callback: tox_group_custom_packet_cb);
+}
+
+/// `tox.h:3851`. `D-051`: a member's new name.
+pub type tox_group_peer_name_cb = Option<
+    unsafe extern "C" fn(
+        tox: *mut Tox,
+        group_number: u32,
+        peer_id: u32,
+        name: *const u8,
+        name_length: usize,
+        user_data: *mut c_void,
+    ),
+>;
+
+/// `tox.h:4654` and `tox.h:4675`: a group text message and a private one have
+/// one shape. `D-051` reads only who sent one and how long it was.
+pub type tox_group_message_cb = Option<
+    unsafe extern "C" fn(
+        tox: *mut Tox,
+        group_number: u32,
+        peer_id: u32,
+        message_type: c_int,
+        message: *const u8,
+        message_length: usize,
+        message_id: u32,
+        user_data: *mut c_void,
+    ),
+>;
+
+// `D-051`, harness builds only: what a stranger needs to find this client on
+// one machine -- its UDP port and its DHT key -- and nothing else.
+#[cfg(feature = "fault-harness")]
+extern "C" {
+    /// `tox.h:3050`
+    pub fn tox_self_get_udp_port(tox: *const Tox, error: *mut c_int) -> u16;
+    /// `tox.h:3045`
+    pub fn tox_self_get_dht_id(tox: *const Tox, dht_id: *mut u8);
 }
 
 /// `tox.h:4801`. Fires when another peer becomes **confirmed** — the same flag

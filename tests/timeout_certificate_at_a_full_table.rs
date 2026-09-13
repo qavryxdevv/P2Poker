@@ -63,6 +63,8 @@ fn a_vote() -> TimeoutVote {
         parent_event_hash: [0xEF; 32],
         deadline_ms: u32::MAX,
         kind: 2,
+        // `D-051`: a vote with a cause is the widest vote.
+        cause: Some(p2p_poker::table::handwire::CAUSE_FLOOD),
     }
 }
 

@@ -129,6 +129,13 @@ pub enum Event {
         target_is_self: bool,
         kick: bool,
     },
+    /// `D-051`: a member's name changed. A seat's client names itself with
+    /// its member binding, once, before anybody can read it; the new name is
+    /// read with [`Tox::peer_name`].
+    GroupPeerName { group: u32, peer: u32 },
+    /// `D-051`: a group text message, a private message or a private packet
+    /// -- none of which a client of ours sends -- and how long it was.
+    GroupStray { group: u32, peer: u32, bytes: usize },
 }
 
 /// Where the C callbacks put what they are given, for the length of one
@@ -327,6 +334,48 @@ unsafe extern "C" fn on_group_moderation(
         // `TOX_GROUP_MOD_EVENT_KICK` is the first value of the enum.
         kick: mod_type == 0,
     });
+}
+
+/// `D-051`: a member's name changed. See [`Event::GroupPeerName`].
+unsafe extern "C" fn on_group_peer_name(
+    _tox: *mut sys::Tox,
+    group: u32,
+    peer: u32,
+    _name: *const u8,
+    _name_len: usize,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    s.events.push(Event::GroupPeerName { group, peer });
+}
+
+/// `D-051`: a group text or private message. See [`Event::GroupStray`].
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn on_group_stray_message(
+    _tox: *mut sys::Tox,
+    group: u32,
+    peer: u32,
+    _message_type: c_int,
+    _message: *const u8,
+    message_len: usize,
+    _message_id: u32,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    s.events.push(Event::GroupStray { group, peer, bytes: message_len });
+}
+
+/// `D-051`: a private packet. See [`Event::GroupStray`].
+unsafe extern "C" fn on_group_stray_packet(
+    _tox: *mut sys::Tox,
+    group: u32,
+    peer: u32,
+    _data: *const u8,
+    len: usize,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    s.events.push(Event::GroupStray { group, peer, bytes: len });
 }
 
 /// This client's own join finished. See [`Event::GroupSelfJoin`].
@@ -617,6 +666,14 @@ impl Tox {
             sys::tox_callback_group_peer_status(ptr, Some(on_group_peer_status));
             sys::tox_callback_group_peer_exit(ptr, Some(on_group_peer_exit));
             sys::tox_callback_group_moderation(ptr, Some(on_group_moderation));
+            // `D-051`: a member's name is where it says which seat it is, and
+            // three kinds of traffic no client of ours sends are counted
+            // against the member that sends them. None of the four callbacks
+            // is read by the library beyond calling it.
+            sys::tox_callback_group_peer_name(ptr, Some(on_group_peer_name));
+            sys::tox_callback_group_message(ptr, Some(on_group_stray_message));
+            sys::tox_callback_group_private_message(ptr, Some(on_group_stray_message));
+            sys::tox_callback_group_custom_private_packet(ptr, Some(on_group_stray_packet));
             sys::tox_callback_friend_connection_status(ptr, Some(on_friend_connection));
             sys::tox_callback_friend_request(ptr, Some(on_friend_request));
 
@@ -1018,6 +1075,77 @@ impl Tox {
     pub fn cut_line(&mut self, cut: bool) {
         // SAFETY: sets a flag in the library; no pointer is involved.
         unsafe { sys::p2p_poker_cut_line(cut) }
+    }
+
+    /// `D-051`: this member's name in the group -- a seat's client sets its
+    /// member binding. Whether the library kept it; a name set before anybody
+    /// else is in the group is kept and said with this member's peer
+    /// information, even where the broadcast itself had nobody to reach.
+    pub fn set_self_name(&mut self, group: u32, name: &[u8]) -> bool {
+        let mut err: c_int = 0;
+        // SAFETY: valid pointer; the slice is valid for the call and its
+        // length is passed with it.
+        let ok = unsafe { sys::tox_group_self_set_name(self.ptr, group, name.as_ptr(), name.len(), &mut err) };
+        // `TOX_ERR_GROUP_SELF_NAME_SET_FAIL_SEND` is 4: the name is set here,
+        // only the broadcast failed.
+        (ok && err == 0) || err == 4
+    }
+
+    /// `D-051`: this client's own member key in the group; `None` when the
+    /// group is not found.
+    pub fn self_key(&self, group: u32) -> Option<[u8; 32]> {
+        let mut out = [0u8; 32];
+        let mut err: c_int = 0;
+        // SAFETY: the buffer is exactly `TOX_PUBLIC_KEY_SIZE`.
+        let ok = unsafe { sys::tox_group_self_get_public_key(self.ptr, group, out.as_mut_ptr(), &mut err) };
+        (ok && err == 0).then_some(out)
+    }
+
+    /// `D-051`: a member's name as the group holds it; `None` when the peer
+    /// is not found.
+    pub fn peer_name(&self, group: u32, peer: u32) -> Option<Vec<u8>> {
+        let mut err: c_int = 0;
+        // SAFETY: as above; the call only reads.
+        let size = unsafe { sys::tox_group_peer_get_name_size(self.ptr, group, peer, &mut err) };
+        if err != 0 {
+            return None;
+        }
+        // The library's own bound on a member name.
+        let mut out = vec![0u8; size.min(128)];
+        if size > 0 {
+            // SAFETY: `out` is as long as the size the library just gave, and
+            // a name never exceeds 128 bytes.
+            let ok = unsafe { sys::tox_group_peer_get_name(self.ptr, group, peer, out.as_mut_ptr(), &mut err) };
+            if !ok || err != 0 {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
+    /// `D-051`, harness builds only: one custom packet, lossy -- what a
+    /// flooder sends when it wants no acknowledgement to slow it.
+    #[cfg(feature = "fault-harness")]
+    pub fn send_lossy(&mut self, group: u32, data: &[u8]) -> bool {
+        let mut err: c_int = 0;
+        // SAFETY: the slice is valid for the call and its length is passed.
+        unsafe { sys::tox_group_send_custom_packet(self.ptr, group, false, data.as_ptr(), data.len(), &mut err) }
+    }
+
+    /// `D-051`, harness builds only: the UDP port and DHT key another instance
+    /// on this machine bootstraps from.
+    #[cfg(feature = "fault-harness")]
+    pub fn local_node(&self) -> Option<(u16, [u8; 32])> {
+        let mut err: c_int = 0;
+        // SAFETY: valid pointer; the error out-pointer is valid.
+        let port = unsafe { sys::tox_self_get_udp_port(self.ptr, &mut err) };
+        if err != 0 {
+            return None;
+        }
+        let mut dht = [0u8; 32];
+        // SAFETY: the buffer is exactly `TOX_PUBLIC_KEY_SIZE`.
+        unsafe { sys::tox_self_get_dht_id(self.ptr, dht.as_mut_ptr()) };
+        Some((port, dht))
     }
 
     /// `D-049`: say in the group whether this member sits out -- the group's

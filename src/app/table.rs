@@ -158,6 +158,8 @@ impl AppState {
             opponent_slow: self.opponent_gone.as_ref().is_some_and(|g| g.slow),
             opponent_left: self.opponent_left,
             out_for_good: self.out_for_good.clone(),
+            out_flooded: self.out_flooded,
+            unsafe_note: self.unsafe_note.clone(),
             // `S1-EL`: and the group's softer *the line may be down* yields to the
             // question when that stands, which says the same with the choice.
             line: match self.line_message() {
@@ -829,6 +831,32 @@ mod tests {
         s.apply(NodeEvent::ShowdownChoice { hand_id: 3, open_ms: Some(7_000) });
         s.apply(NodeEvent::HandBegan { hand_id: 4, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert_eq!(s.table_view().show_cards_in_ms, None, "a new hand waits for nothing of the last");
+    }
+
+    /// `D-051`: the table not safe reaches the window with a serial the
+    /// window's *Stay* closes -- a second word from the node is a second
+    /// question -- and goes when the node says the table is safe again; out
+    /// for flooding is said as that, not as a fourth absence.
+    #[test]
+    fn the_table_not_safe_and_out_for_flooding_reach_the_window() {
+        let mut s = seated(0);
+        assert_eq!(s.table_view().unsafe_note, None);
+        s.apply(NodeEvent::SeatFlooded { seat: 2 });
+        assert!(
+            s.table_view().log.iter().any(|l| l.text.contains("flooded the table's connection")),
+            "the table's log says who flooded it"
+        );
+        s.apply(NodeEvent::TableUnsafe { why: Some("2 of the 4 players flooded".into()) });
+        let (why, first) = s.table_view().unsafe_note.expect("said");
+        assert!(why.contains("flooded"));
+        s.apply(NodeEvent::TableUnsafe { why: Some("2 of the 4 players flooded".into()) });
+        let (_, second) = s.table_view().unsafe_note.expect("said again");
+        assert!(second > first, "asked again");
+        s.apply(NodeEvent::TableUnsafe { why: None });
+        assert_eq!(s.table_view().unsafe_note, None, "safe again");
+        s.apply(NodeEvent::OutForGood { key: [0; 32], why: "out for flooding".into(), flooded: true });
+        let v = s.table_view();
+        assert!(v.out_for_good.is_some() && v.out_flooded);
     }
 
     #[test]

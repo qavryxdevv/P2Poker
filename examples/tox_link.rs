@@ -280,6 +280,14 @@ fn main() {
                 Event::GroupPeerStatus { group, peer, away } => {
                     println!("group {group}: peer {peer} status, away {away}")
                 }
+                // `D-051`: a member's name, which a table reads as its binding,
+                // and traffic no client of ours sends.
+                Event::GroupPeerName { group, peer } => {
+                    println!("group {group}: peer {peer} changed its name")
+                }
+                Event::GroupStray { group, peer, bytes } => {
+                    println!("group {group}: peer {peer} sent {bytes} bytes no table sends")
+                }
             }
         }
 

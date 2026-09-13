@@ -180,6 +180,7 @@ async fn main() {
                 group_name: "ToxHand".into(),
                 self_name: "seat0".into(),
                 roster: vec![peer],
+                binder: None,
             },
         )
     } else {
@@ -197,6 +198,7 @@ async fn main() {
                 group_name: "ToxHand".into(),
                 self_name: "seat1".into(),
                 roster: vec![peer],
+                binder: None,
             },
         )
     };

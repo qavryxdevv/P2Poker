@@ -232,6 +232,11 @@ pub struct TableView {
     /// `D-047`: this seat is out of the table for good -- said with the one
     /// thing left to do, closing the table.
     pub out_for_good: Option<String>,
+    /// `D-051`: and the word was that this client flooded the table's group.
+    pub out_flooded: bool,
+    /// `D-051`: why this table is not safe, with the serial the window is
+    /// closed by -- the question comes back when the node says it again.
+    pub unsafe_note: Option<(String, u64)>,
     /// `S1-EH`: a word over the felt about this client's own line, while it
     /// is gone: which network is unavailable.
     pub line: Option<String>,
@@ -462,6 +467,9 @@ pub struct TableUi {
     pub winner_since: Vec<(u64, SeatIdx, f64)>,
     /// The window about the place finished in was closed to watch the table.
     pub finish_closed: bool,
+    /// `D-051`: the serial of the *not safe* question the player chose to
+    /// stay through.
+    pub unsafe_closed: u64,
 }
 
 /// The raise the control offers this frame.
@@ -1430,12 +1438,49 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                 ui.set_min_width(400.0);
                 ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
                 window_heading(ui, "Out of the game", false);
-                ui.label("You were removed from this table after your fourth absence: your connection dropped too often, and the table plays on without you.");
+                if view.out_flooded {
+                    // `D-051`.
+                    ui.label("You were removed from this table for flooding its connection: every other player's client measured junk traffic from yours, and the table plays on without you.");
+                } else {
+                    ui.label("You were removed from this table after your fourth absence: your connection dropped too often, and the table plays on without you.");
+                }
                 ui.label(RichText::new("Your game at this table is over for good.").strong());
                 ui.label(RichText::new(why.as_str()).color(style::PANEL_MUTED).small());
                 if ui.add(egui::Button::new(RichText::new("Close the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
                     action = Some(TableAction::CloseOut);
                 }
+            });
+    }
+
+    // `D-051`, the owner: where the table cannot put out what floods it, the
+    // honest players are told it is not safe and that leaving is recommended.
+    // Stay closes the question until the node says it again.
+    if let Some((why, serial)) = view
+        .unsafe_note
+        .as_ref()
+        .filter(|(_, n)| *n != state.unsafe_closed && view.out_for_good.is_none())
+    {
+        egui::Window::new("Not safe")
+            .id(egui::Id::new("table-not-safe"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .frame(window_frame(&ctx))
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(&ctx, |ui| {
+                ui.set_min_width(400.0);
+                ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
+                window_heading(ui, "This table is not safe", false);
+                ui.label(why.as_str());
+                ui.label(RichText::new("We recommend leaving the table.").strong());
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(RichText::new("Leave the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
+                        action = Some(TableAction::LeaveTable);
+                    }
+                    if ui.add(egui::Button::new(RichText::new("Stay").color(style::WHITE)).fill(Color32::from_rgb(0x1A, 0x4A, 0x8A))).clicked() {
+                        state.unsafe_closed = *serial;
+                    }
+                });
             });
     }
 
@@ -1759,6 +1804,8 @@ impl TableView {
             opponent_slow: false,
             opponent_left: false,
             out_for_good: None,
+            out_flooded: false,
+            unsafe_note: None,
             line: None,
             absent: Vec::new(),
             opponent_alone: false,

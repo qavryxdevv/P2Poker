@@ -209,6 +209,8 @@ pub struct TableApp {
     pub away: std::collections::BTreeSet<u8>,
     pub finished: Option<(crate::gui::table::Finish, std::time::Instant)>,
     pub show_choice: Option<(u64, std::time::Instant)>,
+    pub out_flooded: bool,
+    pub unsafe_note: Option<(String, u64)>,
 }
 
 /// Everything the client knows, in the form the panes read it.
@@ -333,6 +335,13 @@ pub struct AppState {
     /// `D-050`: this client's hand waits at the showdown for the player, who
     /// may show it: the hand, and until when.
     pub show_choice: Option<(u64, std::time::Instant)>,
+    /// `D-051`: this seat is out for good for flooding the table's group, as
+    /// against `D-047`'s fourth absence.
+    pub out_flooded: bool,
+    /// `D-051`: why this table is not safe, as the node last said it, with a
+    /// serial the window closes by -- the question comes back when the node
+    /// says it again.
+    pub unsafe_note: Option<(String, u64)>,
     /// The sounds owed since the window last played them, in order.
     pub sound_cues: Vec<crate::sound::Cue>,
     /// How many games this client has sat down to since it started: PokerTH's
@@ -576,6 +585,8 @@ impl AppState {
         std::mem::swap(&mut self.away, &mut other.away);
         std::mem::swap(&mut self.finished, &mut other.finished);
         std::mem::swap(&mut self.show_choice, &mut other.show_choice);
+        std::mem::swap(&mut self.out_flooded, &mut other.out_flooded);
+        std::mem::swap(&mut self.unsafe_note, &mut other.unsafe_note);
     }
 
     /// `D-043`: turn to another of this client's tables: its state becomes
@@ -1353,9 +1364,29 @@ impl AppState {
             }
             // `D-047`: this seat is out of the table for good. The table is held
             // for the window to say so; leaving is the player's click.
-            NodeEvent::OutForGood { key: _, why } => {
+            NodeEvent::OutForGood { key: _, why, flooded } => {
                 self.out_for_good = Some(why.clone());
+                self.out_flooded = flooded;
                 self.note(why);
+            }
+            // `D-051`: a seat this client cut off for flooding the table's group.
+            NodeEvent::SeatFlooded { seat } => {
+                let name = self.seat_name(seat);
+                let line = format!("{name} flooded the table's connection with junk traffic and is cut off for good");
+                self.log_table(crate::gui::table::LogKind::SitOut, line.clone());
+                self.note(line);
+            }
+            // `D-051`: the table is not safe, or safe again.
+            NodeEvent::TableUnsafe { why } => {
+                self.unsafe_note = why.map(|w| {
+                    let serial = self.unsafe_note.as_ref().map_or(1, |(_, n)| n + 1);
+                    (w, serial)
+                });
+                if let Some((w, _)) = self.unsafe_note.as_ref() {
+                    let line = format!("This table is not safe: {w}");
+                    self.log_table(crate::gui::table::LogKind::SitOut, line.clone());
+                    self.note(line);
+                }
             }
             NodeEvent::LeftTable { why } => {
                 self.forget_the_table();
@@ -1449,6 +1480,8 @@ impl AppState {
         self.away.clear();
         self.finished = None;
         self.show_choice = None;
+        self.out_flooded = false;
+        self.unsafe_note = None;
     }
 
     /// A seat's chips when the hand began: the last settlement's figure, or

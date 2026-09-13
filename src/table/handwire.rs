@@ -756,7 +756,26 @@ pub struct TimeoutVote {
     /// `1` an action deadline, `2` a cryptographic-step deadline.
     #[n(5)]
     pub kind: u16,
+    /// `D-051`: why the voter says so, when it says more than that the
+    /// deadline passed. [`CAUSE_FLOOD`] is the one cause: this voter's own
+    /// client cut the seat off for flooding the table's carrier group.
+    ///
+    /// **Absent, the vote is byte for byte the vote it was before the field
+    /// existed** -- a trailing `None` is not encoded -- so every digest and
+    /// every vector of an ordinary vote stands. **Part of the subject**: a
+    /// vote with a cause and a vote without one are about two subjects, so a
+    /// certificate completes only with the cause every voter signed, and a
+    /// voter that says both to two peers completes neither alone. A voter
+    /// votes once about one seat at one stage, so the cause is fixed with its
+    /// first vote there.
+    #[n(6)]
+    pub cause: Option<u16>,
 }
+
+/// `D-051`: a timeout vote's cause -- the voter's client cut the seat off for
+/// flooding the table's carrier group. A seat that every vote of a
+/// certificate names with it is out of the table for good at that boundary.
+pub const CAUSE_FLOOD: u16 = 1;
 
 impl TimeoutVote {
     /// The digest a certificate identifies this subject by.
@@ -784,6 +803,14 @@ impl TimeoutVote {
             && self.parent_event_hash == other.parent_event_hash
             && self.deadline_ms == other.deadline_ms
             && self.kind == other.kind
+            && self.cause == other.cause
+    }
+
+    /// `D-051`: whether the cause is one this catalogue defines. `Some(0)`
+    /// is refused rather than read as no cause: it is a second encoding of
+    /// the same subject.
+    pub fn cause_is_known(&self) -> bool {
+        matches!(self.cause, None | Some(CAUSE_FLOOD))
     }
 }
 
@@ -802,6 +829,8 @@ pub struct CertSubject {
     pub parent_event_hash: Hash,
     pub deadline_ms: u32,
     pub kind: u16,
+    /// `D-051`: each named seat's cause, in `subject_seats`' order.
+    pub causes: Vec<Option<u16>>,
 }
 
 impl CertSubject {
@@ -814,23 +843,47 @@ impl CertSubject {
             parent_event_hash: vote.parent_event_hash,
             deadline_ms: vote.deadline_ms,
             kind: vote.kind,
+            causes: vec![vote.cause],
         }
+    }
+
+    /// The cause this subject names `seat` with.
+    pub fn cause_of(&self, seat: SeatIdx) -> Option<u16> {
+        self.subject_seats
+            .iter()
+            .position(|s| *s == seat)
+            .and_then(|i| self.causes.get(i).copied().flatten())
     }
 
     /// The digest a certificate identifies its subject by: every field but
     /// the position, the seats as one ascending byte string -- so one seat
     /// hashes to what `TimeoutVote::subject_digest` always did.
+    ///
+    /// `D-051`: and, only when a seat is named with a cause, one more part --
+    /// every seat's cause as a big-endian `u16`, zero for none, in the seats'
+    /// order. A subject with no cause hashes exactly as it did before causes.
     pub fn digest(&self) -> Hash {
+        let mut parts: Vec<Vec<u8>> = vec![
+            self.subject_sequence.to_be_bytes().to_vec(),
+            self.subject_seats.clone(),
+            self.subject_event_type.to_be_bytes().to_vec(),
+            self.parent_event_hash.to_vec(),
+            self.deadline_ms.to_be_bytes().to_vec(),
+            self.kind.to_be_bytes().to_vec(),
+        ];
+        if self.causes.iter().any(Option::is_some) {
+            parts.push(
+                self.subject_seats
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, _)| self.causes.get(i).copied().flatten().unwrap_or(0).to_be_bytes())
+                    .collect(),
+            );
+        }
+        let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
         crate::protocol::serialization::h(
             crate::protocol::signatures::Domain::TimeoutCert.context(),
-            &[
-                &self.subject_sequence.to_be_bytes(),
-                self.subject_seats.as_slice(),
-                &self.subject_event_type.to_be_bytes(),
-                &self.parent_event_hash,
-                &self.deadline_ms.to_be_bytes(),
-                &self.kind.to_be_bytes(),
-            ],
+            &refs,
         )
     }
 
@@ -843,6 +896,7 @@ impl CertSubject {
             parent_event_hash: self.parent_event_hash,
             deadline_ms: self.deadline_ms,
             kind: self.kind,
+            cause: self.cause_of(seat),
         }
     }
 
@@ -978,6 +1032,74 @@ impl ActionAmount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `D-051`: a vote without a cause is the vote it was before the field
+    /// existed, byte for byte, and its subject hashes as it did -- so every
+    /// ordinary vote, certificate and digest stands. A vote with the cause is
+    /// another subject, and one with an unknown cause is refused.
+    #[test]
+    fn a_vote_without_a_cause_is_the_vote_it_always_was() {
+        #[derive(minicbor::Encode)]
+        #[cbor(array)]
+        struct Before {
+            #[n(0)]
+            subject_sequence: u64,
+            #[n(1)]
+            subject_seat: SeatIdx,
+            #[n(2)]
+            subject_event_type: u16,
+            #[cbor(n(3), with = "minicbor::bytes")]
+            parent_event_hash: Hash,
+            #[n(4)]
+            deadline_ms: u32,
+            #[n(5)]
+            kind: u16,
+        }
+        let vote = TimeoutVote {
+            subject_sequence: 12,
+            subject_seat: 3,
+            subject_event_type: 0x0203,
+            parent_event_hash: [7; 32],
+            deadline_ms: 30_000,
+            kind: 2,
+            cause: None,
+        };
+        let before = Before {
+            subject_sequence: 12,
+            subject_seat: 3,
+            subject_event_type: 0x0203,
+            parent_event_hash: [7; 32],
+            deadline_ms: 30_000,
+            kind: 2,
+        };
+        assert_eq!(minicbor::to_vec(vote).unwrap(), minicbor::to_vec(&before).unwrap(), "the same bytes");
+        let old_digest = crate::protocol::serialization::h(
+            crate::protocol::signatures::Domain::TimeoutCert.context(),
+            &[&12u64.to_be_bytes(), &[3u8], &0x0203u16.to_be_bytes(), &[7u8; 32], &30_000u32.to_be_bytes(), &2u16.to_be_bytes()],
+        );
+        assert_eq!(vote.subject_digest(), old_digest, "the same subject digest");
+
+        let flagged = TimeoutVote { cause: Some(CAUSE_FLOOD), ..vote };
+        assert_ne!(flagged.subject_digest(), vote.subject_digest(), "the cause is part of the subject");
+        assert!(!flagged.same_subject(&vote));
+        let back: TimeoutVote = minicbor::decode(&minicbor::to_vec(flagged).unwrap()).unwrap();
+        assert_eq!(back, flagged, "the cause survives the wire");
+        assert!(flagged.cause_is_known() && vote.cause_is_known());
+        assert!(!TimeoutVote { cause: Some(0), ..vote }.cause_is_known(), "no second spelling of no cause");
+        assert!(!TimeoutVote { cause: Some(2), ..vote }.cause_is_known());
+
+        // A joint subject names each seat's cause; one without any hashes as before.
+        let mut joint = CertSubject::of(&vote);
+        joint.subject_seats = vec![3, 4];
+        joint.causes = vec![None, None];
+        let mut plain_parts = joint.clone();
+        plain_parts.causes = Vec::new();
+        assert_eq!(joint.digest(), plain_parts.digest());
+        joint.causes = vec![Some(CAUSE_FLOOD), None];
+        assert_eq!(joint.vote_about(3).cause, Some(CAUSE_FLOOD));
+        assert_eq!(joint.vote_about(4).cause, None);
+        assert_ne!(joint.digest(), plain_parts.digest());
+    }
 
     /// The street code is the board length, pinned against the engine rather
     /// than against a table of literals — because the reason §4.7 chose the

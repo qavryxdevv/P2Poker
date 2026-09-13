@@ -258,6 +258,30 @@ fn open_inner(
     })
 }
 
+/// `D-051`: why these bytes are noise -- not a canonical signed event, or one
+/// whose signature does not verify under the sender key inside it -- or
+/// `None` when they are a signed event, whatever it says.
+///
+/// **Nothing an honest client of this build sends is noise.** Every message
+/// on a table's group is a signed event built by `seal`, so bytes that fail
+/// here were built to fail. The envelope's catalogue check is deliberately not
+/// asked: an event type this build does not know is a newer client's, not
+/// noise.
+pub fn noise(bytes: &[u8], cap: usize) -> Option<&'static str> {
+    let Ok(signed) = from_canonical::<SignedEvent>(bytes, cap) else {
+        return Some("not a canonical signed event");
+    };
+    let Ok(envelope) = from_canonical::<EventBody>(&signed.body, cap) else {
+        return Some("not a canonical envelope");
+    };
+    let Ok(key) = VerifyingKey::from_bytes(&envelope.sender_public_key) else {
+        return Some("a sender key that is no key");
+    };
+    key.verify_strict(&to_be_signed(&signed.body), &Signature::from_bytes(&signed.signature))
+        .err()
+        .map(|_| "a signature that does not verify")
+}
+
 /// What an event says it is, before anything about it is believed.
 ///
 /// `open` demands the expected type up front, which is right where the caller

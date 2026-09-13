@@ -87,6 +87,25 @@ pub enum Seat {
         group_key: [u8; 32],
         app_key: [u8; 32],
     },
+    /// `D-051`: the application keys of the seats, and whether the roster is
+    /// ratified. A member whose binding names none of them is no seat.
+    Seats { apps: Vec<[u8; 32]>, fixed: bool },
+    /// `D-051`: a whole message from this group member was not a signed
+    /// event, or did not verify under the key inside it.
+    Noise { member_key: [u8; 32] },
+}
+
+/// `D-051`: a member the carrier cut off from this table's group, as the node
+/// reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutOff {
+    /// The application key the member's binding named, when it had one.
+    pub app_key: Option<[u8; 32]>,
+    pub member_key: [u8; 32],
+    /// What it flooded the group with, when that is why.
+    pub flood: Option<String>,
+    /// Why, in words.
+    pub why: String,
 }
 
 /// The table's game transport, when there is one.
@@ -324,6 +343,7 @@ impl TableSink {
         group_name: &str,
         self_name: &str,
         roster: Vec<[u8; 32]>,
+        binder: Option<ed25519_dalek::SigningKey>,
     ) -> Result<Option<[u8; 32]>, String> {
         #[cfg(feature = "tox")]
         {
@@ -351,12 +371,13 @@ impl TableSink {
                 group_name: group_name.to_string(),
                 self_name: self_name.to_string(),
                 roster,
+                binder,
             }));
             Ok(self.mine)
         }
         #[cfg(not(feature = "tox"))]
         {
-            let _ = (profile, role, group_name, self_name, roster);
+            let _ = (profile, role, group_name, self_name, roster, binder);
             Ok(None)
         }
     }
@@ -895,8 +916,56 @@ impl TableSink {
                         group_key,
                         app_key,
                     },
+                    Seat::Seats { apps, fixed } => Command::Seats { apps, fixed },
+                    Seat::Noise { member_key } => Command::Noise { member_key },
                 });
             }
+        }
+    }
+
+    /// `D-051`: the members the carrier cut off since the node last asked.
+    pub fn take_cut_offs(&self) -> Vec<CutOff> {
+        #[cfg(feature = "tox")]
+        {
+            use crate::tox::table::Cut;
+            let Some(t) = self.inner.as_ref() else {
+                return Vec::new();
+            };
+            let Ok(mut said) = t.trouble().cut_off.lock() else {
+                return Vec::new();
+            };
+            std::mem::take(&mut *said)
+                .into_iter()
+                .map(|c| CutOff {
+                    app_key: c.app_key,
+                    member_key: c.member_key,
+                    flood: match &c.why {
+                        Cut::Flood(f) => Some(f.to_string()),
+                        _ => None,
+                    },
+                    why: c.why.to_string(),
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// `D-051`: messages held back from a member that was filling the inbox.
+    pub fn inbox_yielded(&self) -> u64 {
+        #[cfg(feature = "tox")]
+        {
+            use std::sync::atomic::Ordering;
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().inbox_yielded.load(Ordering::Relaxed),
+                None => 0,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            0
         }
     }
 

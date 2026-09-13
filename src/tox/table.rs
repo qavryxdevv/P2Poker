@@ -141,6 +141,124 @@ fn offline_window() -> Option<(Duration, Duration, Duration)> {
     })
 }
 
+/// fault-harness, `D-051`: what a flooder sends.
+#[cfg(feature = "fault-harness")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloodKind {
+    /// Lossy packets of random bytes, longer than any fragment this build
+    /// cuts: each one a refused fragment at every member.
+    Noise,
+    /// Lossless packets of random bytes a fragment long.
+    Lossless,
+    /// Well-framed one-fragment messages of random bytes: every one reaches
+    /// the node, which finds no signed event in it.
+    Frames,
+    /// Well-framed first halves of two-fragment messages that never finish:
+    /// nothing is refused anywhere, so only the count says it is a flood.
+    Halves,
+}
+
+/// fault-harness, `D-051`: `P2P_POKER_FLOOD_RATE`, packets a second, 500
+/// unless said -- for this client's flood and for its stranger's.
+#[cfg(feature = "fault-harness")]
+fn flood_rate() -> u64 {
+    std::env::var("P2P_POKER_FLOOD_RATE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(500)
+        .max(1)
+}
+
+/// fault-harness, `D-051`: this client floods every table's group from
+/// `P2P_POKER_FLOOD_AT`, that second of the driver's life, at the flood rate,
+/// with `P2P_POKER_FLOOD_KIND` (`noise`, `lossless`, `frames`, `halves`;
+/// `noise` unless said).
+#[cfg(feature = "fault-harness")]
+fn flood_plan() -> Option<(Duration, u64, FloodKind)> {
+    use std::sync::OnceLock;
+    static PLAN: OnceLock<Option<(Duration, u64, FloodKind)>> = OnceLock::new();
+    *PLAN.get_or_init(|| {
+        let at = std::env::var("P2P_POKER_FLOOD_AT").ok()?.trim().parse::<u64>().ok()?;
+        let rate = flood_rate();
+        let kind = match std::env::var("P2P_POKER_FLOOD_KIND").unwrap_or_default().trim() {
+            "lossless" => FloodKind::Lossless,
+            "frames" => FloodKind::Frames,
+            "halves" => FloodKind::Halves,
+            _ => FloodKind::Noise,
+        };
+        Some((Duration::from_secs(at), rate, kind))
+    })
+}
+
+/// fault-harness, `D-051`: a stranger -- a second Tox instance in this process,
+/// no seat of any table -- that this client befriends at that second and
+/// invites into its first table's group, as any member of a private group
+/// can. `P2P_POKER_STRANGER_FLOOD=1`: once in, the stranger floods the group
+/// at the flood rate. `P2P_POKER_STRANGER_NAME=copy`: its name is a copy of a
+/// seat's binding.
+#[cfg(feature = "fault-harness")]
+fn stranger_plan() -> Option<(Duration, bool, bool)> {
+    use std::sync::OnceLock;
+    static PLAN: OnceLock<Option<(Duration, bool, bool)>> = OnceLock::new();
+    *PLAN.get_or_init(|| {
+        let at = std::env::var("P2P_POKER_STRANGER_AT").ok()?.trim().parse::<u64>().ok()?;
+        let flood = std::env::var("P2P_POKER_STRANGER_FLOOD").is_ok_and(|v| v.trim() == "1");
+        let copy = std::env::var("P2P_POKER_STRANGER_NAME").is_ok_and(|v| v.trim() == "copy");
+        Some((Duration::from_secs(at), flood, copy))
+    })
+}
+
+/// fault-harness: the stranger's instance and how far it got.
+#[cfg(feature = "fault-harness")]
+struct Stranger {
+    tox: Tox,
+    /// The stranger as this client's friend, and this client as the stranger's.
+    friend_here: u32,
+    invited: bool,
+    group: Option<u32>,
+    joined: bool,
+    flood_sent: u64,
+    flood_since: Option<Instant>,
+}
+
+/// fault-harness: a xorshift, so a flood costs no dependency and no entropy.
+#[cfg(feature = "fault-harness")]
+fn junk(state: &mut u64, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// fault-harness: one flood packet of this kind into this group.
+#[cfg(feature = "fault-harness")]
+fn flood_one(tox: &mut Tox, g: u32, kind: FloodKind, state: &mut u64, id: u32) -> bool {
+    match kind {
+        FloodKind::Noise => {
+            let bytes = junk(state, 1_200);
+            tox.send_lossy(g, &bytes)
+        }
+        FloodKind::Lossless => {
+            let bytes = junk(state, fragment::TOX_PACKET);
+            tox.send(g, &bytes).is_ok()
+        }
+        FloodKind::Frames | FloodKind::Halves => {
+            let (index, total) = if kind == FloodKind::Frames { (0u16, 1u16) } else { (0u16, 2u16) };
+            let mut frame = Vec::with_capacity(fragment::TOX_PACKET);
+            frame.extend_from_slice(&id.to_be_bytes());
+            frame.extend_from_slice(&index.to_be_bytes());
+            frame.extend_from_slice(&total.to_be_bytes());
+            frame.extend_from_slice(&junk(state, fragment::payload_for(fragment::TOX_PACKET)));
+            tox.send(g, &frame).is_ok()
+        }
+    }
+}
+
 /// How long a joiner waits for its own join to finish before it gives it up.
 ///
 /// **Comfortably past toxcore's own reaper, and deliberately so.**
@@ -214,6 +332,11 @@ pub struct Setup {
     /// Both ends add each other, because a Tox friendship is two-sided and one
     /// side of it establishes nothing.
     pub roster: Vec<[u8; 32]>,
+    /// `D-051`: this seat's signing key, for the member binding its name in
+    /// the group carries (`table::membership`). With it the driver also
+    /// holds every other member to one; `None` only where there is no seat
+    /// to sign for -- the tests of the transport alone.
+    pub binder: Option<ed25519_dalek::SigningKey>,
 }
 
 /// Something the client tells the driver after it has started.
@@ -294,6 +417,14 @@ pub enum Command {
     /// `D-049`: this seat sits out (`true`) or plays (`false`), said as the
     /// group's own status of this member.
     Away(bool),
+    /// `D-051`: the application keys of the seats this table seats, and
+    /// whether the list is the table's for good -- the roster ratified -- or
+    /// still forming. A member whose binding names no key here is no seat.
+    Seats { apps: Vec<[u8; 32]>, fixed: bool },
+    /// `D-051`: a whole message from this member was not a signed event, or
+    /// did not verify under the key inside it -- which no client of this
+    /// build sends.
+    Noise { member_key: [u8; 32] },
     /// Close this table: say what it still holds, leave its group. The
     /// instance and its thread stay for the next table, and the friends no
     /// open table needs go `FRIEND_LINGER` later (`D-042`).
@@ -375,6 +506,12 @@ pub struct Trouble {
     /// word, and the times this client was itself removed by it.
     pub removed: AtomicU64,
     pub kicked_out: AtomicU64,
+    /// `D-051`: the members this client cut off since the node last asked --
+    /// flooders, and members that are no seat of this table.
+    pub cut_off: std::sync::Mutex<Vec<CutOff>>,
+    /// `D-051`: messages held back from a member sending past `INBOX_LOUD`
+    /// while the inbox was three quarters full.
+    pub inbox_yielded: AtomicU64,
     /// `D-035`: the roster seats whose client is a confirmed member of the
     /// group right now, by application key -- recomputed every sweep, for
     /// the window's link indicator.
@@ -495,6 +632,55 @@ pub struct Trouble {
     /// that is this client noticing silence.
     pub join_fails: AtomicU64,
 }
+
+/// `D-051`: one member this client cut off from a table's group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutOff {
+    /// The application key the member's binding named, when it had one.
+    pub app_key: Option<[u8; 32]>,
+    pub member_key: [u8; 32],
+    pub why: Cut,
+}
+
+/// `D-051`: why a member was cut off. Every reason rests on what reached this
+/// client from that member's key, or on the binding in its name against the
+/// roster -- on nobody's word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cut {
+    /// It flooded the group. Its seat is barred here for the table's life.
+    Flood(crate::table::membership::Flood),
+    /// Its binding names an application key this table does not seat.
+    NotASeat,
+    /// Its name is a binding made for another member or another group: a
+    /// copy, or a forgery.
+    NotItsBinding,
+    /// It carried no binding within `NAME_GRACE` of joining.
+    Nameless,
+    /// It is bound to a seat barred here: one this client cut off for
+    /// flooding, or one the table put out for good.
+    Barred,
+}
+
+impl std::fmt::Display for Cut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Cut::Flood(why) => write!(f, "it flooded the table's group ({why})"),
+            Cut::NotASeat => write!(f, "its name binds it to no seat of this table"),
+            Cut::NotItsBinding => write!(f, "its name is a binding made for another member"),
+            Cut::Nameless => write!(f, "it said no seat within {} s of joining", NAME_GRACE.as_secs()),
+            Cut::Barred => write!(f, "it is bound to a seat barred from this table"),
+        }
+    }
+}
+
+/// `D-051`: how long a member may be in the group before its name binds it to
+/// a seat. A seat's client names itself before its first handshake, so the
+/// binding arrives with the member; this is a margin, not a wait.
+pub const NAME_GRACE: Duration = Duration::from_secs(10);
+
+/// `D-051`: packets in one second from one member past which, with the inbox
+/// three quarters full, its messages wait for the others'.
+pub const INBOX_LOUD: u64 = 100;
 
 /// A table's number inside the client's one driver (`D-042`).
 pub type TableId = u32;
@@ -863,6 +1049,34 @@ struct TableState {
     /// `D-049`: whether this seat sits out, and when the group was last told.
     away: bool,
     away_said_at: Option<Instant>,
+    /// `D-051`: the group this client's name carries its binding in.
+    named: Option<u32>,
+    /// `D-051`: the application keys of the seats, and whether that list is
+    /// the ratified roster's.
+    seat_apps: Vec<[u8; 32]>,
+    seats_fixed: bool,
+    /// `D-051`: member key -> the application key its name binds it to,
+    /// verified against the group's own key for it.
+    bound: HashMap<[u8; 32], [u8; 32]>,
+    /// `D-051`: members not placed at a seat yet, and since when -- no
+    /// binding yet, or bound to a key the forming roster does not name yet.
+    unplaced: HashMap<[u8; 32], Instant>,
+    /// `D-051`: seats barred from this group here, by application key: cut
+    /// off for flooding, or put out for good by the table.
+    barred: std::collections::HashSet<[u8; 32]>,
+    /// `D-051`: the same seats by the Tox key of the line their members came
+    /// in over, where this client invited them: offered the group no more.
+    barred_lines: std::collections::HashSet<[u8; 32]>,
+    /// `D-051`: each member's traffic, by member key.
+    meters: HashMap<[u8; 32], crate::table::membership::Meter>,
+    /// `D-051`: members cut off here, by member key.
+    cut: std::collections::HashSet<[u8; 32]>,
+    /// fault-harness: the most one member has sent within each window, for
+    /// measuring what an honest table sends.
+    #[cfg(feature = "fault-harness")]
+    peak: (u64, u64, u64, u64),
+    #[cfg(feature = "fault-harness")]
+    peak_said: (u64, u64, u64, u64),
     invited: Vec<u32>,
     confirmed: std::collections::HashSet<u32>,
     accepted_at: Option<Instant>,
@@ -968,6 +1182,173 @@ fn keys_of_seat(t: &TableState, app_key: Option<&[u8; 32]>, tox_key: Option<&[u8
     keys
 }
 
+/// `D-051`: this client's name in the group is its member binding -- its
+/// application key and its signature over the group and its own member key --
+/// set the moment the group exists, before any member can read a name.
+fn name_self(tox: &mut Tox, key: &ed25519_dalek::SigningKey, g: u32) -> bool {
+    let (Ok(chat), Some(me)) = (tox.chat_id(g), tox.self_key(g)) else {
+        return false;
+    };
+    let name = crate::table::membership::binding_for(key, &chat, &me);
+    tox.set_self_name(g, &name)
+}
+
+/// `D-051`: which seat a member is, from the binding in its name, checked
+/// against the group's own key for it and the table's seats.
+///
+/// Placed at a seat, the binding is the pairing (`known_as`), and a claim
+/// read off carried traffic no longer decides it. Cut off at once: a name
+/// that is a binding made for another member or group; a binding of a seat
+/// barred here; a binding of this client's own seat, which only this client
+/// holds; a binding of a key the ratified roster does not seat. Left to wait:
+/// no binding yet, for `NAME_GRACE` at the sweep; a key the forming roster
+/// does not name yet, until the roster is ratified.
+fn place_member(tox: &mut Tox, t: &mut TableState, g: u32, peer: u32, key: [u8; 32]) {
+    let Some(mine) = t.setup.binder.as_ref().map(|k| *k.verifying_key().as_bytes()) else {
+        return;
+    };
+    if t.cut.contains(&key) {
+        return;
+    }
+    let (Some(name), Ok(chat)) = (tox.peer_name(g, peer), tox.chat_id(g)) else {
+        return;
+    };
+    match crate::table::membership::bound_to(&name, &chat, &key) {
+        Some(app) => {
+            if t.bound.insert(key, app).is_some_and(|was| was != app) {
+                cut_off(tox, t, g, key, Cut::NotItsBinding);
+                return;
+            }
+            if t.barred.contains(&app) {
+                cut_off(tox, t, g, key, Cut::Barred);
+                return;
+            }
+            // `S1-EE`'s rule, by binding: another member is never this client's
+            // own seat -- an old entry of this client's own dead process, or a
+            // second client on the same identity.
+            if app == mine {
+                cut_off(tox, t, g, key, Cut::NotASeat);
+                return;
+            }
+            // No seats said yet: nothing to judge a binding against, so it
+            // waits -- a table whose node has not said its roster cuts nobody
+            // off for not being on it.
+            if t.seat_apps.is_empty() {
+                t.unplaced.entry(key).or_insert_with(Instant::now);
+                return;
+            }
+            if t.seat_apps.contains(&app) {
+                t.unplaced.remove(&key);
+                t.known_as.insert(key, app);
+                if let Ok(mut known) = t.trouble.known.lock() {
+                    known.insert(app);
+                }
+                if t.confirmed.contains(&peer) {
+                    if let Ok(mut present) = t.trouble.present.lock() {
+                        present.insert(app);
+                    }
+                }
+                return;
+            }
+            if t.seats_fixed {
+                cut_off(tox, t, g, key, Cut::NotASeat);
+            } else {
+                t.unplaced.entry(key).or_insert_with(Instant::now);
+            }
+        }
+        None if crate::table::membership::looks_like_a_binding(&name) => {
+            cut_off(tox, t, g, key, Cut::NotItsBinding);
+        }
+        None => {
+            // A member bound before and named otherwise now is not ours.
+            if t.bound.contains_key(&key) {
+                cut_off(tox, t, g, key, Cut::NotItsBinding);
+            } else {
+                t.unplaced.entry(key).or_insert_with(Instant::now);
+            }
+        }
+    }
+}
+
+/// `D-051`: cut a member off from this client's view of the group for good:
+/// allowed to be kicked, kicked where this client is the founder, dropped,
+/// its key refused for the group's life. A flooder's seat is barred with it,
+/// so every other entry the seat holds goes now and any it takes later goes
+/// the moment its binding is read. Said to the node.
+fn cut_off(tox: &mut Tox, t: &mut TableState, g: u32, key: [u8; 32], why: Cut) {
+    if !t.cut.insert(key) {
+        return;
+    }
+    let app = t.bound.get(&key).copied();
+    // A flooder's line, where it came in over one of this client's invitations:
+    // the founder offers the group to that seat no more.
+    if matches!(why, Cut::Flood(_) | Cut::Barred) {
+        let line = t
+            .peer_keys
+            .iter()
+            .find(|(_, k)| **k == key)
+            .and_then(|(p, _)| t.peer_lines.get(p))
+            .copied();
+        if let Some(line) = line {
+            t.barred_lines.insert(line);
+        }
+    }
+    let _ = tox.allow_kick(g, &key);
+    if matches!(t.setup.role, Role::Host) {
+        if let Some(p) = t.peer_keys.iter().find(|(_, k)| **k == key).map(|(p, _)| *p) {
+            let _ = tox.kick(g, p);
+            // `S1-ED`: the library's kick deletes without the exit callback.
+            member_gone(tox, t, g, p, Some(key), false);
+        }
+    }
+    if tox.peer_drop(g, &key, true) {
+        t.trouble.removed.fetch_add(1, Ordering::Relaxed);
+    }
+    t.unplaced.remove(&key);
+    t.meters.remove(&key);
+    let flood = matches!(why, Cut::Flood(_));
+    if let Ok(mut said) = t.trouble.cut_off.lock() {
+        said.push(CutOff {
+            app_key: app,
+            member_key: key,
+            why,
+        });
+    }
+    if let (true, Some(app)) = (flood, app) {
+        bar_seat(tox, t, g, app);
+    }
+}
+
+/// `D-051`: bar a seat from this group here, and cut off every entry it holds.
+fn bar_seat(tox: &mut Tox, t: &mut TableState, g: u32, app: [u8; 32]) {
+    if !t.barred.insert(app) {
+        return;
+    }
+    let entries: Vec<[u8; 32]> = t
+        .bound
+        .iter()
+        .filter(|(k, a)| **a == app && !t.cut.contains(*k))
+        .map(|(k, _)| *k)
+        .collect();
+    for key in entries {
+        cut_off(tox, t, g, key, Cut::Barred);
+    }
+}
+
+/// `D-051`: count noise against a member and cut it off if that makes it a
+/// flooder.
+fn score_noise(tox: &mut Tox, t: &mut TableState, g: u32, key: [u8; 32], points: u32) {
+    if t.setup.binder.is_none() || t.cut.contains(&key) {
+        return;
+    }
+    let now = millis();
+    let meter = t.meters.entry(key).or_default();
+    meter.noise(now, points);
+    if let Some(flood) = meter.over(now) {
+        cut_off(tox, t, g, key, Cut::Flood(flood));
+    }
+}
+
 fn by_group(tables: &mut HashMap<TableId, TableState>, g: u32) -> Option<&mut TableState> {
     tables.values_mut().find(|t| t.group == Some(g))
 }
@@ -1022,6 +1403,59 @@ fn sweep_table(
     self_connection: u64,
 ) {
     t.reassembler.sweep(millis());
+    // `D-051`: every member not at a seat is read again, and one still not at
+    // a seat past its grace is no seat of this table.
+    if let (Some(g), true) = (t.group, t.setup.binder.is_some()) {
+        let members: Vec<(u32, [u8; 32])> = t
+            .peer_keys
+            .iter()
+            .filter(|(p, k)| {
+                t.confirmed.contains(p)
+                    && !t.cut.contains(*k)
+                    && !t.bound.get(*k).is_some_and(|a| t.seat_apps.contains(a))
+            })
+            .map(|(p, k)| (*p, *k))
+            .collect();
+        for (p, k) in members {
+            place_member(tox, t, g, p, k);
+            if t.cut.contains(&k) {
+                continue;
+            }
+            let Some(since) = t.unplaced.get(&k).copied() else {
+                continue;
+            };
+            // A member bound to a key the forming roster does not name yet waits
+            // for the roster: `place_member` cuts it the moment the roster is
+            // ratified without it, and never before -- a joiner's roster can lag
+            // the founder's invitation by as long as the mesh takes (`S1-DP`).
+            if t.bound.contains_key(&k) {
+                continue;
+            }
+            if since.elapsed() >= NAME_GRACE {
+                cut_off(tox, t, g, k, Cut::Nameless);
+            }
+        }
+    }
+    // `D-051`: named with this seat's binding, again if the first try found
+    // no key or no chat id to sign.
+    if let (Some(g), Some(key)) = (t.group, t.setup.binder.as_ref()) {
+        if t.named != Some(g) && name_self(tox, key, g) {
+            t.named = Some(g);
+        }
+    }
+    #[cfg(feature = "fault-harness")]
+    if t.peak != t.peak_said {
+        t.peak_said = t.peak;
+        println!(
+            "fault-harness: the busiest member of this table's group sent at most {} packets and {} bytes in {} s, {} packets and {} bytes in {} s (D-051)",
+            t.peak.0,
+            t.peak.1,
+            crate::table::membership::FLOOD_SHORT_S,
+            t.peak.2,
+            t.peak.3,
+            crate::table::membership::FLOOD_LONG_S
+        );
+    }
     // **Offer the group again to whoever is not in it.** See `REINVITE_EVERY`:
     // `invited` says what this client has done, and a peer that restarted
     // needs asking again even though it does. Only while the group is short;
@@ -1269,6 +1703,17 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
     let started = Instant::now();
     #[cfg(feature = "fault-harness")]
     let mut line_cut = false;
+    // fault-harness, `D-051`: the flood and the stranger.
+    #[cfg(feature = "fault-harness")]
+    let mut flood_sent: u64 = 0;
+    #[cfg(feature = "fault-harness")]
+    let mut flood_said = false;
+    #[cfg(feature = "fault-harness")]
+    let mut junk_state: u64 = 0x9E37_79B9_7F4A_7C15 ^ u64::from(std::process::id());
+    #[cfg(feature = "fault-harness")]
+    let mut stranger: Option<Stranger> = None;
+    #[cfg(feature = "fault-harness")]
+    let mut stranger_tried = false;
 
     loop {
         // --- what the client asked for -------------------------------------
@@ -1302,6 +1747,11 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                         Role::Host => tox.new_group(&setup.group_name, &setup.self_name).ok(),
                         Role::Joiner { .. } | Role::Back { .. } => None,
                     };
+                    // `D-051`: named with this seat's binding before anybody joins.
+                    let named = match (group, setup.binder.as_ref()) {
+                        (Some(g), Some(key)) => name_self(&mut tox, key, g).then_some(g),
+                        _ => None,
+                    };
                     // Said as soon as there is something to say: the founder's
                     // advertisement cannot name the group until this arrives.
                     announce(&tox, group, &chat);
@@ -1318,6 +1768,19 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                             group,
                             away: false,
                             away_said_at: None,
+                            named,
+                            seat_apps: Vec::new(),
+                            seats_fixed: false,
+                            bound: HashMap::new(),
+                            unplaced: HashMap::new(),
+                            barred: std::collections::HashSet::new(),
+                            barred_lines: std::collections::HashSet::new(),
+                            meters: HashMap::new(),
+                            cut: std::collections::HashSet::new(),
+                            #[cfg(feature = "fault-harness")]
+                            peak: (0, 0, 0, 0),
+                            #[cfg(feature = "fault-harness")]
+                            peak_said: (0, 0, 0, 0),
                             invited: Vec::new(),
                             confirmed: std::collections::HashSet::new(),
                             accepted_at: None,
@@ -1406,6 +1869,10 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                         // What signed traffic has taught this client about who
                         // is who in the group: the only authenticated bridge
                         // between the two key spaces (`S1-I`).
+                        // `D-051`: a member whose name binds it decides its own
+                        // pairing; a claim read off carried traffic -- which
+                        // anybody can carry -- does not move it.
+                        Command::KnownAs { group_key, .. } if t.bound.contains_key(&group_key) => {}
                         Command::KnownAs { group_key, app_key } => {
                             // `S1-DW`: a claim to a seat that is here and speaking
                             // is refused -- a member's first word could be another
@@ -1505,7 +1972,34 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                                     if let Some(k) = tox_key {
                                         t.roster.retain(|r| *r != k);
                                     }
+                                    // `D-051`: and barred by its application key, so a
+                                    // fresh member key bound to it is cut off on sight.
+                                    if let Some(a) = app_key {
+                                        bar_seat(&mut tox, t, g, a);
+                                    }
                                 }
+                            }
+                        }
+                        Command::Seats { apps, fixed } => {
+                            t.seat_apps = apps;
+                            t.seats_fixed = fixed;
+                            // Every member not placed yet is read again against the
+                            // seats as they now stand.
+                            if let Some(g) = t.group {
+                                let members: Vec<(u32, [u8; 32])> = t
+                                    .peer_keys
+                                    .iter()
+                                    .filter(|(p, k)| t.confirmed.contains(p) && t.known_as.get(*k).is_none_or(|a| !t.seat_apps.contains(a)))
+                                    .map(|(p, k)| (*p, *k))
+                                    .collect();
+                                for (p, k) in members {
+                                    place_member(&mut tox, t, g, p, k);
+                                }
+                            }
+                        }
+                        Command::Noise { member_key } => {
+                            if let Some(g) = t.group {
+                                score_noise(&mut tox, t, g, member_key, crate::table::membership::NOISE_BAD_MESSAGE);
                             }
                         }
                         Command::KickWithoutWord(key) => {
@@ -1725,6 +2219,27 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                                 present.insert(l);
                             }
                         }
+                        // `D-051`: which seat it is, by the binding in its name.
+                        if let Some(k) = key {
+                            place_member(&mut tox, t, g, peer, k);
+                        }
+                    }
+                }
+                // `D-051`: a name changed. A seat's client names itself once,
+                // before anybody can read it; any later name is read again.
+                Event::GroupPeerName { group: g, peer } => {
+                    let key = tox.peer_key(g, peer).ok();
+                    if let (Some(t), Some(k)) = (by_group(&mut tables, g), key) {
+                        if t.confirmed.contains(&peer) {
+                            place_member(&mut tox, t, g, peer, k);
+                        }
+                    }
+                }
+                // `D-051`: traffic no client of ours sends.
+                Event::GroupStray { group: g, peer, .. } => {
+                    let key = tox.peer_key(g, peer).ok();
+                    if let (Some(t), Some(k)) = (by_group(&mut tables, g), key) {
+                        score_noise(&mut tox, t, g, k, crate::table::membership::NOISE_STRAY);
                     }
                 }
                 Event::GroupPeerExit {
@@ -1741,16 +2256,65 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                     // Reassembled here, so nothing above this module ever sees
                     // a fragment.
                     if let Some(t) = by_group(&mut tables, g) {
-                        match t.reassembler.accept(&peer, &data, millis()) {
+                        let now = millis();
+                        // `D-051`: counted against the member before anything is
+                        // spent on it; a member cut off here is not read at all.
+                        let key = t.peer_keys.get(&peer).copied().or_else(|| tox.peer_key(g, peer).ok());
+                        if let Some(k) = key {
+                            if t.cut.contains(&k) {
+                                continue;
+                            }
+                            let meter = t.meters.entry(k).or_default();
+                            meter.packet(now, data.len());
+                            let over = meter.over(now);
+                            #[cfg(feature = "fault-harness")]
+                            {
+                                let (p10, b10) = meter.within(now, crate::table::membership::FLOOD_SHORT_S);
+                                let (p60, b60) = meter.within(now, crate::table::membership::FLOOD_LONG_S);
+                                let peak = &mut t.peak;
+                                peak.0 = peak.0.max(p10);
+                                peak.1 = peak.1.max(b10);
+                                peak.2 = peak.2.max(p60);
+                                peak.3 = peak.3.max(b60);
+                            }
+                            if let (Some(flood), true) = (over, t.setup.binder.is_some()) {
+                                cut_off(&mut tox, t, g, k, Cut::Flood(flood));
+                                continue;
+                            }
+                        }
+                        match t.reassembler.accept(&peer, &data, now) {
                             Ok(Some(message)) => {
                                 // The sender's GROUP key, advisory: the
                                 // signature inside the message is the only
                                 // thing that says who spoke. Carried out so
                                 // the node loop can pair it with the signing
                                 // key (`S1-I`).
-                                let claimed = tox.peer_key(g, peer).ok();
+                                let claimed = key;
                                 if let Some(k) = claimed {
                                     t.peer_keys.insert(peer, k);
+                                }
+                                // `D-051`: while the inbox is three quarters full,
+                                // a member sending far more than anybody this
+                                // second waits its turn, so no one member fills
+                                // it for the rest. An honest seat's burst is a
+                                // re-said stage, well under `INBOX_LOUD` packets
+                                // in a second and not twice everybody else's.
+                                let max = t.inbox.max_capacity();
+                                if t.inbox.capacity() < max / 4 {
+                                    if let Some(k) = claimed {
+                                        let mine = t.meters.get(&k).map_or(0, |m| m.this_second(now));
+                                        let others = t
+                                            .meters
+                                            .iter()
+                                            .filter(|(o, _)| **o != k)
+                                            .map(|(_, m)| m.this_second(now))
+                                            .max()
+                                            .unwrap_or(0);
+                                        if mine >= INBOX_LOUD && mine > others.saturating_mul(2) {
+                                            t.trouble.inbox_yielded.fetch_add(1, Ordering::Relaxed);
+                                            continue;
+                                        }
+                                    }
                                 }
                                 let item = FromTable {
                                     claimed,
@@ -1765,7 +2329,12 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                                 }
                             }
                             Ok(None) => {}
-                            Err(_) => {}
+                            // `D-051`: a fragment no client of this build cuts.
+                            Err(_) => {
+                                if let Some(k) = key {
+                                    score_noise(&mut tox, t, g, k, crate::table::membership::NOISE_BAD_FRAGMENT);
+                                }
+                            }
                         }
                     }
                 }
@@ -1801,6 +2370,116 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
             take_invitation(&mut tox, &mut tables, &friends, friend, &invite);
         }
         invites_to_take.append(&mut invites_deferred);
+
+        // --- fault-harness, `D-051`: the flood and the stranger ---------------
+        #[cfg(feature = "fault-harness")]
+        {
+            let now = started.elapsed();
+            if let Some((at, rate, kind)) = flood_plan() {
+                if let Some(since) = now.checked_sub(at) {
+                    if !flood_said {
+                        flood_said = true;
+                        println!(
+                            "fault-harness: this client floods every table's group from {} s, {rate} packets a second of {kind:?}, as P2P_POKER_FLOOD_AT asked",
+                            at.as_secs()
+                        );
+                    }
+                    let due = (since.as_millis() as u64).saturating_mul(rate) / 1_000;
+                    let groups: Vec<u32> = tables.values().filter_map(|t| t.group).collect();
+                    for _ in 0..due.saturating_sub(flood_sent).min(2_000) {
+                        for g in &groups {
+                            let _ = flood_one(&mut tox, *g, kind, &mut junk_state, 0x8000_0000 | (flood_sent as u32));
+                        }
+                        flood_sent += 1;
+                    }
+                }
+            }
+            if let Some((at, flood, copy)) = stranger_plan() {
+                if now >= at && !stranger_tried {
+                    stranger_tried = true;
+                    match (Tox::new(), tox.local_node()) {
+                        (Ok(mut st), Some((port, dht))) => {
+                            let _ = st.bootstrap("127.0.0.1", port, &dht);
+                            let here: [u8; 32] = tox.address()[..32].try_into().unwrap_or([0u8; 32]);
+                            let there: [u8; 32] = st.address()[..32].try_into().unwrap_or([0u8; 32]);
+                            let _ = st.add_friend(&here);
+                            match tox.add_friend(&there) {
+                                Ok(n) => {
+                                    println!(
+                                        "fault-harness: a stranger is made at {} s and befriended, as P2P_POKER_STRANGER_AT asked",
+                                        now.as_secs()
+                                    );
+                                    stranger = Some(Stranger {
+                                        tox: st,
+                                        friend_here: n,
+                                        invited: false,
+                                        group: None,
+                                        joined: false,
+                                        flood_sent: 0,
+                                        flood_since: None,
+                                    });
+                                }
+                                Err(e) => println!("fault-harness: the stranger could not be befriended: {e}"),
+                            }
+                        }
+                        _ => println!("fault-harness: no stranger could be made"),
+                    }
+                }
+                if let Some(s) = stranger.as_mut() {
+                    for e in s.tox.iterate() {
+                        match e {
+                            Event::GroupInvite { friend, invite } if s.group.is_none() => {
+                                match s.tox.accept_invite(friend, &invite, "stranger") {
+                                    Ok(g2) => {
+                                        s.group = Some(g2);
+                                        if copy {
+                                            // A seat's binding, as this client reads it.
+                                            let name = tables.values().find_map(|t| {
+                                                let g = t.group?;
+                                                t.bound.keys().find_map(|k| {
+                                                    let p = t.peer_keys.iter().find(|(_, kk)| *kk == k).map(|(p, _)| *p)?;
+                                                    tox.peer_name(g, p)
+                                                })
+                                            });
+                                            if let Some(n) = name {
+                                                let _ = s.tox.set_self_name(g2, &n);
+                                            }
+                                        }
+                                        println!(
+                                            "fault-harness: the stranger took the invitation{}",
+                                            if copy { ", named with a copy of a seat's binding" } else { "" }
+                                        );
+                                    }
+                                    Err(e) => println!("fault-harness: the stranger could not take the invitation: {e}"),
+                                }
+                            }
+                            Event::GroupSelfJoin { .. } if !s.joined => {
+                                s.joined = true;
+                                s.flood_since = Some(Instant::now());
+                                println!("fault-harness: the stranger is in the table's group");
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !s.invited && tox.friend_connection(s.friend_here) > 0 {
+                        if let Some(g) = tables.values().find_map(|t| t.group) {
+                            if tox.invite(g, s.friend_here).is_ok() {
+                                s.invited = true;
+                                println!("fault-harness: this client invited the stranger into its table's group");
+                            }
+                        }
+                    }
+                    if let (true, true, Some(g2), Some(since)) = (flood, s.joined, s.group, s.flood_since) {
+                        let rate = flood_rate();
+                        let due = (since.elapsed().as_millis() as u64).saturating_mul(rate) / 1_000;
+                        for _ in 0..due.saturating_sub(s.flood_sent).min(2_000) {
+                            let _ = flood_one(&mut s.tox, g2, FloodKind::Noise, &mut junk_state, 0);
+                            s.flood_sent += 1;
+                        }
+                    }
+                }
+            }
+        }
 
         // --- the founder's invitations, one at a time -------------------------
         for t in tables.values_mut() {
@@ -1926,8 +2605,14 @@ pub const INVITE_GAP: Duration = Duration::from_secs(3);
 /// the founder's felt until the seat itself came back (run161903-3).
 fn member_gone(tox: &Tox, t: &mut TableState, g: u32, peer: u32, key: Option<[u8; 32]>, quit: bool) {
     t.confirmed.remove(&peer);
+    // `D-051`: the peer id is given to the next member that joins; its first
+    // message must not meet a partial this one left.
+    t.reassembler.forget(&peer);
     let remembered = t.peer_keys.remove(&peer);
     let line = t.peer_lines.remove(&peer);
+    if let Some(k) = key.or(remembered) {
+        t.unplaced.remove(&k);
+    }
     // `D-035`: a seat this driver knows by its group key is
     // reported gone, on purpose or by timing out. `S1-DS`: by
     // the key remembered for the peer when the callback
@@ -2022,6 +2707,13 @@ fn take_invitation(
             t.group = Some(joined);
             t.accepted_at = Some(Instant::now());
             t.self_joined = false;
+            // `D-051`: named with this seat's binding before the first handshake.
+            t.named = None;
+            if let Some(key) = t.setup.binder.as_ref() {
+                if name_self(tox, key, joined) {
+                    t.named = Some(joined);
+                }
+            }
             announce(tox, t.group, &t.chat);
             // **The harness's stall, once per process.** Sleeping here
             // starves the handshake past toxcore's twelve-second reaper
@@ -2050,7 +2742,9 @@ fn invite_pending(
             return;
         }
     }
-    let Some(friend) = pending_invites(connected, friends, &t.roster, &t.invited)
+    // `D-051`: never a seat this client cut off for flooding the group.
+    let wanted: Vec<[u8; 32]> = t.roster.iter().copied().filter(|k| !t.barred_lines.contains(k)).collect();
+    let Some(friend) = pending_invites(connected, friends, &wanted, &t.invited)
         .into_iter()
         .next()
     else {
@@ -2412,6 +3106,7 @@ mod tests {
                 group_name: "TwoNet".into(),
                 self_name: "host".into(),
                 roster: vec![join_key],
+                binder: None,
             },
         );
 
@@ -2434,6 +3129,7 @@ mod tests {
                 group_name: "TwoNet".into(),
                 self_name: "player".into(),
                 roster: vec![host_key],
+                binder: None,
             },
         );
 
@@ -2505,6 +3201,7 @@ mod tests {
                 group_name: "TwoNet".into(),
                 self_name: "host".into(),
                 roster: vec![join_key],
+                binder: None,
             },
         );
         let real = tokio::time::timeout(Duration::from_secs(10), host.wait_for_chat_id())
@@ -2529,6 +3226,7 @@ mod tests {
                 group_name: "TwoNet".into(),
                 self_name: "player".into(),
                 roster: vec![host_key],
+                binder: None,
             },
         );
 
@@ -2561,6 +3259,7 @@ mod tests {
                 group_name: "T".into(),
                 self_name: "h".into(),
                 roster: Vec::new(),
+                binder: None,
             },
         );
         assert_eq!(t.cap(), fragment::MAX_MESSAGE);

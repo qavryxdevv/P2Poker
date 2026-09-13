@@ -63,7 +63,7 @@ use super::dealing::{self, Dealing, Identity, Refused, Share};
 use super::handwire::{street_code, street_from_code, ActionAmount, ActionHead, BoardReveal,
     DealPrivate, DeckCommit, DeckInit, Field, HandAbort, HandComplete, HandInit, NotOurs, PotAward,
     Refund, RevealEntry, ShowdownMuck, ShowdownReveal, ShuffleProof, ShuffleStep, TimeoutCert,
-    TimeoutVote, CertSubject};
+    TimeoutVote, CertSubject, CAUSE_FLOOD};
 use super::stage::{Collective, Heard};
 use crate::table::returnwire::{ReturnCert, ReturnVote, RETURN_CERT_CAP, RETURN_VOTE_CAP};
 
@@ -1503,6 +1503,17 @@ pub struct Hand {
     /// by seat -- the table's word for the seat's own client. Kept at the
     /// bank, because a certificate never enters the transcript.
     words: BTreeMap<SeatIdx, Vec<u8>>,
+    /// `D-051`: the seats this client cut off for flooding the table's carrier
+    /// group, as the node says them. Its votes about them carry
+    /// `CAUSE_FLOOD`. It only grows within a hand.
+    flooders: BTreeSet<SeatIdx>,
+    /// `D-051`: the seats this client has voted about at the stage now open,
+    /// whatever the cause -- one vote about one seat at one stage, so a
+    /// cause is fixed with the first.
+    voted_about: BTreeSet<SeatIdx>,
+    /// `D-051`: the seats a banked certificate named with `CAUSE_FLOOD`: every
+    /// voter's client cut them off for flooding the group.
+    flood_named: BTreeSet<SeatIdx>,
     /// R4: a betting stage certified while this client was elsewhere. The two
     /// chains cannot be reconciled, so this is reported and not repaired.
     forked: Option<String>,
@@ -1994,6 +2005,9 @@ impl Hand {
                 banked: BTreeSet::new(),
                 proof: None,
                 words: BTreeMap::new(),
+                flooders: BTreeSet::new(),
+                voted_about: BTreeSet::new(),
+                flood_named: BTreeSet::new(),
                 forked: None,
                 late: None,
                 bank_left_ms: o.time_bank_ms,
@@ -6108,6 +6122,8 @@ impl Hand {
         let first = &about[set.iter().next()?].0;
         let mut subject = CertSubject::of(first);
         subject.subject_seats = set.into_iter().collect();
+        // `D-051`: each seat with the cause its votes carry.
+        subject.causes = subject.subject_seats.iter().map(|s| about[s].0.cause).collect();
         Some((subject, voters))
     }
 
@@ -6176,6 +6192,7 @@ impl Hand {
         self.certifying = None;
         self.votes.clear();
         self.voted.clear();
+        self.voted_about.clear();
         self.own_vote_at = None;
     }
 
@@ -6257,6 +6274,10 @@ impl Hand {
             // can check the value rather than trust it.
             deadline_ms: self.next_deadline_for(self.owed_type()?),
             kind: if acting { 1 } else { 2 },
+            // `D-051`: a seat this client cut off for flooding is voted about
+            // with the cause, and only votes with the same cause count with
+            // this client's.
+            cause: self.flooders.contains(&seat).then_some(CAUSE_FLOOD),
         })
     }
 
@@ -6494,7 +6515,10 @@ impl Hand {
                 continue;
             };
             let digest = subject.subject_digest();
-            if self.voted.contains(&digest) {
+            // `D-051`: once about one seat at one stage, whatever the cause --
+            // a seat cut off after this client voted about it without one is
+            // voted about with the cause at its next stage, never twice here.
+            if self.voted.contains(&digest) || self.voted_about.contains(&seat) {
                 continue;
             }
             // Below the floor a certificate has no effect whatever, so a vote
@@ -6541,6 +6565,7 @@ impl Hand {
                 now_ms,
             )?;
             self.voted.insert(digest);
+            self.voted_about.insert(seat);
             // **`S1-BB`: the carrier, sampled where the accusation is made.**
             // Read from the same `mid_delivery` word the lever above consulted,
             // so the two cannot drift; recorded after `say_at` has succeeded,
@@ -6598,6 +6623,12 @@ impl Hand {
             return Err(Failed::Elsewhere {
                 seat,
                 what: "it were not the subject of its own vote",
+            });
+        }
+        if !body.cause_is_known() {
+            return Err(Failed::Elsewhere {
+                seat,
+                what: "its vote named a cause this catalogue defines",
             });
         }
         let Some(mine) = self.subject_now(body.subject_seat) else {
@@ -7056,6 +7087,8 @@ impl Hand {
 
         let mut stage: Option<CertSubject> = None;
         let mut per_subject: BTreeMap<SeatIdx, BTreeSet<SeatIdx>> = BTreeMap::new();
+        // `D-051`: the cause every vote about a seat carries, one per seat.
+        let mut causes: BTreeMap<SeatIdx, Option<u16>> = BTreeMap::new();
         let mut votes: Vec<(SeatIdx, TimeoutVote, Vec<u8>)> = Vec::new();
         for vote in &body.votes {
             let v = chained::open_in_hand(
@@ -7069,6 +7102,18 @@ impl Hand {
             let voter = self.seat_of(&v.sender)?;
             let named: TimeoutVote =
                 chained::payload(&v, TIMEOUT_VOTE_CAP).map_err(Failed::Wire)?;
+            if !named.cause_is_known() {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "every carried vote named a cause this catalogue defines",
+                });
+            }
+            if *causes.entry(named.subject_seat).or_insert(named.cause) != named.cause {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "every vote about one seat named one cause",
+                });
+            }
             match &stage {
                 None => stage = Some(CertSubject::of(&named)),
                 Some(first) => {
@@ -7112,6 +7157,11 @@ impl Hand {
             });
         };
         subject.subject_seats = per_subject.keys().copied().collect();
+        subject.causes = subject
+            .subject_seats
+            .iter()
+            .map(|s| causes.get(s).copied().flatten())
+            .collect();
         // D-036: one voter set for every seat named, and no named seat in it.
         let voters: BTreeSet<SeatIdx> = per_subject.values().next().cloned().unwrap_or_default();
         if per_subject.values().any(|v| *v != voters) {
@@ -7283,6 +7333,11 @@ impl Hand {
         // D-036: every seat named leaves R(k+1); one strike per seat per
         // stage, however many sets at this stage name it.
         for seat in &subject.subject_seats {
+            // `D-051`: named with the flood cause by every voter -- the digest
+            // commits to it -- the seat is out of the table for good.
+            if subject.cause_of(*seat) == Some(CAUSE_FLOOD) {
+                self.flood_named.insert(*seat);
+            }
             if !self.certified.contains(seat) {
                 self.certified.push(*seat);
             }
@@ -9397,12 +9452,32 @@ impl Hand {
         let mut out = self.open.out.clone();
         for seat in &self.certified {
             let came_back = self.open.returns.get(usize::from(*seat)).copied().unwrap_or(0);
-            if came_back >= crate::protocol::constants::MAX_RETURNS && !out.contains(seat) {
+            // `D-051`: or certified with the flood cause by every voter.
+            let flooded = self.flood_named.contains(seat);
+            if (came_back >= crate::protocol::constants::MAX_RETURNS || flooded) && !out.contains(seat) {
                 out.push(*seat);
             }
         }
         out.sort_unstable();
         out
+    }
+
+    /// `D-051`: whether this hand's certificate named the seat with the flood
+    /// cause -- out of the table for good for flooding its carrier group, as
+    /// against `D-047`'s fourth absence.
+    pub fn named_for_flooding(&self, seat: SeatIdx) -> bool {
+        self.flood_named.contains(&seat) && self.certified.contains(&seat)
+    }
+
+    /// `D-051`: the seats this client cut off for flooding the table's carrier
+    /// group. Its votes about them carry the flood cause from the next vote
+    /// on; a seat once said stays said for the hand.
+    pub fn note_flooders(&mut self, seats: &[SeatIdx]) {
+        for seat in seats {
+            if *seat != self.open.my_seat {
+                self.flooders.insert(*seat);
+            }
+        }
     }
 
     pub fn returned(&self) -> &[SeatIdx] {
@@ -9589,6 +9664,16 @@ impl Hand {
                 || !self.occupies_a_seat(seat)
                 || self.boundary_stack_of(seat) == 0
             {
+                continue;
+            }
+            // `D-051`: a seat this client cut off for flooding the table's
+            // group gets no vote for a return from it, ever.
+            if self.flooders.contains(&seat) {
+                if self.return_refused.insert(seat) {
+                    self.cert_note.push(format!(
+                        "seat {seat} asks to come back, and this client cut it off for flooding the table's group, so it votes for no return of that seat (D-051)"
+                    ));
+                }
                 continue;
             }
             // `D-032`: three returns and no more. A certificate needs every
@@ -10107,6 +10192,29 @@ pub fn certificate_names(
         voters.insert(voter);
     }
     Some((subjects, voters))
+}
+
+/// `D-051`: the cause every vote about `seat` in a certificate's bytes
+/// carries -- `Some(CAUSE_FLOOD)` for a seat put out for flooding the table's
+/// carrier group -- or `None` when the votes about it disagree or there are
+/// none. Read after `certificate_names` has accepted the bytes.
+pub fn certificate_cause(raw: &[u8], table_id: &[u8; 32], hand_id: u64, seat: SeatIdx) -> Option<u16> {
+    let opened = chained::open_in_hand(raw, FRAME_CAP, EventType::TimeoutCert, table_id, hand_id).ok()?;
+    let body: TimeoutCert = chained::payload(&opened, TIMEOUT_CERT_CAP).ok()?;
+    let mut cause: Option<Option<u16>> = None;
+    for vote in &body.votes {
+        let v = chained::open_in_hand(vote, FRAME_CAP, EventType::TimeoutVote, table_id, hand_id).ok()?;
+        let named: TimeoutVote = chained::payload(&v, TIMEOUT_VOTE_CAP).ok()?;
+        if named.subject_seat != seat {
+            continue;
+        }
+        match cause {
+            None => cause = Some(named.cause),
+            Some(c) if c != named.cause => return None,
+            Some(_) => {}
+        }
+    }
+    cause.flatten()
 }
 
 #[cfg(test)]
@@ -14905,6 +15013,98 @@ mod tests {
             assert_eq!(n.required, vec![0, 1, 2], "{:?}", n.required);
             assert_eq!(n.genesis, nexts[0].genesis, "one GENESIS(k+1)");
         }
+    }
+
+    /// `D-051`: seats every voter's client cut off for flooding the table's
+    /// group are certified with the flood cause -- together, as D-036 -- and
+    /// are out of the table for good at the boundary: chips gone, not
+    /// required, carried in `out`, one genesis. The flooders' own votes are
+    /// never needed: they are the seats named.
+    #[test]
+    fn seats_every_voter_cut_off_for_flooding_are_out_of_the_table_for_good() {
+        let (mut hands, keys) = three_present_two_quiet();
+        for h in hands.iter_mut() {
+            h.note_flooders(&[3, 4]);
+        }
+        let t1 = NOW + 30_000;
+        let mut votes: Vec<Vec<Vec<u8>>> = Vec::new();
+        for i in 0..3 {
+            let out = bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap());
+            assert_eq!(out.len(), 2, "seat {i} votes about both flooders");
+            votes.push(out);
+        }
+        let mut copies: Vec<Vec<u8>> = vec![Vec::new(); 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                if i == j {
+                    continue;
+                }
+                for v in &votes[j] {
+                    for b in bytes_of_sends(hands[i].on_event(v, &keys[i], t1 + 1_000).unwrap()) {
+                        copies[i] = b;
+                    }
+                }
+            }
+            assert!(!copies[i].is_empty(), "seat {i} seals a certificate about the pair");
+        }
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    hands[i].on_event(&copies[j], &keys[i], t1 + 2_000).expect("a peer's copy holds");
+                }
+            }
+            assert!(hands[i].named_for_flooding(3) && hands[i].named_for_flooding(4), "seat {i}: both named with the cause");
+            assert_eq!(hands[i].out_for_good(), vec![3, 4], "seat {i}: out for good");
+            assert_eq!(
+                certificate_cause(&copies[i], &hands[i].open.table_id, hands[i].open.hand_id, 3),
+                Some(CAUSE_FLOOD),
+                "seat {i}: the bytes say why, for the seat's own client"
+            );
+        }
+        let nexts: Vec<Opening> = hands.iter().map(|h| h.next_hand().expect("a successor")).collect();
+        for n in &nexts {
+            assert_eq!(n.required, vec![0, 1, 2]);
+            assert_eq!(n.out, vec![3, 4], "carried");
+            for s in [3u8, 4] {
+                assert_eq!(n.seats.iter().find(|x| x.0 == s).map(|x| x.2), Some(0), "seat {s}'s chips left the table");
+            }
+            assert_eq!(n.genesis, nexts[0].genesis, "one GENESIS(k+1)");
+        }
+    }
+
+    /// `D-051`: the cause is part of the subject. A voter that cut the seats
+    /// off alone votes about another subject than the voters that did not, so
+    /// nobody's set completes -- one client's measurement puts nobody out, and
+    /// the table is back to waiting on its deadline, as with any vote that is
+    /// not everybody's.
+    #[test]
+    fn a_flood_cause_one_voter_alone_names_completes_no_certificate() {
+        let (mut hands, keys) = three_present_two_quiet();
+        hands[0].note_flooders(&[3, 4]);
+        let t1 = NOW + 30_000;
+        let votes: Vec<Vec<Vec<u8>>> = (0..3)
+            .map(|i| bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], t1, 0).unwrap()))
+            .collect();
+        for i in 0..3 {
+            for j in 0..3 {
+                if i == j {
+                    continue;
+                }
+                for v in &votes[j] {
+                    let out = hands[i].on_event(v, &keys[i], t1 + 1_000);
+                    assert!(out.map(|o| o.is_empty()).unwrap_or(true), "seat {i} seals nothing");
+                }
+            }
+            assert!(hands[i].out_for_good().is_empty(), "seat {i}: nobody out");
+            assert!(hands[i].aborted().is_none(), "seat {i}: no certificate ended the hand");
+        }
+        // And the voter that cut them off votes once about each seat at this
+        // stage, whatever it learns later.
+        hands[1].note_flooders(&[3, 4]);
+        assert!(
+            hands[1].vote_on_timeouts(&keys[1], t1 + 1_500, 0).unwrap().is_empty(),
+            "a seat already voted about at this stage is not voted about again with a cause"
+        );
     }
 
     /// D-034: a seat's own clock is the timeout the window shows plus what is
