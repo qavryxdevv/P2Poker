@@ -16,6 +16,8 @@
       3. It creates its profile BESIDE ITSELF and nothing anywhere else.
       4. A second copy in a second directory is a DIFFERENT client, which is what
          a portable profile means.
+      5. It names nothing of the machine it was built on (S1-EN): no user
+         profile, user name, computer name or repository path in its bytes.
 
     Run it after any change to .cargo/config.toml, to the dependencies, or to
     anything under src/storage/.
@@ -180,6 +182,11 @@ try {
 finally {
     Remove-Item $a, $b -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# --- 5. nothing of the machine it was built on -----------------------------
+& (Join-Path $PSScriptRoot 'check-build-paths.ps1') -Exe $Exe
+if ($LASTEXITCODE -eq 0) { Pass 'names nothing of the machine it was built on' }
+else { Fail 'names the machine it was built on: tools\remap-build-paths.ps1, then build again' }
 
 Write-Host ''
 if ($failures -eq 0) {

@@ -38,8 +38,10 @@
 
 [CmdletBinding()]
 param(
-    [string] $Target  = 'user@172.16.0.20',
-    [string] $KeyPath = 'X:\keys\far-machine-key',
+    # The far machine: FarTarget and FarKeyPath in tools\machine.local.psd1
+    # when not given here (S1-EN).
+    [string] $Target  = '',
+    [string] $KeyPath = '',
     [int]    $Seconds = 180,
     [string] $Binary  = "$PSScriptRoot\..\target\release\examples\tox_link.exe",
     # Forces both ends through a TCP relay. Not a preference: two hosts behind
@@ -63,6 +65,13 @@ function Fail($msg) { Write-Host "FAIL  $msg" -ForegroundColor Red; exit 1 }
 function Note($msg) { Write-Host "      $msg" -ForegroundColor DarkGray }
 function Step($msg) { Write-Host "==>   $msg" -ForegroundColor Cyan }
 function Warn($msg) { Write-Host "WARN  $msg" -ForegroundColor Yellow }
+
+. (Join-Path $PSScriptRoot 'machine.ps1')
+if (-not $Target) { $Target = Get-MachineValue 'FarTarget' }
+if (-not $KeyPath) { $KeyPath = Get-MachineValue 'FarKeyPath' }
+if (-not $Target -or -not $KeyPath) {
+    Fail "the far machine is not named: pass -Target and -KeyPath, or set FarTarget and FarKeyPath in tools\machine.local.psd1 (tools\machine.example.psd1 shows the shape)."
+}
 
 $hostPart = ($Target -split '@')[-1]
 

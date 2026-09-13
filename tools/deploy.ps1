@@ -5,7 +5,8 @@
 # over. This script never touches `profile\`: it replaces the binary and leaves
 # the player's keys, settings and the tables they have joined alone.
 #
-#   tools\deploy.ps1                     build, check, copy to <profile>\Games\P2Poker
+#   tools\deploy.ps1                     build, check, copy to DeployTo in
+#                                        tools\machine.local.psd1, else <profile>\p2p-poker
 #   tools\deploy.ps1 -To D:\Elsewhere    somewhere else
 #   tools\deploy.ps1 -SkipChecks         copy what is already built
 #
@@ -13,7 +14,7 @@
 # with a file-in-use error that leaves the folder in neither state.
 
 param(
-    [string]$To = "$env:USERPROFILE\Games\P2Poker",
+    [string]$To = '',
     [switch]$SkipChecks,
     [switch]$SkipClean
 )
@@ -34,6 +35,12 @@ function Invoke-Native {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
+
+# Where the client is played from belongs to this machine, not to the
+# repository (S1-EN).
+. (Join-Path $PSScriptRoot 'machine.ps1')
+if (-not $To) { $To = Get-MachineValue 'DeployTo' }
+if (-not $To) { $To = Join-Path $env:USERPROFILE 'p2p-poker' }
 
 # Cargo is not always on the PATH of the shell this is launched from — a
 # scheduled task, or an editor's terminal, or a session that has never opened a
@@ -83,6 +90,10 @@ try {
     if ($LASTEXITCODE -ne 0) { Die 'the build failed' }
     if (-not (Test-Path $exe)) { Die "no binary at $exe" }
     Ok ("built {0:N1} MB" -f ((Get-Item $exe).Length / 1MB))
+
+    Step 'the binary names nothing of the machine it was built on'
+    & (Join-Path $PSScriptRoot 'check-build-paths.ps1') -Exe $exe
+    if ($LASTEXITCODE -ne 0) { Die 'the binary names this machine: run tools\remap-build-paths.ps1 once and build again' }
 }
 finally { Pop-Location }
 

@@ -64,8 +64,10 @@ param(
     # is specifically about the long tail -- throughput drift, a late
     # divergence, a peer that flaps -- and say so when you do.
     [ValidateRange(60, 3600)][int]$Seconds = 420,
-    [string]$Target = 'user@172.16.0.20',
-    [string]$KeyPath = 'X:\keys\far-machine-key',
+    # The far machine: FarTarget and FarKeyPath in tools\machine.local.psd1 when
+    # not given here (S1-EN).
+    [string]$Target = '',
+    [string]$KeyPath = '',
     [string]$Exe,
     [string]$FarDir = 'C:\p2ptest',
     # **On by default, because it is the shape that works and the honest one.**
@@ -363,7 +365,13 @@ if (-not $faultHarness) {
     }
 }
 
-if (-not (Test-Path $KeyPath)) { throw "no key at $KeyPath. Plug the USB volume in or pass -KeyPath." }
+. (Join-Path $PSScriptRoot 'machine.ps1')
+if (-not $Target) { $Target = Get-MachineValue 'FarTarget' }
+if (-not $KeyPath) { $KeyPath = Get-MachineValue 'FarKeyPath' }
+if (-not $Target -or -not $KeyPath) {
+    throw "the far machine is not named: pass -Target and -KeyPath, or set FarTarget and FarKeyPath in tools\machine.local.psd1 (tools\machine.example.psd1 shows the shape)."
+}
+if (-not (Test-Path $KeyPath)) { throw "no key at $KeyPath. Pass -KeyPath, or correct FarKeyPath in tools\machine.local.psd1." }
 
 # **Where the logs go, and it is not the temp directory (2026-09-06).**
 #

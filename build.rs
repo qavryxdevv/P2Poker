@@ -9,6 +9,8 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=build.rs");
 
+    refuse_a_release_that_names_this_machine();
+
     #[cfg(windows)]
     {
         let mut res = winresource::WindowsResource::new();
@@ -26,6 +28,60 @@ fn main() {
 
     #[cfg(feature = "tox")]
     tox::build();
+}
+
+/// `S1-EN`: a release names nothing of the machine it was built on.
+///
+/// rustc writes the source path of every panic location and trace point into
+/// the binary, and a dependency's path is absolute: the cargo home, under the
+/// builder's profile, with the user name in it. Some three thousand of them were
+/// in the owner's release, and two build scripts' generated bindings named the
+/// repository's own folders. Cargo's `trim-paths` would say it once in
+/// `Cargo.toml` and is not stable (cargo 1.95); rustc's `--remap-path-prefix`
+/// is, but it has to name the paths it hides, so it cannot be committed.
+/// `tools/remap-build-paths.ps1` writes it into this machine's cargo home, and
+/// this refuses a release build that would still name the cargo home or the
+/// target directory, so a machine without it cannot ship one by accident.
+/// `tools/check-build-paths.ps1` reads the built binary for what this cannot
+/// see.
+fn refuse_a_release_that_names_this_machine() {
+    println!("cargo:rerun-if-env-changed=CARGO_HOME");
+    if std::env::var("PROFILE").as_deref() != Ok("release") {
+        return;
+    }
+    let flags = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    let mut hidden: Vec<std::path::PathBuf> = Vec::new();
+    let mut args = flags.split('\u{1f}');
+    while let Some(arg) = args.next() {
+        let map = if arg == "--remap-path-prefix" {
+            args.next()
+        } else {
+            arg.strip_prefix("--remap-path-prefix=")
+        };
+        // rustc: the FROM may itself contain `=`, the TO may not.
+        if let Some((from, _)) = map.and_then(|m| m.rsplit_once('=')) {
+            hidden.push(std::path::PathBuf::from(from));
+        }
+    }
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os(home).map(|h| std::path::PathBuf::from(h).join(".cargo")));
+    let out_dir = std::env::var_os("OUT_DIR").map(std::path::PathBuf::from);
+    let named: Vec<String> = [cargo_home, out_dir]
+        .into_iter()
+        .flatten()
+        .filter(|path| !hidden.iter().any(|h| path.starts_with(h)))
+        .map(|path| path.display().to_string())
+        .collect();
+    assert!(
+        named.is_empty(),
+        "a release built here would carry this machine's paths in the binary ({}): rustc writes every \
+         dependency's source path into panic locations and trace points. Run tools/remap-build-paths.ps1 \
+         once -- it puts --remap-path-prefix for this machine into the cargo home's config.toml -- or add \
+         those flags there yourself, and build again (S1-EN)",
+        named.join(", ")
+    );
 }
 
 /// Compiling the vendored `c-toxcore` (D-019).
@@ -115,10 +171,23 @@ mod tox {
             sources.len()
         );
 
+        // `S1-EN`: every path the compiler is given is relative to this
+        // package's directory, which is the build script's working directory.
+        // MSVC's `__FILE__` is the path as it was given, and toxcore's logger
+        // passes `__FILE__` into the binary: given absolute paths, every source
+        // file's name carried the builder's home and folder layout into the
+        // release.
+        let tox_here = Path::new("vendor/c-toxcore");
+        let sodium_here = Path::new("vendor/libsodium");
+        assert!(
+            tox_here.join("CMakeLists.txt").is_file(),
+            "the build script is not running in the package directory, so the C sources cannot be named relative to it"
+        );
+
         let mut cc = cc::Build::new();
-        cc.include(tox.join("toxcore"))
-            .include(&tox)
-            .include(sodium.join("src/libsodium/include"))
+        cc.include(tox_here.join("toxcore"))
+            .include(tox_here)
+            .include(sodium_here.join("src/libsodium/include"))
             .warnings(false);
 
         // **The library's own diagnostics, at DEBUG, in the harness build only.**
@@ -163,7 +232,7 @@ mod tox {
             // fifteen calls Windows has native primitives for. `tools/msvc-shim`
             // supplies exactly those fifteen; see the header for what it does
             // not supply and why that is a compile error rather than a stub.
-            cc.include(root.join("tools/msvc-shim"));
+            cc.include("tools/msvc-shim");
             // Linking libsodium as a static archive rather than through its
             // import library, which is what the vendored build produces.
             cc.define("SODIUM_STATIC", "1");
@@ -176,7 +245,7 @@ mod tox {
         }
 
         for s in &sources {
-            cc.file(tox.join(s));
+            cc.file(tox_here.join(s));
         }
         cc.compile("toxcore");
 

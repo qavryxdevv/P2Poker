@@ -51,3 +51,8 @@ desktop.ini
 
 # Windows OpenSSH once left this here on every run; see tools/table-run-split.ps1
 /NUL
+
+# One machine's values for the tools: the far test machine, where the client is
+# deployed. Never committed -- the repository names nobody's machines (S1-EN);
+# tools/machine.example.psd1 shows the shape.
+/tools/machine.local.psd1
