@@ -172,7 +172,8 @@ fn main() {
     // `--preview-ranking` and `--preview-player-note`; `--preview-odds` puts the
     // sample hand on the flop, so the odds have something to say, and
     // `--preview-chat` gives the table something said; `--preview-sitout` sits
-    // the hero and seat 2 out and `--preview-bust` has the hero finish fourth.
+    // the hero and seat 2 out, `--preview-bust` has the hero finish fourth and
+    // `--preview-won` win the tournament.
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -1319,7 +1320,10 @@ fn preview_table(args: &[String]) {
         }
     }
     if has("--preview-bust") {
-        view.busted = Some(table::Busted { place: 4, players_left: 3 });
+        view.finished = Some(table::Finish { place: 4, players_left: 3, show_in_ms: 0 });
+    }
+    if has("--preview-won") {
+        view.finished = Some(table::Finish { place: 1, players_left: 1, show_in_ms: 0 });
     }
     if has("--preview-out") {
         view.out_for_good = Some("certified out after the fourth absence (hand 128)".into());

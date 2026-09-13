@@ -246,8 +246,8 @@ pub struct TableView {
     pub winning_hand: Option<String>,
     /// `D-049`: this client's seat sits out; the bar offers *I'm back*.
     pub hero_sitting_out: bool,
-    /// Out of chips, and the place finished in.
-    pub busted: Option<Busted>,
+    /// The tournament over for this player: the place, and when to say it.
+    pub finished: Option<Finish>,
 }
 
 /// The smallest table window the client allows. `main.rs` opens the window
@@ -331,13 +331,19 @@ pub struct Link {
     pub away: bool,
 }
 
-/// The owner, 2026-09-13: out of chips in a tournament, the place the player
-/// finished in, and how many still play.
+/// The owner, 2026-09-13: the place the player finished the tournament in --
+/// out of chips, or first, the winner -- and how many still play. The window
+/// about it waits `show_in_ms`, so the hand that decided it can be looked at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Busted {
+pub struct Finish {
     pub place: usize,
     pub players_left: usize,
+    pub show_in_ms: u64,
 }
+
+/// How long the window about the place waits after the deciding hand (the
+/// owner: ten seconds, to look at the winning hand).
+pub const FINISH_WINDOW_DELAY_MS: u64 = 10_000;
 
 /// *1st*, *2nd*, *3rd*, *4th* ...
 pub fn ordinal(n: usize) -> String {
@@ -447,7 +453,7 @@ pub struct TableUi {
     /// PokerTH's blink.
     pub winner_since: Vec<(u64, SeatIdx, f64)>,
     /// The window about the place finished in was closed to watch the table.
-    pub bust_closed: bool,
+    pub finish_closed: bool,
 }
 
 /// The raise the control offers this frame.
@@ -1425,36 +1431,49 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
             });
     }
 
-    // The owner, 2026-09-13: out of chips in a tournament -- the place, and
-    // leave or, while others still play, watch.
-    if let Some(b) = view.busted.filter(|_| !state.bust_closed && view.out_for_good.is_none()) {
-        egui::Window::new("Out of chips")
-            .id(egui::Id::new("table-busted"))
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .frame(window_frame(&ctx))
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .show(&ctx, |ui| {
-                ui.set_min_width(360.0);
-                ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
-                window_heading(ui, "Out of the tournament", false);
-                ui.label(RichText::new(format!("You finished in {} place.", ordinal(b.place))).size(18.0).strong().color(style::COLOR_ACCENT));
-                let watch = b.players_left >= 2;
-                if watch {
-                    ui.label(format!("{} players are still playing. Watch the table, or leave it.", b.players_left));
-                } else {
-                    ui.label(RichText::new("The tournament is over.").color(style::PANEL_MUTED));
-                }
-                ui.horizontal(|ui| {
-                    if watch && ui.add(egui::Button::new(RichText::new("Watch the table").color(style::WHITE)).fill(Color32::from_rgb(0x1A, 0x4A, 0x8A))).clicked() {
-                        state.bust_closed = true;
+    // The owner, 2026-09-13: the tournament over for this player -- out of
+    // chips, the place, and leave or, while others still play, watch; or the
+    // winner, congratulated. Ten seconds after the deciding hand, so it can be
+    // looked at first.
+    if let Some(f) = view.finished.filter(|_| !state.finish_closed && view.out_for_good.is_none()) {
+        if f.show_in_ms > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(f.show_in_ms));
+        } else {
+            let won = f.place == 1;
+            egui::Window::new(if won { "Winner" } else { "Out of chips" })
+                .id(egui::Id::new("table-finished"))
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .frame(window_frame(&ctx))
+                .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+                .show(&ctx, |ui| {
+                    ui.set_min_width(360.0);
+                    ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
+                    let watch = !won && f.players_left >= 2;
+                    if won {
+                        window_heading(ui, "You won the tournament!", false);
+                        ui.label(RichText::new("Congratulations! You finished in 1st place.").size(18.0).strong().color(style::COLOR_ACCENT));
+                        ui.label(RichText::new("The tournament is over.").color(style::PANEL_MUTED));
+                    } else {
+                        window_heading(ui, "Out of the tournament", false);
+                        ui.label(RichText::new(format!("You finished in {} place.", ordinal(f.place))).size(18.0).strong().color(style::COLOR_ACCENT));
+                        if watch {
+                            ui.label(format!("{} players are still playing. Watch the table, or leave it.", f.players_left));
+                        } else {
+                            ui.label(RichText::new("The tournament is over.").color(style::PANEL_MUTED));
+                        }
                     }
-                    if ui.add(egui::Button::new(RichText::new("Leave the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
-                        action = Some(TableAction::LeaveTable);
-                    }
+                    ui.horizontal(|ui| {
+                        if watch && ui.add(egui::Button::new(RichText::new("Watch the table").color(style::WHITE)).fill(Color32::from_rgb(0x1A, 0x4A, 0x8A))).clicked() {
+                            state.finish_closed = true;
+                        }
+                        if ui.add(egui::Button::new(RichText::new("Leave the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
+                            action = Some(TableAction::LeaveTable);
+                        }
+                    });
                 });
-            });
+        }
     }
 
     // PokerTH's sound settings, at the gear.
@@ -1734,7 +1753,7 @@ impl TableView {
             ],
             winning_hand: None,
             hero_sitting_out: false,
-            busted: None,
+            finished: None,
         }
     }
 }

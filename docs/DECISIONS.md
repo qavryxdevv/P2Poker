@@ -4168,6 +4168,12 @@ style and its `preview.png` for the look. `assets/pokerth/PROVENANCE.md` names e
     this seat's chips went to zero, the place is the number of seats still holding chips plus one, and of the
     seats busted in the same hand the ones that began it with more finish ahead. The window says the place,
     offers *Watch the table* while two or more still play, and *Leave the table*; the log says it too.
+16. **The winner is congratulated, and both windows wait ten seconds** (the owner, on a screenshot of the
+    second-place window: *this message, titled that I am the winner, with congratulations, for the winner of
+    the tournament, ten seconds after, so the winning hand can be looked at*). The last seat holding chips at
+    the end of a hand two or more seats played gets *You won the tournament!* and *Congratulations! You finished
+    in 1st place.* with *Leave the table*. That window and the place window both open
+    `FINISH_WINDOW_DELAY_MS` = 10 000 ms after the deciding hand ended, which covered the showdown before.
 
 **Guard.** `gui::table::seats`, `gui::table::style`, `gui::table::bar`, `gui::table::icons`, `gui::table` (the view, the
 phases, the blind seats, the badge's pop, `both_corners_stay_in_their_corners_at_every_size` over seven window sizes

@@ -207,7 +207,7 @@ pub struct TableApp {
     pub turn_warned: u64,
     pub sitting_out: bool,
     pub away: std::collections::BTreeSet<u8>,
-    pub busted: Option<crate::gui::table::Busted>,
+    pub finished: Option<(crate::gui::table::Finish, std::time::Instant)>,
 }
 
 /// Everything the client knows, in the form the panes read it.
@@ -326,8 +326,9 @@ pub struct AppState {
     /// `D-049`: the seats the table's group says sit out, as the last link
     /// reading of each had it -- only ever said of a seat on the line.
     pub away: std::collections::BTreeSet<u8>,
-    /// The place this player finished the tournament in, once out of chips.
-    pub busted: Option<crate::gui::table::Busted>,
+    /// The place this player finished the tournament in -- out of chips, or
+    /// the winner -- and when the deciding hand ended.
+    pub finished: Option<(crate::gui::table::Finish, std::time::Instant)>,
     /// The sounds owed since the window last played them, in order.
     pub sound_cues: Vec<crate::sound::Cue>,
     /// How many games this client has sat down to since it started: PokerTH's
@@ -569,7 +570,7 @@ impl AppState {
         std::mem::swap(&mut self.turn_warned, &mut other.turn_warned);
         std::mem::swap(&mut self.sitting_out, &mut other.sitting_out);
         std::mem::swap(&mut self.away, &mut other.away);
-        std::mem::swap(&mut self.busted, &mut other.busted);
+        std::mem::swap(&mut self.finished, &mut other.finished);
     }
 
     /// `D-043`: turn to another of this client's tables: its state becomes
@@ -1068,7 +1069,7 @@ impl AppState {
                 self.clock_for(None, 0);
                 if !restored {
                     self.log_showdown(hand_id);
-                    self.note_the_bust(hand_id);
+                    self.note_the_finish(hand_id);
                 }
                 self.note(format!("hand #{hand_id} is over"));
             }
@@ -1434,7 +1435,7 @@ impl AppState {
         self.turn_warned = 0;
         self.sitting_out = false;
         self.away.clear();
-        self.busted = None;
+        self.finished = None;
     }
 
     /// A seat's chips when the hand began: the last settlement's figure, or
@@ -1449,12 +1450,14 @@ impl AppState {
         })
     }
 
-    /// The owner, 2026-09-13: out of chips in a tournament, the window says
-    /// the place the player finished in. The seats still holding chips are
-    /// ahead; of the seats busted in the same hand, one that began it with
-    /// more chips finishes ahead too (the tournament rule).
-    fn note_the_bust(&mut self, hand_id: u64) {
-        if self.busted.is_some() {
+    /// The owner, 2026-09-13: the tournament over for this player. Out of
+    /// chips, the window says the place: the seats still holding chips are
+    /// ahead, and of the seats busted in the same hand one that began it with
+    /// more chips finishes ahead too (the tournament rule). The last seat
+    /// holding chips has won it, and is congratulated. Either way the window
+    /// waits `FINISH_WINDOW_DELAY_MS` after the hand that decided it.
+    fn note_the_finish(&mut self, hand_id: u64) {
+        if self.finished.is_some() {
             return;
         }
         let Some(me) = self.seated.as_ref().and_then(|s| s.seat) else {
@@ -1465,23 +1468,40 @@ impl AppState {
         };
         let end = |seat: u8| h.stacks.get(usize::from(seat)).copied().unwrap_or(0);
         let mine = self.start_stack(h, me);
-        if mine == 0 || end(me) > 0 || !h.dealt_in.contains(&me) {
+        if mine == 0 || !h.dealt_in.contains(&me) {
             return;
         }
         let alive = h.stacks.iter().filter(|s| **s > 0).count();
-        let ahead_of_me = h
-            .dealt_in
-            .iter()
-            .filter(|n| **n != me && end(**n) == 0 && self.start_stack(h, **n) > mine)
-            .count();
-        let busted = crate::gui::table::Busted { place: alive + ahead_of_me + 1, players_left: alive };
+        let place = if end(me) > 0 {
+            // Still holding chips: finished only as the last seat that does,
+            // at the end of a hand more than one seat played.
+            if alive != 1 || h.dealt_in.len() < 2 {
+                return;
+            }
+            1
+        } else {
+            let ahead_of_me = h
+                .dealt_in
+                .iter()
+                .filter(|n| **n != me && end(**n) == 0 && self.start_stack(h, **n) > mine)
+                .count();
+            alive + ahead_of_me + 1
+        };
+        let finish = crate::gui::table::Finish {
+            place,
+            players_left: alive,
+            show_in_ms: crate::gui::table::FINISH_WINDOW_DELAY_MS,
+        };
         let name = self.seat_name(me);
-        self.log_table(
-            crate::gui::table::LogKind::SitOut,
-            format!("{name} finished in {} place", crate::gui::table::ordinal(busted.place)),
-        );
-        self.note(format!("out of chips: finished in {} place", crate::gui::table::ordinal(busted.place)));
-        self.busted = Some(busted);
+        let words = crate::gui::table::ordinal(place);
+        if place > 1 {
+            // The winner's line is the log's own: *wins game N!*.
+            self.log_table(crate::gui::table::LogKind::SitOut, format!("{name} finished in {words} place"));
+            self.note(format!("out of chips: finished in {words} place"));
+        } else {
+            self.note("you won the tournament".to_string());
+        }
+        self.finished = Some((finish, std::time::Instant::now()));
     }
 
     /// `S1-CX`: the other seat, when this table is heads-up and set.

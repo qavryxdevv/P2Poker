@@ -180,7 +180,11 @@ impl AppState {
             log: self.table_log.iter().cloned().collect(),
             winning_hand: winning_hand(hand, hero, self.strength.as_ref()),
             hero_sitting_out: self.sitting_out,
-            busted: self.busted,
+            // The window about it waits: the deciding hand is looked at first.
+            finished: self.finished.map(|(f, at)| crate::gui::table::Finish {
+                show_in_ms: f.show_in_ms.saturating_sub(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                ..f
+            }),
         }
     }
 
@@ -752,18 +756,19 @@ mod tests {
 
     /// Out of chips: the place is the seats still holding chips plus one, and
     /// of two seats busted in one hand the one that began it with more
-    /// finishes ahead.
+    /// finishes ahead. The window waits ten seconds.
     #[test]
     fn a_busted_player_is_told_the_place() {
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![600, 1_400, 1_000], shown: vec![None; 3] });
-        assert_eq!(s.table_view().busted, None, "still in");
+        assert_eq!(s.table_view().finished, None, "still in");
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         // Seat 0 (600) and seat 2 (1 000) both lose everything to seat 1.
         s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3] });
-        let b = s.table_view().busted.expect("the window says the place");
+        let b = s.table_view().finished.expect("the window says the place");
         assert_eq!((b.place, b.players_left), (3, 1), "seat 2 began with more and finishes second");
+        assert!(b.show_in_ms > 9_000, "the deciding hand is looked at first: {} ms", b.show_in_ms);
         assert!(s.table_log.iter().any(|l| l.text.contains("finished in 3rd place")));
         // Said once.
         s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3] });
@@ -773,14 +778,35 @@ mod tests {
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![], shown: vec![] });
-        assert_eq!(s.table_view().busted, None);
+        assert_eq!(s.table_view().finished, None);
 
         // Out while two others play on: fourth of four, two still in... of three, third.
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 1_900, 1_100], shown: vec![None; 3] });
-        let b = s.table_view().busted.expect("out");
+        let b = s.table_view().finished.expect("out");
         assert_eq!((b.place, b.players_left), (3, 2));
+    }
+
+    /// The last seat holding chips has won, and is told so -- once the hand
+    /// that won it has been looked at.
+    #[test]
+    fn the_winner_is_congratulated() {
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![2_000, 1_000, 0], shown: vec![None; 3] });
+        assert_eq!(s.table_view().finished, None, "two still hold chips: nobody has won yet");
+        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![3_000, 0, 0], shown: vec![None; 3] });
+        let f = s.table_view().finished.expect("the winner is told");
+        assert_eq!((f.place, f.players_left), (1, 1));
+        assert!(f.show_in_ms > 9_000, "ten seconds to look at the winning hand: {} ms", f.show_in_ms);
+
+        // Holding chips while another seat still does is not a win.
+        let mut s = seated(1);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 2_500, 500], shown: vec![None; 3] });
+        assert_eq!(s.table_view().finished, None);
     }
 
     #[test]
