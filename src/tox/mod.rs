@@ -107,6 +107,10 @@ pub enum Event {
     /// delivered, and why every reading of the status line before this had to
     /// hedge.
     GroupPeerJoin { group: u32, peer: u32 },
+    /// `D-049`: a member's status in a group changed; `away` is `AWAY`.
+    /// Reported the moment the library takes the status, so the sit-out word
+    /// does not wait for the driver's sweep.
+    GroupPeerStatus { group: u32, peer: u32, away: bool },
     /// A confirmed peer left, was kicked, or timed out. `key` is its group
     /// key, read inside the callback while the peer still exists; `quit`
     /// is `TOX_GROUP_EXIT_TYPE_QUIT` -- the peer left on purpose -- as
@@ -258,6 +262,18 @@ unsafe extern "C" fn on_group_peer_join(
 ) {
     let Some(s) = sink(user_data) else { return };
     s.events.push(Event::GroupPeerJoin { group, peer });
+}
+
+/// `D-049`: a member's status changed. See [`Event::GroupPeerStatus`].
+unsafe extern "C" fn on_group_peer_status(
+    _tox: *mut sys::Tox,
+    group: u32,
+    peer: u32,
+    status: c_int,
+    user_data: *mut c_void,
+) {
+    let Some(s) = sink(user_data) else { return };
+    s.events.push(Event::GroupPeerStatus { group, peer, away: status == sys::TOX_USER_STATUS_AWAY });
 }
 
 /// A confirmed peer left. The name and part message are not read: a display
@@ -598,6 +614,7 @@ impl Tox {
             sys::tox_callback_group_join_fail(ptr, Some(on_group_join_fail));
             // **The confirmed-peer set, which `peer_count` is not.**
             sys::tox_callback_group_peer_join(ptr, Some(on_group_peer_join));
+            sys::tox_callback_group_peer_status(ptr, Some(on_group_peer_status));
             sys::tox_callback_group_peer_exit(ptr, Some(on_group_peer_exit));
             sys::tox_callback_group_moderation(ptr, Some(on_group_moderation));
             sys::tox_callback_friend_connection_status(ptr, Some(on_friend_connection));

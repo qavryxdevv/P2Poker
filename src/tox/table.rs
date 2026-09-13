@@ -1683,6 +1683,29 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                         let _ = reason;
                     }
                 }
+                // `D-049`: a member's word on sitting out, taken at once -- the
+                // sweep reads it again within five seconds either way. A status
+                // comes from the member that sent it, so it is that seat's
+                // freshest word.
+                Event::GroupPeerStatus { group: g, peer, away } => {
+                    if let Some(t) = by_group(&mut tables, g) {
+                        let app_key = t.peer_keys.get(&peer).and_then(|k| t.known_as.get(k)).copied();
+                        if let (Some(k), Ok(mut set)) = (app_key, t.trouble.away.lock()) {
+                            if away {
+                                set.insert(k);
+                            } else {
+                                set.remove(&k);
+                            }
+                        }
+                        if let (Some(line), Ok(mut set)) = (t.peer_lines.get(&peer).copied(), t.trouble.away_lines.lock()) {
+                            if away {
+                                set.insert(line);
+                            } else {
+                                set.remove(&line);
+                            }
+                        }
+                    }
+                }
                 Event::GroupPeerJoin { group: g, peer } => {
                     let key = tox.peer_key(g, peer).ok();
                     // `S1-DV`: the friend this member came in through, if any.

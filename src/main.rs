@@ -1697,11 +1697,15 @@ impl Client {
             }
             // `D-050`: *Show cards*.
             Ta::ShowCards => {
+                self.state.show_choice = None;
                 self.tell(p2p_poker::net::node::NodeCommand::ShowCards);
                 None
             }
             // `D-049`: *I'm back*.
             Ta::Back => {
+                // The owner: gone at the click. The node says the same a
+                // moment later; the window does not wait for it.
+                self.state.sitting_out = false;
                 self.tell(p2p_poker::net::node::NodeCommand::SitBack);
                 None
             }

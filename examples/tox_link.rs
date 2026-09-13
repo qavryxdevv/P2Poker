@@ -276,6 +276,10 @@ fn main() {
                 Event::GroupModeration { group, target_is_self, kick } => {
                     println!("group {group}: moderation, about me {target_is_self}, a kick {kick}")
                 }
+                // `D-049`: a member's status, which a table reads as sitting out.
+                Event::GroupPeerStatus { group, peer, away } => {
+                    println!("group {group}: peer {peer} status, away {away}")
+                }
             }
         }
 

@@ -4234,6 +4234,15 @@ jako duch, i když hráč zruší svůj status sit out nebo přejde do offline"*
    5.1 s later, and nothing more to the end. 55 hands; the cut seat came back behind and rejoined from the
    table's copies (D-038), sitting out as it had left.
 
+7. **At once** (the owner, the same day: *the sit-out status must go immediately after I'm back; it has a big
+   delay*). The delay was at the far end: a status arrived at once, but the driver published it on its
+   five-second sweep and the node read it on its two-second tick. Now the driver takes a member's status the
+   moment the library reports it (`tox_callback_group_peer_status`), the node looks at the group's word every
+   250 ms, and the player's own window drops the word at the click, before the node answers; the sweep and the
+   tick still read everything again, so a missed callback costs seconds and not a ghost. Measured **run175118-3**
+   (`-AfkAt 90 -BackAt 200`): the other two seats said *sits out* 0.1 s and 0.2 s after the seat sat out, and
+   *plays again* 0.1 s and 0.2 s after it was back, against 0.7 to 9.1 s before; 32 hands on one genesis.
+
 **Guard.** `app::table::sitting_out_and_the_groups_word_reach_the_window` (the word shown, dropped off the line
 without a *back*, taken back); the bar's *I'm back* photographed from `--table-preview --preview-sitout`; the
 harness's `-AfkAt`/`-BackAt`.
@@ -4270,9 +4279,12 @@ a přidat krátkou zvukovou událost pro muck"*).
 6. **Everybody sees a muck.** At a showdown -- somebody showed -- every seat that held its cards to the end and
    showed none wears a *Muck* badge where its last action's badge was, in the greys of cards face down; the log says
    *Bob mucks.* between the shown hands and the winners; and a short sound plays. PokerTH has no muck and no sound
-   for one, so `assets/sounds/muck.wav` is this project's own: a swish of filtered noise falling as it fades and a
-   soft tap, 0.24 s, as loud as PokerTH's fold, generated from a fixed seed by `tools/make-muck-sound.py` so the
-   same bytes can be made again. It plays under *Game actions*.
+   for one, so `assets/sounds/muck.wav` is this project's own, generated from a fixed seed by
+   `tools/make-muck-sound.py` so the same bytes can be made again. The first one hit at once with most of its
+   energy a low tap under 300 Hz, and the owner found it aggressive; of four softer candidates made in the character
+   of PokerTH's deal sound he chose **B, a soft flick**: the swell of a sliding card and a gentle, darker flick at
+   75 ms, nothing below 300 Hz and nothing above 5 kHz to speak of, 0.22 s, peak -12 dBFS and about 7 dB quieter
+   than the first. It plays under *Game actions*.
 7. **Measured**, three seats autoplaying with `-HoldMuck`. **run170847-3** (the 7 s build, `muck`): every wait said
    6 999-7 000 ms and ended in the muck; the hand was over 0.3 s later, or after a second seat's own wait in the
    same showdown (hands #1 and #10, about 14 s together); 16 hands at every node on one genesis, none aborted.

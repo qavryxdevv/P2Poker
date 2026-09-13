@@ -366,6 +366,8 @@ extern "C" {
     pub fn tox_callback_group_join_fail(tox: *mut Tox, callback: tox_group_join_fail_cb);
     /// `tox.h:4808`
     pub fn tox_callback_group_peer_join(tox: *mut Tox, callback: tox_group_peer_join_cb);
+    /// `tox.h:3876`
+    pub fn tox_callback_group_peer_status(tox: *mut Tox, callback: tox_group_peer_status_cb);
     /// `tox.h:4872`
     pub fn tox_callback_group_peer_exit(tox: *mut Tox, callback: tox_group_peer_exit_cb);
     /// `tox.h:5513`
@@ -377,6 +379,10 @@ extern "C" {
 /// broadcast will reach.
 pub type tox_group_peer_join_cb = Option<
     unsafe extern "C" fn(tox: *mut Tox, group_number: u32, peer_id: u32, user_data: *mut c_void),
+>;
+/// `tox.h:3868`. `D-049`: a member's status changed.
+pub type tox_group_peer_status_cb = Option<
+    unsafe extern "C" fn(tox: *mut Tox, group_number: u32, peer_id: u32, status: c_int, user_data: *mut c_void),
 >;
 
 /// `tox.h:4862`.

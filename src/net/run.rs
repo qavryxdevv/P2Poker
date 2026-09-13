@@ -1072,6 +1072,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // until that receiver's own timer agrees.
     let mut stall = tokio::time::interval(std::time::Duration::from_secs(2));
     stall.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `D-049`: the group's word on sitting out, looked at four times a second.
+    let mut away_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    away_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut resend = tokio::time::interval(std::time::Duration::from_secs(5));
     resend.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -5846,6 +5849,62 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // A stage that nobody is completing. Polled rather than armed:
             // the answer changes every time a stage opens or closes, and the
             // cryptographic ones are bounded per stage rather than per hand.
+            // `D-049`, the owner: the sit-out word goes at once. Only the word
+            // is read here; whether the seat is on the line stays the stall
+            // tick's, and a seat off the line is never said to sit out.
+            _ = away_tick.tick() => {
+                for t in tables.iter_mut() {
+                    if !t.tox_sink.is_on_tox() {
+                        continue;
+                    }
+                    let Some(f) = t.table.as_ref() else {
+                        continue;
+                    };
+                    let me = f.my_seat();
+                    let words: Vec<(u8, bool)> = f
+                        .roster()
+                        .seats()
+                        .iter()
+                        .filter(|e| Some(e.seat) != me)
+                        .map(|e| {
+                            let away = if t.tox_sink.in_group(&e.app_public_key) {
+                                t.tox_sink.away(&e.app_public_key)
+                            } else {
+                                e.tox_key.is_some_and(|k| t.tox_sink.away_line(&k))
+                            };
+                            (e.seat, away)
+                        })
+                        .collect();
+                    let mut said: Vec<(u8, bool, Option<u64>, bool)> = Vec::new();
+                    for (seat, away) in words {
+                        if let Some((group, quiet_s, was, at)) = t.link_said.get_mut(&seat) {
+                            let away = *group && away;
+                            if away != *was {
+                                *was = away;
+                                *at = tokio::time::Instant::now();
+                                said.push((seat, *group, *quiet_s, away));
+                            }
+                        }
+                    }
+                    if said.is_empty() {
+                        continue;
+                    }
+                    mark_table(&events, &mut marked, t).await;
+                    for (seat, group, quiet_s, away) in said {
+                        let _ = events
+                            .send(NodeEvent::SeatLink { seat, rtt_ms: None, group, quiet_s, away })
+                            .await;
+                        let _ = events
+                            .send(NodeEvent::Warning(if away {
+                                format!("seat {seat} sits out by the table's group")
+                            } else {
+                                format!("seat {seat} plays again by the table's group")
+                            }))
+                            .await;
+                    }
+                }
+            }
+
             _ = stall.tick() => {
                 for which in 0..tables.len() {
                     let t = &mut tables[which];
