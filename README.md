@@ -6,6 +6,13 @@ rather than promised.
 
 Written in Rust. One portable executable.
 
+![The table window with all ten seats taken, in PokerTH's Green Casino style](docs/images/table-ten-seats.png)
+
+*The table window with all ten seats taken, drawn from the client's built-in
+sample hand (`--table-preview --preview-seats 10 --preview-odds --preview-chat
+--preview-showcase`). The look follows PokerTH's Green Casino table; see
+[`assets/pokerth/PROVENANCE.md`](assets/pokerth/PROVENANCE.md).*
+
 > **Status: in progress.** The poker engine, the protocol layer and the mental
 > poker construction are complete and tested. Two clients discover each other,
 > exchange signed table advertisements, and **form a table** — a roster every

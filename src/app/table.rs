@@ -73,6 +73,9 @@ impl AppState {
                         stale: at.elapsed().as_millis() as u64 > LINK_STALE_MS,
                         group: *group,
                         quiet_s: *quiet,
+                        // `D-049`: sits out by the group's word, and only while
+                        // the group holds the seat.
+                        away: *group && self.away.contains(n),
                     }),
                     shown_hand: shown_name(hand, *n, hero),
                     act: hand.and_then(|h| h.acted.get(i).copied().flatten()),
@@ -176,6 +179,8 @@ impl AppState {
             game_no: seat.game_no,
             log: self.table_log.iter().cloned().collect(),
             winning_hand: winning_hand(hand, hero, self.strength.as_ref()),
+            hero_sitting_out: self.sitting_out,
+            busted: self.busted,
         }
     }
 
@@ -436,13 +441,13 @@ mod tests {
     fn stacks_follow_the_engine_and_survive_the_boundary() {
         let mut s = seated(0);
         assert_eq!(stacks(&s.table_view()), vec![1_000, 1_000, 1_000], "the buy-ins before a hand");
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert_eq!(stacks(&s.table_view()), vec![1_000, 1_000, 1_000]);
         s.apply(state(1, 0, 150, Some(0), &[1_000, 950, 900], &[0, 50, 100], &[false; 3]));
         assert_eq!(stacks(&s.table_view()), vec![1_000, 950, 900], "the engine's figures");
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_150, 950, 900], shown: vec![None; 3] });
         assert_eq!(stacks(&s.table_view()), vec![1_150, 950, 900], "the settlement's");
-        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert_eq!(stacks(&s.table_view()), vec![1_150, 950, 900], "and they carry into the next hand");
     }
 
@@ -451,7 +456,7 @@ mod tests {
     #[test]
     fn bets_and_the_pot_are_shown_whoever_is_to_act() {
         let mut s = seated(0);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(state(1, 0, 150, Some(2), &[1_000, 950, 900], &[0, 50, 100], &[false; 3]));
         s.apply(NodeEvent::NotYourTurn { hand_id: 1, seat: Some(2), elapsed_ms: 0 });
         let v = s.table_view();
@@ -468,7 +473,7 @@ mod tests {
     #[test]
     fn folds_and_winnings_reach_the_seats() {
         let mut s = seated(1);
-        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(state(3, 1, 300, Some(1), &[900, 900, 900], &[0, 0, 0], &[false, false, true]));
         let v = s.table_view();
         assert!(v.seats[2].folded && !v.seats[1].folded);
@@ -492,7 +497,7 @@ mod tests {
             (0..52u8).find(|i| Card::from_index(*i).ok() == Some(want)).expect("a card has an index")
         };
         let mut s = seated(1);
-        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::CardsDealt { hand_id: 3, seats: vec![0, 1, 2] });
         s.apply(state(3, 3, 300, None, &[900, 900, 900], &[0, 0, 0], &[false; 3]));
         let board = vec![
@@ -538,9 +543,9 @@ mod tests {
     #[test]
     fn a_hand_ended_without_a_settlement_shows_the_stacks_it_started_with() {
         let mut s = seated(0);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_100, 900, 1_000], shown: vec![None, None, None] });
-        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::TableState {
             hand_id: 2,
             street: 0,
@@ -567,13 +572,13 @@ mod tests {
     #[test]
     fn a_seat_not_dealt_in_sits_out_and_a_hero_outside_the_hand_is_told() {
         let mut s = seated(0);
-        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         let v = s.table_view();
         assert!(v.seats.iter().any(|x| x.seat == 2 && x.sitting_out), "seat 2 sits this hand out");
         assert!(v.seats.iter().filter(|x| x.seat != 2).all(|x| !x.sitting_out));
 
         let mut b = seated(2);
-        b.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1] });
+        b.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         b.apply(NodeEvent::TableState {
             hand_id: 3,
             street: 1,
@@ -594,7 +599,7 @@ mod tests {
     #[test]
     fn the_hero_sees_the_hand_named_and_its_odds() {
         let mut s = seated(0);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert_eq!(s.table_view().hero_hand, None, "no cards, no name");
         s.apply(NodeEvent::CardsDealt { hand_id: 1, seats: vec![0, 1, 2] });
         s.apply(NodeEvent::HoleCards { hand_id: 1, cards: [card(Rank::Ace, Suit::Spades), card(Rank::King, Suit::Spades)] });
@@ -623,7 +628,7 @@ mod tests {
     #[test]
     fn a_left_table_leaves_no_cards_behind() {
         let mut s = seated(0);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::CardsDealt { hand_id: 1, seats: vec![0, 1, 2] });
         s.apply(NodeEvent::HoleCards { hand_id: 1, cards: [card(Rank::Ace, Suit::Spades), card(Rank::King, Suit::Spades)] });
         s.apply(state(1, 0, 150, Some(0), &[1_000, 950, 900], &[0, 50, 100], &[false; 3]));
@@ -649,7 +654,7 @@ mod tests {
     #[test]
     fn each_turn_is_numbered_for_the_raise_control() {
         let mut s = seated(0);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         let turn = |hand_id| NodeEvent::YourTurn {
             hand_id,
             street: 0,
@@ -683,7 +688,7 @@ mod tests {
         assert!(s.table_view().note.unwrap().contains("the table is set"));
         s.apply(NodeEvent::HandWaiting { hand_id: 1, seats: vec![2] });
         assert!(s.table_view().note.unwrap().contains("waiting for seat 2"));
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert!(s.table_view().note.unwrap().contains("preparing the deck"));
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3] });
         assert!(s.table_view().note.unwrap().contains("is over"));
@@ -699,7 +704,7 @@ mod tests {
         assert_eq!(clock_fraction(5, 0), 1.0, "no budget is no clock to run out");
 
         let mut s = seated(0);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(state(1, 0, 30, Some(2), &[1_000; 3], &[0, 10, 20], &[false; 3]));
         let v = s.table_view();
         let clocks: Vec<Option<f32>> = v.seats.iter().map(|x| x.clock).collect();
@@ -713,18 +718,84 @@ mod tests {
     /// muted seat is not heard until it is unmuted, and a seat's link is
     /// shown as the last ping said.
     #[test]
+    fn sitting_out_and_the_groups_word_reach_the_window() {
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        assert!(!s.table_view().hero_sitting_out);
+        s.apply(NodeEvent::SittingOut { on: true });
+        assert!(s.table_view().hero_sitting_out, "the bar offers the way back");
+        s.apply(NodeEvent::SittingOut { on: false });
+        assert!(!s.table_view().hero_sitting_out);
+
+        let away_of = |s: &AppState, seat: u8| {
+            s.table_view().seats.iter().find(|x| x.seat == seat).and_then(|x| x.link).is_some_and(|l| l.away)
+        };
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: true });
+        assert!(away_of(&s, 1), "seat 1 sits out by the group's word");
+        assert!(s.table_log.iter().any(|l| l.text.ends_with("sits out")));
+        // Off the line: not said to sit out, and nothing of it is kept.
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(25), away: true });
+        assert!(!away_of(&s, 1), "a seat off the line is not shown sitting out");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        assert!(!away_of(&s, 1), "back on the line and playing: no ghost of the old word");
+        assert!(
+            !s.table_log.iter().any(|l| l.text.ends_with("is back")),
+            "dropping off the line is not coming back"
+        );
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: true });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        assert!(!away_of(&s, 1), "the word taken back is taken back");
+        assert!(s.table_log.iter().any(|l| l.text.ends_with("is back")));
+        s.apply(NodeEvent::LeftTable { why: "left the table".into() });
+        assert!(s.away.is_empty() && !s.sitting_out, "nothing of it outlives the table");
+    }
+
+    /// Out of chips: the place is the seats still holding chips plus one, and
+    /// of two seats busted in one hand the one that began it with more
+    /// finishes ahead.
+    #[test]
+    fn a_busted_player_is_told_the_place() {
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![600, 1_400, 1_000], shown: vec![None; 3] });
+        assert_eq!(s.table_view().busted, None, "still in");
+        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        // Seat 0 (600) and seat 2 (1 000) both lose everything to seat 1.
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3] });
+        let b = s.table_view().busted.expect("the window says the place");
+        assert_eq!((b.place, b.players_left), (3, 1), "seat 2 began with more and finishes second");
+        assert!(s.table_log.iter().any(|l| l.text.contains("finished in 3rd place")));
+        // Said once.
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3] });
+        assert_eq!(s.table_log.iter().filter(|l| l.text.contains("finished in")).count(), 1);
+
+        // A hand ended without a settlement busts nobody.
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![], shown: vec![] });
+        assert_eq!(s.table_view().busted, None);
+
+        // Out while two others play on: fourth of four, two still in... of three, third.
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 1_900, 1_100], shown: vec![None; 3] });
+        let b = s.table_view().busted.expect("out");
+        assert_eq!((b.place, b.players_left), (3, 2));
+    }
+
+    #[test]
     fn the_chat_the_mutes_and_the_links_reach_the_window() {
         let mut s = seated(0);
         s.apply(NodeEvent::TableSaid { seat: 1, nickname: "Bob".into(), text: "hi".into() });
         s.apply(NodeEvent::TableSaid { seat: 2, nickname: "Carol".into(), text: "hello".into() });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(80), group: false, quiet_s: None });
-        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(80), group: false, quiet_s: None, away: false });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: None, away: false });
         let v = s.table_view();
         assert_eq!(v.chat.len(), 2);
         assert_eq!(v.chat[0].seat, 1);
         assert!(v.chat[1].who.contains("Carol"));
-        assert_eq!(v.seats[1].link, Some(Link { rtt_ms: Some(80), stale: false, group: false, quiet_s: None }));
-        assert_eq!(v.seats[2].link, Some(Link { rtt_ms: None, stale: false, group: false, quiet_s: None }));
+        assert_eq!(v.seats[1].link, Some(Link { rtt_ms: Some(80), stale: false, group: false, quiet_s: None, away: false }));
+        assert_eq!(v.seats[2].link, Some(Link { rtt_ms: None, stale: false, group: false, quiet_s: None, away: false }));
         assert_eq!(v.seats[0].link, None, "nobody pings themselves");
 
         s.muted.insert(1);
@@ -750,7 +821,7 @@ mod tests {
         s.apply(NodeEvent::Carrier { seen: 2, want: 2 });
         let n = s.table_view().note.unwrap();
         assert!(!n.contains("joining") && n.contains("the table is set"), "{n}");
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert!(!s.table_view().note.unwrap().contains("joining"), "a hand on the felt says the hand");
     }
 
@@ -764,7 +835,7 @@ mod tests {
         // The node turns to a second slot and seats this client there.
         s.apply(NodeEvent::AtTable { slot: 1, key: None });
         s.apply(NodeEvent::Seated { key: [9u8; 32], seat: 0 });
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::YourTurn {
             hand_id: 1,
             street: 0,

@@ -291,6 +291,9 @@ pub enum Command {
     /// asks has restarted and lost everything it held, the group among it.
     /// `net::run` sends this from the `AlreadySeated` path and nowhere else.
     Rejoined([u8; 32]),
+    /// `D-049`: this seat sits out (`true`) or plays (`false`), said as the
+    /// group's own status of this member.
+    Away(bool),
     /// Close this table: say what it still holds, leave its group. The
     /// instance and its thread stay for the next table, and the friends no
     /// open table needs go `FRIEND_LINGER` later (`D-042`).
@@ -389,6 +392,11 @@ pub struct Trouble {
     /// by application key -- read every sweep, so a seat whose client died
     /// is quiet here long before the library gives it up (58 s).
     pub quiet: std::sync::Mutex<HashMap<[u8; 32], u64>>,
+    /// `D-049`: the present seats whose group status says they sit out, by
+    /// application key -- each seat as its most recently heard entry says.
+    pub away: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// `D-049`: the same by the Tox key of the line a member came in over.
+    pub away_lines: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
     /// `D-035`: seats whose client left the group since the node last
     /// asked, by application key, each with whether it quit on purpose.
     pub gone: std::sync::Mutex<Vec<([u8; 32], bool)>>,
@@ -767,6 +775,12 @@ const SWEEP_EVERY: Duration = Duration::from_secs(5);
 /// only when it holds none.
 const REINVITE_EVERY: Duration = Duration::from_secs(30);
 
+/// `D-049`: how often a member says its sitting-out status in the group again,
+/// changed or not. The library broadcasts a status losslessly and exchanges it
+/// with every peer a member connects to; this bounds what any gap in that
+/// could leave behind.
+const AWAY_RESAY: Duration = Duration::from_secs(20);
+
 // **There is deliberately no wait here for the founder's transport, and the
 // reason is worth keeping because the wait was written and then removed.**
 //
@@ -846,6 +860,9 @@ struct TableState {
     /// taken by leaving it.
     settled: bool,
     group: Option<u32>,
+    /// `D-049`: whether this seat sits out, and when the group was last told.
+    away: bool,
+    away_said_at: Option<Instant>,
     invited: Vec<u32>,
     confirmed: std::collections::HashSet<u32>,
     accepted_at: Option<Instant>,
@@ -1058,20 +1075,39 @@ fn sweep_table(
     t.trouble.in_group.store(seen as u64, Ordering::Relaxed);
     // `D-035`, `D-041`: which seats are confirmed members right now, by
     // APPLICATION key through the bridge `known_as` holds.
+    // `D-049`: this seat's own word on sitting out is the group's status of
+    // it: AWAY while it sits out, NONE while it plays. Set whenever the
+    // library's copy differs -- a fresh copy of the group starts at NONE --
+    // and said again every `AWAY_RESAY`, so a member whose connection to this
+    // one was down at the broadcast has it within that, whatever the library's
+    // own peer exchange did.
+    if let Some(g) = t.group {
+        let due = t.away_said_at.is_none_or(|at| at.elapsed() >= AWAY_RESAY);
+        if (due || tox.self_away(g) != Some(t.away)) && tox.set_self_away(g, t.away) {
+            t.away_said_at = Some(Instant::now());
+        }
+    }
     if let Ok(mut present) = t.trouble.present.lock() {
         present.clear();
         let mut quiet: HashMap<[u8; 32], u64> = HashMap::new();
+        // `D-049`: each seat's status as its most recently heard entry has it.
+        let mut away: HashMap<[u8; 32], (u64, bool)> = HashMap::new();
         if let Some(g) = t.group {
             for (group_key, app_key) in t.known_as.iter() {
                 let member =
                     (0..Tox::PEER_SCAN).find(|p| tox.peer_key(g, *p).ok().as_ref() == Some(group_key));
-                if member.is_some_and(|p| t.confirmed.contains(&p)) {
+                if let Some(p) = member.filter(|p| t.confirmed.contains(p)) {
                     present.insert(*app_key);
                     // `S1-DT`: and how long the group has heard nothing from it.
-                    if let Some(q) = tox.peer_quiet_secs(g, group_key) {
+                    let entry_quiet = tox.peer_quiet_secs(g, group_key);
+                    if let Some(q) = entry_quiet {
                         // `S1-DU`: a seat is as quiet as its most recent entry.
                         let q = quiet.get(app_key).map_or(q, |cur| (*cur).min(q));
                         quiet.insert(*app_key, q);
+                    }
+                    let q = entry_quiet.unwrap_or(u64::MAX);
+                    if away.get(app_key).is_none_or(|(cur, _)| q < *cur) {
+                        away.insert(*app_key, (q, tox.peer_away(g, p).unwrap_or(false)));
                     }
                 }
             }
@@ -1079,26 +1115,38 @@ fn sweep_table(
         if let Ok(mut q) = t.trouble.quiet.lock() {
             *q = quiet;
         }
+        if let Ok(mut a) = t.trouble.away.lock() {
+            *a = away.into_iter().filter(|(_, (_, on))| *on).map(|(k, _)| k).collect();
+        }
     }
     // `S1-DV`: the same by the Tox key of the friend each member came in
     // through -- taught by nobody, known from the join.
     if let Ok(mut present) = t.trouble.present_lines.lock() {
         present.clear();
         let mut quiet: HashMap<[u8; 32], u64> = HashMap::new();
+        let mut away: HashMap<[u8; 32], (u64, bool)> = HashMap::new();
         if let Some(g) = t.group {
             for (peer, line) in t.peer_lines.iter() {
                 if !t.confirmed.contains(peer) {
                     continue;
                 }
                 present.insert(*line);
-                if let Some(q) = t.peer_keys.get(peer).and_then(|k| tox.peer_quiet_secs(g, k)) {
+                let entry_quiet = t.peer_keys.get(peer).and_then(|k| tox.peer_quiet_secs(g, k));
+                if let Some(q) = entry_quiet {
                     let q = quiet.get(line).map_or(q, |cur| (*cur).min(q));
                     quiet.insert(*line, q);
+                }
+                let q = entry_quiet.unwrap_or(u64::MAX);
+                if away.get(line).is_none_or(|(cur, _)| q < *cur) {
+                    away.insert(*line, (q, tox.peer_away(g, *peer).unwrap_or(false)));
                 }
             }
         }
         if let Ok(mut q) = t.trouble.quiet_lines.lock() {
             *q = quiet;
+        }
+        if let Ok(mut a) = t.trouble.away_lines.lock() {
+            *a = away.into_iter().filter(|(_, (_, on))| *on).map(|(k, _)| k).collect();
         }
     }
     // `D-041`: and the friend connections that are up, by Tox key.
@@ -1268,6 +1316,8 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                             had_members: false,
                             settled: false,
                             group,
+                            away: false,
+                            away_said_at: None,
                             invited: Vec::new(),
                             confirmed: std::collections::HashSet::new(),
                             accepted_at: None,
@@ -1492,6 +1542,21 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                             }
                         }
                         Command::Rejoined(_) => {}
+                        Command::Away(on) => {
+                            // Said now -- the sweep is five seconds apart, and a
+                            // seat at the far end waited nine for the word
+                            // (run155209-3) -- and again every `AWAY_RESAY`
+                            // after (see `sweep_table`).
+                            if t.away != on {
+                                t.away = on;
+                                t.away_said_at = None;
+                                if let Some(g) = t.group {
+                                    if tox.set_self_away(g, on) {
+                                        t.away_said_at = Some(Instant::now());
+                                    }
+                                }
+                            }
+                        }
                         Command::Leave => {}
                     }
                 }

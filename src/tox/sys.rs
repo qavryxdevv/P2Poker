@@ -199,6 +199,11 @@ pub const TOX_GROUP_PRIVACY_STATE_PUBLIC: c_int = 0;
 /// `tox.h:3173`
 pub const TOX_GROUP_PRIVACY_STATE_PRIVATE: c_int = 1;
 
+/// `tox.h:381`, `Tox_User_Status`: `D-049` reads `AWAY` as a seat sitting out.
+pub const TOX_USER_STATUS_NONE: c_int = 0;
+/// `tox.h:387`
+pub const TOX_USER_STATUS_AWAY: c_int = 1;
+
 /// `tox.h:3106`. The reason `table::fragment` exists.
 pub const TOX_GROUP_MAX_CUSTOM_LOSSLESS_PACKET_LENGTH: usize = 1373;
 
@@ -278,6 +283,14 @@ extern "C" {
         group_number: u32,
         peer_public_key: *const u8,
     ) -> bool;
+    /// `tox.h:3679`. `D-049`: the group's own status of this member -- a
+    /// lossless broadcast to the members, and part of the peer information a
+    /// member exchanges with every peer it connects to.
+    pub fn tox_group_self_set_status(tox: *mut Tox, group_number: u32, status: c_int, error: *mut c_int) -> bool;
+    /// `tox.h:3686`
+    pub fn tox_group_self_get_status(tox: *const Tox, group_number: u32, error: *mut c_int) -> c_int;
+    /// `tox.h:3793`
+    pub fn tox_group_peer_get_status(tox: *const Tox, group_number: u32, peer_id: u32, error: *mut c_int) -> c_int;
     /// `tox.h:4475`
     pub fn tox_group_send_custom_packet(
         tox: *const Tox,

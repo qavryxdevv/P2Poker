@@ -1003,6 +1003,34 @@ impl Tox {
         unsafe { sys::p2p_poker_cut_line(cut) }
     }
 
+    /// `D-049`: say in the group whether this member sits out -- the group's
+    /// own `AWAY` status, `NONE` when it plays. Whether the library took it.
+    pub fn set_self_away(&mut self, group: u32, away: bool) -> bool {
+        let mut err: c_int = 0;
+        let status = if away { sys::TOX_USER_STATUS_AWAY } else { sys::TOX_USER_STATUS_NONE };
+        // SAFETY: valid pointer; the group number is toxcore's own handle.
+        let ok = unsafe { sys::tox_group_self_set_status(self.ptr, group, status, &mut err) };
+        ok && err == 0
+    }
+
+    /// `D-049`: whether this member's own status in the group says it sits
+    /// out, as the library holds it; `None` when the group is not found.
+    pub fn self_away(&self, group: u32) -> Option<bool> {
+        let mut err: c_int = 0;
+        // SAFETY: as above; the call only reads.
+        let status = unsafe { sys::tox_group_self_get_status(self.ptr, group, &mut err) };
+        (err == 0).then_some(status == sys::TOX_USER_STATUS_AWAY)
+    }
+
+    /// `D-049`: whether a member's status in the group says it sits out;
+    /// `None` when the peer is not found.
+    pub fn peer_away(&self, group: u32, peer: u32) -> Option<bool> {
+        let mut err: c_int = 0;
+        // SAFETY: as above; the call only reads.
+        let status = unsafe { sys::tox_group_peer_get_status(self.ptr, group, peer, &mut err) };
+        (err == 0).then_some(status == sys::TOX_USER_STATUS_AWAY)
+    }
+
     pub fn peer_key(&self, group: u32, peer: u32) -> Result<[u8; 32], Failed> {
         let mut out = [0u8; 32];
         let mut err: c_int = 0;

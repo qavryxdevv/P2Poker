@@ -205,6 +205,9 @@ pub struct TableApp {
     pub opponent_left: bool,
     pub table_log: VecDeque<crate::gui::table::LogLine>,
     pub turn_warned: u64,
+    pub sitting_out: bool,
+    pub away: std::collections::BTreeSet<u8>,
+    pub busted: Option<crate::gui::table::Busted>,
 }
 
 /// Everything the client knows, in the form the panes read it.
@@ -317,6 +320,14 @@ pub struct AppState {
     pub table_log: VecDeque<crate::gui::table::LogLine>,
     /// The turn (`turns`) PokerTH's three-second warning was played for.
     pub turn_warned: u64,
+    /// `D-049`: this client's seat sits out -- its own clock ran out, and the
+    /// node checks or folds at once on every turn until the player is back.
+    pub sitting_out: bool,
+    /// `D-049`: the seats the table's group says sit out, as the last link
+    /// reading of each had it -- only ever said of a seat on the line.
+    pub away: std::collections::BTreeSet<u8>,
+    /// The place this player finished the tournament in, once out of chips.
+    pub busted: Option<crate::gui::table::Busted>,
     /// The sounds owed since the window last played them, in order.
     pub sound_cues: Vec<crate::sound::Cue>,
     /// How many games this client has sat down to since it started: PokerTH's
@@ -556,6 +567,9 @@ impl AppState {
         std::mem::swap(&mut self.opponent_left, &mut other.opponent_left);
         std::mem::swap(&mut self.table_log, &mut other.table_log);
         std::mem::swap(&mut self.turn_warned, &mut other.turn_warned);
+        std::mem::swap(&mut self.sitting_out, &mut other.sitting_out);
+        std::mem::swap(&mut self.away, &mut other.away);
+        std::mem::swap(&mut self.busted, &mut other.busted);
     }
 
     /// `D-043`: turn to another of this client's tables: its state becomes
@@ -758,7 +772,28 @@ impl AppState {
                     said: text,
                 });
             }
-            NodeEvent::SeatLink { seat, rtt_ms, group, quiet_s } => {
+            NodeEvent::SeatLink { seat, rtt_ms, group, quiet_s, away } => {
+                // `D-049`: the seat's word that it sits out, as the group has
+                // it -- never kept for a seat off the line, so nothing of it
+                // outlives the seat's presence.
+                let away = away && group;
+                let was_away = self.away.contains(&seat);
+                if !group {
+                    // Off the line: the word is not kept, and nothing is said
+                    // about it -- the seat has not come back, it is not there.
+                    self.away.remove(&seat);
+                } else if away != was_away && self.seated.as_ref().is_some_and(|s| s.seat != Some(seat)) {
+                    if away {
+                        self.away.insert(seat);
+                    } else {
+                        self.away.remove(&seat);
+                    }
+                    let name = self.seat_name(seat);
+                    self.log_table(
+                        crate::gui::table::LogKind::SitOut,
+                        if away { format!("{name} sits out") } else { format!("{name} is back") },
+                    );
+                }
                 // `D-041`: on the line when the table's group holds the seat,
                 // or when a ping answered; the group is the reading that
                 // matters where the hand rides it.
@@ -815,7 +850,29 @@ impl AppState {
                 hand_id,
                 button,
                 dealt_in,
+                small_blind,
+                big_blind,
             } => {
+                // The hand's own blinds, as its init derived them from the
+                // tournament's schedule: the status bar showed the starting
+                // ones for the whole game (the owner, 2026-09-13).
+                if let Some(s) = self.seated.as_mut() {
+                    if big_blind > 0 {
+                        let (seen, level) = s.blinds_seen;
+                        if big_blind > seen {
+                            if seen > 0 {
+                                s.blinds_seen = (big_blind, level.saturating_add(1));
+                                if let Some(cue) = crate::sound::Cue::blinds_raised(level.saturating_add(1)) {
+                                    self.sound_cues.push(cue);
+                                }
+                            } else {
+                                s.blinds_seen = (big_blind, 0);
+                            }
+                        }
+                        s.small_blind = small_blind;
+                        s.big_blind = big_blind;
+                    }
+                }
                 self.hand = Some(HandInProgress {
                     hand_id,
                     button,
@@ -1011,6 +1068,7 @@ impl AppState {
                 self.clock_for(None, 0);
                 if !restored {
                     self.log_showdown(hand_id);
+                    self.note_the_bust(hand_id);
                 }
                 self.note(format!("hand #{hand_id} is over"));
             }
@@ -1269,6 +1327,17 @@ impl AppState {
                 }
                 self.note(format!("the founder says no: {}", refusal(reason)));
             }
+            // `D-049`: this client's seat sits out, or the player is back.
+            NodeEvent::SittingOut { on } => {
+                if self.sitting_out != on {
+                    self.sitting_out = on;
+                    self.note(if on {
+                        "sitting out: your clock ran out; your seat checks or folds at once until you are back".to_string()
+                    } else {
+                        "back at the table".to_string()
+                    });
+                }
+            }
             // `D-047`: this seat is out of the table for good. The table is held
             // for the window to say so; leaving is the player's click.
             NodeEvent::OutForGood { key: _, why } => {
@@ -1363,6 +1432,56 @@ impl AppState {
         self.strength = None;
         self.table_log.clear();
         self.turn_warned = 0;
+        self.sitting_out = false;
+        self.away.clear();
+        self.busted = None;
+    }
+
+    /// A seat's chips when the hand began: the last settlement's figure, or
+    /// the roster's before the first one.
+    fn start_stack(&self, h: &HandInProgress, seat: u8) -> u64 {
+        h.start_stacks.get(usize::from(seat)).copied().unwrap_or_else(|| {
+            self.seated
+                .as_ref()
+                .and_then(|s| s.roster.iter().find(|(n, _, _)| *n == seat))
+                .map(|(_, _, stack)| *stack)
+                .unwrap_or(0)
+        })
+    }
+
+    /// The owner, 2026-09-13: out of chips in a tournament, the window says
+    /// the place the player finished in. The seats still holding chips are
+    /// ahead; of the seats busted in the same hand, one that began it with
+    /// more chips finishes ahead too (the tournament rule).
+    fn note_the_bust(&mut self, hand_id: u64) {
+        if self.busted.is_some() {
+            return;
+        }
+        let Some(me) = self.seated.as_ref().and_then(|s| s.seat) else {
+            return;
+        };
+        let Some(h) = self.hand.as_ref().filter(|h| h.hand_id == hand_id && h.over) else {
+            return;
+        };
+        let end = |seat: u8| h.stacks.get(usize::from(seat)).copied().unwrap_or(0);
+        let mine = self.start_stack(h, me);
+        if mine == 0 || end(me) > 0 || !h.dealt_in.contains(&me) {
+            return;
+        }
+        let alive = h.stacks.iter().filter(|s| **s > 0).count();
+        let ahead_of_me = h
+            .dealt_in
+            .iter()
+            .filter(|n| **n != me && end(**n) == 0 && self.start_stack(h, **n) > mine)
+            .count();
+        let busted = crate::gui::table::Busted { place: alive + ahead_of_me + 1, players_left: alive };
+        let name = self.seat_name(me);
+        self.log_table(
+            crate::gui::table::LogKind::SitOut,
+            format!("{name} finished in {} place", crate::gui::table::ordinal(busted.place)),
+        );
+        self.note(format!("out of chips: finished in {} place", crate::gui::table::ordinal(busted.place)));
+        self.busted = Some(busted);
     }
 
     /// `S1-CX`: the other seat, when this table is heads-up and set.
@@ -2187,7 +2306,7 @@ mod tests {
         let mut s = AppState::new();
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::HandBegan { hand_id: 4, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::HandBegan { hand_id: 4, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::CardsDealt { hand_id: 4, seats: vec![0, 1] });
         s.apply(NodeEvent::HoleCards { hand_id: 4, cards: [12, 13] });
         s.apply(NodeEvent::HandWaiting { hand_id: 4, seats: vec![0] });
@@ -2200,11 +2319,11 @@ mod tests {
         // Sitting down somewhere else, with a hand still on record from
         // before, is the same thing from the other side.
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
-        s.apply(NodeEvent::HandBegan { hand_id: 5, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::HandBegan { hand_id: 5, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::Seated { key: [8u8; 32], seat: 3 });
         assert!(s.hand.is_none(), "a hand from another table is not this table's");
 
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 3] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 3], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::JoinRefused { reason: 1 });
         assert!(s.hand.is_none(), "a refused seat has no hand");
     }
@@ -2216,7 +2335,7 @@ mod tests {
         let mut s = AppState::new();
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert_eq!(s.turn_seat, None);
         s.apply(NodeEvent::TableState {
             hand_id: 1, street: 0, pot: 30, to_act: Some(2), stacks: vec![1_000; 3], bets: vec![0, 10, 20], folded: vec![false; 3],
@@ -2251,7 +2370,7 @@ mod tests {
         assert_eq!(last.seat, 2);
         assert!(last.who.contains("Carol") && last.who.contains("seat 2"));
         assert_eq!(last.said, format!("line {}", MAX_CHAT_LINES + 4));
-        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: Some(120), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: Some(120), group: false, quiet_s: None, away: false });
         assert_eq!(s.links.get(&2).map(|(r, _, _, _)| *r), Some(Some(120)));
         s.apply(NodeEvent::LeftTable { why: "left the table".into() });
         assert!(s.table_chat.is_empty() && s.links.is_empty(), "the chat and the links went with the table");
@@ -2357,8 +2476,8 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0) });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(21) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(21), away: false });
         s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
         let v = s.table_view();
         assert!(v.opponent_gone_s.is_some(), "the question stands");
@@ -2380,14 +2499,14 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "a".into(), 1_000), (2, "b".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0) });
-        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         assert!(s.heads_up_opponent().is_none(), "three in the game: no heads-up");
         s.apply(NodeEvent::SeatLeft { seat: 2, quit: true });
         assert_eq!(s.heads_up_opponent(), Some(1), "one left for good: heads-up against the other");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(21) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(21), away: false });
         assert!(s.opponent_gone.is_some(), "the opponent out of reach opens the question");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         s.apply(NodeEvent::SeatLeft { seat: 1, quit: true });
         assert!(s.opponent_left && s.opponent_out, "the opponent left: the game is over, said as at two seats");
     }
@@ -2400,11 +2519,11 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "a".into(), 1_000), (2, "b".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0) });
-        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0) });
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         assert!(s.absent_seats().is_empty(), "everybody on the line");
-        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: Some(25) });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: Some(25), away: false });
         s.apply(NodeEvent::HandWaiting { hand_id: 3, seats: vec![2] });
         let absent = s.absent_seats();
         assert_eq!(absent.len(), 1);
@@ -2413,14 +2532,14 @@ mod tests {
         assert!(s.absent_seats()[0].certified, "certified out, said so");
         s.tick_opponent();
         assert!(s.opponent_gone.is_none(), "one seat off is not the question");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(21) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(21), away: false });
         s.tick_opponent();
         assert!(s.opponent_gone.as_ref().is_some_and(|g| g.alone), "everybody off: the question, about everybody");
         assert_eq!(s.opponent_returns, 0, "no returns counted at three seats");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(1) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(1), away: false });
         s.tick_opponent();
         assert!(s.opponent_gone.is_none(), "a seat back: withdrawn");
-        s.apply(NodeEvent::HandBegan { hand_id: 4, button: 1, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::HandBegan { hand_id: 4, button: 1, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         assert!(s.certified.is_empty(), "the next hand starts clean");
     }
 
@@ -2452,11 +2571,11 @@ mod tests {
         // `S1-EC`: before the opponent was ever on the line, *not on the line* is a
         // seat still joining the group, not an absence -- run160251-2 spent a return
         // (D-032) and asked the question at 19 s while the joiner was handshaking.
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None, away: false });
         assert!(s.opponent_gone.is_none(), "no episode before the opponent was ever reached");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0) });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         assert!(s.opponent_gone.is_none() && s.opponent_returns == 0, "the first contact is not a return");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None, away: false });
         assert!(s.opponent_gone.is_some(), "the closed connection opens an episode");
         assert_eq!(s.opponent_gone_for_s(), None, "not worth asking about yet");
         s.tick_opponent();
@@ -2481,15 +2600,15 @@ mod tests {
         assert!(s.opponent_gone_for_s().is_some(), "asked again after the wait (D-046)");
         assert_eq!(s.log.iter().filter(|l| l.contains("unreachable")).count(), 2, "and said again");
         s.dismiss_opponent_gone();
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None, away: false });
         assert!(s.opponent_gone.is_none(), "a ping ends the episode");
         s.apply(NodeEvent::Carrier { seen: 0, want: 1 });
         assert!(s.opponent_gone.is_none(), "an empty group is the other seat still joining it, not an opponent out of reach");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None, away: false });
         assert!(s.opponent_gone.as_ref().is_some_and(|g| g.dismissed_at.is_none()), "a closed connection is a new episode, asked anew");
         s.apply(NodeEvent::Carrier { seen: 1, want: 1 });
         assert!(s.opponent_gone.is_some(), "a seat the group merely sees is not one this client can reach");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false, quiet_s: None, away: false });
         assert!(s.opponent_gone.is_none(), "a ping is");
         // And a reading gone stale -- no ping for longer than the window doubts --
         // starts an episode by itself.
@@ -2509,7 +2628,7 @@ mod tests {
             seats: vec![(0, "a".into(), 1_000), (1, "b".into(), 1_000), (2, "c".into(), 1_000)],
         });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None, away: false });
         s.apply(NodeEvent::Carrier { seen: 0, want: 2 });
         assert!(s.opponent_gone.is_none());
     }
@@ -2525,23 +2644,23 @@ mod tests {
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
         // `S1-EC`: the opponent has been on the line once; before that nothing is an absence.
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None, away: false });
         assert_eq!(s.opponent_returns, 0, "the first contact is no return");
         for n in 1..=MAX_RETURNS {
-            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
+            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None, away: false });
             s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
             s.tick_opponent();
             assert!(!s.opponent_out, "absence {n} is not the last");
-            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
+            s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None, away: false });
             assert_eq!(s.opponent_returns, n, "return {n} counted");
             assert!(s.log.back().unwrap().contains("D-032"), "and said");
         }
         // A blip shorter than the question does not count.
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None, away: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None, away: false });
         assert_eq!(s.opponent_returns, MAX_RETURNS, "a blip is no return");
         // The fourth absence is final.
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None, away: false });
         s.opponent_gone.as_mut().unwrap().since = std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_GONE_MS + 1_000);
         s.tick_opponent();
         assert!(s.opponent_out, "the fourth absence ends the game");
@@ -2549,7 +2668,7 @@ mod tests {
         assert!(line.contains("D-032") && line.contains("limit"), "{line}");
         assert!(s.table_view().opponent_out, "the window is told");
         assert!(s.table_view().opponent_gone_s.is_some(), "and still shows how long");
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(40), group: false, quiet_s: None, away: false });
         assert!(s.opponent_out, "and nothing reachable undoes it");
         assert_eq!(s.opponent_returns, MAX_RETURNS);
     }
@@ -2591,7 +2710,7 @@ mod tests {
         s.turn_since = Some(std::time::Instant::now() - std::time::Duration::from_millis(30_000 + OPPONENT_GONE_MS + 1_000));
         s.tick_opponent();
         assert!(s.opponent_gone.as_ref().is_some_and(|g| g.slow));
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false, quiet_s: None, away: false });
         assert!(s.opponent_gone.is_none(), "a reading that reaches them ends any episode");
         assert_eq!(s.opponent_returns, 0, "but a slow one was no absence");
     }
@@ -2605,13 +2724,13 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(20), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(20), group: false, quiet_s: None, away: false });
         // A timeout: gone from the felt, not the end of the game.
         s.apply(NodeEvent::SeatLeft { seat: 1, quit: false });
         assert!(s.gone.contains(&1));
         assert!(s.table_view().seats.iter().any(|v| v.seat == 1 && v.left), "drawn as left");
         assert!(!s.opponent_out && !s.opponent_left);
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false, quiet_s: None, away: false });
         assert!(!s.gone.contains(&1), "seen in the group again: back");
         assert!(!s.table_view().seats.iter().any(|v| v.seat == 1 && v.left));
         // A quit ends a game of two, at once.
@@ -2620,7 +2739,7 @@ mod tests {
         let v = s.table_view();
         assert!(v.opponent_left && v.opponent_gone_s.is_some(), "the window is told at once");
         assert!(s.log.back().unwrap().contains("left the table"), "{}", s.log.back().unwrap());
-        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false, quiet_s: None });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false, quiet_s: None, away: false });
         assert!(s.opponent_out && s.opponent_left, "nothing on the line undoes a quit");
         assert_eq!(s.opponent_returns, 0, "a quit is no return");
     }

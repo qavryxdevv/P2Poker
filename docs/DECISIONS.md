@@ -4155,6 +4155,19 @@ style and its `preview.png` for the look. `assets/pokerth/PROVENANCE.md` names e
     likeliest improvements, as many rows as fit; the left one holds the table chat with its line to type in, and
     stands down while the big chat panel is open, so there is one place to type. Two switches in both settings
     dialogs, `show_odds` and `show_chat`, optional fields an older settings file reads as shown.
+13. **The winner blinks** (the owner, the same day: *in PokerTH the winner's place blinked with the WINNER
+    label*). PokerTH's widget client, `gametableimpl.cpp`'s `postRiverRunAnimation5`, hides and shows the winner
+    ten times at `winnerBlinkSpeed`; here the winner's gold frame, its glow and its *WINNER* badge go off and on
+    ten times at 210 ms and then stay (`winner_blink_on`).
+14. **The status bar says the hand's blinds.** It showed the table's starting blinds for the whole tournament.
+    `NodeEvent::HandBegan` now carries the blinds the hand's `HAND_INIT` derived from the schedule, and the blind
+    raise sound follows them instead of reading the posted bets, where a short stack's all-in blind looked like
+    a level.
+15. **Out of chips, the place** (the owner: *when I run out of chips after a hand, a window saying what place I
+    finished in, with leaving the table or watching while players are still playing*). At a settled hand where
+    this seat's chips went to zero, the place is the number of seats still holding chips plus one, and of the
+    seats busted in the same hand the ones that began it with more finish ahead. The window says the place,
+    offers *Watch the table* while two or more still play, and *Leave the table*; the log says it too.
 
 **Guard.** `gui::table::seats`, `gui::table::style`, `gui::table::bar`, `gui::table::icons`, `gui::table` (the view, the
 phases, the blind seats, the badge's pop, `both_corners_stay_in_their_corners_at_every_size` over seven window sizes
@@ -4165,3 +4178,56 @@ node (`--preview-seats N`, `--preview-panels`, `--preview-over`, `--preview-note
 `--preview-line`, `--preview-absent`, `--preview-sound`, `--preview-ranking`, `--preview-player-note`, `--preview-odds`,
 `--preview-chat`), each photographed against `preview.png`, and the corners at 760 by 560, 1000 by 720, 900 by 1000 and
 1800 by 980 with two, six and ten seats.
+
+## D-049 — a seat whose clock runs out sits out until the player is back
+
+**Built 2026-09-13 at the project owner's instruction** (*"Hráč, který se nerozhodne v časovém limitu, získá status
+sit out, tzn. že když bude na řadě, tak dá jeho klient instantně check / fold, dokud svým návratem sit out nezruší
+stiskem tlačítka v GUI. To tlačítko se zobrazí místo těch tří akčních tlačítek ... Ostatní hráči u toho hráče uvidí
+nápis sit out. Zařiď, ať tato indikace je spolehlivě aktualizovaná a aby tam nezůstala (například po ztrátě packetů)
+jako duch, i když hráč zruší svůj status sit out nebo přejde do offline"*).
+
+1. **The rule.** When this client's own clock runs out on its own turn and it checks or folds for its player
+   (D-034), the seat **sits out**: from then on the node checks or folds **at once** on every turn of the seat,
+   and nothing else of the hand changes -- the seat is dealt in, posts its blinds, shows its cards and signs its
+   own actions, so no certificate is spent on it and no absence is counted (D-032, D-047). It ends only when the
+   player presses *I'm back*, which replaces Fold, Call and Raise in the window (`NodeCommand::SitBack`); a turn
+   armed at that moment gets its clock back. `--autoplay`, the measurement flag, never sits a seat out.
+2. **What the others see is the seat's own word, carried by the table's group.** Tox groups keep a status per
+   member: NONE, AWAY or BUSY. A seat sitting out sets its status in the table's group to AWAY, and back to NONE
+   when it is back. The library sends a status as a lossless broadcast to the members, and every member
+   exchanges it again with each peer it connects or reconnects to, so a status lost with a connection comes
+   back with the connection. Belt and braces, the seat says its status again every 20 s
+   (`AWAY_RESAY`), changed or not, and sets it on every fresh copy of the group it takes. No protocol message
+   and no toxcore patch: the status is part of the group protocol the library already speaks.
+3. **No ghost.** The driver reads each member's status in the same sweep that reads whether the member is in
+   the group and how long it has been quiet, and takes it from the seat's most recently heard entry (S1-DU: a
+   seat back under a fresh key leaves a dead entry behind for a while). The node says `away` with each seat's
+   link reading, and only for a seat on the line (D-041, S1-DX); the window keeps the word only while the seat
+   is on the line and draws nothing of it for a seat that is not. So a seat that goes offline shows as off
+   the line, not as sitting out; one that comes back sitting out is said to sit out again once the group
+   holds it; and one that is back is said to play within one sweep of the group hearing it.
+4. **Display only.** The status is never evidence and never enters a hash (D-012): it is what a seat says
+   about itself, read from the member the table's evidence says the seat is. A member cannot set another's.
+5. **The harness** gained `-AfkAt`, `-BackAt` and `-AfkNode` (`P2P_POKER_AFK_AT`, `P2P_POKER_BACK_AT`): from
+   `-AfkAt` a node stops autoplaying, so its own clock runs out as a player's does who left the keyboard; at
+   `-BackAt` it presses *I'm back*. Every node's log says *seat N sits out by the table's group* and *seat N
+   plays again by the table's group* when the reading changes.
+
+6. **Measured**, three seats on this machine, every node autoplaying but the one told to stop. **run155209-3**
+   (`-AfkAt 70 -BackAt 200`; the group took 110 s to form, so the seat's first turn came late): its own clock ran
+   out once, at 156 s, and it sat out; its next thirteen actions went out *at once*, each about 0.2 s after the
+   action before it, and none was autoplay; the other two seats said *seat 2 sits out by the table's group* 4.9 s
+   and 9.1 s after, and *plays again* 2.8 s and 5.0 s after the seat was back at 200 s; one of each at each seat,
+   24 hands on one genesis, no hand aborted. The 9.1 s was the driver's five-second sweep at both ends, so the
+   status is now set when the command arrives. **run160018-3** (`-AfkAt 150 -BackAt 380`, and the sitting seat's
+   internet cut at 230 s for 45 s): the word reached the others 1.4 s and 6.0 s after the seat sat out at 190 s;
+   at the cut both said *seat 1 link: not on the line* about 22 s later and nothing about sitting out; when the
+   seat was in the group again, at 295 s, both said *seat 1 sits out by the table's group* in the same second as
+   *on the line* -- the group's word read again, the seat still sitting out; at 385 s *plays again* came 0.7 s and
+   5.1 s later, and nothing more to the end. 55 hands; the cut seat came back behind and rejoined from the
+   table's copies (D-038), sitting out as it had left.
+
+**Guard.** `app::table::sitting_out_and_the_groups_word_reach_the_window` (the word shown, dropped off the line
+without a *back*, taken back); the bar's *I'm back* photographed from `--table-preview --preview-sitout`; the
+harness's `-AfkAt`/`-BackAt`.

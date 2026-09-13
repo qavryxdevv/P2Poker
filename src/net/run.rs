@@ -478,6 +478,10 @@ struct TableRun {
     /// How many of the running hand's actions the interface has been told, by
     /// hand id: each is said once, as a badge, a log line and a sound.
     acted_said: (u64, usize),
+    /// `D-049`: this client's seat sits out: its own clock ran out on a turn,
+    /// so it checks or folds at once on every turn until the player is back
+    /// (`NodeCommand::SitBack`). Said to the table as the group's status.
+    sitting_out: bool,
     /// When the next hand may start. D-020's hold, and the only timer in this
     /// loop that is about a person rather than about the network.
     next_hand_at: Option<tokio::time::Instant>,
@@ -769,7 +773,7 @@ struct TableRun {
     /// `D-041`: the last link reading told to the window per seat -- the ping,
     /// the group's word, and when -- so the stall tick says it again only on a
     /// change or every ten seconds.
-    link_said: std::collections::HashMap<u8, (bool, Option<u64>, tokio::time::Instant)>,
+    link_said: std::collections::HashMap<u8, (bool, Option<u64>, bool, tokio::time::Instant)>,
     /// Whether the table this client is at has closed to newcomers. Drives
     /// `dht_effort`, stops the lobby being polled by somebody who is not reading
     /// it, and stops the advertisement of a table nobody can join.
@@ -808,6 +812,7 @@ impl TableRun {
             required_seen: (0, Vec::new()),
             turn_reported: None,
             acted_said: (0, 0),
+            sitting_out: false,
             next_hand_at: None,
             deal_at: None,
             return_hold: None,
@@ -1042,8 +1047,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     fn hurry(
         at: Option<tokio::time::Instant>,
         autoplay: Option<std::time::Duration>,
+        sitting_out: bool,
     ) -> Option<tokio::time::Instant> {
+        // `D-049`: a seat sitting out checks or folds at once.
+        let autoplay = autoplay.filter(|_| !afk_now());
         match (at, autoplay) {
+            (Some(at), _) if sitting_out => Some(at.min(tokio::time::Instant::now())),
             (Some(at), Some(d)) => Some(at.min(tokio::time::Instant::now() + d)),
             (at, _) => at,
         }
@@ -1485,7 +1494,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(end) = report.ended {
                 arm_boundary!($t, end.pause());
             }
-            $t.act_by = hurry(report.clock.apply($t.act_by, $h.action_deadline()), autoplay);
+            $t.act_by = hurry(report.clock.apply($t.act_by, $h.action_deadline()), autoplay, $t.sitting_out);
         }};
     }
     macro_rules! hand_event {
@@ -1597,6 +1606,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 hand_id: init.hand_id,
                                                 button: init.button_position,
                                                 dealt_in: init.dealt_in.clone(),
+                                                small_blind: init.small_blind,
+                                                big_blind: init.big_blind,
                                             })
                                             .await;
                                     }
@@ -1734,7 +1745,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(end) = report.ended {
                                     arm_boundary!($t, end.pause());
                                 }
-                                $t.act_by = hurry(report.clock.apply($t.act_by, $h.action_deadline()), autoplay);
+                                $t.act_by = hurry(report.clock.apply($t.act_by, $h.action_deadline()), autoplay, $t.sitting_out);
                                 if let Some(cards) = $h.cards().filter(|_| !$t.cards_reported) {
                                     $t.cards_reported = true;
                                     let _ = events
@@ -2117,6 +2128,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // of the branch, or the branch would be the table.
     // The player's own leave, from the window or from the fault knob below:
     // the group, the topic, the table, every local fact, the record.
+    // `D-049`: the player is back. The group hears it at the driver's next
+    // sweep; a turn armed for now gets its clock back.
+    macro_rules! sit_back {
+        ($t:ident) => {{
+            if $t.sitting_out {
+                $t.sitting_out = false;
+                $t.tox_sink.tell(super::toxsink::Seat::Away(false));
+                let _ = events.send(NodeEvent::SittingOut { on: false }).await;
+                let _ = events
+                    .send(NodeEvent::Warning(
+                        "back: this client waits for the player's own action again (D-049)".into(),
+                    ))
+                    .await;
+                if let Some(h) = $t.hand.as_ref() {
+                    if $t.act_by.is_some() && h.turn().is_some_and(|x| x.mine) {
+                        $t.act_by = Some(tokio::time::Instant::now() + h.action_deadline());
+                    }
+                }
+            }
+        }};
+    }
     macro_rules! leave_table_now {
         ($t:ident) => {
             leave_table_now!($t, "left the table".to_string())
@@ -2335,6 +2367,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.abort_reported = false;
             $t.turn_reported = None;
             $t.acted_said = (0, 0);
+            $t.sitting_out = false;
             $t.said.clear();
             $t.next_hand_at = None;
             $t.deal_at = None;
@@ -2512,6 +2545,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         rtt_ms: Some(u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX)),
                                         group: t.tox_sink.is_on_tox() && in_group,
                                         quiet_s: None,
+                                        away: false,
                                     })
                                     .await;
                             }
@@ -2549,7 +2583,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // reading does, every two seconds, and this says nothing.
                                 if !t.tox_sink.is_on_tox() {
                                     let _ = events
-                                        .send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false, quiet_s: None })
+                                        .send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false, quiet_s: None, away: false })
                                         .await;
                                 }
                             }
@@ -5071,7 +5105,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(end) = report.ended {
                                     arm_boundary!(t, end.pause());
                                 }
-                                t.act_by = hurry(report.clock.apply(t.act_by, h.action_deadline()), autoplay);
+                                t.act_by = hurry(report.clock.apply(t.act_by, h.action_deadline()), autoplay, t.sitting_out);
                             }
                             // The player's own engine refused it, which means
                             // the window offered something it should not have.
@@ -5083,6 +5117,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .await;
                             }
                         }
+                    }
+
+                    NodeCommand::SitBack => {
+                        sit_back!(t);
                     }
 
                     NodeCommand::LeaveTable => {
@@ -5744,6 +5782,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                         }
                     }
+                    // fault-harness: `P2P_POKER_BACK_AT=<s>`: the player is back at
+                    // that second, as the window's button says (`D-049`).
+                    if back_due() {
+                        println!("fault-harness: back at the table, as P2P_POKER_BACK_AT asked");
+                        sit_back!(t);
+                    }
                     // fault-harness: `P2P_POKER_KICK_WITHOUT_WORD_AT=<s>`: the founder kicks its
                     // first other seat without the table's word, for measuring that no
                     // member honours it (`D-045`).
@@ -6106,7 +6150,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if t.tox_sink.is_on_tox() {
                         if let Some(f) = t.table.as_ref() {
                             let me = f.my_seat();
-                            let fresh: Vec<(u8, bool, Option<u64>)> = f
+                            let fresh: Vec<(u8, bool, Option<u64>, bool)> = f
                                 .roster()
                                 .seats()
                                 .iter()
@@ -6129,7 +6173,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .flatten()
                                     .min();
                                     let group = (by_app || by_line) && quiet_s.map_or(true, |q| q < QUIET_LIMIT_S);
-                                    (e.seat, group, quiet_s)
+                                    // `D-049`: the seat's word on sitting out, from the
+                                    // entry the seat is known by, and only on the line.
+                                    let away = group
+                                        && if by_app {
+                                            t.tox_sink.away(&e.app_public_key)
+                                        } else {
+                                            e.tox_key.is_some_and(|k| t.tox_sink.away_line(&k))
+                                        };
+                                    (e.seat, group, quiet_s, away)
                                 })
                                 .collect();
                             // `S1-EH`: the group's reading of this client's own line,
@@ -6137,8 +6189,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // 45 s cut never moved that, run202830-2): every other seat
                             // off the line at once, once one was on it, is nobody
                             // reachable from here. Said on change.
-                            let all_off = !fresh.is_empty() && fresh.iter().all(|(_, g, _)| !*g);
-                            if fresh.iter().any(|(_, g, _)| *g) {
+                            let all_off = !fresh.is_empty() && fresh.iter().all(|(_, g, _, _)| !*g);
+                            if fresh.iter().any(|(_, g, _, _)| *g) {
                                 t.ever_on_line = true;
                             }
                             if t.ever_on_line && all_off != t.nobody_said {
@@ -6151,19 +6203,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     }))
                                     .await;
                             }
-                            for (seat, group, quiet_s) in fresh {
-                                let (changed, moved, again) = match t.link_said.get(&seat) {
-                                    Some((g, q, at)) => (
+                            for (seat, group, quiet_s, away) in fresh {
+                                let (changed, moved, away_changed, again) = match t.link_said.get(&seat) {
+                                    Some((g, q, a, at)) => (
                                         *g != group,
                                         *q != quiet_s,
+                                        *a != away,
                                         at.elapsed() >= std::time::Duration::from_secs(10),
                                     ),
-                                    None => (true, true, true),
+                                    None => (true, true, away, true),
                                 };
-                                if changed || moved || again {
-                                    t.link_said.insert(seat, (group, quiet_s, tokio::time::Instant::now()));
+                                if changed || moved || away_changed || again {
+                                    t.link_said.insert(seat, (group, quiet_s, away, tokio::time::Instant::now()));
                                     let _ = events
-                                        .send(NodeEvent::SeatLink { seat, rtt_ms: None, group, quiet_s })
+                                        .send(NodeEvent::SeatLink { seat, rtt_ms: None, group, quiet_s, away })
+                                        .await;
+                                }
+                                // Said only on the line: a seat that dropped off it
+                                // has not stopped sitting out, it is just not there.
+                                if away_changed && group {
+                                    let _ = events
+                                        .send(NodeEvent::Warning(if away {
+                                            format!("seat {seat} sits out by the table's group")
+                                        } else {
+                                            format!("seat {seat} plays again by the table's group")
+                                        }))
                                         .await;
                                 }
                                 if changed {
@@ -6334,7 +6398,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(seat) = t.table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
                             let _ = events.send(NodeEvent::SeatLeft { seat, quit }).await;
                             let _ = events
-                                .send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false, quiet_s: None })
+                                .send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false, quiet_s: None, away: false })
                                 .await;
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
@@ -7061,29 +7125,48 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // every hand to a showdown, which is the long case and the one
                 // worth knowing. It plays for you, on purpose, and it says so
                 // in `--help`.
+                // `D-049`: a seat already sitting out acts at once, and says so
+                // as the check or fold it is, not as a clock that ran out.
+                let playing_for_the_run = autoplay.is_some() && !afk_now() && !t.sitting_out;
                 let action = if turn.legal.can_check {
                     crate::poker::actions::Action::Check
-                } else if autoplay.is_some() {
+                } else if playing_for_the_run {
                     crate::poker::actions::Action::Call
                 } else {
                     crate::poker::actions::Action::Fold
                 };
                 let now = super::node::now_unix_ms();
+                let was_sitting_out = t.sitting_out;
                 match h.act(action, &app_key, now) {
                     Ok(sends) => {
                         publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
                         let _ = events
-                            .send(NodeEvent::Warning(if autoplay.is_some() {
+                            .send(NodeEvent::Warning(if playing_for_the_run {
                                 format!("autoplay: {action:?}")
+                            } else if was_sitting_out {
+                                format!("sitting out — {action:?} at once")
                             } else {
                                 format!("your clock ran out — {action:?} for you")
                             }))
                             .await;
+                        // `D-049`, the owner's rule: a player who does not decide
+                        // in time sits out -- this client checks or folds at once
+                        // on every turn until the player is back.
+                        if !playing_for_the_run && !t.sitting_out {
+                            t.sitting_out = true;
+                            t.tox_sink.tell(super::toxsink::Seat::Away(true));
+                            let _ = events.send(NodeEvent::SittingOut { on: true }).await;
+                            let _ = events
+                                .send(NodeEvent::Warning(
+                                    "sitting out: the clock ran out, so this client checks or folds at once on every turn until the player is back (D-049)".into(),
+                                ))
+                                .await;
+                        }
                         let report = report_hand(h, &events, &mut t.turn_reported, &mut t.acted_said).await;
                         if let Some(end) = report.ended {
                             arm_boundary!(t, end.pause());
                         }
-                        t.act_by = hurry(report.clock.apply(t.act_by, h.action_deadline()), autoplay);
+                        t.act_by = hurry(report.clock.apply(t.act_by, h.action_deadline()), autoplay, t.sitting_out);
                     }
                     Err(e) => {
                         let _ = events
@@ -9188,6 +9271,45 @@ fn kick_without_word_due() -> bool {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
     });
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    match (at, PROCESS_STARTED.get()) {
+        (Some(s), Some(since)) => {
+            since.elapsed().as_secs() >= *s && !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        }
+        _ => false,
+    }
+}
+
+/// fault-harness: whether `P2P_POKER_AFK_AT` names a second this process has
+/// reached and `P2P_POKER_BACK_AT` has not yet come: `--autoplay` is suspended
+/// in between, so the seat's own clock runs out as a player's does who has
+/// gone from the keyboard (`D-049`). `false` in every build without the feature.
+fn afk_now() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static AT: std::sync::OnceLock<(Option<u64>, Option<u64>)> = std::sync::OnceLock::new();
+    let (afk, back) = AT.get_or_init(|| {
+        let read = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (read("P2P_POKER_AFK_AT"), read("P2P_POKER_BACK_AT"))
+    });
+    match (afk, PROCESS_STARTED.get()) {
+        (Some(a), Some(since)) => {
+            let s = since.elapsed().as_secs();
+            s >= *a && back.is_none_or(|b| s < b)
+        }
+        _ => false,
+    }
+}
+
+/// fault-harness: whether `P2P_POKER_BACK_AT` names a second this loop has
+/// reached, once; `false` in every build without the feature (`D-049`).
+fn back_due() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let at = AT.get_or_init(|| std::env::var("P2P_POKER_BACK_AT").ok().and_then(|v| v.trim().parse::<u64>().ok()));
     static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     match (at, PROCESS_STARTED.get()) {
         (Some(s), Some(since)) => {

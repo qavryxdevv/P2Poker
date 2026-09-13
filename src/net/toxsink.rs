@@ -74,6 +74,8 @@ pub enum Seat {
     /// It is back after a restart and needs the group offered again. See
     /// `tox::table::Command::Rejoined` for why nothing else notices.
     Back([u8; 32]),
+    /// `D-049`: this client's seat sits out (`true`) or plays again.
+    Away(bool),
     /// A group peer's own key, and the **application** key that was verified to
     /// have signed a message from it.
     ///
@@ -539,6 +541,40 @@ impl TableSink {
         }
     }
 
+    /// `D-049`: whether the table's group says this seat sits out -- its
+    /// status as its most recently heard entry holds it. `false` when it is
+    /// not a present member: a seat off the line is not said to sit out.
+    pub fn away(&self, app_key: &[u8; 32]) -> bool {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().away.lock().map(|a| a.contains(app_key)).unwrap_or(false),
+                None => false,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            let _ = app_key;
+            false
+        }
+    }
+
+    /// `D-049`: the same by the Tox key of the line the member came in over.
+    pub fn away_line(&self, tox_key: &[u8; 32]) -> bool {
+        #[cfg(feature = "tox")]
+        {
+            match self.inner.as_ref() {
+                Some(t) => t.trouble().away_lines.lock().map(|a| a.contains(tox_key)).unwrap_or(false),
+                None => false,
+            }
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            let _ = tox_key;
+            false
+        }
+    }
+
     /// `S1-DT`: how many seconds ago the group last heard from this seat,
     /// `None` when it is not a present member.
     pub fn quiet_secs(&self, app_key: &[u8; 32]) -> Option<u64> {
@@ -851,6 +887,7 @@ impl TableSink {
                     Seat::Remove { app_key, tox_key, for_good } => Command::Remove { app_key, tox_key, for_good },
                     Seat::KickWithoutWord(k) => Command::KickWithoutWord(k),
                     Seat::Back(k) => Command::Rejoined(k),
+                    Seat::Away(on) => Command::Away(on),
                     Seat::KnownAs {
                         group_key,
                         app_key,

@@ -57,7 +57,7 @@ pub fn log_card(card: Card) -> String {
 }
 
 impl AppState {
-    fn log_table(&mut self, kind: LogKind, text: String) {
+    pub(super) fn log_table(&mut self, kind: LogKind, text: String) {
         if self.table_log.len() >= MAX_TABLE_LOG {
             self.table_log.pop_front();
         }
@@ -134,20 +134,6 @@ impl AppState {
         }
         let name = self.seat_name(big.0);
         self.log_table(LogKind::Normal, format!("{name} posts big blind (${})", big.1));
-
-        if let Some(s) = self.seated.as_mut() {
-            let (seen, level) = s.blinds_seen;
-            if big.1 > seen {
-                if seen > 0 {
-                    s.blinds_seen = (big.1, level.saturating_add(1));
-                    if let Some(cue) = Cue::blinds_raised(level.saturating_add(1)) {
-                        self.sound_cues.push(cue);
-                    }
-                } else {
-                    s.blinds_seen = (big.1, 0);
-                }
-            }
-        }
     }
 
     /// A street opened: PokerTH's `--- Flop --- [..]` for each street the
@@ -324,7 +310,7 @@ mod tests {
     fn a_hand_is_logged_in_pokerths_words() {
         let mut s = table(&["Alice", "Bob"]);
         s.take_sound_cues();
-        s.apply(NodeEvent::HandBegan { hand_id: 7, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::HandBegan { hand_id: 7, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::TableState {
             hand_id: 7,
             street: 0,
@@ -378,7 +364,7 @@ mod tests {
     #[test]
     fn a_new_street_keeps_only_fold_and_all_in() {
         let mut s = table(&["A", "B", "C"]);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2] });
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         for (seat, action, all_in) in [(0u8, Action::Fold, false), (1, Action::Raise(500), true), (2, Action::Call, false)] {
             s.apply(NodeEvent::SeatActed { hand_id: 1, seat, action, put_in: 0, total: 500, all_in, by_table: false });
         }
@@ -396,7 +382,7 @@ mod tests {
     #[test]
     fn a_run_out_says_every_street() {
         let mut s = table(&["A", "B"]);
-        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::Board { hand_id: 2, cards: vec![0, 1, 2, 3, 4] });
         let streets: Vec<String> = s
             .table_log
@@ -408,28 +394,22 @@ mod tests {
     }
 
     /// The blinds going up is PokerTH's blind raise sound, by how many times
-    /// they have; the first hand only sets where they start.
+    /// they have; the first hand only sets where they start. Read from the
+    /// hand's own blinds, not from what the seats posted, so a short stack's
+    /// all-in blind is no level.
     #[test]
     fn the_blinds_going_up_is_heard() {
         let mut s = table(&["A", "B"]);
-        for (hand, bb) in [(1u64, 20u64), (2, 20), (3, 40), (4, 60)] {
-            s.apply(NodeEvent::HandBegan { hand_id: hand, button: 0, dealt_in: vec![0, 1] });
-            s.take_sound_cues();
-            s.apply(NodeEvent::TableState {
-                hand_id: hand,
-                street: 0,
-                pot: 0,
-                to_act: Some(0),
-                stacks: vec![900, 900],
-                bets: vec![bb / 2, bb],
-                folded: vec![false, false],
-            });
+        s.take_sound_cues();
+        for (hand, bb) in [(1u64, 20u64), (2, 20), (3, 40), (4, 80), (5, 80)] {
+            s.apply(NodeEvent::HandBegan { hand_id: hand, button: 0, dealt_in: vec![0, 1], small_blind: bb / 2, big_blind: bb });
             let cues = s.take_sound_cues();
             match hand {
-                1 | 2 => assert!(cues.is_empty(), "hand {hand}: {cues:?}"),
+                1 | 2 | 5 => assert!(cues.is_empty(), "hand {hand}: {cues:?}"),
                 3 | 4 => assert_eq!(cues, vec![Cue::BlindsRaiseLevel1], "hand {hand}"),
                 _ => unreachable!(),
             }
+            assert_eq!(s.table_view().blinds, format!("{} / {}", bb / 2, bb), "the status bar says hand {hand}'s blinds");
         }
     }
 
@@ -438,7 +418,7 @@ mod tests {
     #[test]
     fn the_showdown_and_the_game_are_logged() {
         let mut s = table(&["A", "B"]);
-        s.apply(NodeEvent::HandBegan { hand_id: 9, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::HandBegan { hand_id: 9, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::TableState {
             hand_id: 9,
             street: 3,
@@ -466,7 +446,7 @@ mod tests {
     fn every_action_and_the_deal_are_heard() {
         let mut s = table(&["A", "B"]);
         s.take_sound_cues();
-        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1] });
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::HoleCards { hand_id: 3, cards: [0, 1] });
         s.apply(NodeEvent::SeatActed { hand_id: 3, seat: 1, action: Action::Fold, put_in: 0, total: 0, all_in: false, by_table: true });
         assert_eq!(s.take_sound_cues(), vec![Cue::DealTwoCards, Cue::Fold]);

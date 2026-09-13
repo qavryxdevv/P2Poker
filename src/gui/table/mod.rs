@@ -244,6 +244,10 @@ pub struct TableView {
     /// The winning hand in words, once the hand is settled and a winner
     /// showed: PokerTH's gold badge under the board.
     pub winning_hand: Option<String>,
+    /// `D-049`: this client's seat sits out; the bar offers *I'm back*.
+    pub hero_sitting_out: bool,
+    /// Out of chips, and the place finished in.
+    pub busted: Option<Busted>,
 }
 
 /// The smallest table window the client allows. `main.rs` opens the window
@@ -283,6 +287,8 @@ pub enum TableAction {
     /// PokerTH's *Note about player ...*: a rating and a note, kept locally
     /// under the player's key.
     SaveNote { key: [u8; 32], rating: u8, note: String },
+    /// `D-049`: *I'm back* -- this seat stops sitting out.
+    Back,
 }
 
 /// `S1-EI`: a seat off the line during the hand, and what happens about it.
@@ -320,6 +326,40 @@ pub struct Link {
     /// `S1-DX`: how many seconds ago the table's group last heard the seat
     /// -- the figure beside the dot on a Tox table, where no ping is shown.
     pub quiet_s: Option<u64>,
+    /// `D-049`: the seat sits out by the table's group's word -- only ever
+    /// true while `group` is.
+    pub away: bool,
+}
+
+/// The owner, 2026-09-13: out of chips in a tournament, the place the player
+/// finished in, and how many still play.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Busted {
+    pub place: usize,
+    pub players_left: usize,
+}
+
+/// *1st*, *2nd*, *3rd*, *4th* ...
+pub fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+/// PokerTH's winner blink (`gametableimpl.cpp`, `postRiverRunAnimation5`):
+/// ten steps of `winnerBlinkSpeed`, the highlight hidden on the even ones,
+/// then steady. `age` is seconds since the winner was known.
+pub const WINNER_BLINK_STEP: f64 = 0.21;
+pub fn winner_blink_on(age: f64) -> bool {
+    if !(0.0..WINNER_BLINK_STEP * 10.0).contains(&age) {
+        return true;
+    }
+    (age / WINNER_BLINK_STEP) as u32 % 2 == 1
 }
 
 /// PokerTH's playing mode (`GameActionBar`'s combo box).
@@ -403,6 +443,11 @@ pub struct TableUi {
     pub note: Option<NoteDraft>,
     /// When each seat's badge last changed, for PokerTH's pop.
     pub badge_changed: Vec<(SeatIdx, Option<SeatAct>, f64)>,
+    /// When each winner of a hand was first drawn: `(hand, seat, time)`, for
+    /// PokerTH's blink.
+    pub winner_since: Vec<(u64, SeatIdx, f64)>,
+    /// The window about the place finished in was closed to watch the table.
+    pub bust_closed: bool,
 }
 
 /// The raise the control offers this frame.
@@ -845,9 +890,28 @@ fn seat_box(
     let opacity = if out { style::DIMMED } else if seat.folded { 0.72 } else { 1.0 };
     let at_turn = seat.clock.is_some() && !view.hand_over;
     let winner = view.hand_over && seat.won > 0;
+    // PokerTH's blink: the winner's highlight and its badge on and off for
+    // two seconds, then steady.
+    let blink_on = !winner || {
+        let since = match state.winner_since.iter().find(|(h, n, _)| *h == view.hand && *n == seat.seat) {
+            Some((_, _, at)) => *at,
+            None => {
+                state.winner_since.retain(|(h, _, _)| *h == view.hand);
+                state.winner_since.push((view.hand, seat.seat, now));
+                now
+            }
+        };
+        let age = now - since;
+        if age < WINNER_BLINK_STEP * 10.0 {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
+        }
+        winner_blink_on(age)
+    };
+    // `D-049`: sits out, by its own word to the table (the hero: its node's).
+    let sits_out = if hero { view.hero_sitting_out } else { seat.link.is_some_and(|l| l.away && l.group) };
 
     // The halos under the box, so they light the felt around it and not the box.
-    if winner {
+    if winner && blink_on {
         style::winner_glow(p, rect, s);
     }
     if at_turn {
@@ -924,7 +988,14 @@ fn seat_box(
     // above the box for the hero.
     let changed_at = badge_changed(state, seat.seat, seat.act, now);
     let pop = pop_scale(now - changed_at);
-    if let Some(act) = seat.act.filter(|_| !winner) {
+    if sits_out && !winner {
+        let at = if hero {
+            pos2(rect.right() - 36.0 * s, rect.top() - 6.0 * s - 9.0 * s)
+        } else {
+            cards_area.center()
+        };
+        style::sit_out_badge(p, at, s);
+    } else if let Some(act) = seat.act.filter(|_| !winner) {
         let at = if hero {
             let size = 12.0 * s;
             let w = style::text_width(p, act.word(), size, Weight::Bold) + 16.0 * s;
@@ -959,7 +1030,7 @@ fn seat_box(
         };
         style::bet_chip(p, label, seat.bet);
     }
-    if winner {
+    if winner && blink_on {
         style::winner(p, rect, s);
     }
 
@@ -1354,6 +1425,38 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
             });
     }
 
+    // The owner, 2026-09-13: out of chips in a tournament -- the place, and
+    // leave or, while others still play, watch.
+    if let Some(b) = view.busted.filter(|_| !state.bust_closed && view.out_for_good.is_none()) {
+        egui::Window::new("Out of chips")
+            .id(egui::Id::new("table-busted"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .frame(window_frame(&ctx))
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(&ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
+                window_heading(ui, "Out of the tournament", false);
+                ui.label(RichText::new(format!("You finished in {} place.", ordinal(b.place))).size(18.0).strong().color(style::COLOR_ACCENT));
+                let watch = b.players_left >= 2;
+                if watch {
+                    ui.label(format!("{} players are still playing. Watch the table, or leave it.", b.players_left));
+                } else {
+                    ui.label(RichText::new("The tournament is over.").color(style::PANEL_MUTED));
+                }
+                ui.horizontal(|ui| {
+                    if watch && ui.add(egui::Button::new(RichText::new("Watch the table").color(style::WHITE)).fill(Color32::from_rgb(0x1A, 0x4A, 0x8A))).clicked() {
+                        state.bust_closed = true;
+                    }
+                    if ui.add(egui::Button::new(RichText::new("Leave the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
+                        action = Some(TableAction::LeaveTable);
+                    }
+                });
+            });
+    }
+
     // PokerTH's sound settings, at the gear.
     if let Some(mut draft) = state.settings_open.take() {
         let mut open = true;
@@ -1630,6 +1733,8 @@ impl TableView {
                 LogLine { kind: LogKind::Normal, text: "Erin bets $260.".into() },
             ],
             winning_hand: None,
+            hero_sitting_out: false,
+            busted: None,
         }
     }
 }
@@ -1871,6 +1976,19 @@ mod tests {
             l.others[0].rect = Rect::from_min_size(pos2(x, full.bottom() - 30.0), vec2(114.0, 84.0));
             assert_eq!(rect(&l), None, "{corner:?}");
         }
+    }
+
+    #[test]
+    fn the_winner_blinks_five_times_then_stays() {
+        let flips: Vec<bool> = (0..10).map(|i| winner_blink_on((i as f64 + 0.5) * WINNER_BLINK_STEP)).collect();
+        assert_eq!(flips, vec![false, true, false, true, false, true, false, true, false, true]);
+        assert!(winner_blink_on(WINNER_BLINK_STEP * 10.0 + 0.01) && winner_blink_on(60.0), "then steady");
+    }
+
+    #[test]
+    fn places_are_said_as_places() {
+        let words: Vec<String> = [1, 2, 3, 4, 10, 11, 12, 13, 21, 22].iter().map(|n| ordinal(*n)).collect();
+        assert_eq!(words, ["1st", "2nd", "3rd", "4th", "10th", "11th", "12th", "13th", "21st", "22nd"]);
     }
 
     #[test]

@@ -170,12 +170,15 @@ fn due(view: &TableView, state: &mut TableUi, n: &Now) -> Option<TableAction> {
 pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &TableView, state: &mut TableUi, time: f64) -> Option<TableAction> {
     let mut action = None;
     let n = now_of(view, state);
-    // A preselection belongs to the street it was made on.
-    if !n.armed {
+    // A preselection belongs to the street it was made on, and a seat sitting
+    // out has none: its node acts at once (`D-049`).
+    if !n.armed || view.hero_sitting_out {
         state.pre = None;
     }
-    if let Some(a) = due(view, state, &n) {
-        action = Some(a);
+    if !view.hero_sitting_out {
+        if let Some(a) = due(view, state, &n) {
+            action = Some(a);
+        }
     }
 
     let p = ui.painter().clone();
@@ -368,6 +371,15 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &TableView, state: &mut TableUi
     } else {
         word.to_owned()
     };
+    // `D-049`: sitting out, the three buttons give way to the one that ends it.
+    if view.hero_sitting_out {
+        let r = ui.interact(actions, ui.id().with("im-back"), egui::Sense::click());
+        style::action_button(&p, actions, ButtonLook::Raise, "I'm back", 17.0, 1.0, r.hovered(), r.is_pointer_button_down_on(), true, false);
+        if r.on_hover_text("Stop sitting out: your seat waits for your own decision again").clicked() {
+            action = Some(TableAction::Back);
+        }
+        return action;
+    }
     let cell_w = (actions.width() - 16.0) / 3.0;
     let buttons = [
         (Pre::Fold, ButtonLook::Fold, fold_text, n.armed, false),

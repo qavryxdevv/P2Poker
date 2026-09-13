@@ -171,7 +171,8 @@ fn main() {
     // `--preview-absent` (seats off the line), `--preview-sound`,
     // `--preview-ranking` and `--preview-player-note`; `--preview-odds` puts the
     // sample hand on the flop, so the odds have something to say, and
-    // `--preview-chat` gives the table something said.
+    // `--preview-chat` gives the table something said; `--preview-sitout` sits
+    // the hero and seat 2 out and `--preview-bust` has the hero finish fourth.
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -1255,10 +1256,11 @@ fn preview_table(args: &[String]) {
 
     let mut view = TableView::sample();
     view.seats.truncate(usize::from(seats));
+    const MORE_NAMES: [&str; 4] = ["Grace", "Heidi", "Ivan", "Judy"];
     for n in view.seats.len() as u8..seats {
         view.seats.push(SeatView {
             seat: n,
-            name: format!("Player {n}"),
+            name: MORE_NAMES.get(usize::from(n).wrapping_sub(6)).map_or_else(|| format!("Player {n}"), |s| (*s).to_string()),
             stack: 4_980,
             cards: [Facing::Down, Facing::Down],
             act: if n % 3 == 0 { Some(SeatAct::Call) } else { None },
@@ -1303,6 +1305,21 @@ fn preview_table(args: &[String]) {
             ("a full house".into(), 0.0333),
             ("four of a kind".into(), 0.0009),
         ];
+    }
+    // `--preview-showcase`: the same sample without the banner, for the README's
+    // picture of the window -- whose caption says it is the sample hand. The
+    // client itself never draws a sample without it (the module note on §22).
+    if has("--preview-showcase") {
+        view.preview = false;
+    }
+    if has("--preview-sitout") {
+        view.hero_sitting_out = true;
+        for s in view.seats.iter_mut().filter(|s| s.seat == 2) {
+            s.link = Some(table::Link { rtt_ms: None, stale: false, group: true, quiet_s: Some(1), away: true });
+        }
+    }
+    if has("--preview-bust") {
+        view.busted = Some(table::Busted { place: 4, players_left: 3 });
     }
     if has("--preview-out") {
         view.out_for_good = Some("certified out after the fourth absence (hand 128)".into());
@@ -1662,6 +1679,11 @@ impl Client {
                 if let Err(e) = p2p_poker::storage::notes::save(&self.profile_dir, &self.state.notes) {
                     self.state.log.push_back(format!("the note did not save: {e}"));
                 }
+                None
+            }
+            // `D-049`: *I'm back*.
+            Ta::Back => {
+                self.tell(p2p_poker::net::node::NodeCommand::SitBack);
                 None
             }
             Ta::None | Ta::Exit => None,

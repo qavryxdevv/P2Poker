@@ -338,6 +338,20 @@ pub fn action_badge(p: &Painter, at: Pos2, act: super::SeatAct, s: f32, pop: f32
     rect
 }
 
+/// `D-049`: a seat that sits out, in the action badge's place and shape, in
+/// the greys of a seat that is not playing.
+pub fn sit_out_badge(p: &Painter, at: Pos2, s: f32) -> Rect {
+    let word = "Sit out";
+    let size = 12.0 * s;
+    let w = text_width(p, word, size, Weight::Bold) + 14.0 * s;
+    let h = 18.0 * s;
+    let rect = Rect::from_center_size(at, vec2(w, h));
+    p.rect_filled(rect, radius(h / 2.0), rgba(0x1E1E1E, 235));
+    p.rect_stroke(rect, radius(h / 2.0), Stroke::new(1.0, rgb(0x9E9E9E)), StrokeKind::Inside);
+    text(p, rect.center(), Align2::CENTER_CENTER, word, size, Weight::Bold, rgb(0xD6D6D6));
+    rect
+}
+
 /// `PlayerTimeoutBar`: the time left, shrinking to the left.
 pub fn timeout_bar(p: &Painter, rect: Rect, left: f32, fill: Color32) {
     let r = rect.height() / 2.0;

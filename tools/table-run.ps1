@@ -191,6 +191,16 @@ param(
     # first, the same length each time; four absences in one run is how D-047
     # (the fourth absence is the last) is measured. Zero cuts once.
     [ValidateRange(0, 3600)][int]$OfflineEvery = 0,
+    # `-AfkAt <s> -BackAt <s> -AfkNode <n>` (D-049): from `-AfkAt` the node stops
+    # playing for its owner (`--autoplay` suspended), so its own clock runs out
+    # and it sits out -- checking or folding at once on every turn, and saying
+    # so as the table's group status; at `-BackAt` it is back, as the window's
+    # *I'm back* says. Every other node's log says when the group's word
+    # reached it: *seat N sits out by the table's group* / *plays again*.
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateRange(0, 100000)][int]$AfkAt = 0,
+    [ValidateRange(0, 100000)][int]$BackAt = 0,
+    [ValidateRange(0, 32)][int]$AfkNode = 1,
     # `-StallJoin <seconds> -StallJoinNode <n>` starves one joiner's **group
     # handshake** for that long, right after it accepts the invitation.
     #
@@ -418,6 +428,8 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     $diverge = if ($DivergeAt -gt 0 -and $i -eq $DivergeNode) { $DivergeAt } else { 0 }
     $downAt = if ($LinkDownAt -gt 0 -and $i -eq $LinkDownNode) { $LinkDownAt } else { 0 }
     $offAt = if ($OfflineAt -gt 0 -and $i -eq $OfflineNode) { $OfflineAt } else { 0 }
+    $afkForNode = if ($AfkAt -gt 0 -and $i -eq $AfkNode) { $AfkAt } else { 0 }
+    $backForNode = if ($BackAt -gt 0 -and $i -eq $AfkNode) { $BackAt } else { 0 }
     $stall = if ($StallJoin -gt 0 -and $i -eq $StallJoinNode) { $StallJoin } else { 0 }
     $mute = if ($MuteFor -gt 0 -and $i -eq $MuteNode) { $MuteFor } else { 0 }
     # Not `$startStack`: PowerShell's names are case-insensitive and that IS
@@ -426,8 +438,10 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # The founder alone, and handed to the job like the stack: the job sees
     # nothing of this scope (the first run printed the banner and kicked nobody).
     $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt)
+        if ($afkAt -gt 0) { $env:P2P_POKER_AFK_AT = "$afkAt" }
+        if ($backAt -gt 0) { $env:P2P_POKER_BACK_AT = "$backAt" }
         if ($offAt -gt 0) {
             $env:P2P_POKER_OFFLINE_AT = "$offAt"
             $env:P2P_POKER_OFFLINE_FOR = "$offFor"
@@ -505,6 +519,10 @@ if ($StallJoin -gt 0) {
     Write-Host "==> n$StallJoinNode starves its group handshake for $StallJoin s after accepting the invite"
     Write-Host "    (S1-AA shape (i): past 12 s the inviter entry is reaped and there is no way back;"
     Write-Host "     expect a leave-and-rejoin, counted on the status line. Needs --features fault-harness)"
+}
+if ($AfkAt -gt 0) {
+    Write-Host "==> n$AfkNode stops playing at $AfkAt s and sits out when its clock runs out$(if ($BackAt -gt 0) { "; back at $BackAt s" })"
+    Write-Host "    (needs a binary built with --features fault-harness; D-049)"
 }
 if ($OfflineAt -gt 0) {
     Write-Host "==> n$OfflineNode's INTERNET goes away at $OfflineAt s for $OfflineFor s, at the socket; the process lives on$(if ($OfflineEvery -gt 0) { " -- and again every $OfflineEvery s" })"

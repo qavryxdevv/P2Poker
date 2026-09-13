@@ -57,6 +57,9 @@ pub enum NodeCommand {
     /// something illegal would fail at the first of them rather than reaching
     /// the wire.
     Act(crate::poker::actions::Action),
+    /// `D-049`: the player is back -- this seat stops sitting out and waits
+    /// for the player's own action again.
+    SitBack,
     /// Say something in the lobby.
     ///
     /// The text is whatever was typed. It is trimmed and capped where it is
@@ -228,6 +231,10 @@ pub enum NodeEvent {
         hand_id: u64,
         button: u8,
         dealt_in: Vec<u8>,
+        /// The hand's blinds, as its `HAND_INIT` derived them from the
+        /// tournament's schedule -- not the table's starting ones.
+        small_blind: u64,
+        big_blind: u64,
     },
     /// A hand is waiting for these seats to say the same thing this client did.
     ///
@@ -392,7 +399,13 @@ pub enum NodeEvent {
     /// `S1-DX`: `quiet_s` is how many seconds ago the table's group last
     /// heard the seat -- the figure beside the dot on a Tox table, where
     /// `rtt_ms` is never sent and the line is the group's alone.
-    SeatLink { seat: u8, rtt_ms: Option<u64>, group: bool, quiet_s: Option<u64> },
+    /// `D-049`: `away` is the seat's own word, as the table's group status of
+    /// it, that it sits out -- read only while the group holds the seat, so a
+    /// seat off the line is never said to sit out.
+    SeatLink { seat: u8, rtt_ms: Option<u64>, group: bool, quiet_s: Option<u64>, away: bool },
+    /// `D-049`: this client's seat sits out (`on`) -- its own clock ran out,
+    /// and it checks or folds at once on every turn -- or the player is back.
+    SittingOut { on: bool },
     /// `D-035`: a seat's client left the table's group -- on purpose
     /// (`quit`) or by timing out. The seat is shown gone; heads-up a quit
     /// ends the game.
@@ -542,6 +555,7 @@ impl NodeEvent {
             | Self::RosterKeys { .. }
             | Self::TableReal { .. }
             | Self::HandBegan { .. }
+            | Self::SittingOut { .. }
             | Self::SeatActed { .. }
             | Self::TableState { .. }
             | Self::HandWaiting { .. }

@@ -6648,6 +6648,18 @@ forwarding them. Everything §7.7 says of the two strings and of the absence
 of any security claim holds here unchanged. Muting a seat is the receiver's
 own affair -- it stops showing that seat's lines -- and is never on the wire.
 
+### 7.9 A seat's word that it sits out -- no message
+
+D-049. A seat whose own clock ran out sits out: its client checks or folds at
+once on every turn until the player is back. It says so **without a message of
+this protocol**: as its own member status in the table's group -- the carrier
+D-019 chose keeps one per member -- *away* while it sits out and *none*
+otherwise, set again every 20 s and on every fresh copy of the group. A receiver reads the status of the group member its evidence
+binds to the seat (the most recently heard entry, S1-DU) and shows the seat
+sitting out only while the group holds it. The status is display data: it is
+not signed by the application key, never evidence, never hashed, and never
+changes what any seat may do.
+
 ---
 
 ## 8. Deadlines and timeouts
@@ -6670,6 +6682,10 @@ the hand plays out. Only a betting decision is missing, and poker has always had
 an answer to that.
 
 Only the right-hand column is hard, and it is the rarer case.
+
+A seat whose own clock ran out once then **sits out** (D-049, §7.9): its client
+makes the same check or fold at once on every later turn, until the player is
+back.
 
 **No timeout of any kind ends the tournament or the cash game.** At worst one hand
 aborts, and only in the right-hand column. The next hand begins immediately
