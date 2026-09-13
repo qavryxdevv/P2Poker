@@ -322,6 +322,8 @@ pub fn badge_colours(act: super::SeatAct) -> (Color32, Color32, Color32, f32) {
         SeatAct::Check | SeatAct::Call => (rgb(0x122A55), rgb(0x6AA0E8), rgb(0xEAF1FF), 1.0),
         SeatAct::Bet | SeatAct::Raise => (rgb(0x4A3A10), rgb(0xDCC065), PANEL_TEXT, 1.0),
         SeatAct::AllIn => (rgba(0x000000, 170), rgb(0xEF5350), WHITE, 2.0),
+        // `D-050`: a hand that went into the muck, in the greys of cards face down.
+        SeatAct::Muck => (rgb(0x2E2E2E), rgb(0xA8A8A8), rgb(0xE4E4E4), 1.0),
     }
 }
 

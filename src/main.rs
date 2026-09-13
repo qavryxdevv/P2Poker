@@ -173,7 +173,7 @@ fn main() {
     // sample hand on the flop, so the odds have something to say, and
     // `--preview-chat` gives the table something said; `--preview-sitout` sits
     // the hero and seat 2 out, `--preview-bust` has the hero finish fourth and
-    // `--preview-won` win the tournament.
+    // `--preview-won` win the tournament; `--preview-show` offers *Show cards*.
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -582,6 +582,7 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
         let _ = commands
             .send(NodeCommand::SetNickname(settings.nickname.clone()))
             .await;
+        let _ = commands.send(NodeCommand::SetAutoMuck(settings.auto_muck())).await;
         if let Some(command) = hosted {
             let _ = commands.send(command).await;
         }
@@ -980,6 +981,7 @@ fn windowed(player: Player, run: Run) -> Started {
     // true: a 95 ms shuffle proof on the paint thread is six dropped frames.
     let opening = commands.clone();
     let opening_name = settings.nickname.clone();
+    let opening_auto_muck = settings.auto_muck();
     // The window keeps a copy: it saves the settings, and the defaults a
     // settings file falls back to are derived from this key.
     let node_key = app_key.clone();
@@ -988,6 +990,7 @@ fn windowed(player: Player, run: Run) -> Started {
     let node_dir = profile_dir.clone();
     rt.spawn(async move {
         let _ = opening.send(NodeCommand::SetNickname(opening_name)).await;
+        let _ = opening.send(NodeCommand::SetAutoMuck(opening_auto_muck)).await;
         if let Some(command) = hosted {
             let _ = opening.send(command).await;
         }
@@ -1321,6 +1324,13 @@ fn preview_table(args: &[String]) {
     }
     if has("--preview-bust") {
         view.finished = Some(table::Finish { place: 4, players_left: 3, show_in_ms: 0 });
+    }
+    if has("--preview-show") {
+        view.show_cards_in_ms = Some(2_400);
+        for s in view.seats.iter_mut().filter(|s| s.seat == 2) {
+            s.act = Some(SeatAct::Muck);
+            s.folded = false;
+        }
     }
     if has("--preview-won") {
         view.finished = Some(table::Finish { place: 1, players_left: 1, show_in_ms: 0 });
@@ -1685,6 +1695,11 @@ impl Client {
                 }
                 None
             }
+            // `D-050`: *Show cards*.
+            Ta::ShowCards => {
+                self.tell(p2p_poker::net::node::NodeCommand::ShowCards);
+                None
+            }
             // `D-049`: *I'm back*.
             Ta::Back => {
                 self.tell(p2p_poker::net::node::NodeCommand::SitBack);
@@ -1730,6 +1745,8 @@ impl Client {
             self.state.me = settings.nickname.clone();
             self.tell(NodeCommand::SetNickname(settings.nickname.clone()));
         }
+        // `D-050`: said on every save; the node keeps the last word.
+        self.tell(NodeCommand::SetAutoMuck(settings.auto_muck()));
         // Saved to disk, and said either way. A setting that silently did not
         // persist is one the player changes again next time and blames the
         // client for.

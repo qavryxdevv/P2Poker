@@ -208,6 +208,7 @@ pub struct TableApp {
     pub sitting_out: bool,
     pub away: std::collections::BTreeSet<u8>,
     pub finished: Option<(crate::gui::table::Finish, std::time::Instant)>,
+    pub show_choice: Option<(u64, std::time::Instant)>,
 }
 
 /// Everything the client knows, in the form the panes read it.
@@ -329,6 +330,9 @@ pub struct AppState {
     /// The place this player finished the tournament in -- out of chips, or
     /// the winner -- and when the deciding hand ended.
     pub finished: Option<(crate::gui::table::Finish, std::time::Instant)>,
+    /// `D-050`: this client's hand waits at the showdown for the player, who
+    /// may show it: the hand, and until when.
+    pub show_choice: Option<(u64, std::time::Instant)>,
     /// The sounds owed since the window last played them, in order.
     pub sound_cues: Vec<crate::sound::Cue>,
     /// How many games this client has sat down to since it started: PokerTH's
@@ -571,6 +575,7 @@ impl AppState {
         std::mem::swap(&mut self.sitting_out, &mut other.sitting_out);
         std::mem::swap(&mut self.away, &mut other.away);
         std::mem::swap(&mut self.finished, &mut other.finished);
+        std::mem::swap(&mut self.show_choice, &mut other.show_choice);
     }
 
     /// `D-043`: turn to another of this client's tables: its state becomes
@@ -854,6 +859,8 @@ impl AppState {
                 small_blind,
                 big_blind,
             } => {
+                // `D-050`: a new hand waits for nobody's word about the last.
+                self.show_choice = None;
                 // The hand's own blinds, as its init derived them from the
                 // tournament's schedule: the status bar showed the starting
                 // ones for the whole game (the owner, 2026-09-13).
@@ -1328,6 +1335,11 @@ impl AppState {
                 }
                 self.note(format!("the founder says no: {}", refusal(reason)));
             }
+            // `D-050`: the showdown waits for this player's word, or no longer.
+            NodeEvent::ShowdownChoice { hand_id, open_ms } => {
+                self.show_choice =
+                    open_ms.map(|ms| (hand_id, std::time::Instant::now() + std::time::Duration::from_millis(ms)));
+            }
             // `D-049`: this client's seat sits out, or the player is back.
             NodeEvent::SittingOut { on } => {
                 if self.sitting_out != on {
@@ -1436,6 +1448,7 @@ impl AppState {
         self.sitting_out = false;
         self.away.clear();
         self.finished = None;
+        self.show_choice = None;
     }
 
     /// A seat's chips when the hand began: the last settlement's figure, or

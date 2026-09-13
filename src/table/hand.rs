@@ -806,6 +806,17 @@ pub const SHOWDOWN_REVEAL_CAP: usize = 512;
 /// The cap on a `SHOWDOWN_MUCK` body: one boolean.
 pub const SHOWDOWN_MUCK_CAP: usize = 64;
 
+/// `D-050`: how long a hand that may muck waits for its player (the owner:
+/// seven seconds is too long, three are enough).
+pub const SHOW_WINDOW_MS: u64 = 3_000;
+
+/// `D-050`: what a waiting hand leaves of the showdown stage's budget for the
+/// seats behind it and the network.
+pub const SHOW_MARGIN_MS: u64 = 8_000;
+
+/// `D-050`: below this, a hand does not wait for its player: it mucks.
+pub const SHOW_WINDOW_MIN_MS: u64 = 2_000;
+
 /// The cap on a `HAND_COMPLETE` body: at most `MAX_SEATS` pots, each with three
 /// seat lists, plus four vectors of that length.
 pub const HAND_COMPLETE_CAP: usize = 4_096;
@@ -1716,6 +1727,14 @@ pub struct Hand {
     /// hand can be followed and folded, not played out -- no share of this
     /// seat's is ever made, its cards are not read, and at a showdown it mucks.
     fold_only: bool,
+    /// `D-050`: whether this client's own hand, where the rules let it muck at
+    /// the showdown, waits for its player -- who may show it instead -- rather
+    /// than mucking at once. Set by the node for a client with a player.
+    hold_muck: bool,
+    /// `D-050`: when this client saw the showdown stage open, on its clock.
+    showdown_opened_ms: Option<u64>,
+    /// `D-050`: the hand is waiting for its player until then, on the same clock.
+    muck_held_until_ms: Option<u64>,
     /// `D-033`: every frame this hand accepted from the wire, in the order
     /// accepted, for a seat back from a restart to take the hand up from --
     /// said again by the node beside its own frames.
@@ -2003,6 +2022,9 @@ impl Hand {
                 restoring,
                 restored_secret,
                 fold_only,
+                hold_muck: false,
+                showdown_opened_ms: None,
+                muck_held_until_ms: None,
                 transcript: Vec::new(),
                 transcript_seen: BTreeSet::new(),
                 voice,
@@ -4017,6 +4039,7 @@ impl Hand {
     /// clockwise. It decides **when** each client speaks and nothing else: the
     /// stage is collective and completes whenever every live seat has spoken.
     fn begin_showdown(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        self.showdown_opened_ms.get_or_insert(now_ms);
         let button = self.mine.button_position;
         let bb_seat = self.mine.bb_seat;
         let seat_count = self.open.max_players;
@@ -4125,9 +4148,35 @@ impl Hand {
         // `D-033`: a hand with no secret can show nothing, so it mucks.
         if !self.fold_only && self.shows_rather_than_mucks(my_place, first)? {
             self.show(key, now_ms)
+        } else if self.muck_held_until_ms.is_some() {
+            // `D-050`: already waiting for its player.
+            Ok(Vec::new())
+        } else if let Some(until) = self.hold_until(now_ms) {
+            // `D-050`, the owner: a hand that may muck waits for its player,
+            // who may show it instead (`show_held`); the node mucks it when the
+            // window is up (`muck_held_now`).
+            self.muck_held_until_ms = Some(until);
+            Ok(Vec::new())
         } else {
             self.muck(key, now_ms)
         }
+    }
+
+    /// `D-050`: until when this client's hand may wait at the showdown for
+    /// its player, or `None` when it mucks at once: nobody holds it, it has no
+    /// cards to show, or too little of the stage's budget is left. The window
+    /// is `SHOW_WINDOW_MS`, cut to what the stage leaves after
+    /// `SHOW_MARGIN_MS`, since the seats behind this one in the order wait on
+    /// it inside the same budget.
+    fn hold_until(&self, now_ms: u64) -> Option<u64> {
+        if !self.hold_muck || self.fold_only || self.restoring || self.cards().is_none() {
+            return None;
+        }
+        let opened = self.showdown_opened_ms.unwrap_or(now_ms);
+        let spent = now_ms.saturating_sub(opened);
+        let left = u64::from(self.open.crypto_step_timeout_ms).saturating_sub(spent).saturating_sub(SHOW_MARGIN_MS);
+        let window = SHOW_WINDOW_MS.min(left);
+        (window >= SHOW_WINDOW_MIN_MS).then(|| now_ms.saturating_add(window))
     }
 
     /// Whether this client shows its hand or forfeits (D-021).
@@ -8290,6 +8339,40 @@ impl Hand {
             Phase::Playing { play, .. } => *play.shown.get(usize::from(seat))?,
             _ => None,
         }
+    }
+
+    /// `D-050`: hold this client's muck at the showdown for its player.
+    pub fn hold_muck_for_the_player(&mut self, on: bool) {
+        self.hold_muck = on;
+    }
+
+    /// `D-050`: whether this client holds its muck for a player at all.
+    pub fn holds_muck(&self) -> bool {
+        self.hold_muck
+    }
+
+    /// `D-050`: until when, on this client's clock, its hand waits at the
+    /// showdown for its player's word -- it may muck, and may be shown instead.
+    pub fn muck_held_until(&self) -> Option<u64> {
+        self.muck_held_until_ms.filter(|_| self.showing())
+    }
+
+    /// `D-050`: show the waiting hand instead of mucking it.
+    pub fn show_held(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        if self.muck_held_until().is_none() {
+            return Ok(Vec::new());
+        }
+        self.muck_held_until_ms = None;
+        self.show(key, now_ms)
+    }
+
+    /// `D-050`: muck the waiting hand -- its player's window is up.
+    pub fn muck_held_now(&mut self, key: &SigningKey, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        if self.muck_held_until().is_none() {
+            return Ok(Vec::new());
+        }
+        self.muck_held_until_ms = None;
+        self.muck(key, now_ms)
     }
 
     /// Whether a seat forfeited at the showdown.
@@ -12814,6 +12897,91 @@ mod tests {
             3,
             "and keeps its stack, which the blinds go on taking"
         );
+    }
+
+    /// `D-050`: a hand the rules let muck waits for its player and may be shown
+    /// instead; left alone, it mucks. Both peers agree either way. The deal is
+    /// random, so hands are played until each outcome has come up.
+    #[test]
+    fn a_hand_that_may_muck_waits_for_its_player() {
+        let keys = [key(10), key(11)];
+        let (mut shown_once, mut mucked_once) = (false, false);
+        for _ in 0..60 {
+            if shown_once && mucked_once {
+                break;
+            }
+            let (mut a, from_a) = Hand::open(opening(0), &key(10), NOW, 30_000).unwrap();
+            let (mut b, from_b) = Hand::open(opening(1), &key(11), NOW, 30_000).unwrap();
+            a.hold_muck_for_the_player(true);
+            b.hold_muck_for_the_player(true);
+            let b_deck = deliver(&mut b, &from_a, &key(11));
+            let a_deck = deliver(&mut a, &from_b, &key(10));
+            let mut queue: Vec<(SeatIdx, Vec<Send>)> = vec![(1, deliver(&mut b, &a_deck, &key(11))), (0, deliver(&mut a, &b_deck, &key(10)))];
+            for _ in 0..256 {
+                if let Some((from, sends)) = queue.pop() {
+                    if sends.is_empty() {
+                        continue;
+                    }
+                    let to = 1 - from;
+                    let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                    let out = deliver(hand, &sends, &keys[usize::from(to)]);
+                    queue.push((to, out));
+                    continue;
+                }
+                if a.betting_over() && b.betting_over() {
+                    break;
+                }
+                let Some(turn) = a.turn().or_else(|| b.turn()) else {
+                    break;
+                };
+                let seat = turn.seat;
+                let hand: &mut Hand = if seat == 0 { &mut a } else { &mut b };
+                let action = if hand.turn().unwrap().legal.can_check { Action::Check } else { Action::Call };
+                let out = hand.act(action, &keys[usize::from(seat)], NOW).unwrap();
+                queue.push((seat, out));
+            }
+            let Some(seat) = (0..2u8).find(|s| if *s == 0 { a.muck_held_until().is_some() } else { b.muck_held_until().is_some() }) else {
+                // The second hand was not beaten, or tied: it showed, as the rules say.
+                assert!(a.shown(0).is_some() && a.shown(1).is_some(), "nobody waited, so both showed");
+                continue;
+            };
+            let until = if seat == 0 { a.muck_held_until() } else { b.muck_held_until() }.unwrap();
+            assert!(until > NOW && until <= NOW + SHOW_WINDOW_MS, "three seconds at most: {}", until - NOW);
+            assert!(!a.mucked(seat) && a.shown(seat).is_none() && !b.mucked(seat) && b.shown(seat).is_none(), "nothing said yet");
+            let show = !shown_once;
+            let out = {
+                let hand: &mut Hand = if seat == 0 { &mut a } else { &mut b };
+                if show {
+                    hand.show_held(&keys[usize::from(seat)], NOW).unwrap()
+                } else {
+                    hand.muck_held_now(&keys[usize::from(seat)], NOW).unwrap()
+                }
+            };
+            assert!(!out.is_empty(), "the word goes out");
+            let mut queue = vec![(seat, out)];
+            while let Some((from, sends)) = queue.pop() {
+                if sends.is_empty() {
+                    continue;
+                }
+                let to = 1 - from;
+                let hand: &mut Hand = if to == 0 { &mut a } else { &mut b };
+                let more = deliver(hand, &sends, &keys[usize::from(to)]);
+                queue.push((to, more));
+            }
+            assert!(a.muck_held_until().is_none() && b.muck_held_until().is_none(), "nobody waits any more");
+            if show {
+                let holder: &Hand = if seat == 0 { &a } else { &b };
+                assert_eq!(a.shown(seat), holder.cards(), "shown on this peer's table");
+                assert_eq!(b.shown(seat), holder.cards(), "and on the other's");
+                assert!(!a.mucked(seat) && !b.mucked(seat));
+                shown_once = true;
+            } else {
+                assert!(a.mucked(seat) && b.mucked(seat), "mucked on both");
+                assert!(a.shown(seat).is_none() && b.shown(seat).is_none());
+                mucked_once = true;
+            }
+        }
+        assert!(shown_once && mucked_once, "both outcomes came up (shown {shown_once}, mucked {mucked_once})");
     }
 
     /// A mucked hand is never opened, by anybody, ever.

@@ -74,6 +74,11 @@ pub struct Settings {
     /// reads as shown.
     #[n(4)]
     pub show_chat: Option<bool>,
+    /// `D-050`: a hand that may muck at a showdown is mucked at once (`true`,
+    /// the owner's default) or waits three seconds for *Show cards*. `None`
+    /// reads as on.
+    #[n(5)]
+    pub auto_muck: Option<bool>,
 }
 
 /// PokerTH's sound settings (`SoundSettings.qml`, `configfile.cpp`'s defaults):
@@ -142,6 +147,7 @@ impl Settings {
             sound: None,
             show_odds: None,
             show_chat: None,
+            auto_muck: None,
         }
     }
 
@@ -160,6 +166,12 @@ impl Settings {
     /// player said no.
     pub fn show_chat(&self) -> bool {
         self.show_chat.unwrap_or(true)
+    }
+
+    /// `D-050`: whether a hand that may muck is mucked at once: yes unless the
+    /// player said no.
+    pub fn auto_muck(&self) -> bool {
+        self.auto_muck.unwrap_or(true)
     }
 
     /// The scale as egui wants it.
@@ -257,6 +269,7 @@ mod tests {
             sound: None,
             show_odds: None,
             show_chat: None,
+            auto_muck: None,
         };
         save(&dir, &s, &k).unwrap();
         assert_eq!(load(&dir, &k), s);
@@ -287,6 +300,7 @@ mod tests {
         assert_eq!(s.show_odds, None);
         assert!(s.show_odds());
         assert!(s.show_chat());
+        assert!(s.auto_muck(), "and a hand that may muck is mucked at once");
         let hidden = Settings { show_odds: Some(false), ..s };
         save(&dir, &hidden, &k).unwrap();
         assert!(!load(&dir, &k).show_odds());
@@ -330,6 +344,7 @@ mod tests {
             sound: None,
             show_odds: None,
             show_chat: None,
+            auto_muck: None,
         };
         s.repair(&k);
         assert!(s.nickname.len() <= NAME_MAX);
@@ -340,6 +355,7 @@ mod tests {
             sound: None,
             show_odds: None,
             show_chat: None,
+            auto_muck: None,
         };
         s.repair(&k);
         assert!(!s.nickname.chars().any(|c| c.is_control()));
@@ -352,6 +368,7 @@ mod tests {
             sound: None,
             show_odds: None,
             show_chat: None,
+            auto_muck: None,
         };
         s.repair(&k);
         assert_eq!(s.nickname, Settings::defaults(&k).nickname);
@@ -370,6 +387,7 @@ mod tests {
                 sound: None,
                 show_odds: None,
                 show_chat: None,
+                auto_muck: None,
             };
             s.repair(&k);
             assert!(s.nickname.len() <= NAME_MAX, "{n}");
@@ -392,6 +410,7 @@ mod tests {
             sound: None,
             show_odds: None,
             show_chat: None,
+            auto_muck: None,
         };
         // Written past `save`'s own repair, the way a person editing the file
         // would.
@@ -405,6 +424,7 @@ mod tests {
             sound: None,
             show_odds: None,
             show_chat: None,
+            auto_muck: None,
         };
         std::fs::write(settings_path(&dir), minicbor::to_vec(&tiny).unwrap()).unwrap();
         assert_eq!(load(&dir, &k).text_percent, SCALE_MIN);
@@ -419,6 +439,7 @@ mod tests {
             sound: None,
             show_odds: None,
             show_chat: None,
+            auto_muck: None,
         };
         assert_eq!(s.zoom(), 1.0);
     }
@@ -437,6 +458,7 @@ mod tests {
                 sound: None,
                 show_odds: None,
                 show_chat: None,
+                auto_muck: None,
             },
             &k,
         )
@@ -449,6 +471,7 @@ mod tests {
                 sound: None,
                 show_odds: None,
                 show_chat: None,
+                auto_muck: None,
             },
             &k,
         )

@@ -60,6 +60,12 @@ pub enum NodeCommand {
     /// `D-049`: the player is back -- this seat stops sitting out and waits
     /// for the player's own action again.
     SitBack,
+    /// `D-050`: show this client's waiting hand at the showdown instead of
+    /// mucking it.
+    ShowCards,
+    /// `D-050`: the player's *Auto muck*: a hand that may muck is mucked at
+    /// once (`true`) or waits for *Show cards*.
+    SetAutoMuck(bool),
     /// Say something in the lobby.
     ///
     /// The text is whatever was typed. It is trimmed and capped where it is
@@ -406,6 +412,10 @@ pub enum NodeEvent {
     /// `D-049`: this client's seat sits out (`on`) -- its own clock ran out,
     /// and it checks or folds at once on every turn -- or the player is back.
     SittingOut { on: bool },
+    /// `D-050`: this client's hand may muck at the showdown and waits for the
+    /// player, who may show it instead, for `open_ms` more; `None` when the
+    /// wait is over, whichever way it ended.
+    ShowdownChoice { hand_id: u64, open_ms: Option<u64> },
     /// `D-035`: a seat's client left the table's group -- on purpose
     /// (`quit`) or by timing out. The seat is shown gone; heads-up a quit
     /// ends the game.
@@ -556,6 +566,7 @@ impl NodeEvent {
             | Self::TableReal { .. }
             | Self::HandBegan { .. }
             | Self::SittingOut { .. }
+            | Self::ShowdownChoice { .. }
             | Self::SeatActed { .. }
             | Self::TableState { .. }
             | Self::HandWaiting { .. }

@@ -4237,3 +4237,52 @@ jako duch, i když hráč zruší svůj status sit out nebo přejde do offline"*
 **Guard.** `app::table::sitting_out_and_the_groups_word_reach_the_window` (the word shown, dropped off the line
 without a *back*, taken back); the bar's *I'm back* photographed from `--table-preview --preview-sitout`; the
 harness's `-AfkAt`/`-BackAt`.
+
+## D-050 — a hand that may muck waits for its player, who may show it
+
+**Built 2026-09-13 at the project owner's instruction** (*"přidej na showdown tlačítko pro možnost ukázat své karty
+(v časovém limitu délky showdownu), v případě, když karty nemusím ukazovat (muck), ve stejném stylu jako je tlačítko
+I'm back"*; the same day: *"7 s je moc dlouhá doba, stačí 3 sekundy, a také možnost do nastavení auto muck
+defaultně zapnuté"*, *"a aby se muck zobrazovalo u hráčů v GUI podobně jako bet, raise, fold, call"*, and *"vygenerovat
+a přidat krátkou zvukovou událost pro muck"*).
+
+1. **What was there.** At a showdown the seats speak in order, and each client decides for its own hand when the
+   seats ahead of it have spoken: it shows when it is first, when anybody is all in, or when nothing shown beats
+   it, and otherwise it mucks at once (D-021, the owner's *if they find out they have lost, they muck*). Nobody was
+   asked.
+2. **The rule now.** A setting decides, *Auto muck*, on by default: on, a hand the rules let muck is mucked at
+   once, as before. Off, it waits for its player instead: the window offers *Show cards* in place of Fold, Call
+   and Raise, with the seconds left, in the style of *I'm back*. Pressed, the client sends `SHOWDOWN_REVEAL`; not
+   pressed, it sends `SHOWDOWN_MUCK` when the time is up. Both are the messages the showdown always had; only when
+   the muck is sent changed, and nothing about who may muck. The setting is in both settings windows and reaches
+   the node as `NodeCommand::SetAutoMuck` at start and on every save.
+3. **How long.** `SHOW_WINDOW_MS` = 3 000 ms (a first build waited the table's 7 s pause; the owner: too long), cut to
+   what the showdown stage's budget (`crypto_step_timeout_ms`, 30 s) leaves after `SHOW_MARGIN_MS` = 8 000 ms, counted
+   from when this client saw the stage open. The seats behind a waiting hand wait on it inside that one budget, so
+   a later waiting hand can get less, and below `SHOW_WINDOW_MIN_MS` = 2 000 ms a hand mucks at once. A seat sitting out
+   (D-049) has nobody to ask and mucks at once; a measurement run (`--autoplay`) never waits.
+4. **Where it lives.** The engine holds the decision (`Hand::hold_muck_for_the_player`, `muck_held_until`,
+   `show_held`, `muck_held_now`), the node keeps the timer (`TableRun::show_by`), says
+   `NodeEvent::ShowdownChoice` and takes `NodeCommand::ShowCards`; the window reads the time left.
+5. **The harness** gained `-HoldMuck show|muck` (`P2P_POKER_HOLD_MUCK`): an autoplay run whose hands wait as a
+   window's do, then show at once or let the window run out.
+
+6. **Everybody sees a muck.** At a showdown -- somebody showed -- every seat that held its cards to the end and
+   showed none wears a *Muck* badge where its last action's badge was, in the greys of cards face down; the log says
+   *Bob mucks.* between the shown hands and the winners; and a short sound plays. PokerTH has no muck and no sound
+   for one, so `assets/sounds/muck.wav` is this project's own: a swish of filtered noise falling as it fades and a
+   soft tap, 0.24 s, as loud as PokerTH's fold, generated from a fixed seed by `tools/make-muck-sound.py` so the
+   same bytes can be made again. It plays under *Game actions*.
+7. **Measured**, three seats autoplaying with `-HoldMuck`. **run170847-3** (the 7 s build, `muck`): every wait said
+   6 999-7 000 ms and ended in the muck; the hand was over 0.3 s later, or after a second seat's own wait in the
+   same showdown (hands #1 and #10, about 14 s together); 16 hands at every node on one genesis, none aborted.
+   **run172111-3** (3 s, `muck`): nineteen waits of 2 999-3 000 ms, each ended in the muck and the hand over
+   0.1-0.3 s after, or about 3 s after where a second seat waited in the same showdown; 20 hands at every node
+   on one genesis. **run172536-3** (3 s, `show`): thirty-three waits, each shown within the same tenth of a
+   second, not one muck; 28 hands at every node on one genesis, none aborted.
+
+**Guard.** `table::hand::a_hand_that_may_muck_waits_for_its_player` (two peers to a showdown until both outcomes
+come up: the waiting hand shown on both tables, or mucked on both), `app::table::the_showdown_choice_reaches_the_window`,
+`app::tablelog::a_mucked_hand_is_said_shown_and_heard`, `sound::every_sound_is_sixteen_bit_stereo_pcm` (the muck
+among them), `storage::settings` (Auto muck on for a file from before it); the bar and the badge photographed
+from `--table-preview --preview-show`.

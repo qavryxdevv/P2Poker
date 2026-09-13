@@ -104,6 +104,8 @@ pub enum SeatAct {
     Bet,
     Raise,
     AllIn,
+    /// `D-050`: the seat mucked at the showdown.
+    Muck,
 }
 
 impl SeatAct {
@@ -115,6 +117,7 @@ impl SeatAct {
             SeatAct::Bet => "Bet",
             SeatAct::Raise => "Raise",
             SeatAct::AllIn => "All-In",
+            SeatAct::Muck => "Muck",
         }
     }
 }
@@ -246,6 +249,9 @@ pub struct TableView {
     pub winning_hand: Option<String>,
     /// `D-049`: this client's seat sits out; the bar offers *I'm back*.
     pub hero_sitting_out: bool,
+    /// `D-050`: this client's hand waits at the showdown and may be shown
+    /// instead of mucked, for this much longer; the bar offers *Show cards*.
+    pub show_cards_in_ms: Option<u64>,
     /// The tournament over for this player: the place, and when to say it.
     pub finished: Option<Finish>,
 }
@@ -289,6 +295,8 @@ pub enum TableAction {
     SaveNote { key: [u8; 32], rating: u8, note: String },
     /// `D-049`: *I'm back* -- this seat stops sitting out.
     Back,
+    /// `D-050`: *Show cards* -- the waiting hand is shown instead of mucked.
+    ShowCards,
 }
 
 /// `S1-EI`: a seat off the line during the hand, and what happens about it.
@@ -1483,6 +1491,7 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
         let mut sound = draft.sound();
         let mut show_odds = draft.show_odds();
         let mut show_chat = draft.show_chat();
+        let mut auto_muck = draft.auto_muck();
         egui::Window::new("Settings")
             .id(egui::Id::new("table-sound"))
             .title_bar(false)
@@ -1519,6 +1528,10 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                 ui.label(RichText::new("Table").color(style::BOX_ACCENT).strong());
                 changed |= ui.checkbox(&mut show_odds, "Show the odds beside the action bar").changed();
                 changed |= ui.checkbox(&mut show_chat, "Show the chat beside the action bar").changed();
+                changed |= ui
+                    .checkbox(&mut auto_muck, "Auto muck: a hand that may muck is mucked at once")
+                    .on_hover_text("Off: at a showdown your losing hand waits three seconds for Show cards")
+                    .changed();
             });
         if draft.sound() != sound {
             draft.sound = Some(sound);
@@ -1528,6 +1541,9 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
         }
         if draft.show_chat() != show_chat {
             draft.show_chat = Some(show_chat);
+        }
+        if draft.auto_muck() != auto_muck {
+            draft.auto_muck = Some(auto_muck);
         }
         if changed {
             action = Some(TableAction::SaveSettings(draft.clone()));
@@ -1753,6 +1769,7 @@ impl TableView {
             ],
             winning_hand: None,
             hero_sitting_out: false,
+            show_cards_in_ms: None,
             finished: None,
         }
     }

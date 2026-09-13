@@ -173,6 +173,20 @@ impl AppState {
         };
         let board: Vec<Card> = h.board.iter().filter_map(|i| Card::from_index(*i).ok()).collect();
         let mut lines: Vec<(LogKind, String)> = Vec::new();
+        // `D-050`: at a showdown -- somebody showed -- a seat that held cards
+        // to the end and showed none mucked them.
+        let mucked: Vec<u8> = if h.shown.iter().any(|s| s.is_some()) {
+            h.holding
+                .iter()
+                .copied()
+                .filter(|n| {
+                    let i = usize::from(*n);
+                    !h.folded.get(i).copied().unwrap_or(false) && h.shown.get(i).is_none_or(|s| s.is_none())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         for (i, pair) in h.shown.iter().enumerate() {
             let Some([a, b]) = pair else {
                 continue;
@@ -189,6 +203,10 @@ impl AppState {
                 LogKind::Normal,
                 format!("{name} shows [{}, {}] - \"{named}\"", log_card(ca), log_card(cb)),
             ));
+        }
+        for n in &mucked {
+            let name = self.seat_name(*n);
+            lines.push((LogKind::Normal, format!("{name} mucks.")));
         }
         for (i, won) in h.won.iter().enumerate() {
             if *won > 0 {
@@ -210,6 +228,19 @@ impl AppState {
         }
         for (kind, text) in lines {
             self.log_table(kind, text);
+        }
+        // `D-050`: and each wears *Muck* where its last action was, with the sound.
+        if !mucked.is_empty() {
+            if let Some(h) = self.hand.as_mut() {
+                for n in &mucked {
+                    let i = usize::from(*n);
+                    if h.acted.len() <= i {
+                        h.acted.resize(i + 1, None);
+                    }
+                    h.acted[i] = Some(SeatAct::Muck);
+                }
+            }
+            self.sound_cues.push(Cue::Muck);
         }
     }
 
@@ -251,6 +282,7 @@ impl AppState {
             SeatAct::Call => format!("{name} calls ${total}."),
             SeatAct::Bet | SeatAct::Raise => format!("{name} bets ${total}."),
             SeatAct::AllIn => format!("{name} is all in with ${total}."),
+            SeatAct::Muck => format!("{name} mucks."),
         };
         self.log_table(LogKind::Normal, text);
         self.sound_cues.push(match act {
@@ -260,6 +292,7 @@ impl AppState {
             SeatAct::Bet => Cue::Bet,
             SeatAct::Raise => Cue::Raise,
             SeatAct::AllIn => Cue::AllIn,
+            SeatAct::Muck => Cue::Muck,
         });
     }
 
@@ -411,6 +444,41 @@ mod tests {
             }
             assert_eq!(s.table_view().blinds, format!("{} / {}", bb / 2, bb), "the status bar says hand {hand}'s blinds");
         }
+    }
+
+    /// `D-050`: a seat that held its cards to a showdown and showed none mucked
+    /// them: the log says so, the seat wears *Muck*, and the muck sound plays.
+    #[test]
+    fn a_mucked_hand_is_said_shown_and_heard() {
+        let mut s = table(&["Alice", "Bob", "Carol"]);
+        s.apply(NodeEvent::HandBegan { hand_id: 9, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::CardsDealt { hand_id: 9, seats: vec![0, 1, 2] });
+        s.apply(NodeEvent::TableState {
+            hand_id: 9,
+            street: 3,
+            pot: 60,
+            to_act: None,
+            stacks: vec![980, 980, 980],
+            bets: vec![0, 0, 0],
+            folded: vec![false, false, true],
+        });
+        s.take_sound_cues();
+        // Alice showed and won; Bob held his cards to the end and showed none; Carol folded.
+        s.apply(NodeEvent::HandEnded { hand_id: 9, stacks: vec![1_040, 980, 980], shown: vec![Some([12, 25]), None, None] });
+        let v = s.table_view();
+        let act = |seat: u8| v.seats.iter().find(|x| x.seat == seat).and_then(|x| x.act);
+        assert_eq!(act(1), Some(SeatAct::Muck), "Bob wears Muck");
+        assert_ne!(act(2), Some(SeatAct::Muck), "a fold is not a muck");
+        assert!(texts(&s).iter().any(|l| l == "Bob mucks."), "{:?}", texts(&s));
+        assert!(!texts(&s).iter().any(|l| l == "Carol mucks."));
+        assert!(s.take_sound_cues().contains(&Cue::Muck));
+
+        // Everybody else folded: no showdown, nobody mucked.
+        let mut s = table(&["Alice", "Bob"]);
+        s.apply(NodeEvent::HandBegan { hand_id: 10, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::CardsDealt { hand_id: 10, seats: vec![0, 1] });
+        s.apply(NodeEvent::HandEnded { hand_id: 10, stacks: vec![1_010, 990], shown: vec![None, None] });
+        assert!(!texts(&s).iter().any(|l| l.ends_with("mucks.")));
     }
 
     /// The showdown's cards with the hand's name, the winner, and the game's

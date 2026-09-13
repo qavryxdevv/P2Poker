@@ -3224,6 +3224,13 @@ something no rule allows and the resulting proof is the predicate working, not a
 false positive. That is the distinction §5.2's property draws, and this pair sits
 on the correct side of it.
 
+**When a muck is sent is the sender's own affair, inside the stage's budget
+(D-050).** A client whose hand may muck may wait for its player, who may show
+the hand instead, for at most 3 000 ms, cut so that `SHOW_MARGIN_MS` = 8 000 ms
+of the showdown stage's budget is left to the seats behind it; below 2 000 ms it
+does not wait. Receivers see only the one message
+that ends the wait, and nothing about it is legal that was not legal before.
+
 Whether `TDA_MUCK` is offered at all is **OPEN QUESTION Q-01** (§12). The
 mechanism is specified now because it costs nothing to specify and because the
 collective-stage required set must be well-defined either way; it is not enabled.

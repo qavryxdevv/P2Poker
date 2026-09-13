@@ -727,6 +727,14 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                     if ui.checkbox(&mut show_chat, "Show the chat beside the action bar").changed() {
                         f.show_chat = Some(show_chat);
                     }
+                    let mut auto_muck = f.auto_muck();
+                    if ui
+                        .checkbox(&mut auto_muck, "Auto muck: a hand that may muck is mucked at once")
+                        .on_hover_text("Off: at a showdown your losing hand waits three seconds for Show cards")
+                        .changed()
+                    {
+                        f.auto_muck = Some(auto_muck);
+                    }
 
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {

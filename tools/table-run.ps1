@@ -201,6 +201,12 @@ param(
     [ValidateRange(0, 100000)][int]$AfkAt = 0,
     [ValidateRange(0, 100000)][int]$BackAt = 0,
     [ValidateRange(0, 32)][int]$AfkNode = 1,
+    # `-HoldMuck show|muck` (D-050): every node's hand that may muck at a showdown
+    # waits for its player as a window's client does, although the run autoplays;
+    # `show` then shows it at once, `muck` lets the window run out. Every node's
+    # log says *showdown: this hand may muck and waits N ms* and what came of it.
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateSet('', 'show', 'muck')][string]$HoldMuck = '',
     # `-StallJoin <seconds> -StallJoinNode <n>` starves one joiner's **group
     # handshake** for that long, right after it accepts the invitation.
     #
@@ -438,8 +444,9 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # The founder alone, and handed to the job like the stack: the job sees
     # nothing of this scope (the first run printed the banner and kicked nobody).
     $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck)
+        if ($holdMuck) { $env:P2P_POKER_HOLD_MUCK = "$holdMuck" }
         if ($afkAt -gt 0) { $env:P2P_POKER_AFK_AT = "$afkAt" }
         if ($backAt -gt 0) { $env:P2P_POKER_BACK_AT = "$backAt" }
         if ($offAt -gt 0) {
@@ -519,6 +526,10 @@ if ($StallJoin -gt 0) {
     Write-Host "==> n$StallJoinNode starves its group handshake for $StallJoin s after accepting the invite"
     Write-Host "    (S1-AA shape (i): past 12 s the inviter entry is reaped and there is no way back;"
     Write-Host "     expect a leave-and-rejoin, counted on the status line. Needs --features fault-harness)"
+}
+if ($HoldMuck) {
+    Write-Host "==> every node's hand that may muck waits at the showdown, then $(if ($HoldMuck -eq 'show') { 'shows at once' } else { 'mucks when the window runs out' })"
+    Write-Host "    (needs a binary built with --features fault-harness; D-050)"
 }
 if ($AfkAt -gt 0) {
     Write-Host "==> n$AfkNode stops playing at $AfkAt s and sits out when its clock runs out$(if ($BackAt -gt 0) { "; back at $BackAt s" })"

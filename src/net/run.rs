@@ -482,6 +482,13 @@ struct TableRun {
     /// so it checks or folds at once on every turn until the player is back
     /// (`NodeCommand::SitBack`). Said to the table as the group's status.
     sitting_out: bool,
+    /// `D-050`: when this client's hand, waiting at the showdown for its
+    /// player, is mucked if the player has not shown it.
+    show_by: Option<tokio::time::Instant>,
+    /// fault-harness (`P2P_POKER_HOLD_MUCK=show`): when `show_by` comes, the
+    /// waiting hand is shown rather than mucked -- the harness's player
+    /// pressing *Show cards*.
+    show_at_expiry: bool,
     /// When the next hand may start. D-020's hold, and the only timer in this
     /// loop that is about a person rather than about the network.
     next_hand_at: Option<tokio::time::Instant>,
@@ -813,6 +820,8 @@ impl TableRun {
             turn_reported: None,
             acted_said: (0, 0),
             sitting_out: false,
+            show_by: None,
+            show_at_expiry: false,
             next_hand_at: None,
             deal_at: None,
             return_hold: None,
@@ -1495,6 +1504,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 arm_boundary!($t, end.pause());
             }
             $t.act_by = hurry(report.clock.apply($t.act_by, $h.action_deadline()), autoplay, $t.sitting_out);
+            showdown_hold!($t, $h);
         }};
     }
     macro_rules! hand_event {
@@ -1746,6 +1756,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     arm_boundary!($t, end.pause());
                                 }
                                 $t.act_by = hurry(report.clock.apply($t.act_by, $h.action_deadline()), autoplay, $t.sitting_out);
+                                showdown_hold!($t, $h);
                                 if let Some(cards) = $h.cards().filter(|_| !$t.cards_reported) {
                                     $t.cards_reported = true;
                                     let _ = events
@@ -2128,6 +2139,53 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // of the branch, or the branch would be the table.
     // The player's own leave, from the window or from the fault knob below:
     // the group, the topic, the table, every local fact, the record.
+    // `D-050`: the player's *Auto muck*, on until the window says otherwise.
+    let mut auto_muck = true;
+    // `D-050`: a hand of this client's that may muck waits at the showdown for
+    // its player when *Auto muck* is off -- never on a measurement run, and not
+    // for a seat sitting out, which has nobody to ask (`D-049`).
+    macro_rules! showdown_hold {
+        ($t:ident, $h:expr) => {{
+            let knob = hold_muck_knob();
+            $h.hold_muck_for_the_player((autoplay.is_none() && !auto_muck) || knob.is_some());
+            match $h.muck_held_until() {
+                Some(until) if $t.show_by.is_none() => {
+                    let mut left = if $t.sitting_out {
+                        std::time::Duration::ZERO
+                    } else {
+                        std::time::Duration::from_millis(until.saturating_sub(super::node::now_unix_ms()))
+                    };
+                    // fault-harness: the harness's player shows at once, or
+                    // lets the window run out.
+                    $t.show_at_expiry = knob == Some(true);
+                    if $t.show_at_expiry {
+                        left = std::time::Duration::ZERO;
+                    }
+                    $t.show_by = Some(tokio::time::Instant::now() + left);
+                    if !left.is_zero() {
+                        let _ = events
+                            .send(NodeEvent::ShowdownChoice {
+                                hand_id: $h.hand_id(),
+                                open_ms: Some(u64::try_from(left.as_millis()).unwrap_or(u64::MAX)),
+                            })
+                            .await;
+                    }
+                    let _ = events
+                        .send(NodeEvent::Warning(format!(
+                            "hand #{}: showdown: this hand may muck and waits {} ms for its player to show it (D-050)",
+                            $h.hand_id(),
+                            left.as_millis()
+                        )))
+                        .await;
+                }
+                None if $t.show_by.is_some() => {
+                    $t.show_by = None;
+                    let _ = events.send(NodeEvent::ShowdownChoice { hand_id: $h.hand_id(), open_ms: None }).await;
+                }
+                _ => {}
+            }
+        }};
+    }
     // `D-049`: the player is back. The group hears it at the driver's next
     // sweep; a turn armed for now gets its clock back.
     macro_rules! sit_back {
@@ -2368,6 +2426,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.turn_reported = None;
             $t.acted_said = (0, 0);
             $t.sitting_out = false;
+            $t.show_by = None;
             $t.said.clear();
             $t.next_hand_at = None;
             $t.deal_at = None;
@@ -2415,6 +2474,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         // tables, read before the select so the timers own their instants
         // and borrow no table while the group's messages are awaited.
         let act_deadline = earliest(&tables, |x| x.act_by);
+        let show_deadline = earliest(&tables, |x| x.show_by);
         let deal_deadline = earliest(&tables, |x| x.next_hand_at);
         tokio::select! {
             event = SwarmStreamExt::select_next_some(&mut swarm) => {
@@ -5106,6 +5166,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     arm_boundary!(t, end.pause());
                                 }
                                 t.act_by = hurry(report.clock.apply(t.act_by, h.action_deadline()), autoplay, t.sitting_out);
+                                showdown_hold!(t, h);
                             }
                             // The player's own engine refused it, which means
                             // the window offered something it should not have.
@@ -5121,6 +5182,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
 
                     NodeCommand::SitBack => {
                         sit_back!(t);
+                    }
+
+                    NodeCommand::SetAutoMuck(on) => {
+                        auto_muck = on;
+                    }
+
+                    NodeCommand::ShowCards => {
+                        let Some(h) = t.hand.as_mut() else {
+                            continue;
+                        };
+                        let now = super::node::now_unix_ms();
+                        match h.show_held(&app_key, now) {
+                            Ok(sends) => {
+                                if !sends.is_empty() {
+                                    publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                                    let _ = events
+                                        .send(NodeEvent::Warning("showdown: your hand is shown, as you asked (D-050)".into()))
+                                        .await;
+                                }
+                                hand_may_have_ended!(t, h);
+                            }
+                            Err(e) => {
+                                let _ = events.send(NodeEvent::Warning(format!("showing the hand: {e}"))).await;
+                            }
+                        }
                     }
 
                     NodeCommand::LeaveTable => {
@@ -7093,6 +7179,41 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // `D-050`: the player did not show the waiting hand in time: it mucks.
+            () = tokio::time::sleep_until(
+                show_deadline.map(|d| d.1).unwrap_or_else(tokio::time::Instant::now)
+            ), if show_deadline.is_some() => {
+                let which = show_deadline.map(|d| d.0).unwrap_or(active);
+                let t = &mut tables[which];
+                mark_table(&events, &mut marked, t).await;
+                let Some(h) = t.hand.as_mut() else {
+                    t.show_by = None;
+                    continue;
+                };
+                let now = super::node::now_unix_ms();
+                let show = std::mem::take(&mut t.show_at_expiry);
+                let said = if show { h.show_held(&app_key, now) } else { h.muck_held_now(&app_key, now) };
+                match said {
+                    Ok(sends) => {
+                        if !sends.is_empty() {
+                            publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "hand #{}: showdown: {} (D-050)",
+                                    h.hand_id(),
+                                    if show { "this hand is shown, as the player asked" } else { "nobody showed this hand in time: it is mucked" }
+                                )))
+                                .await;
+                        }
+                        hand_may_have_ended!(t, h);
+                    }
+                    Err(e) => {
+                        t.show_by = None;
+                        let _ = events.send(NodeEvent::Warning(format!("mucking the hand: {e}"))).await;
+                    }
+                }
+            }
+
             // This client's own clock ran out on its own turn.
             () = tokio::time::sleep_until(
                 act_deadline.map(|d| d.1).unwrap_or_else(tokio::time::Instant::now)
@@ -7167,6 +7288,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             arm_boundary!(t, end.pause());
                         }
                         t.act_by = hurry(report.clock.apply(t.act_by, h.action_deadline()), autoplay, t.sitting_out);
+                        showdown_hold!(t, h);
                     }
                     Err(e) => {
                         let _ = events
@@ -9300,6 +9422,22 @@ fn afk_now() -> bool {
         }
         _ => false,
     }
+}
+
+/// fault-harness: `P2P_POKER_HOLD_MUCK=show|muck` holds a hand that may muck at
+/// the showdown even on an autoplay run, and then shows it at once (`show`) or
+/// lets the player's window run out (`muck`); `None` without it and in every
+/// build without the feature (`D-050`).
+fn hold_muck_knob() -> Option<bool> {
+    if !cfg!(feature = "fault-harness") {
+        return None;
+    }
+    static KNOB: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *KNOB.get_or_init(|| match std::env::var("P2P_POKER_HOLD_MUCK").ok().as_deref().map(str::trim) {
+        Some("show") => Some(true),
+        Some("muck") => Some(false),
+        _ => None,
+    })
 }
 
 /// fault-harness: whether `P2P_POKER_BACK_AT` names a second this loop has

@@ -180,6 +180,11 @@ impl AppState {
             log: self.table_log.iter().cloned().collect(),
             winning_hand: winning_hand(hand, hero, self.strength.as_ref()),
             hero_sitting_out: self.sitting_out,
+            // `D-050`: the time left to show the waiting hand.
+            show_cards_in_ms: self
+                .show_choice
+                .filter(|(id, _)| hand.is_some_and(|h| h.hand_id == *id))
+                .map(|(_, until)| u64::try_from(until.saturating_duration_since(std::time::Instant::now()).as_millis()).unwrap_or(u64::MAX)),
             // The window about it waits: the deciding hand is looked at first.
             finished: self.finished.map(|(f, at)| crate::gui::table::Finish {
                 show_in_ms: f.show_in_ms.saturating_sub(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)),
@@ -807,6 +812,23 @@ mod tests {
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 2_500, 500], shown: vec![None; 3] });
         assert_eq!(s.table_view().finished, None);
+    }
+
+    /// `D-050`: the showdown's wait for this player reaches the window, and
+    /// goes with the word or with the next hand.
+    #[test]
+    fn the_showdown_choice_reaches_the_window() {
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 3, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        assert_eq!(s.table_view().show_cards_in_ms, None);
+        s.apply(NodeEvent::ShowdownChoice { hand_id: 3, open_ms: Some(7_000) });
+        let left = s.table_view().show_cards_in_ms.expect("the button is offered");
+        assert!(left > 6_000 && left <= 7_000, "{left}");
+        s.apply(NodeEvent::ShowdownChoice { hand_id: 3, open_ms: None });
+        assert_eq!(s.table_view().show_cards_in_ms, None, "the word is said");
+        s.apply(NodeEvent::ShowdownChoice { hand_id: 3, open_ms: Some(7_000) });
+        s.apply(NodeEvent::HandBegan { hand_id: 4, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        assert_eq!(s.table_view().show_cards_in_ms, None, "a new hand waits for nothing of the last");
     }
 
     #[test]

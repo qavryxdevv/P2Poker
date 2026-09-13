@@ -371,6 +371,18 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &TableView, state: &mut TableUi
     } else {
         word.to_owned()
     };
+    // `D-050`: at a showdown where this hand may muck, the three buttons give
+    // way to the one that shows it, with the time left.
+    if let Some(ms) = view.show_cards_in_ms {
+        let r = ui.interact(actions, ui.id().with("show-cards"), egui::Sense::click());
+        let label = format!("Show cards\n{} s", ms.div_ceil(1_000));
+        style::action_button(&p, actions, ButtonLook::Raise, &label, 16.0, 1.0, r.hovered(), r.is_pointer_button_down_on(), true, false);
+        if r.on_hover_text("Show your cards instead of mucking them").clicked() {
+            action = Some(TableAction::ShowCards);
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        return action;
+    }
     // `D-049`: sitting out, the three buttons give way to the one that ends it.
     if view.hero_sitting_out {
         let r = ui.interact(actions, ui.id().with("im-back"), egui::Sense::click());

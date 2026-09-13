@@ -32,6 +32,10 @@ The per-file sources below are PokerTH's own words, from its
 `allin.wav`, `bet.wav` and `raise.wav` are the same file in PokerTH, byte for
 byte, and stay three files here so the names match PokerTH's.
 
+**Not PokerTH's:** `assets/sounds/muck.wav`, outside this directory. PokerTH has
+no muck and no sound for one; this project generates it from a fixed seed with
+`tools/make-muck-sound.py` (D-050), under the client's own licence.
+
 ## What the code takes
 
 Not only files. These modules port PokerTH's QML client and carry its values:

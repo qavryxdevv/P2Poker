@@ -49,6 +49,9 @@ pub enum Cue {
     PlayerConnected,
     OnlineGameReady,
     LobbyChatNotify,
+    /// `D-050`: a hand mucked at a showdown -- this client's own sound, as
+    /// PokerTH has no muck (`assets/sounds/muck.wav`, `tools/make-muck-sound.py`).
+    Muck,
 }
 
 /// Which of PokerTH's switches a sound is under (`SoundSettings.qml`).
@@ -67,7 +70,7 @@ pub enum Category {
 }
 
 impl Cue {
-    pub const ALL: [Cue; 14] = [
+    pub const ALL: [Cue; 15] = [
         Cue::Fold,
         Cue::Check,
         Cue::Call,
@@ -82,11 +85,12 @@ impl Cue {
         Cue::PlayerConnected,
         Cue::OnlineGameReady,
         Cue::LobbyChatNotify,
+        Cue::Muck,
     ];
 
     pub fn category(self) -> Category {
         match self {
-            Cue::Fold | Cue::Check | Cue::Call | Cue::Bet | Cue::Raise | Cue::AllIn | Cue::DealTwoCards => {
+            Cue::Fold | Cue::Check | Cue::Call | Cue::Bet | Cue::Raise | Cue::AllIn | Cue::DealTwoCards | Cue::Muck => {
                 Category::GameActions
             }
             Cue::YourTurn => Category::Always,
@@ -113,6 +117,7 @@ impl Cue {
             Cue::PlayerConnected => "playerconnected",
             Cue::OnlineGameReady => "onlinegameready",
             Cue::LobbyChatNotify => "lobbychatnotify",
+            Cue::Muck => "muck",
         }
     }
 
@@ -133,6 +138,7 @@ impl Cue {
             Cue::PlayerConnected => include_bytes!("../assets/pokerth/sounds/playerconnected.wav"),
             Cue::OnlineGameReady => include_bytes!("../assets/pokerth/sounds/onlinegameready.wav"),
             Cue::LobbyChatNotify => include_bytes!("../assets/pokerth/sounds/lobbychatnotify.wav"),
+            Cue::Muck => include_bytes!("../assets/sounds/muck.wav"),
         }
     }
 
