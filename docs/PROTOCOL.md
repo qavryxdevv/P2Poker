@@ -6585,7 +6585,7 @@ That is the whole of the improvement, and it does not make the lobby private.
 
 **This paragraph named `LOBBY_INFOHASH` and "roughly 100 arbitrary internet hosts
 per announce cycle" until 2026-09-02.** Both were Mainline's, measured against a
-mechanism `c7e6317` deleted, and no counterpart figure has been measured for
+mechanism `56b0b50` deleted, and no counterpart figure has been measured for
 Kademlia — how many distinct nodes one `get_providers` walk contacts is
 `NETWORK_STACK.md` §3.5's first `[UNMEASURED]`. It is left unquantified rather
 than re-quoted at a number that is no longer about anything. That is a
@@ -8071,7 +8071,7 @@ RELAY_NAMESPACE_KEY             = 1220245eebd20d2cd4c81b5d4ac27c73746279f436d62f
   **These four lines were wrong until 2026-09-02 and this is the one place in
   the corpus where being wrong is fatal to interoperability.** They still named
   `"p2p-poker/mainline-lobby/v1"` and a 20-byte BitTorrent infohash,
-  `fd7c0d69…`, four days after `c7e6317` moved discovery to a libp2p Kademlia
+  `fd7c0d69…`, four days after `56b0b50` moved discovery to a libp2p Kademlia
   provider record and deleted the `mainline` crate. So `PROTOCOL.md` §13 and
   `NETWORK_STACK.md` §3.2 gave one name two values, which is exactly what
   `NETWORK_STACK.md` §14's *"no value has two names anywhere in the corpus"* is

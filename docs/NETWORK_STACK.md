@@ -4,7 +4,7 @@ Specification of the transport and discovery layer of `p2p-poker`.
 
 > ## ⚠ The discovery layer this document specifies is not the one the client runs
 >
-> **Measured 2026-08-31.** `c7e6317` (2026-08-30) replaced Mainline DHT discovery
+> **Measured 2026-08-31.** `56b0b50` (2026-08-30) replaced Mainline DHT discovery
 > with a **libp2p Kademlia provider record**, and removed the `mainline` crate,
 > `src/net/dht.rs` and both infohashes from the build. This document was not
 > rewritten.
@@ -1000,7 +1000,7 @@ which may read them as hints and never as state (§1.2 prohibitions 3 and 8).
 ## 3. The lobby rendezvous
 
 > **Rewritten 2026-09-02 to the mechanism the client runs.** §§3.1–3.4 specified
-> a 20-byte BitTorrent infohash and a Mainline announce; `c7e6317` replaced that
+> a 20-byte BitTorrent infohash and a Mainline announce; `56b0b50` replaced that
 > with a libp2p Kademlia **provider record** and deleted both infohashes from the
 > build. §3.5 below is **not** rewritten and is still Mainline's — see its own
 > note. The rest of this document's Mainline sections are listed in the warning
@@ -1283,7 +1283,7 @@ in this document assumes it works.
 
 > **Rewritten 2026-09-02, and it was the largest stale block in the file.**
 > §§4.2–4.4 specified a `get_peers` → `SocketAddrV4` → synthesised-multiaddr
-> path built on the `mainline` crate, which `c7e6317` deleted. There is no such
+> path built on the `mainline` crate, which `56b0b50` deleted. There is no such
 > path in the client and there is no such crate. This is the section a second
 > implementer would have followed line by line, and the head warning's own
 > reading list did not mention it. `S1-E`.
@@ -1527,7 +1527,7 @@ application signature.
 `libp2p-mdns 0.48.0`, `libp2p-request-response 0.29.0`,
 `libp2p-connection-limits 0.6.0`, `libp2p-allow-block-list 0.6.0`.
 Plus `libp2p-stream = "0.4.0-alpha"` (not re-exported by the umbrella) and
-~~`mainline = "=8.0.0"`~~ — **removed in `c7e6317`**; discovery is `libp2p-kad`, and its version is whatever `libp2p` resolves to (`0.48.0` at the time of writing, per `Cargo.lock`).
+~~`mainline = "=8.0.0"`~~ — **removed in `56b0b50`**; discovery is `libp2p-kad`, and its version is whatever `libp2p` resolves to (`0.48.0` at the time of writing, per `Cargo.lock`).
 
 **Never depend on `libp2p-identity`, `libp2p-core`, `libp2p-swarm`, `multiaddr` or
 `futures` directly.** `libp2p-identity 0.3.0` exists and is outside the umbrella's
@@ -1572,7 +1572,7 @@ and therefore subject to exactly the drift that `PHASE0_REVIEW.md` B-3 found.
 | `libp2p-mdns` `0.48.0`, `libp2p-upnp` `0.5.0` | — | LAN discovery (§9.8), IGD mapping (§9.9) | as above | MIT | as above |
 | `libp2p-connection-limits` `0.6.0`, `libp2p-memory-connection-limits` `0.5.0`, `libp2p-allow-block-list` `0.6.0` | — | resource limits, and the **user-populated** block list of §11.5 — never populated by a protocol proof (§0.1) | as above | MIT | as above |
 | **`libp2p-stream`** | **`0.4.0-alpha`** | per-table streams (§8.1) | as above | MIT | **unaudited and semver-exempt.** An alpha crate carries no stability guarantee; contained behind the §1.3 trait so replacing it is a one-file change |
-| ~~`mainline`~~ | ~~`=8.0.0`~~ | **Removed in `c7e6317`.** The row is kept because the reason for the `=` pin is worth keeping: §11.4 depended on crate internals (`RequestFilter`, adaptive server mode) that are not semver-stable. `libp2p-kad` replaces it and this client pins none of its internals — the one thing §11.4 now depends on, `set_mode`, is public API. | — | — | — |
+| ~~`mainline`~~ | ~~`=8.0.0`~~ | **Removed in `56b0b50`.** The row is kept because the reason for the `=` pin is worth keeping: §11.4 depended on crate internals (`RequestFilter`, adaptive server mode) that are not semver-stable. `libp2p-kad` replaces it and this client pins none of its internals — the one thing §11.4 now depends on, `set_mode`, is public API. | — | — | — |
 | `web-time` | `1` | `Instant` in the `RateLimiter` signature (§9.6) | `github.com/daxpedda/web-time` | MIT OR Apache-2.0 | no advisory in the local advisory database |
 
 The two entries a reader must not skip are **`libp2p-stream 0.4.0-alpha`** here
@@ -1601,7 +1601,7 @@ libp2p = { version = "0.56.0", features = [
     "ed25519", "serde",
 ] }
 libp2p-stream = "0.4.0-alpha"
-# mainline = { version = "=8.0.0", … }   <- removed in c7e6317; see 5.7
+# mainline = { version = "=8.0.0", … }   <- removed in 56b0b50; see 5.7
 ```
 
 `kad` is **not** enabled in v1 — see §5.7.
@@ -1626,7 +1626,7 @@ TCP stays in the build for three structural reasons, not as a preference:
    `could not find yamux in libp2p … found an item that was configured out`.
 3. Peers learned from the DHT or from a relay may be listening only on TCP.
 
-~~Note honestly: TCP does not rescue discovery, because the Mainline DHT is UDP.~~ **That stopped being true in `c7e6317`.** Kademlia is a behaviour on this same swarm, so it rides QUIC *and* TCP: a UDP-blocked network now keeps its discovery as well as its transport. What TCP does not rescue is *playing* against another unreachable peer, which needs §9.
+~~Note honestly: TCP does not rescue discovery, because the Mainline DHT is UDP.~~ **That stopped being true in `56b0b50`.** Kademlia is a behaviour on this same swarm, so it rides QUIC *and* TCP: a UDP-blocked network now keeps its discovery as well as its transport. What TCP does not rescue is *playing* against another unreachable peer, which needs §9.
 On a UDP-blocked network the client cannot discover anybody at all (§12).
 
 > Verification: [RESEARCH+COMPILED] `LIBP2P.md` §9 (both the failing and passing
@@ -1746,7 +1746,7 @@ measured being advertised, dialled, and burning a full handshake timeout
 **This section said the opposite until 2026-09-02, and it was the most misleading
 sentence in the file.** It read *"libp2p Kademlia is not enabled in v1"* and gave
 three reasons — `SPEC_CS.md` §1 names Mainline, a second DHT is a second eclipse
-surface, and it has no mandated role. `c7e6317` removed the `mainline` crate and
+surface, and it has no mandated role. `56b0b50` removed the `mainline` crate and
 put discovery on `kad`; `Cargo.toml` enables the feature and `net::swarm` builds
 **two** `kad::Behaviour`s. An implementer reading the old text would have built a
 client that cannot find ours and would have had a documented reason for it.
@@ -1779,7 +1779,7 @@ player behind a NAT has none worth announcing, so the discovery mechanism
 conclusion outlived it by two days.** It read: *"`mainline`'s `KrpcSocket::new`
 does `unimplemented!("KrpcSocket does not support Ipv6")` … so the libp2p layer
 may be dual-stack, but discovery is IPv4-only."* That crate was deleted in
-`c7e6317`. libp2p's QUIC and TCP transports are both dual-stack, and Kademlia
+`56b0b50`. libp2p's QUIC and TCP transports are both dual-stack, and Kademlia
 now rides them, so nothing about discovery is IPv4-only any more.
 
 **But the client was, and for a different reason nobody had written down.**
@@ -3050,7 +3050,7 @@ backpressure ladder answers it as a rate fact.
 
 ### 11.4 Kademlia limits — and the one that decides whether a lobby stays findable
 
-**This section used to bound a Mainline announce. `c7e6317` replaced it with a
+**This section used to bound a Mainline announce. `56b0b50` replaced it with a
 libp2p Kademlia provider record (§3), and the limits below are that crate's.**
 The version is the one in `Cargo.lock`, `libp2p-kad 0.48.0`, read in the
 registry rather than on docs.rs — which matters here, because two of its own doc
@@ -3441,7 +3441,7 @@ network.
 | **OQ-1** | **Re-aimed 2026-09-02.** The ~45 min figure and the 10-minute re-announce are both gone with Mainline. The open question is now: **what provider-record TTL do the go-libp2p nodes that actually store our record apply?** `libp2p-kad 0.48.0`'s own default is 48 h, but the storing node stamps expiry from *its* config, and the Amino DHT is overwhelmingly go-libp2p. The operative number is unknown and bounds both §10.1 and §3.5's disclosure. Do not quote 48 h as measured. | §10.1, §3.5 | 8 |
 | **OQ-2** | Adopt an epoch-rotating **namespace** for privacy? The same trade as the epoch-rotating infohash was — cross-version compatibility, a midnight rotation race, no help against a live observer — **plus one new cost this mechanism adds**: with a 48 h record TTL the previous day's key stays populated for two more days, so rotation blunts a historical crawl far less than it looks. Still **not** adopted. | §3.5 | later |
 | **OQ-3** | ~~Does the one-port rule hold, and does QUIC-then-TCP fallback on a single DHT hint behave?~~ **Closed by the change of mechanism, not by an answer.** A provider record carries every address the swarm holds, so there is no single hint to fall back from and no port to reconcile. The same numeric port is still bound on QUIC, TCP and now IPv6, but for a human writing one router rule rather than for discovery (§4.4). | §4.4 | — |
-| **OQ-4** | ~~Ship libp2p Kademlia after all?~~ **Answered by `c7e6317`: it is shipped, and it is the only discovery mechanism.** The cost this question named — a second eclipse surface — was accepted rather than avoided, and the reason is in §5.7: a Mainline announce carries one `IP:port`, so the mechanism `SPEC_CS.md` §1 names cannot make a NATed player findable at all. | §5.7 | — |
+| **OQ-4** | ~~Ship libp2p Kademlia after all?~~ **Answered by `56b0b50`: it is shipped, and it is the only discovery mechanism.** The cost this question named — a second eclipse surface — was accepted rather than avoided, and the reason is in §5.7: a Mainline announce carries one `IP:port`, so the mechanism `SPEC_CS.md` §1 names cannot make a NATed player findable at all. | §5.7 | — |
 | **OQ-5** | `TopicScoreParams` values for both lobby topics. Defaults leave the per-topic terms — including the invalid-message penalty a `Reject` feeds — at zero. Requires measured message rates and mesh sizes; badly tuned scoring graylists honest peers. | §6.7 | 8 |
 | **OQ-6** | How often does the relay admission race actually deny an honest peer (reservation request arriving before `identify` completes)? A denial closes the circuit listener with no automatic retry, so our own `listen_on` backoff must cover it. | §9.6 | 7 |
 | **OQ-7** | What is the real per-hand byte count over **one** relayed circuit **counting both directions together**, measured against the `Limit` a real relay actually returns? `max_circuit_bytes` is a single bidirectional counter per circuit (§16.1), so a measurement that records one direction and doubles the headroom is wrong by a factor of two — measure the sum, and compare it against `Limit::data_in_bytes()`, which is the same bidirectional figure. The estimate is `2 × 8 979 = 17 958 B` of shuffle plus the signed event stream, order ~20 KB per hand per circuit, against a 131 072 B public-relay budget — roughly five to seven hands, so the binding public-relay limit is still the 120 s `max_circuit_duration` and not the byte cap (§9.5). The measurement is what gives the "refuse to seat rather than start a hand that will drop" rule a number. | §9.5 | 5 → 8 |

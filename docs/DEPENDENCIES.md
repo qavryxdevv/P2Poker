@@ -283,7 +283,7 @@ both `dns` and `kad` — is on `DECISIONS.md`'s open list with its cost stated.
 ### 3.3 `lru 0.16.4` — RUSTSEC-2026-0253, unsound. **Spent: the crate left the build.**
 
 > **Corrected 2026-08-31.** `lru` is not in `Cargo.lock` and neither is `mainline`,
-> the dependency that brought it. `c7e6317` — *"Discovery is libp2p's now, and
+> the dependency that brought it. `56b0b50` — *"Discovery is libp2p's now, and
 > BitTorrent is out of the binary"* — removed the crate; this section, §3.7, §4's
 > table row and §5.8 were not told, so an accepted unsoundness stood in the register
 > for a crate that is not there. **An accepted advisory is a decision a reader
@@ -322,7 +322,7 @@ is why §8 lists "a pinned crate moves" as a re-audit trigger. What actually end
 was neither an upgrade nor a re-audit — the dependency was removed for an unrelated
 reason, and the register kept the acceptance. **That is the failure this section is
 now an example of**, and it is why §8 gains "a crate leaves the build" as a trigger
-of its own. The gap was one day — `c7e6317` on 2026-08-30, this correction on
+of its own. The gap was one day — `56b0b50` on 2026-08-30, this correction on
 2026-08-31 — which is the argument for the trigger rather than against it: a
 register that is wrong within a day of a routine commit is wrong by default, and
 only a check that runs makes it right by default.
@@ -441,7 +441,7 @@ warning: 1 allowed warning found
 
 **One row left the set and it is the one this pass was looking for.** `lru 0.16.4`
 / RUSTSEC-2026-0253 is gone, because `lru` is gone: it arrived under `mainline`, and
-`c7e6317` took BitTorrent out of the binary. §3.3 had kept it as an **accepted**
+`56b0b50` took BitTorrent out of the binary. §3.3 had kept it as an **accepted**
 unsoundness ever since. The allowed-warning count moved with it, 2 to 1, and that is
 the number CI gates on.
 
@@ -531,7 +531,7 @@ audited, and it does not mean reviewed by us.
 
 > **Re-run 2026-08-31, and it does not hold: 7 of the 122 rows name a crate that is
 > not in `Cargo.lock`.** `serde_bencode` and `serde_bytes` in §5.7, and five of
-> §5.8's six. They left with `mainline` in `c7e6317`, and the register was not
+> §5.8's six. They left with `mainline` in `56b0b50`, and the register was not
 > told. The pass below is kept because its *method* is the right one, and because
 > deleting a verification claim that turned out false is how the next one gets
 > believed too easily - but read it as a record of a run, not as the state of this
@@ -771,7 +771,7 @@ fuzzed; none of them has been fuzzed by us.
 > `mainline`, `lru`, `sha1_smol`, `crc` and `flume`. `futures-lite` is still in the
 > lockfile but arrives by another road entirely — `async-io` under `if-watch`, which
 > `libp2p-mdns`, `libp2p-quic` and `libp2p-tcp` pull on non-Windows targets — and it
-> is **not in the host build** that §1 measures, so it is not re-registered here. `c7e6317` — *"Discovery is libp2p's now, and BitTorrent is
+> is **not in the host build** that §1 measures, so it is not re-registered here. `56b0b50` — *"Discovery is libp2p's now, and BitTorrent is
 > out of the binary"* — removed the group; this section, §3.3, §3.7, §4's table and
 > §5.7's two bencode rows all kept describing it as current, and §3.3 kept an
 > **accepted security advisory** alive for a crate that is not there.
@@ -1013,7 +1013,7 @@ fires and the checklist in §8.2 runs.
 6. **Toolchain change.** A new stable rustc can change what resolves and what
    compiles; §3.6 is an existing example of a crate that a compiler version decides.
 7. **A crate leaves the build.** The one this list did not have, added 2026-08-31
-   after it fired unnoticed. `c7e6317` removed `mainline`, and with it `lru` — and
+   after it fired unnoticed. `56b0b50` removed `mainline`, and with it `lru` — and
    §3.3 went on carrying `lru`'s unsoundness as **accepted with justification**,
    §3.7 went on stating a hard constraint on a deleted module, §4's table went on
    listing the advisory as compiled, and §5.8 went on registering six crates. Every

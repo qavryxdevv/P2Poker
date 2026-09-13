@@ -312,7 +312,7 @@ fn namespace(ns: &[u8]) -> libp2p::kad::RecordKey {
 /// its whole life.** `NETWORK_STACK.md` §5.8 said discovery was IPv4-only and
 /// gave the reason: the `mainline` crate's socket did
 /// `unimplemented!("KrpcSocket does not support Ipv6")`. That crate was deleted
-/// in `c7e6317` and the reason went with it — libp2p's QUIC and TCP transports
+/// in `56b0b50` and the reason went with it — libp2p's QUIC and TCP transports
 /// are both dual-stack — but the four IPv4 literals stayed, so the conclusion
 /// survived its own premise. A player on an IPv6-only network could not be
 /// reached by anybody, and neither could a player whose ISP gives out CGNAT on

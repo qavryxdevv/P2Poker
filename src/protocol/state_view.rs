@@ -258,7 +258,7 @@ mod tests {
         //
         // **It said twenty-nine until 2026-09-07 and asserted twenty-eight.**
         // `signed_this_hand` was field 28 and was deleted on 2026-09-04
-        // (041c39e); the assertion followed FIELD_COUNT and the name and the
+        // (76040e9); the assertion followed FIELD_COUNT and the name and the
         // comment did not. A test whose name states a different number from
         // the one it checks is a test a reader has to distrust, and this file
         // is where somebody counting fields would look first.

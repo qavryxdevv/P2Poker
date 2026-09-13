@@ -2036,7 +2036,7 @@ this project registers are actually in `Cargo.lock`?**
 
 Seven are not.
 
-`c7e6317` — *"Discovery is libp2p's now, and BitTorrent is out of the binary"* —
+`56b0b50` — *"Discovery is libp2p's now, and BitTorrent is out of the binary"* —
 removed `mainline` and everything under it. `DEPENDENCIES.md` was not told, and
 five of its sections went on describing the removed group as current:
 
@@ -2058,7 +2058,7 @@ was true when it was written.** §5 carries a blockquote dated **2026-08-28**:
 > Every `name`+`version` in every §5 table was matched against a `[[package]]`
 > entry in `Cargo.lock` ... **All 122 rows matched; nothing had drifted.**
 
-`c7e6317` landed on **2026-08-30**. Running the same check on **2026-08-31**:
+`56b0b50` landed on **2026-08-30**. Running the same check on **2026-08-31**:
 **7 of 122 do not match.**
 
 **The gap is one day, and that is the part worth keeping.** This is not an old
@@ -2155,7 +2155,7 @@ was missing. There was a second one, and the second one was the one that ran.
 The register above was stale because a crate left. The crate left because the
 **mechanism** changed. The document that specifies the mechanism was never told.
 
-`c7e6317` replaced Mainline DHT discovery with a libp2p Kademlia provider record.
+`56b0b50` replaced Mainline DHT discovery with a libp2p Kademlia provider record.
 **33 sections of `NETWORK_STACK.md` still specify Mainline.** The phrase *provider
 record* appears in that file once.
 
@@ -2275,7 +2275,7 @@ transport is behind"*.
 ### What it cost, measured against itself
 
 Nine seats, same machine, quiet, 300 s, same harness. **The only difference is
-the binary** — the pre-fix one built from `14f3bb0` in a throwaway worktree:
+the binary** — the pre-fix one built from `69964a9` in a throwaway worktree:
 
 | | founder's hands | seats on a genesis the founder never had | s / hand |
 |---|---|---|---|
@@ -3256,7 +3256,7 @@ turbulent point of a run, and neither has recurred in the five runs since.
   met".
 
   Packaging this found four defects, all in the script and none in the
-  protocol, recorded in ee4b269 because each is the kind that reads as a
+  protocol, recorded in f2ad132 because each is the kind that reads as a
   protocol failure: reachability probed by ping against a host that drops ping
   and permits 22; the far node started under `Start-Process
   -RedirectStandardOutput`, which over ssh captures nothing and looks like a

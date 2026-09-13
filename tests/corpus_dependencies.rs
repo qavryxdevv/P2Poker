@@ -7,7 +7,7 @@
 //! against a `[[package]]` entry in `Cargo.lock` and **all 122 rows matched**.
 //! Running that check found **seven** that did not: `mainline` and four crates
 //! under it, plus the two bencode parsers that decoded its packets. They had
-//! left in `c7e6317` — *"Discovery is libp2p's now, and BitTorrent is out of
+//! left in `56b0b50` — *"Discovery is libp2p's now, and BitTorrent is out of
 //! the binary"* — and nothing in the document was told.
 //!
 //! That is not a cosmetic staleness. §3.3 carried `lru 0.16.4`'s RUSTSEC

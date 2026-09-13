@@ -2,7 +2,7 @@
 """Read one -MuteOnTurn run for S1-BM's return certificate (D-028).
 
 The prediction booked before the first such run (2026-09-10, split after
-commit 0d31932):
+commit c92cb61):
 
   1. the muted node is certified out at the action it went quiet on -- a
      TIMEOUT_CERT names its SEAT, and every node opens the next hand without
@@ -23,7 +23,7 @@ others (a fork through IN(k)); a certificate that completes at some nodes and
 not at others without a "held" line explaining it; a return at a boundary any
 node ended by an abort.
 
-The prediction booked for the first S1-CR run (2026-09-10, after commit 21f2683;
+The prediction booked for the first S1-CR run (2026-09-10, after commit 9938f65;
 `tools/table-run.ps1 -Seats 3 -Seconds 300 -DropAt 60 -DropFor 20`, which
 kills n1 at 60 s and starts it again at 80 s with the same profile and
 `--resume`):

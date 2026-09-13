@@ -40,7 +40,7 @@ pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/1";
 pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/1";
 
 // **The two Mainline infohashes and their derivation strings are gone.**
-// `c7e6317` took BitTorrent out of the binary and the lobby became a libp2p
+// `56b0b50` took BitTorrent out of the binary and the lobby became a libp2p
 // Kademlia provider record; `net::run::lobby_namespace` and `relay_namespace`
 // are where a client announces now. The constants outlived the crate by some
 // months, guarded by two compile-time assertions and a test that compared them
