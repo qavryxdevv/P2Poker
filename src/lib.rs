@@ -19,6 +19,7 @@ pub mod net;
 pub mod poker;
 pub mod protocol;
 pub mod security;
+pub mod sound;
 pub mod storage;
 pub mod table;
 

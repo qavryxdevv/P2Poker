@@ -24,6 +24,7 @@ use crate::net::node::NodeEvent;
 
 /// `S1-CS`: the table window's view, derived here so it can be tested.
 mod table;
+mod tablelog;
 
 /// The window's own stale-link threshold, for the opponent question.
 fn app_link_stale_ms() -> u64 {
@@ -142,6 +143,12 @@ pub struct HandInProgress {
     pub street: Option<u16>,
     /// What each seat gained at the settlement, by seat.
     pub won: Vec<u64>,
+    /// What each seat did last this betting round, by seat: the badge beside
+    /// it. A new street clears every word but *fold* and *all in*, as PokerTH's
+    /// engine does.
+    pub acted: Vec<Option<crate::gui::table::SeatAct>>,
+    /// The blinds of this hand are in the table's log.
+    pub blinds_said: bool,
 }
 
 /// What this client may do on its own turn.
@@ -196,6 +203,8 @@ pub struct TableApp {
     pub gone: std::collections::BTreeSet<u8>,
     pub left_for_good: std::collections::BTreeSet<u8>,
     pub opponent_left: bool,
+    pub table_log: VecDeque<crate::gui::table::LogLine>,
+    pub turn_warned: u64,
 }
 
 /// Everything the client knows, in the form the panes read it.
@@ -303,6 +312,19 @@ pub struct AppState {
     /// `D-035`: the heads-up opponent quit the table on purpose; the game is
     /// over, and the one thing left to do is leave.
     pub opponent_left: bool,
+    /// The table's history, PokerTH's *Log* panel: the hand's header, the
+    /// blinds, every action, the streets, the showdown and the winners.
+    pub table_log: VecDeque<crate::gui::table::LogLine>,
+    /// The turn (`turns`) PokerTH's three-second warning was played for.
+    pub turn_warned: u64,
+    /// The sounds owed since the window last played them, in order.
+    pub sound_cues: Vec<crate::sound::Cue>,
+    /// How many games this client has sat down to since it started: PokerTH's
+    /// *Game: N*.
+    pub games: u32,
+    /// What this player keeps about other players, by key: the stars under a
+    /// name and the note behind them. Loaded by the window from the profile.
+    pub notes: crate::storage::notes::Notes,
 }
 
 impl Seat {
@@ -369,6 +391,15 @@ pub struct Seat {
     pub big_blind: u64,
     /// `S1-CS`: how long a seat has to decide, from the table's params.
     pub action_ms: u64,
+    /// Which game of this client's session this table is -- PokerTH's
+    /// *Game: N* -- counted when the table is set; 0 before.
+    pub game_no: u32,
+    /// The application key behind each seat, for the ratings and notes this
+    /// player keeps: never the name (`PROTOCOL.md` §4.3).
+    pub keys: std::collections::BTreeMap<u8, [u8; 32]>,
+    /// The small blind of the last hand and how many times it has gone up in
+    /// this game, for PokerTH's blind raise sound.
+    pub blinds_seen: (u64, u32),
 }
 
 /// `S1-CS`: a line said at the table, filed under the seat that said it.
@@ -523,6 +554,8 @@ impl AppState {
         std::mem::swap(&mut self.gone, &mut other.gone);
         std::mem::swap(&mut self.left_for_good, &mut other.left_for_good);
         std::mem::swap(&mut self.opponent_left, &mut other.opponent_left);
+        std::mem::swap(&mut self.table_log, &mut other.table_log);
+        std::mem::swap(&mut self.turn_warned, &mut other.turn_warned);
     }
 
     /// `D-043`: turn to another of this client's tables: its state becomes
@@ -697,6 +730,14 @@ impl AppState {
                 // joined between two presence messages still sees them in the
                 // list rather than only in the chat.
                 self.players.insert(who, (nickname.clone(), self.last_sweep_ms));
+                // PokerTH's *lobby chat notification*: somebody else named this
+                // player.
+                if !self.me.is_empty()
+                    && nickname != self.me
+                    && text.to_lowercase().contains(&self.me.to_lowercase())
+                {
+                    self.sound_cues.push(crate::sound::Cue::LobbyChatNotify);
+                }
                 if self.chat.len() >= MAX_CHAT_LINES {
                     self.chat.pop_front();
                 }
@@ -799,10 +840,13 @@ impl AppState {
                     pot: 0,
                     street: None,
                     won: Vec::new(),
+                    acted: Vec::new(),
+                    blinds_said: false,
                 });
                 self.strength = None;
                 self.waiting_for.clear();
                 self.certified.clear();
+                self.log_hand_began(hand_id);
                 self.note(format!("hand #{hand_id} has begun"));
             }
             NodeEvent::DeckProgress {
@@ -840,6 +884,7 @@ impl AppState {
                     }
                 }
                 self.last_stacks = stacks;
+                self.log_blinds(hand_id);
                 self.clock_for(to_act, 0);
             }
             NodeEvent::YourTurn {
@@ -899,9 +944,16 @@ impl AppState {
                     .filter_map(|i| crate::poker::state::Card::from_index(*i).ok())
                     .map(|c| c.to_string())
                     .collect();
+                let before = self
+                    .hand
+                    .as_ref()
+                    .filter(|h| h.hand_id == hand_id)
+                    .map(|h| h.board.len())
+                    .unwrap_or(0);
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
                     h.board = cards;
                 }
+                self.log_street(hand_id, before);
                 self.refresh_strength();
                 if !named.is_empty() {
                     self.log
@@ -957,6 +1009,9 @@ impl AppState {
                 }
                 self.last_stacks = stacks;
                 self.clock_for(None, 0);
+                if !restored {
+                    self.log_showdown(hand_id);
+                }
                 self.note(format!("hand #{hand_id} is over"));
             }
             NodeEvent::CardsDealt { hand_id, seats } => {
@@ -969,6 +1024,7 @@ impl AppState {
                     h.cards = Some(cards);
                 }
                 self.refresh_strength();
+                self.sound_cues.push(crate::sound::Cue::DealTwoCards);
                 self.log
                     .push_back(format!("hand #{hand_id}: your cards are dealt"));
             }
@@ -1142,8 +1198,29 @@ impl AppState {
             }
             NodeEvent::Roster { key, seats } => {
                 let n = seats.len();
-                self.table(key).roster = seats;
+                let t = self.table(key);
+                // PokerTH's *network game notification*: somebody sat down
+                // while the table fills; the table set says the rest.
+                let grew = t.session.is_none() && !t.roster.is_empty() && n > t.roster.len();
+                t.roster = seats;
+                if grew {
+                    self.sound_cues.push(crate::sound::Cue::PlayerConnected);
+                }
                 self.note(format!("{n} seated"));
+            }
+            NodeEvent::RosterKeys { key, keys } => {
+                self.table(key).keys = keys.into_iter().collect();
+            }
+            NodeEvent::SeatActed {
+                hand_id,
+                seat,
+                action,
+                put_in,
+                total,
+                all_in,
+                by_table,
+            } => {
+                self.seat_acted(hand_id, seat, action, put_in, total, all_in, by_table);
             }
             NodeEvent::TableParams {
                 key,
@@ -1170,6 +1247,14 @@ impl AppState {
                 let t = self.table(key);
                 if t.session != Some(session) {
                     t.session = Some(session);
+                    if t.game_no == 0 {
+                        self.games = self.games.saturating_add(1);
+                        let games = self.games;
+                        self.table(key).game_no = games;
+                        // PokerTH's *network game notification*: the game is
+                        // ready to start.
+                        self.sound_cues.push(crate::sound::Cue::OnlineGameReady);
+                    }
                     self.note(format!("the table is set: session {}", short(&session)));
                 }
             }
@@ -1276,6 +1361,8 @@ impl AppState {
         self.waiting_for.clear();
         self.last_stacks.clear();
         self.strength = None;
+        self.table_log.clear();
+        self.turn_warned = 0;
     }
 
     /// `S1-CX`: the other seat, when this table is heads-up and set.

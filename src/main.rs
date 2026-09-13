@@ -161,6 +161,20 @@ fn main() {
             .cloned()
     };
 
+    // `--table-preview`: the table window drawn from the sample hand, with no
+    // node, no network and no profile -- for looking at the table's look.
+    // `--preview-seats N` fills the table to N seats, `--preview-panels` opens
+    // the chat and the log, `--preview-over` settles the hand, `--preview-note`
+    // shows a table still waiting for its players, and `--preview-gone` asks
+    // the heads-up question. The rest open one window or message each:
+    // `--preview-out` (out of the game), `--preview-line` (line down),
+    // `--preview-absent` (seats off the line), `--preview-sound`,
+    // `--preview-ranking` and `--preview-player-note`.
+    if has("--table-preview") {
+        preview_table(&args);
+        return;
+    }
+
     // libp2p says a great deal through `tracing` and, without a subscriber,
     // says it to nobody. Every network question asked of this client so far has
     // been answered by adding a temporary `eprintln!` and rebuilding, which is
@@ -1025,6 +1039,8 @@ fn windowed(player: Player, run: Run) -> Started {
                 }
             );
             render::install(&cc.egui_ctx);
+            // PokerTH's Inter, at the weights the table's pieces ask for.
+            p2p_poker::gui::table::style::install_fonts(&cc.egui_ctx);
 
             // Wake the window when the node speaks, rather than asking it to
             // look. What was here was `request_repaint_after(250 ms)` at the
@@ -1075,6 +1091,8 @@ fn windowed(player: Player, run: Run) -> Started {
 
             let mut state = AppState::new();
             state.me = settings.nickname.clone();
+            // PokerTH's notes about players: local, by key.
+            state.notes = p2p_poker::storage::notes::load(&profile_dir);
             cc.egui_ctx.set_zoom_factor(settings.zoom());
             Ok(Box::new(Client {
                 state,
@@ -1085,6 +1103,7 @@ fn windowed(player: Player, run: Run) -> Started {
                 confirm_exit: None,
                 ui: render::LobbyUi::new(settings),
                 table_ui: Default::default(),
+                sound: p2p_poker::sound::Player::new(),
                 profile_dir,
                 app_key,
                 commands,
@@ -1220,6 +1239,122 @@ fn advice(draw: Draw) {
 ///
 /// A failure yields no icon rather than no client. The picture is not worth
 /// refusing to start over.
+/// `--table-preview`: the table from the sample hand, with no node.
+fn preview_table(args: &[String]) {
+    use p2p_poker::gui::table::{self as table, Facing, SeatAct, SeatView, TableView};
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let seats: u8 = args
+        .iter()
+        .position(|a| a == "--preview-seats")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6)
+        .clamp(2, 10);
+
+    let mut view = TableView::sample();
+    view.seats.truncate(usize::from(seats));
+    for n in view.seats.len() as u8..seats {
+        view.seats.push(SeatView {
+            seat: n,
+            name: format!("Player {n}"),
+            stack: 4_980,
+            cards: [Facing::Down, Facing::Down],
+            act: if n % 3 == 0 { Some(SeatAct::Call) } else { None },
+            bet: if n % 3 == 0 { 120 } else { 0 },
+            ..Default::default()
+        });
+    }
+    view.max_seats = seats;
+    if view.button >= seats {
+        view.button = seats - 1;
+    }
+    if has("--preview-over") {
+        view.hand_over = true;
+        for s in view.seats.iter_mut() {
+            s.clock = None;
+            s.bet = 0;
+            if s.seat == 0 {
+                s.won = 1_150;
+            }
+        }
+        view.can_act = false;
+        view.winning_hand = Some("two pair, kings and eights".into());
+    }
+    if has("--preview-note") {
+        view = TableView::waiting("Riverside".into(), seats);
+        view.seats = vec![SeatView { seat: 0, name: "Alice".into(), stack: 1_500, ..Default::default() }];
+        view.note = Some("waiting for players — 1 of 2".into());
+    }
+    if has("--preview-gone") {
+        view.opponent_gone_s = Some(21);
+    }
+    if has("--preview-out") {
+        view.out_for_good = Some("certified out after the fourth absence (hand 128)".into());
+    }
+    if has("--preview-line") {
+        view.line = Some("This client has heard nobody at the table for 12 s. Your seat keeps its cards; the hand goes on when the line is back".into());
+    }
+    if has("--preview-absent") {
+        view.absent = vec![
+            table::AbsentSeat { seat: 2, name: "Carol".into(), certified: false, waited: true, on_clock_s: Some(14), quiet_s: Some(9) },
+            table::AbsentSeat { seat: 4, name: "Erin".into(), certified: true, waited: false, on_clock_s: None, quiet_s: Some(31) },
+        ];
+    }
+    let mut ui_state = table::TableUi::default();
+    if has("--preview-ranking") {
+        ui_state.ranking_open = true;
+    }
+    if has("--preview-player-note") {
+        ui_state.note = Some(table::NoteDraft {
+            key: [7u8; 32],
+            name: "Carol".into(),
+            rating: 4,
+            note: "calls too wide on the river".into(),
+        });
+    }
+    if has("--preview-panels") {
+        ui_state.chat_open = true;
+        ui_state.log_open = true;
+        view.chat = vec![
+            table::TableChatLine { seat: 2, who: "Carol (seat 2)".into(), said: "nice hand".into() },
+            table::TableChatLine { seat: 0, who: "Alice (seat 0)".into(), said: "thanks, gl".into() },
+        ];
+    }
+
+    struct Preview {
+        view: TableView,
+        ui: table::TableUi,
+        settings: p2p_poker::storage::settings::Settings,
+    }
+    impl eframe::App for Preview {
+        fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+            let _ = table::draw(ui, &self.view, &mut self.ui, &self.settings);
+        }
+    }
+    let settings = p2p_poker::storage::settings::Settings::defaults(&ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]));
+    if has("--preview-sound") {
+        ui_state.settings_open = Some(settings.clone());
+    }
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1_280.0, 800.0])
+            .with_min_inner_size(table::MIN_WINDOW)
+            .with_title("p2p-poker — table preview")
+            .with_icon(window_icon()),
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+    let _ = eframe::run_native(
+        "p2p-poker-table-preview",
+        options,
+        Box::new(move |cc| {
+            render::install(&cc.egui_ctx);
+            table::style::install_fonts(&cc.egui_ctx);
+            Ok(Box::new(Preview { view, ui: ui_state, settings }))
+        }),
+    );
+}
+
 fn window_icon() -> std::sync::Arc<eframe::egui::IconData> {
     const PNG: &[u8] = include_bytes!("../assets/icon-256.png");
     let empty = || {
@@ -1277,6 +1412,8 @@ struct Client {
     ui: p2p_poker::gui::render::LobbyUi,
     /// `S1-EF`: what each table window is typing or sliding, by slot.
     table_ui: std::collections::BTreeMap<u8, p2p_poker::gui::table::TableUi>,
+    /// PokerTH's sounds, played as the app owes them.
+    sound: p2p_poker::sound::Player,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
     commands: tokio::sync::mpsc::Sender<NodeCommand>,
     bounded: Option<u64>,
@@ -1361,6 +1498,7 @@ impl Client {
 
         let view = self.state.table_view_of(slot);
         let mut table_ui = self.table_ui.remove(&slot).unwrap_or_default();
+        let settings = self.ui.settings.clone();
         let mut action = p2p_poker::gui::table::TableAction::None;
         let mut close_asked = false;
         let mut answer: Option<bool> = None;
@@ -1387,7 +1525,7 @@ impl Client {
                 eframe::egui::CentralPanel::default()
                     .frame(eframe::egui::Frame::NONE)
                     .show(ctx, |ui| {
-                        action = p2p_poker::gui::table::draw(ui, &view, &mut table_ui);
+                        action = p2p_poker::gui::table::draw(ui, &view, &mut table_ui, &settings);
                     });
                 if let Some(u) = unfinished.as_ref() {
                     answered = render::unfinished_window(ctx, u);
@@ -1431,7 +1569,10 @@ impl Client {
         if !is_active
             && !matches!(
                 action,
-                p2p_poker::gui::table::TableAction::None | p2p_poker::gui::table::TableAction::Exit
+                p2p_poker::gui::table::TableAction::None
+                    | p2p_poker::gui::table::TableAction::Exit
+                    | p2p_poker::gui::table::TableAction::SaveSettings(_)
+                    | p2p_poker::gui::table::TableAction::SaveNote { .. }
             )
         {
             self.turn_to(slot);
@@ -1486,6 +1627,19 @@ impl Client {
                 self.table_closed = true;
                 None
             }
+            // PokerTH's sound settings, changed at the table's gear.
+            Ta::SaveSettings(settings) => {
+                self.save_settings(ctx, settings);
+                None
+            }
+            // PokerTH's note about a player: kept locally, by key.
+            Ta::SaveNote { key, rating, note } => {
+                self.state.notes.set(key, rating, &note);
+                if let Err(e) = p2p_poker::storage::notes::save(&self.profile_dir, &self.state.notes) {
+                    self.state.log.push_back(format!("the note did not save: {e}"));
+                }
+                None
+            }
             Ta::None | Ta::Exit => None,
         };
         if let Some(a) = played {
@@ -1515,6 +1669,35 @@ impl Client {
     fn forget_unfinished(&mut self) {
         self.state.forget_unfinished();
         self.tell(NodeCommand::ForgetSession);
+    }
+
+    /// Save the settings the player changed -- in the lobby's dialog or at the
+    /// table's gear -- apply them, and say whether they were saved.
+    fn save_settings(&mut self, ctx: &eframe::egui::Context, mut settings: p2p_poker::storage::settings::Settings) {
+        settings.repair(&self.app_key);
+        ctx.set_zoom_factor(settings.zoom());
+        if self.state.me != settings.nickname {
+            self.state.me = settings.nickname.clone();
+            self.tell(NodeCommand::SetNickname(settings.nickname.clone()));
+        }
+        // Saved to disk, and said either way. A setting that silently did not
+        // persist is one the player changes again next time and blames the
+        // client for.
+        match p2p_poker::storage::settings::save(&self.profile_dir, &settings, &self.app_key) {
+            Ok(()) => self.state.log.push_back("settings saved".into()),
+            Err(e) => self.state.log.push_back(format!("the settings did not save: {e}")),
+        }
+        self.ui.settings = settings;
+    }
+
+    /// PokerTH's sounds the app owes, under the player's switches.
+    fn play_sounds(&mut self) {
+        let switches = self.ui.settings.sound();
+        for cue in self.state.take_sound_cues() {
+            if switches.allows(cue) {
+                self.sound.play(cue, switches.volume);
+            }
+        }
     }
 
     fn tell(&mut self, command: NodeCommand) {
@@ -1550,6 +1733,9 @@ impl eframe::App for Client {
         self.state.tick_join();
         // `S1-CX`: an unreachable heads-up opponent is said once it is worth saying.
         self.state.tick_opponent();
+        // PokerTH's turn warning, and every sound owed since the last frame.
+        self.state.tick_turn_warning();
+        self.play_sounds();
         // `--resume` in the window: the question is answered *rejoin* once.
         if self.resume && self.state.unfinished.is_some() {
             self.resume = false;
@@ -1666,26 +1852,8 @@ impl eframe::App for Client {
                     render::LobbyAction::Resume => self.rejoin_unfinished(),
                     render::LobbyAction::Forget => self.forget_unfinished(),
                     render::LobbyAction::Say(text) => self.tell(NodeCommand::SayInLobby(text)),
-                    render::LobbyAction::Save(mut settings) => {
-                        settings.repair(&self.app_key);
-                        ctx.set_zoom_factor(settings.zoom());
-                        self.state.me = settings.nickname.clone();
-                        self.tell(NodeCommand::SetNickname(settings.nickname.clone()));
-                        // Saved to disk, and said either way. A setting that
-                        // silently did not persist is one the player changes
-                        // again next time and blames the client for.
-                        match p2p_poker::storage::settings::save(
-                            &self.profile_dir,
-                            &settings,
-                            &self.app_key,
-                        ) {
-                            Ok(()) => self.state.log.push_back("settings saved".into()),
-                            Err(e) => self
-                                .state
-                                .log
-                                .push_back(format!("the settings did not save: {e}")),
-                        }
-                        self.ui.settings = settings;
+                    render::LobbyAction::Save(settings) => {
+                        self.save_settings(&ctx, settings);
                     }
                 }
             }

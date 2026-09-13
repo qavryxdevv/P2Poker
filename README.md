@@ -205,6 +205,12 @@ makes this whole client that. `DECISIONS.md`'s D-019 records the trade under
 foreclosed, and the open item *"the project licence has never been chosen"* is
 closed by a transport decision rather than by a licensing one.
 
+The table window's look, its sounds, icons and font come from PokerTH, which is
+AGPL-3.0-or-later; GPLv3 section 13 permits the combination, and AGPLv3 section
+13's requirement about users interacting over a network applies to it as such.
+[`assets/pokerth/PROVENANCE.md`](assets/pokerth/PROVENANCE.md) names every file,
+its source and its terms.
+
 The released binary always carries Tox, so the licence is unconditional.
 `--no-default-features` builds without it and is a development convenience — a
 contributor with no C toolchain, or a test run with no business opening a socket

@@ -75,6 +75,10 @@ impl AppState {
                         quiet_s: *quiet,
                     }),
                     shown_hand: shown_name(hand, *n, hero),
+                    act: hand.and_then(|h| h.acted.get(i).copied().flatten()),
+                    key: seat.keys.get(n).copied(),
+                    rating: seat.keys.get(n).map(|k| self.notes.about(k).0).unwrap_or(0),
+                    note: seat.keys.get(n).map(|k| self.notes.about(k).1.to_owned()).unwrap_or_default(),
                 }
             })
             .collect::<Vec<_>>();
@@ -169,6 +173,9 @@ impl AppState {
                     said: l.said.clone(),
                 })
                 .collect(),
+            game_no: seat.game_no,
+            log: self.table_log.iter().cloned().collect(),
+            winning_hand: winning_hand(hand, hero, self.strength.as_ref()),
         }
     }
 
@@ -189,6 +196,25 @@ impl AppState {
         }
         self.last_stacks.get(i).copied().unwrap_or(buyin)
     }
+}
+
+/// PokerTH's winning hand under the board: the hand of the seat that took the
+/// most at the settlement, in words -- the hero's own reading when the hero
+/// won, the shown cards' name for anybody else -- and nothing when the pot
+/// went without a showdown.
+fn winning_hand(
+    hand: Option<&HandInProgress>,
+    hero: Option<u8>,
+    strength: Option<&crate::poker::strength::Strength>,
+) -> Option<String> {
+    let h = hand.filter(|h| h.over)?;
+    let (seat, _) = h.won.iter().enumerate().filter(|(_, w)| **w > 0).max_by_key(|(_, w)| **w)?;
+    let seat = seat as u8;
+    h.shown.get(usize::from(seat)).copied().flatten()?;
+    if hero == Some(seat) {
+        return strength.map(|s| s.name.clone());
+    }
+    shown_name(Some(h), seat, hero)
 }
 
 /// A link reading older than this is shown as stale: two ping intervals

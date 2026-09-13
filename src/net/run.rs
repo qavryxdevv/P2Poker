@@ -475,6 +475,9 @@ struct TableRun {
     /// The last turn told to the interface, so a stage per action does not
     /// become a redraw per action.
     turn_reported: Option<HandReport>,
+    /// How many of the running hand's actions the interface has been told, by
+    /// hand id: each is said once, as a badge, a log line and a sound.
+    acted_said: (u64, usize),
     /// When the next hand may start. D-020's hold, and the only timer in this
     /// loop that is about a person rather than about the network.
     next_hand_at: Option<tokio::time::Instant>,
@@ -804,6 +807,7 @@ impl TableRun {
             kicked_out_said: 0,
             required_seen: (0, Vec::new()),
             turn_reported: None,
+            acted_said: (0, 0),
             next_hand_at: None,
             deal_at: None,
             return_hold: None,
@@ -1477,7 +1481,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = events.send(NodeEvent::Warning(abort_words(why))).await;
                 arm_boundary!($t, std::time::Duration::from_millis(800));
             }
-            let report = report_hand($h, &events, &mut $t.turn_reported).await;
+            let report = report_hand($h, &events, &mut $t.turn_reported, &mut $t.acted_said).await;
             if let Some(end) = report.ended {
                 arm_boundary!($t, end.pause());
             }
@@ -1726,7 +1730,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     arm_boundary!($t, std::time::Duration::from_millis(800));
                                 }
                                 let report =
-                                    report_hand($h, &events, &mut $t.turn_reported).await;
+                                    report_hand($h, &events, &mut $t.turn_reported, &mut $t.acted_said).await;
                                 if let Some(end) = report.ended {
                                     arm_boundary!($t, end.pause());
                                 }
@@ -2292,6 +2296,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.deck_reported = None;
             $t.cards_reported = false;
             $t.turn_reported = None;
+            $t.acted_said = (0, 0);
             $t.abort_reported = false;
             $t.resuming = true;
         }};
@@ -2329,6 +2334,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.cards_reported = false;
             $t.abort_reported = false;
             $t.turn_reported = None;
+            $t.acted_said = (0, 0);
             $t.said.clear();
             $t.next_hand_at = None;
             $t.deal_at = None;
@@ -5061,7 +5067,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             Ok(sends) => {
                                 publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
                                 let report =
-                                    report_hand(h, &events, &mut t.turn_reported).await;
+                                    report_hand(h, &events, &mut t.turn_reported, &mut t.acted_said).await;
                                 if let Some(end) = report.ended {
                                     arm_boundary!(t, end.pause());
                                 }
@@ -7073,7 +7079,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 format!("your clock ran out — {action:?} for you")
                             }))
                             .await;
-                        let report = report_hand(h, &events, &mut t.turn_reported).await;
+                        let report = report_hand(h, &events, &mut t.turn_reported, &mut t.acted_said).await;
                         if let Some(end) = report.ended {
                             arm_boundary!(t, end.pause());
                         }
@@ -8474,12 +8480,19 @@ async fn report_roster(events: &Events, f: &Formation) {
             })
             .await;
     }
+    let keys = f.roster().seats().iter().map(|e| (e.seat, e.app_public_key)).collect();
     let seats = f
         .roster()
         .seats()
         .iter()
         .map(|e| (e.seat, e.display_name.clone(), e.buyin))
         .collect();
+    let _ = events
+        .send(NodeEvent::RosterKeys {
+            key: f.table_id(),
+            keys,
+        })
+        .await;
     let _ = events
         .send(NodeEvent::Roster {
             key: f.table_id(),
@@ -11526,8 +11539,29 @@ async fn report_hand(
     h: &crate::table::hand::Hand,
     events: &Events,
     last: &mut Option<HandReport>,
+    acted_said: &mut (u64, usize),
 ) -> Report {
     let hand_id = h.hand_id();
+    // The actions since the last report, each said once and before the state
+    // they lead to: the badge beside the seat, the log line and the sound.
+    // Before the key below, which a check that only moved the turn along
+    // would otherwise be all there is of.
+    let acted = h.acted();
+    let from = if acted_said.0 == hand_id { acted_said.1.min(acted.len()) } else { 0 };
+    for a in &acted[from..] {
+        let _ = events
+            .send(NodeEvent::SeatActed {
+                hand_id,
+                seat: a.seat,
+                action: a.action,
+                put_in: a.put_in,
+                total: a.total,
+                all_in: a.all_in,
+                by_table: a.by_table,
+            })
+            .await;
+    }
+    *acted_said = (hand_id, acted.len());
     let turn = h.turn();
     // The hand being **over** is part of the key. Without it, a fold-out reads
     // as `(nobody to act, this pot, this board)` both when the fold is applied

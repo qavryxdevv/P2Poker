@@ -60,6 +60,63 @@ pub struct Settings {
     /// Text size, as a percentage of the designed size.
     #[n(1)]
     pub text_percent: u16,
+    /// PokerTH's sound switches. `None` in a file written before they existed,
+    /// which reads as PokerTH's defaults: everything on, volume eight.
+    #[n(2)]
+    pub sound: Option<SoundSettings>,
+}
+
+/// PokerTH's sound settings (`SoundSettings.qml`, `configfile.cpp`'s defaults):
+/// the master switch, the volume from one to ten, and the four categories.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
+pub struct SoundSettings {
+    /// *Enable sound effects*.
+    #[n(0)]
+    pub on: bool,
+    /// *Volume*, 1..=10.
+    #[n(1)]
+    pub volume: u8,
+    /// *Game actions (check, call, raise ...)*.
+    #[n(2)]
+    pub game_actions: bool,
+    /// *Lobby chat notifications*.
+    #[n(3)]
+    pub lobby_chat: bool,
+    /// *Network game notifications*.
+    #[n(4)]
+    pub network_game: bool,
+    /// *Blind raise notification*.
+    #[n(5)]
+    pub blind_raise: bool,
+}
+
+impl Default for SoundSettings {
+    fn default() -> Self {
+        SoundSettings {
+            on: true,
+            volume: 8,
+            game_actions: true,
+            lobby_chat: true,
+            network_game: true,
+            blind_raise: true,
+        }
+    }
+}
+
+impl SoundSettings {
+    /// Whether `cue` plays under these switches.
+    pub fn allows(&self, cue: crate::sound::Cue) -> bool {
+        use crate::sound::Category;
+        self.on
+            && match cue.category() {
+                Category::GameActions => self.game_actions,
+                Category::LobbyChat => self.lobby_chat,
+                Category::NetworkGame => self.network_game,
+                Category::BlindRaise => self.blind_raise,
+                Category::Always => true,
+            }
+    }
 }
 
 impl Settings {
@@ -72,7 +129,13 @@ impl Settings {
         Settings {
             nickname: super::profile::short_name(&app_key.verifying_key().to_bytes()),
             text_percent: 100,
+            sound: None,
         }
+    }
+
+    /// The sound switches in force: the player's, or PokerTH's defaults.
+    pub fn sound(&self) -> SoundSettings {
+        self.sound.unwrap_or_default()
     }
 
     /// The scale as egui wants it.
@@ -98,6 +161,9 @@ impl Settings {
             self.nickname = Settings::defaults(app_key).nickname;
         }
         self.text_percent = self.text_percent.clamp(SCALE_MIN, SCALE_MAX);
+        if let Some(s) = self.sound.as_mut() {
+            s.volume = s.volume.clamp(1, 10);
+        }
     }
 }
 
@@ -164,6 +230,7 @@ mod tests {
         let s = Settings {
             nickname: "Alice".into(),
             text_percent: 130,
+            sound: None,
         };
         save(&dir, &s, &k).unwrap();
         assert_eq!(load(&dir, &k), s);
@@ -202,6 +269,7 @@ mod tests {
         let mut s = Settings {
             nickname: "x".repeat(64),
             text_percent: 100,
+            sound: None,
         };
         s.repair(&k);
         assert!(s.nickname.len() <= NAME_MAX);
@@ -209,6 +277,7 @@ mod tests {
         let mut s = Settings {
             nickname: "a\u{7}b\nc".into(),
             text_percent: 100,
+            sound: None,
         };
         s.repair(&k);
         assert!(!s.nickname.chars().any(|c| c.is_control()));
@@ -218,6 +287,7 @@ mod tests {
         let mut s = Settings {
             nickname: "   ".into(),
             text_percent: 100,
+            sound: None,
         };
         s.repair(&k);
         assert_eq!(s.nickname, Settings::defaults(&k).nickname);
@@ -233,6 +303,7 @@ mod tests {
                 // Four bytes each, so the cap never falls on a boundary.
                 nickname: "\u{1F0A1}".repeat(n),
                 text_percent: 100,
+                sound: None,
             };
             s.repair(&k);
             assert!(s.nickname.len() <= NAME_MAX, "{n}");
@@ -252,6 +323,7 @@ mod tests {
         let absurd = Settings {
             nickname: "Alice".into(),
             text_percent: 5_000,
+            sound: None,
         };
         // Written past `save`'s own repair, the way a person editing the file
         // would.
@@ -262,6 +334,7 @@ mod tests {
         let tiny = Settings {
             nickname: "Alice".into(),
             text_percent: 1,
+            sound: None,
         };
         std::fs::write(settings_path(&dir), minicbor::to_vec(&tiny).unwrap()).unwrap();
         assert_eq!(load(&dir, &k).text_percent, SCALE_MIN);
@@ -273,6 +346,7 @@ mod tests {
         let s = Settings {
             nickname: "Alice".into(),
             text_percent: 100,
+            sound: None,
         };
         assert_eq!(s.zoom(), 1.0);
     }
@@ -288,6 +362,7 @@ mod tests {
             &Settings {
                 nickname: "First".into(),
                 text_percent: 100,
+                sound: None,
             },
             &k,
         )
@@ -297,6 +372,7 @@ mod tests {
             &Settings {
                 nickname: "Second".into(),
                 text_percent: 120,
+                sound: None,
             },
             &k,
         )

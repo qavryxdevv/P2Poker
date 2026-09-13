@@ -1406,6 +1406,38 @@ struct StepHeard {
     bytes: Vec<u8>,
 }
 
+/// One betting action as the hand applied it, for the window: who acted, what
+/// they did, what went in with it, the seat's total for the round afterwards,
+/// and whether it put the seat all in. `by_table`: a certificate acted for the
+/// seat (`D-034`'s check or fold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Acted {
+    pub seat: SeatIdx,
+    pub action: Action,
+    pub put_in: Chips,
+    pub total: Chips,
+    pub all_in: bool,
+    pub by_table: bool,
+}
+
+impl Acted {
+    /// Read off the round right after the action was applied, with what the
+    /// seat had committed before it.
+    fn after(round: &BettingRound, seat: SeatIdx, action: Action, before: Chips, by_table: bool) -> Acted {
+        let i = usize::from(seat);
+        let total = round.committed.get(i).copied().unwrap_or(0);
+        let behind = round.stack.get(i).copied().unwrap_or(0);
+        Acted {
+            seat,
+            action,
+            put_in: total.saturating_sub(before),
+            total,
+            all_in: behind == 0 && !matches!(action, Action::Fold | Action::Check),
+            by_table,
+        }
+    }
+}
+
 /// One hand in progress.
 pub struct Hand {
     open: Opening,
@@ -1553,6 +1585,12 @@ pub struct Hand {
     /// event at a table that has no author to attribute it to, and a player who
     /// saw a seat fold without folding deserves to know why.
     acted_for: Option<(SeatIdx, Action)>,
+    /// Every betting action this hand applied, in order, whoever took it --
+    /// the seat or a certificate for it. The node says each one to the window
+    /// once: the badge beside the seat, the line in the table's log, the
+    /// sound. A reading only: nothing the hand decides looks at it, and it is
+    /// neither hashed nor sent.
+    acted: Vec<Acted>,
     /// Votes heard about each subject, by the digest that identifies it.
     ///
     /// A vote alone is not evidence and does nothing; only a complete set —
@@ -1972,6 +2010,7 @@ impl Hand {
                 abort_hold_said: None,
                 shortfall_said: BTreeSet::new(),
                 acted_for: None,
+                acted: Vec::new(),
                 votes: BTreeMap::new(),
                 voted: BTreeSet::new(),
                 own_vote_at: None,
@@ -3600,6 +3639,7 @@ impl Hand {
             let Phase::Playing { play, .. } = &mut self.phase else {
                 return Err(Failed::NothingFurther);
             };
+            let before = play.round.committed.get(usize::from(seat)).copied().unwrap_or(0);
             // The engine, and nothing else, decides whether this was legal. An
             // illegal action is refused and never corrected: `PROTOCOL.md` §4.7
             // says it "is not a state transition, and it never becomes one".
@@ -3610,6 +3650,7 @@ impl Hand {
                 play.aggressor = Some(seat);
             }
             play.actions = play.actions.saturating_add(1);
+            self.acted.push(Acted::after(&play.round, seat, action, before, false));
         }
 
         // A betting stage is single-writer, so its hash is fixed the moment its
@@ -7516,10 +7557,12 @@ impl Hand {
                     let Phase::Playing { play, .. } = &mut self.phase else {
                         return Err(Failed::NothingFurther);
                     };
+                    let before = play.round.committed.get(usize::from(seat)).copied().unwrap_or(0);
                     play.round
                         .apply(seat, action)
                         .map_err(|what| Failed::Illegal { seat, what })?;
                     play.actions = play.actions.saturating_add(1);
+                    self.acted.push(Acted::after(&play.round, seat, action, before, true));
                 }
                 // Nothing has failed, so the certificate has had its effect and
                 // the roster effects go with it.
@@ -7672,6 +7715,12 @@ impl Hand {
     /// it once and it is not a standing fact about the hand.
     pub fn take_certified_action(&mut self) -> Option<(SeatIdx, Action)> {
         self.acted_for.take()
+    }
+
+    /// Every betting action this hand has applied so far, in order. The node
+    /// remembers how many it has said and says the rest.
+    pub fn acted(&self) -> &[Acted] {
+        &self.acted
     }
 
     /// How many certificates have been accepted against a seat this hand.

@@ -195,6 +195,29 @@ pub enum NodeEvent {
         key: [u8; 32],
         seats: Vec<(u8, String, u64)>,
     },
+    /// The application key behind each seat of the roster, said with every
+    /// roster: what this client keeps about a player on its own (a rating, a
+    /// note) is kept by key, because a name is display data and never an
+    /// identifier (`PROTOCOL.md` §4.3).
+    RosterKeys {
+        key: [u8; 32],
+        keys: Vec<(u8, [u8; 32])>,
+    },
+    /// A seat acted in the running hand -- its own action, or the table's for
+    /// it (`by_table`, `D-034`). Said once per action, before the table state
+    /// it leads to: the badge beside the seat, the table log's line and the
+    /// action's sound in the window. `put_in` is what went in with it; for a
+    /// bet or a raise the action carries the round's total.
+    SeatActed {
+        hand_id: u64,
+        seat: u8,
+        action: crate::poker::actions::Action,
+        put_in: u64,
+        /// The seat's total for the betting round after the action.
+        total: u64,
+        all_in: bool,
+        by_table: bool,
+    },
     /// Every seat has ratified: the table is real and has a session identity.
     TableReal { key: [u8; 32], session: [u8; 32] },
     /// A hand has begun: every seat agreed on the same `HAND_INIT`.
@@ -516,8 +539,10 @@ impl NodeEvent {
             | Self::TableParams { .. }
             | Self::Seated { .. }
             | Self::Roster { .. }
+            | Self::RosterKeys { .. }
             | Self::TableReal { .. }
             | Self::HandBegan { .. }
+            | Self::SeatActed { .. }
             | Self::TableState { .. }
             | Self::HandWaiting { .. }
             | Self::SeatCertified { .. }

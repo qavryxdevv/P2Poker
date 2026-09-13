@@ -192,7 +192,12 @@ pub fn install(ctx: &egui::Context) {
     visuals.widgets.active.bg_fill = theme::SELECTED;
     visuals.selection.bg_fill = theme::SELECTED;
     visuals.selection.stroke = Stroke::new(1.0, theme::ACCENT);
-    ctx.set_visuals(visuals);
+    // Both themes. `set_visuals` sets only the theme egui is in when this
+    // runs, which is the dark fallback before the first frame; on a system
+    // whose apps are set to light, egui then drew with its own light visuals
+    // -- white fields, light title bars under light words.
+    ctx.set_visuals_of(egui::Theme::Dark, visuals.clone());
+    ctx.set_visuals_of(egui::Theme::Light, visuals);
 
     // egui 0.36 keeps one style per theme, so both get the same one — a client
     // whose text changed size with the system theme would be two clients.
@@ -690,6 +695,25 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                             .color(theme::TEXT_DIM)
                             .size(14.0),
                     );
+
+                    // PokerTH's sound settings (`SoundSettings.qml`): the
+                    // master switch, the volume, the four categories.
+                    ui.add_space(10.0);
+                    let mut sound = f.sound();
+                    ui.label(RichText::new("Sound").color(theme::TEXT).strong());
+                    ui.checkbox(&mut sound.on, "Enable sound effects");
+                    ui.add_enabled_ui(sound.on, |ui| {
+                        field_row(ui, "Volume", |ui| {
+                            ui.add(egui::Slider::new(&mut sound.volume, 1..=10));
+                        });
+                        ui.checkbox(&mut sound.game_actions, "Game actions (check, call, raise ...)");
+                        ui.checkbox(&mut sound.lobby_chat, "Lobby chat notifications");
+                        ui.checkbox(&mut sound.network_game, "Network game notifications");
+                        ui.checkbox(&mut sound.blind_raise, "Blind raise notification");
+                    });
+                    if sound != f.sound() {
+                        f.sound = Some(sound);
+                    }
 
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
@@ -1372,6 +1396,22 @@ mod tests {
             style.spacing.interact_size.y >= 30.0,
             "a row too short to click comfortably reads as cramped however large the letters in it are"
         );
+    }
+
+    /// Both themes carry the client's palette: with apps set to light, egui
+    /// had drawn the fields white and the window titles light grey.
+    #[test]
+    fn both_themes_get_the_same_palette() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let dark = ctx.style_of(egui::Theme::Dark);
+        let light = ctx.style_of(egui::Theme::Light);
+        assert_eq!(dark.visuals.extreme_bg_color, theme::FIELD);
+        assert_eq!(light.visuals.extreme_bg_color, theme::FIELD);
+        assert_eq!(dark.visuals.window_fill, light.visuals.window_fill);
+        assert_eq!(dark.visuals.widgets.inactive.weak_bg_fill, light.visuals.widgets.inactive.weak_bg_fill);
+        assert_eq!(dark.visuals.widgets.open.weak_bg_fill, light.visuals.widgets.open.weak_bg_fill);
+        assert!(light.visuals.dark_mode);
     }
 
     /// Both themes carry the same sizes: a client whose text changed size with

@@ -620,7 +620,7 @@ no open advisory) is a proc-macro and is counted with the unregistered remainder
 | `aead` | 0.6.1 | AEAD traits | `github.com/RustCrypto/traits` | MIT OR Apache-2.0 | no open advisory |
 | `cipher` | 0.5.2 | block/stream cipher traits | `github.com/RustCrypto/traits` | MIT OR Apache-2.0 | no open advisory |
 | `universal-hash` | 0.6.1 | universal-hash traits | `github.com/RustCrypto/traits` | MIT OR Apache-2.0 | no open advisory |
-| `windows-sys` | 0.61.2 | DPAPI key slot on Windows | `github.com/microsoft/windows-rs` | MIT OR Apache-2.0 | no open advisory; Windows-only path, and the only OS-keystore path implemented |
+| `windows-sys` | 0.61.2 | DPAPI key slot on Windows; since D-048 also the table's sounds through WinMM (`waveOut*`, features `Win32_Media` and `Win32_Media_Audio`) | `github.com/microsoft/windows-rs` | MIT OR Apache-2.0 | no open advisory; Windows-only path, and the only OS-keystore path implemented |
 
 ### 5.4 Randomness — the whole set, including what we do not use (11)
 
@@ -840,7 +840,11 @@ of §5 without a row of their own. They are covered by the whole-tree licence sw
 **The assumption that makes that exclusion defensible, stated so it can be
 attacked:** no attacker-controlled bytes reach them. The table image and the fonts
 are compiled into the binary by `rust-embed`, so the PNG and font decoders only ever
-see our own assets. The same holds for the renderer: `naga` compiles shaders, and the
+see our own assets. The same holds for what D-048 took from PokerTH: the table
+picture, the font, the sounds and the icons are compiled in with `include_bytes!` and
+`include_str!`, and our own readers of them -- the WAV reader in `sound.rs`, the SVG
+path filler in `gui/table/icons.rs` -- never see a byte from a peer. The notes about
+players (`storage/notes.rs`) are the local player's own file. The same holds for the renderer: `naga` compiles shaders, and the
 only shaders it ever sees are `egui`'s own, compiled in. **This assumption fails the moment anything peer-supplied is
 rendered** — an avatar, a table skin, a chat message with an image, a downloaded
 theme. If any of that is ever added, `image`, the font stack and the clipboard path

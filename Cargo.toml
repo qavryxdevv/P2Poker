@@ -99,7 +99,7 @@ netdev = { version = "0.46", default-features = false, features = ["gateway"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Media", "Win32_Media_Audio"] }
 # The second renderer, and the reason the client starts on a machine with no
 # graphics driver. Only the Direct3D 12 backend is compiled: it is the one that
 # can reach WARP, the software rasteriser every Windows 10 already carries.
