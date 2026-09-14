@@ -258,6 +258,10 @@ pub enum NodeEvent {
     /// Named rather than left as a spinner: "waiting for seat 3" is something a
     /// player can act on and a turning circle is not.
     HandWaiting { hand_id: u64, seats: Vec<u8> },
+    /// `D-058`: the seats a dealt hand's cryptographic stage -- the deck, a
+    /// reveal, the showdown -- has stood on for a moment, said on change and
+    /// empty once it moves on. Before the deal `HandWaiting` says it.
+    StageStands { hand_id: u64, seats: Vec<u8> },
     /// `S1-EI`: the table certified this seat's timeout in the running hand;
     /// the window says what happens next.
     SeatCertified { seat: u8 },
@@ -647,6 +651,7 @@ impl NodeEvent {
             | Self::TableReach { .. }
             | Self::SitInAsked { .. }
             // `D-058`: the wait on another seat over the felt.
+            | Self::StageStands { .. }
             | Self::TimeoutVotes { .. }
             | Self::ReturnVotes { .. } => true,
 

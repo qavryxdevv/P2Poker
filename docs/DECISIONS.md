@@ -4875,30 +4875,39 @@ stolu, který čeká na nekomunikujícího peera, a pak přijde proces (hlasová
 founder's outage in `fe181646-3`, from its silence to dealt in again). `--table-preview --preview-waits` and
 `--preview-waits-back` draw it.
 
-**D-058 amended 2026-09-14 (the owner's word, twice: nothing over a hand that is being played).** First
-*"malé škobrtnutí: ta hláška Waiting for tam nemá být, pokud už hraje zbytek hráčů po vyhození mrtvého peera
-atd."* -- with a screenshot of *Waiting for* a seat that had left the table, every step to its certificate done and
-*Back on the line* turning, over a table that had dealt on without it: the panel had no end but a return, so a
-seat that never came back was waited for over the felt for the rest of the game. Then, on `01a38e0`, which still
-said a seat certified out over the felt for four seconds and a seat on its way back in a panel of its own: *"i ta
-coming back hláška nesmí vizuálně rušit aktuálně živou a rozehranou handu"*.
+**D-058 amended 2026-09-14 (the owner's word, three times: said while the table is not being played, never over a
+hand that is).** First *"malé škobrtnutí: ta hláška Waiting for tam nemá být, pokud už hraje zbytek hráčů po vyhození
+mrtvého peera atd."* -- with a screenshot of *Waiting for* a seat that had left the table, every step to its
+certificate done and *Back on the line* turning, over a table that had dealt on without it: the panel had no end but a
+return. Then, on `01a38e0`, which still said a certified seat over the felt for four seconds and a returning one in a
+panel of its own: *"i ta coming back hláška nesmí vizuálně rušit aktuálně živou a rozehranou handu"*. Then, on
+`974fb8b`, which said the certificate in the table's log alone: *"zas ta hláška o certifikaci hned zmizela dříve, než
+se začala hrát nová handa po vyhozeném hráči (stůl vypadal pro uživatele jako zmrzlý)"* -- and for `D-057`: *"hláška
+Back in the game musí zmizet, jakmile dostanu hole cards po reconnectu"*.
 
-4. **A panel over the felt only while the hand stands on a seat**: the seat is off the line and the hand waits on
-   it -- its turn, or a stage it owes -- or the other seats' votes to act for it are running. A seat off the line
-   while the others still play the hand is shown by its seat's link alone (*offline*, and how long it has been
-   silent); `S1-EI`'s older sentences follow the same rule and name only the seats a hand stands on.
-5. **Certified out, the hand goes on and nothing over the felt waits for the seat**: the table's log says *Carol is
-   certified out of this hand; the table plays on without it*, and nothing more is said about it in that hand or
-   in the hands dealt without it.
-6. **Its way back is said at its seat and in the table's log, never over the hand**: the seat reads *coming back*
-   where *sitting out* stood, from its sit-in or the seats' votes on its return until it is dealt in again; the
-   log says *Carol asks to sit in after hand #20* once per boundary, and *Carol is back in the game* under the
-   header of the hand that deals it in. A return that goes quiet is not said past the hand after the one it was
-   last heard at.
-7. The votes to act for a seat are the running hand's alone; a seat back on the line before it was certified out
-   is simply no longer waited on.
+4. **While the hand stands on a seat, a panel says so**: the seat holds the turn (one no certificate has acted on
+   yet) or a cryptographic stage -- the deck, a reveal, the showdown -- and it is off the line or the votes about it
+   run. At its turn: its clock, the other seats agreeing to act for it (with the count), certified out as the table
+   checks or folds for it. At a stage: *the cards cannot move on without it*, the other seats agreeing to end the hand
+   (with the count), the next hand dealt without it. A dealt hand told the window nothing about its stages, and a seat
+   gone from the line holds one for the stage's thirty seconds before anybody votes, so the node now says which seats
+   a dealt hand's cryptographic stage has stood on for three seconds (`NodeEvent::StageStands`, from the stall tick,
+   on change). A seat off the line while the others still play is shown by its seat's link alone, and `S1-EI`'s older
+   sentences follow the same rule.
+5. **Certified out, the table goes on without the seat and says so until it is played again**: *The table goes on
+   without Carol* -- certified out of hand #N, that hand finishing without it, the next hand dealt without it -- from
+   the certificate until the turn is at a seat on the line in the same hand, or the next hand's cards are out; a hand
+   called off after the certificate says it again until then. The table's log says *Carol is certified out of this
+   hand; the table plays on without it*.
+6. **Its way back is said at its seat and in the table's log, never over the felt**: *coming back* where *sitting
+   out* stood, from its sit-in or the votes on its return until it is dealt in again; *Carol asks to sit in after
+   hand #20* once per boundary, and *Carol is back in the game* under the header of the hand that deals it in. A return
+   that goes quiet is not said past the hand after the one it was last heard at.
+7. **`D-057`: this client's own *Back in the game* goes the moment its hole cards are here**, and is not said at all
+   over a hand it already holds cards in (a short outage inside a hand); between hands it stays its four seconds.
 
-**Guard.** `app::tests::the_felt_says_the_wait_on_a_seat_only_while_the_hand_stands_on_it` (in place of
-`the_wait_on_a_seat_is_shown_step_by_step_until_it_is_back`) and `app::tests::no_wait_is_said_over_a_table_that_plays_on`;
-`--table-preview --preview-waits` draws the panel over a hand that stands, `--preview-waits-back` a seat reading
-*coming back* with nothing over the felt.
+**Guard.** `app::tests::the_felt_says_the_wait_on_a_seat_only_while_nothing_is_played` (the turn, the certificate
+until the turn is at a seat on the line, the stage, the hand called off until the next hand's cards, the return),
+`app::tests::no_wait_is_said_over_a_table_that_plays_on`, and the rewritten end of
+`app::tests::the_way_back_is_shown_step_by_step_until_dealt_in_again`; `--table-preview` with `--preview-waits`,
+`--preview-waits-gap` and `--preview-waits-back`.

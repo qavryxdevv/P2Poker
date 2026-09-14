@@ -607,6 +607,9 @@ struct TableRun {
     frozen_said: bool,
     /// When a vote was last reported as owed and not cast (`vote_state`).
     vote_state_said: u64,
+    /// `D-058`: the seats a dealt hand's cryptographic stage was last said to
+    /// stand on, and in which hand.
+    stands_said: (u64, Vec<u8>),
     /// The hand whose "a certificate about the previous hand arrived too late
     /// to be kept" line has been said.
     late_cert_said: Option<u64>,
@@ -873,6 +876,7 @@ impl TableRun {
             roster_seats: Vec::new(),
             frozen_said: false,
             vote_state_said: 0,
+            stands_said: (0, Vec::new()),
             late_cert_said: None,
             late_settle_said: None,
             unsettled_abort_here: None,
@@ -7571,6 +7575,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if now.saturating_sub(t.vote_state_said) >= 30_000 {
                             t.vote_state_said = now;
                             let _ = events.send(NodeEvent::Warning(line)).await;
+                        }
+                    }
+                    // `D-058`: the seats a dealt hand's cryptographic stage has stood
+                    // on for a moment, said to the window on change. A dealt hand
+                    // reports nothing else about its deck and its reveals, and a seat
+                    // gone from the line holds such a stage for the thirty seconds
+                    // of its budget before anybody votes: a table that looked frozen
+                    // (the owner, 2026-09-14). Before the deal `HandWaiting` says it.
+                    if h.dealt() {
+                        const STAGE_STANDS_AFTER_MS: u64 = 3_000;
+                        let stands = h.stage_stands_on(now, STAGE_STANDS_AFTER_MS);
+                        let said: &[u8] = if t.stands_said.0 == h.hand_id() { &t.stands_said.1 } else { &[] };
+                        if stands.as_slice() != said {
+                            t.stands_said = (h.hand_id(), stands.clone());
+                            let _ = events.send(NodeEvent::StageStands { hand_id: h.hand_id(), seats: stands }).await;
                         }
                     }
 

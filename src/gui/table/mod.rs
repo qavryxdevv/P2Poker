@@ -407,7 +407,7 @@ impl AbsentSeat {
     /// owes -- rather than being played on among the others. Only such a seat
     /// is said over the felt.
     pub fn stalls(&self) -> bool {
-        !self.certified && (self.waited || self.on_clock_s.is_some())
+        self.waited || self.on_clock_s.is_some()
     }
 }
 
@@ -1498,9 +1498,9 @@ fn overlays(ui: &egui::Ui, p: &egui::Painter, zone: Rect, view: &TableView) {
         }
         return;
     }
-    // `S1-EI`: the seats off the line the hand stands on. A seat certified out,
-    // or one the others play the hand without for now, is not said over the
-    // felt: nothing covers a hand that is being played (`D-058`).
+    // `S1-EI`: the seats off the line the hand stands on -- its turn, or a stage
+    // it owes. One the others play the hand without for now is not said over
+    // the felt: nothing covers a hand that is being played (`D-058`).
     let waited_on: Vec<&AbsentSeat> = view.absent.iter().filter(|a| a.stalls()).collect();
     if view.line.is_none() && !waited_on.is_empty() {
         let mut lines: Vec<String> = Vec::new();
@@ -1508,7 +1508,7 @@ fn overlays(ui: &egui::Ui, p: &egui::Painter, zone: Rect, view: &TableView) {
             let quiet = a.quiet_s.map(|q| format!(", silent {q} s")).unwrap_or_default();
             lines.push(match a.on_clock_s {
                 Some(s) => format!("{} is off the line{quiet}: the hand waits on it, {s} s on its clock; when the clock runs out the other seats certify it out and play on.", a.name),
-                None => format!("{} is off the line{quiet}: the hand waits on it; when its clock runs out the other seats certify it out and play on.", a.name),
+                None => format!("{} is off the line{quiet}: the cards cannot move on without it; when its time runs out the other seats end the hand and deal the next without it.", a.name),
             });
         }
         lines.push("The hand finishes when the seats it waits on are back on the line or certified out; nothing here is stuck.".to_string());

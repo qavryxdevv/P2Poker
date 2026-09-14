@@ -628,19 +628,28 @@ impl Rejoin {
 }
 
 /// `D-058`: a seat this table waits on -- off the line in a hand that deals it
-/// in -- or takes back: the votes to act for it, and, if it comes back, its
-/// sit-in and the votes on its return.
+/// in -- or goes on without, or takes back: the votes about it, the hand it was
+/// certified out of, and, if it comes back, its sit-in and the votes on its
+/// return.
 ///
-/// **Nothing over a hand that is being played** (the owner, 2026-09-14, twice).
-/// The felt shows a wait only while the hand stands on the seat
-/// ([`AppState::wait_views`]); a seat certified out is said in the table's log
-/// and waited for no more; a seat on its way back is said at its seat and in the
-/// log.
+/// **Said while the table is not being played, and never over a hand that is**
+/// (the owner, 2026-09-14, three times). The felt shows a wait while the hand
+/// stands on the seat, and a seat certified out until the table is played
+/// again ([`AppState::wait_views`]); a seat on its way back is said at its seat
+/// and in the table's log.
 #[derive(Debug, Clone)]
 pub struct SeatWait {
     pub since: std::time::Instant,
-    /// How the votes to act for it stand in the running hand: held, needed.
+    /// How the votes about it stand, while the hand stands on it: held, needed.
     pub votes: Option<(u8, u8)>,
+    /// The hand it was certified out of, and whether that hand was played on
+    /// after it -- the turn at a seat on the line -- which is where saying so
+    /// ends; otherwise the next hand's cards end it.
+    pub certified_in: Option<u64>,
+    pub played_on: bool,
+    /// The certificate acted for it at its turn: the turn this window still
+    /// shows at the seat is spent until the turn moves.
+    pub turn_spent: bool,
     /// Asked to sit in at the end of this hand.
     pub asked: Option<u64>,
     /// How the votes on its return stand: held, needed.
@@ -655,6 +664,9 @@ impl SeatWait {
         SeatWait {
             since: std::time::Instant::now(),
             votes: None,
+            certified_in: None,
+            played_on: false,
+            turn_spent: false,
             asked: None,
             return_votes: None,
             return_hand: None,
@@ -1426,6 +1438,16 @@ impl AppState {
                 }
                 self.last_stacks = stacks;
                 self.clock_for(None, 0);
+                // `D-058`: a hand called off after a seat was certified out of it
+                // leaves nothing moving on the felt until the next hand's cards --
+                // said, even where the hand had been played on in between.
+                if restored {
+                    for w in self.waits.values_mut() {
+                        if w.certified_in == Some(hand_id) {
+                            w.played_on = false;
+                        }
+                    }
+                }
                 if !restored {
                     self.log_showdown(hand_id);
                     self.note_the_finish(hand_id);
@@ -1441,6 +1463,11 @@ impl AppState {
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
                     h.cards = Some(cards);
                 }
+                // `D-057`, the owner's word: the way back is over the moment this
+                // client holds its cards again -- nothing over a hand it plays.
+                if self.hand.as_ref().is_some_and(|h| h.hand_id == hand_id) {
+                    self.rejoin = None;
+                }
                 self.refresh_strength();
                 self.sound_cues.push(crate::sound::Cue::DealTwoCards);
                 self.log
@@ -1455,10 +1482,21 @@ impl AppState {
                         r.certified_out = true;
                     }
                 } else {
-                    // `D-058`: another: the hand goes on without it, nothing over the
-                    // felt waits for it any more, and the table's log says so.
-                    if self.waits.get(&seat).is_some_and(|w| !w.returning()) {
-                        self.waits.remove(&seat);
+                    // `D-058`: another: the table goes on without it, and says so over
+                    // the felt until the table is played again -- the turn at a seat
+                    // on the line, or the next hand's cards -- and in the log.
+                    let me = self.seated.as_ref().and_then(|s| s.seat);
+                    let hand = self.hand.as_ref().filter(|h| !h.over).map(|h| h.hand_id);
+                    let live_turn = self.turn_seat.is_some_and(|t| {
+                        t != seat && (Some(t) == me || self.links.get(&t).is_some_and(|(_, group, _, _)| *group))
+                    });
+                    let turn_here = self.turn_seat == Some(seat);
+                    let w = self.waits.entry(seat).or_insert_with(SeatWait::begin);
+                    if !w.returning() {
+                        w.votes = None;
+                        w.certified_in = hand;
+                        w.played_on = live_turn;
+                        w.turn_spent = turn_here;
                     }
                     let name = self.seat_name(seat);
                     self.log_table(
@@ -1482,6 +1520,13 @@ impl AppState {
                         who.join(", ")
                     ));
                     self.waiting_for = seats;
+                }
+            }
+            // `D-058`: the seats a dealt hand's cryptographic stage stands on.
+            NodeEvent::StageStands { hand_id, seats } => {
+                if self.hand.as_ref().is_some_and(|h| h.hand_id == hand_id) {
+                    self.waiting_for = seats;
+                    self.turn_moved();
                 }
             }
             NodeEvent::Carrier { seen, want } => {
@@ -1519,6 +1564,8 @@ impl AppState {
                     }
                 }
                 if self.rejoin.as_ref().is_some_and(|r| r.back_at.is_some_and(|at| at.elapsed() >= REJOIN_BACK_SHOWN))
+                    // `D-057`, the owner's word: not over a hand it holds cards in.
+                    || (self.rejoin.as_ref().is_some_and(|r| r.back_at.is_some()) && self.holds_cards())
                     || self.finished.is_some()
                     || self.out_for_good.is_some()
                 {
@@ -2026,17 +2073,19 @@ impl AppState {
                 .all(|n| self.links.get(n).is_some_and(|(_, group, _, _)| !*group))
     }
 
-    /// `D-058`: the seats this table waits on, and the ones on their way back,
+    /// `D-058`: the seats this table waits on, goes on without, or takes back,
     /// read afresh on every sweep.
     ///
-    /// **Nothing over a hand that is being played** (the owner, 2026-09-14, twice:
-    /// *Waiting for* had stood over a table dealing on without a seat that had
-    /// left, and then *coming back* over a live hand). A seat off the line is kept
-    /// while a hand deals it in and it is not certified out, and shown only while
-    /// that hand stands on it ([`AppState::wait_views`]); its way back is kept, for
-    /// its seat to say, until it is dealt in again and not past the hand after the
-    /// one its return was last heard at; a seat that left the table or the roster
-    /// is not kept.
+    /// **Said while the table is not being played, and never over a hand that
+    /// is** (the owner, 2026-09-14, three times: *Waiting for* had stood over a
+    /// table dealing on without a seat that had left; then *coming back* over a
+    /// live hand; then, once that was gone, the certificate's word went at once
+    /// and the table stood still and silent until the next hand). A seat off the
+    /// line is kept while a running hand deals it in; certified out, it is kept
+    /// until the table is played again -- the turn at a seat on the line, or the
+    /// next hand's cards; on its way back it is kept, for its seat to say, until
+    /// it is dealt in again and not past the hand after the one its return was
+    /// last heard at.
     pub fn tick_waits(&mut self) {
         let me = self.seated.as_ref().and_then(|s| s.seat);
         let roster: Vec<u8> = self.seated.as_ref().map(|s| s.roster.iter().map(|(n, _, _)| *n).collect()).unwrap_or_default();
@@ -2045,41 +2094,58 @@ impl AppState {
             return;
         }
         for a in self.absent_seats() {
-            if !a.certified {
-                self.waits.entry(a.seat).or_insert_with(SeatWait::begin);
-            }
+            self.waits.entry(a.seat).or_insert_with(SeatWait::begin);
         }
-        let hand = self.hand.as_ref().map(|h| (h.hand_id, h.dealt_in.clone()));
-        let (left, links, certified) = (&self.left_for_good, &self.links, &self.certified);
+        let hand = self.hand.as_ref().map(|h| (h.hand_id, h.over, h.dealt_in.clone()));
+        let cards_out = self.cards_out_in();
+        let (left, links) = (&self.left_for_good, &self.links);
         self.waits.retain(|seat, w| {
-            if Some(*seat) == me || !roster.contains(seat) || left.contains(seat) {
+            if Some(*seat) == me || !roster.contains(seat) {
                 return false;
             }
             if w.returning() {
-                return match &hand {
-                    Some((id, _)) => *id <= *w.return_hand.get_or_insert(*id) + 1,
-                    None => true,
-                };
+                return !left.contains(seat)
+                    && match &hand {
+                        Some((id, _, _)) => *id <= *w.return_hand.get_or_insert(*id) + 1,
+                        None => true,
+                    };
             }
-            // Waited on: dealt in, not certified out, and off the line or voted on.
+            if w.certified_in.is_some_and(|k| !w.played_on && cards_out.is_none_or(|id| id <= k)) {
+                return true;
+            }
+            // Waited on: a running hand deals it in, and it is off the line or
+            // voted on.
             let off = !links.get(seat).is_some_and(|(_, group, _, _)| *group);
-            !certified.contains(seat) && hand.as_ref().is_some_and(|(_, dealt)| dealt.contains(seat)) && (off || w.votes.is_some())
+            hand.as_ref().is_some_and(|(_, over, dealt)| !*over && dealt.contains(seat)) && (off || w.votes.is_some())
         });
     }
 
-    /// `D-058`: whether the hand stands on `seat`: the votes to act for it run,
-    /// or it is off the line with the turn or a stage it owes. Anything less is
-    /// a hand the others are still playing.
-    fn hand_stands_on(&self, seat: u8, w: &SeatWait) -> bool {
-        let off = !self.links.get(&seat).is_some_and(|(_, group, _, _)| *group);
-        w.votes.is_some() || (off && (self.turn_seat == Some(seat) || self.waiting_for.contains(&seat)))
+    /// The hand whose cards are out -- this client's, or anybody's -- if the
+    /// running hand's are.
+    fn cards_out_in(&self) -> Option<u64> {
+        self.hand.as_ref().filter(|h| h.cards.is_some() || !h.holding.is_empty()).map(|h| h.hand_id)
     }
 
-    /// `D-058`: every seat the hand stands on, as the felt shows it -- and no
-    /// other: a hand the others are still playing is not covered, a seat certified
-    /// out is not waited for, and a seat on its way back is said at its seat.
+    /// `D-058`: whether the running hand stands on `seat`: its turn (one the
+    /// certificate has not already acted on) or a cryptographic stage it owes,
+    /// while it is off the line or the votes about it run. Anything less is a
+    /// hand the others are still playing.
+    fn hand_stands_on(&self, seat: u8, w: &SeatWait) -> bool {
+        if self.hand.as_ref().is_none_or(|h| h.over) {
+            return false;
+        }
+        let off = !self.links.get(&seat).is_some_and(|(_, group, _, _)| *group);
+        let holds = (self.turn_seat == Some(seat) && !w.turn_spent) || self.waiting_for.contains(&seat);
+        holds && (off || w.votes.is_some())
+    }
+
+    /// `D-058`: every seat the hand stands on, and every seat the table goes on
+    /// without while it is not being played, as the felt shows them -- and no
+    /// other: a hand the others are playing is not covered, and a seat on its
+    /// way back is said at its seat.
     pub fn wait_views(&self) -> Vec<crate::gui::table::WaitView> {
         use crate::gui::table::StepState::{Done, Later, Now};
+        use crate::gui::table::{RejoinView, WaitView};
         let Some(seated) = self.seated.as_ref() else {
             return Vec::new();
         };
@@ -2088,55 +2154,102 @@ impl AppState {
             return Vec::new();
         }
         let state = |done: bool, now: bool| if done { Done } else if now { Now } else { Later };
-        self.waits
-            .iter()
-            .filter(|(seat, w)| !w.returning() && !self.certified.contains(seat) && self.hand_stands_on(**seat, w))
-            .map(|(seat, w)| {
-                let name = seated
-                    .roster
-                    .iter()
-                    .find(|(n, _, _)| n == seat)
-                    .map(|(_, name, _)| name.clone())
-                    .unwrap_or_else(|| format!("Seat {seat}"));
-                let quiet = self.links.get(seat).and_then(|(_, _, q, _)| *q);
-                let on_clock = if self.turn_seat == Some(*seat) { self.turn_since.map(|t| t.elapsed().as_secs()) } else { None };
-                let steps = vec![
-                    (Done, format!("{name} stopped answering")),
+        let cards_out = self.cards_out_in();
+        let mut stands = Vec::new();
+        let mut gaps = Vec::new();
+        for (seat, w) in &self.waits {
+            if w.returning() {
+                continue;
+            }
+            let name = seated
+                .roster
+                .iter()
+                .find(|(n, _, _)| n == seat)
+                .map(|(_, name, _)| name.clone())
+                .unwrap_or_else(|| format!("Seat {seat}"));
+            let quiet = self.links.get(seat).and_then(|(_, _, q, _)| *q);
+            if self.hand_stands_on(*seat, w) {
+                let turn = self.turn_seat == Some(*seat) && !w.turn_spent;
+                let (steps, detail) = if turn {
+                    let on_clock = self.turn_since.map(|t| t.elapsed().as_secs());
                     (
-                        state(w.votes.is_some(), true),
-                        match on_clock {
-                            Some(secs) if w.votes.is_none() => format!("The hand waits on its clock – {secs} s"),
-                            _ => "The hand waits on its clock".to_string(),
+                        vec![
+                            (Done, format!("{name} stopped answering")),
+                            (
+                                state(w.votes.is_some(), true),
+                                match on_clock {
+                                    Some(secs) if w.votes.is_none() => format!("The hand waits on its clock – {secs} s"),
+                                    _ => "The hand waits on its clock".to_string(),
+                                },
+                            ),
+                            (
+                                state(false, w.votes.is_some()),
+                                match w.votes {
+                                    Some((held, need)) => format!("The other seats agree to act for it – {held} of {need}"),
+                                    None => "The other seats agree to act for it".to_string(),
+                                },
+                            ),
+                            (Later, "Certified out: the table checks or folds for it".to_string()),
+                        ],
+                        if w.votes.is_some() {
+                            "Its clock ran out; when every other seat agrees, the table checks or folds for it and the hand goes on".to_string()
+                        } else {
+                            format!(
+                                "{name} has not answered{}; when its clock runs out the other seats certify it out and play on. Nothing here is stuck",
+                                quiet.map(|q| format!(" for {q} s")).unwrap_or_default()
+                            )
                         },
-                    ),
-                    (
-                        state(false, w.votes.is_some()),
-                        match w.votes {
-                            Some((held, need)) => format!("The other seats agree to act for it – {held} of {need}"),
-                            None => "The other seats agree to act for it".to_string(),
-                        },
-                    ),
-                    (Later, "Certified out: the hand goes on without it".to_string()),
-                ];
-                let detail = if w.votes.is_some() {
-                    "A seat's clock ran out; when every other seat agrees, the table acts for it and the hand goes on".to_string()
+                    )
                 } else {
-                    format!(
-                        "{name} has not answered{}; when its clock runs out the other seats certify it out and play on. Nothing here is stuck",
-                        quiet.map(|q| format!(" for {q} s")).unwrap_or_default()
+                    (
+                        vec![
+                            (Done, format!("{name} stopped answering")),
+                            (state(w.votes.is_some(), true), "The cards cannot move on without it".to_string()),
+                            (
+                                state(false, w.votes.is_some()),
+                                match w.votes {
+                                    Some((held, need)) => format!("The other seats agree to end the hand – {held} of {need}"),
+                                    None => "The other seats agree to end the hand".to_string(),
+                                },
+                            ),
+                            (Later, "The next hand is dealt without it".to_string()),
+                        ],
+                        if w.votes.is_some() {
+                            "Its time ran out; when every other seat agrees, this hand ends and the next is dealt without it".to_string()
+                        } else {
+                            format!(
+                                "The cards need {name}'s part{}; when its time runs out the other seats end this hand and deal the next without it. Nothing here is stuck",
+                                quiet.map(|q| format!(", silent {q} s")).unwrap_or_default()
+                            )
+                        },
                     )
                 };
-                crate::gui::table::WaitView {
+                stands.push(WaitView {
                     title: format!("Waiting for {name}"),
-                    panel: crate::gui::table::RejoinView {
+                    panel: RejoinView { for_s: w.since.elapsed().as_secs(), steps, detail: Some(detail), back: false },
+                });
+            } else if let Some(k) = w.certified_in.filter(|k| !w.played_on && cards_out.is_none_or(|id| id <= *k)) {
+                let over = self.hand.as_ref().is_some_and(|h| h.hand_id > k || h.over);
+                gaps.push(WaitView {
+                    title: format!("The table goes on without {name}"),
+                    panel: RejoinView {
                         for_s: w.since.elapsed().as_secs(),
-                        steps,
-                        detail: Some(detail),
+                        steps: vec![
+                            (Done, format!("{name} stopped answering")),
+                            (Done, format!("Certified out of hand #{k}")),
+                            (state(over, true), format!("Hand #{k} finishes without it")),
+                            (state(false, over), "The next hand is dealt without it".to_string()),
+                        ],
+                        detail: Some(format!(
+                            "The table goes on without {name}; it can come back at a later hand. Nothing here is stuck"
+                        )),
                         back: false,
                     },
-                }
-            })
-            .collect()
+                });
+            }
+        }
+        stands.extend(gaps);
+        stands
     }
 
     /// `D-057`: this client's own way back, as the felt shows it: every step,
@@ -2145,6 +2258,11 @@ impl AppState {
         use crate::gui::table::StepState::{Done, Later, Now};
         let r = self.rejoin.as_ref()?;
         let back = r.back_at.is_some();
+        // `D-057`, the owner's word: *Back in the game* is not said over a hand
+        // this client holds its cards in.
+        if back && self.holds_cards() {
+            return None;
+        }
         let state = |done: bool, now: bool| if done { Done } else if now { Now } else { Later };
         let mut steps = Vec::new();
         let first_done = back || r.reached || (r.line_lost && r.network_back);
@@ -2187,6 +2305,11 @@ impl AppState {
             None
         };
         Some(crate::gui::table::RejoinView { for_s: r.since.elapsed().as_secs(), steps, detail, back })
+    }
+
+    /// Whether this client holds its cards in a hand still being played.
+    fn holds_cards(&self) -> bool {
+        self.hand.as_ref().is_some_and(|h| !h.over && h.cards.is_some())
     }
 
     /// `D-057`: the way back starts -- this client's line went, its table stopped
@@ -2505,6 +2628,31 @@ impl AppState {
         } else if let (Some(was), Some(now)) = (self.turn_since, anchored) {
             if now < was {
                 self.turn_since = Some(now);
+            }
+        }
+        self.turn_moved();
+    }
+
+    /// `D-058`: the turn, or the stage, moved. The turn at a seat on the line is
+    /// a table being played: a seat certified out of this hand is not said over
+    /// it any more. A seat the hand no longer stands on has its votes spent, and
+    /// a turn the certificate acted on is spent until the turn leaves the seat.
+    fn turn_moved(&mut self) {
+        let me = self.seated.as_ref().and_then(|s| s.seat);
+        let hand = self.hand.as_ref().filter(|h| !h.over).map(|h| h.hand_id);
+        let turn = self.turn_seat;
+        let live = turn.is_some_and(|t| Some(t) == me || self.links.get(&t).is_some_and(|(_, group, _, _)| *group));
+        let waiting = &self.waiting_for;
+        for (seat, w) in self.waits.iter_mut() {
+            if turn == Some(*seat) {
+                continue;
+            }
+            w.turn_spent = false;
+            if live && hand.is_some() && w.certified_in == hand {
+                w.played_on = true;
+            }
+            if !waiting.contains(seat) {
+                w.votes = None;
             }
         }
     }
@@ -3244,25 +3392,38 @@ mod tests {
         s.apply(NodeEvent::HandBegan { hand_id: 21, button: 1, dealt_in: vec![0, 1, 2], small_blind: 100, big_blind: 200 });
         let v = s.table_view().rejoin.expect("the moment it is back is shown");
         assert!(v.back && v.steps.iter().all(|(st, _)| *st == Done), "{:?}", v.steps);
-        s.rejoin.as_mut().unwrap().back_at = Some(std::time::Instant::now() - REJOIN_BACK_SHOWN);
-        s.apply(NodeEvent::Swept { now_ms: 1 });
-        assert!(s.table_view().rejoin.is_none(), "and then it goes");
+        // The owner: gone the moment this client holds its cards again.
+        s.apply(NodeEvent::HoleCards { hand_id: 21, cards: [12, 13] });
+        assert!(s.table_view().rejoin.is_none(), "gone with the hole cards");
 
-        // A short outage: the table waited, nobody was put out.
+        // A short outage while holding cards: the hand stands for this client while
+        // it reaches nobody, and being back needs no word over the hand it plays.
+        s.apply(NodeEvent::TableReach { reachable: false });
+        assert!(s.table_view().rejoin.is_some(), "nobody answers: said");
+        s.apply(NodeEvent::TableReach { reachable: true });
+        s.rejoin.as_mut().unwrap().reached_at = Some(std::time::Instant::now() - REJOIN_SETTLES);
+        s.apply(NodeEvent::Swept { now_ms: 1 });
+        assert!(s.table_view().rejoin.is_none() && s.rejoin.is_none(), "back with its cards: nothing over the hand");
+
+        // Between hands the same outage is said back for a moment, and then it goes.
+        s.apply(NodeEvent::HandEnded { hand_id: 21, stacks: vec![], shown: vec![], pots: vec![], gained: vec![] });
         s.apply(NodeEvent::TableReach { reachable: false });
         s.apply(NodeEvent::TableReach { reachable: true });
         s.rejoin.as_mut().unwrap().reached_at = Some(std::time::Instant::now() - REJOIN_SETTLES);
         s.apply(NodeEvent::Swept { now_ms: 2 });
         assert!(s.table_view().rejoin.is_some_and(|v| v.back), "back in the game once nothing more follows");
+        s.rejoin.as_mut().unwrap().back_at = Some(std::time::Instant::now() - REJOIN_BACK_SHOWN);
+        s.apply(NodeEvent::Swept { now_ms: 3 });
+        assert!(s.table_view().rejoin.is_none(), "and then it goes");
     }
 
     /// `D-058`: the table standing on a seat, from the members' side of `fe181646-3`
-    /// -- over the felt only while the hand cannot go on without it (its turn or a
-    /// stage it owes, the votes to act for it), never over a hand the others are
-    /// playing (the owner, 2026-09-14): certified out it is said in the table's log,
-    /// and its way back at its seat and in the log until it is dealt in again.
+    /// -- said over the felt while the hand cannot go on without it (its turn, a
+    /// stage it owes) and, once it is certified out, until the table is played
+    /// again; never over a hand the others are playing (the owner, 2026-09-14,
+    /// three times).
     #[test]
-    fn the_felt_says_the_wait_on_a_seat_only_while_the_hand_stands_on_it() {
+    fn the_felt_says_the_wait_on_a_seat_only_while_nothing_is_played() {
         use crate::gui::table::StepState::Now;
         let mut s = AppState::new();
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
@@ -3277,46 +3438,74 @@ mod tests {
         s.apply(NodeEvent::Swept { now_ms: 1 });
         assert!(s.table_view().waits.is_empty(), "nobody away, no panel");
 
-        // Off the line while the others still play the hand: nothing over the felt.
+        // Off the line while another seat is to act: nothing over the felt.
         s.apply(NodeEvent::SeatLink { seat: 0, rtt_ms: None, group: false, quiet_s: Some(22), away: false });
-        s.apply(NodeEvent::HandWaiting { hand_id: 12, seats: vec![2] });
+        s.apply(NodeEvent::NotYourTurn { hand_id: 12, seat: Some(2), elapsed_ms: 0 });
         s.apply(NodeEvent::Swept { now_ms: 2 });
         let v = s.table_view();
         assert!(v.waits.is_empty(), "the others are playing: {:?}", v.waits);
         assert!(v.absent.iter().all(|a| !a.stalls()), "nor the older sentences: {:?}", v.absent);
 
-        // The hand stands on it.
-        s.apply(NodeEvent::HandWaiting { hand_id: 12, seats: vec![0] });
+        // Its turn: the hand stands on it.
+        s.apply(NodeEvent::NotYourTurn { hand_id: 12, seat: Some(0), elapsed_ms: 0 });
         let v = s.table_view().waits;
-        assert_eq!(v.len(), 1, "the hand stands on the founder");
+        assert_eq!(v.len(), 1);
         assert_eq!(v[0].title, "Waiting for Founder");
         assert_eq!(v[0].panel.steps[1].0, Now, "on its clock: {:?}", v[0].panel.steps);
         s.apply(NodeEvent::TimeoutVotes { seat: 0, held: 1, need: 2 });
         let v = s.table_view().waits;
-        assert!(v[0].panel.steps.iter().any(|(st, t)| *st == Now && t.contains("1 of 2")), "{:?}", v[0].panel.steps);
+        assert!(v[0].panel.steps.iter().any(|(st, t)| *st == Now && t.contains("act for it – 1 of 2")), "{:?}", v[0].panel.steps);
 
-        // Certified out: the hand goes on, and only the log says so.
+        // Certified out: said until the table is played again -- here the turn at a
+        // seat on the line.
         s.apply(NodeEvent::SeatCertified { seat: 0 });
-        assert!(s.table_view().waits.is_empty(), "the hand goes on without it");
+        let v = s.table_view().waits;
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].title, "The table goes on without Founder", "not gone before anything moves");
         assert!(
             s.table_log.iter().any(|l| l.text == "Founder is certified out of this hand; the table plays on without it"),
             "{:?}",
             s.table_log
         );
+        s.apply(NodeEvent::NotYourTurn { hand_id: 12, seat: Some(2), elapsed_ms: 0 });
+        assert!(s.table_view().waits.is_empty(), "the hand is played again: nothing over it");
+
+        // The cards need its part: the hand stands on it again, and the other seats
+        // end the hand.
+        s.apply(NodeEvent::NotYourTurn { hand_id: 12, seat: None, elapsed_ms: 0 });
+        s.apply(NodeEvent::StageStands { hand_id: 12, seats: vec![0] });
+        let v = s.table_view().waits;
+        assert_eq!(v[0].title, "Waiting for Founder");
+        assert_eq!(v[0].panel.steps[1], (Now, "The cards cannot move on without it".to_string()));
+        s.apply(NodeEvent::TimeoutVotes { seat: 0, held: 1, need: 2 });
+        let v = s.table_view().waits;
+        assert!(v[0].panel.steps.iter().any(|(st, t)| *st == Now && t.contains("end the hand – 1 of 2")), "{:?}", v[0].panel.steps);
+
+        // The hand called off: said until the next hand's cards are out.
+        s.apply(NodeEvent::HandEnded { hand_id: 12, stacks: vec![], shown: vec![], pots: vec![], gained: vec![] });
+        s.apply(NodeEvent::StageStands { hand_id: 12, seats: vec![] });
         s.apply(NodeEvent::Swept { now_ms: 3 });
-        assert!(s.table_view().waits.is_empty(), "and not again while it stays away");
+        let v = s.table_view().waits;
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].title, "The table goes on without Founder");
+        assert_eq!(v[0].panel.steps[3], (Now, "The next hand is dealt without it".to_string()));
         s.apply(NodeEvent::SeatLeft { seat: 0, quit: false });
         s.apply(NodeEvent::HandBegan { hand_id: 13, button: 2, dealt_in: vec![1, 2], small_blind: 100, big_blind: 200 });
         s.apply(NodeEvent::Swept { now_ms: 4 });
-        assert!(s.table_view().waits.is_empty() && s.waits.is_empty(), "a hand dealt without it waits for nobody");
+        assert_eq!(s.table_view().waits.len(), 1, "dealt, but no card is out yet");
+        s.apply(NodeEvent::CardsDealt { hand_id: 13, seats: vec![1, 2] });
+        s.apply(NodeEvent::HoleCards { hand_id: 13, cards: [12, 13] });
+        assert!(s.table_view().waits.is_empty(), "the next hand is being played");
+        s.apply(NodeEvent::Swept { now_ms: 5 });
+        assert!(s.waits.is_empty(), "and nothing kept: {:?}", s.waits);
 
-        // Its way back: at its seat and in the log, never over the hand.
+        // Its way back: at its seat and in the log, never over the felt.
         s.apply(NodeEvent::SeatLink { seat: 0, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         s.apply(NodeEvent::SitInAsked { seat: 0, hand_id: 20 });
         s.apply(NodeEvent::ReturnVotes { seat: 0, held: 1, need: 2 });
-        s.apply(NodeEvent::Swept { now_ms: 5 });
+        s.apply(NodeEvent::Swept { now_ms: 6 });
         let v = s.table_view();
-        assert!(v.waits.is_empty(), "not over the hand being played: {:?}", v.waits);
+        assert!(v.waits.is_empty(), "not over the felt: {:?}", v.waits);
         assert!(v.seats.iter().any(|x| x.seat == 0 && x.coming_back), "said at its seat");
         assert!(s.table_log.iter().any(|l| l.text == "Founder asks to sit in after hand #20"), "{:?}", s.table_log);
         s.apply(NodeEvent::SitInAsked { seat: 0, hand_id: 20 });
@@ -3330,9 +3519,9 @@ mod tests {
     }
 
     /// `D-058`, the owner's rule: nothing over a hand that is being played -- the
-    /// votes to act for a seat still heard stand the hand and are the running
-    /// hand's alone, and a return that goes quiet is not said at its seat past the
-    /// hand after the one it was last heard at.
+    /// votes about a seat still heard are said only while its turn stands, and a
+    /// return that goes quiet is not said at its seat past the hand after the one
+    /// it was last heard at.
     #[test]
     fn no_wait_is_said_over_a_table_that_plays_on() {
         let mut s = AppState::new();
@@ -3346,16 +3535,19 @@ mod tests {
         s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         s.apply(NodeEvent::HandBegan { hand_id: 5, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
 
+        s.apply(NodeEvent::NotYourTurn { hand_id: 5, seat: Some(2), elapsed_ms: 0 });
         s.apply(NodeEvent::TimeoutVotes { seat: 2, held: 1, need: 2 });
         s.apply(NodeEvent::Swept { now_ms: 1 });
         let v = s.table_view().waits;
-        assert_eq!(v.len(), 1, "the hand stands on the votes");
+        assert_eq!(v.len(), 1, "its turn stands on the votes");
         assert_eq!(v[0].title, "Waiting for b");
-        s.apply(NodeEvent::HandBegan { hand_id: 6, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::NotYourTurn { hand_id: 5, seat: Some(0), elapsed_ms: 0 });
+        assert!(s.table_view().waits.is_empty(), "it acted after all: the votes are spent");
         s.apply(NodeEvent::Swept { now_ms: 2 });
-        assert!(s.table_view().waits.is_empty() && s.waits.is_empty(), "{:?}", s.waits);
+        assert!(s.waits.is_empty(), "{:?}", s.waits);
 
         let coming_back = |s: &AppState| s.table_view().seats.iter().any(|x| x.seat == 0 && x.coming_back);
+        s.apply(NodeEvent::HandBegan { hand_id: 6, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::SeatLink { seat: 0, rtt_ms: None, group: false, quiet_s: Some(40), away: false });
         s.apply(NodeEvent::SeatCertified { seat: 0 });
         s.apply(NodeEvent::SitInAsked { seat: 0, hand_id: 6 });

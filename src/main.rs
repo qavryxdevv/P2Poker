@@ -178,8 +178,9 @@ fn main() {
     // says the table is not safe (D-051); `--preview-winner` ends the hand with
     // the winners' words blinking at their seats (D-052); `--preview-rejoin`
     // shows the way back half done and `--preview-rejoin-back` over (D-057);
-    // `--preview-waits` the table waiting on a seat and `--preview-waits-back`
-    // that seat on its way back (D-058).
+    // `--preview-waits` the table waiting on a seat, `--preview-waits-gap` the
+    // table going on without it and `--preview-waits-back` that seat on its way
+    // back (D-058).
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -1421,9 +1422,26 @@ fn preview_table(args: &[String]) {
                     (Done, "Carol stopped answering".into()),
                     (Done, "The hand waits on its clock".into()),
                     (Now, "The other seats agree to act for it – 1 of 2".into()),
-                    (Later, "Certified out: the hand goes on without it".into()),
+                    (Later, "Certified out: the table checks or folds for it".into()),
                 ],
-                detail: Some("A seat's clock ran out; when every other seat agrees, the table acts for it and the hand goes on".into()),
+                detail: Some("Its clock ran out; when every other seat agrees, the table checks or folds for it and the hand goes on".into()),
+                back: false,
+            },
+        }];
+    }
+    if has("--preview-waits-gap") {
+        use table::StepState::{Done, Now};
+        view.waits = vec![table::WaitView {
+            title: "The table goes on without Carol".into(),
+            panel: table::RejoinView {
+                for_s: 64,
+                steps: vec![
+                    (Done, "Carol stopped answering".into()),
+                    (Done, "Certified out of hand #128".into()),
+                    (Done, "Hand #128 finishes without it".into()),
+                    (Now, "The next hand is dealt without it".into()),
+                ],
+                detail: Some("The table goes on without Carol; it can come back at a later hand. Nothing here is stuck".into()),
                 back: false,
             },
         }];
