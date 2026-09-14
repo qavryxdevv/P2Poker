@@ -473,7 +473,7 @@ pub fn joining_window(ctx: &egui::Context, j: &super::lobby::JoiningView) -> Opt
                     });
                     // A frame every few hundred milliseconds keeps the spinner
                     // turning and the seconds honest.
-                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                    crate::gui::table::paint_again(ctx, std::time::Duration::from_millis(250));
                     if ui.button("Cancel").clicked() {
                         action = Some(LobbyAction::CancelJoin);
                     }

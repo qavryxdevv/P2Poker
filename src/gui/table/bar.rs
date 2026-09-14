@@ -359,7 +359,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &TableView, state: &mut TableUi
     }
     let blocked = time < state.call_blocked_until;
     if blocked {
-        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((state.call_blocked_until - time).max(0.05)));
+        super::paint_again(ui.ctx(), std::time::Duration::from_secs_f64((state.call_blocked_until - time).max(0.05)));
     }
 
     let fold_text = if n.armed && !n.my_turn && n.can_check { "Check /\nFold".to_owned() } else { "Fold".to_owned() };
@@ -380,7 +380,7 @@ pub fn draw(ui: &mut egui::Ui, rect: Rect, view: &TableView, state: &mut TableUi
         if r.on_hover_text("Show your cards instead of mucking them").clicked() {
             action = Some(TableAction::ShowCards);
         }
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        super::paint_again(ui.ctx(), std::time::Duration::from_millis(250));
         return action;
     }
     // `D-049`: sitting out, the three buttons give way to the one that ends it.

@@ -417,6 +417,83 @@ pub fn ordinal(n: usize) -> String {
 /// PokerTH's winner blink (`gametableimpl.cpp`, `postRiverRunAnimation5`):
 /// ten steps of `winnerBlinkSpeed`, the highlight hidden on the even ones,
 /// then steady. `age` is seconds since the winner was known.
+/// `D-056`: the fastest this window ever redraws itself, and the one place that
+/// decides it.
+///
+/// **The owner, 2026-09-14**: *a limit of 25 frames a second -- it is needless
+/// load on the GPU, this is not a first-person shooter.* Twenty-five is what
+/// film has run at for a century and it is far above what a chip sliding across
+/// a felt or a badge blinking needs to read as motion.
+///
+/// The number that matters is not the frame rate but the **count of repaints**,
+/// because `main.rs` measured what one costs: about 4 ms through a graphics
+/// driver and about 500 ms on the software rasteriser. Left at the display's
+/// own rate an animation asked for 60 to 144 of them a second; at 144 that is
+/// well over half a core on a card, and unbounded on a machine without one.
+pub const FRAME: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// `D-056`: the cap on a machine with **no graphics driver**.
+///
+/// `main.rs` measured both: one repaint is about 4 ms through a driver and
+/// about **500 ms** on the software rasteriser -- three orders of magnitude,
+/// because a processor is shading 900 000 pixels. Asking such a machine for
+/// twenty-five frames a second asks for the impossible and costs everything it
+/// has: the next frame is due long before the last one is finished, which is
+/// the 660 % of a core this project has already measured once. Four frames a
+/// second is what it can actually deliver, and an animation there is a
+/// slideshow either way -- the choice is between a slideshow and a locked
+/// window.
+pub const FRAME_SOFTWARE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// `D-056`: whether this process is drawing without a graphics driver.
+///
+/// A process-wide fact, decided once before the window opens and never again:
+/// `main.rs` settles the renderer and says so here. A global rather than a
+/// parameter because every painting function in this module would otherwise
+/// carry it, and a fact that cannot change is not worth threading through
+/// forty signatures.
+static NO_GPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `D-056`: said by `main.rs` when it has settled which rasteriser draws.
+pub fn drawing_without_a_gpu(yes: bool) {
+    NO_GPU.store(yes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The floor this window will not ask for frames faster than.
+fn frame_floor() -> std::time::Duration {
+    if NO_GPU.load(std::sync::atomic::Ordering::Relaxed) {
+        FRAME_SOFTWARE
+    } else {
+        FRAME
+    }
+}
+
+/// `D-056`: how fast this window redraws when the player is looking at
+/// something else.
+///
+/// A table left open behind another window still has a clock ticking and chips
+/// flying, and nobody is watching either. Five frames a second keeps the state
+/// honest for the moment the player comes back and costs a fifth of what
+/// watching it does.
+pub const FRAME_UNFOCUSED: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// `D-056`: ask for the next frame, no sooner than the cap allows.
+///
+/// Every animation in this window goes through here rather than calling
+/// `request_repaint` itself, so the cap is one decision in one place and cannot
+/// be forgotten at a call site. A minimised window asks for nothing at all: it
+/// has no pixels, and whatever it would have drawn is drawn when it comes back.
+pub fn paint_again(ctx: &egui::Context, after: std::time::Duration) {
+    let (focused, minimised) = ctx.input(|i| {
+        (i.focused, i.viewport().minimized.unwrap_or(false))
+    });
+    if minimised {
+        return;
+    }
+    let floor = if focused { frame_floor() } else { FRAME_UNFOCUSED.max(frame_floor()) };
+    ctx.request_repaint_after(after.max(floor));
+}
+
 pub const WINNER_BLINK_STEP: f64 = 0.21;
 pub fn winner_blink_on(age: f64) -> bool {
     if !(0.0..WINNER_BLINK_STEP * 10.0).contains(&age) {
@@ -712,12 +789,16 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi, settings: 
         action = a;
     }
 
+    // `D-056`: the chips in flight and the badge that has just popped are the
+    // only two things here that move every frame, and both read the same at
+    // twenty-five as at a hundred and forty-four. A clock ticks slowly enough
+    // to be drawn ten times a second.
     if state.motion.active(now) {
-        ui.ctx().request_repaint();
+        paint_again(ui.ctx(), FRAME);
     } else if view.seats.iter().any(|s| s.clock.is_some()) {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        paint_again(ui.ctx(), std::time::Duration::from_millis(100));
     } else if state.badge_changed.iter().any(|(_, _, t)| now - *t < 0.3) {
-        ui.ctx().request_repaint();
+        paint_again(ui.ctx(), FRAME);
     }
     action
 }
@@ -973,7 +1054,7 @@ fn seat_box(
         };
         let age = now - since;
         if age < WINNER_BLINK_STEP * 10.0 {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
+            paint_again(ui.ctx(), FRAME);
         }
         winner_blink_on(age)
     };
@@ -1334,7 +1415,7 @@ fn overlays(ui: &egui::Ui, p: &egui::Painter, zone: Rect, view: &TableView) {
             let text = if sentence.ends_with('.') { sentence.to_string() } else { format!("{sentence}.") };
             style::text(p, pos2(rect.center().x, rect.top() + 38.0 + 18.0 * i as f32), Align2::CENTER_CENTER, &text, 12.5, Weight::Regular, style::PANEL_TEXT);
         }
-        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        paint_again(ui.ctx(), std::time::Duration::from_secs(1));
     }
     if view.line.is_none() && !view.absent.is_empty() {
         let mut lines: Vec<String> = Vec::new();
@@ -1362,7 +1443,7 @@ fn overlays(ui: &egui::Ui, p: &egui::Painter, zone: Rect, view: &TableView) {
         for (i, s) in lines.iter().enumerate() {
             style::text(p, pos2(rect.center().x, rect.top() + 32.0 + 16.0 * i as f32), Align2::CENTER_CENTER, s, 11.5, Weight::Regular, style::PANEL_TEXT);
         }
-        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        paint_again(ui.ctx(), std::time::Duration::from_secs(1));
     }
 }
 
@@ -1473,7 +1554,7 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                     }
                 });
             });
-        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        paint_again(&ctx, std::time::Duration::from_secs(1));
     }
 
     // `D-047`: this seat is out of the table for good.
@@ -1541,7 +1622,7 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
     // looked at first.
     if let Some(f) = view.finished.filter(|_| !state.finish_closed && view.out_for_good.is_none()) {
         if f.show_in_ms > 0 {
-            ctx.request_repaint_after(std::time::Duration::from_millis(f.show_in_ms));
+            paint_again(&ctx, std::time::Duration::from_millis(f.show_in_ms));
         } else {
             let won = f.place == 1;
             egui::Window::new(if won { "Winner" } else { "Out of chips" })
@@ -2131,4 +2212,38 @@ mod tests {
         assert!(pop_scale(0.0) < 0.7);
         assert!(pop_scale(0.11) > 1.1);
     }
+    /// `D-056`: the window asks for frames at a bounded rate, and the bound
+    /// follows the rasteriser that has to draw them.
+    ///
+    /// **The owner, 2026-09-14**: *a limit of 25 frames a second -- it is
+    /// needless load on the GPU, this is not a first-person shooter* -- and
+    /// *the same for the CPU renderer on machines where GPU acceleration cannot
+    /// be reached*. The two cannot be the same number: `main.rs` measured one
+    /// repaint at about 4 ms through a graphics driver and about 500 ms on the
+    /// software rasteriser, and asking the second for twenty-five a second asks
+    /// for twelve times what it can do -- which is how this project once
+    /// measured 660 % of a core in an idle window.
+    #[test]
+    fn the_window_asks_for_frames_at_a_bounded_rate() {
+        assert_eq!(FRAME.as_millis(), 40, "twenty-five a second, the owner's number");
+        assert_eq!(FRAME_SOFTWARE.as_millis(), 250, "four a second where one costs half of one");
+        assert!(FRAME_SOFTWARE > FRAME, "a machine without a driver is asked for less, never more");
+        assert!(FRAME_UNFOCUSED >= FRAME, "a window nobody is looking at is never asked for more");
+
+        // The floor follows the rasteriser, and `main.rs` is what sets it.
+        drawing_without_a_gpu(false);
+        assert_eq!(frame_floor(), FRAME);
+        drawing_without_a_gpu(true);
+        assert_eq!(frame_floor(), FRAME_SOFTWARE);
+        drawing_without_a_gpu(false);
+
+        // Every animation of this window is bounded by it, including the ones
+        // that ask for a frame "now": the blink, the chips in flight and the
+        // badge that has just popped all pass `FRAME`, and the drain wake
+        // passes zero -- which the floor lifts.
+        assert!(std::time::Duration::ZERO.max(FRAME) == FRAME);
+        assert!(std::time::Duration::from_secs(1).max(FRAME).as_secs() == 1,
+            "and a slow clock is not sped up to the cap");
+    }
+
 }

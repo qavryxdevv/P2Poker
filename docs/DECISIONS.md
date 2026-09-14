@@ -4787,3 +4787,33 @@ library validates the params, and the settled-score arithmetic of the table abov
 first-seen, the held table survives both the bound and an expiry sweep, and goes back into the rotation when the
 player leaves) and `::a_full_window_gives_up_only_so_many_rows_a_minute` (the pace applies only to a full window, a
 minute has its own share, and a row already shown is refreshed whatever the pace).
+
+
+## D-056 — the window asks for frames at a bounded rate, and the bound follows the rasteriser
+
+**Decided 2026-09-14, the owner's ruling** (*"a co udělat limit fps na 25 snímků za vteřinu (zbytečná zátěž na GPU
+teď), to není FPS online hra"*, then *"všeobecně optimalizovat GUI proti žraní GPU"* and *"a to samé pro CPU render
+pro to GUI na strojích s nedosažitelnou GPU akcelerací"*).
+
+1. **Twenty-five frames a second, and one place decides it.** `gui::table::paint_again` is the only way anything in
+   this window asks to be drawn again; every animation clock goes through it -- the chips in flight, the badge that
+   has just popped, the winner's blink, the seat clocks, the spinner in the lobby, the *Show cards* countdown, and
+   the wake that comes back for the rest of a burst of events. Two of those used to call `request_repaint` outright,
+   which is the display's own rate: at 144 Hz that is well over half a core of repaints for a chip sliding across a
+   felt, and it reads exactly the same at 25.
+2. **The number that matters is the count of repaints, not the frame rate**, and this project has already measured
+   what one costs: about **4 ms** through a graphics driver and about **500 ms** on the software rasteriser
+   (`main.rs`'s own table, and the 660 % of a core it once cost). So the cap cannot be one number:
+   `FRAME` is 40 ms where there is a driver and `FRAME_SOFTWARE` is 250 ms where there is not -- asking a machine
+   that needs half a second a frame for twenty-five of them is asking for twelve times what it has, and the next
+   frame is then always due before the last is finished.
+3. **A window nobody is looking at is asked for less** (`FRAME_UNFOCUSED`, five a second): a table left open behind
+   another window still has a clock ticking and chips flying and nobody watching either. **A minimised window is
+   asked for nothing at all** -- it has no pixels, and what it would have drawn is drawn when it comes back.
+4. **The slow clocks are not sped up.** The cap is a floor on the interval, never a ceiling: a once-a-second clock
+   stays once a second, and only what asked for *more* than the cap is slowed to it.
+5. `main.rs` says which rasteriser it settled on (`drawing_without_a_gpu`) before the window opens. A process-wide
+   fact decided once, rather than a parameter threaded through forty painting signatures.
+
+**Guard.** `gui::table::tests::the_window_asks_for_frames_at_a_bounded_rate` (both caps, their order, that the
+floor follows the rasteriser, and that a slow clock is not sped up).

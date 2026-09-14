@@ -1048,6 +1048,10 @@ fn windowed(player: Player, run: Run) -> Started {
                     Draw::Software => "software",
                 }
             );
+            // `D-056`: and the window's frame cap follows the rasteriser. One
+            // repaint is 4 ms through a driver and half a second without one,
+            // so the two cannot be asked for frames at the same rate.
+            p2p_poker::gui::table::drawing_without_a_gpu(draw == Draw::Software);
             render::install(&cc.egui_ctx);
             // PokerTH's Inter, at the weights the table's pieces ask for.
             p2p_poker::gui::table::style::install_fonts(&cc.egui_ctx);
@@ -1837,7 +1841,11 @@ impl eframe::App for Client {
         // 64 would sit there, unread, until something else happened. A hand
         // beginning inside such a burst would simply not be drawn.
         if !self.drain() {
-            ctx.request_repaint();
+            // `D-056`: come back for the rest of the burst, but at the frame
+            // cap rather than at once -- on a machine without a graphics
+            // driver an immediate repaint costs half a second, and the events
+            // are read at the top of the next frame whenever that is.
+            p2p_poker::gui::table::paint_again(&ctx, std::time::Duration::ZERO);
         }
 
         // `S1-CS`: a join nobody answers is called failed on the clock.
