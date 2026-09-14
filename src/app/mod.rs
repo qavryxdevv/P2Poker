@@ -1160,6 +1160,7 @@ impl AppState {
                 stacks,
                 shown,
                 pots,
+                gained,
             } => {
                 // `S1-DG`: a hand that ended without a settlement -- the
                 // deadline, a certificate -- restores every stack to the
@@ -1178,9 +1179,16 @@ impl AppState {
                     stacks
                 };
                 if let Some(h) = self.hand.as_mut().filter(|h| h.hand_id == hand_id) {
-                    // `S1-CS`: what each seat gained is the settlement's figure
-                    // over the engine's last one -- what the chips fly with.
-                    // Nothing flies to anybody when every stack was restored.
+                    // `S1-ER`: what each seat gained is the **engine's** own
+                    // figure -- it read it off the stacks the settlement
+                    // replaced, which is the only place both sides of it are
+                    // certain. `S1-CS` had the window subtract the last state
+                    // it was told from this one, and the node reported a state
+                    // after the settlement in the very call that ends the hand,
+                    // so every difference came out zero: no winner marked at
+                    // any seat, no chips flying and no line in the table's log.
+                    // The difference stays as the fallback, for a hand whose
+                    // engine named no gain.
                     let before: &[u64] = if h.stacks_now.is_empty() {
                         &self.last_stacks
                     } else {
@@ -1188,6 +1196,8 @@ impl AppState {
                     };
                     let won: Vec<u64> = if restored {
                         vec![0; stacks.len()]
+                    } else if gained.iter().any(|g| *g > 0) {
+                        gained
                     } else {
                         stacks
                             .iter()
@@ -2612,7 +2622,7 @@ mod tests {
             hand_id: 1, street: 0, to_call: 20, pot: 50, can_check: false, can_call: true, can_bet: false, can_raise: true, min_raise_to: 40, max_raise_to: 1_000, elapsed_ms: 0,
         });
         assert_eq!(s.turn_seat, Some(0), "our own turn is our own clock");
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         assert_eq!(s.turn_seat, None);
         assert_eq!(s.turn_since, None);
     }

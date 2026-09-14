@@ -955,7 +955,11 @@ fn seat_box(
     let out = seat.sitting_out || seat.left || (seat.stack == 0 && seat.bet == 0 && view.hand > 0 && seat.won == 0 && !seat.cards.iter().any(|c| !matches!(c, Facing::Empty)));
     let opacity = if out { style::DIMMED } else if seat.folded { 0.72 } else { 1.0 };
     let at_turn = seat.clock.is_some() && !view.hand_over;
-    let winner = view.hand_over && seat.won > 0;
+    // `S1-ER`: a winner is a seat the settlement named, and only where it named
+    // nobody does the amount stand in for it (`win_at`). Reading *who won* off
+    // the chips that moved is how every winner went unmarked once the amount
+    // came out zero.
+    let winner = view.hand_over && seat.win.is_some();
     // PokerTH's blink: the winner's highlight and its badge on and off for
     // two seconds, then steady.
     let blink_on = !winner || {

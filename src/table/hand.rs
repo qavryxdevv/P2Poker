@@ -1520,6 +1520,15 @@ pub struct Hand {
     /// the step that carries the body goes with it (`Step::Ended`), and the
     /// window needs to say which pot a winner won.
     settled_pots: Vec<(Chips, Vec<SeatIdx>)>,
+    /// `S1-ER`: what the settlement moved to each seat, by seat.
+    ///
+    /// Taken here, where the stacks before it and the stacks after it are both
+    /// in hand, because this is the only place either is certain. The window
+    /// used to subtract one reported state from another to learn it, and a
+    /// state reported after the settlement -- which is what the node did in the
+    /// call that ends the hand -- made every difference zero and left every
+    /// winner unmarked.
+    settled_gain: Vec<Chips>,
     /// R4: a betting stage certified while this client was elsewhere. The two
     /// chains cannot be reconciled, so this is reported and not repaired.
     forked: Option<String>,
@@ -2015,6 +2024,7 @@ impl Hand {
                 voted_about: BTreeSet::new(),
                 flood_named: BTreeSet::new(),
                 settled_pots: Vec::new(),
+                settled_gain: Vec::new(),
                 forked: None,
                 late: None,
                 bank_left_ms: o.time_bank_ms,
@@ -4894,9 +4904,17 @@ impl Hand {
         };
         // Applied now, and not when it was computed. The stacks in `round` are
         // what every later question reads.
+        //
+        // `S1-ER`: and what each seat gained is read off here, where both sides
+        // of it are in hand -- the stack about to be overwritten and the one
+        // going in.
+        let mut gain: Vec<Chips> = Vec::with_capacity(mine.final_stacks.len());
         for (seat, end) in mine.final_stacks.iter().enumerate() {
             if let Some(slot) = play.round.stack.get_mut(seat) {
+                gain.push(end.saturating_sub(*slot));
                 *slot = *end;
+            } else {
+                gain.push(0);
             }
         }
         // **Held before the step that computed it goes.** `mine.state_hash` is
@@ -4910,6 +4928,7 @@ impl Hand {
             mine.pots.iter().map(|a| (a.size, a.winners.clone())).collect();
         play.step = Step::Ended;
         self.settled_pots = pots;
+        self.settled_gain = gain;
         Ok(Vec::new())
     }
 
@@ -6895,6 +6914,11 @@ impl Hand {
             chained::payload(&opened, HAND_COMPLETE_CAP).map_err(Failed::Wire)?;
 
         let sequence = opened.envelope.sequence;
+        // `S1-ER`: read before `self.late` is borrowed, because what each seat
+        // gained is this against the body's own final stacks, and by the time
+        // the body closes below there is no way back to it. Empty where this
+        // client is no longer playing the hand, and then nothing is claimed.
+        let stacks_before = self.stacks();
         if self.late.is_none() {
             let stage = Collective::closed(
                 sequence,
@@ -7007,6 +7031,20 @@ impl Hand {
                 // window says the pots from, the late road included.
                 self.settled_pots =
                     late.body.pots.iter().map(|a| (a.size, a.winners.clone())).collect();
+                // `S1-ER`: and what it moved to each seat, where the stacks
+                // before it are known.
+                self.settled_gain = if stacks_before.is_empty() {
+                    Vec::new()
+                } else {
+                    late.body
+                        .final_stacks
+                        .iter()
+                        .enumerate()
+                        .map(|(s, end)| {
+                            end.saturating_sub(stacks_before.get(s).copied().unwrap_or(*end))
+                        })
+                        .collect()
+                };
                 late.closed = Some((hash, stacks));
                 // The agreed branch used to close in silence, so a run could
                 // show the refusal below and never the adoption, and the
@@ -9486,6 +9524,15 @@ impl Hand {
         &self.settled_pots
     }
 
+    /// `S1-ER`: what the settlement moved to each seat, by seat -- the chips
+    /// that fly to it, the figure in the table's log and the mark of a winner.
+    ///
+    /// Empty until a settlement is applied, and on the aborted road, which
+    /// restores every stack and moves nothing.
+    pub fn settled_gain(&self) -> &[Chips] {
+        &self.settled_gain
+    }
+
     /// `D-051`: whether this hand's certificate named the seat with the flood
     /// cause -- out of the table for good for flooding its carrier group, as
     /// against `D-047`'s fourth absence.
@@ -10849,6 +10896,30 @@ mod tests {
                     "seat {seat} mucked a hand that was not beaten"
                 );
             }
+        }
+
+        // `S1-ER`: what the settlement moved to each seat, which is what the
+        // window marks a winner by. Read off here, where both sides of it are
+        // known -- and **the hand still says its street while it is over**,
+        // which is exactly the trap the node fell into: it reported the table's
+        // state on `street().is_some()`, so after the settlement it reported
+        // the settled stacks and the window's own subtraction came out zero at
+        // every seat.
+        assert_eq!(a.street(), Some(Street::River), "a settled hand still says its street");
+        assert!(a.over(), "and is over: the two questions are not the same one");
+        let gain = a.settled_gain();
+        assert_eq!(gain, b.settled_gain(), "one settlement, one figure");
+        assert_eq!(
+            gain.iter().sum::<u64>(),
+            2 * 100,
+            "what moved is the pot, no more and no less"
+        );
+        for (seat, took) in gain.iter().enumerate() {
+            let named = a
+                .settled_pots()
+                .iter()
+                .any(|(_, winners)| winners.contains(&(seat as u8)));
+            assert_eq!(*took > 0, named, "seat {seat}: chips moved to the seats the pots name");
         }
 
         // And the chips moved, identically on both peers.

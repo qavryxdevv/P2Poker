@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(stacks(&s.table_view()), vec![1_000, 1_000, 1_000]);
         s.apply(state(1, 0, 150, Some(0), &[1_000, 950, 900], &[0, 50, 100], &[false; 3]));
         assert_eq!(stacks(&s.table_view()), vec![1_000, 950, 900], "the engine's figures");
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_150, 950, 900], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_150, 950, 900], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         assert_eq!(stacks(&s.table_view()), vec![1_150, 950, 900], "the settlement's");
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert_eq!(stacks(&s.table_view()), vec![1_150, 950, 900], "and they carry into the next hand");
@@ -525,7 +525,7 @@ mod tests {
         let v = s.table_view();
         assert!(v.seats[2].folded && !v.seats[1].folded);
         assert_eq!(v.street, "flop");
-        s.apply(NodeEvent::HandEnded { hand_id: 3, stacks: vec![900, 1_200, 900], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 3, stacks: vec![900, 1_200, 900], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         let v = s.table_view();
         assert!(v.hand_over);
         assert_eq!(v.seats.iter().map(|x| x.won).collect::<Vec<_>>(), vec![0, 300, 0]);
@@ -564,6 +564,7 @@ mod tests {
                 None,
             ],
             pots: Vec::new(),
+            gained: Vec::new(),
         });
         let v = s.table_view();
         let named = v.seats[0].shown_hand.clone().expect("seat 0 showed, so its hand is named");
@@ -592,7 +593,7 @@ mod tests {
     fn a_hand_ended_without_a_settlement_shows_the_stacks_it_started_with() {
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_100, 900, 1_000], shown: vec![None, None, None], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_100, 900, 1_000], shown: vec![None, None, None], pots: Vec::new(), gained: Vec::new() });
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::TableState {
             hand_id: 2,
@@ -605,7 +606,7 @@ mod tests {
         });
         assert_eq!(s.table_view().seats.iter().map(|x| x.stack).collect::<Vec<_>>(), vec![1_100, 850, 900]);
         // The deadline ends it: no settlement, no stacks reported.
-        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![], shown: vec![None, None, None], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![], shown: vec![None, None, None], pots: Vec::new(), gained: Vec::new() });
         let v = s.table_view();
         assert!(v.hand_over);
         assert_eq!(v.seats.iter().map(|x| x.stack).collect::<Vec<_>>(), vec![1_100, 900, 1_000], "the stacks the hand started with");
@@ -738,7 +739,7 @@ mod tests {
         assert!(s.table_view().note.unwrap().contains("waiting for seat 2"));
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert!(s.table_view().note.unwrap().contains("preparing the deck"));
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         assert!(s.table_view().note.unwrap().contains("is over"));
     }
 
@@ -758,7 +759,7 @@ mod tests {
         let clocks: Vec<Option<f32>> = v.seats.iter().map(|x| x.clock).collect();
         assert!(clocks[2].is_some_and(|c| c > 0.95), "{clocks:?}");
         assert!(clocks[0].is_none() && clocks[1].is_none(), "{clocks:?}");
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         assert!(s.table_view().seats.iter().all(|x| x.clock.is_none()), "no clock once the hand is over");
     }
 
@@ -805,29 +806,29 @@ mod tests {
     fn a_busted_player_is_told_the_place() {
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![600, 1_400, 1_000], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![600, 1_400, 1_000], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         assert_eq!(s.table_view().finished, None, "still in");
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         // Seat 0 (600) and seat 2 (1 000) both lose everything to seat 1.
-        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         let b = s.table_view().finished.expect("the window says the place");
         assert_eq!((b.place, b.players_left), (3, 1), "seat 2 began with more and finishes second");
         assert!(b.show_in_ms > 9_000, "the deciding hand is looked at first: {} ms", b.show_in_ms);
         assert!(s.table_log.iter().any(|l| l.text.contains("finished in 3rd place")));
         // Said once.
-        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         assert_eq!(s.table_log.iter().filter(|l| l.text.contains("finished in")).count(), 1);
 
         // A hand ended without a settlement busts nobody.
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![], shown: vec![], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![], shown: vec![], pots: Vec::new(), gained: Vec::new() });
         assert_eq!(s.table_view().finished, None);
 
         // Out while two others play on: fourth of four, two still in... of three, third.
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 1_900, 1_100], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 1_900, 1_100], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         let b = s.table_view().finished.expect("out");
         assert_eq!((b.place, b.players_left), (3, 2));
     }
@@ -838,10 +839,10 @@ mod tests {
     fn the_winner_is_congratulated() {
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![2_000, 1_000, 0], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![2_000, 1_000, 0], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         assert_eq!(s.table_view().finished, None, "two still hold chips: nobody has won yet");
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![3_000, 0, 0], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![3_000, 0, 0], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         let f = s.table_view().finished.expect("the winner is told");
         assert_eq!((f.place, f.players_left), (1, 1));
         assert!(f.show_in_ms > 9_000, "ten seconds to look at the winning hand: {} ms", f.show_in_ms);
@@ -849,7 +850,7 @@ mod tests {
         // Holding chips while another seat still does is not a win.
         let mut s = seated(1);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 2_500, 500], shown: vec![None; 3], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 2_500, 500], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         assert_eq!(s.table_view().finished, None);
     }
 
@@ -888,6 +889,7 @@ mod tests {
             stacks: vec![1_200, 900, 900],
             shown: vec![None; 3],
             pots: vec![PotEnd { size: 300, winners: vec![0] }],
+            gained: Vec::new(),
         });
         assert_eq!(word(&s, 0), Some("Winner"));
         assert_eq!(word(&s, 1), None, "a seat that won nothing says nothing");
@@ -900,6 +902,7 @@ mod tests {
             stacks: vec![1_050, 1_050, 900],
             shown: vec![None; 3],
             pots: vec![PotEnd { size: 300, winners: vec![0, 1] }],
+            gained: Vec::new(),
         });
         assert_eq!(word(&s, 0), Some("Split pot"));
         assert_eq!(word(&s, 1), Some("Split pot"));
@@ -916,6 +919,7 @@ mod tests {
                 PotEnd { size: 300, winners: vec![1] },
                 PotEnd { size: 200, winners: vec![0] },
             ],
+            gained: Vec::new(),
         });
         assert_eq!(word(&s, 1), Some("Main pot"));
         assert_eq!(word(&s, 0), Some("Side pot"));
@@ -930,9 +934,59 @@ mod tests {
                 PotEnd { size: 300, winners: vec![0, 2] },
                 PotEnd { size: 200, winners: vec![0] },
             ],
+            gained: Vec::new(),
         });
         assert_eq!(word(&s, 0), Some("Main + side"), "both pots");
         assert_eq!(word(&s, 2), Some("Split main"), "and its share of the main");
+    }
+
+    /// `S1-ER`: the winner is named from the settlement's own figures, and a
+    /// state reported **after** the settlement cannot blank it.
+    ///
+    /// This is the shape that was live: the node's own `report_hand` sends the
+    /// table's state and then, in the same call, `HandEnded` -- and once the
+    /// hand was over that state already held the settled stacks. The window
+    /// read what each seat took as the difference between the two, so it came
+    /// out zero at every seat: nobody marked a winner, no chips flew and the
+    /// table's log said nothing. The tests above never saw it because they
+    /// applied `HandEnded` to a window that had been told no state at all.
+    #[test]
+    fn the_winner_survives_a_state_reported_after_the_settlement() {
+        use crate::net::node::PotEnd;
+        // Seat 1 takes a 300 pot: 900 behind before the settlement, 1 200 after.
+        let ended = |gained: Vec<u64>| NodeEvent::HandEnded {
+            hand_id: 1,
+            stacks: vec![900, 1_200, 900],
+            shown: vec![None; 3],
+            pots: vec![PotEnd { size: 300, winners: vec![1] }],
+            gained,
+        };
+        let running = state(1, 3, 300, None, &[900, 900, 900], &[0, 0, 0], &[false; 3]);
+        // What the node reported after the settlement: the settled stacks.
+        let settled = state(1, 3, 0, None, &[900, 1_200, 900], &[0, 0, 0], &[false; 3]);
+
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(running.clone());
+        s.apply(settled.clone());
+        s.apply(ended(vec![0, 300, 0]));
+        let v = s.table_view();
+        assert_eq!(v.seats[1].won, 300, "the engine's own figure, not a difference");
+        assert_eq!(v.seats[1].win.map(|w| w.word()), Some("Winner"));
+        assert_eq!(v.seats[0].won, 0, "and nobody else took anything");
+        assert!(
+            s.table_log.iter().any(|l| l.text.contains("wins $300")),
+            "the table's log says what was won: {:?}",
+            s.table_log.iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        );
+
+        // And the node no longer sends that state at all, which is the fix at
+        // its root: the difference is then the right one on its own.
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(running);
+        s.apply(ended(Vec::new()));
+        assert_eq!(s.table_view().seats[1].won, 300, "the last running state is the baseline");
     }
 
     /// `D-051`: the table not safe reaches the window with a serial the

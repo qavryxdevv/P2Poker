@@ -464,7 +464,7 @@ mod tests {
         });
         s.take_sound_cues();
         // Alice showed and won; Bob held his cards to the end and showed none; Carol folded.
-        s.apply(NodeEvent::HandEnded { hand_id: 9, stacks: vec![1_040, 980, 980], shown: vec![Some([12, 25]), None, None], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 9, stacks: vec![1_040, 980, 980], shown: vec![Some([12, 25]), None, None], pots: Vec::new(), gained: Vec::new() });
         let v = s.table_view();
         let act = |seat: u8| v.seats.iter().find(|x| x.seat == seat).and_then(|x| x.act);
         assert_eq!(act(1), Some(SeatAct::Muck), "Bob wears Muck");
@@ -477,7 +477,7 @@ mod tests {
         let mut s = table(&["Alice", "Bob"]);
         s.apply(NodeEvent::HandBegan { hand_id: 10, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::CardsDealt { hand_id: 10, seats: vec![0, 1] });
-        s.apply(NodeEvent::HandEnded { hand_id: 10, stacks: vec![1_010, 990], shown: vec![None, None], pots: Vec::new() });
+        s.apply(NodeEvent::HandEnded { hand_id: 10, stacks: vec![1_010, 990], shown: vec![None, None], pots: Vec::new(), gained: Vec::new() });
         assert!(!texts(&s).iter().any(|l| l.ends_with("mucks.")));
     }
 
@@ -500,7 +500,8 @@ mod tests {
         s.apply(NodeEvent::HandEnded {
             hand_id: 9,
             stacks: vec![2_000, 0],
-            shown: vec![Some([51, 11]), Some([1, 2])], pots: Vec::new()
+            shown: vec![Some([51, 11]), Some([1, 2])], pots: Vec::new(),
+            gained: Vec::new(),
         });
         let log = texts(&s);
         assert!(log.iter().any(|l| l.starts_with("A shows [") && l.contains("] - \"")), "{log:?}");

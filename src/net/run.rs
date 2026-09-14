@@ -12140,7 +12140,17 @@ async fn report_hand(
     }
 
     // `S1-CS`: the table as the engine has it, before the turn is announced.
-    if let Some(street) = h.street() {
+    //
+    // `S1-ER`: **while the hand runs, and not after it is settled.** The stacks
+    // here are `round`'s, which the settlement has already moved by the time
+    // the hand is over, and this is the *same call* that goes on to send
+    // `HandEnded` with those very stacks. The window reads what each seat took
+    // as the difference between the two, so a state sent after the settlement
+    // made every difference zero: no winner marked at any seat, no chips flying
+    // to it and no line in the table's log. The stacks of a hand that is over
+    // are `HandEnded`'s alone, and leaving the last running state standing also
+    // keeps the pot on the felt for the chips to fly out of.
+    if let Some(street) = h.street().filter(|_| !h.over()) {
         let _ = events
             .send(NodeEvent::TableState {
                 hand_id,
@@ -12213,6 +12223,9 @@ async fn report_hand(
                                 winners: winners.clone(),
                             })
                             .collect(),
+                        // `S1-ER`: and how much, as the engine read it off the
+                        // stacks the settlement replaced.
+                        gained: h.settled_gain().to_vec(),
                     })
                     .await;
                 return Report {

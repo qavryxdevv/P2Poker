@@ -323,6 +323,12 @@ pub enum NodeEvent {
         /// then each side pot, so the window can say which pot a winner won
         /// and whether it was shared.
         pots: Vec<PotEnd>,
+        /// `S1-ER`: what the settlement moved to each seat, by seat, as the
+        /// engine read it off the stacks it replaced. The window used to
+        /// subtract the states it was sent to learn this, and the state sent
+        /// after the settlement made every difference zero. Empty for a hand
+        /// that moved nothing.
+        gained: Vec<u64>,
     },
     /// This client's own two cards, opened from a complete set of verified
     /// shares.
