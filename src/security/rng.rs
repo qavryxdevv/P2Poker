@@ -30,11 +30,12 @@
 //! scanning this crate's source on every test run — so the rule fails the build
 //! rather than living in a document nobody re-reads.
 //!
-//! # The one exemption, and why it is counted rather than allowed
+//! # Exemptions, and why they are counted rather than allowed
 //!
 //! Some library constructors take a **concrete** generator type rather than a
-//! generic one, so there is no way to hand them ours. `libp2p`'s AutoNAT is such
-//! a one: it wants `rand::rngs::OsRng` by name.
+//! generic one, so there is no way to hand them ours. `libp2p`'s AutoNAT was
+//! such a one until `libp2p` 0.57: it wanted `rand::rngs::OsRng` by name, and
+//! its two lines were the only exemptions this tree had.
 //!
 //! Widening the deny-list would be the wrong fix and this module has always said
 //! so. Instead a line may carry the marker [`EXEMPT_MARKER`], and the scan
@@ -42,11 +43,10 @@
 //! fails the build until somebody edits the expected number, which is the point:
 //! it is a visible, deliberate act rather than a quiet one.
 //!
-//! Nothing is weakened cryptographically by the exemption that exists —
-//! `rand::rngs::OsRng` **is** the operating system's CSPRNG, and AutoNAT uses it
-//! for probe nonces. What the rule protects against is a self-seeded or
-//! non-cryptographic generator, and this is neither. The rule still holds; the
-//! exemption is about an API's shape, not about the quality of its randomness.
+//! Since `libp2p` 0.57 there are none. AutoNAT v2's client is generic and is
+//! handed [`OsRng10`]; its server wants a seedable generator and seeds its own
+//! from the operating system when built with `Default` -- a library's internal
+//! nonce source, which this crate neither names nor draws from.
 
 /// The marker a line must carry to be exempt from the source scan.
 ///
@@ -94,6 +94,38 @@ impl rand::RngCore for OsRng {
 }
 
 impl rand::CryptoRng for OsRng {}
+
+/// The same OS CSPRNG through `rand_core` 0.10's infallible generator trait,
+/// which is what `rand 0.10` libraries take.
+///
+/// `libp2p` 0.57's AutoNAT v2 client is one, and its constructor is generic, so
+/// it is handed this and no generator of its own. Like [`OsRng`], a zero-sized
+/// handle on [`fill`] that panics when the OS source is unavailable.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OsRng10;
+
+impl rand_core::TryRng for OsRng10 {
+    type Error = core::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut b = [0u8; 4];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut b = [0u8; 8];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        fill(dest).expect("the operating system CSPRNG is unavailable");
+        Ok(())
+    }
+}
+
+impl rand_core::TryCryptoRng for OsRng10 {}
 
 
 use rand_core::TryRng;
@@ -221,7 +253,7 @@ mod tests {
         // hole in it and a rule with a door.
         assert_eq!(
             exemptions.len(),
-            2,
+            0,
             "the exemptions are counted so that adding one is deliberate; found:\n  {}",
             exemptions.join("\n  ")
         );

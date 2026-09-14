@@ -56,6 +56,9 @@ if (-not $Remove) {
     if ($rest -match "(?m)^\s*\[target\.'cfg\(all\(\)\)'\]") {
         throw "$config already has a [target.'cfg(all())'] table of its own: add the flags to its rustflags by hand"
     }
+    if ($rest -match "(?m)^\s*\[env\]") {
+        throw "$config already has an [env] table of its own: add CFLAGS = '/d1trimfile:$($env:USERPROFILE)\' to it by hand"
+    }
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add($begin)
     $lines.Add("[target.'cfg(all())']")
@@ -65,6 +68,13 @@ if (-not $Remove) {
         $lines.Add("    '--remap-path-prefix=$($m[0])=$($m[1])',")
     }
     $lines.Add(']')
+    # S1-FF: and C. MSVC keeps each C file's __FILE__ -- AWS-LC's, under the cargo
+    # home, since libp2p 0.57 -- and /d1trimfile: cuts the prefix. The cc builds of
+    # every build script read CFLAGS; build.rs refuses a release without it.
+    if ($env:USERPROFILE.Contains("'")) { throw "a profile path with a quote in it cannot be a TOML literal string: $env:USERPROFILE" }
+    $lines.Add('')
+    $lines.Add('[env]')
+    $lines.Add("CFLAGS = '/d1trimfile:$($env:USERPROFILE)\'")
     $lines.Add($end)
     $block = $lines -join "`n"
     $rest = if ($rest) { $rest + "`n`n" + $block } else { $block }

@@ -24,7 +24,6 @@
 
 use std::io;
 
-use async_trait::async_trait;
 use futures::prelude::*;
 use libp2p::{request_response, StreamProtocol};
 
@@ -77,7 +76,6 @@ where
     io.close().await
 }
 
-#[async_trait]
 impl request_response::Codec for JoinCodec {
     type Protocol = StreamProtocol;
     type Request = Frame;

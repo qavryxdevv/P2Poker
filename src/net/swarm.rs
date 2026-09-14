@@ -350,7 +350,7 @@ pub struct PokerBehaviour {
     pub ping: ping::Behaviour,
     /// Asks other peers whether this client is reachable, which is what decides
     /// [`RelayRole`].
-    pub autonat_client: autonat::v2::client::Behaviour,
+    pub autonat_client: autonat::v2::client::Behaviour<crate::security::rng::OsRng10>,
     /// Answers the same question for others.
     pub autonat_server: autonat::v2::server::Behaviour,
     /// Direct connection upgrade: the hole punch that turns a relayed
@@ -587,21 +587,18 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
                 ipfs_kad: Bogonless::new(ipfs_kad),
                 identify,
                 ping: ping::Behaviour::new(ping::Config::new()),
-                // AutoNAT's constructor names the concrete OS generator type
-                // from the `rand` crate rather than taking a generic, so this
-                // crate's own handle cannot be passed. Nothing is weakened -
-                // that type **is** the operating system CSPRNG and the value is
-                // a probe nonce - and the two exemptions below are counted by
-                // `security::rng`'s source scan, so a third fails the build.
+                // Since `libp2p` 0.57 AutoNAT's client takes any generator, so it
+                // is handed this crate's own OS handle; its server wants a
+                // seedable one and seeds its own from the operating system when
+                // built with `Default`. No exemption from `security::rng`'s scan
+                // is left (there were two).
                 autonat_client: autonat::v2::client::Behaviour::new(
-                    // RNG-EXEMPT
-                    rand::rngs::OsRng,
+                    crate::security::rng::OsRng10,
                     autonat::v2::client::Config::default()
                         .with_probe_interval(Duration::from_secs(30))
                         .with_max_candidates(8),
                 ),
-                // RNG-EXEMPT: as above.
-                autonat_server: autonat::v2::server::Behaviour::new(rand::rngs::OsRng),
+                autonat_server: autonat::v2::server::Behaviour::default(),
                 dcutr: dcutr::Behaviour::new(local_peer_id),
                 relay_client,
                 relay_server: relay::Behaviour::new(local_peer_id, relay_config(relay_role)),

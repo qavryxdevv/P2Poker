@@ -73,12 +73,13 @@ corrected in place and the correction is recorded in §9.7.
 
 | Figure | Value | How |
 |---|---|---|
-| Crates **compiled into the client** | **461** | `cargo tree --edges normal`, unique name+version, minus `p2p-poker` itself |
-| Crates **recorded in `Cargo.lock`** | **659** | `[[package]]` entries, minus `p2p-poker` itself |
-| Locked but never compiled | **198** | the difference |
+| Crates **compiled into the client** | **442** | `cargo tree --edges normal --target x86_64-pc-windows-msvc`, unique name+version, minus `p2p-poker` itself |
+| Crates **recorded in `Cargo.lock`** | **645** | `[[package]]` entries, minus `p2p-poker` itself |
+| Locked but never compiled | **203** | the difference |
 
-**Re-measured 2026-08-31.** The compiled figure was right; the other two were not,
-and had been 646 / 185. `tests/corpus_dependencies.rs` now measures all three on
+**Re-measured 2026-09-14, after `libp2p` 0.57** (`S1-FF`): 442 / 645 / 203, where the
+2026-08-31 figures were 461 / 659 / 198. **Re-measured 2026-08-31** before that: the
+compiled figure was right; the other two were not, and had been 646 / 185. `tests/corpus_dependencies.rs` now measures all three on
 every `cargo test`, so the next reader gets a failure rather than a number.
 
 `cargo audit` counts the root package too, so its figure is one higher than the
@@ -231,7 +232,13 @@ rating above: one author, one release, unaudited, and its own README says not to
 for non-trivial money. Vendoring freezes bytes; that is the whole claim. See §8, and
 §11 for the fallback if the bytes ever have to be replaced.
 
-### 3.2 `hickory-proto 0.25.2` — two open advisories, one with no fix
+### 3.2 `hickory-proto 0.25.2` — two open advisories, one with no fix. **Spent 2026-09-14: `libp2p` 0.57 moved to `hickory` 0.26.3**
+
+> **Both advisories left the lockfile with the 0.25 line** (`S1-FF`). `libp2p` 0.57's
+> `libp2p-dns` 0.45 and `libp2p-mdns` 0.49 depend on `hickory` 0.26, and the lockfile holds
+> `hickory-proto` and `hickory-resolver` 0.26.3: outside RUSTSEC-2026-0118's affected range
+> and past RUSTSEC-2026-0119's fix (`>= 0.26.1`). The entry is kept as written below: it is
+> the reasoning the acceptance rested on for as long as it stood.
 
 | | |
 |---|---|
@@ -343,11 +350,11 @@ optional `dcbor` **dev**-dependency. It arrives unconditionally with ziffle, so 
 treats it as a warning (exit 0); `cargo deny check advisories` treats unmaintained as
 a failure unless it is explicitly ignored.
 
-### 3.5 `libp2p-stream 0.4.0-alpha` — semver-exempt, no stable release
+### 3.5 `libp2p-stream 0.5.0-alpha` — semver-exempt, no stable release
 
 An `-alpha` pre-release. Cargo's semver rules do not apply to it: any republish may
 change the API or the behaviour with no version signal, and there is no compatibility
-promise to appeal to. The newest published version is still `0.4.0-alpha`; crates.io
+promise to appeal to. `libp2p` 0.57 needed `0.5.0-alpha`, the newest published; crates.io
 reports **no stable version at all** (`max_stable_version: null`). **(c)**
 
 It is also not re-exported by the `libp2p` umbrella, so it is the **one deliberate
@@ -424,6 +431,25 @@ this dependency; it left with it.
 ---
 
 ## 4. Open advisories — the complete `cargo audit` result
+
+**Re-run 2026-09-14 against `Cargo.lock`, after `libp2p` 0.57 and `rustls` 0.23.45, 1 246
+advisories loaded, 646 lockfile packages scanned. This is the whole output. (a)**
+
+```
+Scanning Cargo.lock for vulnerabilities (646 crate dependencies)
+paste         1.0.15  RUSTSEC-2024-0436  Warning: unmaintained
+warning: 1 allowed warning found
+```
+
+**`cargo audit` exits zero for the first time since this register was written.** Both
+`hickory-proto` rows are spent (§3.2), and so is the advisory GitHub raised on `yamux`
+0.12.1 (GHSA-vxx9-2994-q338, a remote panic on a malformed data frame, fixed `>= 0.13.10`):
+`libp2p-yamux` 0.48 links one major, `yamux` 0.14.0. One advisory appeared the same day and
+was fixed before it was ever in a release: **RUSTSEC-2026-0285** on `rustls` 0.23.43 (TLS 1.3
+handshake messages accepted across encryption-level boundaries, fixed `>= 0.23.45`), taken by
+`cargo update -p rustls`. The earlier runs are kept below as they stood.
+
+> **Superseded 2026-09-14** -- the rest of this section describes the 0.56 tree.
 
 **Re-run 2026-08-31 against `Cargo.lock`, 1 233 advisories loaded, 660 lockfile
 packages scanned. This is the whole output, not a selection. (a)** The count matches
@@ -622,33 +648,30 @@ no open advisory) is a proc-macro and is counted with the unregistered remainder
 | `universal-hash` | 0.6.1 | universal-hash traits | `github.com/RustCrypto/traits` | MIT OR Apache-2.0 | no open advisory |
 | `windows-sys` | 0.61.2 | DPAPI key slot on Windows; since D-048 also the table's sounds through WinMM (`waveOut*`, features `Win32_Media` and `Win32_Media_Audio`) | `github.com/microsoft/windows-rs` | MIT OR Apache-2.0 | no open advisory; Windows-only path, and the only OS-keystore path implemented |
 
-### 5.4 Randomness — the whole set, including what we do not use (11)
+### 5.4 Randomness — the whole set, including what we do not use (8)
 
 `SPEC_CS.md` §7 is a rule about *our* code, not an absence in the tree. All eleven of
-these are compiled. Only the first two may ever be a source of protocol randomness.
+these are compiled (eleven until `libp2p` 0.57 took the `rand 0.9` line out). Only the first two may ever be a source of protocol randomness.
 
 | Name | Version | Purpose | Repository | Licence | Security status |
 |---|---|---|---|---|---|
 | `getrandom` | 0.4.3 | **the OS CSPRNG** — `getrandom::fill`, `getrandom::SysRng` | `github.com/rust-random/getrandom` | MIT OR Apache-2.0 | no open advisory. **The only permitted source of cryptographic randomness.** API verified: `pub use sys_rng::SysRng` at `src/lib.rs:34`, `pub fn fill` at `:87` **(b)** |
-| `rand_core` | 0.10.1 | the `RngCore` trait our OS-CSPRNG adapter implements | `github.com/rust-random/rand_core` | MIT OR Apache-2.0 | no open advisory |
+| `rand_core` | 0.10.1 | the generator traits our OS-CSPRNG adapters implement -- `security::rng::OsRng10` is what `libp2p` 0.57's AutoNAT v2 client is handed | `github.com/rust-random/rand_core` | MIT OR Apache-2.0 | no open advisory |
 | `rand` | 0.8.8 | required by `ark-std` with `std_rng`; **not** a source of protocol randomness | `github.com/rust-random/rand` | MIT OR Apache-2.0 | RUSTSEC-2026-0097 (`unsound`) patched at `>= 0.8.6`; 0.8.8 is patched, and the unsound path (`thread_rng` inside a custom `log` impl) does not occur here — §4 |
-| `rand` | 0.9.5 | pulled by `hickory-proto`, `igd-next` and `yamux` | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no open advisory at 0.9.x |
-| `rand` | 0.10.2 | pulled by `quinn-proto` **and by `rs_poker`** | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no open advisory. See §3.6: `rs_poker::core`'s deck and sampler use it and must never be called |
+| `rand` | 0.10.2 | pulled by `quinn-proto`, **`rs_poker`**, and since `libp2p` 0.57 by most of `libp2p` (`-core`, `-swarm`, `-identity`, `-gossipsub`, `-kad`, `-noise`, `-autonat` ...), `hickory` and `igd-next` | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no open advisory. See §3.6: `rs_poker::core`'s deck and sampler use it and must never be called |
 | `rand_chacha` | 0.3.1 | backs `StdRng` inside `rand 0.8` | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no open advisory |
-| `rand_chacha` | 0.9.0 | backs `StdRng` inside `rand 0.9` | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no open advisory |
-| `rand_core` | 0.6.4 | required by `libp2p-autonat` and by `ark-std` | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no open advisory; coexists with 0.9 and 0.10 as three distinct Rust types |
-| `rand_core` | 0.9.5 | under `rand 0.9` | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no open advisory |
+| `rand_core` | 0.6.4 | under `rand 0.8` and `rand_chacha 0.3`, for `ark-std` | `github.com/rust-random/rand` | MIT OR Apache-2.0 | no open advisory; coexists with 0.10 as a distinct Rust type |
 | `rand_pcg` | 0.10.2 | PCG generator used by `quinn-proto` for connection IDs | `github.com/rust-random/rngs` | MIT OR Apache-2.0 | no open advisory; **a non-cryptographic generator in the tree** — never reachable from our code |
 | `ark-std` | 0.5.0 | `no_std` shims; **the crate that reintroduces `rand`** | `github.com/arkworks-rs/std` | `MIT/Apache-2.0` (deprecated SPDX form — §6) | no open advisory; not audited |
 
-`getrandom 0.2.17` (via `libp2p`, `libp2p-gossipsub`, `libp2p-metrics` and
-`rand_core 0.6.4`) and `getrandom 0.3.4` (via `rand_core 0.9.5`) are also compiled,
+`getrandom 0.2.17` (via `rand_core 0.6.4` and `ring`) and `getrandom 0.3.4` (via `snow`)
+are also compiled,
 same repository and licence as 0.4.3, no open advisory. **(a)**
 
 > **The claim that must not be restated.** `research/CRYPTO_LIBS.md` §10 says of its
 > dependency block: *"No `rand` at any depth."* That was true of its isolated probe
-> and is **false in the integrated tree** — three majors of `rand` and three of
-> `rand_core` are compiled. The discipline survives; the absence does not. What
+> and is **false in the integrated tree** — two majors of `rand` and two of
+> `rand_core` are compiled (three of each before `libp2p` 0.57). The discipline survives; the absence does not. What
 > `SPEC_CS.md` §7 actually requires is enforceable as a lint (`CRYPTOGRAPHY.md` §12
 > item 6, OQ-8): our own code draws cryptographic randomness only from
 > `getrandom::SysRng`; `SmallRng`, `StdRng` and any self-seeded generator are never
@@ -657,37 +680,37 @@ same repository and licence as 0.4.3, no open advisory. **(a)**
 ### 5.5 Transport — libp2p (25)
 
 All 25 share repository `github.com/libp2p/rust-libp2p` and licence **MIT**. All are
-resolved by the `libp2p 0.56.0` umbrella except `libp2p-stream`, which is declared
+resolved by the `libp2p 0.57.0` umbrella except `libp2p-stream`, which is declared
 directly (§3.5). No open advisory on any of them at these versions; the historical
 `libp2p` and `libp2p-core` advisories are in §4.
 
 | Name | Version | Purpose | Security status |
 |---|---|---|---|
-| `libp2p` | 0.56.0 | umbrella: transport, encryption, NAT traversal, gossip, relay | RUSTSEC-2022-0084 patched `>= 0.45.1`; pinned version is patched |
-| `libp2p-core` | 0.43.2 | transport traits, connection upgrades | RUSTSEC-2019-0004 (`>= 0.8.1`) and RUSTSEC-2022-0009 (`>= 0.31.1`) both far below 0.43.2 |
-| `libp2p-identity` | 0.2.14 | `PeerId`, transport `Keypair` | no open advisory. **Never depend on it directly**: `libp2p-identity 0.3.0` exists outside the umbrella's `^0.2.12` range and linking it gives a second, incompatible `PeerId` as a *type mismatch*, not a resolver error |
-| `libp2p-swarm` | 0.47.1 | swarm driver | no open advisory |
-| `libp2p-swarm-derive` | 0.35.1 | `#[derive(NetworkBehaviour)]` | no open advisory; proc-macro |
-| `libp2p-quic` | 0.13.1 | primary transport; has a real `hole_punching` module | no open advisory |
-| `libp2p-tcp` | 0.44.1 | fallback transport for UDP-blocked networks | no open advisory |
-| `libp2p-dns` | 0.44.0 | `/dnsaddr/` resolution for relay bootstrap | **the sole path to both hickory advisories** — §3.2 |
-| `libp2p-noise` | 0.46.1 | Noise XX security upgrade; mandatory for relay | no open advisory. Selects `snow`'s `ring-resolver`, so the handshake AEAD and hash come from `ring`, not from RustCrypto — §5.6 |
-| `libp2p-tls` | 0.6.2 | TLS 1.3 security upgrade | no open advisory |
-| `libp2p-yamux` | 0.47.0 | stream muxer; mandatory for relay | no open advisory. **Links two yamux majors on purpose** — §5.6 |
-| `libp2p-gossipsub` | 0.49.5 | lobby topics | no open advisory. Parses attacker-controlled protobuf from unauthenticated peers |
-| `libp2p-kad` | 0.48.0 | Kademlia DHT | no open advisory. **Enabled in `Cargo.toml`; `NETWORK_STACK.md` §5.2 says it is not** — §9 |
-| `libp2p-identify` | 0.47.0 | address candidates | no open advisory. Peer-supplied addresses are attacker-controlled input |
-| `libp2p-ping` | 0.47.0 | liveness | no open advisory |
-| `libp2p-autonat` | 0.15.0 | reachability probing | no open advisory. Pulls `rand_core 0.6.4` |
-| `libp2p-dcutr` | 0.14.1 | direct connection upgrade through relay (hole punching) | no open advisory |
-| `libp2p-relay` | 0.21.1 | Circuit Relay v2 (**D-001**, **D-002**) | no open advisory. **`max_circuit_bytes` is a bidirectional total, not per direction** — see the box below |
-| `libp2p-request-response` | 0.29.0 | snapshot RPC, join RPC | no open advisory |
-| `libp2p-stream` | 0.4.0-alpha | per-table streams | **unaudited and semver-exempt; no stable release exists** — §3.5 |
-| `libp2p-upnp` | 0.5.0 | IGD port mapping | no open advisory. Speaks HTTP to a LAN device that is not authenticated — §5.9 |
-| `libp2p-connection-limits` | 0.6.0 | connection caps | no open advisory. **There is no `connection-limits` cargo feature** — it is a non-optional dependency and `libp2p::connection_limits` is always available; asking for the feature is a hard resolver error |
-| `libp2p-memory-connection-limits` | 0.5.0 | memory-based caps | no open advisory. This one *is* a feature, spelled `memory-connection-limits` |
-| `libp2p-allow-block-list` | 0.6.0 | peer blocklist | no open advisory; non-optional, like `connection-limits`. **Its presence in the build is not permission to drive it from a protocol proof** — D-010 point 3 and D-011 rule 3 forbid automated eviction at every layer, transport included, and this crate is the transport-layer mechanism they were written about. A user-initiated block is a user decision and is fine; a block triggered by an `EquivocationProof` or a `TIMEOUT_CERT` is a defect. `NETWORK_STACK.md` owns the rule (D-011). **D-014 does not reopen this and the distinction is the layer:** a removal for cause takes a seat out of the *table* — dead, blinded off, one-way (`STATE_MACHINE.md` T64, T65, I34) — and never out of the *transport*. The removed peer keeps its connections, and an implementation that reaches for this crate on a `CheatProven` has rebuilt the eviction D-011 rule 3 forbids, with the one decision that sounds like a licence for it |
-| `libp2p-metrics` | 0.17.0 | Prometheus metrics | no open advisory. Enabled in `Cargo.toml`; absent from `NETWORK_STACK.md` §5.1.1 — §9 |
+| `libp2p` | 0.57.0 | umbrella: transport, encryption, NAT traversal, gossip, relay | RUSTSEC-2022-0084 patched `>= 0.45.1`; pinned version is patched |
+| `libp2p-core` | 0.44.0 | transport traits, connection upgrades | RUSTSEC-2019-0004 (`>= 0.8.1`) and RUSTSEC-2022-0009 (`>= 0.31.1`) both far below 0.43.2 |
+| `libp2p-identity` | 0.3.0 | `PeerId`, transport `Keypair` | no open advisory. **Never depend on it directly**: `libp2p-identity 0.3.0` exists outside the umbrella's `^0.2.12` range and linking it gives a second, incompatible `PeerId` as a *type mismatch*, not a resolver error |
+| `libp2p-swarm` | 0.48.0 | swarm driver | no open advisory |
+| `libp2p-swarm-derive` | 0.36.0 | `#[derive(NetworkBehaviour)]` | no open advisory; proc-macro |
+| `libp2p-quic` | 0.14.0 | primary transport; has a real `hole_punching` module | no open advisory |
+| `libp2p-tcp` | 0.45.0 | fallback transport for UDP-blocked networks | no open advisory |
+| `libp2p-dns` | 0.45.0 | `/dnsaddr/` resolution for relay bootstrap | the path to `hickory` 0.26.3; both 0.25 advisories spent — §3.2 |
+| `libp2p-noise` | 0.47.0 | Noise XX security upgrade; mandatory for relay | no open advisory. Selects `snow`'s `ring-resolver`, so the handshake AEAD and hash come from `ring`, not from RustCrypto — §5.6 |
+| `libp2p-tls` | 0.7.0 | TLS 1.3 security upgrade | no open advisory. **Since 0.7 its `rustls` runs on AWS-LC**, post-quantum key exchange preferred -- §5.6 |
+| `libp2p-yamux` | 0.48.0 | stream muxer; mandatory for relay | no open advisory. links one `yamux` major since 0.48 (two before, §5.6) |
+| `libp2p-gossipsub` | 0.50.0 | lobby topics | no open advisory. Parses attacker-controlled protobuf from unauthenticated peers |
+| `libp2p-kad` | 0.49.0 | Kademlia DHT | no open advisory. **Enabled in `Cargo.toml`; `NETWORK_STACK.md` §5.2 says it is not** — §9 |
+| `libp2p-identify` | 0.48.0 | address candidates | no open advisory. Peer-supplied addresses are attacker-controlled input |
+| `libp2p-ping` | 0.48.0 | liveness | no open advisory |
+| `libp2p-autonat` | 0.16.0 | reachability probing | no open advisory. Pulls `rand_core 0.6.4` |
+| `libp2p-dcutr` | 0.15.0 | direct connection upgrade through relay (hole punching) | no open advisory |
+| `libp2p-relay` | 0.22.0 | Circuit Relay v2 (**D-001**, **D-002**) | no open advisory. **`max_circuit_bytes` is a bidirectional total, not per direction** — see the box below |
+| `libp2p-request-response` | 0.30.0 | snapshot RPC, join RPC | no open advisory |
+| `libp2p-stream` | 0.5.0-alpha | per-table streams | **unaudited and semver-exempt; no stable release exists** — §3.5 |
+| `libp2p-upnp` | 0.7.0 | IGD port mapping | no open advisory. Speaks HTTP to a LAN device that is not authenticated — §5.9 |
+| `libp2p-connection-limits` | 0.7.0 | connection caps | no open advisory. **There is no `connection-limits` cargo feature** — it is a non-optional dependency and `libp2p::connection_limits` is always available; asking for the feature is a hard resolver error |
+| `libp2p-memory-connection-limits` | 0.6.0 | memory-based caps | no open advisory. This one *is* a feature, spelled `memory-connection-limits` |
+| `libp2p-allow-block-list` | 0.7.0 | peer blocklist | no open advisory; non-optional, like `connection-limits`. **Its presence in the build is not permission to drive it from a protocol proof** — D-010 point 3 and D-011 rule 3 forbid automated eviction at every layer, transport included, and this crate is the transport-layer mechanism they were written about. A user-initiated block is a user decision and is fine; a block triggered by an `EquivocationProof` or a `TIMEOUT_CERT` is a defect. `NETWORK_STACK.md` owns the rule (D-011). **D-014 does not reopen this and the distinction is the layer:** a removal for cause takes a seat out of the *table* — dead, blinded off, one-way (`STATE_MACHINE.md` T64, T65, I34) — and never out of the *transport*. The removed peer keeps its connections, and an implementation that reaches for this crate on a `CheatProven` has rebuilt the eviction D-011 rule 3 forbids, with the one decision that sounds like a licence for it |
+| `libp2p-metrics` | 0.18.0 | Prometheus metrics | no open advisory. Enabled in `Cargo.toml`; absent from `NETWORK_STACK.md` §5.1.1 — §9 |
 
 > **Correction, verified in source, that must be carried everywhere it appears.**
 > The fix plan's A-8 replacement text described `max_circuit_bytes` as "per circuit
@@ -706,7 +729,7 @@ directly (§3.5). No open advisory on any of them at these versions; the histori
 > Rust behaviour binds us**, and for third-party relays the stricter reading — a
 > bidirectional total — is the safe assumption.
 
-### 5.6 Transport cryptography and muxing, transitive (22)
+### 5.6 Transport cryptography and muxing, transitive (23)
 
 This is where the wire encryption actually lives. None of it is named in
 `Cargo.toml`, and none of it was in either interim register — which is precisely why
@@ -714,50 +737,50 @@ a register generated from the build graph, not from the manifest, is the right s
 
 | Name | Version | Purpose | Repository | Licence | Security status |
 |---|---|---|---|---|---|
-| `ring` | 0.17.14 | **the primitives behind Noise, TLS and QUIC** — AEAD, X25519, digests, RNG | `github.com/briansmith/ring` | Apache-2.0 AND ISC | no open advisory (RUSTSEC-2025-0010 is "< 0.17 unmaintained"; ours is 0.17.14). BoringSSL-derived C and assembly — the largest non-Rust attack surface in the build |
+| `ring` | 0.17.14 | the primitives behind Noise and the transport identity -- AEAD, X25519, digests, RNG; still linked by `libp2p-tls`, `libp2p-quic`, `quinn-proto` and `rcgen` | `github.com/briansmith/ring` | Apache-2.0 AND ISC | no open advisory (RUSTSEC-2025-0010 is "< 0.17 unmaintained"; ours is 0.17.14). BoringSSL-derived C and assembly |
+| `aws-lc-rs` | 1.18.1 | **the primitives behind TLS and QUIC since `libp2p` 0.57** -- `rustls`' provider, with ML-KEM for the post-quantum exchange | `github.com/aws/aws-lc-rs` | ISC AND (Apache-2.0 OR ISC) | no open advisory. Chosen by `libp2p-tls` 0.7 and `libp2p-quic` 0.14 in their own manifests; no feature of ours turns it off |
+| `aws-lc-sys` | 0.45.0 | AWS-LC itself, compiled from C by its build script | `github.com/aws/aws-lc-rs` | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) | no open advisory. **Now the largest non-Rust attack surface in the build**, beside `ring`. Its C put the builder's profile path into the first release 144 times (MSVC keeps `__FILE__`); `tools/remap-build-paths.ps1` adds `CFLAGS=/d1trimfile:` and `build.rs` refuses a release without it (`S1-FF`) |
 | `untrusted` | 0.9.0 | `ring`'s bounds-checked input reader; every byte `ring` parses goes through it | `github.com/briansmith/untrusted` | **ISC** | no open advisory. Tiny by design and that is the point — it exists so `ring` cannot read past a buffer |
-| `rustls` | 0.23.43 | TLS 1.3 for `libp2p-tls` and QUIC | `github.com/rustls/rustls` | Apache-2.0 OR ISC OR MIT | no open advisory; RUSTSEC-2024-0399 patched `>= 0.23.18` |
+| `rustls` | 0.23.45 | TLS 1.3 for `libp2p-tls` and QUIC | `github.com/rustls/rustls` | Apache-2.0 OR ISC OR MIT | no open advisory; RUSTSEC-2024-0399 patched `>= 0.23.18`, RUSTSEC-2026-0285 patched `>= 0.23.45`. **On `aws-lc-rs` since `libp2p` 0.57** (`libp2p-tls` 0.7 names the feature itself), with `prefer-post-quantum` |
 | `rustls-webpki` | 0.103.15 | certificate path validation | `github.com/rustls/webpki` | **ISC** | no open advisory; parses attacker-supplied certificates |
 | `rustls-pki-types` | 1.15.1 | PKI type definitions | `github.com/rustls/pki-types` | MIT OR Apache-2.0 | no open advisory |
 | `futures-rustls` | 0.26.0 | futures adapter for rustls | `github.com/quininer/futures-rustls` | `MIT/Apache-2.0` (deprecated SPDX form) | no open advisory |
-| `snow` | 0.9.6 | Noise protocol framework | `github.com/mcginty/snow` | Apache-2.0 OR MIT | no open advisory; RUSTSEC-2024-0011 patched below this version. Built with `ring-resolver` only, so its pure-Rust resolver is not compiled (§1) |
-| `x25519-dalek` | 2.0.1 | Noise static keypair DH | `github.com/dalek-cryptography/curve25519-dalek/tree/main/x25519-dalek` | BSD-3-Clause | no open advisory |
-| `curve25519-dalek` | 4.1.3 | group arithmetic for `x25519-dalek` and `libp2p-identity` | as §5.2 | BSD-3-Clause | **exactly on the RUSTSEC-2024-0344 patch boundary (`>= 4.1.3`)** — no margin; §4 |
-| `ed25519-dalek` | 2.2.0 | `PeerId` signatures inside `libp2p-identity` | as §5.2 | BSD-3-Clause | no open advisory. Deliberately a *different Rust type* from our 3.0.0, which is what mechanically enforces `SPEC_CS.md` §20's identity separation |
-| `ed25519` | 2.2.3 | signature encoding for the above | `github.com/RustCrypto/signatures/tree/master/ed25519` | Apache-2.0 OR MIT | no open advisory |
-| `signature` | 2.2.0 | signer/verifier traits for the above | `github.com/RustCrypto/traits/tree/master/signature` | Apache-2.0 OR MIT | no open advisory |
+| `snow` | 0.10.0 | Noise protocol framework | `github.com/mcginty/snow` | Apache-2.0 OR MIT | no open advisory; RUSTSEC-2024-0011 patched below this version. Built with `ring-resolver`, not `default-resolver`, so its pure-Rust resolver is not compiled (§1) |
+| `x25519-dalek` | 3.0.0 | Noise static keypair DH | `github.com/dalek-cryptography/curve25519-dalek/tree/main/x25519-dalek` | BSD-3-Clause | no open advisory |
+| `curve25519-dalek` | 5.0.0 | group arithmetic for `x25519-dalek`, `ed25519-dalek` and so `libp2p-identity` | as §5.2 | BSD-3-Clause | no open advisory. **Since `libp2p` 0.57 the transport identity is on the 5.x line too**; 4.1.3, which sat exactly on RUSTSEC-2024-0344's patch boundary, is locked and compiled by nobody |
+| `ed25519-dalek` | 3.0.0 | `PeerId` signatures inside `libp2p-identity` | as §5.2 | BSD-3-Clause | no open advisory. **Since `libp2p` 0.57 the same version as ours** -- it was a different Rust type (2.2.0), and that no longer separates the identities. What does is `libp2p-identity`'s own newtypes: the transport key is a `libp2p::identity::Keypair`, never a `SigningKey`, so `SPEC_CS.md` §20's separation still holds at every signature in our code |
+| `ed25519` | 3.0.0 | signature encoding for the above | `github.com/RustCrypto/signatures/tree/master/ed25519` | Apache-2.0 OR MIT | no open advisory |
+| `signature` | 3.0.0 | signer/verifier traits for the above | `github.com/RustCrypto/traits/tree/master/signature` | Apache-2.0 OR MIT | no open advisory |
 | `sha2` | 0.10.9 | Fiat–Shamir hash inside ziffle; digests in libp2p | `github.com/RustCrypto/hashes` | MIT OR Apache-2.0 | no open advisory |
 | `digest` | 0.10.7 | hash traits for `sha2 0.10` | `github.com/RustCrypto/traits` | MIT OR Apache-2.0 | no open advisory |
-| `hkdf` | 0.12.4 | key derivation in the transport handshakes | `github.com/RustCrypto/KDFs/` | MIT OR Apache-2.0 | no open advisory |
-| `hmac` | 0.12.1 | MAC under HKDF | `github.com/RustCrypto/MACs` | MIT OR Apache-2.0 | no open advisory |
+| `hkdf` | 0.13.0 | key derivation in the transport handshakes | `github.com/RustCrypto/KDFs/` | MIT OR Apache-2.0 | no open advisory |
+| `hmac` | 0.13.0 | MAC under HKDF | `github.com/RustCrypto/MACs` | MIT OR Apache-2.0 | no open advisory |
 | `rcgen` | 0.13.2 | generates the self-signed libp2p TLS certificate | `github.com/rustls/rcgen` | MIT OR Apache-2.0 | no open advisory; handles our transport private key |
 | `quinn` | 0.11.11 | QUIC endpoint | `github.com/quinn-rs/quinn` | MIT OR Apache-2.0 | no open advisory |
 | `quinn-proto` | 0.11.17 | QUIC state machine — parses every UDP datagram | `github.com/quinn-rs/quinn` | MIT OR Apache-2.0 | no open advisory; RUSTSEC-2026-0037 (`>= 0.11.14`) and RUSTSEC-2026-0185 (`>= 0.11.15`) both patched here |
 | `quinn-udp` | 0.5.15 | platform UDP socket layer | `github.com/quinn-rs/quinn` | MIT OR Apache-2.0 | no open advisory |
-| `yamux` | 0.13.10 | stream muxer, current | `github.com/paritytech/yamux` | Apache-2.0 OR MIT | no open advisory |
-| `yamux` | 0.12.1 | stream muxer, compatibility | `github.com/paritytech/yamux` | Apache-2.0 OR MIT | no open advisory. **`libp2p-yamux 0.47.0` links both majors deliberately**, aliased `yamux012` and `yamux013` in its own `Cargo.toml`. This duplicate is intended upstream, not resolver damage **(b)** |
+| `yamux` | 0.14.0 | stream muxer | `github.com/paritytech/yamux` | Apache-2.0 OR MIT | no open advisory. **The only major since `libp2p-yamux` 0.48**: 0.12.1, the compatibility copy `libp2p-yamux` 0.47 linked on purpose, carried GitHub's GHSA-vxx9-2994-q338 (a remote panic on a data frame with SYN set and a length of 262 145) and left with it |
 
-### 5.7 Hostile-input parsers (22)
+### 5.7 Hostile-input parsers (19)
 
 Everything here decodes bytes an attacker chooses. `SPEC_CS.md` §27 wants these
 fuzzed; none of them has been fuzzed by us.
 
 | Name | Version | Purpose | Repository | Licence | Security status |
 |---|---|---|---|---|---|
-| `hickory-proto` | 0.25.2 | DNS wire format | `github.com/hickory-dns/hickory-dns` | MIT OR Apache-2.0 | **RUSTSEC-2026-0118 (no fix; module not compiled) and RUSTSEC-2026-0119 (reachable)** — §3.2 |
-| `hickory-resolver` | 0.25.2 | DNS resolution for `/dnsaddr/` | `github.com/hickory-dns/hickory-dns` | MIT OR Apache-2.0 | no advisory of its own; the sole importer of `hickory-proto` |
-| `x509-parser` | 0.17.0 | parses peer TLS certificates | `github.com/rusticata/x509-parser.git` | MIT OR Apache-2.0 | no open advisory |
+| `hickory-proto` | 0.26.3 | DNS wire format | `github.com/hickory-dns/hickory-dns` | MIT OR Apache-2.0 | no open advisory; RUSTSEC-2026-0118 and -0119, which 0.25.2 carried, are both behind it — §3.2 |
+| `hickory-resolver` | 0.26.3 | DNS resolution for `/dnsaddr/` | `github.com/hickory-dns/hickory-dns` | MIT OR Apache-2.0 | no advisory of its own; with `hickory-net` 0.26.3, the importers of `hickory-proto` |
+| `x509-parser` | 0.18.1 | parses peer TLS certificates | `github.com/rusticata/x509-parser.git` | MIT OR Apache-2.0 | no open advisory |
 | `asn1-rs` | 0.7.2 | ASN.1 decoding under the above | `github.com/rusticata/asn1-rs.git` | MIT OR Apache-2.0 | no open advisory |
 | `der-parser` | 10.0.0 | DER decoding under the above | `github.com/rusticata/der-parser.git` | MIT OR Apache-2.0 | no open advisory |
 | `oid-registry` | 0.8.1 | OID lookup for the above | `github.com/rusticata/oid-registry.git` | MIT OR Apache-2.0 | no open advisory |
 | `yasna` | 0.5.2 | ASN.1 writer used by `rcgen` | `github.com/qnighy/yasna.rs` | MIT OR Apache-2.0 | no open advisory |
-| `quick-protobuf` | 0.8.1 | protobuf for gossipsub, identify, relay, dcutr | `github.com/tafia/quick-protobuf` | MIT | no open advisory; **every libp2p behaviour message passes through it** |
+| `prost-codec` | 0.4.0 | protobuf framing for gossipsub, identify, relay, dcutr, kad and autonat since `libp2p` 0.57 | `github.com/libp2p/rust-libp2p` | MIT | no open advisory; **every libp2p behaviour message passes through it**, and through `prost` beneath it. `quick-protobuf` left with 0.56 |
 | `prost` | 0.14.4 | protobuf decoding of the peer public key inside `libp2p-identity` | `github.com/tokio-rs/prost` | **Apache-2.0** (not dual) | no open advisory. Decodes bytes offered by an unauthenticated dialer **before** the `PeerId` is established, so it runs earlier than any authentication we control |
 | `unsigned-varint` | 0.8.0 | length prefixes on every libp2p frame | `github.com/paritytech/unsigned-varint` | MIT | no open advisory |
-| `unsigned-varint` | 0.7.2 | the same, for crates still on 0.7 | `github.com/paritytech/unsigned-varint` | MIT | no open advisory |
 | `asynchronous-codec` | 0.7.0 | framed codec around the above | `github.com/mxinden/asynchronous-codec` | MIT | no open advisory; **where a missing length cap becomes an allocation DoS** |
 | `multihash` | 0.19.5 | `PeerId` encoding | `github.com/multiformats/rust-multihash` | MIT | no open advisory |
-| `multiaddr` | 0.18.2 | parses peer-supplied addresses | `github.com/multiformats/rust-multiaddr` | MIT | no open advisory; input arrives from `identify` and from the DHT |
+| `multiaddr` | 0.19.0 | parses peer-supplied addresses | `github.com/multiformats/rust-multiaddr` | MIT | no open advisory; input arrives from `identify` and from the DHT |
 | `bs58` | 0.5.1 | base58 in `PeerId` text form | `github.com/Nullus157/bs58-rs` | `MIT/Apache-2.0` (deprecated SPDX form) | no open advisory |
 | `data-encoding` | 2.11.1 | base32/base64 in multiaddr | `github.com/ia0/data-encoding` | MIT | no open advisory |
 | `idna` | 1.1.0 | IDNA in URL parsing | `github.com/servo/rust-url` | MIT OR Apache-2.0 | no open advisory; RUSTSEC-2024-0421 patched `>= 1.0.0` |
@@ -798,7 +821,7 @@ the crate was shared and the keys were not, and must not be.
 
 | Name | Version | Purpose | Repository | Licence | Security status |
 |---|---|---|---|---|---|
-| `igd-next` | 0.16.2 | IGD port mapping via `libp2p-upnp` | `github.com/dariusc93/rust-igd` | MIT | no open advisory. Talks SSDP/HTTP/XML to whatever on the LAN answers as a gateway — the device is discovered, never authenticated |
+| `igd-next` | 0.17.1 | IGD port mapping via `libp2p-upnp` | `github.com/dariusc93/rust-igd` | MIT | no open advisory. Talks SSDP/HTTP/XML to whatever on the LAN answers as a gateway — the device is discovered, never authenticated |
 | `attohttpc` | 0.30.1 | the HTTP client under `igd-next` | `github.com/sbstp/attohttpc` | **MPL-2.0** | no open advisory. **The only copyleft licence in the whole compiled tree** — §6 |
 
 ### 5.10 Poker rules (1)

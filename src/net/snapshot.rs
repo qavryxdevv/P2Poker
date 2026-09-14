@@ -35,7 +35,6 @@
 
 use std::io;
 
-use async_trait::async_trait;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use futures::prelude::*;
 use libp2p::{request_response, StreamProtocol};
@@ -94,7 +93,6 @@ where
     io.close().await
 }
 
-#[async_trait]
 impl request_response::Codec for SnapshotCodec {
     type Protocol = StreamProtocol;
     type Request = Frame;

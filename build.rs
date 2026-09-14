@@ -82,6 +82,31 @@ fn refuse_a_release_that_names_this_machine() {
          those flags there yourself, and build again (S1-EN)",
         named.join(", ")
     );
+
+    // `S1-FF`: **and C, which rustc's flags do not reach.** `libp2p` 0.57's TLS
+    // and QUIC bring AWS-LC, whose C sources its build script compiles from the
+    // cargo home by absolute path, and MSVC's `assert` keeps each file's
+    // `__FILE__`: the first release on it named the builder's profile 144
+    // times. `/d1trimfile:` cuts that prefix from `__FILE__` in every C file a
+    // build script compiles through `CFLAGS`, which the remap script puts into
+    // the cargo home's `[env]` beside the rustc flags.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rerun-if-env-changed=CFLAGS");
+        let cflags = std::env::var("CFLAGS").unwrap_or_default();
+        let trimmed: Vec<std::path::PathBuf> = cflags
+            .split_whitespace()
+            .filter_map(|f| f.strip_prefix("/d1trimfile:"))
+            .map(std::path::PathBuf::from)
+            .collect();
+        let profile = std::env::var_os(home).map(std::path::PathBuf::from);
+        assert!(
+            profile.is_none_or(|p| trimmed.iter().any(|t| p.starts_with(t))),
+            "a release built here would carry this machine's paths in the binary through C: MSVC keeps each \
+             C file's __FILE__, and AWS-LC's are under the cargo home. Run tools/remap-build-paths.ps1 again \
+             -- it also puts CFLAGS=/d1trimfile:<your profile> into the cargo home's [env] -- and build \
+             again (S1-FF)"
+        );
+    }
 }
 
 /// Compiling the vendored `c-toxcore` (D-019).

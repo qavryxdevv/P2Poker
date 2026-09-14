@@ -32,7 +32,7 @@ publish = false
 [dependencies]
 
 # --- network transport: docs/research/LIBP2P.md ---------------------------
-libp2p = { version = "0.56.0", features = [
+libp2p = { version = "0.57.0", features = [
     "tokio", "macros",
     "quic", "tcp", "noise", "tls", "yamux", "dns",
     "gossipsub", "kad", "identify", "ping", "autonat", "dcutr", "relay", "mdns",
@@ -49,10 +49,10 @@ libp2p = { version = "0.56.0", features = [
     "rsa",
     "serde",
 ] }
-libp2p-stream = "0.4.0-alpha"
-# Only so this crate can implement `libp2p::request_response::Codec`, whose
-# trait is `#[async_trait]`. Already in the graph via that crate; this makes the
-# edge direct rather than adding anything to build.
+libp2p-stream = "0.5.0-alpha"
+# For this crate's own async traits (`table::transport`, the Tox carrier).
+# `libp2p::request_response::Codec` was one too until libp2p 0.57, whose trait
+# returns its futures directly.
 async-trait = "0.1"
 
 # --- mental poker: docs/research/MENTAL_POKER.md --------------------------
@@ -136,6 +136,10 @@ ark-std       = { version = "=0.5.0", default-features = false }
 # ---------------------------------------------------------------------------
 [patch.crates-io]
 ziffle = { path = "vendor/ziffle" }
+# Resolution only, never compiled here: libp2p-swarm 0.48 pins it exactly on
+# wasm32, and eframe 0.36 needs a js-sys that pin excludes. See
+# vendor/wasm-bindgen-futures/P2P-POKER.md.
+wasm-bindgen-futures = { path = "vendor/wasm-bindgen-futures" }
 
 # ---------------------------------------------------------------------------
 # Build profiles, sized for how this project is actually worked on.
