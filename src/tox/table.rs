@@ -988,6 +988,26 @@ const REBOOTSTRAP_AFTER: Duration = Duration::from_secs(10);
 /// instance's way back.
 const REBOOTSTRAP_EVERY: Duration = Duration::from_secs(15);
 
+/// `S1-FE`: how long a founder whose copy of the table's group holds nobody
+/// else keeps a member's invitation back into the group before it takes it.
+///
+/// **A founder that lost its line had no way back at a table of three or
+/// more.** Only a founder invites, and a member's copy that still holds another
+/// member does not deliver a founder's invitation (`patches/0035` delivers one
+/// only into a copy held empty) -- while the founder refused every member's
+/// invitation, `invitation_fits` naming no inviter for it at all. The owner's
+/// far machine founded a three-seat table, lost its line for about 48 s, was
+/// certified out and removed by the other two, and read *nobody at the table
+/// has been reachable* for as long as it was left running, the other two
+/// dealing on (2026-09-14, 15:21 UTC).
+///
+/// So a founder takes a member's invitation back -- but not at once. At two
+/// seats the other copy is empty as well, and that member takes the FOUNDER's
+/// invitation (`S1-EB`); a founder leaving its copy the same moment would leave
+/// the group the member is joining. Past `JOIN_GRACE`, a member that could take
+/// the founder's invitation has taken it or given its join up.
+const FOUNDER_YIELDS_AFTER: Duration = Duration::from_secs(30);
+
 /// `D-049`: how often a member says its sitting-out status in the group again,
 /// changed or not. The library broadcasts a status losslessly and exchanges it
 /// with every peer a member connects to; this bounds what any gap in that
@@ -1133,6 +1153,15 @@ struct TableState {
     /// not timed out yet is one -- and was left to `REINVITE_EVERY`. The group
     /// reporting the member gone is the edge this carries.
     offer_again: Vec<[u8; 32]>,
+    /// `S1-FE`: a founder's copy of the group holding nobody else -- a member's
+    /// invitation back into the table's group, the friend it came over, and
+    /// when the first such invitation arrived. See `FOUNDER_YIELDS_AFTER`.
+    held_offer: Option<(u32, Vec<u8>, Instant)>,
+    /// `S1-FE`: the group a founder left to take a member's invitation back
+    /// into it -- the one invitation it then accepts.
+    own_chat: Option<[u8; 32]>,
+    /// `S1-FE`: when a member last offered the group to its absent founder.
+    founder_offered: Option<Instant>,
     out: tokio::sync::mpsc::Receiver<Vec<u8>>,
     inbox: tokio::sync::mpsc::Sender<FromTable>,
     chat: tokio::sync::watch::Sender<Option<[u8; 32]>>,
@@ -1506,7 +1535,8 @@ fn sweep_table(
         // library's own reconnection, reaped after thirty (run180223-3: the
         // group looked whole from 105 s to 175 s and the seat that needed the
         // offer got none until its next outage).
-        let short = t.group.is_some() && 1 + t.confirmed.len() < t.roster.len();
+        // `S1-FE`: short of an OTHER seat -- the roster leaves this client out.
+        let short = t.group.is_some() && group_short(t.confirmed.len(), t.roster.len());
         if short {
             // `S1-EG`: only the seats NOT in the group are asked again. Clearing
             // the record wholesale invited the confirmed members too, each such
@@ -1529,13 +1559,22 @@ fn sweep_table(
     // key the roster holds, so no scan can say which seat a member is. A count
     // answers the only question the gate asks, and it is sound because the
     // group is PRIVATE and the founder the sole admin.
-    // `S1-DZ`: CONFIRMED members, this client among them -- never the
-    // library's peer count, which holds unconfirmed entries: an invitation
-    // half-way through its handshake, a dropped seat's old key re-added by
-    // the library's own reconnection. The founder dealt hand #1 at 17 s to a
-    // seat still handshaking (run192753-3), which never caught up.
+    // `S1-DZ`: CONFIRMED members -- never the library's peer count, which
+    // holds unconfirmed entries: an invitation half-way through its handshake,
+    // a dropped seat's old key re-added by the library's own reconnection. The
+    // founder dealt hand #1 at 17 s to a seat still handshaking (run192753-3),
+    // which never caught up.
+    //
+    // `S1-FE`: **the other seats, as `roster` counts them.** `S1-DZ` counted
+    // this client in as well (`1 +`) against a roster that leaves it out, so
+    // every reading was one seat generous: a heads-up group read complete with
+    // nobody else in it, a larger one with a seat still missing, and the sweeps
+    // that offer the group again only while it is short never fired for one
+    // missing seat -- the founder's `S1-EG` sweep and `S1-FB`'s `offer_again`
+    // alike. The node reads this number as other seats too (*not one of N
+    // other seats*, *held N of M other seats*).
     let seen = match t.group {
-        Some(_) => 1 + t.confirmed.len(),
+        Some(_) => t.confirmed.len(),
         None => 0,
     };
     // The friend connections that are up among the ones THIS table needs.
@@ -1631,20 +1670,34 @@ fn sweep_table(
             }
         }
     }
-    // `D-037`: every sweep while the founder's friendship is up and its key is
-    // not a confirmed member, a member offers the group again -- bounded by
-    // `invited`, which the founder's down-edge clears.
+    // `D-037`: while the founder's friendship is up and it is not a confirmed
+    // member, a member offers the group again.
+    //
+    // `S1-FE`: **every `REINVITE_EVERY`, not once a friendship.** An offer made
+    // while the founder's own copy still held the others is swallowed by the
+    // library (`patches/0035` delivers only into a copy held empty), and the
+    // next one waited for the friendship to go down and come up again -- which
+    // a founder back on its line does not do. And absent by the line its entry
+    // came in over, while the group is short: this read `entries_of` with the
+    // founder's TOX key against APPLICATION keys, found nothing ever, and so
+    // offered while the founder sat in the group. A founder out of the roster
+    // for good (`D-047`) is offered nothing.
     if let (Role::Joiner { founder, .. }, Some(g)) = (&t.setup.role, t.group) {
-        if t.self_joined {
+        if t.self_joined && t.roster.contains(founder) {
             if let Some(n) = friend_number(friends, founder) {
-                let absent = !entries_of(founder, scan_pairs(tox, g), &t.known_as)
-                    .iter()
-                    .any(|(p, _)| t.confirmed.contains(p));
-                if absent && connected.contains(&n) && !t.invited.contains(&n) {
-                    if tox.invite(g, n).is_ok() {
+                let here = t.peer_lines.iter().any(|(p, l)| l == founder && t.confirmed.contains(p));
+                let absent = !here && group_short(t.confirmed.len(), t.roster.len());
+                if !absent {
+                    t.founder_offered = None;
+                } else if connected.contains(&n)
+                    && t.founder_offered.is_none_or(|at| at.elapsed() >= REINVITE_EVERY)
+                    && tox.invite(g, n).is_ok()
+                {
+                    t.founder_offered = Some(Instant::now());
+                    if !t.invited.contains(&n) {
                         t.invited.push(n);
-                        t.trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
                     }
+                    t.trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -1674,10 +1727,11 @@ fn sweep_table(
     // vacuously true at zero, and the roster reaches this thread one turn
     // behind the node loop that sets it. Measured, `split001316-2`: hand 1
     // opened into a group the joiner did not enter for another thirty seconds.
-    // `S1-DZ`, `S1-EG`: complete when every seat is a CONFIRMED member, this
-    // client among them; the library's count holds unconfirmed entries.
+    // `S1-DZ`, `S1-EG`: complete when every other seat is a CONFIRMED member;
+    // the library's count holds unconfirmed entries. `S1-FE`: every OTHER
+    // seat -- see `seen`.
     t.trouble.complete.store(
-        t.group.is_some() && !t.roster.is_empty() && 1 + t.confirmed.len() >= t.roster.len(),
+        t.group.is_some() && group_complete(t.confirmed.len(), t.roster.len()),
         Ordering::Relaxed,
     );
 
@@ -1692,10 +1746,13 @@ fn sweep_table(
         t.trouble.rejoins.store(0, Ordering::Relaxed);
     }
     t.was_reachable = can_be_invited;
+    // `S1-FE`: and a founder taken back into its group by a member's invitation,
+    // whose join can stall like anybody's.
     if !t.self_joined
         && t.group.is_some()
         && can_be_invited
-        && matches!(t.setup.role, Role::Joiner { .. } | Role::Back { .. })
+        && (matches!(t.setup.role, Role::Joiner { .. } | Role::Back { .. })
+            || (matches!(t.setup.role, Role::Host) && t.own_chat.is_some()))
     {
         if let Some(since) = t.accepted_at {
             if since.elapsed() >= JOIN_GRACE && t.rejoins < MAX_REJOINS {
@@ -1839,6 +1896,9 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                             closing: None,
                             last_invite: None,
                             offer_again: Vec::new(),
+                            held_offer: None,
+                            own_chat: None,
+                            founder_offered: None,
                             out,
                             inbox,
                             chat,
@@ -2142,6 +2202,8 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                                 t.invited.retain(|f| *f != friend);
                                 if tox.invite(g, friend).is_ok() {
                                     t.invited.push(friend);
+                                    // `S1-FE`: the sweep's next offer counts from this one.
+                                    t.founder_offered = Some(Instant::now());
                                     t.trouble.invites_sent.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
@@ -2173,10 +2235,28 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                         // trip from confirmed is not an emptied one; leaving it said
                         // goodbye, the founder freed the seat before the first hand,
                         // and the window closed while joining.
-                        if !(t.self_joined && t.settled && t.confirmed.is_empty() && t.closing.is_none()) {
+                        if !held_empty(t) {
                             continue;
                         }
                         if !invitation_fits(t, from) {
+                            continue;
+                        }
+                        // `S1-FE`: a founder keeps a member's invitation into its own
+                        // group -- the newest bytes, the first one's time -- and takes
+                        // it only if its copy still holds nobody else
+                        // `FOUNDER_YIELDS_AFTER` later (the driver's turn, below).
+                        if matches!(t.setup.role, Role::Host) {
+                            let ours = t.group.and_then(|g| tox.chat_id(g).ok());
+                            if ours.is_some_and(|c| invite.get(..c.len()) == Some(&c[..])) {
+                                let since = t.held_offer.as_ref().map_or_else(Instant::now, |(_, _, at)| *at);
+                                if t.held_offer.is_none() {
+                                    println!(
+                                        "the founder's copy of the table's group holds nobody else and a member offers the group back; taken in {} s unless a member comes back to this copy first (S1-FE)",
+                                        FOUNDER_YIELDS_AFTER.as_secs()
+                                    );
+                                }
+                                t.held_offer = Some((friend, invite.clone(), since));
+                            }
                             continue;
                         }
                         if let Some(g) = t.group.take() {
@@ -2540,10 +2620,40 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                 // offer it to.
                 if !t.offer_again.is_empty() {
                     let gone = std::mem::take(&mut t.offer_again);
-                    if t.group.is_some() && 1 + t.confirmed.len() < t.roster.len() {
+                    if t.group.is_some() && group_short(t.confirmed.len(), t.roster.len()) {
                         t.invited
                             .retain(|f| friends.get(f).is_none_or(|k| !gone.contains(k)));
                         t.last_invite = None;
+                    }
+                }
+                // `S1-FE`: a member's invitation kept while this founder's copy
+                // held nobody else. A member back in the copy means the founder's
+                // own offer was taken, and the kept one is dropped; still nobody
+                // `FOUNDER_YIELDS_AFTER` on, the copy is left and the invitation
+                // taken like a joiner's (`S1-EB`) -- the members' group is the one
+                // the table plays in.
+                if let Some((friend, invite, since)) = t.held_offer.take() {
+                    let emptied = held_empty(t);
+                    if emptied && since.elapsed() >= FOUNDER_YIELDS_AFTER {
+                        if let Some(g) = t.group.take() {
+                            t.own_chat = tox.chat_id(g).ok();
+                            let _ = tox.leave(g);
+                            t.self_joined = false;
+                            t.settled = false;
+                            t.accepted_at = None;
+                            t.peer_keys.clear();
+                            t.peer_lines.clear();
+                            t.invited.clear();
+                            t.last_invite = None;
+                            t.trouble.left_empty.fetch_add(1, Ordering::Relaxed);
+                            println!(
+                                "the founder's copy of the table's group held nobody else for {} s: left it, taking a member's invitation back into the table's group (S1-FE)",
+                                since.elapsed().as_secs()
+                            );
+                            invites_deferred.push((friend, invite));
+                        }
+                    } else if emptied {
+                        t.held_offer = Some((friend, invite, since));
                     }
                 }
                 invite_pending(&mut tox, t, &friends, &connected);
@@ -2774,6 +2884,22 @@ fn member_gone(tox: &Tox, t: &mut TableState, g: u32, peer: u32, key: Option<[u8
     }
 }
 
+/// `S1-EB`, `S1-FE`: this client holds the table's group with nobody else
+/// confirmed in it -- a copy every other member timed out of -- after members
+/// had been in it (`S1-EK`), and is not leaving it.
+///
+/// **A founder's copy is joined from its creation.** The library says a self
+/// join only when a sync response arrives with `time_connected` still zero, and
+/// `gc_group_add` sets that at creation, so a founder never hears one and its
+/// `self_joined` stays false: the first build of `S1-FE` read every founder's
+/// copy as never joined and kept no member's invitation at all (`fe180653-3`).
+/// A founder that has left its copy for a member's invitation (`own_chat`) is a
+/// joiner again, and its join is read like one.
+fn held_empty(t: &TableState) -> bool {
+    let joined = t.self_joined || (matches!(t.setup.role, Role::Host) && t.own_chat.is_none());
+    t.group.is_some() && joined && t.settled && t.confirmed.is_empty() && t.closing.is_none()
+}
+
 /// Whether an invitation from this friend could be for this table: a
 /// joiner's founder, or for a founder coming back any member of its roster
 /// (`D-037`); and only a table whose advertisement named a group, since an
@@ -2782,6 +2908,10 @@ fn invitation_fits(t: &TableState, from: Option<[u8; 32]>) -> bool {
     match (&t.setup.role, from) {
         (Role::Joiner { founder, chat_id: Some(_) }, Some(k)) => k == *founder,
         (Role::Back { chat_id: Some(_) }, Some(k)) => t.roster.contains(&k),
+        // `S1-FE`: a founder, from a member of its roster -- only ever taken
+        // into the group it created (`wanted_chat`), and only once its own copy
+        // has held nobody else for `FOUNDER_YIELDS_AFTER`.
+        (Role::Host, Some(k)) => t.roster.contains(&k),
         _ => false,
     }
 }
@@ -2790,7 +2920,8 @@ fn invitation_fits(t: &TableState, from: Option<[u8; 32]>) -> bool {
 fn wanted_chat(t: &TableState) -> Option<[u8; 32]> {
     match &t.setup.role {
         Role::Joiner { chat_id, .. } | Role::Back { chat_id } => *chat_id,
-        Role::Host => None,
+        // `S1-FE`: the group this founder left to be taken back into it.
+        Role::Host => t.own_chat,
     }
 }
 
@@ -2881,6 +3012,20 @@ fn invite_pending(
         // not stop growing.
         t.trouble.invites_refused.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// `S1-FE`: whether the table's group holds every other seat. `confirmed`
+/// counts the confirmed OTHER members; `others` the roster's seats but this
+/// client's own, which is how `TableState::roster` holds them. An empty roster
+/// is never complete: the roster reaches the driver a turn behind the node.
+fn group_complete(confirmed: usize, others: usize) -> bool {
+    others > 0 && confirmed >= others
+}
+
+/// `S1-FE`: whether another seat is missing from the table's group -- the
+/// condition every offer of the group again is gated on.
+fn group_short(confirmed: usize, others: usize) -> bool {
+    confirmed < others
 }
 
 /// Who is owed an invitation: connected, on the roster, not invited yet.
@@ -3076,6 +3221,27 @@ fn millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `S1-FE`: the group's counts are of OTHER seats, as the roster the driver
+    /// holds is. The formula before this counted this client in as well, so a
+    /// heads-up group with nobody else in it read complete and never short, and
+    /// a three-seat group with one seat missing the same.
+    #[test]
+    fn a_group_is_complete_with_every_other_seat_and_short_without_one() {
+        // Heads-up: one other seat.
+        assert!(!group_complete(0, 1), "nobody else in the group is not a complete heads-up group");
+        assert!(group_short(0, 1), "and it is short, so the group is offered again");
+        assert!(group_complete(1, 1));
+        assert!(!group_short(1, 1));
+        // Three seats: two others, one of them missing.
+        assert!(!group_complete(1, 2), "a seat still missing");
+        assert!(group_short(1, 2));
+        assert!(group_complete(2, 2));
+        assert!(!group_short(2, 2));
+        // The roster a turn behind the node: never complete, nothing to offer.
+        assert!(!group_complete(0, 0));
+        assert!(!group_short(0, 0));
+    }
 
     /// An invitation is owed by a **condition**, not by an event.
     ///

@@ -1,0 +1,93 @@
+# 0037 - for the bed only: the library's own ways back to lost members, off on request.
+#
+# S1-FE (2026-09-14). A founder that lost its line at a table of three could not come
+# back: the other two had removed it from their copy of the table's group, only a founder
+# invites, and a member's copy that still holds another member does not deliver the
+# founder's invitation (patch 0035 delivers one only into a copy held empty). The fix is in
+# the driver: a founder whose own copy holds nobody else takes a member's invitation back.
+#
+# Measuring that fix needs the invitation road ALONE, and the library has two others: the
+# timed-out list (do_timed_out_reconn), and the saved peers a copy with nobody in it is
+# re-seeded from. Neither needs an invitation, and on a relayed line either may or may not
+# finish its handshake: runs/fe174529-3 (the far founder, the build before the fix) went
+# half-open with both members for the rest of the run -- "handshaked with peer", then "peer
+# repeated the handshake response already taken" every three seconds, the members reading
+# "lossy packet from invalid peer" -- and never came back; runs/fe175456-3 (the build with
+# it) was taken back by that same road four seconds after its copy emptied, so the run said
+# nothing about the fix at all.
+#
+# P2P_POKER_NO_LIBRARY_RECONNECT=1 turns both roads off for the process that reads it.
+# Entirely inside #ifdef P2P_POKER_FAULT_HARNESS, which build.rs defines only under the
+# cargo feature: a release build compiles the library exactly as without this patch.
+#
+# MEASURED with it on the far founder (runs/fe181646-3): its copy emptied at 207.5 s, it
+# kept a member's offer at 209.4 s, left the copy and took it at 239.4 s, the table was
+# reachable again at 243.5 s, and it was dealt in again from hand #21.
+#
+# Vendored tree patched in place. Re-apply on a toxcore bump with
+#   git apply patches/0037-*.patch
+# and check tools/build-tox.ps1's marker for 0037 in group_chats.c.
+
+diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
+index d5bd1f6..2d02a24 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.c
++++ b/vendor/c-toxcore/toxcore/group_chats.c
+@@ -7521,6 +7521,30 @@ static void p2p_poker_ask_for_what_is_missing(const GC_Chat *_Nonnull chat, GC_C
+     }
+ }
+ 
++#ifdef P2P_POKER_FAULT_HARNESS
++/* p2p-poker (patch 0037): the library's own ways back, off, for the bed.
++ *
++ * P2P_POKER_NO_LIBRARY_RECONNECT=1 turns off both roads by which a copy of a
++ * group goes back to members it lost: the timed-out list (do_timed_out_reconn)
++ * and the saved peers a copy with nobody in it is re-seeded from. Neither
++ * needs an invitation, and on a relayed line either may or may not complete
++ * its handshake -- runs/fe174529-3 left the far founder half-open with both
++ * members for the rest of the run, runs/fe175456-3 took it back in four
++ * seconds -- so a run with them on cannot say what the INVITATION road does
++ * (S1-FE). A test instrument, never a repair: only the harness build reads it. */
++static bool p2p_poker_no_library_reconnect(void)
++{
++    static int cached = -1;
++
++    if (cached < 0) {
++        const char *v = getenv("P2P_POKER_NO_LIBRARY_RECONNECT");
++        cached = (v != nullptr && v[0] == '1') ? 1 : 0;
++    }
++
++    return cached == 1;
++}
++#endif /* P2P_POKER_FAULT_HARNESS */
++
+ static void do_peer_connections(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat, void *_Nullable userdata)
+ {
+     for (uint32_t i = 1; i < chat->numpeers; ++i) {
+@@ -7585,7 +7609,13 @@ static void do_handshakes(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat)
+         send_pending_handshake(chat, gconn);
+     }
+ 
+-    if (chat->numpeers <= 1) {
++    bool reseed = chat->numpeers <= 1;
++#ifdef P2P_POKER_FAULT_HARNESS
++    /* p2p-poker (patch 0037): see p2p_poker_no_library_reconnect. */
++    reseed = reseed && !p2p_poker_no_library_reconnect();
++#endif /* P2P_POKER_FAULT_HARNESS */
++
++    if (reseed) {
+         const uint64_t tm = mono_time_get(chat->mono_time);
+ 
+         if (mono_time_is_timeout(chat->mono_time, chat->last_time_peers_loaded, LOAD_PEERS_TIMEOUT)) {
+@@ -7917,6 +7947,12 @@ static void do_timed_out_reconn(GC_Chat *_Nonnull chat)
+         return;
+     }
+ 
++#ifdef P2P_POKER_FAULT_HARNESS
++    if (p2p_poker_no_library_reconnect()) {
++        return;
++    }
++#endif /* P2P_POKER_FAULT_HARNESS */
++
+     if (!mono_time_is_timeout(chat->mono_time, chat->last_timed_out_reconn_try, TIMED_OUT_RECONN_INTERVAL)) {
+         return;
+     }

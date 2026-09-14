@@ -259,6 +259,9 @@ $patched = @(
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker (patch 0036): a peer''s relay connection sleeps only while a'
        Why    = '0036: S1-FC. A member heard directly but held with no address had its relay connection put to sleep, so nothing could be sent to it once no other connection kept that relay awake: a seat back from a restart was unreachable for 55 s and spent a heads-up return. Local; the wire is untouched.' }
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker (patch 0037): the library''s own ways back, off, for the bed.'
+       Why    = '0037: S1-FE''s instrument. P2P_POKER_NO_LIBRARY_RECONNECT=1 turns off the timed-out list and the saved-peers reseed, so a run measures the invitation road alone; on a relayed line those roads finish their handshake or not by chance. Entirely inside #ifdef P2P_POKER_FAULT_HARNESS' }
 )
 
 Step 'checking the patches are in the vendored source'

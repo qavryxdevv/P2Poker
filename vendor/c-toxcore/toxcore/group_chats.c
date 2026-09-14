@@ -7521,6 +7521,30 @@ static void p2p_poker_ask_for_what_is_missing(const GC_Chat *_Nonnull chat, GC_C
     }
 }
 
+#ifdef P2P_POKER_FAULT_HARNESS
+/* p2p-poker (patch 0037): the library's own ways back, off, for the bed.
+ *
+ * P2P_POKER_NO_LIBRARY_RECONNECT=1 turns off both roads by which a copy of a
+ * group goes back to members it lost: the timed-out list (do_timed_out_reconn)
+ * and the saved peers a copy with nobody in it is re-seeded from. Neither
+ * needs an invitation, and on a relayed line either may or may not complete
+ * its handshake -- runs/fe174529-3 left the far founder half-open with both
+ * members for the rest of the run, runs/fe175456-3 took it back in four
+ * seconds -- so a run with them on cannot say what the INVITATION road does
+ * (S1-FE). A test instrument, never a repair: only the harness build reads it. */
+static bool p2p_poker_no_library_reconnect(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *v = getenv("P2P_POKER_NO_LIBRARY_RECONNECT");
+        cached = (v != nullptr && v[0] == '1') ? 1 : 0;
+    }
+
+    return cached == 1;
+}
+#endif /* P2P_POKER_FAULT_HARNESS */
+
 static void do_peer_connections(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat, void *_Nullable userdata)
 {
     for (uint32_t i = 1; i < chat->numpeers; ++i) {
@@ -7585,7 +7609,13 @@ static void do_handshakes(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat)
         send_pending_handshake(chat, gconn);
     }
 
-    if (chat->numpeers <= 1) {
+    bool reseed = chat->numpeers <= 1;
+#ifdef P2P_POKER_FAULT_HARNESS
+    /* p2p-poker (patch 0037): see p2p_poker_no_library_reconnect. */
+    reseed = reseed && !p2p_poker_no_library_reconnect();
+#endif /* P2P_POKER_FAULT_HARNESS */
+
+    if (reseed) {
         const uint64_t tm = mono_time_get(chat->mono_time);
 
         if (mono_time_is_timeout(chat->mono_time, chat->last_time_peers_loaded, LOAD_PEERS_TIMEOUT)) {
@@ -7916,6 +7946,12 @@ static void do_timed_out_reconn(GC_Chat *_Nonnull chat)
     if (is_public_chat(chat)) {
         return;
     }
+
+#ifdef P2P_POKER_FAULT_HARNESS
+    if (p2p_poker_no_library_reconnect()) {
+        return;
+    }
+#endif /* P2P_POKER_FAULT_HARNESS */
 
     if (!mono_time_is_timeout(chat->mono_time, chat->last_timed_out_reconn_try, TIMED_OUT_RECONN_INTERVAL)) {
         return;
