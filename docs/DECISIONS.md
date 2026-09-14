@@ -4701,13 +4701,60 @@ The owner wants tables to be **practically unlimited**, and §2 says plainly tha
 tables every client relays about 1.9 MB/s. The bounds above make the failure *safe and visible* -- the lobby degrades
 to a rotating sample of about 340 tables instead of collapsing -- but they do not make it unbounded.
 
-The fix is to stop subscribing every client to every table: **shard the advert topic**,
-`/p2p-poker/lobby/1/<first 12 bits of the table key>` = 4 096 shards, a founder publishing only into its table's own
-shard and a client subscribing to as many shards as its window wants rows. The owner's own display limit then becomes
-the traffic rule: 512 rows at `T / 4096` tables a shard is one shard at two million tables, four shards at half a
-million, and the client's cost stops depending on `T` at all. Targeted search ("a 50/100 table") is already built and
-unaffected -- it is D-040's question to peers, not the broadcast. This is `S1-EX`, and it is a protocol change
-(§7.1's topic names), so it is booked rather than smuggled in.
+The fix is to stop subscribing every client to every table: **shard the advert topic** by the table's own key, a
+founder publishing into its table's shard and a client subscribing only to the shards it can afford. Targeted search
+("a 50/100 table") is unaffected -- it is D-040's question to peers, not the broadcast. This is `S1-EX`, and it is a
+protocol change (§7.1's topic names), so it is booked rather than smuggled in. What follows is the design, written
+down so that it is not re-derived from scratch when the day comes.
+
+**A shard cannot be chosen for what is in it.** The shard comes from the table key, which is a public key: it has no
+correlation with stakes, seats or preset, so *"subscribe to the shard with the 50/100 tables"* does not exist. A
+client chooses only **how many** shards and **which arbitrary ones**, and everything else is D-040's question.
+
+**The depth is measured, not guessed.** A client does not need to be told how many tables exist -- it can read it off
+what it hears, because every table advertises once every thirty seconds:
+
+> `T` is about (adverts a second) x 30 x (shards at my depth)
+
+So: start at depth zero, which is the whole topic and today's behaviour, and a small network never leaves it. Measure
+the inbound rate over half a minute. Over the budget -- the per-neighbour cost ceiling already derived above, twelve
+adverts a second -- go one depth deeper and measure again; far under it with a window that will not fill, go
+shallower. Hysteresis on both sides and at most one change a minute, so it cannot oscillate. The depth wanted for `K`
+shards and a window of `MAX_TRACKED_TABLES` rows is the one nearest `T x K / rows`:
+
+| tables | depth | tables a shard | four shards | inbound |
+|---|---|---|---|---|
+| 5 000 | 4 bits (16) | 312 | a full window | 1.4 a second |
+| 100 000 | 11 bits (2 048) | 49 | 195 rows | 6.5 a second |
+| 2 000 000 | 16 bits (65 536) | 30 | 122 rows | 4 a second |
+
+The ladder therefore has to go deeper than twelve bits -- at millions of tables a single twelve-bit shard is over the
+budget on its own -- so the depths are every four bits: 0, 4, 8, 12, 16.
+
+**How many shards is decided by connections, not by bandwidth.** A topic's mesh is built only from peers this client
+is *connected to* that also subscribe to it, so each shard wants ten or twelve connections of the eighty this client
+keeps. That is **four to six shards**, and the rest of the connection budget stays for the table's own traffic, the
+relays and the DHT. It is also why sharding cannot be done by splitting the topic alone: with random peering the
+expected mesh candidates for a shard are `80 x K / N`, which falls below `mesh_n_low` past about `13 x K` shards --
+fifty-odd, whatever the size of the network. **Sharding requires a per-shard discovery key in the DHT** (the pattern
+of `p2p-poker/main-lobby/v1`) so that a client dials peers *of its own shards* and its connections are chosen rather
+than random.
+
+**Which shards: arbitrary, and slowly rotating.** Not derived from this client's own key, which would pin a player to
+one slice of the network for ever and hide the rest. Random, `K` at a time, one swapped for a fresh one every few
+minutes -- which spreads the load evenly across clients, keeps the sample moving (the same rule as the redraw pace,
+one storey up), and is subscribed **before** the old one is left so the list never goes blank.
+
+**What "what N" costs, and how to avoid agreeing on it.** Too few shards is the firehose again; too many leaves a
+shard with so few subscribers worldwide that its mesh cannot hold together. The way out is for a founder to publish
+its advert at **every depth** (0, 4, 8, 12, 16 -- five publishes every thirty seconds, which is nothing) and for each
+client to subscribe at the depth its own network needs. Nobody agrees on anything, a client of an older build keeps
+working at depth zero, and publishing into a topic nobody subscribes to costs the founder nothing at all: with no
+mesh there, it sends nothing.
+
+**The two constants derived above are the inputs of that loop**, which is what makes it self-tuning: the cost ceiling
+is the budget the depth regulates against, and the window's rows are the target the shard count regulates against.
+Nothing further is configured.
 
 **Guard.** `net::swarm::tests::the_peer_score_counts_refusals_and_not_traffic` (the rate terms are zero, the
 library validates the params, and the settled-score arithmetic of the table above),
