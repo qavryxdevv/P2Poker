@@ -1420,10 +1420,6 @@ fn preview_table(args: &[String]) {
                 for_s: if back { 71 } else { 38 },
                 steps: if back {
                     vec![
-                        (Done, "Carol stopped answering".into()),
-                        (Done, "The hand waits on its clock".into()),
-                        (Done, "The other seats agree to act for it".into()),
-                        (Done, "Certified out: the hand goes on without it".into()),
                         (Done, "Back on the line".into()),
                         (Done, "Asked to sit in after hand #20".into()),
                         (Now, "The seats agree to its return – 1 of 2".into()),
@@ -1435,7 +1431,6 @@ fn preview_table(args: &[String]) {
                         (Done, "The hand waits on its clock".into()),
                         (Now, "The other seats agree to act for it – 1 of 2".into()),
                         (Later, "Certified out: the hand goes on without it".into()),
-                        (Later, "Back on the line".into()),
                     ]
                 },
                 detail: Some(if back {

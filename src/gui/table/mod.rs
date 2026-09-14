@@ -1477,13 +1477,14 @@ fn overlays(ui: &egui::Ui, p: &egui::Painter, zone: Rect, view: &TableView) {
         }
         return;
     }
-    if view.line.is_none() && !view.absent.is_empty() {
+    // `S1-EI`: the seats off the line the hand still waits on. A seat certified
+    // out is not one of them: the table plays on without it (`D-058`).
+    let waited_on: Vec<&AbsentSeat> = view.absent.iter().filter(|a| !a.certified).collect();
+    if view.line.is_none() && !waited_on.is_empty() {
         let mut lines: Vec<String> = Vec::new();
-        for a in &view.absent {
+        for a in waited_on {
             let quiet = a.quiet_s.map(|q| format!(", silent {q} s")).unwrap_or_default();
-            lines.push(if a.certified {
-                format!("{} is off the line{quiet}: certified out of this hand; the hand goes on among the seats on the line.", a.name)
-            } else if a.waited {
+            lines.push(if a.waited {
                 match a.on_clock_s {
                     Some(s) => format!("{} is off the line{quiet}: the hand waits on it, {s} s on its clock; when the clock runs out the other seats certify it out and play on.", a.name),
                     None => format!("{} is off the line{quiet}: the hand waits on it; when its clock runs out the other seats certify it out and play on.", a.name),
