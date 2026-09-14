@@ -177,7 +177,9 @@ fn main() {
     // `--preview-flooded` is out for flooding the group and `--preview-unsafe`
     // says the table is not safe (D-051); `--preview-winner` ends the hand with
     // the winners' words blinking at their seats (D-052); `--preview-rejoin`
-    // shows the way back half done and `--preview-rejoin-back` over (D-057).
+    // shows the way back half done and `--preview-rejoin-back` over (D-057);
+    // `--preview-waits` the table waiting on a seat and `--preview-waits-back`
+    // that seat on its way back (D-058).
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -1406,6 +1408,44 @@ fn preview_table(args: &[String]) {
             }),
             back,
         });
+    }
+    // `D-058`: the table waiting on a seat, its votes half in -- and
+    // `--preview-waits-back` one on its way back.
+    if has("--preview-waits") || has("--preview-waits-back") {
+        use table::StepState::{Done, Later, Now};
+        let back = has("--preview-waits-back");
+        view.waits = vec![table::WaitView {
+            title: if back { "Carol is coming back".into() } else { "Waiting for Carol".into() },
+            panel: table::RejoinView {
+                for_s: if back { 71 } else { 38 },
+                steps: if back {
+                    vec![
+                        (Done, "Carol stopped answering".into()),
+                        (Done, "The hand waits on its clock".into()),
+                        (Done, "The other seats agree to act for it".into()),
+                        (Done, "Certified out: the hand goes on without it".into()),
+                        (Done, "Back on the line".into()),
+                        (Done, "Asked to sit in after hand #20".into()),
+                        (Now, "The seats agree to its return – 1 of 2".into()),
+                        (Later, "Back in the game".into()),
+                    ]
+                } else {
+                    vec![
+                        (Done, "Carol stopped answering".into()),
+                        (Done, "The hand waits on its clock".into()),
+                        (Now, "The other seats agree to act for it – 1 of 2".into()),
+                        (Later, "Certified out: the hand goes on without it".into()),
+                        (Later, "Back on the line".into()),
+                    ]
+                },
+                detail: Some(if back {
+                    "Carol asked to come back; the next hand deals it in once every seat has agreed".into()
+                } else {
+                    "A seat's clock ran out; when every other seat agrees, the table acts for it and the hand goes on".into()
+                }),
+                back: false,
+            },
+        }];
     }
     if has("--preview-absent") {
         view.absent = vec![

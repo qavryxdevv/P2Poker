@@ -290,6 +290,9 @@ pub struct TableView {
     /// `D-057`: this client's own way back to the table, step by step, while
     /// it is under way -- so a table waiting on its line does not look frozen.
     pub rejoin: Option<RejoinView>,
+    /// `D-058`: every other seat the table waits on, step by step -- its clock,
+    /// the votes, the certificate, and its way back if it comes.
+    pub waits: Vec<WaitView>,
     /// `S1-EI`: the question is about everybody else, not one opponent.
     pub opponent_alone: bool,
     /// PokerTH's *Game: N*: which game of this client's session the table is.
@@ -370,6 +373,14 @@ pub struct RejoinView {
     pub detail: Option<String>,
     /// Back in the game: the panel says so for a moment and goes.
     pub back: bool,
+}
+
+/// `D-058`: a seat the table waits on, as the felt shows it: the same steps
+/// panel as this client's own way back, under a title that names the seat.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WaitView {
+    pub title: String,
+    pub panel: RejoinView,
 }
 
 /// `S1-EI`: a seat off the line during the hand, and what happens about it.
@@ -1446,6 +1457,26 @@ fn overlays(ui: &egui::Ui, p: &egui::Painter, zone: Rect, view: &TableView) {
         }
         paint_again(ui.ctx(), std::time::Duration::from_secs(1));
     }
+    // `D-058`: the seats the table waits on, step by step, where the words about
+    // the seats off the line were; at most two panels, the rest counted.
+    if view.line.is_none() && !view.waits.is_empty() {
+        let mut top = zone.top() + 44.0;
+        for w in view.waits.iter().take(2) {
+            let h = step_panel_height(&w.panel);
+            let centre = pos2(zone.center().x, top + h * 0.5);
+            let (colour, title) = if w.panel.back {
+                (crate::gui::theme::OK, w.title.as_str())
+            } else {
+                (crate::gui::theme::WARN, w.title.as_str())
+            };
+            step_panel(ui, p, zone, centre, title, colour, &w.panel);
+            top += h + 8.0;
+        }
+        if view.waits.len() > 2 {
+            style::text(p, pos2(zone.center().x, top + 8.0), Align2::CENTER_CENTER, &format!("and {} more seat(s) waited on", view.waits.len() - 2), 11.5, Weight::Regular, style::PANEL_TEXT);
+        }
+        return;
+    }
     if view.line.is_none() && !view.absent.is_empty() {
         let mut lines: Vec<String> = Vec::new();
         for a in &view.absent {
@@ -1486,21 +1517,39 @@ fn overlays(ui: &egui::Ui, p: &egui::Painter, zone: Rect, view: &TableView) {
 /// the felt showed none of them: *Line down* went and nothing replaced it
 /// for as long as a minute (the far founder's return, `fe181646-3`).
 fn rejoin_panel(ui: &egui::Ui, p: &egui::Painter, zone: Rect, r: &RejoinView) {
-    use crate::gui::theme::{DANGER, OK, TEXT_DIM, WARN};
-    let row_h = 20.0;
-    let detail_lines: Vec<String> = r
-        .detail
+    use crate::gui::theme::{OK, WARN};
+    let (title, colour) = if r.back { ("Back in the game", OK) } else { ("Getting back to the table", WARN) };
+    let centre = pos2(zone.center().x, zone.center().y - zone.height() * 0.05);
+    step_panel(ui, p, zone, centre, title, colour, r);
+}
+
+/// The sentences under a steps panel, each ending in a full stop.
+fn step_panel_detail(r: &RejoinView) -> Vec<String> {
+    r.detail
         .as_deref()
         .map(|d| d.split(". ").map(|s| if s.ends_with('.') { s.to_string() } else { format!("{s}.") }).collect())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// How tall a steps panel is.
+fn step_panel_height(r: &RejoinView) -> f32 {
+    let detail = step_panel_detail(r).len();
+    46.0 + 20.0 * r.steps.len() as f32 + 16.0 * detail as f32 + if detail == 0 { 4.0 } else { 12.0 }
+}
+
+/// `D-057`, `D-058`: a panel of steps -- done, under way, still to come -- with
+/// a title, how long it has been, and what the step under way waits on.
+fn step_panel(ui: &egui::Ui, p: &egui::Painter, zone: Rect, centre: egui::Pos2, title: &str, colour: Color32, r: &RejoinView) {
+    use crate::gui::theme::{DANGER, OK, TEXT_DIM, WARN};
+    let row_h = 20.0;
+    let detail_lines = step_panel_detail(r);
     let w = (zone.width() * 0.62).max(340.0);
-    let h = 46.0 + row_h * r.steps.len() as f32 + 16.0 * detail_lines.len() as f32 + if detail_lines.is_empty() { 4.0 } else { 12.0 };
-    let rect = Rect::from_center_size(pos2(zone.center().x, zone.center().y - zone.height() * 0.05), vec2(w, h));
+    let h = step_panel_height(r);
+    let rect = Rect::from_center_size(centre, vec2(w, h));
     style::shadow(p, rect, 12.0, 3.0, 14.0, Color32::from_black_alpha(160));
     p.rect_filled(rect, 12.0, style::faded(style::PANEL_BG, 0.95));
     p.rect_stroke(rect, 12.0, Stroke::new(1.0, style::PANEL_BORDER), StrokeKind::Inside);
 
-    let (title, colour) = if r.back { ("Back in the game", OK) } else { ("Getting back to the table", WARN) };
     style::text(p, pos2(rect.left() + 18.0, rect.top() + 19.0), Align2::LEFT_CENTER, title, 15.5, Weight::Bold, colour);
     let clock = if r.for_s >= 60 { format!("{}:{:02}", r.for_s / 60, r.for_s % 60) } else { format!("{} s", r.for_s) };
     style::text(p, pos2(rect.right() - 18.0, rect.top() + 19.0), Align2::RIGHT_CENTER, &clock, 12.5, Weight::Regular, TEXT_DIM);
@@ -2036,6 +2085,7 @@ impl TableView {
             line: None,
             absent: Vec::new(),
             rejoin: None,
+            waits: Vec::new(),
             opponent_alone: false,
             game_no: 1,
             log: vec![

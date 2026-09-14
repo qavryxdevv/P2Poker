@@ -1458,6 +1458,9 @@ pub struct Hand {
     /// the peers all say their clocks ran out and nothing ever happens — so the
     /// count is reported rather than inferred.
     tally: Option<(SeatIdx, usize, usize, Hash)>,
+    /// `D-058`: the same count for a seat's return -- the subject, votes held,
+    /// votes needed -- taken by the node for the window's panel.
+    return_tally: Option<(SeatIdx, usize, usize)>,
     /// What the carrier was holding **at the moment this client cast its own
     /// vote**: subject seat, the seat's `mid-delivery` bit, and whether the
     /// stage was already past twice its budget.
@@ -2014,6 +2017,7 @@ impl Hand {
                 last_heard_at: vec![None; usize::from(o.max_players)],
             checkpoint8: None,
                 tally: None,
+                return_tally: None,
                 own_vote_carrier: Vec::new(),
                 certs: BTreeMap::new(),
                 struck: BTreeSet::new(),
@@ -7863,6 +7867,12 @@ impl Hand {
         self.tally.take()
     }
 
+    /// `D-058`: how a seat's return vote stands -- subject, held, needed --
+    /// taken rather than read, as `take_tally`.
+    pub fn take_return_tally(&mut self) -> Option<(SeatIdx, usize, usize)> {
+        self.return_tally.take()
+    }
+
     /// `S1-BB`'s reading: what the carrier held about each seat this client has
     /// just voted about. Taken rather than read; see the field.
     pub fn take_vote_carrier(&mut self) -> Vec<(SeatIdx, bool, bool)> {
@@ -9806,6 +9816,7 @@ impl Hand {
                 "return: vote {held}/{} about seat {seat}'s return (mine)",
                 self.return_voters().len()
             ));
+            self.return_tally = Some((seat, held, self.return_voters().len()));
             out.append(&mut self.certify_returns_if_unanimous(key, now_ms)?);
         }
         Ok(out)
@@ -9889,6 +9900,7 @@ impl Hand {
             self.return_voters().len(),
             body.subject_seat
         ));
+        self.return_tally = Some((body.subject_seat, held, self.return_voters().len()));
         self.certify_returns_if_unanimous(key, now_ms)
     }
 

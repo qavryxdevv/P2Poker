@@ -4851,3 +4851,26 @@ stůl nevypadal zamrzlý"*).
 **Guard.** `app::tests::the_way_back_is_shown_step_by_step_until_dealt_in_again` (the far founder's sequence, and a
 short outage that put nobody out) and `app::tests::heads_up_the_way_back_waits_for_this_clients_own_line`.
 `--table-preview --preview-rejoin` and `--preview-rejoin-back` draw it.
+
+## D-058 — the window says how the table's wait on a seat is going
+
+**Decided 2026-09-14, the owner's ruling** (*"podobně uživatelsky hezké GUI okno z commitu 9171c39 bych chtěl mít i pro situace, kdy u
+stolu, který čeká na nekomunikujícího peera, a pak přijde proces (hlasování atd.) na certifikaci"*).
+
+1. **A seat the table waits on gets the same panel of steps as this client's own way back (`D-057`)**, in the place
+   `S1-EI`'s sentences about the seats off the line had: the seat stopped answering, the hand waits on its clock
+   (with the seconds while it is that seat's turn), the other seats agree to act for it (with the count), certified
+   out and the hand goes on without it, back on the line -- and, if it comes back, its sit-in at the end of a hand,
+   the seats agreeing to its return (with the count), and dealt in again. The title names the seat -- *Waiting for
+   Carol*, *Carol is coming back*, *Carol is back* -- and the sentence under the steps says what the step under way
+   waits on. A seat back before it was ever put out is done at once; *is back* stays four seconds.
+2. **Two panels at most**, stacked at the top of the felt, and a count of the rest. This client's own way back is
+   the only panel while it is under way: a client that cannot reach the table has nothing reliable to say about
+   the others.
+3. **From the node's facts**: `NodeEvent::TimeoutVotes` and `ReturnVotes` (the tallies the hand engine already kept
+   for its log, now also a structured `take_return_tally`), `SitInAsked { seat }` (for every seat, where `D-057`
+   had only this client's own), with `SeatLink`, `SeatCertified` and `HandBegan` the window already had.
+
+**Guard.** `app::tests::the_wait_on_a_seat_is_shown_step_by_step_until_it_is_back` (the members' side of the far
+founder's outage in `fe181646-3`, from its silence to dealt in again). `--table-preview --preview-waits` and
+`--preview-waits-back` draw it.

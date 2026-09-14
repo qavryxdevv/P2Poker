@@ -514,8 +514,13 @@ pub enum NodeEvent {
     /// `D-057`: whether any seat of the table can be reached from here, said
     /// when that changes once a seat has been on the line.
     TableReach { reachable: bool },
-    /// `D-057`: this client's seat asked to sit in at the boundary of this hand.
-    SitInAsked { hand_id: u64 },
+    /// `D-057`, `D-058`: a seat -- this client's own or another -- asked to sit
+    /// in at the boundary of this hand.
+    SitInAsked { seat: u8, hand_id: u64 },
+    /// `D-058`: how the votes to act for a seat whose clock ran out stand.
+    TimeoutVotes { seat: u8, held: u8, need: u8 },
+    /// `D-058`: how the votes on a seat's return stand.
+    ReturnVotes { seat: u8, held: u8, need: u8 },
 }
 
 impl NodeEvent {
@@ -640,7 +645,10 @@ impl NodeEvent {
             | Self::SessionGaveUp { .. }
             // `D-057`: the way back over the felt.
             | Self::TableReach { .. }
-            | Self::SitInAsked { .. } => true,
+            | Self::SitInAsked { .. }
+            // `D-058`: the wait on another seat over the felt.
+            | Self::TimeoutVotes { .. }
+            | Self::ReturnVotes { .. } => true,
 
             // Log only. Chatty, repetitive, and worth a second's delay.
             //

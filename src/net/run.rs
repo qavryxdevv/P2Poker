@@ -1763,6 +1763,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             short_hash(&d)
                                         )))
                                         .await;
+                                    let _ = events
+                                        .send(NodeEvent::TimeoutVotes {
+                                            seat: subject,
+                                            held: u8::try_from(held).unwrap_or(u8::MAX),
+                                            need: u8::try_from(need).unwrap_or(u8::MAX),
+                                        })
+                                        .await;
+                                }
+                                // `D-058`: and a seat's return, the same way.
+                                if let Some((subject, held, need)) = $h.take_return_tally() {
+                                    let _ = events
+                                        .send(NodeEvent::ReturnVotes {
+                                            seat: subject,
+                                            held: u8::try_from(held).unwrap_or(u8::MAX),
+                                            need: u8::try_from(need).unwrap_or(u8::MAX),
+                                        })
+                                        .await;
                                 }
                                 // **`S1-BB`: the carrier at the moment of
                                 // the accusation, not at the moment of
@@ -7464,8 +7481,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // acts for its own owner first.
                             let who: Vec<String> =
                                 h.waiting_for().iter().map(|s| s.to_string()).collect();
-                            let mine = h
-                                .take_tally()
+                            let tally = h.take_tally();
+                            // `D-058`: the count, as a fact for the window.
+                            if let Some((s, held, need, _)) = tally {
+                                let _ = events
+                                    .send(NodeEvent::TimeoutVotes {
+                                        seat: s,
+                                        held: u8::try_from(held).unwrap_or(u8::MAX),
+                                        need: u8::try_from(need).unwrap_or(u8::MAX),
+                                    })
+                                    .await;
+                            }
+                            let mine = tally
                                 .map(|(s, held, need, d)| {
                                     format!("seat {s} @{}: {held}/{need} agree", short_hash(&d))
                                 })
@@ -11970,10 +11997,9 @@ async fn boundary_event(
                      the next hand's opening"
                 )))
                 .await;
-            // `D-057`: this client's own request, for the window's way back.
-            if seat == h.my_seat() {
-                let _ = events.send(NodeEvent::SitInAsked { hand_id }).await;
-            }
+            // `D-057`, `D-058`: for the window's way back (this client's own)
+            // and its wait on another seat.
+            let _ = events.send(NodeEvent::SitInAsked { seat, hand_id }).await;
         }
         WindowTook::Took(k) => {
             // Recorded and read by nobody yet, which is stated in the log rather
