@@ -207,6 +207,10 @@ pub struct SeatView {
     /// `D-035`: the seat's client left the table's group; drawn dim, with
     /// *left the table* where its cards were, and no clock.
     pub left: bool,
+    /// `D-058`: on its way back to the table -- it asked to sit in, or the seats
+    /// vote on its return: *coming back* where its cards were, the only place the
+    /// return is said while a hand is played.
+    pub coming_back: bool,
     /// `S1-CS`: the seat's connection, as the last ping said; `None` before
     /// any reading.
     pub link: Option<Link>,
@@ -290,8 +294,9 @@ pub struct TableView {
     /// `D-057`: this client's own way back to the table, step by step, while
     /// it is under way -- so a table waiting on its line does not look frozen.
     pub rejoin: Option<RejoinView>,
-    /// `D-058`: every other seat the table waits on, step by step -- its clock,
-    /// the votes, the certificate, and its way back if it comes.
+    /// `D-058`: every other seat the running hand stands on, step by step -- its
+    /// clock, the votes, the certificate to come. Nothing else is drawn over a
+    /// hand that is being played.
     pub waits: Vec<WaitView>,
     /// `S1-EI`: the question is about everybody else, not one opponent.
     pub opponent_alone: bool,
@@ -375,7 +380,7 @@ pub struct RejoinView {
     pub back: bool,
 }
 
-/// `D-058`: a seat the table waits on, as the felt shows it: the same steps
+/// `D-058`: a seat the hand stands on, as the felt shows it: the same steps
 /// panel as this client's own way back, under a title that names the seat.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WaitView {
@@ -395,6 +400,15 @@ pub struct AbsentSeat {
     /// On the clock, for this long.
     pub on_clock_s: Option<u64>,
     pub quiet_s: Option<u64>,
+}
+
+impl AbsentSeat {
+    /// `D-058`: whether the hand stands on this seat -- its turn, or a stage it
+    /// owes -- rather than being played on among the others. Only such a seat
+    /// is said over the felt.
+    pub fn stalls(&self) -> bool {
+        !self.certified && (self.waited || self.on_clock_s.is_some())
+    }
 }
 
 /// `S1-CS`: a line of table chat as the window shows it.
@@ -1143,8 +1157,15 @@ fn seat_box(
         }
     }
     if out || seat.left {
-        let words = if seat.left { "left the table" } else { "sitting out" };
-        style::text(p, cards_area.center(), Align2::CENTER_CENTER, words, (11.0 * s).max(9.0), Weight::Medium, style::faded(style::TEXT_2, 0.9));
+        // `D-058`: a seat on its way back says so here, and nowhere over the hand.
+        let (words, tint) = if seat.coming_back {
+            ("coming back", crate::gui::theme::WARN)
+        } else if seat.left {
+            ("left the table", style::faded(style::TEXT_2, 0.9))
+        } else {
+            ("sitting out", style::faded(style::TEXT_2, 0.9))
+        };
+        style::text(p, cards_area.center(), Align2::CENTER_CENTER, words, (11.0 * s).max(9.0), Weight::Medium, tint);
     }
 
     // The info bar: the name, the stars under it, the stack on the right.
@@ -1477,20 +1498,17 @@ fn overlays(ui: &egui::Ui, p: &egui::Painter, zone: Rect, view: &TableView) {
         }
         return;
     }
-    // `S1-EI`: the seats off the line the hand still waits on. A seat certified
-    // out is not one of them: the table plays on without it (`D-058`).
-    let waited_on: Vec<&AbsentSeat> = view.absent.iter().filter(|a| !a.certified).collect();
+    // `S1-EI`: the seats off the line the hand stands on. A seat certified out,
+    // or one the others play the hand without for now, is not said over the
+    // felt: nothing covers a hand that is being played (`D-058`).
+    let waited_on: Vec<&AbsentSeat> = view.absent.iter().filter(|a| a.stalls()).collect();
     if view.line.is_none() && !waited_on.is_empty() {
         let mut lines: Vec<String> = Vec::new();
         for a in waited_on {
             let quiet = a.quiet_s.map(|q| format!(", silent {q} s")).unwrap_or_default();
-            lines.push(if a.waited {
-                match a.on_clock_s {
-                    Some(s) => format!("{} is off the line{quiet}: the hand waits on it, {s} s on its clock; when the clock runs out the other seats certify it out and play on.", a.name),
-                    None => format!("{} is off the line{quiet}: the hand waits on it; when its clock runs out the other seats certify it out and play on.", a.name),
-                }
-            } else {
-                format!("{} is off the line{quiet}: certified out when its turn comes; it rejoins at a later hand if it comes back.", a.name)
+            lines.push(match a.on_clock_s {
+                Some(s) => format!("{} is off the line{quiet}: the hand waits on it, {s} s on its clock; when the clock runs out the other seats certify it out and play on.", a.name),
+                None => format!("{} is off the line{quiet}: the hand waits on it; when its clock runs out the other seats certify it out and play on.", a.name),
             });
         }
         lines.push("The hand finishes when the seats it waits on are back on the line or certified out; nothing here is stuck.".to_string());
@@ -1905,7 +1923,9 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                         ui.label(RichText::new(format!("{}", i + 1)).color(style::PANEL_TEXT_2));
                         ui.label(RichText::new(&s.name).color(colour));
                         ui.label(RichText::new(format!("${}", s.stack)).color(style::COLOR_ACCENT));
-                        let state_word = if s.left {
+                        let state_word = if s.coming_back {
+                            "coming back"
+                        } else if s.left {
                             "left the table"
                         } else if s.stack == 0 && view.hand > 0 && !s.cards.iter().any(|c| !matches!(c, Facing::Empty)) {
                             "out"

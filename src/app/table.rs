@@ -104,6 +104,8 @@ impl AppState {
                     win: hand.and_then(|h| win_at(h, *n)),
                     muted: self.muted.contains(n),
                     left: self.gone.contains(n),
+                    // `D-058`: on its way back, said at its seat and not over the hand.
+                    coming_back: self.waits.get(n).is_some_and(|w| w.returning()),
                     link: self.links.get(n).map(|(rtt, group, quiet, at)| Link {
                         rtt_ms: *rtt,
                         stale: at.elapsed().as_millis() as u64 > LINK_STALE_MS,

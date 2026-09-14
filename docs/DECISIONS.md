@@ -4875,24 +4875,30 @@ stolu, který čeká na nekomunikujícího peera, a pak přijde proces (hlasová
 founder's outage in `fe181646-3`, from its silence to dealt in again). `--table-preview --preview-waits` and
 `--preview-waits-back` draw it.
 
-**D-058 amended 2026-09-14 (the owner's word: nothing waits over a table that plays on).** *"Malé škobrtnutí: ta
-hláška Waiting for tam nemá být, pokud už hraje zbytek hráčů po vyhození mrtvého peera atd."* -- with a screenshot
-of *Waiting for* a seat that had left the table, every step to its certificate done and *Back on the line* turning,
-over a table that had dealt on without it. The panel had no end but a return: a seat that never came back was
-waited for over the felt for as long as the game went on.
+**D-058 amended 2026-09-14 (the owner's word, twice: nothing over a hand that is being played).** First
+*"malé škobrtnutí: ta hláška Waiting for tam nemá být, pokud už hraje zbytek hráčů po vyhození mrtvého peera
+atd."* -- with a screenshot of *Waiting for* a seat that had left the table, every step to its certificate done and
+*Back on the line* turning, over a table that had dealt on without it: the panel had no end but a return, so a
+seat that never came back was waited for over the felt for the rest of the game. Then, on `01a38e0`, which still
+said a seat certified out over the felt for four seconds and a seat on its way back in a panel of its own: *"i ta
+coming back hláška nesmí vizuálně rušit aktuálně živou a rozehranou handu"*.
 
-4. **A seat is waited on while a hand deals it in and it is off the line** (or the votes to act for it run in that
-   hand). Once the table certifies it out, the panel says *Carol is out of this hand* -- every step done, the table
-   plays on without it -- for four seconds, and nothing more is said about it: not in that hand, not in the hands
-   dealt without it, and not by `S1-EI`'s older sentences either, which now name only the seats a hand still waits
-   on.
-5. **Its way back is a panel of its own from the first word of it** -- its sit-in, or the seats' votes on its
-   return: *Carol is coming back* (back on the line, asked to sit in, the seats agree with the count, back in the
-   game) until it is dealt in again. A return that goes quiet is not said past the hand after the one it was last
-   heard at.
-6. A seat never seen off the line is never *back*; a seat back a moment ago and certified out after all is a new
-   wait; the votes to act for a seat are the running hand's alone.
+4. **A panel over the felt only while the hand stands on a seat**: the seat is off the line and the hand waits on
+   it -- its turn, or a stage it owes -- or the other seats' votes to act for it are running. A seat off the line
+   while the others still play the hand is shown by its seat's link alone (*offline*, and how long it has been
+   silent); `S1-EI`'s older sentences follow the same rule and name only the seats a hand stands on.
+5. **Certified out, the hand goes on and nothing over the felt waits for the seat**: the table's log says *Carol is
+   certified out of this hand; the table plays on without it*, and nothing more is said about it in that hand or
+   in the hands dealt without it.
+6. **Its way back is said at its seat and in the table's log, never over the hand**: the seat reads *coming back*
+   where *sitting out* stood, from its sit-in or the seats' votes on its return until it is dealt in again; the
+   log says *Carol asks to sit in after hand #20* once per boundary, and *Carol is back in the game* under the
+   header of the hand that deals it in. A return that goes quiet is not said past the hand after the one it was
+   last heard at.
+7. The votes to act for a seat are the running hand's alone; a seat back on the line before it was certified out
+   is simply no longer waited on.
 
-**Guard.** `app::tests::no_wait_is_said_over_a_table_that_plays_on`, and the certificate-to-return half of
-`the_wait_on_a_seat_is_shown_step_by_step_until_it_is_back` rewritten after the screenshot; `--preview-waits` and
-`--preview-waits-back` draw the panels as they now are.
+**Guard.** `app::tests::the_felt_says_the_wait_on_a_seat_only_while_the_hand_stands_on_it` (in place of
+`the_wait_on_a_seat_is_shown_step_by_step_until_it_is_back`) and `app::tests::no_wait_is_said_over_a_table_that_plays_on`;
+`--table-preview --preview-waits` draws the panel over a hand that stands, `--preview-waits-back` a seat reading
+*coming back* with nothing over the felt.
