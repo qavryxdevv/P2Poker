@@ -6370,10 +6370,11 @@ impl Hand {
         v
     }
 
-    /// `D-058`: the seats the open cryptographic stage has waited on for at
-    /// least `after_ms` -- empty inside that moment, at a betting stage (whose
+    /// `D-058`: the seats the open cryptographic stage -- the hand's opening
+    /// before the deal, the deck, a reveal, the showdown -- has waited on for at
+    /// least `after_ms`; empty inside that moment, at a betting stage (whose
     /// turn says who) and for a hand that is over. For the window: a stage held
-    /// by a seat gone from the line is said long before its budget runs out.
+    /// by a seat that answers nothing is said long before its budget runs out.
     pub fn stage_stands_on(&self, now_ms: u64, after_ms: u64) -> Vec<SeatIdx> {
         if self.over() || !self.crypto_stage() || now_ms.saturating_sub(self.stage_at_ms) < after_ms {
             return Vec::new();

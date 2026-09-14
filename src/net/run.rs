@@ -607,8 +607,8 @@ struct TableRun {
     frozen_said: bool,
     /// When a vote was last reported as owed and not cast (`vote_state`).
     vote_state_said: u64,
-    /// `D-058`: the seats a dealt hand's cryptographic stage was last said to
-    /// stand on, and in which hand.
+    /// `D-058`: the seats a hand's cryptographic stage was last said to stand
+    /// on, and in which hand.
     stands_said: (u64, Vec<u8>),
     /// The hand whose "a certificate about the previous hand arrived too late
     /// to be kept" line has been said.
@@ -1595,6 +1595,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // table sat on the ended hand for the rest of the run.
     macro_rules! hand_may_have_ended {
         ($t:ident, $h:expr) => {{
+            // `D-058`: the table's word about a certified seat before the word
+            // that the hand is over. A certificate this client's own vote
+            // completed at the stall tick was said at the next tick, two
+            // seconds after `HandEnded`, and the window read the hand as
+            // already over when it heard of it.
+            remove_by_the_word!($t, $h);
             if let Some(why) = $h.aborted().filter(|_| !$t.abort_reported) {
                 $t.abort_reported = true;
                 $t.act_by = None;
@@ -2375,7 +2381,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.required_seen.1 = cert;
             for seat in fresh {
                 // `S1-EI`: the window says what happens about a certified seat.
-                let _ = events.send(NodeEvent::SeatCertified { seat }).await;
+                let _ = events.send(NodeEvent::SeatCertified { seat, hand_id: id }).await;
                 let entry = $t.table.as_ref().and_then(|f| {
                     f.roster()
                         .seats()
@@ -7577,19 +7583,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events.send(NodeEvent::Warning(line)).await;
                         }
                     }
-                    // `D-058`: the seats a dealt hand's cryptographic stage has stood
-                    // on for a moment, said to the window on change. A dealt hand
-                    // reports nothing else about its deck and its reveals, and a seat
-                    // gone from the line holds such a stage for the thirty seconds
-                    // of its budget before anybody votes: a table that looked frozen
-                    // (the owner, 2026-09-14). Before the deal `HandWaiting` says it.
-                    if h.dealt() {
-                        const STAGE_STANDS_AFTER_MS: u64 = 3_000;
-                        let stands = h.stage_stands_on(now, STAGE_STANDS_AFTER_MS);
-                        let said: &[u8] = if t.stands_said.0 == h.hand_id() { &t.stands_said.1 } else { &[] };
-                        if stands.as_slice() != said {
-                            t.stands_said = (h.hand_id(), stands.clone());
-                            let _ = events.send(NodeEvent::StageStands { hand_id: h.hand_id(), seats: stands }).await;
+                    // `D-058`: the seats a hand's cryptographic stage has stood on
+                    // for a moment, said to the window on change. A hand reports
+                    // nothing else about its opening, its deck and its reveals, and
+                    // a seat gone from the line -- or one the group still hears
+                    // whose client answers nothing -- holds such a stage for the
+                    // thirty seconds of its budget before anybody votes: a table
+                    // that looked frozen (the owner, 2026-09-14, twice). Before the
+                    // deal as after it: the hand's opening is the stage a seat that
+                    // died between hands holds. A hand that moved on with a stall
+                    // still said has it unsaid first.
+                    {
+                        let hid = h.hand_id();
+                        let stands = h.stage_stands_on(now, super::node::STAGE_STANDS_AFTER_MS);
+                        if t.stands_said.0 != hid {
+                            if !t.stands_said.1.is_empty() {
+                                let _ = events.send(NodeEvent::StageStands { hand_id: t.stands_said.0, seats: Vec::new() }).await;
+                            }
+                            t.stands_said = (hid, Vec::new());
+                        }
+                        if stands != t.stands_said.1 {
+                            t.stands_said.1 = stands.clone();
+                            let _ = events.send(NodeEvent::StageStands { hand_id: hid, seats: stands }).await;
                         }
                     }
 

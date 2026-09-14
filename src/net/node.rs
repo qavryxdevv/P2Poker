@@ -258,13 +258,16 @@ pub enum NodeEvent {
     /// Named rather than left as a spinner: "waiting for seat 3" is something a
     /// player can act on and a turning circle is not.
     HandWaiting { hand_id: u64, seats: Vec<u8> },
-    /// `D-058`: the seats a dealt hand's cryptographic stage -- the deck, a
-    /// reveal, the showdown -- has stood on for a moment, said on change and
-    /// empty once it moves on. Before the deal `HandWaiting` says it.
+    /// `D-058`: the seats a hand's cryptographic stage -- its opening, the
+    /// deck, a reveal, the showdown -- has stood on for [`STAGE_STANDS_AFTER_MS`],
+    /// said on change and empty once it moves on; before the deal as after it,
+    /// and for a seat the group still hears as for one gone from the line.
     StageStands { hand_id: u64, seats: Vec<u8> },
-    /// `S1-EI`: the table certified this seat's timeout in the running hand;
-    /// the window says what happens next.
-    SeatCertified { seat: u8 },
+    /// `S1-EI`: the table certified this seat's timeout in hand `hand_id`;
+    /// the window says what happens next. `D-058`: the hand is named, since
+    /// the word can reach the window after the hand it is about has ended --
+    /// a certificate this client's own vote completed at the stall tick did.
+    SeatCertified { seat: u8, hand_id: u64 },
     /// How far the deck has got.
     ///
     /// Sent whenever the answer changes and not on every event, because the
@@ -685,6 +688,12 @@ impl NodeEvent {
         }
     }
 }
+
+/// `D-058`: how long a cryptographic stage waits on a seat before the node
+/// says so ([`NodeEvent::StageStands`]). Longer than an honest seat's own step
+/// on a slow machine -- a shuffle with its proof -- and well inside the thirty
+/// seconds a stage's budget gives a seat that is gone before anybody votes.
+pub const STAGE_STANDS_AFTER_MS: u64 = 5_000;
 
 /// How often to re-publish this node's own adverts.
 ///
