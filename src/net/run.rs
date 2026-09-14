@@ -273,6 +273,24 @@ fn lobby_namespace() -> libp2p::kad::RecordKey {
     namespace(b"p2p-poker/main-lobby/v1")
 }
 
+/// `S1-EX`: the DHT key the peers of **one slice** of the lobby find each other
+/// under.
+///
+/// Without it, slicing the lobby breaks it. A topic's mesh is built only out of
+/// peers this client is already connected to that also subscribe to that topic,
+/// and connections are otherwise arbitrary: holding `K` slices of `N`, the
+/// expected candidates for one slice's mesh are `80 x K / N`, which falls under
+/// `mesh_n_low` past about `13 x K` slices -- fifty-odd, at any size of network.
+/// Four thousand slices with arbitrary peering would leave every mesh empty and
+/// not one advert would arrive anywhere.
+///
+/// So a client announces itself under the key of each slice it listens to and
+/// asks who else is there, and its connections stop being arbitrary: ten or
+/// twelve of them per slice, which is what `mesh_n` wants.
+fn shard_namespace(slice: &str) -> libp2p::kad::RecordKey {
+    namespace(format!("p2p-poker/main-lobby/v1/{slice}").as_bytes())
+}
+
 /// A namespace string as the DHT key its provider records live under.
 ///
 /// go-libp2p's routing discovery maps a namespace to `CIDv1(raw, sha2-256(ns))`
@@ -958,8 +976,42 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let topics = Topics::default();
-    subscribe_scored(&mut swarm, &topics.lobby)?;
+    // fault-harness, `S1-EX`: a forced depth applies from the **start**, not
+    // from the first weighing half a minute in -- otherwise a bed run has
+    // already formed its table on the whole lobby before the slices exist, and
+    // measures only that slicing does not break what is already running.
+    #[allow(unused_mut)]
+    let mut listening = super::shard::Listening::default();
+    #[cfg(feature = "fault-harness")]
+    if let Some(d) = forced_depth().filter(|d| *d > 0) {
+        let mut pick = || {
+            let mut b = [0u8; 2];
+            let _ = crate::security::rng::fill(&mut b);
+            u16::from_le_bytes(b)
+        };
+        listening = super::shard::Listening {
+            depth: d,
+            slices: super::shard::slices_at(d, &[], super::shard::SLICES, &mut pick),
+        };
+    }
+    for name in listening.topics() {
+        subscribe_scored(&mut swarm, &gossipsub::IdentTopic::new(name))?;
+    }
     subscribe_scored(&mut swarm, &topics.lobby_chat)?;
+    // `S1-EX`: what this client listens to, said once at the start. A run that
+    // cannot be read is not a measurement, and every line below about the lobby
+    // is about whichever slice of it this is.
+    let _ = events
+        .send(NodeEvent::Warning(format!(
+            "the lobby: depth {} bit(s), listening to {} (S1-EX)",
+            listening.depth,
+            if listening.depth == 0 {
+                "the whole of it".to_owned()
+            } else {
+                format!("slice(s) {}", listening.slices.join(", "))
+            },
+        )))
+        .await;
 
     for addr in listen_addrs(port) {
         swarm.listen_on(addr)?;
@@ -1036,6 +1088,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut state = NodeState::new();
+    // `S1-EX`: what was subscribed to above, so the two cannot disagree.
+    state.listening = listening;
     let my_peer_bytes = swarm.local_peer_id().to_bytes();
     // This node's own application key, used as the "from peer" when it files its
     // own advertisement. It is charged the same rate limit as anybody else,
@@ -1108,6 +1162,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     /// fifth of a hertz it does not appear in a profile at all.
     const HOLD_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
     let mut hold_checked = tokio::time::Instant::now() - HOLD_EVERY;
+    // `S1-EX`: when this client last swapped one slice of the lobby for
+    // another, so that four slices of a big network still walk across it.
+    let mut walked_slices = tokio::time::Instant::now();
     away_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut resend = tokio::time::interval(std::time::Duration::from_secs(5));
     resend.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3903,7 +3960,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // The same handler for both keys: a relay and a
                             // fellow player are both peers to be dialled, and
                             // what differs is only what is said about them.
-                            let lobby = key == lobby_namespace();
+                            // `S1-EX`: a slice's providers are players of that
+                            // slice, so they are said as players and dialled as
+                            // players -- the handler below makes no other
+                            // distinction.
+                            let lobby = key == lobby_namespace()
+                                || state
+                                    .listening
+                                    .slices
+                                    .iter()
+                                    .any(|s| !s.is_empty() && shard_namespace(s) == key);
                             let _ = events
                                 .send(NodeEvent::Warning(if lobby {
                                     format!("{} player(s) in the public lobby", providers.len())
@@ -4262,11 +4328,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 if quiet {
                                     last_lobby_shout = Some(tokio::time::Instant::now());
                                     if let Ok(bytes) = f.readvertise(now, AD_TTL_MS) {
-                                        if swarm
-                                            .behaviour_mut()
-                                            .gossipsub
-                                            .publish(topics.lobby.clone(), bytes.clone())
-                                            .is_ok()
+                                        if publish_advert(&mut swarm, &f.table_id(), &bytes).is_ok()
                                         {
                                             show_own_table(
                                                 &bytes,
@@ -4455,6 +4517,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // to announce can still see who is there, and a table it
                     // can reach is a table it can sit at.
                     swarm.behaviour_mut().ipfs_kad.get_providers(lobby_namespace());
+                    // `S1-EX`: and the same for each slice of the lobby this
+                    // client listens to, which is what makes a sliced lobby
+                    // able to hold a mesh at all -- see `shard_namespace`. At
+                    // depth zero there are no slices and this does nothing,
+                    // which is every network small enough to be carried whole.
+                    let slices: Vec<String> = state
+                        .listening
+                        .slices
+                        .iter()
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                        .collect();
+                    for slice in slices {
+                        let key = shard_namespace(&slice);
+                        if reachable_here {
+                            let _ = swarm.behaviour_mut().ipfs_kad.start_providing(key.clone());
+                        }
+                        swarm.behaviour_mut().ipfs_kad.get_providers(key);
+                    }
                 }
 
                 // A relay is needed when this client cannot be reached
@@ -4817,11 +4898,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         // appears in its founder's own lobby when
                                         // the network has taken it, and not when
                                         // it was signed.
-                                        match swarm
-                                            .behaviour_mut()
-                                            .gossipsub
-                                            .publish(topics.lobby.clone(), bytes.clone())
-                                        {
+                                        match publish_advert(&mut swarm, &key, &bytes) {
                                             Ok(_) => {
                                                 show_own_table(
                                                     &bytes,
@@ -8391,6 +8468,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             _ = housekeeping.tick() => {
                 let now = super::node::now_unix_ms();
                 state.tick(now);
+                // `S1-EX`: and weigh what the lobby is costing, which is what
+                // decides how much of it this client listens to. Does nothing
+                // until half a minute of traffic has been counted, and nothing
+                // at all in a network small enough to carry whole -- which is
+                // every network this build has ever been run on.
+                weigh_lobby(&mut swarm, &mut state, &events, &mut walked_slices).await;
                 // `D-040`, §7.5: every `AD_REBROADCAST_MS`, ask every poker peer
                 // on the line what it offers. Bounded by the number of poker
                 // peers, which is small, and by one question per peer per tick.
@@ -8833,11 +8916,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         match f.readvertise(now, AD_TTL_MS) {
                             Ok(bytes) => {
                                 let n = bytes.len();
-                                match swarm
-                                    .behaviour_mut()
-                                    .gossipsub
-                                    .publish(topics.lobby.clone(), bytes.clone())
-                                {
+                                match publish_advert(&mut swarm, &f.table_id(), &bytes) {
                                     Ok(_) => {
                                         let _ = events.send(NodeEvent::Published { bytes: n }).await;
                                         // And into this node's own lobby, so a
@@ -9357,7 +9436,17 @@ async fn handle_gossip(
         return gossipsub::MessageAcceptance::Reject;
     }
 
-    if message.topic != topics.lobby.hash() {
+    // `S1-EX`: an advert arrives on whichever slice of the lobby this client
+    // listens to -- the whole topic at depth zero, which is where a network
+    // small enough stays for ever, and a narrower one below that. The slice is
+    // named by the table's own key, so a listener computes the same name the
+    // founder published to and there is nothing to agree about.
+    let ours = state
+        .listening
+        .topics()
+        .iter()
+        .any(|name| gossipsub::IdentTopic::new(name.clone()).hash() == message.topic);
+    if !ours {
         return if message.topic == topics.lobby_chat.hash() {
             let now = super::node::now_unix_ms();
             match super::lobbytalk::receive(&message.data, peer_bytes(&from), now, &mut state.limits)
@@ -9400,7 +9489,28 @@ async fn handle_gossip(
     peer[..take].copy_from_slice(&bytes[..take]);
 
     let now = super::node::now_unix_ms();
-    match advert::receive(&message.data, peer, now, &mut state.limits, &mut state.lobby) {
+    let judged = advert::receive(&message.data, peer, now, &mut state.limits, &mut state.lobby);
+    // `S1-EX`: **what the depth is measured from, and what it is not.** An
+    // advert that verified -- taken, or refused by this client's own budget or
+    // its own full window -- is a table that exists, and counting those is how
+    // this client reads the size of the network off its own ear. A message that
+    // is **provably not one** is not counted at all: a peer sending forgeries
+    // would otherwise steer every listener's depth by sending rubbish, and
+    // narrowing an honest player's lobby is a cheap thing to be able to do.
+    // Provable rubbish is `Reject`ed instead, where `D-055`'s score takes it.
+    //
+    // What is left to a rogue is the traffic it can get *counted*: its own
+    // per-neighbour budget, 90 a minute, against a ceiling of twelve a second.
+    // To move this client one step deeper it would have to hold most of the
+    // mesh at once -- and the whole of what it wins by that is a lobby showing
+    // fewer tables, on a client that keeps playing.
+    if matches!(
+        judged,
+        Ok(_) | Err(advert::NotAccepted::RateLimited) | Err(advert::NotAccepted::NotTaken(_))
+    ) {
+        state.heard.0 += 1;
+    }
+    match judged {
         Ok(key) => {
             // The record the interface needs to draw a row and to build a
             // join request, taken from this node's own store rather than
@@ -10337,6 +10447,160 @@ fn peer_has_our_topics(
 /// all three topics every five seconds while a table formed pushed the lobby
 /// hard enough that adverts came back `RateLimited`, including at the founder
 /// against its own. Say again only what is actually missing.
+/// `S1-EX`: how often the lobby's depth is weighed.
+///
+/// Half a minute is one round of every table's advertisement, so the rate
+/// measured over it is a whole sample rather than a burst -- and it is also the
+/// floor on how fast a client can chase a network that is changing size, which
+/// wants to be slow.
+const WEIGH_LOBBY_EVERY: Duration = Duration::from_secs(30);
+
+/// `S1-EX`: how often one slice is swapped for another at an unchanged depth.
+///
+/// A client holds four slices of a sliced lobby, so without this it would see
+/// the same `4 / N` of the world for as long as it ran. Swapping one every few
+/// minutes walks it across the network, at a pace that costs one topic's mesh
+/// to rebuild and nothing else. (At depth zero there is one slice -- the whole
+/// lobby -- and nothing to swap.)
+const WALK_SLICES_EVERY: Duration = Duration::from_secs(180);
+
+/// `S1-EX`: the adverts a second this client is willing to take.
+///
+/// `D-055`'s cost ceiling, as a rate: the per-neighbour budget across a full
+/// mesh. The depth regulates against this and against nothing else.
+fn lobby_budget_per_s() -> f64 {
+    f64::from(crate::protocol::constants::MAX_ADS_PER_PEER_PER_MIN) * 8.0 / 60.0
+}
+
+/// fault-harness, `S1-EX`: `P2P_POKER_LOBBY_DEPTH=<bits>` holds this client at
+/// that depth whatever the traffic says.
+///
+/// A network of four nodes will never slice its lobby on its own -- it is not
+/// meant to -- so this is the only way to put the sliced path on the bed at
+/// all: every node forced to the same depth plays a whole tournament through
+/// slices of the lobby instead of the whole of it.
+#[cfg(feature = "fault-harness")]
+fn forced_depth() -> Option<u8> {
+    use std::sync::OnceLock;
+    static DEPTH: OnceLock<Option<u8>> = OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        let d = std::env::var("P2P_POKER_LOBBY_DEPTH").ok()?.trim().parse::<u8>().ok()?;
+        super::shard::DEPTHS.contains(&d).then_some(d)
+    })
+}
+
+/// `S1-EX`: weigh what the lobby costs and move to the slice of it that fits.
+///
+/// Called on the housekeeping tick and does nothing at all until
+/// `WEIGH_LOBBY_EVERY` has passed. Every client starts at depth zero -- the
+/// whole lobby, which is what every earlier build listens to for ever -- and a
+/// network small enough never leaves it: `depth_for` only goes deeper when what
+/// arrives is over the budget.
+///
+/// **Subscribed before unsubscribed**, so the list never goes blank across the
+/// change.
+async fn weigh_lobby(
+    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    state: &mut NodeState,
+    events: &Events,
+    walked: &mut tokio::time::Instant,
+) {
+    let elapsed = state.heard.1.elapsed();
+    if elapsed < WEIGH_LOBBY_EVERY {
+        return;
+    }
+    let rate = state.heard.0 as f64 / elapsed.as_secs_f64();
+    state.heard = (0, std::time::Instant::now());
+
+    let now = &state.listening;
+    let depth = super::shard::depth_for(
+        rate,
+        lobby_budget_per_s(),
+        crate::protocol::constants::MAX_TRACKED_TABLES,
+        now,
+    );
+    #[cfg(feature = "fault-harness")]
+    let depth = forced_depth().unwrap_or(depth);
+    let walk = depth == now.depth && depth > 0 && walked.elapsed() >= WALK_SLICES_EVERY;
+    if depth == now.depth && !walk {
+        return;
+    }
+    // A slice is drawn from the system's own randomness rather than from this
+    // client's key: a client whose slices followed from its identity would see
+    // one `4 / N` of the world for ever, and the same one after every restart.
+    let mut pick = || {
+        let mut b = [0u8; 2];
+        let _ = crate::security::rng::fill(&mut b);
+        u16::from_le_bytes(b)
+    };
+    let keep: Vec<String> = if walk {
+        *walked = tokio::time::Instant::now();
+        now.slices.iter().skip(1).cloned().collect()
+    } else {
+        now.slices.clone()
+    };
+    let slices = super::shard::slices_at(depth, &keep, super::shard::SLICES, &mut pick);
+    let after = super::shard::Listening { depth, slices };
+    if after == *now {
+        return;
+    }
+
+    let before: Vec<String> = now.topics();
+    for name in after.topics() {
+        let topic = gossipsub::IdentTopic::new(name);
+        let _ = subscribe_scored(swarm, &topic);
+    }
+    for name in before {
+        if !after.holds(&name) {
+            let _ = swarm
+                .behaviour_mut()
+                .gossipsub
+                .unsubscribe(&gossipsub::IdentTopic::new(name));
+        }
+    }
+    let _ = events
+        .send(NodeEvent::Warning(format!(
+            "the lobby carries {rate:.1} advert(s) a second, which is about {} table(s) out there: listening to {} slice(s) of it at depth {} (S1-EX)",
+            super::shard::tables_out_there(rate, now).round(),
+            after.slices.len(),
+            after.depth,
+        )))
+        .await;
+    state.listening = after;
+}
+
+/// `S1-EX`: say an advert on **every depth** of the lobby -- the whole topic,
+/// and the slice this table's key names at each depth below it.
+///
+/// Five publications every thirty seconds, and four of them are free wherever
+/// nobody is listening: with no mesh and no fanout under a topic there is
+/// nobody to send to, and the attempt fails the same benign way an empty lobby
+/// already fails. What it buys is that **no two clients have to agree on a
+/// depth**: a client of any earlier build hears every table on the whole topic
+/// exactly as it always did, and a client of a network large enough to have
+/// sliced its lobby hears the same tables on a narrower one.
+///
+/// The verdict returned is the **whole lobby's**, because that is the one that
+/// decides whether the table is out there at all, and every caller here was
+/// written to read it.
+fn publish_advert(
+    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    table_key: &[u8; 32],
+    bytes: &[u8],
+) -> Result<gossipsub::MessageId, gossipsub::PublishError> {
+    let mut whole = None;
+    for (i, name) in super::shard::topics_for(table_key).into_iter().enumerate() {
+        let said = swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(gossipsub::IdentTopic::new(name), bytes.to_vec());
+        if i == 0 {
+            whole = Some(said);
+        }
+    }
+    whole.expect("the ladder of depths is never empty")
+}
+
 /// `D-055`: subscribe to a topic **and** install its score parameters.
 ///
 /// Never `gossipsub.subscribe` directly: a topic with no `TopicScoreParams`

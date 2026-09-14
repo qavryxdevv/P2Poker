@@ -204,16 +204,43 @@ There are two version numbers and they do different jobs.
 | `PROTOCOL_MAJOR` | compile-time constant, `1` | libp2p protocol name strings, GossipSub topic string | wire-format epoch. Two peers with different majors cannot negotiate anything; they never meet, because the protocol strings differ. |
 | `protocol_version` | `u16`, currently `1` | every signed envelope, every table advertisement | the exact rule set and encoding in force for this session. Must equal the value pinned by the table advertisement for every event of that table. |
 
-For `PROTOCOL_MAJOR = 1` there are **six** strings, exactly:
+For `PROTOCOL_MAJOR = 1` there are **seven** strings, exactly:
 
 ```
 identify protocol             /p2p-poker/1
 GossipSub lobby topic         /p2p-poker/lobby/1        (IdentTopic, not Sha256Topic)
+GossipSub lobby slice topic   /p2p-poker/lobby/1/<slice> (S1-EX; see below)
 GossipSub lobby chat topic    /p2p-poker/lobby-chat/1   (IdentTopic; see §7.7)
 lobby snapshot RPC            /p2p-poker/lobby-snapshot/1
 join RPC                      /p2p-poker/join/1
 table event stream            /p2p-poker/table/1
 ```
+
+**The lobby's slices (`S1-EX`).** A lobby topic may carry a `<slice>`: the
+leading bits of the advertised table's own key, written in hexadecimal, four
+bits a character. The depths are **0, 4, 8, 12 and 16 bits** and no others, so
+the slice is zero to four characters long and depth zero is the lobby topic
+itself, unchanged and unversioned.
+
+* A founder **publishes its advert at every depth** -- five publications per
+  re-broadcast. Publishing into a topic nobody subscribes to costs nothing, and
+  it is what removes any need for two clients to agree on a depth: a client that
+  knows nothing of slices subscribes to the lobby topic and hears every table
+  exactly as before.
+* A receiver takes an advert from whichever slices it subscribes to and computes
+  the slice of a table from the table's own key, so a listener and a founder
+  never have to be told the same number.
+* A client **chooses its depth by what arrives**: every table advertises once
+  per `AD_REBROADCAST_MS`, so the rate on a known share of the lobby is the size
+  of the whole of it. It goes a depth deeper when that rate is over what it will
+  carry, and shallower only when the shallower depth would still be inside it.
+  Slices are arbitrary, never derived from the client's own key, and one is
+  swapped for another every few minutes so that a client holding four slices of
+  a large network still walks across it.
+* The peers of a slice find each other under the slice's own DHT provider key
+  (`p2p-poker/main-lobby/v1/<slice>`). This is not optional: a mesh is built
+  only out of connected peers that share the topic, so without it a sliced lobby
+  cannot hold a mesh at all.
 
 `/p2p-poker/join/1` is new: the join exchange is a one-shot request-response RPC,
 not table-stream traffic (C-7 of `docs/research/PHASE0_FIXPLAN.md`; see §1.4 and

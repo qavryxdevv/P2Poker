@@ -686,6 +686,15 @@ pub fn now_unix_ms() -> u64 {
 pub struct NodeState {
     pub lobby: LobbyStore,
     pub limits: RateLimiter,
+    /// `S1-EX`: which slice of the lobby this client listens to.
+    ///
+    /// The whole of it until the network is large enough that the whole of it
+    /// costs more than the budget, which is the state every earlier build is
+    /// in for ever. See `net::shard`.
+    pub listening: crate::net::shard::Listening,
+    /// `S1-EX`: adverts heard since the depth was last weighed, and when that
+    /// was -- the measurement the depth is chosen from.
+    pub heard: (u64, std::time::Instant),
     /// Whether AutoNAT has confirmed this node is reachable, which is what D-002
     /// gates relay volunteering on.
     public: bool,
@@ -703,6 +712,8 @@ impl NodeState {
         NodeState {
             lobby: LobbyStore::new(),
             limits: RateLimiter::new(),
+            listening: crate::net::shard::Listening::default(),
+            heard: (0, std::time::Instant::now()),
             public: false,
         }
     }

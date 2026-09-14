@@ -233,6 +233,13 @@ param(
     # reason, and then D-051's own words as the meter fills: *seat N flooded the
     # table's group* and *out of the table for good for flooding*.
     # Needs a binary built with `--features fault-harness`.
+    # `-LobbyDepth <bits>` (S1-EX): hold every node's lobby at that depth --
+    # 0 (the whole lobby, the default), 4, 8, 12 or 16 bits of the table key.
+    # A bed of four nodes never slices its lobby on its own, so this is the only
+    # way to put the sliced path on it: every node's log says *listening to N
+    # slice(s) of it at depth D*, and the table must still be found and played.
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateSet(0, 4, 8, 12, 16)][int]$LobbyDepth = 0,
     [ValidateRange(0, 100000)][int]$ChatSpamAt = 0,
     [string]$ChatSpamNodes = '',
     [ValidateRange(1, 500)][int]$ChatSpamRate = 8,
@@ -484,14 +491,15 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # The founder alone, and handed to the job like the stack: the job sees
     # nothing of this scope (the first run printed the banner and kicked nobody).
     $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, [bool]$StrangerFlood, $StrangerName, $chatSpamForNode, $ChatSpamRate -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, [bool]$StrangerFlood, $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth)
         if ($holdMuck) { $env:P2P_POKER_HOLD_MUCK = "$holdMuck" }
         $env:P2P_POKER_FLOOD_RATE = "$floodRate"
         if ($floodAt -gt 0) {
             $env:P2P_POKER_FLOOD_AT = "$floodAt"
             $env:P2P_POKER_FLOOD_KIND = "$floodKind"
         }
+        if ($lobbyDepth -gt 0) { $env:P2P_POKER_LOBBY_DEPTH = "$lobbyDepth" }
         if ($chatSpamAt -gt 0) {
             $env:P2P_POKER_CHAT_SPAM_AT = "$chatSpamAt"
             $env:P2P_POKER_CHAT_SPAM_RATE = "$chatSpamRate"
@@ -584,6 +592,9 @@ if ($StallJoin -gt 0) {
 if ($HoldMuck) {
     Write-Host "==> every node's hand that may muck waits at the showdown, then $(if ($HoldMuck -eq 'show') { 'shows at once' } else { 'mucks when the window runs out' })"
     Write-Host "    (needs a binary built with --features fault-harness; D-050)"
+}
+if ($LobbyDepth -gt 0) {
+    Write-Host "==> every node holds its lobby at depth $LobbyDepth bit(s) of the table key (S1-EX)"
 }
 if ($ChatSpamAt -gt 0) {
     Write-Host "==> n$(("$ChatSpamNodes" -split '[,\s]+' | Where-Object { $_ -ne '' }) -join ', n') spam(s) the table's chat from $ChatSpamAt s, $ChatSpamRate line(s) a second (D-054)"

@@ -14,6 +14,7 @@ pub mod peerbook;
 pub mod plaintext;
 pub mod portmap;
 pub mod relay;
+pub mod shard;
 pub mod run;
 pub mod snapshot;
 pub mod streams;
