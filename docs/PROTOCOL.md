@@ -5687,7 +5687,7 @@ class into a single map has pre-committed the version-2 defect.
   11 and reads only envelope fields. The one thing it opens is a memory bound, and
   it is bounded in the paragraph above, in the section that already owns that
   discipline.
-* The lobby keeps at most `MAX_TRACKED_TABLES = 4096` `(table_id, last_timestamp)`
+* The lobby keeps at most `MAX_TRACKED_TABLES = 512` `(table_id, last_timestamp)`
   pairs in an LRU, and at most `MAX_TRACKED_PRESENCE = 8192` peers.
 
 ---
@@ -6565,13 +6565,13 @@ The layers, cheapest first:
 1. **Expiry** — §7.2's TTL, which costs nothing and removes the persistent-spam
    category entirely.
 2. **Per-key rate limits**, enforced locally by every client:
-   `MAX_ADS_PER_TABLE_KEY_PER_MIN = 4`, `MAX_ADS_PER_PEER_PER_MIN = 20`,
+   `MAX_ADS_PER_TABLE_KEY_PER_MIN = 4`, `MAX_ADS_PER_PEER_PER_MIN = 90`,
    `MAX_PRESENCE_PER_PEER_PER_MIN = 4`, and for `LOBBY_CHAT` **1 message per 2 s
    with a burst of 5, per remote `PeerId`**, matching `NETWORK_STACK.md` §6.6.
    Exceeding a limit gets
    `MessageAcceptance::Reject`, which applies the GossipSub P₄ score penalty to the
    forwarder as well.
-3. **Bounded caches** — `MAX_TRACKED_TABLES = 4096`, `MAX_TRACKED_PRESENCE = 8192`,
+3. **Bounded caches** — `MAX_TRACKED_TABLES = 512`, `MAX_TRACKED_PRESENCE = 8192`,
    both LRU. A full cache evicts; it never grows.
 4. **Content deduplication** through the overridden `message_id_fn` (§7.1),
    without which republication of identical bytes is free.
@@ -7722,7 +7722,7 @@ processed.
 | adverts in a snapshot (`SNAPSHOT_MAX_ADS`) | 128 | each a complete `SignedEvent` ≤ `TABLE_AD_SIGNED_MAX` = 1 536 B; 128 × 1 536 = 196 608 B, inside `SNAPSHOT_RESP_MAX` |
 | `ledger_delta` in `HAND_INIT` | `MAX_SEATS` | ascending by seat, unique |
 | `MAX_STAGES_PER_HAND` | 2 048 | exceeding it aborts the hand |
-| `MAX_TRACKED_TABLES` | 4 096 | LRU |
+| `MAX_TRACKED_TABLES` | 512 | the row shown longest makes way, D-055; never the table this client is at |
 | `MAX_TRACKED_PRESENCE` | 8 192 | LRU |
 | `MAX_CBOR_NESTING_DEPTH` | 8 | our own limit, well above the 3 levels we use |
 
@@ -8271,10 +8271,10 @@ REANNOUNCE_INTERVAL_MS          = 600 000
 IDLE_CONNECTION_TIMEOUT_MS      = 60 000
 MDNS_QUERY_INTERVAL_MS          = 15 000
 SNAPSHOT_PEER_COUNT             = 4
-MAX_TRACKED_TABLES              = 4 096         (local)
+MAX_TRACKED_TABLES              = 512           (local)
 MAX_TRACKED_PRESENCE            = 8 192         (local)
 MAX_ADS_PER_TABLE_KEY_PER_MIN   = 4             (local)
-MAX_ADS_PER_PEER_PER_MIN        = 20            (local)
+MAX_ADS_PER_PEER_PER_MIN        = 90            (local)
 MAX_PRESENCE_PER_PEER_PER_MIN   = 4             (local)
 
 HANDSHAKE_DEADLINE_MS           = 15 000

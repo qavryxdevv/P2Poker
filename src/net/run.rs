@@ -958,11 +958,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let topics = Topics::default();
-    swarm.behaviour_mut().gossipsub.subscribe(&topics.lobby)?;
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&topics.lobby_chat)?;
+    subscribe_scored(&mut swarm, &topics.lobby)?;
+    subscribe_scored(&mut swarm, &topics.lobby_chat)?;
 
     for addr in listen_addrs(port) {
         swarm.listen_on(addr)?;
@@ -2260,6 +2257,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
             }
             $t.table = None;
+            // `D-055`: the player has left, so that row goes back into the
+            // window's rotation like any other.
+            if let Some(k) = $t.joined_key.take() {
+                state.lobby.unpin(&k);
+            }
             leave_the_table!($t);
             dht_effort(&mut swarm, false);
             // `S1-CR`: a seat that leaves by its own choice has no session to come back to.
@@ -4798,7 +4800,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     Ok(f) => {
                                         let key = f.table_id();
                                         let topic = joinrpc::table_topic(&key);
-                                        let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                                        let _ = subscribe_scored(&mut swarm, &topic);
                                         t.table_topic = Some(topic);
                                         t.table = Some(f);
                                         let _ = events.send(NodeEvent::Hosting { key }).await;
@@ -4907,6 +4909,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         t.joined_key = Some(key);
                         t.joined_ad = Some(held.ad.clone());
                         t.joined_advert_hash = Some(held.advert_hash);
+                        // `D-055`: this player is sitting down there, so that
+                        // row is theirs: the window's bound never displaces it
+                        // and no expiry sweep takes it. A table that fills stops
+                        // advertising, so without this the row under the player
+                        // is the first one to go.
+                        state.lobby.pin(key);
                         // The founder's PeerId comes from the advert, which was
                         // signed by the table key. Dialling anything else would
                         // be taking routing advice from whoever spoke last.
@@ -5006,7 +5014,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     None => f,
                                 };
                                 let topic = joinrpc::table_topic(&key);
-                                let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                                let _ = subscribe_scored(&mut swarm, &topic);
                                 t.table_topic = Some(topic);
                                 t.table = Some(f);
                                 // **Ask the DHT for the founder before asking
@@ -5134,7 +5142,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 Ok((f, sends)) => {
                                     let key = f.table_id();
                                     let topic = joinrpc::table_topic(&key);
-                                    let _ = swarm.behaviour_mut().gossipsub.subscribe(&topic);
+                                    let _ = subscribe_scored(&mut swarm, &topic);
                                     t.table_topic = Some(topic.clone());
                                     t.table = Some(f);
                                     // A table that is set is not advertised again.
@@ -10304,6 +10312,21 @@ fn peer_has_our_topics(
 /// all three topics every five seconds while a table formed pushed the lobby
 /// hard enough that adverts came back `RateLimited`, including at the founder
 /// against its own. Say again only what is actually missing.
+/// `D-055`: subscribe to a topic **and** install its score parameters.
+///
+/// Never `gossipsub.subscribe` directly: a topic with no `TopicScoreParams`
+/// contributes nothing to a peer's score, so the invalid-message term -- the
+/// only one this project keeps -- would be zero for exactly the traffic it was
+/// turned on for. See `swarm::peer_score`.
+fn subscribe_scored(
+    swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
+    topic: &gossipsub::IdentTopic,
+) -> Result<bool, gossipsub::SubscriptionError> {
+    let g = &mut swarm.behaviour_mut().gossipsub;
+    let _ = g.set_topic_params(topic.clone(), super::swarm::topic_score());
+    g.subscribe(topic)
+}
+
 fn announce_topics(
     swarm: &mut libp2p::Swarm<super::swarm::PokerBehaviour>,
     which: &[&gossipsub::IdentTopic],
@@ -10311,6 +10334,7 @@ fn announce_topics(
     for t in which {
         let g = &mut swarm.behaviour_mut().gossipsub;
         let _ = g.unsubscribe(*t);
+        let _ = g.set_topic_params((*t).clone(), super::swarm::topic_score());
         let _ = g.subscribe(*t);
     }
 }

@@ -623,6 +623,13 @@ pub struct Held {
     /// When this client accepted it, by its own clock. A local view, never
     /// canonical state.
     pub received_at_ms: u64,
+    /// `D-055`: when this table first appeared in this window, as against
+    /// `received_at_ms`, which every re-broadcast moves forward.
+    ///
+    /// It is what decides whose turn in a full window is over: the row that has
+    /// been shown longest makes way, so a bounded window is a moving sample of
+    /// the network and not a record of who arrived first.
+    pub first_seen_ms: u64,
     /// The founder changed the game under a live advert. The table stays visible
     /// and is not joinable.
     pub unjoinable: bool,
@@ -657,11 +664,34 @@ pub struct Listing<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct LobbyStore {
     tables: BTreeMap<[u8; 32], Held>,
+    /// `D-055`: the tables this client is **at**, which the window's bound
+    /// never displaces and which never expire out of it.
+    ///
+    /// A table that fills stops advertising -- there is nothing left to offer
+    /// -- so the entry for the table a player is actually sitting at is the
+    /// first one an expiry sweep would take, and the row under the player
+    /// would go while they played at it.
+    pinned: std::collections::BTreeSet<[u8; 32]>,
 }
 
 impl LobbyStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `D-055`: this client sat down at that table; hold its row.
+    pub fn pin(&mut self, table_key: [u8; 32]) {
+        self.pinned.insert(table_key);
+    }
+
+    /// `D-055`: and it has left, so the row is an ordinary one again.
+    pub fn unpin(&mut self, table_key: &[u8; 32]) {
+        self.pinned.remove(table_key);
+    }
+
+    /// Whether the window is holding this row against its bound.
+    pub fn is_pinned(&self, table_key: &[u8; 32]) -> bool {
+        self.pinned.contains(table_key)
     }
 
     /// Take an advert that has passed [`admit`] and its signature check.
@@ -728,10 +758,25 @@ impl LobbyStore {
                     // then nothing at all.
                     self.expire(now_ms);
                     if self.tables.len() >= MAX_TRACKED_TABLES {
+                        // `D-055`: **and the window turns over.** The rule used
+                        // to displace whichever entry expired soonest, which is
+                        // a rotation only by accident -- a table that
+                        // re-advertises briskly holds its slot for ever, and at
+                        // a network with more tables than the window holds, the
+                        // first few hundred heard are the only ones this player
+                        // ever sees. The entry that has been shown **longest**
+                        // goes instead, so a bounded window is a moving sample
+                        // of the network rather than a snapshot of whoever
+                        // arrived first, and every table gets its turn in it.
+                        //
+                        // A table this client is **at** is never displaced: the
+                        // player is playing there, and it is exactly the entry
+                        // that stops being advertised once the table fills.
                         let victim = self
                             .tables
                             .iter()
-                            .min_by_key(|(_, h)| h.ad.expires_at_unix_ms)
+                            .filter(|(k, _)| !self.pinned.contains(*k))
+                            .min_by_key(|(_, h)| h.first_seen_ms)
                             .map(|(k, _)| *k);
                         match victim {
                             Some(k) => {
@@ -748,6 +793,7 @@ impl LobbyStore {
                         params_hash,
                         advert_hash,
                         received_at_ms: now_ms,
+                        first_seen_ms: now_ms,
                         unjoinable: false,
                     },
                 );
@@ -764,11 +810,18 @@ impl LobbyStore {
     /// advert is caught by the second even though the first has not lapsed.
     pub fn expire(&mut self, now_ms: u64) -> usize {
         let before = self.tables.len();
-        self.tables.retain(|_, h| {
+        let pinned = std::mem::take(&mut self.pinned);
+        self.tables.retain(|k, h| {
+            // `D-055`: the table this client is at stays, however quiet its
+            // advert goes -- a table that fills stops advertising.
+            if pinned.contains(k) {
+                return true;
+            }
             let claimed_alive = h.ad.expires_at_unix_ms > now_ms;
             let heard_recently = now_ms.saturating_sub(h.received_at_ms) < AD_TTL_MS;
             claimed_alive && heard_recently
         });
+        self.pinned = pinned;
         before - self.tables.len()
     }
 
@@ -2032,4 +2085,62 @@ mod tests {
         rl.sweep(NOW + 120_000);
         assert_eq!(rl.tracked(), (0, 0));
     }
+    /// `D-055`: a full window turns over, and the table this client is at is
+    /// never the row that goes.
+    ///
+    /// The rule used to displace whichever advert expired soonest, which holds
+    /// a slot for ever for anybody who re-advertises briskly: at a network with
+    /// more tables than the window holds, the first few hundred heard were the
+    /// only ones a player ever saw. And the row a player is actually sitting at
+    /// is the **first** an expiry sweep takes, because a table that fills stops
+    /// advertising at all.
+    #[test]
+    fn a_full_window_rotates_and_keeps_the_table_this_client_is_at() {
+        let mut store = LobbyStore::new();
+        let mut at = 1_700_000_000_000u64;
+        let key = |n: usize| {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            k
+        };
+        let offer = |store: &mut LobbyStore, n: usize, at: u64| {
+            let mut ad = TableAd::sng(6, format!("table {n}"), key(n), vec![2u8; 38], at);
+            ad.expires_at_unix_ms = at + AD_TTL_MS;
+            store.offer(key(n), ad, [1u8; 32], [2u8; 32], at)
+        };
+
+        // Fill the window, then sit down at the first table there is.
+        for n in 0..MAX_TRACKED_TABLES {
+            assert!(offer(&mut store, n, at).is_ok(), "row {n}");
+            at += 1;
+        }
+        store.pin(key(0));
+        assert_eq!(store.tables().count(), MAX_TRACKED_TABLES);
+
+        // Every new table displaces the row that has been shown longest -- and
+        // never the one this client is at, however long it has been there.
+        for n in MAX_TRACKED_TABLES..MAX_TRACKED_TABLES + 50 {
+            assert!(offer(&mut store, n, at).is_ok(), "the window takes row {n}");
+            at += 1;
+            assert!(store.get(&key(0)).is_some(), "the table this client is at stays");
+        }
+        assert_eq!(store.tables().count(), MAX_TRACKED_TABLES, "and the bound holds");
+        assert!(store.get(&key(1)).is_none(), "the oldest row made way");
+        assert!(
+            store.get(&key(MAX_TRACKED_TABLES + 49)).is_some(),
+            "the newest table is in the window"
+        );
+
+        // The advert of a table that filled goes quiet; the row stays anyway.
+        let much_later = at + AD_TTL_MS * 3;
+        store.expire(much_later);
+        assert!(store.get(&key(0)).is_some(), "a table that stopped advertising is still the player's");
+        assert!(store.get(&key(MAX_TRACKED_TABLES + 49)).is_none(), "and everything else expired");
+
+        // Once the player leaves, the row is ordinary again.
+        store.unpin(&key(0));
+        store.expire(much_later);
+        assert!(store.get(&key(0)).is_none());
+    }
+
 }

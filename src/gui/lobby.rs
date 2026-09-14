@@ -518,6 +518,7 @@ mod tests {
             params_hash: [0u8; 32],
             advert_hash: [0u8; 32],
             received_at_ms: NOW,
+            first_seen_ms: NOW,
             unjoinable,
         }
     }

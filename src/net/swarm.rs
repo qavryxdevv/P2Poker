@@ -660,10 +660,102 @@ pub fn build(config: NodeConfig) -> Result<Swarm<PokerBehaviour>, Box<dyn std::e
 fn build_gossipsub(
     key: &identity::Keypair,
 ) -> Result<gossipsub::Behaviour, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(gossipsub::Behaviour::new(
+    let mut behaviour = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Signed(key.clone()),
         gossipsub_config()?,
-    )?)
+    )?;
+    // `D-055`: and the score, which `NETWORK_STACK.md` §6.7 decided was on from
+    // day one and which nothing ever switched on.
+    let (params, thresholds) = peer_score();
+    behaviour
+        .with_peer_score(params, thresholds)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    Ok(behaviour)
+}
+
+/// `D-055`: what a peer's behaviour is worth, and the score at which this
+/// client stops listening to it.
+///
+/// **Only what this client can prove about the peer itself.** GossipSub's
+/// scoring has five terms per topic and four of them are about *traffic rate*:
+/// time in the mesh, first deliveries, the shortfall below an expected delivery
+/// rate (P₃) and mesh failures (P₃b). They are written for a network whose
+/// topics carry a steady stream, and this one's do not -- a table advertises
+/// once every thirty seconds and a quiet lobby may say nothing for minutes. The
+/// library's own defaults would put **every honest peer** of such a topic below
+/// the graylist threshold on P₃ alone, which is the outcome `NETWORK_STACK.md`
+/// §6.7 refused to risk (OQ-5) and the reason scoring stayed off entirely.
+///
+/// So every rate term is zero here and the only per-topic term is **P₄, the
+/// invalid message count** -- messages this client itself judged and refused,
+/// which for a peer of this build is none: the refusals that are about *this
+/// client's own budget* are reported as `Ignore` and never reach the score
+/// (`run.rs` keeps that distinction at every verdict, and a test holds it).
+/// Beside it stand the library's own defaults for the terms that are not about
+/// traffic at all: the IP colocation factor and the behaviour penalty.
+///
+/// **The arithmetic.** P₄ is `weight × count²` with `count` decaying by
+/// `invalid_message_deliveries_decay` every second, so a peer sending `r`
+/// refusable messages a second settles at `count ≈ r / (1 - decay)` = `2r`, and
+/// its score at `-(2r)²`. Against the library's `graylist_threshold` of -80:
+///
+/// | refusals a second | settled score | |
+/// |---|---|---|
+/// | 1 in ten seconds | -0.04 | a disagreement between honest clients costs nothing |
+/// | 1 | -4 | still heard |
+/// | 4.5 | -81 | **graylisted**: its RPCs are dropped unread |
+/// | 50 | -10 000 | gone at once |
+///
+/// A graylisted peer is not disconnected -- this is not a ban, and the score
+/// decays -- but nothing it sends is parsed while it stays there, which is what
+/// isolates a flooder from the work it is trying to make.
+pub fn peer_score() -> (gossipsub::PeerScoreParams, gossipsub::PeerScoreThresholds) {
+    let mut params = gossipsub::PeerScoreParams::default();
+    // Two peers of this project on one address are a bed run, not a colocation
+    // attack: every measured run this project has is ten clients on one
+    // machine, and the default penalty would score them all into the graylist
+    // the moment a run grew past ten.
+    params.ip_colocation_factor_whitelist.insert("127.0.0.1".parse().expect("a literal address"));
+    params.ip_colocation_factor_whitelist.insert("::1".parse().expect("a literal address"));
+    (params, gossipsub::PeerScoreThresholds::default())
+}
+
+/// `D-055`: the per-topic score for every topic this client subscribes to.
+///
+/// See [`peer_score`]: P₁ to P₃b are off because they are about traffic rate
+/// and this network's topics are quiet; P₄ is the only term, and it counts
+/// nothing but what this client refused.
+pub fn topic_score() -> gossipsub::TopicScoreParams {
+    gossipsub::TopicScoreParams {
+        topic_weight: 1.0,
+        // P1, time in the mesh: off. The quantum stays non-zero because the
+        // library validates it whether or not the weight is.
+        time_in_mesh_weight: 0.0,
+        time_in_mesh_quantum: Duration::from_secs(1),
+        time_in_mesh_cap: 0.0,
+        // P2, first deliveries: off. It rewards whoever is fastest, which on a
+        // topic that carries an advert every thirty seconds is whoever happens
+        // to be nearest the one table that spoke.
+        first_message_deliveries_weight: 0.0,
+        first_message_deliveries_decay: 0.0,
+        first_message_deliveries_cap: 0.0,
+        // P3 and P3b, the delivery-rate shortfall: off, and this is the one
+        // that matters. The library's default expects twenty deliveries a
+        // window from every mesh peer and squares the shortfall; a lobby of
+        // quiet tables delivers none, so every honest peer would be graylisted
+        // for the crime of having nothing to say.
+        mesh_message_deliveries_weight: 0.0,
+        mesh_message_deliveries_decay: 0.0,
+        mesh_message_deliveries_cap: 0.0,
+        mesh_message_deliveries_threshold: 0.0,
+        mesh_message_deliveries_window: Duration::from_secs(0),
+        mesh_message_deliveries_activation: Duration::from_secs(1),
+        mesh_failure_penalty_weight: 0.0,
+        mesh_failure_penalty_decay: 0.0,
+        // P4: what this client refused. The only thing a peer is judged on.
+        invalid_message_deliveries_weight: -1.0,
+        invalid_message_deliveries_decay: 0.5,
+    }
 }
 
 /// The configuration, separately, so a test can read it back.
@@ -982,4 +1074,45 @@ mod tests {
     fn the_transmit_cap_is_the_protocols() {
         assert_eq!(GOSSIP_MAX_TRANSMIT, 65_536);
     }
+    /// `D-055`: the score judges a peer on what this client refused of it, and
+    /// on nothing about how much it talks.
+    ///
+    /// Every rate term is zero **on purpose**. The library's defaults expect
+    /// twenty deliveries a window from each mesh peer and square the shortfall
+    /// (P3); a lobby of quiet tables delivers none, so the defaults would
+    /// graylist every honest peer for having nothing to say -- which is why
+    /// `NETWORK_STACK.md` §6.7 left scoring off rather than risk it (OQ-5).
+    #[test]
+    fn the_peer_score_counts_refusals_and_not_traffic() {
+        let p = topic_score();
+        assert_eq!(p.time_in_mesh_weight, 0.0, "P1 off");
+        assert_eq!(p.first_message_deliveries_weight, 0.0, "P2 off");
+        assert_eq!(p.mesh_message_deliveries_weight, 0.0, "P3 off: the one that would graylist a quiet honest peer");
+        assert_eq!(p.mesh_failure_penalty_weight, 0.0, "P3b off");
+        assert!(p.invalid_message_deliveries_weight < 0.0, "P4 is the whole of it");
+        p.validate().expect("the library accepts it");
+
+        let (params, thresholds) = peer_score();
+        params.validate().expect("the library accepts the peer params");
+        thresholds.validate().expect("and the thresholds");
+        assert!(
+            params.ip_colocation_factor_whitelist.contains(&"127.0.0.1".parse().unwrap()),
+            "a bed run is ten clients on one machine, not a colocation attack"
+        );
+
+        // The arithmetic the doc comment claims: a peer sending `r` refusable
+        // messages a second settles at a count of `r / (1 - decay)` and scores
+        // `weight * count^2`. Graylisting takes a stream, not a disagreement.
+        let settled = |r: f64| {
+            let count = r / (1.0 - p.invalid_message_deliveries_decay);
+            p.topic_weight * p.invalid_message_deliveries_weight * count * count
+        };
+        assert!(settled(0.1) > thresholds.gossip_threshold,
+            "one refusal in ten seconds costs an honest neighbour nothing: {}", settled(0.1));
+        assert!(settled(1.0) > thresholds.graylist_threshold,
+            "and one a second is still heard: {}", settled(1.0));
+        assert!(settled(8.0) < thresholds.graylist_threshold,
+            "a flooder is graylisted: {}", settled(8.0));
+    }
+
 }

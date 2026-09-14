@@ -254,10 +254,40 @@ pub const MDNS_QUERY_INTERVAL_MS: u64 = 15_000;
 pub const HANDSHAKE_DEADLINE_MS: u64 = 15_000;
 pub const SNAPSHOT_PEER_COUNT: usize = 4;
 
-pub const MAX_TRACKED_TABLES: usize = 4_096;
+/// `D-055`: how many tables one client's lobby holds at once.
+///
+/// **Derived from what the wire can honestly deliver, not from memory.** Every
+/// subscriber of a GossipSub topic receives every message published to it, so a
+/// client hears one advert per table per `AD_REBROADCAST_MS` (30 s) --
+/// `T / 30` messages a second for `T` tables in the world -- and forwards each
+/// one to its `mesh_n - 1` = 7 mesh peers. At a relay budget of 32 KB/s out
+/// (0.26 Mbit/s, which a game must not notice) and an advert of about 400 B
+/// that is 11 adverts a second in, so about **340 live tables**. A window of
+/// 512 sits above that: the *wire* is the constraint and the store never
+/// silently drops something that did arrive. 512 rows cost about half a
+/// megabyte.
+///
+/// The old bound was 4 096, which is four megabytes of a lobby no wire of this
+/// design can fill -- an honest-looking number that hid where the real ceiling
+/// was.
+pub const MAX_TRACKED_TABLES: usize = 512;
 pub const MAX_TRACKED_PRESENCE: usize = 8_192;
 pub const MAX_ADS_PER_TABLE_KEY_PER_MIN: u32 = 4;
-pub const MAX_ADS_PER_PEER_PER_MIN: u32 = 20;
+/// `D-055`: how many adverts one **forwarding neighbour** may deliver a minute.
+///
+/// This is not a fairness rule -- fairness is `MAX_ADS_PER_TABLE_KEY_PER_MIN`,
+/// which is per table and scales with the network. This is a **cost ceiling**:
+/// what this client is willing to parse, verify and relay for one neighbour.
+///
+/// It was 20, and 20 was a fairness number in the wrong place. A neighbour
+/// relays for the whole mesh, so at `T` tables it carries about `T / 4` adverts
+/// a minute -- and 20 is reached at **80 tables in the world**. Past that, an
+/// honest neighbour's adverts were dropped and the lobby quietly stopped being
+/// a list of the tables that exist. 90 a minute against 8 neighbours is 12
+/// adverts a second, which is the 340-table ceiling above and the same 32 KB/s
+/// budget; a neighbour past it is dropped without being condemned (`Ignore`,
+/// never `Reject`, so it costs nobody a score).
+pub const MAX_ADS_PER_PEER_PER_MIN: u32 = 90;
 pub const MAX_PRESENCE_PER_PEER_PER_MIN: u32 = 4;
 
 // ---------------------------------------------------------------------------
