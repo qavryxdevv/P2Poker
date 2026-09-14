@@ -4650,6 +4650,15 @@ The same formula holds for presence on the chat topic, with `P` players in place
 - **Except the table this client is at**, which is held (the owner's exception): never displaced, and never taken by
   an expiry sweep. This matters more than it sounds -- a table that fills **stops advertising**, so the row under the
   player was the first one the sweep would have taken.
+- **And the redraw has a pace** (the owner: *a simple optimisation compromise*). A full window gives up at most
+  `ROWS_ROTATED_PER_MIN` = 50 rows a minute. Without it a network past the window redraws the whole list every
+  **forty-three seconds** -- at a hundred thousand tables this client accepts about 716 adverts a minute it does not
+  hold, against 512 rows -- and that number hardly moves with the size of the network, because it is set by what this
+  client accepts rather than by what exists. Fifty a minute turns the window over in about ten minutes instead: the
+  same arbitrary, evenly drawn, still-moving sample, only legible enough to click on. It governs **displacement, not
+  arrival** -- a window with room takes every table at once, so an empty lobby fills in seconds -- and a table already
+  held costs nothing to re-advertise. It does **not** reduce what arrives: those adverts still land on the link and
+  are still thrown away, which only `S1-EX` reaches.
 - **And a row is held only while it is actively true that this client plays there** (the owner's second rule, which
   changed the design). The first build held a row on a *join* and released it on a *leave*, which is a pair of events
   -- and an event can be missed: a join that is refused never becomes a table and never leaves one, so its hold would
@@ -4703,5 +4712,6 @@ unaffected -- it is D-040's question to peers, not the broadcast. This is `S1-EX
 **Guard.** `net::swarm::tests::the_peer_score_counts_refusals_and_not_traffic` (the rate terms are zero, the
 library validates the params, and the settled-score arithmetic of the table above),
 `net::lobby::tests::a_full_window_rotates_and_keeps_the_table_this_client_is_at` (a full window turns over by
-first-seen, the pinned table survives both the bound and an expiry sweep, and goes back into the rotation when the
-player leaves).
+first-seen, the held table survives both the bound and an expiry sweep, and goes back into the rotation when the
+player leaves) and `::a_full_window_gives_up_only_so_many_rows_a_minute` (the pace applies only to a full window, a
+minute has its own share, and a row already shown is refreshed whatever the pace).

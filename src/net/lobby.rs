@@ -647,6 +647,12 @@ pub enum NotTaken {
     /// The lobby is full. A bound, because the advert stream is open to
     /// strangers.
     LobbyFull,
+    /// `D-055`: the window is full and has already given up its share of rows
+    /// for this minute. Not a finding about the advert -- it is about the pace
+    /// this client is willing to redraw its own list at -- so it is `Ignore`d
+    /// on the wire like any other budget, and the table will be heard again in
+    /// thirty seconds.
+    RotatingTooFast,
 }
 
 /// One row of the lobby, as a caller reads it.
@@ -664,6 +670,8 @@ pub struct Listing<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct LobbyStore {
     tables: BTreeMap<[u8; 32], Held>,
+    /// `D-055`: how many rows this window has given up in the current minute.
+    rotated: Window,
     /// `D-055`: the tables this client is **at**, which the window's bound
     /// never displaces and which never expire out of it.
     ///
@@ -769,6 +777,17 @@ impl LobbyStore {
                     // then nothing at all.
                     self.expire(now_ms);
                     if self.tables.len() >= MAX_TRACKED_TABLES {
+                        // `D-055`: **the pace of the redraw.** A full window
+                        // gives up only so many rows a minute, so a network
+                        // larger than the window is read as a sample that moves
+                        // slowly enough to click on rather than as a list that
+                        // replaces itself while the player looks at it. Charged
+                        // here and nowhere else: a window with room takes
+                        // everything, and a table already held costs nothing to
+                        // re-advertise.
+                        if !self.rotated.admit(now_ms, ROWS_ROTATED_PER_MIN) {
+                            return Err(NotTaken::RotatingTooFast);
+                        }
                         // `D-055`: **and the window turns over.** The rule used
                         // to displace whichever entry expired soonest, which is
                         // a rotation only by accident -- a table that
@@ -899,6 +918,26 @@ pub struct RateLimiter {
     /// `D-054`: and what one author may announce about itself.
     per_author_presence: BTreeMap<[u8; 32], Window>,
 }
+
+/// `D-055`: how many rows a **full** window gives up in a minute.
+///
+/// Without it, a lobby past its bound redraws itself faster than anybody can
+/// read it. At a hundred thousand tables the network offers 3 333 adverts a
+/// second, of which this client takes twelve; at that size almost every one is
+/// a table it does not hold, so about 716 rows a minute would displace 512 --
+/// **the whole list, every forty-three seconds**, with rows vanishing under the
+/// player's cursor. And the number barely moves with the size of the network,
+/// because it is set by what this client accepts and not by what exists.
+///
+/// Fifty a minute turns the window over in about ten minutes instead. It is
+/// still the same arbitrary, evenly-drawn sample of whatever is out there, and
+/// it still keeps moving -- it is merely legible. What it does **not** do is
+/// reduce what arrives: those 3 333 adverts a second still land on the link and
+/// are still thrown away, and only `S1-EX`'s sharding reaches that.
+///
+/// It governs **displacement, not arrival**: a window with room takes every
+/// table at once, so an empty lobby fills in seconds rather than in ten minutes.
+pub const ROWS_ROTATED_PER_MIN: u32 = 50;
 
 /// `D-054`: how many lines one key may say in the lobby a minute.
 ///
@@ -2152,6 +2191,77 @@ mod tests {
         store.hold_only([]);
         store.expire(much_later);
         assert!(store.get(&key(0)).is_none());
+    }
+
+    /// `D-055`: a full window gives up only so many rows a minute, so a network
+    /// bigger than the window reads as a sample that moves slowly enough to
+    /// click on -- and a window with room still fills at once.
+    ///
+    /// At a hundred thousand tables this client accepts about 716 adverts a
+    /// minute it does not hold, against 512 rows: without a pace, the whole
+    /// list would be replaced every forty-three seconds, with rows vanishing
+    /// under the player's cursor. The number hardly moves with the size of the
+    /// network, because it is set by what this client accepts.
+    #[test]
+    fn a_full_window_gives_up_only_so_many_rows_a_minute() {
+        let mut store = LobbyStore::new();
+        let at = 1_700_000_000_000u64;
+        let key = |n: usize| {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            k
+        };
+        let offer = |store: &mut LobbyStore, n: usize, at: u64| {
+            let mut ad = TableAd::sng(6, format!("table {n}"), key(n), vec![2u8; 38], at);
+            ad.expires_at_unix_ms = at + AD_TTL_MS;
+            store.offer(key(n), ad, [1u8; 32], [2u8; 32], at)
+        };
+
+        // A window with room takes everything: an empty lobby fills in seconds,
+        // not in ten minutes.
+        for n in 0..MAX_TRACKED_TABLES {
+            assert!(offer(&mut store, n, at).is_ok(), "row {n} of an unfull window");
+        }
+
+        // Full, and now the pace applies. Offer a thousand tables inside one
+        // minute and exactly the minute's share is taken.
+        let mut taken = 0;
+        for n in MAX_TRACKED_TABLES..MAX_TRACKED_TABLES + 1_000 {
+            match offer(&mut store, n, at + 1_000) {
+                Ok(()) => taken += 1,
+                Err(NotTaken::RotatingTooFast) => {}
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+        assert_eq!(taken, ROWS_ROTATED_PER_MIN as usize, "the minute's share, and no more");
+        assert_eq!(store.tables().count(), MAX_TRACKED_TABLES, "the bound still holds");
+
+        // The next minute has its own share.
+        let next = at + 61_000;
+        let mut later = 0;
+        for n in 20_000..21_000 {
+            if offer(&mut store, n, next).is_ok() {
+                later += 1;
+            }
+        }
+        assert_eq!(later, ROWS_ROTATED_PER_MIN as usize, "a minute on, another share");
+
+        // A table already in the window costs nothing to re-advertise: it
+        // refreshes a row rather than rotating one, and a busy minute must
+        // never stop the list being kept up to date.
+        let held = store
+            .tables()
+            .map(|l| *l.key)
+            .next()
+            .expect("the window holds rows");
+        let n = u64::from_be_bytes(held[..8].try_into().unwrap()) as usize;
+        let mut fresh = TableAd::sng(6, format!("table {n}"), held, vec![2u8; 38], next + 1);
+        fresh.expires_at_unix_ms = next + 1 + AD_TTL_MS;
+        assert_eq!(
+            store.offer(held, fresh, [1u8; 32], [3u8; 32], next + 1),
+            Ok(()),
+            "a row already shown is refreshed whatever the pace"
+        );
     }
 
 }
