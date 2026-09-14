@@ -4823,3 +4823,30 @@ pro to GUI na strojích s nedosažitelnou GPU akcelerací"*).
 **Guard.** `gui::table::tests::the_window_asks_for_frames_at_a_bounded_rate` (both caps, their order, that the
 floor follows the rasteriser, and that a slow clock is not sped up).
 
+## D-057 — the window says how its own way back to the table is going
+
+**Decided 2026-09-14, the owner's ruling** (*"a v GUI aby byl uživatel informován hlášením o průběhu reconnectu, aby
+stůl nevypadal zamrzlý"*).
+
+1. **A table waiting on this client's own line shows every step of the way back**, over the felt where *Line down*
+   was: the connection lost (or, at three seats or more, nobody at the table answering), the network back, the
+   table's group again, the running hand followed while this seat was out of it, the sit-in asked at its end, and
+   dealt in. Each step is done, under way or still to come; the one under way turns once a second, the panel says
+   how long it has been, and a sentence under the steps says what the step under way waits on. *Back in the game*
+   stays four seconds and goes.
+2. **Why.** Between the line coming back and the seat being dealt in there can be a minute of things to wait for,
+   and the felt showed none of them: *Line down* went and nothing replaced it (the far founder's return in
+   `fe181646-3`: table reachable 243.5 s, dealt in from hand #21 after following hand #20 and a return vote -- a
+   minute from its line coming back). A window that shows nothing for a minute looks frozen, and a player who thinks
+   the table froze leaves it.
+3. **Only this client's own way back.** At two seats nobody answering is as likely the opponent as this line, and
+   that has its own question (`D-046`); there the panel starts only when the library says this client's own line is
+   gone. The seats that are off the line are `S1-EI`'s panel, which the way back replaces while it is shown.
+4. **From the node's own facts, not from its log lines**: `NodeEvent::TableReach` (whether any seat can be reached
+   from here, on change), `SitInAsked` (this seat's own request), and `SessionResumed { member }` (a running hand
+   taken up, dealt in or followed); with `ToxLine`, `SeatCertified` and `HandBegan` the window already had.
+5. The panel repaints once a second, as *Line down* did, inside `D-056`'s budget.
+
+**Guard.** `app::tests::the_way_back_is_shown_step_by_step_until_dealt_in_again` (the far founder's sequence, and a
+short outage that put nobody out) and `app::tests::heads_up_the_way_back_waits_for_this_clients_own_line`.
+`--table-preview --preview-rejoin` and `--preview-rejoin-back` draw it.

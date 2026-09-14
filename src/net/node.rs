@@ -506,10 +506,16 @@ pub enum NodeEvent {
         hand_id: u64,
     },
     /// `S1-CR`: the rejoin opened a hand of the running table from the
-    /// members' copies and follows it.
-    SessionResumed { hand_id: u64 },
+    /// members' copies and follows it. `D-057`: `member` when this seat is
+    /// dealt in that hand, as against following it to sit in at its end.
+    SessionResumed { hand_id: u64, member: bool },
     /// `S1-CR`: the rejoin stopped and the record is gone.
     SessionGaveUp { why: String },
+    /// `D-057`: whether any seat of the table can be reached from here, said
+    /// when that changes once a seat has been on the line.
+    TableReach { reachable: bool },
+    /// `D-057`: this client's seat asked to sit in at the boundary of this hand.
+    SitInAsked { hand_id: u64 },
 }
 
 impl NodeEvent {
@@ -631,7 +637,10 @@ impl NodeEvent {
             // `S1-CR`: the question about an unfinished game, and its answer.
             | Self::UnfinishedSession { .. }
             | Self::SessionResumed { .. }
-            | Self::SessionGaveUp { .. } => true,
+            | Self::SessionGaveUp { .. }
+            // `D-057`: the way back over the felt.
+            | Self::TableReach { .. }
+            | Self::SitInAsked { .. } => true,
 
             // Log only. Chatty, repetitive, and worth a second's delay.
             //

@@ -287,6 +287,9 @@ pub struct TableView {
     /// `S1-EI`: the seats off the line during the hand, and what happens
     /// about each.
     pub absent: Vec<AbsentSeat>,
+    /// `D-057`: this client's own way back to the table, step by step, while
+    /// it is under way -- so a table waiting on its line does not look frozen.
+    pub rejoin: Option<RejoinView>,
     /// `S1-EI`: the question is about everybody else, not one opponent.
     pub opponent_alone: bool,
     /// PokerTH's *Game: N*: which game of this client's session the table is.
@@ -346,6 +349,27 @@ pub enum TableAction {
     Back,
     /// `D-050`: *Show cards* -- the waiting hand is shown instead of mucked.
     ShowCards,
+}
+
+/// `D-057`: where a step of the way back stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepState {
+    Done,
+    Now,
+    Later,
+}
+
+/// `D-057`: the way back, as the felt shows it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RejoinView {
+    /// Seconds since the trouble began.
+    pub for_s: u64,
+    /// Every step in order.
+    pub steps: Vec<(StepState, String)>,
+    /// What the step under way is waiting on, in a sentence.
+    pub detail: Option<String>,
+    /// Back in the game: the panel says so for a moment and goes.
+    pub back: bool,
 }
 
 /// `S1-EI`: a seat off the line during the hand, and what happens about it.
@@ -1402,6 +1426,11 @@ fn app_bar_row(ui: &egui::Ui, p: &egui::Painter, rect: Rect, state: &mut TableUi
 /// The words over the felt that are not PokerTH's and stay: this client's own
 /// line (`S1-EH`) and the seats off the line (`S1-EI`), in the table's colours.
 fn overlays(ui: &egui::Ui, p: &egui::Painter, zone: Rect, view: &TableView) {
+    // `D-057`: the way back, step by step, in place of the bare *Line down*.
+    if let Some(r) = view.rejoin.as_ref() {
+        rejoin_panel(ui, p, zone, r);
+        return;
+    }
     if let Some(line) = view.line.as_ref() {
         let sentences: Vec<&str> = line.split(". ").collect();
         let w = (zone.width() * 0.72).max(340.0);
@@ -1445,6 +1474,72 @@ fn overlays(ui: &egui::Ui, p: &egui::Painter, zone: Rect, view: &TableView) {
         }
         paint_again(ui.ctx(), std::time::Duration::from_secs(1));
     }
+}
+
+/// `D-057`: the panel over the felt while this client finds its way back to
+/// the table: every step, the one under way turning, and how long it has been.
+///
+/// **A table waiting on its line must not look frozen.** Between the line
+/// coming back and the seat being dealt in again there are up to five things
+/// to wait for -- the network, the table's group, the hand running without
+/// this seat, the sit-in at its end, the other seats' votes -- and before this
+/// the felt showed none of them: *Line down* went and nothing replaced it
+/// for as long as a minute (the far founder's return, `fe181646-3`).
+fn rejoin_panel(ui: &egui::Ui, p: &egui::Painter, zone: Rect, r: &RejoinView) {
+    use crate::gui::theme::{DANGER, OK, TEXT_DIM, WARN};
+    let row_h = 20.0;
+    let detail_lines: Vec<String> = r
+        .detail
+        .as_deref()
+        .map(|d| d.split(". ").map(|s| if s.ends_with('.') { s.to_string() } else { format!("{s}.") }).collect())
+        .unwrap_or_default();
+    let w = (zone.width() * 0.62).max(340.0);
+    let h = 46.0 + row_h * r.steps.len() as f32 + 16.0 * detail_lines.len() as f32 + if detail_lines.is_empty() { 4.0 } else { 12.0 };
+    let rect = Rect::from_center_size(pos2(zone.center().x, zone.center().y - zone.height() * 0.05), vec2(w, h));
+    style::shadow(p, rect, 12.0, 3.0, 14.0, Color32::from_black_alpha(160));
+    p.rect_filled(rect, 12.0, style::faded(style::PANEL_BG, 0.95));
+    p.rect_stroke(rect, 12.0, Stroke::new(1.0, style::PANEL_BORDER), StrokeKind::Inside);
+
+    let (title, colour) = if r.back { ("Back in the game", OK) } else { ("Getting back to the table", WARN) };
+    style::text(p, pos2(rect.left() + 18.0, rect.top() + 19.0), Align2::LEFT_CENTER, title, 15.5, Weight::Bold, colour);
+    let clock = if r.for_s >= 60 { format!("{}:{:02}", r.for_s / 60, r.for_s % 60) } else { format!("{} s", r.for_s) };
+    style::text(p, pos2(rect.right() - 18.0, rect.top() + 19.0), Align2::RIGHT_CENTER, &clock, 12.5, Weight::Regular, TEXT_DIM);
+
+    // The step under way turns once a second: the panel repaints at that rate
+    // anyway, and a mark that moves is the whole point.
+    let tick = ui.ctx().input(|i| i.time).floor() as u64;
+    for (i, (state, text)) in r.steps.iter().enumerate() {
+        let y = rect.top() + 44.0 + row_h * i as f32;
+        let c = pos2(rect.left() + 26.0, y);
+        match state {
+            StepState::Done => {
+                p.circle_filled(c, 6.5, OK);
+                let s = Stroke::new(1.8, style::PANEL_BG);
+                p.line_segment([pos2(c.x - 3.2, c.y + 0.2), pos2(c.x - 0.8, c.y + 2.6)], s);
+                p.line_segment([pos2(c.x - 0.8, c.y + 2.6), pos2(c.x + 3.4, c.y - 2.6)], s);
+            }
+            StepState::Now => {
+                p.circle_stroke(c, 6.0, Stroke::new(1.6, WARN));
+                let a = std::f32::consts::FRAC_PI_2 * (tick % 4) as f32;
+                p.circle_filled(pos2(c.x + 6.0 * a.cos(), c.y + 6.0 * a.sin()), 2.4, WARN);
+            }
+            StepState::Later => {
+                p.circle_stroke(c, 6.0, Stroke::new(1.2, style::faded(TEXT_DIM, 0.55)));
+            }
+        }
+        let (weight, tint) = match state {
+            StepState::Done => (Weight::Regular, TEXT_DIM),
+            StepState::Now => (Weight::Bold, style::PANEL_TEXT),
+            StepState::Later => (Weight::Regular, style::faded(TEXT_DIM, 0.6)),
+        };
+        style::text(p, pos2(rect.left() + 42.0, y), Align2::LEFT_CENTER, text, 12.5, weight, tint);
+    }
+    let top = rect.top() + 44.0 + row_h * r.steps.len() as f32 + 2.0;
+    for (i, line) in detail_lines.iter().enumerate() {
+        let tint = if r.back { TEXT_DIM } else if i == 0 && r.steps.first().is_some_and(|(s, _)| *s == StepState::Now) { DANGER } else { style::PANEL_TEXT };
+        style::text(p, pos2(rect.left() + 18.0, top + 16.0 * i as f32), Align2::LEFT_CENTER, line, 11.5, Weight::Regular, tint);
+    }
+    paint_again(ui.ctx(), std::time::Duration::from_secs(1));
 }
 
 /// The sample's banner (§22: a sample that looks like a hand says so).
@@ -1940,6 +2035,7 @@ impl TableView {
             unsafe_note: None,
             line: None,
             absent: Vec::new(),
+            rejoin: None,
             opponent_alone: false,
             game_no: 1,
             log: vec![

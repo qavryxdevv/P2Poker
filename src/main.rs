@@ -176,7 +176,8 @@ fn main() {
     // `--preview-won` win the tournament; `--preview-show` offers *Show cards*;
     // `--preview-flooded` is out for flooding the group and `--preview-unsafe`
     // says the table is not safe (D-051); `--preview-winner` ends the hand with
-    // the winners' words blinking at their seats (D-052).
+    // the winners' words blinking at their seats (D-052); `--preview-rejoin`
+    // shows the way back half done and `--preview-rejoin-back` over (D-057).
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -1384,6 +1385,27 @@ fn preview_table(args: &[String]) {
     }
     if has("--preview-line") {
         view.line = Some("This client has heard nobody at the table for 12 s. Your seat keeps its cards; the hand goes on when the line is back".into());
+    }
+    // `D-057`: the way back, half done -- `--preview-rejoin-back` when it is over.
+    if has("--preview-rejoin") || has("--preview-rejoin-back") {
+        use table::StepState::{Done, Later, Now};
+        let back = has("--preview-rejoin-back");
+        view.rejoin = Some(table::RejoinView {
+            for_s: 47,
+            steps: vec![
+                (Done, "Nobody at the table answers".into()),
+                (Done, "Back in the table's group".into()),
+                (if back { Done } else { Now }, "Following hand #20, played on without this seat".into()),
+                (if back { Done } else { Later }, "Asking to sit in when that hand ends".into()),
+                (if back { Done } else { Later }, "Back in the game".into()),
+            ],
+            detail: Some(if back {
+                "Dealt in again".into()
+            } else {
+                "The table played on while this seat was away; this client catches up with the running hand and asks to sit in at its end".into()
+            }),
+            back,
+        });
     }
     if has("--preview-absent") {
         view.absent = vec![

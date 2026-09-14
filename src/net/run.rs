@@ -6724,6 +6724,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         "a seat of the table can be reached again from here".to_string()
                                     }))
                                     .await;
+                                let _ = events.send(NodeEvent::TableReach { reachable: !all_off }).await;
                             }
                             for (seat, group, quiet_s, away) in fresh {
                                 let (changed, moved, away_changed, again) = match t.link_said.get(&seat) {
@@ -7197,7 +7198,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                                 }
                                                             )))
                                                             .await;
-                                                        let _ = events.send(NodeEvent::SessionResumed { hand_id: hid }).await;
+                                                        let _ = events.send(NodeEvent::SessionResumed { hand_id: hid, member }).await;
                                                         t.hand = Some(h);
                                                         t.resume_inits.retain(|k, _| *k > hid);
                                                         t.resume_early.retain(|(k, _)| *k > hid);
@@ -11969,6 +11970,10 @@ async fn boundary_event(
                      the next hand's opening"
                 )))
                 .await;
+            // `D-057`: this client's own request, for the window's way back.
+            if seat == h.my_seat() {
+                let _ = events.send(NodeEvent::SitInAsked { hand_id }).await;
+            }
         }
         WindowTook::Took(k) => {
             // Recorded and read by nobody yet, which is stated in the log rather

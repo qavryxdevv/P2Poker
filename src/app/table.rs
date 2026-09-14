@@ -203,6 +203,7 @@ impl AppState {
                 other => other,
             },
             absent: self.absent_seats(),
+            rejoin: self.rejoin_view(),
             opponent_alone: self.opponent_gone.as_ref().is_some_and(|g| g.alone),
             chat: self
                 .table_chat

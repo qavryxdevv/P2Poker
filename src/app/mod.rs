@@ -329,6 +329,7 @@ pub struct TableApp {
     pub show_choice: Option<(u64, std::time::Instant)>,
     pub out_flooded: bool,
     pub unsafe_note: Option<(String, u64)>,
+    pub rejoin: Option<Rejoin>,
 }
 
 /// Everything the client knows, in the form the panes read it.
@@ -460,6 +461,8 @@ pub struct AppState {
     /// serial the window closes by -- the question comes back when the node
     /// says it again.
     pub unsafe_note: Option<(String, u64)>,
+    /// `D-057`: this client's own way back to the table, while it is under way.
+    pub rejoin: Option<Rejoin>,
     /// The sounds owed since the window last played them, in order.
     pub sound_cues: Vec<crate::sound::Cue>,
     /// How many games this client has sat down to since it started: PokerTH's
@@ -579,6 +582,53 @@ pub struct Joining {
 /// Longer than the node's own request timeout plus the time a founder has
 /// been measured to take to become dialable.
 pub const JOIN_WAIT_MS: u64 = 90_000;
+
+/// `D-057`: this client's own way back to the table, as far as it has come --
+/// from the moment its line went, the table's group fell silent or its seat
+/// was certified out, until it is dealt in again.
+#[derive(Debug, Clone)]
+pub struct Rejoin {
+    pub since: std::time::Instant,
+    /// The library said the Tox network is unreachable, rather than only the
+    /// table's group falling silent.
+    pub line_lost: bool,
+    /// The network is back, by the library's word.
+    pub network_back: bool,
+    /// A seat of the table can be reached from here again, and since when.
+    pub reached: bool,
+    pub reached_at: Option<std::time::Instant>,
+    /// This client's seat was certified out of a hand while it was away.
+    pub certified_out: bool,
+    /// Following the table's running hand as a bystander: which.
+    pub following: Option<u64>,
+    /// Asked to sit in at that hand's end.
+    pub asked: Option<u64>,
+    /// Dealt in again, or never out: when.
+    pub back_at: Option<std::time::Instant>,
+}
+
+impl Rejoin {
+    fn begin() -> Rejoin {
+        Rejoin {
+            since: std::time::Instant::now(),
+            line_lost: false,
+            network_back: false,
+            reached: false,
+            reached_at: None,
+            certified_out: false,
+            following: None,
+            asked: None,
+            back_at: None,
+        }
+    }
+}
+
+/// How long *Back in the game* stays over the felt.
+const REJOIN_BACK_SHOWN: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// How long after the table is reachable again a seat never put out counts as
+/// back in the game.
+const REJOIN_SETTLES: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// `S1-CX`: a heads-up opponent this client cannot reach, since when,
 /// whether the log has said so and whether the player has answered.
@@ -705,6 +755,7 @@ impl AppState {
         std::mem::swap(&mut self.show_choice, &mut other.show_choice);
         std::mem::swap(&mut self.out_flooded, &mut other.out_flooded);
         std::mem::swap(&mut self.unsafe_note, &mut other.unsafe_note);
+        std::mem::swap(&mut self.rejoin, &mut other.rejoin);
     }
 
     /// `D-043`: turn to another of this client's tables: its state becomes
@@ -795,8 +846,18 @@ impl AppState {
                 // until the DHT answers, which is nobody's line going away.
                 if how == "offline" && before.is_some_and(|b| b != "offline") {
                     self.note("the Tox network is unreachable from here: the table's hands ride it".into());
+                    // `D-057`: this client's own line went.
+                    if let Some(r) = self.rejoin_begins() {
+                        r.line_lost = true;
+                        r.network_back = false;
+                        r.reached = false;
+                        r.back_at = None;
+                    }
                 } else if how != "offline" && before == Some("offline") && self.ever_on_line {
                     self.note(format!("the Tox network is reachable again ({how})"));
+                    if let Some(r) = self.rejoin.as_mut() {
+                        r.network_back = true;
+                    }
                 }
             }
             NodeEvent::Reachability { public } => {
@@ -841,9 +902,48 @@ impl AppState {
                 ));
                 self.unfinished = Some(Unfinished { key, table_name, seat, stack, hand_id });
             }
-            NodeEvent::SessionResumed { hand_id } => {
+            NodeEvent::SessionResumed { hand_id, member } => {
                 self.unfinished = None;
                 self.note(format!("back at the table: following hand #{hand_id}"));
+                // `D-057`: in the table's group and caught up with its hand --
+                // dealt in it, or following it to sit in at its end.
+                let r = self.rejoin.get_or_insert_with(Rejoin::begin);
+                r.network_back = true;
+                r.reached = true;
+                r.reached_at.get_or_insert_with(std::time::Instant::now);
+                if member {
+                    r.back_at.get_or_insert_with(std::time::Instant::now);
+                } else {
+                    r.certified_out = true;
+                    r.following = Some(hand_id);
+                    r.back_at = None;
+                }
+            }
+            NodeEvent::TableReach { reachable } => {
+                // `D-057`: nobody at the table answers -- this client's own line,
+                // most likely, at three seats or more; at two the question about
+                // the opponent (`D-046`) is the word, and this panel stays out.
+                if reachable {
+                    if let Some(r) = self.rejoin.as_mut() {
+                        r.network_back = true;
+                        r.reached = true;
+                        r.reached_at.get_or_insert_with(std::time::Instant::now);
+                    }
+                } else if self.seated.as_ref().is_some_and(|s| s.roster.len() >= 3) {
+                    if let Some(r) = self.rejoin_begins() {
+                        r.reached = false;
+                        r.reached_at = None;
+                        r.back_at = None;
+                    }
+                }
+            }
+            NodeEvent::SitInAsked { hand_id } => {
+                if let Some(r) = self.rejoin.as_mut() {
+                    r.network_back = true;
+                    r.reached = true;
+                    r.certified_out = true;
+                    r.asked = Some(hand_id);
+                }
             }
             NodeEvent::SessionGaveUp { why } => {
                 self.unfinished = None;
@@ -1047,6 +1147,14 @@ impl AppState {
                 self.strength = None;
                 self.waiting_for.clear();
                 self.certified.clear();
+                // `D-057`: dealt in again after the way back.
+                let me = self.seated.as_ref().and_then(|s| s.seat);
+                if let (Some(r), Some(me)) = (self.rejoin.as_mut(), me) {
+                    let dealt = self.hand.as_ref().is_some_and(|h| h.dealt_in.contains(&me));
+                    if dealt && r.reached && (r.certified_out || r.following.is_some() || r.asked.is_some()) {
+                        r.back_at.get_or_insert_with(std::time::Instant::now);
+                    }
+                }
                 self.log_hand_began(hand_id);
                 self.note(format!("hand #{hand_id} has begun"));
             }
@@ -1246,6 +1354,12 @@ impl AppState {
             // `S1-EI`: the table certified a seat out of the running hand.
             NodeEvent::SeatCertified { seat } => {
                 self.certified.insert(seat);
+                // `D-057`: this client's own seat, put out of the hand while away.
+                if self.seated.as_ref().and_then(|s| s.seat) == Some(seat) {
+                    if let Some(r) = self.rejoin_begins() {
+                        r.certified_out = true;
+                    }
+                }
                 self.note(format!(
                     "seat {seat} certified out of this hand: the hand goes on among the seats on the line"
                 ));
@@ -1285,6 +1399,24 @@ impl AppState {
             NodeEvent::Swept { now_ms } => {
                 self.last_sweep_ms = now_ms;
                 self.tick_opponent();
+                // `D-057`: *Back in the game* for a moment, then nothing; and no
+                // way back at a table this client no longer plays at.
+                // Back in the table's group with nothing more to do -- the seat
+                // was never put out -- is back in the game once no catching-up
+                // has followed for a moment (a founder's adoption comes seconds
+                // after it is reached, `fe181646-3`).
+                if let Some(r) = self.rejoin.as_mut() {
+                    let settled = r.reached_at.is_some_and(|at| at.elapsed() >= REJOIN_SETTLES);
+                    if settled && !r.certified_out && r.following.is_none() && r.asked.is_none() {
+                        r.back_at.get_or_insert_with(std::time::Instant::now);
+                    }
+                }
+                if self.rejoin.as_ref().is_some_and(|r| r.back_at.is_some_and(|at| at.elapsed() >= REJOIN_BACK_SHOWN))
+                    || self.finished.is_some()
+                    || self.out_for_good.is_some()
+                {
+                    self.rejoin = None;
+                }
                 // A player who has stopped saying they are here stops being
                 // here. There is no goodbye message, because a client that is
                 // switched off does not send one.
@@ -1620,6 +1752,7 @@ impl AppState {
         self.show_choice = None;
         self.out_flooded = false;
         self.unsafe_note = None;
+        self.rejoin = None;
     }
 
     /// A seat's chips when the hand began: the last settlement's figure, or
@@ -1783,6 +1916,70 @@ impl AppState {
             && others
                 .iter()
                 .all(|n| self.links.get(n).is_some_and(|(_, group, _, _)| !*group))
+    }
+
+    /// `D-057`: this client's own way back, as the felt shows it: every step,
+    /// the one under way, and what it waits on.
+    pub fn rejoin_view(&self) -> Option<crate::gui::table::RejoinView> {
+        use crate::gui::table::StepState::{Done, Later, Now};
+        let r = self.rejoin.as_ref()?;
+        let back = r.back_at.is_some();
+        let state = |done: bool, now: bool| if done { Done } else if now { Now } else { Later };
+        let mut steps = Vec::new();
+        let first_done = back || r.reached || (r.line_lost && r.network_back);
+        steps.push((
+            state(first_done, true),
+            if r.line_lost { "Connection to the network lost".to_string() } else { "Nobody at the table answers".to_string() },
+        ));
+        if r.line_lost {
+            steps.push((state(back || r.network_back || r.reached, false), "Network back".to_string()));
+        }
+        steps.push((state(back || r.reached, first_done), "Back in the table's group".to_string()));
+        if r.certified_out || r.following.is_some() || r.asked.is_some() {
+            let following = match r.following.or(r.asked) {
+                Some(h) => format!("Following hand #{h}, played on without this seat"),
+                None => "Following the hand played on without this seat".to_string(),
+            };
+            steps.push((state(back || r.asked.is_some(), r.reached), following));
+            let asked = match r.asked {
+                Some(h) => format!("Asked to sit in after hand #{h}"),
+                None => "Asking to sit in when that hand ends".to_string(),
+            };
+            steps.push((state(back, r.asked.is_some()), asked));
+        }
+        steps.push((state(back, false), "Back in the game".to_string()));
+
+        let detail = if back {
+            Some("Dealt in again".to_string())
+        } else if r.line_lost && !r.network_back {
+            self.line_message().or_else(|| Some("No connection to the Tox network: the table's hands ride it".to_string()))
+        } else if !r.reached {
+            Some(
+                "Waiting for the table's group to take this seat back: the other seats offer it every few seconds, and this client takes the offer as soon as it can"
+                    .to_string(),
+            )
+        } else if r.asked.is_some() {
+            Some("The other seats agree to the return at the end of this hand; the next hand deals this seat in".to_string())
+        } else if r.certified_out || r.following.is_some() {
+            Some("The table played on while this seat was away; this client catches up with the running hand and asks to sit in at its end".to_string())
+        } else {
+            None
+        };
+        Some(crate::gui::table::RejoinView { for_s: r.since.elapsed().as_secs(), steps, detail, back })
+    }
+
+    /// `D-057`: the way back starts -- this client's line went, its table stopped
+    /// answering at a table of three or more, or its seat was certified out.
+    fn rejoin_begins(&mut self) -> Option<&mut Rejoin> {
+        let playing = self.seated.as_ref().is_some_and(|s| s.session.is_some())
+            && self.ever_on_line
+            && self.finished.is_none()
+            && self.out_for_good.is_none()
+            && !self.opponent_left;
+        if !playing {
+            return None;
+        }
+        Some(self.rejoin.get_or_insert_with(Rejoin::begin))
     }
 
     /// `S1-EI`: the other seats off the line during a running hand, with what
@@ -2787,6 +2984,75 @@ mod tests {
         assert!(v.opponent_gone_s.is_none(), "and the question is not asked beside it");
         s.apply(NodeEvent::ToxLine { how: "udp" });
         assert!(s.table_view().opponent_gone_s.is_some(), "the line back, the others still gone: the question again");
+    }
+
+    /// `D-057`: the far founder's way back in `fe181646-3`, as the felt shows it --
+    /// nobody answers, the group again, the running hand followed, the sit-in, and
+    /// dealt in -- and a short outage that put nobody out ends at *Back in the game*.
+    #[test]
+    fn the_way_back_is_shown_step_by_step_until_dealt_in_again() {
+        use crate::gui::table::StepState::{Done, Later, Now};
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster {
+            key: [7u8; 32],
+            seats: vec![(0, "me".into(), 1_000), (1, "a".into(), 1_000), (2, "b".into(), 1_000)],
+        });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        assert!(s.table_view().rejoin.is_none(), "nothing wrong, nothing shown");
+
+        s.apply(NodeEvent::TableReach { reachable: false });
+        let v = s.table_view().rejoin.expect("nobody at three seats answers: the way back begins");
+        assert_eq!(v.steps[0], (Now, "Nobody at the table answers".to_string()));
+        assert!(v.steps.iter().skip(1).all(|(st, _)| *st == Later), "nothing else yet: {:?}", v.steps);
+
+        s.apply(NodeEvent::TableReach { reachable: true });
+        let v = s.table_view().rejoin.expect("still under way");
+        assert_eq!(v.steps[1], (Done, "Back in the table's group".to_string()));
+        assert!(!v.back, "reached is not yet back in the game");
+
+        s.apply(NodeEvent::SessionResumed { hand_id: 20, member: false });
+        let v = s.table_view().rejoin.expect("following");
+        assert!(v.steps.iter().any(|(st, t)| *st == Now && t.contains("hand #20")), "the running hand, under way: {:?}", v.steps);
+
+        s.apply(NodeEvent::SitInAsked { hand_id: 20 });
+        let v = s.table_view().rejoin.expect("asked");
+        assert!(v.steps.iter().any(|(st, t)| *st == Now && t.contains("sit in")), "{:?}", v.steps);
+
+        s.apply(NodeEvent::HandBegan { hand_id: 21, button: 1, dealt_in: vec![0, 1, 2], small_blind: 100, big_blind: 200 });
+        let v = s.table_view().rejoin.expect("the moment it is back is shown");
+        assert!(v.back && v.steps.iter().all(|(st, _)| *st == Done), "{:?}", v.steps);
+        s.rejoin.as_mut().unwrap().back_at = Some(std::time::Instant::now() - REJOIN_BACK_SHOWN);
+        s.apply(NodeEvent::Swept { now_ms: 1 });
+        assert!(s.table_view().rejoin.is_none(), "and then it goes");
+
+        // A short outage: the table waited, nobody was put out.
+        s.apply(NodeEvent::TableReach { reachable: false });
+        s.apply(NodeEvent::TableReach { reachable: true });
+        s.rejoin.as_mut().unwrap().reached_at = Some(std::time::Instant::now() - REJOIN_SETTLES);
+        s.apply(NodeEvent::Swept { now_ms: 2 });
+        assert!(s.table_view().rejoin.is_some_and(|v| v.back), "back in the game once nothing more follows");
+    }
+
+    /// `D-057`: at two seats nobody answering is the question about the opponent
+    /// (`D-046`), not this client's way back -- unless its own line went.
+    #[test]
+    fn heads_up_the_way_back_waits_for_this_clients_own_line() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::ToxLine { how: "udp" });
+        s.apply(NodeEvent::TableReach { reachable: false });
+        assert!(s.table_view().rejoin.is_none(), "the opponent may be the one gone");
+        s.apply(NodeEvent::ToxLine { how: "offline" });
+        let v = s.table_view().rejoin.expect("this client's own line went");
+        assert_eq!(v.steps[0].1, "Connection to the network lost");
+        s.apply(NodeEvent::ToxLine { how: "udp" });
+        let v = s.table_view().rejoin.expect("still under way");
+        assert_eq!(v.steps[1], (crate::gui::table::StepState::Done, "Network back".to_string()));
     }
 
     /// `S1-EJ`: a table founded for three is heads-up once one seat has left for good,
