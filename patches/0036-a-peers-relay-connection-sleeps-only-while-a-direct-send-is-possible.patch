@@ -1,0 +1,91 @@
+# 0036 - a peer's relay connection sleeps only while a direct send is possible, not merely heard.
+#
+# S1-FC (2026-09-14), found in runs/run161438-2 measuring S1-FB: a seat killed at 60 s and
+# started again at 80 s was back in the table's group at about 120 s, and hand #9 then
+# stalled for 55 s and the seat spent a heads-up return.
+#
+# At the founder, read to the line: the returned member's group handshake went by TCP
+# relay ("UDP handshake failed ... target: (IP invalid)" at 130.5 s, the response by TCP at
+# 131.2), so no address was held for it. Its packets then arrived straight over UDP, and a
+# connection counts as direct by what it RECEIVES alone (gcc_conn_is_direct reads
+# last_received_direct_time, which lossless and lossy packets set without setting an
+# address -- only handshakes and pings do that), so do_gc_tcp put its relay connection to
+# sleep: "connection-to 1 sleeps (peer direct)" at 131.3. gcc_send_packet sends directly
+# only when gcc_direct_conn_is_possible as well -- an address is held -- so every packet to
+# the member went to the sleeping relay connection, which still carried them while another
+# connection kept its relay awake. Relays 0 and 2 slept at 140.1 s; relay 1 was held awake
+# by the dead process's ghost entry, and when the library reaped that entry at 150.2 s
+# relay 1 slept too. From 150.1 s: "no relay carried this packet for connection 1: 0
+# online", 434 such lines in the run against 2 to 10 in the others, and no "sends to ...
+# are now direct" for the member until 204.4 s, after the member had timed the founder out
+# (58 s of hearing nothing) and handshaken again.
+#
+# The change: do_gc_tcp keeps a peer's relay connection awake unless the peer is heard
+# directly AND a direct send is possible -- the same two conditions gcc_send_packet sends
+# directly under -- and says once per crossing when a peer is heard directly with no
+# address. Local; the wire is untouched; a peer with an address sleeps its relay
+# connection as before.
+#
+# MEASURED, and what it does not show. Booked before the build: three restart runs
+# (-KillAt 60 -KillFor 20) and a plain three-seat run. The precondition line never fired in
+# any of them (run163909-2, run164414-2, run164920-2, run165425-3): the bed did not
+# reproduce a handshake by relay followed by direct packets, so the fix itself is shown by
+# the reading above and not by a run. What the runs do show is no harm: every restart back
+# in a hand 16-18 s after the start with 30 hands at one genesis, no burst of unsent
+# packets, and relay connections still put to sleep for direct peers (2-4 per node per
+# run). The first run on which the line fires is the one that measures this patch.
+#
+# Vendored tree patched in place. Re-apply on a toxcore bump with
+#   git apply patches/0036-*.patch
+# and check tools/build-tox.ps1's marker for 0036 in group_chats.c.
+
+diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
+index 9e0433d..d5bd1f6 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.c
++++ b/vendor/c-toxcore/toxcore/group_chats.c
+@@ -7827,10 +7827,31 @@ static void do_gc_tcp(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat, void
+     do_tcp_connections(chat->log, chat->tcp_conn, userdata);
+ 
+     for (uint32_t i = 1; i < chat->numpeers; ++i) {
+-        const GC_Connection *gconn = get_gc_connection(chat, i);
++        GC_Connection *gconn = get_gc_connection(chat, i);
+         assert(gconn != nullptr);
+ 
+-        const bool tcp_set = !gcc_conn_is_direct(chat->mono_time, gconn);
++        /* p2p-poker (patch 0036): a peer's relay connection sleeps only while a
++         * direct send is POSSIBLE as well as heard -- the condition
++         * gcc_send_packet sends directly under. Heard alone, it slept for a
++         * peer whose handshake had gone by relay, so that no address was held
++         * for it: every packet to it then went to a sleeping relay connection,
++         * carried while some other connection kept that relay awake and not
++         * at all once none did (S1-FC, run161438-2: a member back from a
++         * restart could not be reached for 55 s after a dead entry that had
++         * held the last relay awake was reaped). Said once per crossing. */
++        const bool heard_direct = gcc_conn_is_direct(chat->mono_time, gconn);
++        const bool send_direct = gcc_direct_conn_is_possible(chat, gconn);
++        const bool without_address = heard_direct && !send_direct;
++
++        if (without_address != gconn->p2p_heard_without_address) {
++            LOGGER_DEBUG(chat->log, "p2p-poker: peer %u (hash %u) %s", i, gconn->public_key_hash,
++                         without_address
++                         ? "is heard directly with no address to send to: its relay connection stays awake"
++                         : "is no longer heard directly without an address to send to");
++            gconn->p2p_heard_without_address = without_address;
++        }
++
++        const bool tcp_set = !(heard_direct && send_direct);
+         set_tcp_connection_to_status(chat->tcp_conn, gconn->tcp_connection_num, tcp_set);
+     }
+ 
+diff --git a/vendor/c-toxcore/toxcore/group_common.h b/vendor/c-toxcore/toxcore/group_common.h
+index c6d81ad..c5b314b 100644
+--- a/vendor/c-toxcore/toxcore/group_common.h
++++ b/vendor/c-toxcore/toxcore/group_common.h
+@@ -119,6 +119,7 @@ typedef struct GC_Connection {
+     int         tcp_connection_num;
+     int32_t     friend_number; /* The messenger friend number associated with this group connection. Used to discover the peer's IP/port if it wasn't available during the initial invite. */
+     bool        last_send_was_direct; /* p2p-poker: so gcc_send_packet can say when the path flips (S1-BN) */
++    bool        p2p_heard_without_address; /* p2p-poker (patch 0036): heard directly with no address to send to (S1-FC) */
+     uint64_t    last_sent_tcp_relays_time;  /* the last time we attempted to send this peer our tcp relays */
+     uint16_t    tcp_relay_share_index;
+     uint64_t    last_received_direct_time;   /* the last time we received a direct UDP packet from this connection */

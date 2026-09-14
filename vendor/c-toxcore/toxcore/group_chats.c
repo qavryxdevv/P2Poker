@@ -7827,10 +7827,31 @@ static void do_gc_tcp(const GC_Session *_Nonnull c, GC_Chat *_Nonnull chat, void
     do_tcp_connections(chat->log, chat->tcp_conn, userdata);
 
     for (uint32_t i = 1; i < chat->numpeers; ++i) {
-        const GC_Connection *gconn = get_gc_connection(chat, i);
+        GC_Connection *gconn = get_gc_connection(chat, i);
         assert(gconn != nullptr);
 
-        const bool tcp_set = !gcc_conn_is_direct(chat->mono_time, gconn);
+        /* p2p-poker (patch 0036): a peer's relay connection sleeps only while a
+         * direct send is POSSIBLE as well as heard -- the condition
+         * gcc_send_packet sends directly under. Heard alone, it slept for a
+         * peer whose handshake had gone by relay, so that no address was held
+         * for it: every packet to it then went to a sleeping relay connection,
+         * carried while some other connection kept that relay awake and not
+         * at all once none did (S1-FC, run161438-2: a member back from a
+         * restart could not be reached for 55 s after a dead entry that had
+         * held the last relay awake was reaped). Said once per crossing. */
+        const bool heard_direct = gcc_conn_is_direct(chat->mono_time, gconn);
+        const bool send_direct = gcc_direct_conn_is_possible(chat, gconn);
+        const bool without_address = heard_direct && !send_direct;
+
+        if (without_address != gconn->p2p_heard_without_address) {
+            LOGGER_DEBUG(chat->log, "p2p-poker: peer %u (hash %u) %s", i, gconn->public_key_hash,
+                         without_address
+                         ? "is heard directly with no address to send to: its relay connection stays awake"
+                         : "is no longer heard directly without an address to send to");
+            gconn->p2p_heard_without_address = without_address;
+        }
+
+        const bool tcp_set = !(heard_direct && send_direct);
         set_tcp_connection_to_status(chat->tcp_conn, gconn->tcp_connection_num, tcp_set);
     }
 

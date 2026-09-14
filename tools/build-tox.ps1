@@ -256,6 +256,9 @@ $patched = @(
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker (patch 0035): an invitation to a group this client holds with'
        Why    = '0035b: S1-EB. An invitation to a chat this client holds was swallowed in Messenger.c; a member back from an outage holds an emptied copy of the table''s group and its founder''s fresh invitation never reached the application, so a seat whose old address no longer answered could never be brought back. Delivered when the chat holds nobody else; the wire is untouched.' }
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker (patch 0036): a peer''s relay connection sleeps only while a'
+       Why    = '0036: S1-FC. A member heard directly but held with no address had its relay connection put to sleep, so nothing could be sent to it once no other connection kept that relay awake: a seat back from a restart was unreachable for 55 s and spent a heads-up return. Local; the wire is untouched.' }
 )
 
 Step 'checking the patches are in the vendored source'
