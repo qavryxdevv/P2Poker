@@ -737,8 +737,13 @@ for ($i = 0; $i -lt $nodeCount; $i++) { $logs += @{ Name = "n$i"; Path = (Join-P
 if ($LeaverSeconds -gt 0) { $logs += @{ Name = 'nR'; Path = (Join-Path $work 'nR.log') } }
 if (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $LeaverSeconds -eq 0) {
     foreach ($dn in $droppers) { $logs += @{ Name = "n$dn-again"; Path = (Join-Path $work "n$dn-again.log") } }
-    if ($KillAt -gt 0 -and $KillFor -gt 0) { $logs += @{ Name = "n$KillNode-again"; Path = (Join-Path $work "n$KillNode-again.log") } }
 }
+# `S1-FB`: a node killed and started again plays its second life in its own log,
+# and that log was read only when -DropAt was given as well. So a restart that
+# never came back printed its first life's hands and *same genesis yes*: a clean
+# table (run154928-2, where the restarted client had gone back to the lobby at
+# 2.1 s and played nothing).
+if ($KillAt -gt 0 -and $KillFor -gt 0) { $logs += @{ Name = "n$KillNode-again"; Path = (Join-Path $work "n$KillNode-again.log") } }
 
 $nodes = @()
 foreach ($entry in $logs) {

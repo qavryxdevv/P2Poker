@@ -6484,7 +6484,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `SEAT_SILENCE_MS`, or said the roster again without this
                         // client, has nothing to sit at. Back to the lobby, and the
                         // note says which. Before this a joiner waited for ever.
-                        let gone: Option<String> = t.table.as_ref().filter(|f| !f.is_founder()).and_then(|f| {
+                        //
+                        // `S1-FB`: **never a seat coming back from its session
+                        // record.** Every reading below is about a table that has not
+                        // started, and a resuming client's table has: the record is
+                        // first written when the table is set, and a table that has
+                        // started is not advertised, so the founder's lobby answer
+                        // leaves it out by construction. A founder silent or out of
+                        // the group is likewise an absence the table deals with, not
+                        // a table gone. The restarted client read that answer as a
+                        // withdrawal two seconds after it started, and leaving forgot
+                        // the record as well, so the seat never came back at all
+                        // (`run154928-2`, killed at 60 s and started again at 80 s:
+                        // *back to the lobby* at 2.1 s of its clock, NO TABLE at the
+                        // end, and the founder opening a hand every 31 s for the rest
+                        // of the run). A founder that no longer holds the seat still
+                        // refuses the rejoin, and that forgets the record (`S1-CR`).
+                        let gone: Option<String> = t.table.as_ref().filter(|f| !f.is_founder() && !t.resuming).and_then(|f| {
                             let founder_peer = PeerId::from_bytes(f.founder_peer_id()).ok();
                             let founder_line = f
                                 .roster()

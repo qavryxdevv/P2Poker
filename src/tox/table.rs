@@ -730,11 +730,18 @@ impl Driver {
     /// Take the instance onto its thread and keep it there for the client's
     /// life. Bootstrapping is the caller's, before this.
     pub fn start(tox: Tox) -> Driver {
+        Driver::start_with_nodes(tox, Vec::new())
+    }
+
+    /// `S1-FB`: start the driver with the bootstrap nodes the instance was
+    /// started from, so it can offer them again while the instance is offline.
+    /// An empty list, as [`start`](Self::start) gives, never bootstraps again.
+    pub fn start_with_nodes(tox: Tox, nodes: Vec<crate::tox::nodes::Node>) -> Driver {
         let mine: [u8; 32] = tox.address()[..32].try_into().unwrap_or([0u8; 32]);
         let (ctl_tx, ctl_rx) = sync_mpsc::channel::<Ctl>();
         let thread = std::thread::Builder::new()
             .name("tox".into())
-            .spawn(move || run(tox, ctl_rx))
+            .spawn(move || run(tox, ctl_rx, nodes))
             .expect("a thread for the client's Tox instance");
         Driver {
             control: ctl_tx,
@@ -959,7 +966,27 @@ const SWEEP_EVERY: Duration = Duration::from_secs(5);
 /// because then nothing is short and nothing is sent; and a peer that is
 /// already in a group ignores a second invitation, since the joiner accepts
 /// only when it holds none.
-const REINVITE_EVERY: Duration = Duration::from_secs(30);
+///
+/// `S1-FB`: **ten seconds, not thirty.** This is the safety net and not the way
+/// back -- the friend link's up-edge offers at once, and so does the group's own
+/// report of a member gone (`offer_again`) -- and a sweep that fires only while
+/// the group is short costs a handful of invitations to peers who are not in it.
+const REINVITE_EVERY: Duration = Duration::from_secs(10);
+
+/// `S1-FB`: how long the instance may be offline before the driver bootstraps
+/// it again itself.
+///
+/// Long enough not to fight toxcore's own reconnection over a blip -- which it
+/// handles, and which `S1-EH` measured the library reporting as *offline* for
+/// tens of seconds at every start -- and short against an outage a player sits
+/// through.
+const REBOOTSTRAP_AFTER: Duration = Duration::from_secs(10);
+
+/// `S1-FB`: how often, while still offline, the bootstrap nodes are offered
+/// again. A packet per node, into a line that may carry nothing yet: cheap
+/// while the outage lasts, and the first one to land after it ends is the
+/// instance's way back.
+const REBOOTSTRAP_EVERY: Duration = Duration::from_secs(15);
 
 /// `D-049`: how often a member says its sitting-out status in the group again,
 /// changed or not. The library broadcasts a status losslessly and exchanges it
@@ -1094,6 +1121,18 @@ struct TableState {
     /// When the founder's last invitation went, and how many members were
     /// confirmed then. See `invite_pending`.
     last_invite: Option<(Instant, usize)>,
+    /// `S1-FB`: the lines -- friend keys -- whose member the table's group has
+    /// just reported gone, for the founder to offer the group to again at once.
+    ///
+    /// **An edge of the group's own, beside the friend link's.** The friend
+    /// link's down-edge is what clears a friend from `invited`, and a line cut
+    /// for longer than the friend timeout (about 32 s, sooner than the group's
+    /// 58 s) produces it: `run154144-2` had the invitation 0.3 s after the line
+    /// came back. A member the group times out while its friend link still
+    /// reads up produces none -- a restarted client whose old connection has
+    /// not timed out yet is one -- and was left to `REINVITE_EVERY`. The group
+    /// reporting the member gone is the edge this carries.
+    offer_again: Vec<[u8; 32]>,
     out: tokio::sync::mpsc::Receiver<Vec<u8>>,
     inbox: tokio::sync::mpsc::Sender<FromTable>,
     chat: tokio::sync::watch::Sender<Option<[u8; 32]>>,
@@ -1674,7 +1713,12 @@ fn sweep_table(
 }
 
 /// The driver: one instance, every table, until the client ends.
-fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
+fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::nodes::Node>) {
+    // `S1-FB`: when the instance went offline, and when it was last pointed at
+    // the bootstrap nodes again. See `REBOOTSTRAP_AFTER`.
+    let mut offline_since: Option<Instant> = None;
+    let mut last_rebootstrap = Instant::now();
+    let mut rebootstraps = 0u32;
     // Tox friend number -> that friend's public key. The instance's, shared by
     // every table: a friendship outlives the table it was made for as long as
     // any open table needs it, and `FRIEND_LINGER` past that.
@@ -1794,6 +1838,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                             reassembler: Reassembler::new(fragment::TOX_PACKET),
                             closing: None,
                             last_invite: None,
+                            offer_again: Vec::new(),
                             out,
                             inbox,
                             chat,
@@ -2484,7 +2529,27 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
         // --- the founder's invitations, one at a time -------------------------
         for t in tables.values_mut() {
             if matches!(t.setup.role, Role::Host) && t.closing.is_none() {
+                // `S1-FB`: a member the group has just reported gone is no longer
+                // one this founder "has invited" -- that record was of an
+                // invitation to a membership that has ended. Forgotten here, the
+                // very next call below offers the group again at once if the
+                // seat's friend link is up, and on its up-edge if not. The
+                // one-at-a-time gap is reset with it, so the offer is not held
+                // behind an earlier one. Only while the group is short, as the
+                // sweep's (`S1-EG`): a group holding every seat has nobody to
+                // offer it to.
+                if !t.offer_again.is_empty() {
+                    let gone = std::mem::take(&mut t.offer_again);
+                    if t.group.is_some() && 1 + t.confirmed.len() < t.roster.len() {
+                        t.invited
+                            .retain(|f| friends.get(f).is_none_or(|k| !gone.contains(k)));
+                        t.last_invite = None;
+                    }
+                }
                 invite_pending(&mut tox, t, &friends, &connected);
+            } else {
+                // A member of somebody else's group has nobody to invite.
+                t.offer_again.clear();
             }
         }
 
@@ -2527,6 +2592,49 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                 }
             }
             let self_connection = tox.connection().max(0) as u64;
+            // `S1-FB`: **an instance that has been offline a while is pointed at
+            // its bootstrap nodes again**, every `REBOOTSTRAP_EVERY`, until it is
+            // back. It was bootstrapped once, when it started, and after that it
+            // relied on toxcore's own reconnection alone -- which keeps pinging the
+            // nodes of its close list, and after an outage long enough for every
+            // one of them to time out has nobody left to ping. The owner's own
+            // client read *self offline* eight minutes after an outage; whether
+            // its line was back all that while, its log cannot say, and this
+            // costs a packet per node for as long as the instance is offline.
+            if self_connection == 0 {
+                let since = *offline_since.get_or_insert_with(Instant::now);
+                if !nodes.is_empty()
+                    && since.elapsed() >= REBOOTSTRAP_AFTER
+                    && last_rebootstrap.elapsed() >= REBOOTSTRAP_EVERY
+                {
+                    for n in &nodes {
+                        let _ = tox.bootstrap(&n.host, n.udp_port, &n.key);
+                        if let Some(port) = crate::tox::nodes::best_tcp_port(&n.tcp_ports) {
+                            let _ = tox.add_tcp_relay(&n.host, port, &n.key);
+                        }
+                    }
+                    last_rebootstrap = Instant::now();
+                    rebootstraps += 1;
+                    if rebootstraps == 1 {
+                        println!(
+                            "the Tox instance has been offline for {} s: bootstrapping it again from {} stored node(s), every {} s until it is back (S1-FB)",
+                            since.elapsed().as_secs(),
+                            nodes.len(),
+                            REBOOTSTRAP_EVERY.as_secs()
+                        );
+                    }
+                }
+            } else {
+                if let Some(since) = offline_since.take() {
+                    if rebootstraps > 0 {
+                        println!(
+                            "the Tox instance is back after about {} s offline, bootstrapped again {rebootstraps} time(s) (S1-FB)",
+                            since.elapsed().as_secs()
+                        );
+                    }
+                }
+                rebootstraps = 0;
+            }
             for t in tables.values_mut() {
                 if t.closing.is_none() {
                     sweep_table(&mut tox, t, &friends, &connected, self_connection);
@@ -2618,6 +2726,8 @@ fn member_gone(tox: &Tox, t: &mut TableState, g: u32, peer: u32, key: Option<[u8
     // the key remembered for the peer when the callback
     // could not read one.
     let key = key.or(remembered);
+    // `S1-FB`: the seat still here by another entry it is known by.
+    let mut seat_still = false;
     if let Some(app) = key.and_then(|k| t.known_as.get(&k).copied()) {
         // `S1-DU`: a seat back under a fresh key is still here
         // by that entry -- the one that timed out is gone, the
@@ -2629,6 +2739,7 @@ fn member_gone(tox: &Tox, t: &mut TableState, g: u32, peer: u32, key: Option<[u8
             && entries_of(&app, scan_pairs(tox, g), &t.known_as)
                 .iter()
                 .any(|(p, _)| t.confirmed.contains(p));
+        seat_still = still;
         if !still {
             if let Ok(mut present) = t.trouble.present.lock() {
                 present.remove(&app);
@@ -2648,6 +2759,16 @@ fn member_gone(tox: &Tox, t: &mut TableState, g: u32, peer: u32, key: Option<[u8
             }
             if let Ok(mut gone) = t.trouble.gone_lines.lock() {
                 gone.push((l, quit));
+            }
+            // `S1-FB`: and it is to be offered the group again the moment it
+            // can take it, rather than when the next sweep happens to forget
+            // that it was invited once already -- unless its seat is here by
+            // a fresh entry. A restarted client's old entry times out a minute
+            // after the kill, long after the new one is in, and its line is
+            // not among the new entry's: that offer went to a member already in
+            // the group (`run160249-2`, the third invitation at 120 s).
+            if !seat_still && !t.offer_again.contains(&l) {
+                t.offer_again.push(l);
             }
         }
     }

@@ -279,7 +279,9 @@ impl TableSink {
             let mut nodes = 0usize;
             let mut booted = 0usize;
             let mut relays = 0usize;
-            for n in crate::tox::nodes::load(profile) {
+            // `S1-FB`: kept, so the driver can offer them again while offline.
+            let list: Vec<crate::tox::nodes::Node> = crate::tox::nodes::load(profile).into_iter().collect();
+            for n in list.iter().cloned() {
                 nodes += 1;
                 if tox.bootstrap(&n.host, n.udp_port, &n.key).is_ok() {
                     booted += 1;
@@ -301,7 +303,7 @@ impl TableSink {
                 relays,
                 refreshed,
             };
-            self.driver = Some(std::sync::Arc::new(table::Driver::start(tox)));
+            self.driver = Some(std::sync::Arc::new(table::Driver::start_with_nodes(tox, list)));
             self.mine = Some(mine);
             Ok(Some(mine))
         }
