@@ -159,12 +159,17 @@ fn seal(
 /// Bytes rather than characters, because the cap the wire enforces is bytes and
 /// a name of thirty-two emoji is a hundred and twenty-eight of them. Popping
 /// whole characters is what keeps the result a `String`.
+///
+/// `D-054`: and it is made one line of printable text first, so what this
+/// client signs is what a receiver of this build accepts -- the sender's rule
+/// and the receiver's are one rule.
 fn clip(s: &str, cap: usize) -> String {
-    let mut out = s.trim().to_owned();
+    let mut out = crate::net::plaintext::to_plain_line(s);
     while out.len() > cap {
         out.pop();
     }
-    out
+    // A cut on a byte cap can leave a mark whose base has gone.
+    crate::net::plaintext::to_plain_line(&out)
 }
 
 /// Take a presence or a chat line off the wire.
@@ -210,6 +215,18 @@ pub fn receive(
     let who = envelope.sender_public_key;
     verify(&who, &signed).map_err(|_| NotHeard::Forged)?;
 
+    // `D-054`: and now that the key is a fact rather than a claim, what that
+    // **author** may say. The budget above is the forwarding neighbour's, and
+    // on a gossip mesh one speaker reaches this client through every neighbour
+    // it has -- so nothing bounded what one speaker could put in the pane.
+    let allowed = match kind {
+        EventType::LobbyChat => limits.admit_author_talk(who, now_ms),
+        _ => limits.admit_author_presence(who, now_ms),
+    };
+    if !allowed {
+        return Err(NotHeard::TooMuch);
+    }
+
     let body: Body = from_canonical(&envelope.payload, LOBBY_CHAT_MAX)
         .map_err(|_| NotHeard::Malformed("not a lobby body"))?;
     if body.nickname.len() > NAME_MAX {
@@ -218,12 +235,22 @@ pub fn receive(
     if body.text.len() > SAID_MAX {
         return Err(NotHeard::TooLong("the line is over its cap"));
     }
+    // `D-054`: a name is one line of printable text wherever it is shown, and
+    // the lobby shows names beside every table and every player.
+    if !body.nickname.is_empty() {
+        crate::net::plaintext::is_plain_line(&body.nickname)
+            .map_err(|_| NotHeard::Malformed("the name is not one line of text"))?;
+    }
 
     Ok(match kind {
         EventType::LobbyChat => {
             if body.text.trim().is_empty() {
                 return Err(NotHeard::Malformed("an empty line is not a message"));
             }
+            // `D-054`: as is a line. This client cleans what its own player
+            // types before signing it, so nothing honest is refused here.
+            crate::net::plaintext::is_plain_line(&body.text)
+                .map_err(|_| NotHeard::Malformed("the line is not one line of text"))?;
             Heard::Said {
                 who,
                 nickname: body.nickname,
@@ -363,5 +390,96 @@ mod tests {
             }
         }
         assert!(refused > 0, "a peer with no limit is a peer with a megaphone");
+    }
+
+    /// `D-054`: **one speaker, one budget, however many neighbours relay it.**
+    ///
+    /// The per-neighbour budget bounds what each *link* carries, and on a
+    /// gossip mesh one author reaches this client through every neighbour it
+    /// has: twenty neighbours were twenty budgets, all of them somebody else's,
+    /// and nothing at all bounded what one speaker could put in the pane. This
+    /// is that speaker, coming in through a fresh neighbour every time.
+    #[test]
+    fn one_author_is_bounded_however_many_neighbours_relay_it() {
+        let k = key(11);
+        let mut limits = RateLimiter::new();
+        let mut said = 0;
+        for i in 0..60u32 {
+            // A different forwarding neighbour each time, so its own budget is
+            // untouched -- which is exactly the shape of a gossip mesh.
+            let mut peer = [0u8; 32];
+            peer[0] = (i % 251) as u8;
+            peer[1] = (i / 251) as u8;
+            let bytes = say(&k, "Mallory", &format!("line {i}"), NOW).unwrap();
+            if receive(&bytes, peer, NOW, &mut limits).is_ok() {
+                said += 1;
+            }
+        }
+        assert_eq!(
+            said,
+            crate::net::lobby::MAX_TALK_PER_AUTHOR_PER_MIN,
+            "one key says its own allowance and no more"
+        );
+        // Another key's allowance is its own.
+        let other = say(&key(12), "Bob", "hello", NOW).unwrap();
+        assert!(receive(&other, [200u8; 32], NOW, &mut limits).is_ok());
+        // And a minute on, the first may speak again.
+        let again = say(&k, "Mallory", "still here", NOW + 61_000).unwrap();
+        assert!(receive(&again, [201u8; 32], NOW + 61_000, &mut limits).is_ok());
+    }
+
+    /// `D-054`: a lobby line is one line of printable text, and so is a name.
+    ///
+    /// The pane is eight lines tall and the names are drawn beside every table
+    /// in the list; a newline or a direction override in either is a way to
+    /// draw over a window that nobody at the table can mute, because in a
+    /// public lobby there is no roster to be thrown out of.
+    #[test]
+    fn a_lobby_line_and_a_name_are_one_line_of_text() {
+        let mut limits = RateLimiter::new();
+        // A client that does not clean: the body is built by hand.
+        let bytes = forge(&key(13), EventType::LobbyChat, "Mallory", "one\ntwo", NOW);
+        assert!(matches!(
+            receive(&bytes, [4u8; 32], NOW, &mut limits),
+            Err(NotHeard::Malformed(_))
+        ));
+        let named = forge(&key(14), EventType::LobbyChat, "M\u{202E}yrolla", "hi", NOW);
+        assert!(matches!(
+            receive(&named, [5u8; 32], NOW, &mut limits),
+            Err(NotHeard::Malformed(_))
+        ));
+        // What this build says is cleaned before it is signed, so it is heard.
+        let honest = say(&key(15), "Mallory", "one\ntwo", NOW).unwrap();
+        match receive(&honest, [6u8; 32], NOW, &mut limits).unwrap() {
+            Heard::Said { text, .. } => assert_eq!(text, "one two"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A message whose body was written by a client that does not clean.
+    fn forge(
+        k: &SigningKey,
+        kind: EventType,
+        nickname: &str,
+        text: &str,
+        now_ms: u64,
+    ) -> Vec<u8> {
+        let body = Body {
+            nickname: nickname.to_owned(),
+            text: text.to_owned(),
+        };
+        let body_bytes = to_canonical(&body).unwrap();
+        let envelope =
+            EventBody::unchained(kind, k.verifying_key().to_bytes(), body_bytes, now_ms).unwrap();
+        let envelope_bytes = to_canonical(&envelope).unwrap();
+        let signature = {
+            use ed25519_dalek::Signer;
+            k.sign(&to_be_signed(&envelope_bytes))
+        };
+        to_canonical(&SignedEvent {
+            body: envelope_bytes,
+            signature: signature.to_bytes(),
+        })
+        .unwrap()
     }
 }

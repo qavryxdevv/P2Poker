@@ -226,6 +226,16 @@ param(
     # flood once it is in; `-StrangerName copy` names it with a copy of a seat's
     # binding. Every node's log says when it removed the stranger, and why.
     # Needs a binary built with `--features fault-harness`.
+    # `-ChatSpamAt <s> -ChatSpamNodes <list> [-ChatSpamRate <lines/s>]` (D-054):
+    # those nodes spam their table's chat from that second, with lines that are
+    # well formed and correctly signed -- what no rule in a sender can stop.
+    # Every other node's log says *a line of table chat was refused* with the
+    # reason, and then D-051's own words as the meter fills: *seat N flooded the
+    # table's group* and *out of the table for good for flooding*.
+    # Needs a binary built with `--features fault-harness`.
+    [ValidateRange(0, 100000)][int]$ChatSpamAt = 0,
+    [string]$ChatSpamNodes = '',
+    [ValidateRange(1, 500)][int]$ChatSpamRate = 8,
     [ValidateRange(0, 100000)][int]$StrangerAt = 0,
     [ValidateRange(0, 32)][int]$StrangerNode = 1,
     [switch]$StrangerFlood,
@@ -461,7 +471,10 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     $backForNode = if ($BackAt -gt 0 -and $i -eq $AfkNode) { $BackAt } else { 0 }
     # `D-051`. Not `$floodNodes`: a local of that name IS the parameter.
     $floodList = @("$FloodNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+    # `D-054`, and the same trap: a local named after the parameter IS it.
+    $chatSpamList = @("$ChatSpamNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
     $floodForNode = if ($FloodAt -gt 0 -and ($floodList -contains $i)) { $FloodAt } else { 0 }
+    $chatSpamForNode = if ($ChatSpamAt -gt 0 -and ($chatSpamList -contains $i)) { $ChatSpamAt } else { 0 }
     $strangerForNode = if ($StrangerAt -gt 0 -and $i -eq $StrangerNode) { $StrangerAt } else { 0 }
     $stall = if ($StallJoin -gt 0 -and $i -eq $StallJoinNode) { $StallJoin } else { 0 }
     $mute = if ($MuteFor -gt 0 -and $i -eq $MuteNode) { $MuteFor } else { 0 }
@@ -471,13 +484,17 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # The founder alone, and handed to the job like the stack: the job sees
     # nothing of this scope (the first run printed the banner and kicked nobody).
     $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, [bool]$StrangerFlood, $StrangerName -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName)
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, [bool]$StrangerFlood, $StrangerName, $chatSpamForNode, $ChatSpamRate -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate)
         if ($holdMuck) { $env:P2P_POKER_HOLD_MUCK = "$holdMuck" }
         $env:P2P_POKER_FLOOD_RATE = "$floodRate"
         if ($floodAt -gt 0) {
             $env:P2P_POKER_FLOOD_AT = "$floodAt"
             $env:P2P_POKER_FLOOD_KIND = "$floodKind"
+        }
+        if ($chatSpamAt -gt 0) {
+            $env:P2P_POKER_CHAT_SPAM_AT = "$chatSpamAt"
+            $env:P2P_POKER_CHAT_SPAM_RATE = "$chatSpamRate"
         }
         if ($strangerAt -gt 0) {
             $env:P2P_POKER_STRANGER_AT = "$strangerAt"
@@ -567,6 +584,9 @@ if ($StallJoin -gt 0) {
 if ($HoldMuck) {
     Write-Host "==> every node's hand that may muck waits at the showdown, then $(if ($HoldMuck -eq 'show') { 'shows at once' } else { 'mucks when the window runs out' })"
     Write-Host "    (needs a binary built with --features fault-harness; D-050)"
+}
+if ($ChatSpamAt -gt 0) {
+    Write-Host "==> n$(("$ChatSpamNodes" -split '[,\s]+' | Where-Object { $_ -ne '' }) -join ', n') spam(s) the table's chat from $ChatSpamAt s, $ChatSpamRate line(s) a second (D-054)"
 }
 if ($FloodAt -gt 0) {
     Write-Host "==> n$(("$FloodNodes" -split '[,\s]+' | Where-Object { $_ -ne '' }) -join ', n') flood(s) the table's group from $FloodAt s, $FloodRate packets a second of $FloodKind (D-051)"

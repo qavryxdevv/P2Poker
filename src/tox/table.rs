@@ -424,7 +424,7 @@ pub enum Command {
     /// `D-051`: a whole message from this member was not a signed event, or
     /// did not verify under the key inside it -- which no client of this
     /// build sends.
-    Noise { member_key: [u8; 32] },
+    Noise { member_key: [u8; 32], points: u32 },
     /// Close this table: say what it still holds, leave its group. The
     /// instance and its thread stay for the next table, and the friends no
     /// open table needs go `FRIEND_LINGER` later (`D-042`).
@@ -1997,9 +1997,9 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>) {
                                 }
                             }
                         }
-                        Command::Noise { member_key } => {
+                        Command::Noise { member_key, points } => {
                             if let Some(g) = t.group {
-                                score_noise(&mut tox, t, g, member_key, crate::table::membership::NOISE_BAD_MESSAGE);
+                                score_noise(&mut tox, t, g, member_key, points);
                             }
                         }
                         Command::KickWithoutWord(key) => {

@@ -732,7 +732,17 @@ struct TableRun {
     ratification_asked_ms: u64,
     ratification_asked_said: bool,
     /// `S1-CS`: one line per two seconds per seat of table chat.
-    chat_limits: super::tabletalk::SeatLimiter,
+    chat_limits: super::tabletalk::Talk,
+    /// `D-054`: when a refused line of chat was last said in the log, so a
+    /// flood of them costs one note a minute and not a note apiece.
+    chat_refused_said_ms: u64,
+    /// `D-054`: this client's own budget for what it says at this table --
+    /// the same one every receiver will hold it to, so its own player can
+    /// never be cut off the table for typing too fast.
+    my_chat: super::tabletalk::Budget,
+    /// fault-harness, `D-054`: whether this table has said it is spamming.
+    #[cfg(feature = "fault-harness")]
+    chat_spam_said: bool,
     /// `S1-CS`: the group count the window was last told, so the felt can
     /// say *the players are joining the group* as they do and not on the
     /// thirty-second status line.
@@ -891,7 +901,11 @@ impl TableRun {
             ratification_echo_ms: 0,
             ratification_asked_ms: 0,
             ratification_asked_said: false,
-            chat_limits: super::tabletalk::SeatLimiter::default(),
+            chat_limits: super::tabletalk::Talk::default(),
+            chat_refused_said_ms: 0,
+            my_chat: super::tabletalk::Budget::default(),
+            #[cfg(feature = "fault-harness")]
+            chat_spam_said: false,
             carrier_reported: None,
             material_recorded: None,
             hand_said_again_ms: 0,
@@ -1323,6 +1337,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // `PeerCondition::DisconnectedAndNotDialing` makes it a no-op.
     let mut dialled_lobby: std::collections::HashMap<libp2p::PeerId, std::time::Instant> =
         std::collections::HashMap::new();
+    // `D-054`: what this client may say in the lobby, by the rule every
+    // receiver applies to it -- so a line it would refuse of anybody else is
+    // one it does not send, and its own player is told why.
+    let mut my_lobby_chat = super::tabletalk::Budget::default();
 
     // When this loop started, which is what `FAST_REDIAL_WINDOW` is measured
     // from. The node's own clock and not the wall: a run's opening minute is a
@@ -3296,41 +3314,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             continue;
                         }
-                        // `S1-CS`: a line of table chat, from a seated key, to the
-                        // window and nowhere else. Accepted for the mesh when it
-                        // verified, ignored when the seat's budget is spent, refused
-                        // when it is no seat's or another table's.
+                        // `D-054`: **table chat does not ride this carrier.**
+                        //
+                        // It used to ride both this topic and the table's group.
+                        // The topic is `/p2p-poker/table/<table_id>` and the
+                        // table id is public in the advertisement, so *any* peer
+                        // on the mesh could publish a line into a table it has
+                        // no seat at -- bytes on every seat's link that no
+                        // budget of `D-051`'s meter ever saw, because that meter
+                        // counts what the group carries. Worse, nothing on this
+                        // path had verified a signature before a budget was
+                        // charged, so a stranger could silence a player by
+                        // sending unsigned lines under that player's own key.
+                        //
+                        // The group is the table's closed set of members, every
+                        // one of them bound to a seat (`D-051`), and it is
+                        // metered. So the line rides there and only there, and a
+                        // chat frame arriving here is a client that is not this
+                        // build: refused, and not forwarded for it.
                         if let Ok((crate::protocol::messages::EventType::TableChat, _, _)) =
                             crate::net::chained::peek(&message.data, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
                         {
-                            let now = super::node::now_unix_ms();
-                            let verdict = match t.table.as_ref() {
-                                Some(f) => match super::tabletalk::receive(
-                                    &message.data,
-                                    &f.table_id(),
-                                    |k| f.roster().seat_of(k),
-                                    now,
-                                    &mut t.chat_limits,
-                                ) {
-                                    Ok(spoken) => {
-                                        let _ = events
-                                            .send(NodeEvent::TableSaid {
-                                                seat: spoken.seat,
-                                                nickname: spoken.nickname,
-                                                text: spoken.text,
-                                            })
-                                            .await;
-                                        gossipsub::MessageAcceptance::Accept
-                                    }
-                                    Err(super::tabletalk::NotHeard::TooMuch) => gossipsub::MessageAcceptance::Ignore,
-                                    Err(_) => gossipsub::MessageAcceptance::Reject,
-                                },
-                                None => gossipsub::MessageAcceptance::Ignore,
-                            };
                             let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
                                 &message_id,
                                 &propagation_source,
-                                verdict,
+                                gossipsub::MessageAcceptance::Reject,
                             );
                             continue;
                         }
@@ -4527,9 +4535,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 match command {
                     NodeCommand::SayAtTable(text) => {
                         // `S1-CS`: to the table's group, which is the closed set of
-                        // its seats; the table's GossipSub topic only where the
-                        // table has no group. Said to this client's own window
-                        // directly, as the lobby's line is.
+                        // its seats. `D-054`: and **nowhere else** -- the table's
+                        // GossipSub topic is open to any peer on the mesh and is
+                        // not metered, so a line said there is a line every
+                        // stranger may answer with a flood. Said to this client's
+                        // own window directly, as the lobby's line is.
                         let Some(f) = t.table.as_ref() else {
                             let _ = events.send(NodeEvent::Warning("not at a table".into())).await;
                             continue;
@@ -4538,14 +4548,37 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let _ = events.send(NodeEvent::Warning("no seat to speak from yet".into())).await;
                             continue;
                         };
+                        if !t.tox_sink.is_on_tox() {
+                            let _ = events
+                                .send(NodeEvent::Warning(
+                                    "not said: the table's chat rides the table's group, which is not up yet (D-054)".into(),
+                                ))
+                                .await;
+                            continue;
+                        }
                         let now = super::node::now_unix_ms();
+                        // `D-054`: **this client holds itself to the budget it
+                        // holds everybody else to.** Every receiver counts an
+                        // over-budget line against the member that carried it,
+                        // and enough of those is a flood by `D-051`'s meter --
+                        // so a client that let its own player type faster than
+                        // the rule would have that player cut off the table for
+                        // being chatty. The refusal is said in the window, where
+                        // the player can see why the line did not go.
+                        let line = super::tabletalk::clip_line(&text);
+                        if !line.is_empty()
+                            && !t.my_chat.admit(now, super::tabletalk::line_weight(&line))
+                        {
+                            let _ = events
+                                .send(NodeEvent::Warning(
+                                    "not said: a line every two seconds, three held back at most (D-054)".into(),
+                                ))
+                                .await;
+                            continue;
+                        }
                         match super::tabletalk::say(&app_key, &f.table_id(), &nickname, &text, now) {
                             Ok(bytes) => {
-                                if t.tox_sink.is_on_tox() {
-                                    t.tox_sink.try_broadcast(&bytes);
-                                } else if let Some(topic) = t.table_topic.as_ref() {
-                                    let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes);
-                                }
+                                t.tox_sink.try_broadcast(&bytes);
                                 let _ = events
                                     .send(NodeEvent::TableSaid {
                                         seat,
@@ -4561,6 +4594,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     NodeCommand::SayInLobby(text) => {
                         let now = super::node::now_unix_ms();
+                        // `D-054`: and this client holds itself to the budget
+                        // every receiver holds it to here too. Nothing in the
+                        // lobby throws anybody out, so what is at stake is only
+                        // that the line would go nowhere and the player would
+                        // never learn it -- which is reason enough to say so.
+                        if !my_lobby_chat.admit(now, super::tabletalk::line_weight(&text)) {
+                            let _ = events
+                                .send(NodeEvent::Warning(
+                                    "not said: the lobby hears one line every two seconds from a player (D-054)".into(),
+                                ))
+                                .await;
+                            continue;
+                        }
                         match super::lobbytalk::say(&app_key, &nickname, &text, now) {
                             Ok(bytes) => {
                                 // Shown locally whatever the mesh does. A line
@@ -5304,7 +5350,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // read no further.
                 if let Some(gk) = item.claimed {
                     if crate::net::chained::noise(&item.bytes, crate::table::fragment::MAX_MESSAGE).is_some() {
-                        t.tox_sink.tell(super::toxsink::Seat::Noise { member_key: gk });
+                        t.tox_sink.tell(super::toxsink::Seat::Noise {
+                            member_key: gk,
+                            points: crate::table::membership::NOISE_BAD_MESSAGE,
+                        });
                         continue;
                     }
                 }
@@ -5405,25 +5454,51 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 // `S1-CS`: a line of table chat over the group -- the closed set
                 // of the table's seats -- from a seated key, to the window.
+                //
+                // `D-054`: and the group is the **only** carrier it rides, so
+                // every line is charged to the member the group itself reports,
+                // and a refused one is counted against that member's meter. A
+                // peer that spends its chat budget over and over is a flooder by
+                // `D-051`'s own measure and is cut off by it.
                 if let Ok((crate::protocol::messages::EventType::TableChat, _, _)) =
                     crate::net::chained::peek(&item.bytes, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
                 {
-                    if let Some(f) = t.table.as_ref() {
+                    if let (Some(f), Some(gk)) = (t.table.as_ref(), item.claimed) {
                         let now = super::node::now_unix_ms();
-                        if let Ok(heard) = super::tabletalk::receive(
+                        match super::tabletalk::receive(
                             &item.bytes,
                             &f.table_id(),
+                            &gk,
                             |k| f.roster().seat_of(k),
                             now,
                             &mut t.chat_limits,
                         ) {
-                            let _ = events
-                                .send(NodeEvent::TableSaid {
-                                    seat: heard.seat,
-                                    nickname: heard.nickname,
-                                    text: heard.text,
-                                })
-                                .await;
+                            Ok(heard) => {
+                                let _ = events
+                                    .send(NodeEvent::TableSaid {
+                                        seat: heard.seat,
+                                        nickname: heard.nickname,
+                                        text: heard.text,
+                                    })
+                                    .await;
+                            }
+                            Err(why) => {
+                                t.tox_sink.tell(super::toxsink::Seat::Noise {
+                                    member_key: gk,
+                                    points: super::tabletalk::noise_points(why),
+                                });
+                                // Said once a minute at most: the point of the
+                                // note is that a seat went quiet for a reason,
+                                // not to write a line per refused line.
+                                if now.saturating_sub(t.chat_refused_said_ms) >= 60_000 {
+                                    t.chat_refused_said_ms = now;
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "a line of table chat was refused and counted against the member that carried it: {why:?} (D-054)"
+                                        )))
+                                        .await;
+                                }
+                            }
                         }
                     }
                     continue;
@@ -5905,6 +5980,46 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // is read here; whether the seat is on the line stays the stall
             // tick's, and a seat off the line is never said to sit out.
             _ = away_tick.tick() => {
+                // fault-harness, `D-054`: `P2P_POKER_CHAT_SPAM_AT=<s>` and
+                // `P2P_POKER_CHAT_SPAM_RATE=<n>`: from that second of this
+                // client's life it says n lines a second at every table it
+                // sits at -- a spammer whose every line is well formed and
+                // signed, which is what no budget in the sender can stop and
+                // what every receiver must therefore stop for itself.
+                #[cfg(feature = "fault-harness")]
+                if let Some((at, rate)) = chat_spam_plan() {
+                    if started.elapsed() >= at {
+                        let now = super::node::now_unix_ms();
+                        for t in tables.iter_mut() {
+                            let Some(f) = t.table.as_ref() else { continue };
+                            if f.my_seat().is_none() || !t.tox_sink.is_on_tox() {
+                                continue;
+                            }
+                            // The tick is four to the second, so the rate is
+                            // shared out over it.
+                            let per_tick = (rate / 4).max(1);
+                            for i in 0..per_tick {
+                                if let Ok(bytes) = super::tabletalk::say(
+                                    &app_key,
+                                    &f.table_id(),
+                                    &nickname,
+                                    &format!("spam {} {i}", now / 250),
+                                    now,
+                                ) {
+                                    t.tox_sink.try_broadcast(&bytes);
+                                }
+                            }
+                            if !t.chat_spam_said {
+                                t.chat_spam_said = true;
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "fault-harness: this client spams its table's chat at {rate} line(s) a second, as P2P_POKER_CHAT_SPAM_AT asked"
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
+                }
                 for t in tables.iter_mut() {
                     if !t.tox_sink.is_on_tox() {
                         continue;
@@ -10259,6 +10374,26 @@ const TABLE_FRAME_PEEK: usize = crate::protocol::constants::HAND_ABORT_MAX;
 /// it. Two locks, and the outer one is a compile-time absence: without
 /// `--features fault-harness` this is the constant `false` and the environment
 /// is never read.
+/// fault-harness, `D-054`: `P2P_POKER_CHAT_SPAM_AT=<s>` with
+/// `P2P_POKER_CHAT_SPAM_RATE=<lines per second>` (8 unless said) -- a seat that
+/// spams its table's chat with well formed, correctly signed lines. Nothing in
+/// a sender can stop that, which is the point of it: what stops it is every
+/// receiver's own budget, and what it costs its sender is `D-051`'s meter.
+#[cfg(feature = "fault-harness")]
+fn chat_spam_plan() -> Option<(std::time::Duration, u32)> {
+    use std::sync::OnceLock;
+    static PLAN: OnceLock<Option<(std::time::Duration, u32)>> = OnceLock::new();
+    *PLAN.get_or_init(|| {
+        let at = std::env::var("P2P_POKER_CHAT_SPAM_AT").ok()?.trim().parse::<u64>().ok()?;
+        let rate = std::env::var("P2P_POKER_CHAT_SPAM_RATE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(8)
+            .clamp(1, 500);
+        Some((std::time::Duration::from_secs(at), rate))
+    })
+}
+
 #[cfg(feature = "fault-harness")]
 fn link_is_down() -> bool {
     use std::sync::OnceLock;

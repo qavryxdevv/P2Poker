@@ -901,9 +901,15 @@ impl AppState {
                 if self.table_chat.len() >= MAX_CHAT_LINES {
                     self.table_chat.pop_front();
                 }
+                // `D-054`: the name is kept as the name, and nothing else. It
+                // used to be written into one string with the seat --
+                // *"{nickname} (seat {seat})"* -- and a name is whatever the
+                // other client typed, so a seat could call itself *Alice (seat
+                // 0)* and read as another player's line. The seat is drawn by
+                // the window from this field, which the signature decided.
                 self.table_chat.push_back(TableLine {
                     seat,
-                    who: format!("{nickname} (seat {seat})"),
+                    who: nickname,
                     said: text,
                 });
             }
@@ -2639,7 +2645,9 @@ mod tests {
         assert_eq!(s.table_chat.len(), MAX_CHAT_LINES);
         let last = s.table_chat.back().unwrap();
         assert_eq!(last.seat, 2);
-        assert!(last.who.contains("Carol") && last.who.contains("seat 2"));
+        // `D-054`: the name is the name; the seat is the window's own, drawn
+        // from `seat` so no name can claim to be another seat.
+        assert_eq!(last.who, "Carol");
         assert_eq!(last.said, format!("line {}", MAX_CHAT_LINES + 4));
         s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: Some(120), group: false, quiet_s: None, away: false });
         assert_eq!(s.links.get(&2).map(|(r, _, _, _)| *r), Some(Some(120)));

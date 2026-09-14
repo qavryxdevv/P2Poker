@@ -92,7 +92,11 @@ pub enum Seat {
     Seats { apps: Vec<[u8; 32]>, fixed: bool },
     /// `D-051`: a whole message from this group member was not a signed
     /// event, or did not verify under the key inside it.
-    Noise { member_key: [u8; 32] },
+    ///
+    /// `D-054`: `points` is what it is worth against the member's meter, so a
+    /// refusal that is merely an eager speaker (a spent chat budget) is not
+    /// counted as the forgery it is not.
+    Noise { member_key: [u8; 32], points: u32 },
 }
 
 /// `D-051`: a member the carrier cut off from this table's group, as the node
@@ -917,7 +921,7 @@ impl TableSink {
                         app_key,
                     },
                     Seat::Seats { apps, fixed } => Command::Seats { apps, fixed },
-                    Seat::Noise { member_key } => Command::Noise { member_key },
+                    Seat::Noise { member_key, points } => Command::Noise { member_key, points },
                 });
             }
         }

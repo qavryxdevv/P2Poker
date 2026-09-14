@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 use crate::poker::state::Hash;
 use crate::protocol::constants::{
     hand_deadline_min_ms, PresetId, AD_TTL_MS, HAND_DEADLINE_CAP_MS, MAX_ADS_PER_PEER_PER_MIN,
-    MAX_ADS_PER_TABLE_KEY_PER_MIN, MAX_AD_LIFETIME_MS, MAX_CLOCK_SKEW_MS, MAX_SEATS,
+    MAX_ADS_PER_TABLE_KEY_PER_MIN, MAX_AD_LIFETIME_MS, MAX_CLOCK_SKEW_MS, MAX_PRESENCE_PER_PEER_PER_MIN, MAX_SEATS,
     sng_hand_deadline_ms, sng_small_blind_cap, MAX_TRACKED_TABLES, RATED_BLIND_EVERY_N_HANDS,
     RATED_HAND_DEADLINE_MS, RATED_SEATS, RATED_SMALL_BLIND, RATED_SMALL_BLIND_CAP,
     RATED_START_STACK,
@@ -829,6 +829,36 @@ pub struct RateLimiter {
     /// first is exactly table discovery.
     per_peer_talk: BTreeMap<[u8; 32], Window>,
     per_table: BTreeMap<[u8; 32], Window>,
+    /// `D-054`: what one **author** may say, whatever number of neighbours
+    /// relayed it here. See [`admit_author_talk`](RateLimiter::admit_author_talk).
+    per_author_talk: BTreeMap<[u8; 32], Window>,
+    /// `D-054`: and what one author may announce about itself.
+    per_author_presence: BTreeMap<[u8; 32], Window>,
+}
+
+/// `D-054`: how many lines one key may say in the lobby a minute.
+///
+/// A person types a handful; a pane is eight lines tall. Twelve is generous
+/// for somebody talking and is a thirtieth of what a client sending as fast as
+/// the topic allows would put there.
+pub const MAX_TALK_PER_AUTHOR_PER_MIN: u32 = 12;
+
+/// `D-054`: how many keys a budget map may hold before the spent ones are
+/// swept out of it.
+///
+/// The maps keyed by a **peer** are bounded by the connections this client
+/// has. The ones keyed by a key out of a message are not: a lobby is public,
+/// and a client rotating identities would otherwise grow them without end --
+/// a limiter that is itself a way to exhaust the machine it defends.
+const BUDGETS_MAX: usize = 1_024;
+
+/// Drop the windows that have run out, once a map has grown enough to be worth
+/// walking.
+fn prune(map: &mut BTreeMap<[u8; 32], Window>, now_ms: u64) {
+    if map.len() <= BUDGETS_MAX {
+        return;
+    }
+    map.retain(|_, w| now_ms.saturating_sub(w.started_ms) < 60_000);
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -879,17 +909,50 @@ impl RateLimiter {
     /// Moving a threshold and un-sharing a map in one edit would leave neither
     /// measured.
     ///
-    /// **`MAX_PRESENCE_PER_PEER_PER_MIN` is still unused, and that is on
-    /// purpose.** It is 4, which is a sane per-*author* rate against a
-    /// heartbeat of one per forty seconds — and this charge is per *forwarding
-    /// neighbour*, which relays for its whole mesh. Wiring the constant in here
-    /// would drop almost all presence. It is left declared and unread until
-    /// something charges the author, which nothing does yet.
+    /// **`MAX_PRESENCE_PER_PEER_PER_MIN` is charged against the author**, by
+    /// [`admit_author_presence`](Self::admit_author_presence), and not here: it
+    /// is 4, which is a sane per-*author* rate against a heartbeat of one per
+    /// forty seconds, and this charge is per *forwarding neighbour*, which
+    /// relays for its whole mesh. (`D-054` wired it. It sat declared and unread
+    /// until something charged the author, which nothing did.)
     pub fn admit_peer_talk(&mut self, peer: [u8; 32], now_ms: u64) -> bool {
         self.per_peer_talk
             .entry(peer)
             .or_default()
             .admit(now_ms, MAX_ADS_PER_PEER_PER_MIN)
+    }
+
+    /// `D-054`: whether this **author key** may say another line in the lobby.
+    ///
+    /// Charged **after** the signature verifies, because until then the key is
+    /// a claim, and a claim that spends a budget is a way to silence the player
+    /// it names (`lobbytalk`, and the same lesson as
+    /// [`admit_table`](Self::admit_table)'s).
+    ///
+    /// This is the budget that was missing. The per-neighbour one bounds what
+    /// each *link* carries, and on a gossip mesh one author reaches this client
+    /// through as many neighbours as it has: a peer with twenty neighbours had
+    /// twenty budgets, all of them somebody else's. Nothing bounded what one
+    /// *speaker* could put in the pane.
+    pub fn admit_author_talk(&mut self, author: [u8; 32], now_ms: u64) -> bool {
+        prune(&mut self.per_author_talk, now_ms);
+        self.per_author_talk
+            .entry(author)
+            .or_default()
+            .admit(now_ms, MAX_TALK_PER_AUTHOR_PER_MIN)
+    }
+
+    /// `D-054`: whether this **author key** may say it is here again.
+    ///
+    /// One heartbeat per forty seconds is the protocol; four a minute is that
+    /// with room for a clock and a retry, and a peer announcing itself thirty
+    /// times a second is not announcing itself.
+    pub fn admit_author_presence(&mut self, author: [u8; 32], now_ms: u64) -> bool {
+        prune(&mut self.per_author_presence, now_ms);
+        self.per_author_presence
+            .entry(author)
+            .or_default()
+            .admit(now_ms, MAX_PRESENCE_PER_PEER_PER_MIN)
     }
 
     /// Whether this **table key** may advertise again.

@@ -11,6 +11,7 @@ pub mod lobbytalk;
 pub mod tabletalk;
 pub mod node;
 pub mod peerbook;
+pub mod plaintext;
 pub mod portmap;
 pub mod relay;
 pub mod run;

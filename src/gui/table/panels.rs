@@ -137,7 +137,18 @@ fn chat(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi) -> Option<Stri
                     for line in &view.chat {
                         let mut job = LayoutJob::default();
                         job.wrap.max_width = width - 14.0;
-                        job.append(&format!("{}:", line.who), 0.0, TextFormat::simple(style::font(13.0, Weight::Bold), style::PANEL_TEXT));
+                        // `D-054`: **the seat first, and in the window's own
+                        // hand.** It is what the signature decided; the name
+                        // after it is whatever the other client typed, drawn
+                        // muted so the two cannot be read as one. Written as a
+                        // single string -- *"{name} (seat {n})"* -- a seat
+                        // could call itself *Alice (seat 0)* and every line of
+                        // it read as another player's.
+                        job.append(&format!("seat {}", line.seat), 0.0, TextFormat::simple(style::font(13.0, Weight::Bold), style::PANEL_TEXT));
+                        if !line.who.is_empty() {
+                            job.append(&format!(" {}", line.who), 0.0, TextFormat::simple(style::font(13.0, Weight::Regular), style::PANEL_MUTED));
+                        }
+                        job.append(":", 0.0, TextFormat::simple(style::font(13.0, Weight::Bold), style::PANEL_TEXT));
                         // Untrusted display data, rendered as data.
                         job.append(&line.said, 6.0, TextFormat::simple(style::font(13.0, Weight::Regular), style::PANEL_TEXT_2));
                         ui.label(job);

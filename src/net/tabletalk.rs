@@ -26,6 +26,27 @@ pub use super::lobbytalk::{CLOCK_SLACK_MS, SAID_MAX};
 /// How often one seat may be heard: one line per this many milliseconds.
 pub const LINE_EVERY_MS: u64 = 2_000;
 
+/// `D-054`: how many of those a speaker may hold back and spend at once.
+///
+/// A hard one-per-two-seconds gate drops the second half of a real exchange --
+/// *nice hand* and then *wp* half a second later -- which is the shape of
+/// people talking and not of a flood. Three is what a person can type in a
+/// burst and is still three hundredths of what a flood is.
+pub const LINE_BURST: u32 = 3;
+
+/// `D-054`: over how long the byte budget below is counted.
+pub const CHAT_BYTES_MS: u64 = 60_000;
+
+/// `D-054`: how many bytes of chat one speaker may put on the carrier a
+/// minute.
+///
+/// Eight full-length lines. The line budget alone bounds the *count* and says
+/// nothing about the size, so a speaker inside it can still put thirty
+/// maximum-length lines a minute on a link that is carrying a hand; this is
+/// what makes chat unable to crowd the game out even while every line of it is
+/// legal. A person types a fraction of it.
+pub const CHAT_BYTES_MAX: u64 = 2_048;
+
 /// A line, once it has been checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Said {
@@ -44,27 +65,122 @@ pub enum NotHeard {
     NotASeat,
     /// A line said at another table.
     AnotherTable,
+    /// The **member that carried it** has put more on the carrier than a
+    /// speaker may (`D-054`). Charged before anything is read, against the key
+    /// the carrier itself reports, which nobody can claim to be.
+    TooMuchCarried,
     /// This seat has said too much, too fast.
     TooMuch,
     TooLong(&'static str),
+    /// `D-054`: the line or the name is not one line of printable text.
+    NotPlain(crate::net::plaintext::NotPlain),
     Stale,
 }
 
-/// One line per two seconds per seat, charged before the signature.
-#[derive(Debug, Clone, Default)]
-pub struct SeatLimiter {
-    last: BTreeMap<u8, u64>,
+/// `D-054`: how much noise a refusal is worth, for `D-051`'s meter.
+///
+/// A budget spent is one point: it is what an eager client looks like, and
+/// sixteen of them in a minute is still a flood. Everything else is a message
+/// no client of this build sends -- a forgery, another table's line, a stranger
+/// claiming a seat, text that is not text -- and is worth what any other bad
+/// message is worth.
+pub fn noise_points(why: NotHeard) -> u32 {
+    use crate::table::membership::{NOISE_BAD_FRAGMENT, NOISE_BAD_MESSAGE};
+    match why {
+        NotHeard::TooMuch | NotHeard::TooMuchCarried => NOISE_BAD_FRAGMENT,
+        // A clock that drifted is not an attack, and two minutes of slack is
+        // already generous; count it as the smallest thing there is.
+        NotHeard::Stale => NOISE_BAD_FRAGMENT,
+        _ => NOISE_BAD_MESSAGE,
+    }
 }
 
-impl SeatLimiter {
-    pub fn admit(&mut self, seat: u8, now_ms: u64) -> bool {
-        match self.last.get(&seat) {
-            Some(at) if now_ms.saturating_sub(*at) < LINE_EVERY_MS => false,
-            _ => {
-                self.last.insert(seat, now_ms);
-                true
-            }
+/// `D-054`: what one speaker may put on a carrier -- lines and bytes.
+///
+/// A token bucket for the lines, so a burst of a real exchange survives and a
+/// stream does not, and a rolling window for the bytes, because the count of
+/// lines says nothing about what they weigh.
+#[derive(Debug, Clone)]
+pub struct Budget {
+    tokens: u32,
+    at: u64,
+    bytes: std::collections::VecDeque<(u64, u64)>,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self { tokens: LINE_BURST, at: 0, bytes: std::collections::VecDeque::new() }
+    }
+}
+
+impl Budget {
+    /// Whether a line of `bytes` may be spent now, and spend it if so.
+    pub fn admit(&mut self, now_ms: u64, bytes: u64) -> bool {
+        if self.at == 0 {
+            self.at = now_ms;
         }
+        // The tokens earned since the last look, never more than the burst.
+        let earned = now_ms.saturating_sub(self.at) / LINE_EVERY_MS;
+        if earned > 0 {
+            self.tokens = (self.tokens as u64 + earned).min(u64::from(LINE_BURST)) as u32;
+            self.at += earned * LINE_EVERY_MS;
+        }
+        while self.bytes.front().is_some_and(|(at, _)| now_ms.saturating_sub(*at) >= CHAT_BYTES_MS) {
+            self.bytes.pop_front();
+        }
+        let carried: u64 = self.bytes.iter().map(|(_, n)| *n).sum();
+        if self.tokens == 0 || carried + bytes > CHAT_BYTES_MAX {
+            return false;
+        }
+        self.tokens -= 1;
+        self.bytes.push_back((now_ms, bytes));
+        true
+    }
+}
+
+/// `D-054`: the budgets of one table's chat, kept apart on purpose.
+///
+/// **By carrier** is charged first, against the member key the group itself
+/// reports for the bytes -- a fact about who sent them, which no sender can
+/// claim to be. **By seat** is charged only *after* the signature verifies,
+/// because until then the key in the envelope is a claim, and a claim that
+/// could spend a budget is a way to silence the player it names: one unsigned
+/// line every two seconds under Alice's key and Alice is mute at every table
+/// she sits at, with nothing in anybody's window to say why. `lobby.rs` had
+/// exactly this bug against table adverts and its fix is the same one.
+#[derive(Debug, Clone, Default)]
+pub struct Talk {
+    by_carrier: BTreeMap<[u8; 32], Budget>,
+    by_seat: BTreeMap<u8, Budget>,
+}
+
+/// `D-054`: what a line of this text will weigh on the wire, near enough for a
+/// sender to hold itself to the budget its receivers hold it to.
+///
+/// The envelope, the signature and the CBOR round it are a fixed cost the
+/// sender cannot see from here, so it is counted in: a sender that guessed low
+/// would send a line every receiver then refused, which is the one outcome this
+/// is for avoiding.
+pub fn line_weight(text: &str) -> u64 {
+    const ENVELOPE: u64 = 200;
+    ENVELOPE + text.len() as u64 + NAME_MAX as u64
+}
+
+impl Talk {
+    /// The carrier's own budget, charged before a byte is read.
+    pub fn carried(&mut self, carrier: &[u8; 32], now_ms: u64, bytes: u64) -> bool {
+        self.by_carrier.entry(*carrier).or_default().admit(now_ms, bytes)
+    }
+
+    /// The seat's budget, charged after the signature.
+    pub fn said(&mut self, seat: u8, now_ms: u64, bytes: u64) -> bool {
+        self.by_seat.entry(seat).or_default().admit(now_ms, bytes)
+    }
+
+    /// Forget a member that has left the group, so the map cannot grow beyond
+    /// the table.
+    pub fn forget(&mut self, carrier: &[u8; 32]) {
+        self.by_carrier.remove(carrier);
     }
 }
 
@@ -81,15 +197,20 @@ struct Body {
 }
 
 /// Cut a string to a byte cap without splitting a character.
+///
+/// `D-054`: and make it one line of printable text first, so what this client
+/// signs is what a receiver of this build accepts -- the two rules are one.
 fn clip(s: &str, cap: usize) -> String {
-    let mut out = s.trim().to_owned();
+    let mut out = crate::net::plaintext::to_plain_line(s);
     while out.len() > cap {
         out.pop();
     }
-    out
+    // A cut on a byte cap can leave a mark whose base has gone.
+    crate::net::plaintext::to_plain_line(&out)
 }
 
-/// The line as it will be said: trimmed and capped the way `say` caps it.
+/// The line as it will be said: cleaned, trimmed and capped the way `say` caps
+/// it.
 pub fn clip_line(text: &str) -> String {
     clip(text, SAID_MAX)
 }
@@ -110,6 +231,11 @@ pub fn say(
         text: clip(text, SAID_MAX),
         table_id: *table_id,
     };
+    // `D-054`: a line that cleans to nothing was never a line -- somebody
+    // pasted a page of newlines, or a stack of marks.
+    if body.text.is_empty() {
+        return Err("nothing to say");
+    }
     let body_bytes = to_canonical(&body).map_err(|_| "the body does not encode")?;
     if body_bytes.len() > LOBBY_CHAT_MAX {
         return Err("over the cap");
@@ -136,18 +262,27 @@ pub fn say(
 /// Take a line off the wire, for the table `table_id`, where `seat_of` says
 /// which seat a key holds.
 ///
-/// The seat's budget is charged before the signature is verified, which is
-/// the expensive part, and after the key has been placed in the roster --
-/// a stranger has no budget to spend.
+/// `carrier` is the member key the table's group reports for these bytes: a
+/// fact, not a claim. It is charged **before** anything is read, so a stream
+/// of rubbish costs its sender its own budget and this client nothing.
+///
+/// The **seat's** budget is charged only after the signature verifies. `D-054`:
+/// charging the key in the envelope before that let anybody silence any player
+/// at will -- the key is public, it is in the roster, and an unsigned line
+/// under it spent its owner's allowance before the forgery was noticed.
 pub fn receive(
     bytes: &[u8],
     table_id: &[u8; 32],
+    carrier: &[u8; 32],
     seat_of: impl Fn(&[u8; 32]) -> Option<u8>,
     now_ms: u64,
-    limits: &mut SeatLimiter,
+    limits: &mut Talk,
 ) -> Result<Said, NotHeard> {
     if bytes.len() > LOBBY_MSG_MAX {
         return Err(NotHeard::TooLong("the message is over the cap"));
+    }
+    if !limits.carried(carrier, now_ms, bytes.len() as u64) {
+        return Err(NotHeard::TooMuchCarried);
     }
     let signed: SignedEvent =
         from_canonical(bytes, LOBBY_MSG_MAX).map_err(|_| NotHeard::Malformed("not a signed event"))?;
@@ -163,10 +298,10 @@ pub fn receive(
     }
     let who = envelope.sender_public_key;
     let seat = seat_of(&who).ok_or(NotHeard::NotASeat)?;
-    if !limits.admit(seat, now_ms) {
+    verify(&who, &signed).map_err(|_| NotHeard::Forged)?;
+    if !limits.said(seat, now_ms, bytes.len() as u64) {
         return Err(NotHeard::TooMuch);
     }
-    verify(&who, &signed).map_err(|_| NotHeard::Forged)?;
 
     let body: Body = from_canonical(&envelope.payload, LOBBY_CHAT_MAX)
         .map_err(|_| NotHeard::Malformed("not a table line"))?;
@@ -179,8 +314,12 @@ pub fn receive(
     if body.text.len() > SAID_MAX {
         return Err(NotHeard::TooLong("the line is over its cap"));
     }
-    if body.text.trim().is_empty() {
-        return Err(NotHeard::Malformed("an empty line is not a message"));
+    // `D-054`: and it is one line of printable text, at both ends. This client
+    // cleans what its own player types before it signs it, so an honest line is
+    // already plain and nothing honest is refused here.
+    plain(&body.text).map_err(NotHeard::NotPlain)?;
+    if !body.nickname.is_empty() {
+        plain(&body.nickname).map_err(NotHeard::NotPlain)?;
     }
     Ok(Said {
         seat,
@@ -188,6 +327,10 @@ pub fn receive(
         nickname: body.nickname,
         text: body.text,
     })
+}
+
+fn plain(s: &str) -> Result<(), crate::net::plaintext::NotPlain> {
+    crate::net::plaintext::is_plain_line(s)
 }
 
 fn verify(who: &[u8; 32], signed: &SignedEvent) -> Result<(), ()> {
@@ -201,6 +344,7 @@ fn verify(who: &[u8; 32], signed: &SignedEvent) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::plaintext::NotPlain;
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -208,6 +352,9 @@ mod tests {
 
     const NOW: u64 = 1_700_000_000_000;
     const TABLE: [u8; 32] = [7u8; 32];
+    /// The member key the group reports for the bytes: a fact, not a claim.
+    const CARRIER: [u8; 32] = [21u8; 32];
+    const OTHER_CARRIER: [u8; 32] = [22u8; 32];
 
     /// Seat 2 is key 2, seat 5 is key 5, nobody else is seated.
     fn seat_of(k: &[u8; 32]) -> Option<u8> {
@@ -217,11 +364,15 @@ mod tests {
             .map(|(seat, _)| *seat)
     }
 
+    fn hear(bytes: &[u8], carrier: &[u8; 32], now: u64, talk: &mut Talk) -> Result<Said, NotHeard> {
+        receive(bytes, &TABLE, carrier, seat_of, now, talk)
+    }
+
     #[test]
     fn a_line_round_trips_under_its_seat() {
         let bytes = say(&key(2), &TABLE, "Bob", "nice hand", NOW).unwrap();
-        let mut limits = SeatLimiter::default();
-        let said = receive(&bytes, &TABLE, seat_of, NOW, &mut limits).unwrap();
+        let mut talk = Talk::default();
+        let said = hear(&bytes, &CARRIER, NOW, &mut talk).unwrap();
         assert_eq!(said.seat, 2);
         assert_eq!(said.who, key(2).verifying_key().to_bytes());
         assert_eq!(said.nickname, "Bob");
@@ -232,8 +383,8 @@ mod tests {
     #[test]
     fn a_stranger_is_not_heard() {
         let bytes = say(&key(9), &TABLE, "Bob", "let me in", NOW).unwrap();
-        let mut limits = SeatLimiter::default();
-        assert_eq!(receive(&bytes, &TABLE, seat_of, NOW, &mut limits), Err(NotHeard::NotASeat));
+        let mut talk = Talk::default();
+        assert_eq!(hear(&bytes, &CARRIER, NOW, &mut talk), Err(NotHeard::NotASeat));
     }
 
     /// A line said at one table is not a line at another, however the bytes
@@ -241,8 +392,8 @@ mod tests {
     #[test]
     fn a_line_from_another_table_is_dropped() {
         let bytes = say(&key(2), &[8u8; 32], "Bob", "wrong room", NOW).unwrap();
-        let mut limits = SeatLimiter::default();
-        assert_eq!(receive(&bytes, &TABLE, seat_of, NOW, &mut limits), Err(NotHeard::AnotherTable));
+        let mut talk = Talk::default();
+        assert_eq!(hear(&bytes, &CARRIER, NOW, &mut talk), Err(NotHeard::AnotherTable));
     }
 
     /// The signature covers the envelope, so a byte changed under it fails.
@@ -252,29 +403,102 @@ mod tests {
         let mut broken = bytes.clone();
         let at = broken.len() / 2;
         broken[at] ^= 0xff;
-        let mut limits = SeatLimiter::default();
-        assert!(receive(&broken, &TABLE, seat_of, NOW, &mut limits).is_err());
+        let mut talk = Talk::default();
+        assert!(hear(&broken, &CARRIER, NOW, &mut talk).is_err());
     }
 
-    /// One line per two seconds per seat; the other seat's budget is its own.
+    /// `D-054`: **a forgery must not spend the budget of the seat it names.**
+    ///
+    /// The key in the envelope is public and sits in every roster. Charging a
+    /// seat's allowance before the signature was checked -- which is what this
+    /// module did -- meant anybody who could put bytes in front of this client
+    /// could silence any player at the table: one unsigned line under Alice's
+    /// key every two seconds and Alice's own lines were dropped as *too much*,
+    /// with nothing in any window to say why. `lobby.rs` had the same bug
+    /// against table adverts, and the rule there is the rule here: a key that
+    /// has not been verified is a claim, and a claim spends nothing.
     #[test]
-    fn a_seat_is_heard_once_in_two_seconds() {
-        let mut limits = SeatLimiter::default();
-        let first = say(&key(2), &TABLE, "Bob", "one", NOW).unwrap();
-        let second = say(&key(2), &TABLE, "Bob", "two", NOW + 500).unwrap();
-        let other = say(&key(5), &TABLE, "Erin", "me too", NOW + 600).unwrap();
-        let third = say(&key(2), &TABLE, "Bob", "three", NOW + LINE_EVERY_MS).unwrap();
-        assert!(receive(&first, &TABLE, seat_of, NOW, &mut limits).is_ok());
-        assert_eq!(receive(&second, &TABLE, seat_of, NOW + 500, &mut limits), Err(NotHeard::TooMuch));
-        assert!(receive(&other, &TABLE, seat_of, NOW + 600, &mut limits).is_ok());
-        assert!(receive(&third, &TABLE, seat_of, NOW + LINE_EVERY_MS, &mut limits).is_ok());
+    fn a_forged_line_cannot_silence_the_seat_it_names() {
+        let mut talk = Talk::default();
+        let honest = say(&key(2), &TABLE, "Bob", "my own line", NOW).unwrap();
+        let mut forged = say(&key(2), &TABLE, "Bob", "not my line", NOW).unwrap();
+        let at = forged.len() - 1;
+        forged[at] ^= 0xff;
+        assert_eq!(
+            hear(&forged, &OTHER_CARRIER, NOW, &mut talk),
+            Err(NotHeard::Forged),
+            "the forgery is refused"
+        );
+        assert!(
+            hear(&honest, &CARRIER, NOW, &mut talk).is_ok(),
+            "and seat 2 still has everything it had"
+        );
+    }
+
+    /// The carrier's own budget is charged first, so a stream of rubbish costs
+    /// its sender and not this client: nothing of the message is read once it
+    /// is spent.
+    #[test]
+    fn the_carrier_pays_before_a_byte_is_read() {
+        let mut talk = Talk::default();
+        let junk = vec![0xffu8; 300];
+        let mut refused = 0;
+        for i in 0..10u64 {
+            if hear(&junk, &CARRIER, NOW + i, &mut talk) == Err(NotHeard::TooMuchCarried) {
+                refused += 1;
+            }
+        }
+        assert!(refused >= 6, "a burst and then nothing: {refused} of ten refused");
+        let bytes = say(&key(5), &TABLE, "Erin", "hello", NOW).unwrap();
+        assert!(
+            hear(&bytes, &OTHER_CARRIER, NOW, &mut talk).is_ok(),
+            "and another member's budget is its own"
+        );
+    }
+
+    /// A burst of a real exchange survives; a stream does not.
+    #[test]
+    fn a_seat_may_say_three_at_once_and_then_one_every_two_seconds() {
+        let mut talk = Talk::default();
+        for i in 0..u64::from(LINE_BURST) {
+            let bytes = say(&key(2), &TABLE, "Bob", &format!("line {i}"), NOW + i * 10).unwrap();
+            assert!(hear(&bytes, &CARRIER, NOW + i * 10, &mut talk).is_ok(), "burst line {i}");
+        }
+        let over = say(&key(2), &TABLE, "Bob", "one too many", NOW + 40).unwrap();
+        assert_eq!(hear(&over, &CARRIER, NOW + 40, &mut talk), Err(NotHeard::TooMuchCarried));
+        let later = say(&key(2), &TABLE, "Bob", "and now", NOW + LINE_EVERY_MS + 40).unwrap();
+        assert!(hear(&later, &CARRIER, NOW + LINE_EVERY_MS + 40, &mut talk).is_ok());
+    }
+
+    /// The count of lines says nothing about what they weigh, so the bytes are
+    /// counted too -- what keeps chat from crowding out a hand while every
+    /// line of it is legal.
+    #[test]
+    fn a_minute_of_chat_is_bounded_in_bytes() {
+        let mut budget = Budget::default();
+        let mut spent = 0u64;
+        let mut at = NOW;
+        // One line of chat every two seconds for just under the window: as
+        // fast as the line budget allows, so what stops it is the bytes.
+        for _ in 0..(CHAT_BYTES_MS / LINE_EVERY_MS - 1) {
+            if budget.admit(at, 400) {
+                spent += 400;
+            }
+            at += LINE_EVERY_MS;
+        }
+        assert!(spent <= CHAT_BYTES_MAX, "{spent} bytes in a minute");
+        assert!(spent >= CHAT_BYTES_MAX / 2, "and not so tight nobody can speak: {spent}");
+        assert!(
+            budget.admit(NOW + CHAT_BYTES_MS * 2, 400),
+            "a minute on, the window has rolled and there is room again"
+        );
     }
 
     #[test]
     fn a_stale_line_and_an_empty_one_are_refused() {
-        let mut limits = SeatLimiter::default();
+        let mut talk = Talk::default();
         let old = say(&key(2), &TABLE, "Bob", "from long ago", NOW - CLOCK_SLACK_MS * 2).unwrap();
-        assert_eq!(receive(&old, &TABLE, seat_of, NOW, &mut limits), Err(NotHeard::Stale));
+        assert_eq!(hear(&old, &CARRIER, NOW, &mut talk), Err(NotHeard::Stale));
         assert!(say(&key(2), &TABLE, "Bob", "   ", NOW).is_err());
     }
 
@@ -282,11 +506,93 @@ mod tests {
     /// is what arrives.
     #[test]
     fn a_long_line_is_cut_where_the_wire_cuts_it() {
-        let long = "🂡".repeat(200);
+        let long = "a".repeat(200);
         let bytes = say(&key(2), &TABLE, "Bob", &long, NOW).unwrap();
-        let mut limits = SeatLimiter::default();
-        let said = receive(&bytes, &TABLE, seat_of, NOW, &mut limits).unwrap();
+        let mut talk = Talk::default();
+        let said = hear(&bytes, &CARRIER, NOW, &mut talk).unwrap();
         assert!(said.text.len() <= SAID_MAX);
         assert_eq!(said.text, clip_line(&long));
+    }
+
+    /// `D-054`: a message is one line of printable text. What a rogue client
+    /// writes instead -- a screenful of newlines inside one message's budget, a
+    /// direction override, a stack of marks drawn over the window -- is refused
+    /// and counted, and what this client says is cleaned before it is signed so
+    /// nothing honest ever trips it.
+    #[test]
+    fn a_line_that_is_not_one_line_of_text_is_refused() {
+        for (raw, why) in [
+            ("one\ntwo", NotPlain::Control),
+            ("hello \u{202E}dlrow", NotPlain::Deceiving),
+            ("a\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}\u{0301}", NotPlain::Stacked),
+        ] {
+            let mut talk = Talk::default();
+            let bytes = forge_body(&key(2), "Bob", raw, &TABLE, NOW);
+            assert_eq!(
+                hear(&bytes, &CARRIER, NOW, &mut talk),
+                Err(NotHeard::NotPlain(why)),
+                "{raw:?}"
+            );
+            let mut talk = Talk::default();
+            let honest = say(&key(2), &TABLE, "Bob", raw, NOW).unwrap();
+            assert!(hear(&honest, &CARRIER, NOW, &mut talk).is_ok(), "cleaned: {raw:?}");
+        }
+        let mut talk = Talk::default();
+        let bytes = forge_body(&key(2), "Bob\nthe\nsecond", "hi", &TABLE, NOW);
+        assert_eq!(
+            hear(&bytes, &CARRIER, NOW, &mut talk),
+            Err(NotHeard::NotPlain(NotPlain::Control)),
+            "the name is text too, so a name cannot draw over the pane"
+        );
+    }
+
+    /// `D-054`: what a refusal is worth against `D-051`'s meter -- an eager
+    /// speaker is not a forger.
+    #[test]
+    fn a_spent_budget_is_the_smallest_noise_and_a_forgery_is_not() {
+        use crate::table::membership::{NOISE_BAD_FRAGMENT, NOISE_BAD_MESSAGE, NOISE_LIMIT};
+        assert_eq!(noise_points(NotHeard::TooMuch), NOISE_BAD_FRAGMENT);
+        assert_eq!(noise_points(NotHeard::TooMuchCarried), NOISE_BAD_FRAGMENT);
+        assert_eq!(noise_points(NotHeard::Stale), NOISE_BAD_FRAGMENT);
+        assert_eq!(noise_points(NotHeard::Forged), NOISE_BAD_MESSAGE);
+        assert_eq!(noise_points(NotHeard::NotASeat), NOISE_BAD_MESSAGE);
+        assert_eq!(noise_points(NotHeard::NotPlain(NotPlain::Control)), NOISE_BAD_MESSAGE);
+        // A client spending its chat budget over and over is cut off by the
+        // same measure as one filling the group with junk -- it just takes
+        // longer, which is the difference between eager and hostile.
+        assert!(NOISE_BAD_FRAGMENT * 16 >= NOISE_LIMIT);
+    }
+
+    /// A line whose body was written by a client that does not clean.
+    fn forge_body(
+        k: &SigningKey,
+        nickname: &str,
+        text: &str,
+        table_id: &[u8; 32],
+        now_ms: u64,
+    ) -> Vec<u8> {
+        let body = Body {
+            nickname: nickname.to_owned(),
+            text: text.to_owned(),
+            table_id: *table_id,
+        };
+        let body_bytes = to_canonical(&body).unwrap();
+        let envelope = EventBody::unchained(
+            EventType::TableChat,
+            k.verifying_key().to_bytes(),
+            body_bytes,
+            now_ms,
+        )
+        .unwrap();
+        let envelope_bytes = to_canonical(&envelope).unwrap();
+        let signature = {
+            use ed25519_dalek::Signer;
+            k.sign(&to_be_signed(&envelope_bytes))
+        };
+        to_canonical(&SignedEvent {
+            body: envelope_bytes,
+            signature: signature.to_bytes(),
+        })
+        .unwrap()
     }
 }

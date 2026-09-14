@@ -6637,6 +6637,18 @@ inputs to a state transition, and must reject control characters
 `U+2066`–`U+2069`.** These are the §9.4 rules, restated at the message rather than
 inherited, because chat is the one message class that is pure attacker-controlled
 UTF-8 reaching a UI and is therefore the field most likely to be attacked.
+D-054 adds the two bounds a character rule needs to be one: at most **four
+combining marks** on one base character, and at most **120 base characters** --
+a byte cap bounds neither the height a line is drawn at nor the number of
+glyphs in it. A sender cleans to exactly this rule before signing; a receiver
+refuses what is not already clean, on both string fields.
+
+**One author, one budget (D-054).** The per-neighbour budget above bounds what
+each *link* carries; on a gossip mesh one speaker reaches a receiver through
+every neighbour it has, so a receiver charges the **author key** as well --
+after the signature verifies, never before -- at 12 lines a minute for chat and
+4 for presence. A budget spent by a key that has not been verified is a way to
+silence the player that key names.
 
 Chat carries **no security claim of any kind**. It is authenticated as coming from
 an application key and nothing more; impersonation by display name is trivial and
@@ -6650,8 +6662,13 @@ player is.
 does.
 
 *Channel:* the table's own group (D-019), which is the closed set of its
-seats; the table's GossipSub topic only at a table that has no group. Never
-the lobby's chat topic: a line at a table is for the seats at it.
+seats, and **nothing else** (D-054). Not the table's GossipSub topic: that
+topic's name is derived from a `table_id` every advertisement carries, so any
+peer of the network may publish into it, and what it publishes is bytes on
+every seat's link that the group's own meter (D-051 §7.10) never sees. Never
+the lobby's chat topic: a line at a table is for the seats at it. A receiver
+that sees a `TABLE_CHAT` on any carrier but the group refuses it and does not
+forward it.
 *Signed by:* the sender's application key, which must hold a seat in the
 receiver's roster for the table the line names; a line from any other key is
 refused, and a line naming another table is dropped.
@@ -6663,11 +6680,36 @@ refused, and a line naming another table is dropped.
 | `n(1) text` | `bytes` | ≤ 256 B UTF-8, §9.4 string rules |
 | `n(2) table_id` | `bytes(32)` | the table the line is said at |
 
-Payload cap `LOBBY_CHAT_MAX = 2 048 B`, shared with §7.7. A receiver admits at
-most one line per two seconds per seat and ignores the rest without
-forwarding them. Everything §7.7 says of the two strings and of the absence
-of any security claim holds here unchanged. Muting a seat is the receiver's
-own affair -- it stops showing that seat's lines -- and is never on the wire.
+Payload cap `LOBBY_CHAT_MAX = 2 048 B`, shared with §7.7. Everything §7.7 says
+of the two strings and of the absence of any security claim holds here
+unchanged. Muting a seat is the receiver's own affair -- it stops showing that
+seat's lines -- and is never on the wire.
+
+**What a receiver allows (D-054).** Every rule below is the receiver's own and
+rests on what reached it, because the sender's client is the attacker's to
+write:
+
+1. **Two budgets, and the order of them is the rule.** The *carrier's* budget
+   is charged first, against the group member key the carrier itself reports
+   for the bytes -- a fact, not a claim -- and nothing of the message is read
+   until it is paid. The *seat's* budget is charged only **after** the
+   signature verifies. Charging the key inside the envelope before that is a
+   way to silence any player: the key is public and in every roster, so an
+   unsigned line under it every two seconds spends its owner's whole allowance.
+2. **What each budget is:** three lines held back and spent at once, then one
+   line per two seconds, and at most 2 048 B of chat a minute. The byte budget
+   is what keeps chat from crowding out a hand while every line of it is legal.
+3. **A line is one line of printable text**, and so is a display name: no
+   control character (a newline is a screenful of pane out of one line's
+   budget), none of the invisible characters that change the direction or
+   shape of what is around them, at most four combining marks on one base, and
+   at most 120 bases. A sender of this protocol cleans what it sends to exactly
+   this rule before it signs, so a refusal here is a client that did not.
+4. **A refusal is noise, and noise is D-051's business.** A spent budget counts
+   as one point against the member that carried it and anything else as four,
+   so a peer that spams is cut off from the group by the same measure, and by
+   the same joint certificate, as one that floods it -- and no single peer's
+   word is involved in either.
 
 ### 7.9 A seat's word that it sits out -- no message
 
