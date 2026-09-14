@@ -4602,13 +4602,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     NodeCommand::CreateTable { .. } | NodeCommand::JoinTable { .. }
                 );
                 // The new slot takes the command; the active one stays the window's
-                // until it turns there (`NodeCommand::Focus`).
-                let mut opened: Option<usize> = None;
-                if opening && tables[active].table.is_some() && tables.len() < MAX_TABLES {
+                // until it turns there (`NodeCommand::Focus`). `S1-FD`: a join for
+                // a table a slot already holds goes to that slot -- see
+                // `slot_for_command`.
+                let join_key = match &command {
+                    NodeCommand::JoinTable { key, .. } => Some(*key),
+                    _ => None,
+                };
+                let held: Vec<Option<[u8; 32]>> =
+                    tables.iter().map(|x| x.table.as_ref().map(|f| f.table_id())).collect();
+                let (which, open) = slot_for_command(opening, join_key, &held, active);
+                if open {
                     let sink = tables[0].tox_sink.share();
                     tables.push(TableRun::new(next_slot, &profile_dir, None, sink));
                     next_slot = next_slot.saturating_add(1);
-                    opened = Some(tables.len() - 1);
                     let _ = events
                         .send(NodeEvent::Warning(format!(
                             "another table: {} of {MAX_TABLES} slots open",
@@ -4616,7 +4623,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         )))
                         .await;
                 }
-                let which = opened.unwrap_or(active);
                 let mut close_slot = false;
                 let t = &mut tables[which];
                 mark_table(&events, &mut marked, t).await;
@@ -9249,6 +9255,36 @@ pub const TABLE_NAME_MAX: usize = 64;
 
 /// `D-043`: how many tables one client sits at, at most -- the owner's four.
 pub const MAX_TABLES: usize = 4;
+
+/// `D-043`, `S1-FD`: the slot a command goes to, and whether that slot is a new
+/// one to open, from the table each slot holds (its id, or `None`).
+///
+/// A table founded or joined while the active slot holds a table opens a new
+/// slot, up to `MAX_TABLES`; everything else goes to the active slot. **A join
+/// for a table a slot already holds goes to that slot, and never opens one**:
+/// that slot's own arm answers *already joining or seated*, the one-join-at-a-
+/// time guard this opening had put out of reach. The headless client asks again
+/// on every edge while it has no seat, and a restarted one asked three times:
+/// the third opened a second slot for the same table, which was not resuming,
+/// read the founder's lobby answer as a withdrawal, went back to the lobby and
+/// forgot the session record the first slot was playing from (`run164414-2`).
+fn slot_for_command(
+    opening: bool,
+    join_key: Option<[u8; 32]>,
+    held: &[Option<[u8; 32]>],
+    active: usize,
+) -> (usize, bool) {
+    if let Some(key) = join_key {
+        if let Some(slot) = held.iter().position(|h| *h == Some(key)) {
+            return (slot, false);
+        }
+    }
+    let active_holds = held.get(active).is_some_and(|h| h.is_some());
+    if opening && active_holds && held.len() < MAX_TABLES {
+        return (held.len(), true);
+    }
+    (active, false)
+}
 
 /// `D-042`: how long after a tournament's end its group is left. Two
 /// rounds of the five-second resend loop, so a seat that missed the terminal
@@ -13897,5 +13933,37 @@ mod the_boundary_window_at_the_wire {
             ),
             WindowPosition::NotTheSeatsSlot
         );
+    }
+}
+
+#[cfg(test)]
+mod a_join_finds_its_slot {
+    use super::*;
+
+    const A: [u8; 32] = [1u8; 32];
+    const B: [u8; 32] = [2u8; 32];
+
+    /// `S1-FD`: the restarted client's third ask, for the table its first slot
+    /// already holds, goes to that slot and opens none. The rule before it
+    /// answered `(1, true)`: a second slot for the same table.
+    #[test]
+    fn a_join_for_a_table_a_slot_holds_goes_to_that_slot() {
+        assert_eq!(slot_for_command(true, Some(A), &[Some(A)], 0), (0, false));
+        assert_eq!(
+            slot_for_command(true, Some(A), &[Some(B), Some(A)], 0),
+            (1, false),
+            "and to the slot that holds it, when that is not the active one"
+        );
+    }
+
+    /// `D-043` as it was for every other command.
+    #[test]
+    fn another_table_still_opens_a_slot_up_to_the_limit() {
+        assert_eq!(slot_for_command(true, Some(B), &[Some(A)], 0), (1, true), "a join elsewhere");
+        assert_eq!(slot_for_command(true, None, &[Some(A)], 0), (1, true), "a table founded");
+        assert_eq!(slot_for_command(true, Some(B), &[None], 0), (0, false), "an idle active slot takes it");
+        let full = [Some(A), Some([3u8; 32]), Some([4u8; 32]), Some([5u8; 32])];
+        assert_eq!(slot_for_command(true, Some(B), &full, 2), (2, false), "no fifth slot");
+        assert_eq!(slot_for_command(false, None, &[Some(A), Some(B)], 1), (1, false), "the rest go to the active slot");
     }
 }
