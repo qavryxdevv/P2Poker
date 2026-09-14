@@ -1097,6 +1097,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     stall.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // `D-049`: the group's word on sitting out, looked at four times a second.
     let mut away_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    /// `D-055`: how often the lobby's held rows are re-derived from the tables
+    /// this client is actually at.
+    ///
+    /// Five seconds, and the two ends of the choice are both cheap: the set is
+    /// read only when the window is full or being swept, so a hold a few
+    /// seconds stale costs one row of a 512-row window for a moment -- while a
+    /// hold that is minutes stale is the ghost this rule exists to prevent.
+    /// Building it is a handful of keys out of at most four tables, so at a
+    /// fifth of a hertz it does not appear in a profile at all.
+    const HOLD_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+    let mut hold_checked = tokio::time::Instant::now() - HOLD_EVERY;
     away_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut resend = tokio::time::interval(std::time::Duration::from_secs(5));
     resend.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2257,11 +2268,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
             }
             $t.table = None;
-            // `D-055`: the player has left, so that row goes back into the
-            // window's rotation like any other.
-            if let Some(k) = $t.joined_key.take() {
-                state.lobby.unpin(&k);
-            }
             leave_the_table!($t);
             dht_effort(&mut swarm, false);
             // `S1-CR`: a seat that leaves by its own choice has no session to come back to.
@@ -4909,12 +4915,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         t.joined_key = Some(key);
                         t.joined_ad = Some(held.ad.clone());
                         t.joined_advert_hash = Some(held.advert_hash);
-                        // `D-055`: this player is sitting down there, so that
-                        // row is theirs: the window's bound never displaces it
-                        // and no expiry sweep takes it. A table that fills stops
-                        // advertising, so without this the row under the player
-                        // is the first one to go.
-                        state.lobby.pin(key);
                         // The founder's PeerId comes from the advert, which was
                         // signed by the table key. Dialling anything else would
                         // be taking routing advice from whoever spoke last.
@@ -5988,6 +5988,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // is read here; whether the seat is on the line stays the stall
             // tick's, and a seat off the line is never said to sit out.
             _ = away_tick.tick() => {
+                // `D-055`, **the owner's rule**: a lobby row is held only while
+                // it is actively true that this client plays at that table. So
+                // the held set is **derived** from the live tables rather than
+                // set by one event and cleared by another: an event can be
+                // missed -- a join that is refused, a table that dissolves down
+                // a path nobody thought of -- and a hold that outlives its
+                // table is a row nothing in the lobby can ever shift again, a
+                // ghost until the client is restarted. Derived, there is no
+                // path to get wrong.
+                //
+                // **Not on every tick of this loop**, which runs four times a
+                // second for the clocks: the held set is read only when the
+                // window is full or swept, and a hold that is a few seconds
+                // stale merely keeps a row a moment longer. `HOLD_EVERY` is
+                // the interval, and the check that skips it is one comparison.
+                if hold_checked.elapsed() >= HOLD_EVERY {
+                    hold_checked = tokio::time::Instant::now();
+                    state.lobby.hold_only(
+                        tables
+                            .iter()
+                            .filter_map(|t| t.table.as_ref())
+                            .filter(|f| f.my_seat().is_some())
+                            .map(|f| f.table_id()),
+                    );
+                }
                 // fault-harness, `D-054`: `P2P_POKER_CHAT_SPAM_AT=<s>` and
                 // `P2P_POKER_CHAT_SPAM_RATE=<n>`: from that second of this
                 // client's life it says n lines a second at every table it

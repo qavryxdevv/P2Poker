@@ -679,18 +679,29 @@ impl LobbyStore {
         Self::default()
     }
 
-    /// `D-055`: this client sat down at that table; hold its row.
-    pub fn pin(&mut self, table_key: [u8; 32]) {
-        self.pinned.insert(table_key);
+    /// `D-055`: the tables this client is at **right now** -- the whole set,
+    /// replacing whatever was held before.
+    ///
+    /// **The owner's rule**: a row may be held only while it is actively true
+    /// that this client plays at that table. So the caller re-derives the set
+    /// from the tables it holds, at its own interval, and this replaces it
+    /// wholesale. There is deliberately no *add one* and no *remove one*: a
+    /// pair of events can be missed -- a join that is refused, a table that
+    /// dissolves down a path nobody wrote down -- and a hold that outlives its
+    /// table is a row nothing in the lobby can ever shift again, a ghost for as
+    /// long as the client runs.
+    pub fn hold_only(&mut self, at: impl IntoIterator<Item = [u8; 32]>) {
+        self.pinned = at.into_iter().collect();
     }
 
-    /// `D-055`: and it has left, so the row is an ordinary one again.
-    pub fn unpin(&mut self, table_key: &[u8; 32]) {
-        self.pinned.remove(table_key);
+    /// `D-055`, for a test: hold this one row and no other.
+    #[cfg(test)]
+    pub fn hold(&mut self, table_key: [u8; 32]) {
+        self.hold_only([table_key]);
     }
 
     /// Whether the window is holding this row against its bound.
-    pub fn is_pinned(&self, table_key: &[u8; 32]) -> bool {
+    pub fn is_held(&self, table_key: &[u8; 32]) -> bool {
         self.pinned.contains(table_key)
     }
 
@@ -2114,7 +2125,7 @@ mod tests {
             assert!(offer(&mut store, n, at).is_ok(), "row {n}");
             at += 1;
         }
-        store.pin(key(0));
+        store.hold(key(0));
         assert_eq!(store.tables().count(), MAX_TRACKED_TABLES);
 
         // Every new table displaces the row that has been shown longest -- and
@@ -2138,7 +2149,7 @@ mod tests {
         assert!(store.get(&key(MAX_TRACKED_TABLES + 49)).is_none(), "and everything else expired");
 
         // Once the player leaves, the row is ordinary again.
-        store.unpin(&key(0));
+        store.hold_only([]);
         store.expire(much_later);
         assert!(store.get(&key(0)).is_none());
     }

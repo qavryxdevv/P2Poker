@@ -4647,9 +4647,18 @@ The same formula holds for presence on the chat topic, with `P` players in place
   re-advertises briskly holds its slot for ever, so at a network bigger than the window the first few hundred tables
   heard were the only ones a player ever saw. The row that has been **shown longest** goes instead, so the window is
   a moving sample of the network.
-- **Except the table this client is at**, which is pinned (the owner's exception): never displaced, and never taken
-  by an expiry sweep. This matters more than it sounds -- a table that fills **stops advertising**, so the row under
-  the player was the first one the sweep would have taken.
+- **Except the table this client is at**, which is held (the owner's exception): never displaced, and never taken by
+  an expiry sweep. This matters more than it sounds -- a table that fills **stops advertising**, so the row under the
+  player was the first one the sweep would have taken.
+- **And a row is held only while it is actively true that this client plays there** (the owner's second rule, which
+  changed the design). The first build held a row on a *join* and released it on a *leave*, which is a pair of events
+  -- and an event can be missed: a join that is refused never becomes a table and never leaves one, so its hold would
+  have outlived it and left a row nothing in the lobby could ever shift again, a ghost for as long as the client ran.
+  The held set is therefore **derived**: every `HOLD_EVERY` (five seconds) the node replaces it wholesale with the
+  tables it is at and holds a seat in. There is no *add one* and no *remove one* to get wrong, a hold cannot outlive
+  its table by more than those five seconds, and the cost is a handful of keys out of at most four tables at a fifth
+  of a hertz -- the 250 ms loop skips it on a single comparison, because the set is read only when the window is full
+  or being swept and a hold a few seconds stale costs one row of 512 for a moment.
 
 ### 5. The score, which is what isolates a flooder
 
