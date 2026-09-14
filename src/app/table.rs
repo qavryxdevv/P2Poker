@@ -1102,4 +1102,55 @@ mod tests {
         assert_eq!(s.seated.as_ref().map(|x| x.key), Some([9u8; 32]), "leaving the first did not touch the second");
         assert_eq!(s.slots().len(), 1, "the first table is gone from the list");
     }
+    /// `S1-FA`: a seat the table removed keeps its chips on the felt, and they
+    /// must not be counted as a living opponent.
+    ///
+    /// Found in the owner's own game, 2026-09-14 (`table 486376d1`, hand #57).
+    /// Seat 0's connection dropped, the table certified it out and went on
+    /// heads-up between seats 1 and 2; seat 2 then busted. The node asked the
+    /// engine over the **roster**, correctly found no hand #58 and left the
+    /// table's group ten seconds later. The window asked a different question
+    /// -- how many seats anywhere hold chips -- counted the removed seat's
+    /// 10 600 among them, decided two players were still in and said nothing.
+    /// So the winner was never told they had won: the felt showed *Hand over*
+    /// until the group went, and *Line down: nobody at the table can be
+    /// reached* afterwards, about a line this client had hung up itself.
+    ///
+    /// The same miscount put the loser one place too low: busting heads-up at
+    /// that table was announced as **third**.
+    #[test]
+    fn a_removed_seats_chips_do_not_keep_the_tournament_open() {
+        use crate::net::node::PotEnd;
+        // Three sat down; the table certified seat 0 out, so hands are dealt
+        // between 1 and 2 while seat 0's chips stay where they were.
+        let mut s = seated(1);
+        s.apply(NodeEvent::HandBegan { hand_id: 57, button: 1, dealt_in: vec![1, 2], small_blind: 1_600, big_blind: 3_200 });
+        s.apply(NodeEvent::TableState { hand_id: 57, street: 0, pot: 0, to_act: None, stacks: vec![10_600, 17_200, 2_200], bets: vec![0; 3], folded: vec![false; 3] });
+        s.apply(NodeEvent::HandEnded {
+            hand_id: 57,
+            stacks: vec![10_600, 19_400, 0],
+            shown: vec![None; 3],
+            pots: vec![PotEnd { size: 4_400, winners: vec![1] }],
+            gained: vec![0, 2_200, 0],
+        });
+
+        let v = s.table_view();
+        let finish = v.finished.expect("the tournament ended and the window was told");
+        assert_eq!(finish.place, 1, "the last seat of the roster holding chips has won it");
+        assert_eq!(finish.players_left, 1, "and the removed seat is not a player left in it");
+        assert!(
+            s.log.iter().any(|n| n.contains("won the tournament")),
+            "the winner is congratulated: {:?}",
+            s.log
+        );
+        // And the line is not reported down: this client's own group goes ten
+        // seconds after the last hand, by `D-042`, which is not a fault.
+        assert_eq!(v.unsafe_note, None);
+        assert!(
+            !v.note.as_deref().unwrap_or("").contains("line may be down"),
+            "a tournament that ended is not a network that failed: {:?}",
+            v.note
+        );
+    }
+
 }

@@ -1655,7 +1655,19 @@ impl AppState {
         if mine == 0 || !h.dealt_in.contains(&me) {
             return;
         }
-        let alive = h.stacks.iter().filter(|s| **s > 0).count();
+        // `S1-FA`: the seats still **in the game**, which is the hand's own
+        // roster and not every seat that ever sat here. A seat the table
+        // removed -- certified out by `D-036`'s timeout, or out for good by
+        // `D-047` -- keeps its chips on the felt, and counting those chips as a
+        // living opponent is what left a winner uncongratulated: at a table of
+        // three where one had been certified out, the last seat with chips saw
+        // `alive == 2`, decided the tournament was still running, and said
+        // nothing -- while the node, asking the engine over the roster, had
+        // already ended it and left the group. The window then showed *Hand
+        // over* until the group went and *Line down* after it, which is the
+        // shape the owner reported. It also mis-counts a loser's place: busting
+        // heads-up at that table was announced as third.
+        let alive = h.dealt_in.iter().filter(|n| end(**n) > 0).count();
         let place = if end(me) > 0 {
             // Still holding chips: finished only as the last seat that does,
             // at the end of a hand more than one seat played.
@@ -1952,6 +1964,14 @@ impl AppState {
             ));
         }
         if seated.session.is_none() || !self.ever_on_line || self.opponent_left {
+            return None;
+        }
+        // `S1-FA`: and never once the game is over. The table's group is left
+        // by **this client itself** ten seconds after the last hand (`D-042`),
+        // so of course nobody is reachable in it -- saying *the line may be
+        // down* about a line this client hung up is telling the player their
+        // network failed when their tournament finished.
+        if self.finished.is_some() {
             return None;
         }
         let me = seated.seat?;
