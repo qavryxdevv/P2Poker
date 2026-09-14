@@ -122,6 +122,47 @@ impl SeatAct {
     }
 }
 
+/// `D-052`: what a seat won when the hand ended, for the badge that blinks at
+/// its box.
+///
+/// **The owner, 2026-09-14**: *the winner of the pot at a showdown, or of the
+/// hand when everybody else folded, must blink `Winner` at its seat as
+/// PokerTH does -- and it must be clear what was won: the hand, the main pot,
+/// a side pot, or a split.* So a hand that settled into one pot says only
+/// **Winner**, which is PokerTH's word and the whole truth there; where the
+/// settlement built side pots the word names the pot instead, because at such
+/// a table *winner* alone does not say which chips went where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Win {
+    /// The hand settled into a single pot, so there is no pot to name.
+    pub one_pot: bool,
+    /// This seat took the main pot -- the settlement's first.
+    pub main: bool,
+    /// This seat took at least one side pot.
+    pub side: bool,
+    /// It shared one of the pots it took with another seat.
+    pub split: bool,
+}
+
+impl Win {
+    /// The badge's word.
+    pub fn word(self) -> &'static str {
+        match (self.one_pot, self.main, self.side, self.split) {
+            (true, _, _, true) => "Split pot",
+            (true, _, _, false) => "Winner",
+            (_, true, true, _) => "Main + side",
+            (_, true, false, true) => "Split main",
+            (_, true, false, false) => "Main pot",
+            (_, false, true, true) => "Split side",
+            (_, false, true, false) => "Side pot",
+            // A winner the settlement named no pot for -- an abort's restored
+            // stacks, a hand the window heard the end of and not the pots.
+            (_, false, false, true) => "Split pot",
+            (_, false, false, false) => "Winner",
+        }
+    }
+}
+
 /// The colour role of a line of the table's log, as PokerTH's history colours
 /// them (`chatcolors.h`): the ordinary line, the hand's header, a street and a
 /// seat sitting out, the pot's winner, the game's winner.
@@ -158,6 +199,9 @@ pub struct SeatView {
     /// What this seat gained at the settlement (`S1-CS`): the chips that
     /// fly from the pot to it.
     pub won: Chips,
+    /// `D-052`: what it won, for the word its badge blinks. `None` for every
+    /// seat that won nothing.
+    pub win: Option<Win>,
     /// `S1-CS`: this player does not hear the seat.
     pub muted: bool,
     /// `D-035`: the seat's client left the table's group; drawn dim, with
@@ -1007,10 +1051,12 @@ fn seat_box(
     }
 
     // The badge and the clock: over the cards for an opponent, in the strip
-    // above the box for the hero.
+    // above the box for the hero. `D-052`: a winner's seat says its own word in
+    // the pill above its box instead, and the action it last took is stale the
+    // moment the hand is settled, so that is not drawn over it.
     let changed_at = badge_changed(state, seat.seat, seat.act, now);
     let pop = pop_scale(now - changed_at);
-    if sits_out && !winner {
+    if sits_out {
         let at = if hero {
             pos2(rect.right() - 36.0 * s, rect.top() - 6.0 * s - 9.0 * s)
         } else {
@@ -1026,7 +1072,7 @@ fn seat_box(
             cards_area.center()
         };
         style::action_badge(p, at, act, s, pop);
-    } else if at_turn && !winner {
+    } else if at_turn {
         let left = seat.clock.unwrap_or(0.0);
         let bar = if hero {
             Rect::from_center_size(pos2(rect.center().x, rect.top() - 6.0 * s - 9.0 * s), vec2(56.0, 7.0) * s)
@@ -1053,7 +1099,8 @@ fn seat_box(
         style::bet_chip(p, label, seat.bet);
     }
     if winner && blink_on {
-        style::winner(p, rect, s);
+        // `D-052`: the word this seat won by -- which pot, and whether shared.
+        style::winner(p, rect, seat.win.unwrap_or_default().word(), s);
     }
 
     // A right-click on another seat: mute it or hear it again (local), and

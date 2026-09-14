@@ -296,17 +296,25 @@ pub fn winner_glow(p: &Painter, rect: Rect, s: f32) {
     halo(p, rect, 6.0 * s, 11.0 * s, faded(GOLD, 0.75));
 }
 
-/// `PlayerWinnerOverlay`: the gold frame and the *WINNER* badge above the box.
-pub fn winner(p: &Painter, rect: Rect, s: f32) {
+/// `PlayerWinnerOverlay`: the gold frame and the winner's badge above the box.
+///
+/// `D-052`: the badge carries the winner's own word -- *Winner* where the hand
+/// settled into one pot, and *Main pot*, *Side pot*, *Split pot* … where it did
+/// not -- so a table with side pots says which chips moved. **One** label, in
+/// one place for every seat, hero or opponent, blinking with the frame the way
+/// PokerTH's does: a second mark elsewhere would say the same thing twice and,
+/// at the hero's own seat, land under its bet chip.
+pub fn winner(p: &Painter, rect: Rect, word: &str, s: f32) {
     let r = 6.0 * s;
     p.rect_stroke(rect, radius(r), Stroke::new(3.0 * s, GOLD), StrokeKind::Inside);
-    let size = 9.0 * s.max(0.9);
-    let w = text_width(p, "WINNER", size, Weight::Bold) + 12.0 * s;
-    let h = 16.0 * s;
+    let size = 10.0 * s.max(0.9);
+    let w = text_width(p, word, size, Weight::Bold) + 14.0 * s;
+    let h = 18.0 * s;
     let badge = Rect::from_center_size(pos2(rect.center().x, rect.top() - 6.0 * s - h / 2.0), vec2(w, h));
+    glow(p, badge, h / 2.0, 8.0, faded(GOLD, 0.45));
     p.rect_filled(badge, radius(h / 2.0), WINNER_BADGE);
     p.rect_stroke(badge, radius(h / 2.0), Stroke::new(1.0, GOLD), StrokeKind::Inside);
-    text(p, badge.center(), Align2::CENTER_CENTER, "WINNER", size, Weight::Bold, GOLD);
+    text(p, badge.center(), Align2::CENTER_CENTER, word, size, Weight::Bold, GOLD);
 }
 
 /// The colours of a seat's action badge: fill, edge, text, edge width.
@@ -351,6 +359,21 @@ pub fn sit_out_badge(p: &Painter, at: Pos2, s: f32) -> Rect {
     p.rect_filled(rect, radius(h / 2.0), rgba(0x1E1E1E, 235));
     p.rect_stroke(rect, radius(h / 2.0), Stroke::new(1.0, rgb(0x9E9E9E)), StrokeKind::Inside);
     text(p, rect.center(), Align2::CENTER_CENTER, word, size, Weight::Bold, rgb(0xD6D6D6));
+    rect
+}
+
+/// `D-052`: the winner's word at its seat, in the table's gold -- PokerTH puts
+/// *Winner* there and this says which pot where the hand had more than one.
+/// Drawn only while the blink is on, so it flashes and then stays.
+pub fn winner_badge(p: &Painter, at: Pos2, word: &str, s: f32, pop: f32) -> Rect {
+    let size = 12.0 * s * pop;
+    let w = text_width(p, word, size, Weight::Bold) + 16.0 * s;
+    let h = 19.0 * s * pop;
+    let rect = Rect::from_center_size(at, vec2(w, h));
+    glow(p, rect, h / 2.0, 10.0, faded(GOLD, 0.5));
+    p.rect_filled(rect, radius(h / 2.0), rgba(0x0D3D0D, 240));
+    p.rect_stroke(rect, radius(h / 2.0), Stroke::new(1.0, GOLD), StrokeKind::Inside);
+    text(p, rect.center(), Align2::CENTER_CENTER, word, size, Weight::Bold, GOLD);
     rect
 }
 

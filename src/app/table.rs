@@ -12,10 +12,44 @@
 //! [`Facing::up`] with a verdict, and the verdict is that the card was opened
 //! here from a complete set of verified shares.
 
-use crate::gui::table::{Facing, Link, SeatView, TableChatLine, TableView};
+use crate::gui::table::{Facing, Link, SeatView, TableChatLine, TableView, Win};
 use crate::poker::strength::{category_name, Horizon};
 
 use super::{AppState, HandInProgress};
+
+/// `D-052`: what this seat won of a hand that has ended, or `None`.
+///
+/// Read from the settlement's own pots -- the first is the main pot, each one
+/// after it a side pot, and a pot with more than one winner was split. A hand
+/// that ended with no pots named (an abort restores every stack, and a window
+/// that heard only the end has nothing) falls back to the chips that moved,
+/// which is what the badge said before there were pots to name.
+fn win_at(h: &HandInProgress, seat: u8) -> Option<Win> {
+    if !h.over {
+        return None;
+    }
+    let mut win = Win {
+        one_pot: h.pots.len() <= 1,
+        ..Win::default()
+    };
+    for (i, pot) in h.pots.iter().enumerate() {
+        if !pot.winners.contains(&seat) {
+            continue;
+        }
+        if i == 0 {
+            win.main = true;
+        } else {
+            win.side = true;
+        }
+        win.split |= pot.winners.len() > 1;
+    }
+    if win.main || win.side {
+        return Some(win);
+    }
+    // No pot names this seat: it won only if chips moved to it.
+    let moved = h.won.get(usize::from(seat)).copied().unwrap_or(0) > 0;
+    moved.then_some(Win { one_pot: true, ..Win::default() })
+}
 
 impl AppState {
     /// The table, as the window should draw it now.
@@ -66,6 +100,8 @@ impl AppState {
                         )
                     }),
                     won: hand.and_then(|h| h.won.get(i).copied()).unwrap_or(0),
+                    // `D-052`: and which pot it was, for the word that blinks.
+                    win: hand.and_then(|h| win_at(h, *n)),
                     muted: self.muted.contains(n),
                     left: self.gone.contains(n),
                     link: self.links.get(n).map(|(rtt, group, quiet, at)| Link {
@@ -456,7 +492,7 @@ mod tests {
         assert_eq!(stacks(&s.table_view()), vec![1_000, 1_000, 1_000]);
         s.apply(state(1, 0, 150, Some(0), &[1_000, 950, 900], &[0, 50, 100], &[false; 3]));
         assert_eq!(stacks(&s.table_view()), vec![1_000, 950, 900], "the engine's figures");
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_150, 950, 900], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_150, 950, 900], shown: vec![None; 3], pots: Vec::new() });
         assert_eq!(stacks(&s.table_view()), vec![1_150, 950, 900], "the settlement's");
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert_eq!(stacks(&s.table_view()), vec![1_150, 950, 900], "and they carry into the next hand");
@@ -489,7 +525,7 @@ mod tests {
         let v = s.table_view();
         assert!(v.seats[2].folded && !v.seats[1].folded);
         assert_eq!(v.street, "flop");
-        s.apply(NodeEvent::HandEnded { hand_id: 3, stacks: vec![900, 1_200, 900], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 3, stacks: vec![900, 1_200, 900], shown: vec![None; 3], pots: Vec::new() });
         let v = s.table_view();
         assert!(v.hand_over);
         assert_eq!(v.seats.iter().map(|x| x.won).collect::<Vec<_>>(), vec![0, 300, 0]);
@@ -527,6 +563,7 @@ mod tests {
                 Some([idx(Rank::Seven, Suit::Clubs), idx(Rank::Eight, Suit::Clubs)]),
                 None,
             ],
+            pots: Vec::new(),
         });
         let v = s.table_view();
         let named = v.seats[0].shown_hand.clone().expect("seat 0 showed, so its hand is named");
@@ -555,7 +592,7 @@ mod tests {
     fn a_hand_ended_without_a_settlement_shows_the_stacks_it_started_with() {
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_100, 900, 1_000], shown: vec![None, None, None] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_100, 900, 1_000], shown: vec![None, None, None], pots: Vec::new() });
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::TableState {
             hand_id: 2,
@@ -568,7 +605,7 @@ mod tests {
         });
         assert_eq!(s.table_view().seats.iter().map(|x| x.stack).collect::<Vec<_>>(), vec![1_100, 850, 900]);
         // The deadline ends it: no settlement, no stacks reported.
-        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![], shown: vec![None, None, None] });
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![], shown: vec![None, None, None], pots: Vec::new() });
         let v = s.table_view();
         assert!(v.hand_over);
         assert_eq!(v.seats.iter().map(|x| x.stack).collect::<Vec<_>>(), vec![1_100, 900, 1_000], "the stacks the hand started with");
@@ -701,7 +738,7 @@ mod tests {
         assert!(s.table_view().note.unwrap().contains("waiting for seat 2"));
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert!(s.table_view().note.unwrap().contains("preparing the deck"));
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new() });
         assert!(s.table_view().note.unwrap().contains("is over"));
     }
 
@@ -721,7 +758,7 @@ mod tests {
         let clocks: Vec<Option<f32>> = v.seats.iter().map(|x| x.clock).collect();
         assert!(clocks[2].is_some_and(|c| c > 0.95), "{clocks:?}");
         assert!(clocks[0].is_none() && clocks[1].is_none(), "{clocks:?}");
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new() });
         assert!(s.table_view().seats.iter().all(|x| x.clock.is_none()), "no clock once the hand is over");
     }
 
@@ -768,29 +805,29 @@ mod tests {
     fn a_busted_player_is_told_the_place() {
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![600, 1_400, 1_000], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![600, 1_400, 1_000], shown: vec![None; 3], pots: Vec::new() });
         assert_eq!(s.table_view().finished, None, "still in");
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         // Seat 0 (600) and seat 2 (1 000) both lose everything to seat 1.
-        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3], pots: Vec::new() });
         let b = s.table_view().finished.expect("the window says the place");
         assert_eq!((b.place, b.players_left), (3, 1), "seat 2 began with more and finishes second");
         assert!(b.show_in_ms > 9_000, "the deciding hand is looked at first: {} ms", b.show_in_ms);
         assert!(s.table_log.iter().any(|l| l.text.contains("finished in 3rd place")));
         // Said once.
-        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3], pots: Vec::new() });
         assert_eq!(s.table_log.iter().filter(|l| l.text.contains("finished in")).count(), 1);
 
         // A hand ended without a settlement busts nobody.
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![], shown: vec![] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![], shown: vec![], pots: Vec::new() });
         assert_eq!(s.table_view().finished, None);
 
         // Out while two others play on: fourth of four, two still in... of three, third.
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 1_900, 1_100], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 1_900, 1_100], shown: vec![None; 3], pots: Vec::new() });
         let b = s.table_view().finished.expect("out");
         assert_eq!((b.place, b.players_left), (3, 2));
     }
@@ -801,10 +838,10 @@ mod tests {
     fn the_winner_is_congratulated() {
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![2_000, 1_000, 0], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![2_000, 1_000, 0], shown: vec![None; 3], pots: Vec::new() });
         assert_eq!(s.table_view().finished, None, "two still hold chips: nobody has won yet");
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![3_000, 0, 0], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![3_000, 0, 0], shown: vec![None; 3], pots: Vec::new() });
         let f = s.table_view().finished.expect("the winner is told");
         assert_eq!((f.place, f.players_left), (1, 1));
         assert!(f.show_in_ms > 9_000, "ten seconds to look at the winning hand: {} ms", f.show_in_ms);
@@ -812,7 +849,7 @@ mod tests {
         // Holding chips while another seat still does is not a win.
         let mut s = seated(1);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 2_500, 500], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 2_500, 500], shown: vec![None; 3], pots: Vec::new() });
         assert_eq!(s.table_view().finished, None);
     }
 
@@ -831,6 +868,71 @@ mod tests {
         s.apply(NodeEvent::ShowdownChoice { hand_id: 3, open_ms: Some(7_000) });
         s.apply(NodeEvent::HandBegan { hand_id: 4, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         assert_eq!(s.table_view().show_cards_in_ms, None, "a new hand waits for nothing of the last");
+    }
+
+    /// `D-052`: the winner's badge says which pot it won. One pot is
+    /// PokerTH's bare *Winner*; with side pots the word names the pot, and a
+    /// pot with two winners is a split. Nobody who won nothing has a word.
+    #[test]
+    fn the_winner_of_each_pot_is_named_at_its_seat() {
+        use crate::net::node::PotEnd;
+        let word = |s: &AppState, seat: usize| {
+            s.table_view().seats[seat].win.map(|w| w.word())
+        };
+
+        // One pot, one winner: the hand, whether it was shown or everybody folded.
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded {
+            hand_id: 1,
+            stacks: vec![1_200, 900, 900],
+            shown: vec![None; 3],
+            pots: vec![PotEnd { size: 300, winners: vec![0] }],
+        });
+        assert_eq!(word(&s, 0), Some("Winner"));
+        assert_eq!(word(&s, 1), None, "a seat that won nothing says nothing");
+
+        // One pot, two winners: a split.
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded {
+            hand_id: 1,
+            stacks: vec![1_050, 1_050, 900],
+            shown: vec![None; 3],
+            pots: vec![PotEnd { size: 300, winners: vec![0, 1] }],
+        });
+        assert_eq!(word(&s, 0), Some("Split pot"));
+        assert_eq!(word(&s, 1), Some("Split pot"));
+
+        // A main pot and a side pot, to different seats -- and the seat that
+        // takes both is told so.
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded {
+            hand_id: 1,
+            stacks: vec![1_400, 800, 800],
+            shown: vec![None; 3],
+            pots: vec![
+                PotEnd { size: 300, winners: vec![1] },
+                PotEnd { size: 200, winners: vec![0] },
+            ],
+        });
+        assert_eq!(word(&s, 1), Some("Main pot"));
+        assert_eq!(word(&s, 0), Some("Side pot"));
+
+        let mut s = seated(0);
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded {
+            hand_id: 1,
+            stacks: vec![1_600, 700, 700],
+            shown: vec![None; 3],
+            pots: vec![
+                PotEnd { size: 300, winners: vec![0, 2] },
+                PotEnd { size: 200, winners: vec![0] },
+            ],
+        });
+        assert_eq!(word(&s, 0), Some("Main + side"), "both pots");
+        assert_eq!(word(&s, 2), Some("Split main"), "and its share of the main");
     }
 
     /// `D-051`: the table not safe reaches the window with a serial the

@@ -48,20 +48,134 @@ pub fn log_to(path: std::path::PathBuf) {
     let _ = LOG_FILE.set(path);
 }
 
+/// `D-053`: how large the client's log file may grow, in bytes.
+pub const LOG_FILE_MAX: u64 = 1_048_576;
+
+/// `D-053`: what survives a trim -- the **newest** half. The file used to be
+/// emptied when it grew past its bound, so the lines a reader wanted (the ones
+/// just before they looked) were exactly the ones thrown away.
+pub const LOG_FILE_KEEP: u64 = LOG_FILE_MAX / 2;
+
+/// `D-053`: whether a line belongs in the client's log file.
+///
+/// **The owner, 2026-09-14**: *the log is very spammy and it swells fast; keep
+/// what matters -- certifications, security incidents from a rogue peer -- and
+/// hold the file to a megabyte.*
+///
+/// It is a **drop list, not a keep list**, and that is the whole design: a line
+/// nobody thought of is kept rather than silently lost, so the next fault to be
+/// diagnosed from this file is still in it. What is dropped is the lobby's own
+/// bookkeeping -- peers appearing and disappearing on the mesh, answers to
+/// lobby questions, dials, relays, addresses -- which is nearly all of the
+/// volume and none of the meaning: the table's traffic does not ride any of it,
+/// and the status line already says what the lobby amounts to.
+///
+/// The **keep list sits above it** so that a line which matters is never
+/// dropped for happening to hold a word the drop list names: anything a
+/// decision tagged, every certificate, and every word about a member that was
+/// cut off, removed, kicked or put out.
+pub fn worth_logging(line: &str) -> bool {
+    /// Kept whatever else the line says.
+    const KEEP: [&str; 12] = [
+        "(D-0",
+        "certif",
+        "the table's word",
+        "flood",
+        "not safe",
+        "cut off",
+        "out of the table for good",
+        "no seat of this table",
+        "removed from the group",
+        "a kick",
+        "stranger",
+        "diverg",
+    ];
+    /// The lobby's bookkeeping, which is the volume.
+    ///
+    /// Two lines that look like this list are deliberately **not** in it:
+    /// *could not join the public lobby* and *no other poker client has been
+    /// reached yet* are this client saying it cannot be played with, which is
+    /// the first thing a reader of this file wants to know.
+    const DROP: [&str; 8] = [
+        "joined the lobby mesh",
+        // The space is load-bearing: without it this also matches *could not
+        // jo-IN THE PUBLIC LOBBY*, which is the opposite of chatter.
+        " in the public lobby",
+        "lobby: answered",
+        "is now a direct connection",
+        "dial failed",
+        "relay said no",
+        "from the DHT refused",
+        "NOT enough to carry a hand",
+    ];
+    KEEP.iter().any(|k| line.contains(k)) || !DROP.iter().any(|d| line.contains(d))
+}
+
+/// `D-053`: hold the file to [`LOG_FILE_MAX`] by keeping its newest
+/// [`LOG_FILE_KEEP`] bytes, cut at a line boundary so no half line survives.
+fn trim_log(path: &std::path::Path, len: u64) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let from = usize::try_from(len.saturating_sub(LOG_FILE_KEEP)).unwrap_or(0);
+    let tail = &bytes[from.min(bytes.len())..];
+    let cut = tail.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
+    let _ = std::fs::write(path, &tail[cut.min(tail.len())..]);
+}
+
 fn log_line(line: &str) {
     let Some(path) = LOG_FILE.get() else {
         return;
     };
+    // `D-053`: the lobby's bookkeeping stays out of the file.
+    if !worth_logging(line) {
+        return;
+    }
+    // `D-053`: and a line saying itself over and over is counted, not repeated.
+    // Written out when a different line comes, so a loop costs one line plus a
+    // number instead of a megabyte. A client that exits mid-fold loses the
+    // count and never a line.
+    static LAST: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
+    // The lock is held to the end of this function on purpose: the fold, the
+    // trim and the append are then one step, so two threads cannot both find
+    // the file over its bound and cut it twice, and no line can be appended
+    // between a trim's read and its write and go with it. A panic elsewhere
+    // must not stop the client logging, so a poisoned lock is taken anyway.
+    let mut last = LAST.lock().unwrap_or_else(|held| held.into_inner());
+    let folded = match last.as_mut() {
+        Some((prev, n)) if prev == line => {
+            *n += 1;
+            return;
+        }
+        Some((prev, n)) => {
+            let folded = (*n > 0).then_some(*n);
+            *prev = line.to_owned();
+            *n = 0;
+            folded
+        }
+        None => {
+            *last = Some((line.to_owned(), 0));
+            None
+        }
+    };
     use std::io::Write;
-    let over = std::fs::metadata(path).map(|m| m.len() > 8 * 1024 * 1024).unwrap_or(false);
-    let file = std::fs::OpenOptions::new().create(true).append(!over).write(true).truncate(over).open(path);
+    if let Ok(m) = std::fs::metadata(path) {
+        if m.len() > LOG_FILE_MAX {
+            trim_log(path, m.len());
+        }
+    }
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(path);
     if let Ok(mut f) = file {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let secs = (now / 1000) % 86_400;
-        let _ = writeln!(f, "{:02}:{:02}:{:02}.{:03} {line}", secs / 3600, (secs / 60) % 60, secs % 60, now % 1000);
+        let at = format!("{:02}:{:02}:{:02}.{:03}", secs / 3600, (secs / 60) % 60, secs % 60, now % 1000);
+        if let Some(n) = folded {
+            let _ = writeln!(f, "{at} the line above repeated {n} more time(s)");
+        }
+        let _ = writeln!(f, "{at} {line}");
     }
 }
 
@@ -143,6 +257,10 @@ pub struct HandInProgress {
     pub street: Option<u16>,
     /// What each seat gained at the settlement, by seat.
     pub won: Vec<u64>,
+    /// `D-052`: the pots the hand settled into -- the main pot first, then
+    /// each side pot -- so a winner's badge can say which one it took and
+    /// whether it was shared.
+    pub pots: Vec<crate::net::node::PotEnd>,
     /// What each seat did last this betting round, by seat: the badge beside
     /// it. A new street clears every word but *fold* and *all in*, as PokerTH's
     /// engine does.
@@ -916,6 +1034,7 @@ impl AppState {
                     pot: 0,
                     street: None,
                     won: Vec::new(),
+                    pots: Vec::new(),
                     acted: Vec::new(),
                     blinds_said: false,
                 });
@@ -1040,6 +1159,7 @@ impl AppState {
                 hand_id,
                 stacks,
                 shown,
+                pots,
             } => {
                 // `S1-DG`: a hand that ended without a settlement -- the
                 // deadline, a certificate -- restores every stack to the
@@ -1076,6 +1196,8 @@ impl AppState {
                             .collect()
                     };
                     h.won = won;
+                    // `D-052`: which pot each winner took, for the badge.
+                    h.pots = pots;
                     h.stacks = stacks.clone();
                     h.shown = shown;
                     h.over = true;
@@ -1989,6 +2111,79 @@ mod tests {
         PeerId::from(libp2p::identity::Keypair::generate_ed25519().public())
     }
 
+    /// `D-053`: the client's log keeps what matters and drops the lobby's own
+    /// bookkeeping -- and a line that matters is kept even where it holds a
+    /// word the drop list names.
+    #[test]
+    fn the_client_log_keeps_what_matters_and_drops_the_lobby() {
+        for line in [
+            "seat 3 flooded the table's group (16 points of traffic no client of this build sends within 60 s)",
+            "the table has certified seats [3, 4]'s timeout, unanimously among [0, 1, 2]",
+            "seat 3 is out of the table for good for flooding the table's group (D-051)",
+            "group member c37070e1 is no seat of this table and is removed from the group here",
+            "this table is not safe: your opponent flooded the table's connection (D-051)",
+            "a kick without the table's word is ignored",
+            "hand #12 is waiting for seat 3",
+            "seat 2 sits out by the table's group",
+            // This client saying it cannot be played with is the first thing a
+            // reader wants, however much it reads like the lobby's chatter.
+            "could not join the public lobby: no listener",
+            "no other poker client has been reached yet",
+        ] {
+            assert!(worth_logging(line), "kept: {line}");
+        }
+        for line in [
+            "12D3KooWCibp… joined the lobby mesh",
+            "lobby: answered 12D3KooWG8WM… with 0 table(s) offered",
+            "found 12D3KooWJxyo… in the public lobby",
+            "10 player(s) in the public lobby",
+            "dial failed: Failed to negotiate transport protocol(s)",
+            "relay said no: Failed to get Reservation.",
+            "707 private address(es) from the DHT refused (2106 this run)",
+            "12D3KooWDffC… is now a direct connection",
+        ] {
+            assert!(!worth_logging(line), "dropped: {line}");
+        }
+        // The keep list wins over the drop list: a security line about a member
+        // found in the lobby is still a security line.
+        assert!(worth_logging(
+            "a stranger found in the public lobby was cut off here for good (D-051)"
+        ));
+    }
+
+    /// `D-053`: the file is held to its bound by keeping the NEWEST half, so
+    /// the lines just before a reader looked are the ones that survive.
+    #[test]
+    fn the_log_file_is_trimmed_to_its_newest_half() {
+        let dir = std::env::temp_dir().join(format!("p2p-poker-log-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("client.log");
+        let line = "x".repeat(99);
+        let mut body = String::new();
+        while body.len() < (LOG_FILE_MAX as usize) + 4_096 {
+            body.push_str(&format!("{} {line}\n", body.len()));
+        }
+        let last = body.lines().next_back().expect("a last line").to_owned();
+        std::fs::write(&path, &body).expect("the file is written");
+        let len = std::fs::metadata(&path).expect("it is there").len();
+        assert!(len > LOG_FILE_MAX);
+
+        trim_log(&path, len);
+
+        let after = std::fs::read_to_string(&path).expect("still readable");
+        assert!(
+            (after.len() as u64) <= LOG_FILE_KEEP,
+            "trimmed to the keep bound, {} bytes",
+            after.len()
+        );
+        assert!(after.ends_with(&format!("{last}\n")), "the newest line survived");
+        assert!(
+            after.lines().next().is_some_and(|l| body.lines().any(|b| b == l)),
+            "and every line kept is a whole line"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A seat is not a table. Until every seat has ratified there is no session
     /// identity, and a client that treated the two as one would deal a hand at a
     /// table nobody agreed to.
@@ -2417,7 +2612,7 @@ mod tests {
             hand_id: 1, street: 0, to_call: 20, pot: 50, can_check: false, can_call: true, can_bet: false, can_raise: true, min_raise_to: 40, max_raise_to: 1_000, elapsed_ms: 0,
         });
         assert_eq!(s.turn_seat, Some(0), "our own turn is our own clock");
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3] });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![1_000; 3], shown: vec![None; 3], pots: Vec::new() });
         assert_eq!(s.turn_seat, None);
         assert_eq!(s.turn_since, None);
     }

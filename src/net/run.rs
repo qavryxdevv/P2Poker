@@ -12204,6 +12204,15 @@ async fn report_hand(
                         hand_id,
                         stacks: h.stacks(),
                         shown,
+                        // `D-052`: which pot each winner won, and whether shared.
+                        pots: h
+                            .settled_pots()
+                            .iter()
+                            .map(|(size, winners)| super::node::PotEnd {
+                                size: *size,
+                                winners: winners.clone(),
+                            })
+                            .collect(),
                     })
                     .await;
                 return Report {

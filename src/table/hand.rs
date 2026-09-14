@@ -1514,6 +1514,12 @@ pub struct Hand {
     /// `D-051`: the seats a banked certificate named with `CAUSE_FLOOD`: every
     /// voter's client cut them off for flooding the group.
     flood_named: BTreeSet<SeatIdx>,
+    /// `D-052`: the pots this hand settled into, in the settlement's own
+    /// order -- the main pot first, then each side pot -- with what each held
+    /// and which seats took it. Kept when the settlement is applied, because
+    /// the step that carries the body goes with it (`Step::Ended`), and the
+    /// window needs to say which pot a winner won.
+    settled_pots: Vec<(Chips, Vec<SeatIdx>)>,
     /// R4: a betting stage certified while this client was elsewhere. The two
     /// chains cannot be reconciled, so this is reported and not repaired.
     forked: Option<String>,
@@ -2008,6 +2014,7 @@ impl Hand {
                 flooders: BTreeSet::new(),
                 voted_about: BTreeSet::new(),
                 flood_named: BTreeSet::new(),
+                settled_pots: Vec::new(),
                 forked: None,
                 late: None,
                 bank_left_ms: o.time_bank_ms,
@@ -4897,7 +4904,12 @@ impl Hand {
         // next line drops the `Step` that carries the first, and the slot moves
         // past the second on the following hand. See the field's own note.
         self.checkpoint8 = Some((diverge_if_asked(mine.state_hash, self.open.hand_id), parent));
+        // `D-052`: and the pots, for the same reason -- the body goes with the
+        // step, and the window says which pot each winner won.
+        let pots: Vec<(Chips, Vec<SeatIdx>)> =
+            mine.pots.iter().map(|a| (a.size, a.winners.clone())).collect();
         play.step = Step::Ended;
+        self.settled_pots = pots;
         Ok(Vec::new())
     }
 
@@ -6991,6 +7003,10 @@ impl Hand {
             if late.own || !late.disagreed {
                 let hash = late.stage.hash().ok_or(Failed::NotInThisStage)?;
                 let stacks = late.body.final_stacks.clone();
+                // `D-052`: the settlement this client ends on is the one the
+                // window says the pots from, the late road included.
+                self.settled_pots =
+                    late.body.pots.iter().map(|a| (a.size, a.winners.clone())).collect();
                 late.closed = Some((hash, stacks));
                 // The agreed branch used to close in silence, so a run could
                 // show the refusal below and never the adoption, and the
@@ -9460,6 +9476,14 @@ impl Hand {
         }
         out.sort_unstable();
         out
+    }
+
+    /// `D-052`: the pots this hand settled into -- the main pot first, then
+    /// each side pot -- with what each held and which seats took it. Empty
+    /// until the settlement is applied, and on the aborted road, which moves
+    /// no chip.
+    pub fn settled_pots(&self) -> &[(Chips, Vec<SeatIdx>)] {
+        &self.settled_pots
     }
 
     /// `D-051`: whether this hand's certificate named the seat with the flood

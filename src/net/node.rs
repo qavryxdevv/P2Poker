@@ -111,6 +111,17 @@ pub enum NodeCommand {
     ForgetSession,
 }
 
+/// `D-052`: one pot of a settled hand, as the window is told it.
+///
+/// The order is the settlement's own: the first is the main pot, each one
+/// after it a side pot. `winners` holds more than one seat where the pot was
+/// split.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PotEnd {
+    pub size: u64,
+    pub winners: Vec<u8>,
+}
+
 /// What the loop reports upwards, for the GUI and the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeEvent {
@@ -308,6 +319,10 @@ pub enum NodeEvent {
         stacks: Vec<u64>,
         /// What each seat showed, by seat; `None` for folded and mucked.
         shown: Vec<Option<[u8; 2]>>,
+        /// `D-052`: the pots the hand settled into, the main pot first and
+        /// then each side pot, so the window can say which pot a winner won
+        /// and whether it was shared.
+        pots: Vec<PotEnd>,
     },
     /// This client's own two cards, opened from a complete set of verified
     /// shares.

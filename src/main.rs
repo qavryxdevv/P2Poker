@@ -175,7 +175,8 @@ fn main() {
     // the hero and seat 2 out, `--preview-bust` has the hero finish fourth and
     // `--preview-won` win the tournament; `--preview-show` offers *Show cards*;
     // `--preview-flooded` is out for flooding the group and `--preview-unsafe`
-    // says the table is not safe (D-051).
+    // says the table is not safe (D-051); `--preview-winner` ends the hand with
+    // the winners' words blinking at their seats (D-052).
     if has("--table-preview") {
         preview_table(&args);
         return;
@@ -1339,6 +1340,32 @@ fn preview_table(args: &[String]) {
     }
     if has("--preview-out") {
         view.out_for_good = Some("certified out after the fourth absence (hand 128)".into());
+    }
+    // `D-052`: the hand over, with the winner's word blinking at each seat
+    // that took a pot -- the hero the main pot, another seat a side pot.
+    if has("--preview-winner") {
+        view.hand_over = true;
+        view.can_act = false;
+        for s in view.seats.iter_mut() {
+            match s.seat {
+                0 => {
+                    s.won = 520;
+                    s.folded = false;
+                    s.win = Some(table::Win { one_pot: false, main: true, side: false, split: false });
+                }
+                2 => {
+                    s.won = 180;
+                    s.folded = false;
+                    s.win = Some(table::Win { one_pot: false, main: false, side: true, split: false });
+                }
+                4 => {
+                    s.won = 90;
+                    s.folded = false;
+                    s.win = Some(table::Win { one_pot: false, main: false, side: true, split: true });
+                }
+                _ => {}
+            }
+        }
     }
     // `D-051`: out for flooding the table's group, and the table not safe.
     if has("--preview-flooded") {
