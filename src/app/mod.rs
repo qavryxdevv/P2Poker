@@ -2047,10 +2047,11 @@ impl AppState {
                 .filter(|(id, _)| *id == hand_id)
                 .map(|(_, at)| at)
                 .unwrap_or_else(std::time::Instant::now);
-            self.finished = Some((
-                crate::gui::table::Finish { place, tied, players_left, show_in_ms: crate::gui::table::FINISH_WINDOW_DELAY_MS },
-                at,
-            ));
+            // Out of chips while others play on: soon, before the next hand is
+            // under way. The winner, or the loser of the last hand: the ten
+            // seconds to look at the hand that ended the tournament.
+            let delay = if over { crate::gui::table::FINISH_WINDOW_DELAY_MS } else { crate::gui::table::BUST_WINDOW_DELAY_MS };
+            self.finished = Some((crate::gui::table::Finish { place, tied, players_left, show_in_ms: delay }, at));
             if place == 1 && over {
                 self.note("you won the tournament".to_string());
             } else {

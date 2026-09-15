@@ -8126,6 +8126,33 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let phase1 = t.hand
                     .as_ref()
                     .is_some_and(|h| t.boundary_done_for != Some(h.hand_id()));
+                // `S1-FL`: the places, the moment the hand is over, whenever no
+                // return still in this boundary's window can change them. Said
+                // later, at the derivation below, they reached a busted seat five
+                // seconds after its hand -- the showdown's pause -- and its window
+                // then waited ten more: a seat back from a restart that busted in
+                // the first hand it played was told its place as the final hand
+                // ended (the owner, 2026-09-15). The derivation still says the
+                // places this could not.
+                if let Some(h) = t.hand.as_ref() {
+                    if t.finish_said_for != Some(h.hand_id()) {
+                        if let Some((over, finishes)) = h.finishes_final_at_the_end() {
+                            t.finish_said_for = Some(h.hand_id());
+                            for f in finishes {
+                                let _ = events
+                                    .send(NodeEvent::Finished {
+                                        hand_id: h.hand_id(),
+                                        seat: f.seat,
+                                        place: u8::try_from(f.place).unwrap_or(u8::MAX),
+                                        tied: f.tied,
+                                        players_left: u8::try_from(f.players_left).unwrap_or(u8::MAX),
+                                        over,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
                 if let Some(h) = t.hand.as_ref().filter(|_| phase1) {
                     // **§4.10's window, on BOTH terminal paths, and this is
                     // separate from the checkpoint below for exactly that

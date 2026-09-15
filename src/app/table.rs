@@ -860,13 +860,19 @@ mod tests {
         assert!(b.tied && b.place == 2);
         assert!(s.table_log.iter().any(|l| l.text == "Alice finished tied for 2nd place"), "{:?}", s.table_log);
 
-        // Out while the others play on: the seats still in, said.
+        // Out while the others play on: the seats still in, said -- and soon,
+        // before the next hand is under way (the owner, 2026-09-15).
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 1_900, 1_100], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
         s.apply(NodeEvent::Finished { hand_id: 1, seat: 0, place: 3, tied: false, players_left: 2, over: false });
         let b = s.table_view().finished.expect("out");
         assert_eq!((b.place, b.players_left), (3, 2));
+        assert!(
+            b.show_in_ms <= crate::gui::table::BUST_WINDOW_DELAY_MS && b.show_in_ms > 2_000,
+            "a few seconds, not ten: {} ms",
+            b.show_in_ms
+        );
     }
 
     /// `S1-FL`: the winner is congratulated by the node's word -- once the hand

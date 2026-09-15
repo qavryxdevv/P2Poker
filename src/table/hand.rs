@@ -1020,6 +1020,17 @@ pub struct SeatFinish {
 /// (`S1-FA`, the owner: busting heads-up beside an absent seat's chips is
 /// second, not third). A seat out of the table for good busted at this
 /// boundary, its chips leaving with it.
+/// `S1-FL`: whether [`place_seats`] can still change at this boundary. A
+/// return adds a seat holding chips to the seats that play on and nothing else,
+/// so every place stands unless the tournament's end hangs on one: fewer than
+/// two seats play on and a seat holding chips is outside them.
+fn places_are_final(occupied: &[SeatIdx], end: &[Chips], playing_on: &[SeatIdx]) -> bool {
+    let absent_with_chips = occupied
+        .iter()
+        .any(|s| end.get(usize::from(*s)).copied().unwrap_or(0) > 0 && !playing_on.contains(s));
+    playing_on.len() >= 2 || !absent_with_chips
+}
+
 fn place_seats(occupied: &[SeatIdx], start: &[Chips], end: &[Chips], playing_on: &[SeatIdx]) -> (bool, Vec<SeatFinish>) {
     let at = |v: &[Chips], s: SeatIdx| v.get(usize::from(s)).copied().unwrap_or(0);
     let over = playing_on.len() < 2;
@@ -8678,6 +8689,20 @@ impl Hand {
         place_seats(&occupied, &self.mine.stacks, &end, &playing_on)
     }
 
+    /// `S1-FL`: the places of [`Hand::finishes_at_boundary`], if nothing still
+    /// to come at this boundary can change them -- which is every boundary but
+    /// one: fewer than two seats play on while a seat holding chips sits
+    /// outside the roster, whose return, banked in the boundary's window, would
+    /// keep the tournament going. So the places are said the moment the hand is
+    /// over and not after the showdown's pause and the return hold (the owner,
+    /// 2026-09-15: *the window must come as soon as I am out*).
+    pub fn finishes_final_at_the_end(&self) -> Option<(bool, Vec<SeatFinish>)> {
+        let end = self.end_stacks_at_boundary();
+        let occupied: Vec<SeatIdx> = self.open.seats.iter().map(|(s, _, _)| *s).collect();
+        let playing_on = self.required_next(&end);
+        places_are_final(&occupied, &end, &playing_on).then(|| self.finishes_at_boundary())
+    }
+
     /// `S1-CX`: the genesis the next hand would open at if this hand were
     /// given up now -- an abort's terminal is a function of this hand's
     /// genesis and moves no chips, so the answer is known before the fact.
@@ -14424,6 +14449,19 @@ mod tests {
         assert!(!r.0 && r.1.is_empty());
     }
 
+    /// `S1-FL`: the places are final the moment the hand ends -- said then --
+    /// unless the tournament's end hangs on a return still in the window.
+    #[test]
+    fn the_places_are_final_at_the_end_unless_a_return_can_keep_the_table_going() {
+        // Two seats play on: a seat busted now has its place whatever returns.
+        assert!(places_are_final(&[0, 1, 2, 3], &[1_000, 0, 2_000, 500], &[0, 2]));
+        // Nobody holds chips outside the roster: the end is the end.
+        assert!(places_are_final(&[0, 1, 2], &[3_000, 0, 0], &[0]));
+        // One seat plays on beside an absent seat holding chips: its return
+        // would keep the tournament going, so the places wait for the window.
+        assert!(!places_are_final(&[0, 1, 2], &[2_000, 0, 1_000], &[0]));
+    }
+
     /// `S1-FL`: the read-only `R(k+1)` agrees with the derivation, and a settled
     /// hand that busts nobody decides no place -- at the seats playing it and
     /// at a busted bystander alike.
@@ -14435,6 +14473,7 @@ mod tests {
             assert_eq!(next, h.required_next(&h.end_stacks_at_boundary()), "seat {i}");
             let (over, finishes) = h.finishes_at_boundary();
             assert!(!over && finishes.is_empty(), "seat {i}: {finishes:?}");
+            assert_eq!(h.finishes_final_at_the_end(), Some((over, finishes)), "seat {i}: final at the end");
         }
     }
 

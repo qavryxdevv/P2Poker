@@ -454,6 +454,14 @@ pub struct Finish {
 /// owner: ten seconds, to look at the winning hand).
 pub const FINISH_WINDOW_DELAY_MS: u64 = 10_000;
 
+/// `S1-FL`: the same for a seat out of chips while the tournament goes on (the
+/// owner, 2026-09-15: *the window must come as soon as I am out, not when the
+/// tournament ends*). The next hand is dealt about five seconds after the one
+/// that busted the seat, and ten seconds put the window into it -- or past the
+/// end of the tournament, when that hand was the last. Three seconds see the
+/// chips go to the winner first.
+pub const BUST_WINDOW_DELAY_MS: u64 = 3_000;
+
 /// *1st*, *2nd*, *3rd*, *4th* ...
 pub fn ordinal(n: usize) -> String {
     let suffix = match (n % 10, n % 100) {
