@@ -951,7 +951,7 @@ reach a relay is invisible rather than merely unplayable.
 |---|---|---|---|
 | 0 | **Load or create the persistent libp2p Ed25519 keypair** from the portable profile directory next to the executable (`SPEC_CS.md` §22). Encoded with `Keypair::to_protobuf_encoding()`, read back with `from_protobuf_encoding`. On Windows the file is wrapped with DPAPI (`SPEC_CS.md` §21). | file missing → first run | generate a new keypair, write it, continue. **Never** generate a fresh identity when a keypair file exists but fails to decode — that silently forks the identity. Report the error and refuse to start, so a corrupted or foreign profile is visible rather than silently replaced. |
 | 1 | **Load the cached DHT bootstrap list** and the per-peer DCUtR failure cache from the profile. | missing/corrupt | fall back to the compiled defaults; not fatal. |
-| 2 | **Build the swarm** (§5) and `listen_on` `/ip4/0.0.0.0/udp/P/quic-v1`, `/ip4/0.0.0.0/tcp/P`, plus the `/ip6/::` equivalents. `P` is chosen once, persisted, reused every run. **The `/ip6/::` half of this row was specified here and not implemented for the whole life of the client** — `S1-Y`, fixed 2026-09-02, and an IPv6 bind failure is reported rather than fatal. | port `P` in use | try `P` once, then fall back to an ephemeral port and persist the new value. Log it. |
+| 2 | **Build the swarm** (§5) and `listen_on` `/ip4/0.0.0.0/udp/P/quic-v1`, `/ip4/0.0.0.0/tcp/P`, plus the `/ip6/::` equivalents. `P` is **0 unless `--port N` is given**: 0 lets the operating system choose afresh at every start, so two instances on one machine never collide, and a player who forwards a port on their router names it with `--port`, which binds that one number on QUIC and TCP alike (`run::listen_addrs`, §4.4). Nothing is persisted. Until 2026-09-15 this row said *`P` is chosen once, persisted, reused every run*, which the client has never done. **The `/ip6/::` half of this row was specified here and not implemented for the whole life of the client** — `S1-Y`, fixed 2026-09-02, and an IPv6 bind failure is reported rather than fatal. | `--port N` already in use | the IPv4 `listen_on` returns the bind error and the node does not start; the IPv6 half is reported and carried on without. There is no fallback to another port — this row used to promise one, persisted, and nothing implements it. |
 | 3 | ~~**Start the Mainline DHT** on its own UDP socket, `.port(0)`, with a deny-all `RequestFilter`.~~ **Gone.** There is no separate DHT socket and no request filter: discovery is a `kad::Behaviour` inside the same swarm, on the same transports, and §11.4 explains why this client deliberately *does* answer strangers' queries. | — | there is no "no-discovery mode" any more: if the swarm cannot bind, nothing runs. |
 | 4 | **Bootstrap the public Kademlia.** Dial the compiled entry point — one name, `/dnsaddr/bootstrap.libp2p.io` (`run::PUBLIC_ENTRY`), never a list of addresses — beside the peers the profile remembers (step 1). On the first `identify` from a peer that speaks `/ipfs/kad/1.0.0`, add its reachable listen addresses to the routing table and call `bootstrap()` once; after that `libp2p-kad`'s own periodic bootstrap keeps the table up (§11.4.1). | the entry is unreachable, or `bootstrap()` has no peer to start from (*"public DHT has no peers yet"*) | **normal**, never fatal, and there is no backoff ladder: while no relay has been seen after three relay searches, every discovery cycle dials the entry again (§9.5). The remembered peers are the way in on a day the entry is down. The failure figures this row carried until 2026-09-15 — *~3 of 35 cold starts failed on the first attempt*, *`router.bittorrent.com` is dead from this network* — were measured against Mainline's bootstrap and describe nothing that runs. |
 | 5 | **`start_providing(lobby_namespace())`** (§3.2) at the moment an external address first exists — for a client behind a NAT, the relay circuit's arrival — and **again every 300 s (`REANNOUNCE_EVERY`) until the announcement is confirmed**: a walk of this session has handed the record to at least one node, and a node has since answered a lookup of the lobby key with this client's own record. From then on `libp2p-kad` owns the republish loop at its 12 h interval (§10.1). | announce error; or a walk that reached few storing nodes, which `start_providing`'s `Ok` cannot show — it comes back `Ok` from a walk that asked nobody | the next walk is the repair: the first happens seconds after the relay reservation, when the routing table is thinnest, and the next five minutes later against a fuller one. **Until 2026-09-15 this row said *once … there is no repair*, and for a client behind a NAT that was what ran** although `79ea1d5` (2026-09-03) had written the repair — the circuit arm latched at dispatch, and the self-sighting meant to confirm was answered by the client's own store (§10.1, `S1-FI`). |
@@ -1099,10 +1099,11 @@ So a hostile provider record costs a dial and nothing else. Its cost in
 > Mainline's: BEP 5's token, LRU eviction, a measured `~45 minutes`. The
 > **obligation** never moved — `SPEC_CS.md` §3 requires these limits to be
 > documented and forbids answering them with a central server — but every fact
-> that discharged it did. What follows is derived from `libp2p-kad 0.48.0`, the
-> version `Cargo.lock` pins, and from what `src/net/run.rs` and `src/net/swarm.rs`
-> actually do with it. Three figures are marked `[UNMEASURED]` and are the honest
-> remainder of `S1-E`.
+> that discharged it did. What follows was derived from `libp2p-kad 0.48.0` and
+> re-read on 2026-09-15 against `0.49.0`, the version `Cargo.lock` pins now — no
+> default or behaviour below moved, only line numbers — and from what
+> `src/net/run.rs` and `src/net/swarm.rs` actually do with it. Three figures are
+> marked `[UNMEASURED]` and are the honest remainder of `S1-E`.
 
 **Start with the fact that frames all the others: the lobby is not our network.**
 The rendezvous lives on the **public IPFS DHT**. `swarm.rs` builds a second
@@ -1122,23 +1123,26 @@ price §3.3 says is worth paying — but the user is the one paying it.
   whatever IP it holds that day. The Mainline announce disclosed an address and
   forgot who you were; this one remembers.
 
-* **It leaks more addresses than it publishes.** The outgoing `ADD_PROVIDER`
-  carries confirmed *external* addresses only (`behaviour.rs:1560`). But when
-  this node **answers** a `GET_PROVIDERS` about itself it substitutes
-  `listen_addresses ∪ external_addresses` (`behaviour.rs:1263-1270`), and
-  `identify` sends the same union to **every peer it connects to** —
-  `hide_listen_addrs` defaults to `false`
-  (`libp2p-identify-0.47.0/src/behaviour.rs:186, 325-331`) and this project never
-  sets it. Measured on the development machine, 2026-09-02: that
-  union contained `/ip4/192.168.1.20/...`, `/ip4/172.27.224.1/...` — a Hyper-V
-  "Default Switch" address — and two `fdc9:…` IPv6 ULAs [MEASURED]. **The
-  external half is filtered and the listen half is not.** `run::reachable` gates
-  what AutoNAT may add as an external address (`run.rs:1629` guards
-  `run.rs:1645`), so §5.6's publish filter is applied where the section says it
-  is; but `listen_addresses` is the raw bound set and passes through both paths
-  untouched. So a stranger on the public DHT who never sees the lobby key learns
-  this player's LAN topology and which hypervisor they run. That is a defect,
-  recorded here because it is a disclosure and not only a bug: `S1-Z`.
+* **It leaks more addresses than it publishes — through one door now, where there
+  were two.** The outgoing `ADD_PROVIDER` carries confirmed *external* addresses
+  only (`behaviour.rs:1563`). But when this node **answers** a `GET_PROVIDERS`
+  about a key it provides, `libp2p-kad` fills in its own record with
+  `listen_addresses ∪ external_addresses` (`behaviour.rs:1267-1274`, the listen set
+  kept from every swarm event at `:2684`), and until 2026-09-02 `identify` sent the
+  same union to **every peer it connected to**, because `hide_listen_addrs`
+  defaults to `false` (`libp2p-identify-0.48.0/src/behaviour.rs:204, 342-348`).
+  Measured on the development machine, 2026-09-02: that union contained
+  `/ip4/192.168.1.20/...`, `/ip4/172.27.224.1/...` — a Hyper-V "Default Switch"
+  address — and two `fdc9:…` IPv6 ULAs [MEASURED]. **The external half is filtered
+  and the listen half is not.** `run::reachable` gates what AutoNAT may add as an
+  external address, so §5.6's publish filter is applied where the section says it
+  is; but `listen_addresses` is the raw bound set. `S1-Z` closed the `identify`
+  door the same day — `net::swarm::build` sets `with_hide_listen_addrs(true)` —
+  and this bullet went on saying *this project never sets it* until 2026-09-15.
+  **The `libp2p-kad` door is still open**: the identify setting does not reach it,
+  so a stranger who asks this client, while it serves the DHT, who provides the
+  lobby key learns this player's LAN topology and which hypervisor they run.
+  `S1-FJ`.
 
 * **The same connections announce what this software is.** `identify` sends
   `protocol_version = "/p2p-poker/1"` and `agent_version = "p2p-poker/<version>"`
@@ -1148,7 +1152,7 @@ price §3.3 says is worth paying — but the user is the one paying it.
   stranger ever sees the lobby key.
 
 * **The record *is* authenticated — in one narrow way, and it is not the way that
-  matters.** `behaviour.rs:2412-2418`: *"Only accept a provider record from a
+  matters.** `behaviour.rs:2415-2421`: *"Only accept a provider record from a
   legitimate peer"*, `if provider.node_id != source { return; }`, where `source`
   is the peer id the libp2p handshake bound to the connection. **Nobody can
   announce somebody else's `PeerId` in our lobby**, which BEP 5's token could not
@@ -1160,11 +1164,11 @@ price §3.3 says is worth paying — but the user is the one paying it.
 
 * **The record outlives the player by up to two days, and there is no way to
   withdraw it.** `provider_record_ttl` defaults to **48 hours** and
-  `provider_publication_interval` to **12 hours** (`behaviour.rs:232-233`), and
+  `provider_publication_interval` to **12 hours** (`behaviour.rs:231-232`), and
   the expiry is stamped by the **storing** node from its own config, not the
-  publisher's (`behaviour.rs:1956`). `stop_providing` is documented as *"a local
+  publisher's (`behaviour.rs:1959`). `stop_providing` is documented as *"a local
   operation"* — other nodes go on considering you a provider until the record
-  expires (`behaviour.rs:1047-1053`) — and **`run.rs` never calls it at all**. So
+  expires (`behaviour.rs:1047-1054`) — and **`run.rs` never calls it at all**. So
   closing the client changes nothing anyone else can see: the player's `PeerId`
   and addresses stay in the public lobby, findable, for as long as the storing
   nodes keep them. **Against Mainline's measured ~45 minutes that is roughly sixty
@@ -1188,7 +1192,7 @@ price §3.3 says is worth paying — but the user is the one paying it.
   `get_providers` runs over an authenticated libp2p connection, so each node on
   the walk learns the querier's **`PeerId`**, its **IP**, its **identify banner**,
   and the **exact key asked for**. The client asks every **60 seconds**
-  (`run.rs:656, 2264`) — about **1440 times a day**, against the ~150 the Mainline
+  (`run::run`'s discovery timer) — about **1440 times a day**, against the ~150 the Mainline
   section counted — plus a second query for the relay namespace whenever there is
   no reservation. **How many distinct nodes one walk contacts is `[UNMEASURED]`;**
   the Mainline figure of 105-176 has no counterpart here and must not be assumed
@@ -1207,18 +1211,18 @@ price §3.3 says is worth paying — but the user is the one paying it.
 
 * **A cheaper enumeration needs no grinding at all.** Poll the key exactly as our
   own client does. Each responder returns up to 20 providers
-  (`behaviour.rs:1291`, `K_VALUE = 20`), the union over the closest nodes is the
+  (`behaviour.rs:1295`, the replication factor, `K_VALUE = 20` by default), the union over the closest nodes is the
   live lobby, and a script left running for a month has the **historical** lobby —
   every `PeerId` that ever sat there, the addresses each was reachable at, and the
   times it appeared. **A `PeerId` is stable, so that log is a per-player
   attendance record.** Nothing in this design prevents it and nothing detects it.
 
 * **A player in the lobby also works for strangers.** `set_mode(None)`
-  (`swarm.rs:345`) restores libp2p's rule: **server** once there is a confirmed
+  (`net::swarm::build`) restores libp2p's rule: **server** once there is a confirmed
   external address. In server mode this machine answers public-DHT queries and
   stores other people's provider records — for arbitrary IPFS content, having
   nothing to do with poker — and its address sits in strangers' routing tables.
-  `dht_effort` turns this down to client mode at a table (`run.rs:4323`), which is
+  `run::dht_effort` turns this down to client mode at a closed table, which is
   a bandwidth decision and happens to be the only mitigation that exists.
 
 * **One eviction rule is worth knowing because it is the reverse of Mainline's.**
@@ -1228,7 +1232,7 @@ price §3.3 says is worth paying — but the user is the one paying it.
   Mainline's LRU pushed the oldest out; this pushes the **newest** away. Under a
   flood the player who cannot be seen is the one who just arrived. Expired entries
   are pruned only lazily, on a query that touches the key
-  (`behaviour.rs:1241-1245`). **What the go-libp2p nodes that actually store our
+  (`behaviour.rs:1245-1249`). **What the go-libp2p nodes that actually store our
   record do instead is `[UNMEASURED]`**, and it is the same gap as the TTL.
 
 * **What is unchanged, and should not be softened.** It is still one fixed public
@@ -1237,7 +1241,7 @@ price §3.3 says is worth paying — but the user is the one paying it.
   is still **no central server**, and none of the above is a reason to add one.
   And there is still **no way to remove the disclosure — only not to announce.**
 
-**Therefore, and none of this is implemented yet:**
+**Therefore — and of this list only the identify half of item 4 is built:**
 
 1. a **one-time, plain-language consent screen** before the first announce, which
    must now say *forty-eight hours* and *a name that follows you between
@@ -1246,13 +1250,17 @@ price §3.3 says is worth paying — but the user is the one paying it.
 3. **announce only while the user is actually looking for a game** — and, because
    `stop_providing` is local, tell them plainly that leaving does not take the
    record back;
-4. set **`with_hide_listen_addrs(true)`**, so neither the provider record nor
-   the identify banner carries LAN and virtual-adapter addresses. §5.6's publish
+4. keep LAN and virtual-adapter addresses out of **both** the identify banner and
+   the provider record. **Half built**: `with_hide_listen_addrs(true)` has closed
+   the identify half since 2026-09-02 (`S1-Z`) — this item, and the heading above
+   it, went on listing it as not implemented until 2026-09-15. It does not reach
+   `libp2p-kad`, which fills this client's own record from the listen set when it
+   answers a lookup, so the provider-record half is open (`S1-FJ`). §5.6's publish
    filter is already applied on the external-address path and needs no change
-   there; what leaks is the listen half, and hiding it is the whole fix. The cost
-   is a delay rather than a loss — a genuinely public host's address is
-   advertised once AutoNAT confirms it, and the LAN case is served by mDNS
-   (§9.8), which does not go through `identify` at all;
+   there; what leaks is the listen half. The cost of hiding it is a delay rather
+   than a loss — a genuinely public host's address is advertised once AutoNAT
+   confirms it, and the LAN case is served by mDNS (§9.8), which does not go
+   through `identify` at all;
 5. `SPEC_CS.md` §3's own words remain the test: *"Nic z toho není důvod k
    centrálnímu serveru, ale hráč to má vědět."*
 
@@ -1262,17 +1270,22 @@ adds: with a 48-hour record TTL the previous day's key stays populated for two
 more days, so rotation blunts a historical crawl far less than it looks. Still
 **not adopted**; OQ-2 is carried forward against the new mechanism.
 
-> **Verification:** `[SOURCE]` `libp2p-kad-0.48.0/src/behaviour.rs:232-233`
-> (TTL 48 h, republish 12 h), `:1956` (the storing node stamps expiry),
-> `:2412-2418` (provider must equal the authenticated sender), `:1047-1053`
-> (`stop_providing` is local), `:1263-1270` and `:1560` (which addresses go
-> where), `:1291` and `lib.rs:91` (20 providers per response),
+> **Verification:** `[SOURCE]` `libp2p-kad-0.49.0/src/behaviour.rs:231-232`
+> (TTL 48 h, republish 12 h), `:1959` (the storing node stamps expiry),
+> `:2415-2421` (provider must equal the authenticated sender), `:1047-1054`
+> (`stop_providing` is local), `:1267-1274`, `:2684` and `:1563` (which addresses
+> go where), `:1295` and `lib.rs:91` (20 providers per response),
 > `record/store/memory.rs:170-175` (a full list ignores the newcomer),
 > `jobs.rs:268-279` (first republish after a full interval),
 > `kbucket/key.rs:115-120` (`sha2-256(PeerId)` placement);
-> `libp2p-identify-0.47.0/src/behaviour.rs:186, 325-331` (`hide_listen_addrs`
-> default false). `[SOURCE]` this project: `src/net/swarm.rs:323-351`,
-> `src/net/run.rs:103, 148-155, 656, 1643, 2243-2264, 4323`.
+> `libp2p-identify-0.48.0/src/behaviour.rs:204, 342-348` (`hide_listen_addrs`
+> default false, and what it withholds). Line numbers re-read on 2026-09-15; they
+> named `libp2p-kad-0.48.0` and `libp2p-identify-0.47.0` before, and no value moved.
+> `[SOURCE]` this project: `net::swarm::build` (both Kademlias, `set_mode(None)`,
+> `with_hide_listen_addrs(true)`), `run::PUBLIC_ENTRY`, `run::DIALS_PER_ANSWER`,
+> `run::reachable`, `run::dht_effort`, and the announce and lookup arms of
+> `run::run` — by name, because this file's line numbers into `run.rs` had all
+> gone stale as it grew.
 > **`[UNMEASURED]`, and these are what keeps `S1-E` open:** (i) the TTL the
 > **go-libp2p** nodes that actually store our record apply — the 48 h above is
 > rust-libp2p's default and is almost certainly not the operative number;
@@ -1329,7 +1342,7 @@ place to try connecting.
 without anybody deciding that it should.** A Mainline record was six bytes that
 anybody could write under anybody's name. A libp2p provider record names a
 `PeerId`, and a storing node refuses one whose `node_id` is not the peer on the
-authenticated connection that sent it (`libp2p-kad` `behaviour.rs:2412-2418`,
+authenticated connection that sent it (`libp2p-kad-0.49.0` `behaviour.rs:2415-2421`,
 *"Only accept a provider record from a legitimate peer"*). So **nobody can
 announce somebody else's identity in our lobby**, which BEP 5's token could not
 prevent.
@@ -1362,11 +1375,14 @@ table, which is where the dial in §4.3 finds them. This is the single largest
 difference from the Mainline bridge: there is no `SocketAddrV4`, no port, and
 nothing for application code to parse, filter or synthesise.
 
-> Verification: [SOURCE] `libp2p-kad-0.48.0/src/behaviour.rs:1238-1248` (a
-> responder returns every non-expired provider except the asker), `:2362-2396`
-> (each batch emitted as it arrives), `record/store/memory.rs:69` (twenty per
-> key); this client: `src/net/run.rs` `SwarmEvent::Behaviour(… IpfsKad(
-> OutboundQueryProgressed))`.
+> Verification: [SOURCE] `libp2p-kad-0.49.0/src/behaviour.rs:1242-1252` (a
+> responder returns every non-expired provider except the asker), `:2365-2399`
+> (each batch emitted as it arrives, an empty one included),
+> `record/store/memory.rs:69` (twenty per key); this client: `src/net/run.rs`
+> `SwarmEvent::Behaviour(… IpfsKad(OutboundQueryProgressed))`. Re-read 2026-09-15
+> from the `0.48.0` lines 1238-1248 and 2362-2396; one exception is worth knowing,
+> and both versions have it — a stored provider with no addresses that is neither
+> the responder nor in its routing table is left out of the answer (`:1277-1281`).
 
 ### 4.3 The bridge, precisely
 
@@ -1536,21 +1552,35 @@ application signature.
 
 ### 5.1 Pinned versions
 
-`libp2p = "0.56.0"` (published 2025-06-27, newest non-yanked), resolving
-`libp2p-gossipsub 0.49.5`, `libp2p-relay 0.21.1`, `libp2p-dcutr 0.14.1`,
-`libp2p-autonat 0.15.0`, `libp2p-quic 0.13.1`, `libp2p-swarm 0.47.1`,
-`libp2p-core 0.43.2`, `libp2p-identity 0.2.14`, `libp2p-identify 0.47.0`,
-`libp2p-mdns 0.48.0`, `libp2p-request-response 0.29.0`,
-`libp2p-connection-limits 0.6.0`, `libp2p-allow-block-list 0.6.0`.
-Plus `libp2p-stream = "0.4.0-alpha"` (not re-exported by the umbrella) and
-~~`mainline = "=8.0.0"`~~ — **removed in `56b0b50`**; discovery is `libp2p-kad`, and its version is whatever `libp2p` resolves to (`0.48.0` at the time of writing, per `Cargo.lock`).
+`libp2p = "0.57.0"` — in `Cargo.lock` since `S1-FF` (2026-09-14), which moved to
+it to clear three dependency advisories — resolving `libp2p-gossipsub 0.50.0`,
+`libp2p-relay 0.22.0`, `libp2p-dcutr 0.15.0`, `libp2p-autonat 0.16.0`,
+`libp2p-quic 0.14.0`, `libp2p-swarm 0.48.0`, `libp2p-core 0.44.0`,
+`libp2p-identity 0.3.0`, `libp2p-identify 0.48.0`, `libp2p-kad 0.49.0`,
+`libp2p-mdns 0.49.0`, `libp2p-request-response 0.30.0`,
+`libp2p-connection-limits 0.7.0`, `libp2p-allow-block-list 0.7.0`.
+Plus `libp2p-stream = "0.5.0-alpha"` (not re-exported by the umbrella) and
+~~`mainline = "=8.0.0"`~~ — **removed in `56b0b50`**; discovery is `libp2p-kad`, and its version is whatever `libp2p` resolves to (`0.49.0` in `Cargo.lock`).
 
-**Never depend on `libp2p-identity`, `libp2p-core`, `libp2p-swarm`, `multiaddr` or
-`futures` directly.** `libp2p-identity 0.3.0` exists and is outside the umbrella's
-`^0.2.12` range; adding it links a second, incompatible `Keypair`/`PeerId` and
-produces a type-mismatch error rather than a resolver error. Use the umbrella
-re-exports. `libp2p-stream` is the one deliberate exception and it works because
-its own ranges resolve to the same instances.
+> **Re-read against the 0.57 set on 2026-09-15.** This section and every
+> `[SOURCE]` citation into a libp2p crate in this document named the 0.56 set
+> until then — `libp2p 0.56.0`, `libp2p-kad 0.48.0`, `libp2p-relay 0.21.1`,
+> `libp2p-dcutr 0.14.1`, `libp2p-identify 0.47.0` and the rest — while the build
+> had moved the day before. Each cited line was found again in the version
+> `Cargo.lock` pins and the citation now names it; where a value or a behaviour
+> moved, the passage says so in place, and where only a line number moved,
+> nothing else changed.
+
+**Never depend on a second instance of `libp2p-identity`, `libp2p-core`,
+`libp2p-swarm` or `multiaddr`.** The umbrella now resolves `libp2p-identity 0.3.0`
+(its requirement is `^0.3.0`); a direct dependency at any other minor would link a
+second, incompatible `Keypair`/`PeerId` and produce a type-mismatch error rather
+than a resolver error. Use the umbrella re-exports. Until 2026-09-15 this rule also
+named `futures`, and warned that `libp2p-identity 0.3.0` was outside the old
+umbrella's `^0.2.12` range; the client does depend on `futures = "0.3"` directly,
+and that is safe for the reason the rule exists — it resolves to the one `0.3.x`
+instance libp2p uses. `libp2p-stream` is the other deliberate exception and it
+works for the same reason: its own ranges resolve to the same instances.
 
 There is **no `connection-limits` cargo feature** — `libp2p-connection-limits` and
 `libp2p-allow-block-list` are non-optional dependencies and
@@ -1567,57 +1597,72 @@ not something a decision can delete**: what D-010 and D-011 constrain is what ma
 #### 5.1.1 Dependency register — the transport side (`SPEC_CS.md` §28)
 
 `SPEC_CS.md` §28 requires a register with six columns for every crate the client
-links. The permanent home is **`docs/DEPENDENCIES.md`**, generated from
-`cargo metadata` and checked in CI so it cannot drift; until that document exists,
-this section carries the transport side and `CRYPTOGRAPHY.md` §9 carries the
-cryptographic side. **Neither is complete on its own**, and both are hand-written
-and therefore subject to exactly the drift that `PHASE0_REVIEW.md` B-3 found.
+links. Its home is **`docs/DEPENDENCIES.md`**, which now exists and whose rows
+`tests/corpus_dependencies.rs` checks against `Cargo.lock` on every `cargo test`;
+this section keeps the transport side for a reader of this document, and
+`CRYPTOGRAPHY.md` §9 the cryptographic side. **Neither is complete on its own**,
+and both are hand-written and therefore subject to exactly the drift that
+`PHASE0_REVIEW.md` B-3 found — this table named the 0.56 set for a day after the
+build had left it.
 
 | Crate | Version | Purpose | Repository | Licence | Security status |
 |---|---|---|---|---|---|
-| `libp2p` (umbrella) | `0.56.0` | transport, encryption, NAT traversal, gossip, relay | `github.com/libp2p/rust-libp2p` | MIT | RUSTSEC-2022-0084 (resource-management DoS) patched at `>= 0.45.1`; pinned version is patched |
-| `libp2p-core` | `0.43.2` | transport traits, upgrades | as above | MIT | RUSTSEC-2019-0004 patched `>= 0.8.1`, RUSTSEC-2022-0009 patched `>= 0.31.1`; both far below the pinned version |
-| `libp2p-identity` | `0.2.14` | `PeerId`, `Keypair` | as above | MIT | no advisory in the local advisory database |
-| `libp2p-swarm` `0.47.1`, `libp2p-swarm-derive` `0.35.1` | — | swarm driver, `#[derive(NetworkBehaviour)]` | as above | MIT | as above |
-| `libp2p-quic` `0.13.1`, `libp2p-tcp` `0.44.1`, `libp2p-dns` `0.44.0` | — | base transports (§5.3) | as above | MIT | as above |
-| `libp2p-noise` `0.46.1`, `libp2p-tls` `0.6.2`, `libp2p-yamux` `0.47.0` | — | security and muxer upgrades (mandatory for relay, §5.3) | as above | MIT | as above |
-| `libp2p-gossipsub` | `0.49.5` | lobby topics (§6) | as above | MIT | as above |
-| `libp2p-identify` `0.47.0`, `libp2p-ping` `0.47.0` | — | address candidates, liveness (§5.5) | as above | MIT | as above |
-| `libp2p-autonat` `0.15.0`, `libp2p-dcutr` `0.14.1`, `libp2p-relay` `0.21.1` | — | reachability, hole punching, relay (§9) | as above | MIT | as above |
-| `libp2p-request-response` | `0.29.0` | snapshot RPC (§7), join RPC (§8.4) | as above | MIT | as above |
-| `libp2p-mdns` `0.48.0`, `libp2p-upnp` `0.5.0` | — | LAN discovery (§9.8), IGD mapping (§9.9) | as above | MIT | as above |
-| `libp2p-connection-limits` `0.6.0`, `libp2p-memory-connection-limits` `0.5.0`, `libp2p-allow-block-list` `0.6.0` | — | resource limits, and the **user-populated** block list of §11.5 — never populated by a protocol proof (§0.1) | as above | MIT | as above |
-| **`libp2p-stream`** | **`0.4.0-alpha`** | per-table streams (§8.1) | as above | MIT | **unaudited and semver-exempt.** An alpha crate carries no stability guarantee; contained behind the §1.3 trait so replacing it is a one-file change |
+| `libp2p` (umbrella) | `0.57.0` | transport, encryption, NAT traversal, gossip, relay | `github.com/libp2p/rust-libp2p` | MIT | RUSTSEC-2022-0084 (resource-management DoS) patched at `>= 0.45.1`; pinned version is patched |
+| `libp2p-core` | `0.44.0` | transport traits, upgrades | as above | MIT | RUSTSEC-2019-0004 patched `>= 0.8.1`, RUSTSEC-2022-0009 patched `>= 0.31.1`; both far below the pinned version |
+| `libp2p-identity` | `0.3.0` | `PeerId`, `Keypair` | as above | MIT | no advisory in the local advisory database |
+| `libp2p-swarm` `0.48.0`, `libp2p-swarm-derive` `0.36.0` | — | swarm driver, `#[derive(NetworkBehaviour)]` | as above | MIT | as above |
+| `libp2p-quic` `0.14.0`, `libp2p-tcp` `0.45.0`, `libp2p-dns` `0.45.0` | — | base transports (§5.3) | as above | MIT | as above |
+| `libp2p-noise` `0.47.0`, `libp2p-tls` `0.7.0`, `libp2p-yamux` `0.48.0` | — | security and muxer upgrades (mandatory for relay, §5.3) | as above | MIT | as above |
+| `libp2p-gossipsub` | `0.50.0` | lobby topics (§6) | as above | MIT | as above |
+| `libp2p-kad` | `0.49.0` | the lobby rendezvous and the relay namespace on the public DHT (§3, §11.4) | as above | MIT | as above |
+| `libp2p-identify` `0.48.0`, `libp2p-ping` `0.48.0` | — | address candidates, liveness (§5.5) | as above | MIT | as above |
+| `libp2p-autonat` `0.16.0`, `libp2p-dcutr` `0.15.0`, `libp2p-relay` `0.22.0` | — | reachability, hole punching, relay (§9) | as above | MIT | as above |
+| `libp2p-request-response` | `0.30.0` | snapshot RPC (§7), join RPC (§8.4) | as above | MIT | as above |
+| `libp2p-mdns` `0.49.0`, `libp2p-upnp` `0.7.0` | — | LAN discovery (§9.8), IGD mapping (§9.9) | as above | MIT | as above |
+| `libp2p-connection-limits` `0.7.0`, `libp2p-memory-connection-limits` `0.6.0`, `libp2p-allow-block-list` `0.7.0` | — | resource limits, and the **user-populated** block list of §11.5 — never populated by a protocol proof (§0.1) | as above | MIT | as above |
+| `libp2p-metrics` | `0.18.0` | enabled as the umbrella's `metrics` feature; nothing in `src/` reads it | as above | MIT | as above |
+| **`libp2p-stream`** | **`0.5.0-alpha`** | per-table streams (§8.1) | as above | MIT | **unaudited and semver-exempt.** An alpha crate carries no stability guarantee; contained behind the §1.3 trait so replacing it is a one-file change |
 | ~~`mainline`~~ | ~~`=8.0.0`~~ | **Removed in `56b0b50`.** The row is kept because the reason for the `=` pin is worth keeping: §11.4 depended on crate internals (`RequestFilter`, adaptive server mode) that are not semver-stable. `libp2p-kad` replaces it and this client pins none of its internals — the one thing §11.4 now depends on, `set_mode`, is public API. | — | — | — |
-| `web-time` | `1` | `Instant` in the `RateLimiter` signature (§9.6) | `github.com/daxpedda/web-time` | MIT OR Apache-2.0 | no advisory in the local advisory database |
+| `web-time` | `1.1.0` | `Instant` in the `RateLimiter` signature (§9.6). In the lock through libp2p and not a direct dependency: the named rate limiter §9.6 specifies is not built | `github.com/daxpedda/web-time` | MIT OR Apache-2.0 | no advisory in the local advisory database |
 
-The two entries a reader must not skip are **`libp2p-stream 0.4.0-alpha`** here
+The two entries a reader must not skip are **`libp2p-stream 0.5.0-alpha`** here
 and **`ziffle 0.1.0`** in `CRYPTOGRAPHY.md` §9: those are the corpus's two
 unaudited, semver-unstable dependencies, and they are flagged explicitly in both
 places.
 
-> Verification: [SOURCE] `license` and `repository` fields read from each crate's
-> own `Cargo.toml` under
-> `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`;
-> advisories read from the local RustSec advisory database under
-> `~/.cargo/advisory-db/crates/`. **No `cargo audit` run has been performed
-> against the assembled transport tree** — the tree does not exist yet, there is
-> no `Cargo.lock`, and the statements above are per-crate lookups, not a tree
-> audit. The tree audit is `docs/DEPENDENCIES.md`'s CI job (D-2), Phase 7.
+> Verification: [SOURCE] versions read from `Cargo.lock` on 2026-09-15, and
+> `license` and `repository` fields from each crate's own `Cargo.toml` at that
+> version under `~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`;
+> advisories from the local RustSec database under `~/.cargo/advisory-db/crates/`
+> (updated 2026-09-14), where nothing matches a version in this table. These are
+> per-crate lookups. **The tree audit of record is `DEPENDENCIES.md` §4**, the
+> complete `cargo audit` result; this note said until 2026-09-15 that no audit had
+> been run because the tree and `Cargo.lock` did not exist yet, which stopped being
+> true long before.
 
 ### 5.2 Features
 
 ```toml
-libp2p = { version = "0.56.0", features = [
+libp2p = { version = "0.57.0", features = [
     "tokio", "macros",
     "quic", "tcp", "noise", "tls", "yamux", "dns",
-    "gossipsub", "kad", "identify", "ping", "autonat", "dcutr", "relay",
+    "gossipsub", "kad", "identify", "ping", "autonat", "dcutr", "relay", "mdns",
     "request-response", "cbor",
-    "mdns", "upnp", "memory-connection-limits",
-    "ed25519", "serde",
+    "upnp", "metrics", "memory-connection-limits",
+    "ed25519",
+    "rsa",
+    "serde",
 ] }
-libp2p-stream = "0.4.0-alpha"
+libp2p-stream = "0.5.0-alpha"
 ```
+
+This is `Cargo.toml`'s block as it stands, copied on 2026-09-15; until then this
+section showed the 0.56 block without `metrics` and `rsa`. **`rsa` is needed and
+used for nothing else:** the public entry points onto the libp2p network still
+have `Qm…` peer ids, multihashes of RSA public keys, and without the feature their
+TLS certificate cannot be verified — which fails as *invalid peer certificate:
+UnknownIssuer* and reads like a broken certificate. **`metrics`** is enabled and
+nothing in `src/` reads it (§5.1.1).
 
 `kad` **is** enabled, and it is the discovery mechanism (§5.7). Until 2026-09-15
 this block left it out, said *"`kad` is not enabled in v1"* and carried a
@@ -1626,8 +1671,8 @@ commented-out `mainline = "=8.0.0"` line; that crate left the build in `56b0b50`
 ### 5.3 Why QUIC first and TCP anyway
 
 QUIC is the primary transport: UDP (so hole punching is possible at all — and
-`libp2p-quic 0.13.1` has a real `hole_punching` module wired into the transport
-[SOURCE]), 1-RTT handshake, native stream multiplexing with no head-of-line
+`libp2p-quic 0.14.0` has a real `hole_punching` module wired into the transport,
+`src/lib.rs:65` and `src/transport.rs:324` [SOURCE]), 1-RTT handshake, native stream multiplexing with no head-of-line
 blocking across per-table streams.
 
 TCP stays in the build for three structural reasons, not as a preference:
@@ -1680,8 +1725,9 @@ pointers** (`noise::Config::new`, not `noise::Config::new()`), and once
 argument** — the ready-made `relay::client::Behaviour` — which must be stored in
 the behaviour struct or the relay transport is dead.
 
-`with_idle_connection_timeout` is set to 60 s deliberately: the default is much
-shorter and silently closes lobby connections that are merely quiet. `ping` keeps
+`with_idle_connection_timeout` is set to 60 s (`IDLE_CONNECTION_TIMEOUT_MS`)
+deliberately: the default is 10 s (`libp2p-swarm-0.48.0/src/connection/pool.rs:1018`)
+and silently closes lobby connections that are merely quiet. `ping` keeps
 NAT mappings warm; consumer-router UDP mappings commonly expire in 30–120 s, so the
 keep-alive interval must stay well under 30 s and `ping`'s default is suitable —
 do not raise it.
@@ -1724,6 +1770,17 @@ it, and on success emits `ToSwarm::ExternalAddrConfirmed`; `dcutr` consumes the
 same event to fill its LRU(20) of hole-punch candidates. Without `identify` in the
 behaviour, neither AutoNAT v2 nor DCUtR ever sees a candidate and both are inert.
 
+**Which address `identify` offers changed with `libp2p-identify 0.48.0`** (its
+changelog's *"check actual port reuse instead of original intent"*). In 0.47.0 an
+observed address was translated to a listening port only for an outbound
+connection dialled from an ephemeral port, and offered raw otherwise, inbound
+connections included. In 0.48.0 it is offered raw when its port matches one this
+node listens on — and not at all if it is already a confirmed external address —
+and otherwise translated to each listening port of the same transport, raw only
+if translation yields nothing (`src/behaviour.rs:350-395`). The chain above is
+unchanged; what feeds AutoNAT's probes and DCUtR's LRU is, for inbound
+connections especially.
+
 **`libp2p::autonat::Behaviour` silently means v1.** The crate re-exports v1 at the
 module root. Only `autonat::v2::*` paths may appear in our source; enforce it as a
 review rule.
@@ -1733,7 +1790,11 @@ review rule.
 > table stream protocol, and binds both listeners. `cargo check` finishes clean;
 > `cargo run` prints `ALL OK`. [SOURCE] the candidate chain, `LIBP2P.md` §3 with
 > file:line references into `libp2p-identify-0.47.0`, `libp2p-autonat-0.15.0` and
-> `libp2p-dcutr-0.14.1`.
+> `libp2p-dcutr-0.14.1` — the probe's versions, and the research note's line
+> numbers stay theirs. Re-read on 2026-09-15 against `libp2p-identify-0.48.0`
+> (`src/behaviour.rs:350-395`, the change above), `libp2p-autonat-0.16.0` and
+> `libp2p-dcutr-0.15.0` (`src/behaviour.rs:341-342` feeds `address_candidates`,
+> an `LruCache::new(20)` at `:364`): the chain holds in all three.
 
 ### 5.6 Persistent identity, and the publish filter
 
@@ -1755,8 +1816,9 @@ measured being advertised, dialled, and burning a full handshake timeout
 
 > Verification: [COMPILED+RUN] keypair round trip in `probe-netstack`
 > (`persistent identity round-trip OK (68 bytes)`); [SOURCE]
-> `libp2p-identity-0.2.14/src/keypair.rs`; [MEASURED] `NAT_AND_DISCOVERY.md`
-> §2.4(ii), §5.3.
+> `libp2p-identity-0.3.0/src/keypair.rs:215, 257` (the pair, unchanged in
+> signature and line from the `0.2.14` the probe used); [MEASURED]
+> `NAT_AND_DISCOVERY.md` §2.4(ii), §5.3.
 
 ### 5.7 libp2p Kademlia is the discovery mechanism
 
@@ -1773,7 +1835,7 @@ Two behaviours, and only one of them runs:
 * **`ipfs_kad`** — the public Amino DHT, the same network Kubo and go-libp2p are
   on. It is what `start_providing` and `get_providers` are called against, and
   it is the lobby. §3 specifies the key.
-* **`kademlia`** — a private table under `/p2p-poker/kad/1` (`swarm.rs:126`). It
+* **`kademlia`** — a private table under `/p2p-poker/kad/1` (`swarm::PokerBehaviour::kademlia`). It
   is constructed and **never driven**: no `set_mode`, no query, no record. It
   costs a behaviour slot and does nothing, and this document says so rather than
   leaving a reader to infer a design from a field name.
@@ -1876,6 +1938,16 @@ Subscription flooding is bounded with
 `Behaviour::new_with_subscription_filter` and a `MaxCountSubscriptionFilter` /
 `WhitelistSubscriptionFilter` over our two topic names, so a peer cannot subscribe
 us into thousands of junk topics.
+
+> **What runs is not that, and the crate's default now does most of it (noted
+> 2026-09-15).** `net::swarm` builds `gossipsub::Behaviour::new`, whose filter type
+> defaults to `MaxCountSubscriptionFilter<AllowAllSubscriptionFilter>`. From
+> `libp2p-gossipsub 0.50.0` that default caps a peer at **100** subscribed topics
+> and **100** subscriptions per request, down from **2000** and **2000** in
+> `0.49.5` (`src/subscription_filter.rs:169-170` in both); a peer over the cap has
+> its whole subscription message ignored. A whitelist over two names would now be
+> wrong as well as unbuilt: the lobby's slice topics (`S1-EX`,
+> `/p2p-poker/lobby/1/<slice>`) are topics of ours it would refuse.
 
 > Verification: [COMPILED+RUN] the whole builder chain plus `subscribe` on both
 > topics in `probe-netstack`; [RESEARCH+SOURCE] `LIBP2P.md` §6 for the defaults and
@@ -1994,11 +2066,12 @@ likewise produces nothing here.
 
 `Behaviour::with_peer_score(PeerScoreParams, PeerScoreThresholds)` exists and is
 callable; `set_topic_params` installs per-topic parameters
-[SOURCE `libp2p-gossipsub-0.49.5/src/behaviour.rs:922,954`]. It compiles and runs
-with the defaults in `probe-netstack`.
+[SOURCE `libp2p-gossipsub-0.50.0/src/behaviour.rs:1051,1083`, lines 922 and 954 in
+the `0.49.5` the probe used]. It compiles and runs with the defaults in
+`probe-netstack`.
 
 But **the defaults do almost nothing for us**: `PeerScoreParams::default()` has
-`topics: HashMap::new()` [SOURCE `src/peer_score/params.rs:164-183`], so the
+`topics: HashMap::new()` [SOURCE `src/peer_score/params.rs:164-183`, byte-identical in `0.50.0`], so the
 per-topic terms — including P₄, `invalid_message_deliveries_weight`, the term a
 `Reject` actually feeds — contribute **zero** until a `TopicScoreParams` is
 installed for each topic. Only `app_specific_weight`, IP-colocation
@@ -2042,7 +2115,7 @@ let snapshot = request_response::Behaviour::with_codec(
 ```
 
 The size caps are **mandatory overrides**: the codec defaults are 1 MiB request /
-10 MiB response [SOURCE `libp2p-request-response-0.29.0/src/cbor.rs:78`], far too
+10 MiB response [SOURCE `libp2p-request-response-0.30.0/src/cbor.rs:77-78`], far too
 generous for a lobby snapshot and a free memory-exhaustion lever. The request
 payload is ~45 B and capped by `PROTOCOL.md` §9.3, so `SNAPSHOT_REQ_MAX` is
 envelope headroom and nothing more; slack in a request cap is DoS surface, not
@@ -2050,7 +2123,11 @@ safety margin.
 
 > Verification: [COMPILED+RUN] exactly this construction, for both the snapshot and
 > the join protocol, in `probe-netstack`; [SOURCE] `with_codec` at
-> `libp2p-request-response-0.29.0/src/lib.rs:395`, the setters at `src/cbor.rs:97,103`.
+> `libp2p-request-response-0.30.0/src/lib.rs:395`, the setters at `src/cbor.rs:96,102`
+> (`0.29.0`: 395 and 97, 103). One change in `0.30.0` touches a custom codec only:
+> the `Codec` trait no longer uses `#[async_trait]` and its methods return
+> `impl Future` (`src/codec.rs:38-69`); the `cbor` codec above is the crate's own
+> and is used unchanged.
 
 ### 7.2 Who is asked, and how many
 
@@ -2229,12 +2306,21 @@ Three operational rules that follow from the crate:
   negotiations fail — hold it for the process lifetime.
 * `OpenStreamError` is `#[non_exhaustive]`; a wildcard arm is mandatory.
 
-The crate is **`0.4.0-alpha` and semver-exempt**. It is contained behind the
+The crate is **`0.5.0-alpha` and semver-exempt**. It is contained behind the
 `net/streams.rs` trait (§1.3) so that replacing it is a one-file change.
 
 > Verification: [COMPILED+RUN] `new_control()` and `accept(TABLE_PROTOCOL)` in
 > `probe-netstack`; [RESEARCH] `LIBP2P.md` §7 for the backpressure and
-> de-registration behaviour and the alpha risk.
+> de-registration behaviour and the alpha risk. Re-read on 2026-09-15 against
+> `libp2p-stream-0.5.0-alpha` (the probe had `0.4.0-alpha`): `new_control` at
+> `src/behaviour.rs:44`, `accept` at `src/control.rs:70-73`, `open_stream` at
+> `:44-48` dialling a disconnected peer through the behaviour
+> (`src/behaviour.rs:136-137`), `OpenStreamError` `#[non_exhaustive]` at
+> `src/control.rs:80-81`, and the README's warnings — streams dropped when the
+> application falls behind, the protocol de-registered when the handle is dropped
+> — word for word as before. There is no `Drop` impl behind the second: a closed
+> channel is pruned (`src/shared.rs:56-57`), and the channel holds no buffer, so a
+> stream that finds it full is dropped (`:63`, `:87-88`).
 
 ### 8.2 Topology: full mesh, and it is a security requirement
 
@@ -2324,16 +2410,18 @@ the same terms as a directly received one.
 ### 9.1 The structural finding that orders everything else
 
 **DCUtR only engages on a connection that is already relayed.**
-`libp2p-dcutr-0.14.1` installs its real handler only when `is_relayed(addr)` —
+`libp2p-dcutr-0.15.0` installs its real handler only when `is_relayed(addr)` —
 literally `addr.iter().any(|p| p == Protocol::P2pCircuit)` — and installs
 `dummy::ConnectionHandler` otherwise. So: no relay ⇒ no DCUtR ⇒ no coordinated hole
 punch. A relay is on the critical path for *establishing* many NAT-to-NAT
 connections even when the resulting connection ends up fully direct.
 
-> Verification: [SOURCE] `libp2p-dcutr-0.14.1/src/behaviour.rs:179,214,385`
-> (`handle_established_{in,out}bound_connection`), `:45` for
-> `MAX_NUMBER_OF_UPGRADE_ATTEMPTS = 3`, `:340,355-386` for the candidate LRU fed
-> only by `FromSwarm::NewExternalAddrCandidate`.
+> Verification: [SOURCE] `libp2p-dcutr-0.15.0/src/behaviour.rs:180,215,386-387`
+> (`handle_established_{in,out}bound_connection` and `is_relayed`), `:46` for
+> `MAX_NUMBER_OF_UPGRADE_ATTEMPTS = 3`, `:341,356-387` for the candidate LRU fed
+> only by `FromSwarm::NewExternalAddrCandidate`. Every line is one below its
+> `0.14.1` number (179, 214, 385, 45, 340, 355-386) and none changed; what feeds
+> the LRU did change, through `identify` (§5.5).
 
 This does **not** contradict D-004 layer 1: blind *mutual dialling* needs no relay
 at all, because the DHT delivers both addresses to both peers symmetrically. Layer
@@ -2356,8 +2444,9 @@ layer 2, and layer 2 needs a relay.
 
 ### 9.2 AutoNAT: v2 only
 
-`libp2p 0.56.0`'s single `autonat` feature enables **both** v1 and v2 (the
-sub-crate's `default = ["v1","v2"]` and the umbrella does not disable defaults).
+`libp2p 0.57.0`'s single `autonat` feature enables **both** v1 and v2 (the
+sub-crate's `default = ["v1","v2"]`, `libp2p-autonat-0.16.0/Cargo.toml:47-50`, and
+the umbrella does not disable defaults) — as `0.56.0`'s did.
 We use **v2 only**:
 
 * v1 stayed `Unknown` with `confidence: 0` for the entire measured run, because
@@ -2377,7 +2466,15 @@ answering AutoNAT probes for others costs almost nothing and the network needs
 servers to exist.
 
 > Verification: [COMPILED+RUN] both behaviours constructed in `probe-netstack`;
-> [MEASURED + SOURCE] `NAT_AND_DISCOVERY.md` §2.2–§2.4, `LIBP2P.md` §3.
+> [MEASURED + SOURCE] `NAT_AND_DISCOVERY.md` §2.2–§2.4, `LIBP2P.md` §3. Re-read on
+> 2026-09-15 against `libp2p-autonat-0.16.0`: v1's `boot_delay` 15 s,
+> `retry_interval` 90 s and `only_global_ips: true` (`src/v1/behaviour.rs:95, 96,
+> 105`), v2's client defaults `max_candidates: 10` and `probe_interval` 5 s
+> (`src/v2/client/behaviour.rs:54-55`), and the server's dial-back on a freshly
+> allocated port (`src/v2/server/behaviour.rs:116-120`), all as stated. One default
+> did change — both v2 behaviours now default their random generator to `StdRng`
+> where the client's was `OsRng` — and it does not reach this client, which hands
+> the client its own OS generator (`net::swarm::build`).
 
 ### 9.3 Reachability classes and what each can do
 
@@ -2394,7 +2491,7 @@ servers to exist.
 
 ### 9.4 DCUtR, with the honest numbers
 
-`libp2p-dcutr 0.14.1`. Public surface is `Behaviour::new(local_peer_id)` and a
+`libp2p-dcutr 0.15.0`. Public surface is `Behaviour::new(local_peer_id)` and a
 single `Event { remote_peer_id, result: Result<ConnectionId, Error> }` — there is
 no "attempt started" signal.
 
@@ -2409,8 +2506,11 @@ Regional variance is severe: individual reporters saw 1–10 %, and one saw zero
 across ten people, both attributed to symmetric NAT prevalence. **A 70 % global
 average can be near zero for a specific pair of players.**
 
-`MAX_NUMBER_OF_UPGRADE_ATTEMPTS = 3`, then `Err(AttemptsExceeded(3))` and the
-connection stays relayed. "Still relayed" is a normal steady state and must be
+`MAX_NUMBER_OF_UPGRADE_ATTEMPTS = 3`, then the event's `Err` and the connection
+stays relayed. The attempts-exceeded cause is a variant of a private enum inside
+the public `Error`, so it can be read only from the message, *Giving up after 3
+dial attempts* (`src/behaviour.rs:55-69`, `:128-140`, unchanged from `0.14.1`
+apart from a line's shift). "Still relayed" is a normal steady state and must be
 shown as such (§2.2), never as an error.
 
 > Verification: [RESEARCH] `NAT_AND_DISCOVERY.md` §4 and §4.1 (paper fetched;
@@ -2447,7 +2547,7 @@ revision of this row compared *table-wide* shuffle traffic (~18 KB heads-up,
 table is a full mesh (§8.2), so one circuit connects exactly one pair and carries
 only those two peers' own steps and proofs. The second correction is the
 *direction*, and it halves the budget: **`max_circuit_bytes` is not per
-direction.** `libp2p-relay 0.21.1` relays a circuit with a single `CopyFuture`
+direction.** `libp2p-relay 0.22.0` relays a circuit with a single `CopyFuture`
 holding one `bytes_sent: u64`, and **both** `forward_data` calls — src→dst and
 dst→src — increment that one counter before it is compared against the cap. The
 crate's own quickcheck asserts the failure condition as `a.len() + b.len() >
@@ -2531,9 +2631,11 @@ The client **must read the `Limit` the relay returns** rather than assume:
 InboundCircuitEstablished}` all carry `limit: Option<Limit>` with public
 `duration()` / `data_in_bytes()` accessors. **`data_in_bytes()` is the same
 bidirectional total**: the relay fills the wire field from its own
-`max_circuit_bytes` (`src/protocol/inbound_hop.rs:83,136`) and `Limit` copies it
+`max_circuit_bytes` (`src/protocol/inbound_hop.rs:85,138`) and `Limit` copies it
 verbatim (`src/protocol.rs:41,49,58`), so the number a relay returns must be
-compared against both directions summed, never against one.
+compared against both directions summed, never against one. `Limit` itself is not
+re-exported — its module is private — so the value is read off the event fields and
+the type cannot be named in this client's code.
 
 A circuit whose advertised limits cannot carry a hand must not be used to sit
 down over — **and under D-012 that sentence needs its subject stated, because a
@@ -2566,14 +2668,18 @@ Several relay **server** `Event` variants (`ReservationReqAcceptFailed`,
 `ReservationReqDenyFailed`, `CircuitReqDenyFailed`, `CircuitReqOutboundConnectFailed`,
 `CircuitReqAcceptFailed`) are `#[deprecated]` upstream — build no logic on them.
 
-> Verification: [SOURCE] `libp2p-relay-0.21.1/src/protocol.rs:31-36,39-52`,
+> Verification: [SOURCE] `libp2p-relay-0.22.0/src/protocol.rs:31-36,39-52`,
 > `src/behaviour.rs:163` (`impl Default for Config`, `max_circuit_bytes: 1 << 17`),
-> `src/priv_client/transport.rs:266-300`; **the bidirectional accounting** in
+> `src/priv_client/transport.rs:266-313` (address parsing, the
+> multiple-`p2p-circuit` refusal at `:276-281`); **the bidirectional accounting** in
 > `src/copy_future.rs:41-48` (one `bytes_sent: u64` on `CopyFuture`), `:78` (the
-> single comparison), `:88-95` and `:97-104` (both `forward_data` calls increment
+> single comparison), `:88-96` and `:98-106` (both `forward_data` calls increment
 > that one counter), and `:241` (the crate's own quickcheck asserting
 > `a.len() + b.len() > max_circuit_bytes`); the returned `Limit` in
-> `src/protocol/inbound_hop.rs:83,136` and `src/protocol.rs:41,49,58`.
+> `src/protocol/inbound_hop.rs:85,138` and `src/protocol.rs:41,49,58`. Re-read
+> 2026-09-15 against 0.22.0: `protocol.rs` and `copy_future.rs` are unchanged
+> from 0.21.1 apart from test formatting, so the accounting and the figures below
+> stand as they were measured.
 > [COMPILED+RUN] the multiaddr round trips in `LIBP2P.md` §4; [RESEARCH] D-001
 > addendum for the kubo defaults, `MENTAL_POKER.md` §5.1 for the per-hand bytes.
 
@@ -2595,6 +2701,18 @@ reservation through you.*
 Slot and bandwidth ceilings are user-visible and user-settable, and the network
 status panel shows how many peers are currently being relayed.
 
+> **The client is not this section, checked 2026-09-15 (`S1-FK`).** Every client
+> is built with `RelayRole::Volunteer`, and there is no setting, no disclosure
+> and no count of relayed peers. `swarm::relay_config` pushes no
+> `PokerPeersOnly` — nothing in `src/` implements `libp2p::relay::RateLimiter` —
+> so the crate's own per-peer and per-IP limiters are the whole of the
+> admission. Its numbers are 128 reservations (4 per peer), 64 circuits (4 per
+> peer, `RELAY_MAX_CIRCUITS_PER_PEER`), an hour per circuit
+> (`RELAY_RESERVATION`) and `RELAY_MAX_CIRCUIT_BYTES`, not the block below. A
+> client with a confirmed external address therefore serves any libp2p peer
+> within those numbers: the open relay the next paragraph describes. What
+> follows is what D-002 requires, not what runs.
+
 **The trap: Circuit Relay v2 is not protocol-selective.** `HOP_PROTOCOL_NAME` and
 `STOP_PROTOCOL_NAME` are compile-time constants
 (`/libp2p/circuit/relay/0.2.0/hop`, `/stop`) and cannot be renamed, and the
@@ -2605,7 +2723,7 @@ there is no application ACL hook. Left alone, enabling the server makes the user
 **The usable hook** is `Config::reservation_rate_limiters` and
 `Config::circuit_src_rate_limiters`. The module `behaviour::rate_limiter` is
 `pub(crate)`, but the trait itself is **re-exported at the crate root**
-(`libp2p-relay-0.21.1/src/lib.rs:42`), so `libp2p::relay::RateLimiter` is a public,
+(`libp2p-relay-0.22.0/src/lib.rs:42-44`), so `libp2p::relay::RateLimiter` is a public,
 nameable, implementable trait:
 
 ```rust
@@ -2660,17 +2778,26 @@ stated fields are corrections rather than choices:
 
 * **`max_circuits_per_peer = 9` is forced.** A relayed peer at a ten-seat table
   needs one circuit per table-mate (§8.2 full mesh, `MAX_SEATS − 1`). The crate
-  default of 4 refuses the fifth, so the D-002 relay as previously written could
-  not carry the case it exists for.
+  refuses a circuit when the *requesting* peer is already an end — source or
+  destination — of **more** than `max_circuits_per_peer` circuits
+  (`src/behaviour.rs:694-695`, `num_circuits_of_peer` at `:946-951`), so the
+  default of 4 refuses a peer's sixth, and the D-002 relay as previously written
+  could not carry the case it exists for. Because the comparison is `>`, 9 admits
+  a peer's tenth: one spare over the nine a full table needs. Until 2026-09-15
+  this bullet said the default *refuses the fifth*, which reads the check as `>=`;
+  the conclusion was right and the count one short.
 * **`max_circuits = 128`** lets one volunteer serve roughly 14 relayed peers at
   full tables (128 / 9), which is the number the consent disclosure above is about.
 
-> Verification: [SOURCE] `libp2p-relay-0.21.1/src/lib.rs:42` (the `RateLimiter`
-> re-export), `src/behaviour/rate_limiter.rs:38` (the trait), `:56` (the blanket
-> impl), `src/behaviour.rs:124-166` (`impl Default for Config`, giving
-> `max_reservations 128`, `max_reservations_per_peer 4`, `reservation_duration`
-> 1 h, `max_circuits 16`, `max_circuits_per_peer 4`, `max_circuit_duration` 2 min,
-> `max_circuit_bytes: 1 << 17`), `src/behaviour/handler.rs:415-450` (the limits
+> Verification: [SOURCE] `libp2p-relay-0.22.0/src/lib.rs:42-44` (the `RateLimiter`
+> re-export), `src/behaviour/rate_limiter.rs:38-39` (the trait and `try_next`),
+> `:56` (the blanket impl), `src/behaviour.rs:124-166` (`impl Default for Config`,
+> giving `max_reservations 128`, `max_reservations_per_peer 4`,
+> `reservation_duration` 1 h, `max_circuits 16`, `max_circuits_per_peer 4`,
+> `max_circuit_duration` 2 min, `max_circuit_bytes: 1 << 17`, and in both limiter
+> vectors a per-peer limiter of 30 tokens refilled one per 2 min and a per-IP one of
+> 60 refilled one per minute), `:562-583` and `:694-703` (the admission checks,
+> `>` per peer and `>=` in total), `src/behaviour/handler.rs:428-463` (the limits
 > handed to each circuit). [COMPILED+RUN] `probe-netstack` builds a `relay::Config`
 > with both rate-limiter vectors populated over a shared admitted-peer set,
 > `relay::Behaviour::new` accepts it, and the swarm builds and runs. D-002
@@ -2678,6 +2805,22 @@ stated fields are corrections rather than choices:
 > the closure form; the named-type form above has not itself been compiled** —
 > it is the same trait and the blanket impl proves the signature, but that is an
 > inference, and Phase 7 must compile it.
+>
+> **One behaviour arrived with 0.22.0 that this section must carry.** A relay
+> server now starts with its hop protocol **not advertised** (`Status::Disable`,
+> `src/behaviour.rs:319`; the handler denies inbound hop streams while disabled,
+> `src/behaviour/handler.rs:522`) and turns advertisement on by itself once the
+> swarm holds a confirmed external address (`:366-405`), or when
+> `set_status(Some(..))` says so (`:329`); the change is reported as
+> `Event::StatusChanged` (`:251`), so a match over every `relay::Event` variant
+> has one more to name. For D-002 it is close to the rule this section wants —
+> only a confirmed-reachable client offers a relay — and not the same rule: the
+> crate counts **any** confirmed external address, and a client behind a NAT
+> holds one as soon as a relay accepts its reservation, because the relay client
+> confirms the circuit address (`src/priv_client.rs:308`). Relayed inbound
+> connections get a handler that denies every stream
+> (`src/behaviour.rs:469-471`), so such a client serves the hop protocol only over
+> a direct connection — the LAN, or one DCUtR has upgraded.
 
 #### Settling the open decision: relay admission
 
@@ -2756,14 +2899,25 @@ only for this application" means "only for peers claiming to run this applicatio
 **A race that must be handled.** `PokerPeersOnly::try_next` runs when the
 reservation request arrives, and it can arrive before `identify` has completed on that
 connection, in which case an honest peer is denied. And a denied reservation is not
-retried for us: on a reservation error the client handler sets its reservation
-state back to `None` and forwards the error to the transport listener, which does
-`self.close(Err(Error::Reservation(e)))` and emits `TransportEvent::ListenerClosed`
-[SOURCE `libp2p-relay-0.21.1/src/priv_client/handler.rs:292-298,515-517`,
-`src/priv_client/transport.rs:408,331-341`]. So **the application must observe
+retried for us: on a reservation error the client handler forwards the error to
+the transport listener and sets its reservation state back to `None`, and the
+listener does `self.close(Err(Error::Reservation(e)))` and emits
+`TransportEvent::ListenerClosed`
+[SOURCE `libp2p-relay-0.22.0/src/priv_client/handler.rs:297-303,521-523`,
+`src/priv_client/transport.rs:408,334-345`]. So **the application must observe
 `SwarmEvent::ListenerClosed` for a circuit listener and re-issue `listen_on` with
 backoff itself.** Whether the race actually occurs in practice, and with what
 frequency, is unmeasured — carried as OQ-6.
+
+Since `libp2p-relay 0.22.0` the client behaviour also acts on a closed circuit
+listener by itself: it expires that listener's external address
+(`ToSwarm::ExternalAddrExpired`, unless another listener still uses the same
+connection) and resets the connection's reservation state
+(`src/priv_client.rs:173-205`, `src/priv_client/handler.rs:255-257`). A re-issued
+`listen_on` therefore starts from a clean reservation, and a circuit address this
+client no longer holds leaves the swarm's external set: it is gone at once from the
+`identify` banner and from the record `libp2p-kad` hands out when asked, and from
+the next `ADD_PROVIDER` this client sends (§10.1 says when that is).
 
 ### 9.7 The four layers of D-004, mapped onto mechanisms
 
@@ -2823,9 +2977,12 @@ from what we *publish*.
 
 `libp2p::upnp::tokio::Behaviour` (IGD port mapping) is enabled as a best-effort
 nicety: when it works, the client becomes publicly reachable and helps everyone.
-It is never depended on. `libp2p-upnp 0.6.0` exists but is outside the umbrella's
-`^0.5.0` range; staying on 0.5.0 is fine because AutoNAT + DCUtR + relay is the
-real path.
+It is never depended on, because AutoNAT + DCUtR + relay is the real path. The
+umbrella `libp2p 0.57.0` requires `^0.7.0` and `Cargo.lock` resolves
+`libp2p-upnp 0.7.0`; until 2026-09-15 this paragraph said `0.6.0` existed outside
+the old umbrella's `^0.5.0` range, which was true of `0.56.0` and is moot now.
+`0.6.0`'s one API change, kept in `0.7.0`, makes the external-address events
+struct variants carrying both the local and the external address.
 
 ---
 
@@ -2848,11 +3005,11 @@ record that outlives the old one by a factor of about sixty.
 
 | Parameter | Value | Basis |
 |---|---|---|
-| Provider record TTL | **48 h** | `libp2p-kad 0.48.0` `behaviour.rs:233` [SOURCE] |
-| Re-announce interval | **12 h**, and the crate runs it | `behaviour.rs:232`, `jobs.rs:268-279` [SOURCE] |
+| Provider record TTL | **48 h** | `libp2p-kad 0.49.0` `behaviour.rs:232` [SOURCE] (233 in `0.48.0`) |
+| Re-announce interval | **12 h**, and the crate runs it | `behaviour.rs:231`, `jobs.rs:268-279` [SOURCE] |
 | First re-announce | **now + 12 h**, not now | `AddProviderJob::new` sets its first deadline a full interval out [SOURCE] |
 | Explicit announce | the moment an external address first exists, then every **300 s** until confirmed | `run::LobbyAnnounce`, `REANNOUNCE_EVERY`. Until 2026-09-15 this row read *once … latched by `in_public_lobby`*, and the latch was the defect (`S1-FI`) |
-| Re-run `get_providers` | **every 60 s** | `run.rs:656`, `run.rs:2264` |
+| Re-run `get_providers` | **every 60 s** | `run::run`'s discovery timer |
 | Un-announce | **never, and it could not help** | `stop_providing` is never called, and is documented local-only: remote copies run their own 48 h clock (`behaviour.rs:1047-1054`) [SOURCE] |
 
 Three consequences follow, and none of them is the old section's.
@@ -2908,7 +3065,7 @@ remotely — it is the reason the discovery loop dials at most
 contains, and it is a disclosure, which §3.5 states.
 
 **The 45-minute figure and `OQ-1` are both obsolete, and their replacement is
-not measured.** 48 h and 12 h are `libp2p-kad 0.48.0`'s **own** defaults. The
+not measured.** 48 h and 12 h are `libp2p-kad`'s **own** defaults, the same in `0.48.0` and `0.49.0`. The
 nodes that actually store our record on the Amino DHT are overwhelmingly
 go-libp2p, whose `ProvideValidity` governs the real lifetime, and that constant
 was not read here. So the operative TTL is **[UNMEASURED]**, and the honest
@@ -3026,7 +3183,8 @@ connections once the process holds a quarter of system memory.
 exists during a DCUtR upgrade, and no more.
 
 > Verification: [COMPILED+RUN] in `probe-netstack`; [SOURCE] the six setter names at
-> `libp2p-connection-limits-0.6.0/src/lib.rs:188-224`.
+> `libp2p-connection-limits-0.7.0/src/lib.rs:189-225` (188-224 in `0.6.0`), and
+> `with_max_percentage` at `libp2p-memory-connection-limits-0.6.0/src/lib.rs:99`.
 
 ### 11.2 Discovery budget
 
@@ -3039,8 +3197,8 @@ built it" is the point, and a deleted row cannot say which it was.
 |---|---|---|
 | Fresh providers dialled per DHT answer | **8** | `run::DIALS_PER_ANSWER` |
 | Discovery cycle | **60 s** | `run.rs`, and every cycle pays a full `α` = 3 Kademlia walk to completion (§11.4) |
-| Retries per provider within a session | **0**, and it is structural rather than a policy: `PeerCondition::DisconnectedAndNotDialing` refuses a second dial while the first is in flight, and a `dialled_lobby` set of 512 suppresses the rest | `run.rs` |
-| Whole-query timeout | **60 s** | `libp2p-kad` `QueryConfig::default`, re-set to the same value at `swarm.rs:316` |
+| Retries per provider within a session | a provider that did not answer is dialled again after **60 s**, at most **8** such re-dials per DHT answer, counted apart from the fresh dials so a lobby of ghosts cannot spend discovery on providers already failed; a provider whose dial *the far end* failed inside the process's first **120 s** may be looked at again after **10 s**, from **128** such looks for the whole life of the process. `PeerCondition::DisconnectedAndNotDialing` still refuses a second dial while one is in flight, and `dialled_lobby` maps each provider to when it was last dialled, trimmed past 512 to the peers still connected. **This row said *0 … a `dialled_lobby` set of 512 suppresses the rest* until 2026-09-15**; that was true before `REDIAL_AFTER` existed, and the old set had refused a live peer for the life of the process after one failed dial | `run::REDIAL_AFTER`, `REDIALS_PER_ANSWER`, `FAST_REDIAL_AFTER`, `FAST_REDIAL_WINDOW`, `FAST_REDIAL_BUDGET` |
+| Whole-query timeout | **60 s** | `libp2p-kad` `QueryConfig::default`, re-set to the same value in `net::swarm::build` |
 | Per-peer timeout inside a query | **10 s** | `libp2p-kad` `query/peers/closest.rs:86` — the old "per-address dial timeout" row's number, in a different place and meaning a different thing |
 | Peers asked for a snapshot | 4 | §7.2 |
 
@@ -3100,7 +3258,7 @@ transport fact and lives nowhere else.
 | Join request / response | `JOIN_REQ_MAX`, `JOIN_RESP_MAX` | the join RPC codec (§8.4) |
 | Table stream frame | `TABLE_FRAME_MAX` | our own `u32` length prefix, checked before the body is read (§8.4) |
 | One embedded evidence element | `MAX_EMBEDDED_EVENT` | inside the frame, by the protocol layer (`PROTOCOL.md` §9.3) |
-| Relay control protocol | `MAX_MESSAGE_SIZE` | **the crate's constant, not ours** — 4 096 B, [SOURCE] `libp2p-relay-0.21.1/src/protocol.rs:36`. It is stated here because it is not in `PROTOCOL.md` §13 and cannot be: we neither choose it nor negotiate it |
+| Relay control protocol | `MAX_MESSAGE_SIZE` | **the crate's constant, not ours** — 4 096 B, [SOURCE] `libp2p-relay-0.22.0/src/protocol.rs:36`, unchanged from `0.21.1`. It is stated here because it is not in `PROTOCOL.md` §13 and cannot be: we neither choose it nor negotiate it |
 
 Every one of these parsers is a fuzz target (`SPEC_CS.md` §27): no input may crash,
 allocate unboundedly, read out of bounds, or bypass schema validation. Collections
@@ -3116,41 +3274,47 @@ backpressure ladder answers it as a rate fact.
 
 **This section used to bound a Mainline announce. `56b0b50` replaced it with a
 libp2p Kademlia provider record (§3), and the limits below are that crate's.**
-The version is the one in `Cargo.lock`, `libp2p-kad 0.48.0`, read in the
+The version is the one in `Cargo.lock`, `libp2p-kad 0.49.0`, read in the
 registry rather than on docs.rs — which matters here, because two of its own doc
-comments disagree with its code.
+comments disagree with its code. This section was written against `0.48.0` and
+re-read line by line against `0.49.0` on 2026-09-15: **no default and no behaviour
+below moved**; the line numbers are the new ones. The changes `0.49.0` does carry
+— stream timeouts on `futures-timer` (still 10 s), a `prost` codec behind the same
+16 KiB limit, `GetRecordError::QuorumFailed` removed, `QueryStats` and
+`ProgressStep` made `Copy` — touch none of it.
 
 #### 11.4.1 The numbers
 
-| Bound | Default in `libp2p-kad 0.48.0` | Does this client change it? |
+| Bound | Default in `libp2p-kad 0.49.0` | Does this client change it? |
 |---|---|---|
-| Provider record TTL | **48 h** (`behaviour.rs:233`) | no |
-| Provider re-publication interval | **12 h** (`behaviour.rs:232`) | no |
-| Value-record TTL | 48 h (`behaviour.rs:228`) | no — the client stores no value records |
-| Value-record replication interval | 1 h (`behaviour.rs:229`) | no |
-| Value-record publication interval | 22 h (`behaviour.rs:230`) | no |
+| Provider record TTL | **48 h** (`behaviour.rs:232`) | no |
+| Provider re-publication interval | **12 h** (`behaviour.rs:231`) | no |
+| Value-record TTL | 48 h (`behaviour.rs:227`) | no — the client stores no value records |
+| Value-record replication interval | 1 h (`behaviour.rs:228`) | no |
+| Value-record publication interval | 22 h (`behaviour.rs:229`) | no |
 | Replication factor `k` | **20** = `K_VALUE` (`lib.rs:91`, `query.rs:274`) | no |
 | Query parallelism `α` | **3** = `ALPHA_VALUE` (`lib.rs:101`, `query.rs:275`) | no |
 | Disjoint query paths | off (`query.rs:276`) | no |
-| Whole-query timeout | 60 s (`query.rs:273`) | **set — to 60 s**, the same value (`swarm.rs:316`, `:324`) |
+| Whole-query timeout | 60 s (`query.rs:273`) | **set — to 60 s**, the same value, on both behaviours in `net::swarm::build` |
 | Per-peer timeout inside a query | 10 s (`query/peers/closest.rs:86`) | no |
 | Closest peers a lookup resolves before ending | `k` = 20 (`query.rs:144-156`) | no |
 | Local peers a lookup is seeded from | ≤ 20 (`query/peers/closest.rs:125`) | no |
-| Concurrent queries | **unbounded** for queries we start; background jobs stop at 100 in the pool and add ≤ 10 per poll (`jobs.rs:80,83`; `behaviour.rs:2553-2571`) | no |
+| Concurrent queries | **unbounded** for queries we start; background jobs stop at 100 in the pool and add ≤ 10 per poll (`jobs.rs:80,83`; `behaviour.rs:2556-2574`) | no |
 | Providers stored per key | **20** = `K_VALUE` (`record/store/memory.rs:69`) | no |
-| Keys this node may provide | 1 024 (`record/store/memory.rs:68`) | no |
-| Value records stored | 1 024, ≤ 65 KiB each (`record/store/memory.rs:66-67`) | no |
-| k-bucket size | 20 (`kbucket.rs:100`) | no |
-| Pending-replacement timeout | 60 s (`kbucket.rs:101`) | no |
+| Keys with provider records the store holds | 1 024 (`record/store/memory.rs:68`) — the check counts every key with any provider, other peers' included, though the field is named for the provided ones (`:144-151`) | no |
+| Value records stored | 1 024, each under 65 KiB — a value of exactly 65 536 bytes is refused (`record/store/memory.rs:66-67`, `:114`) | no |
+| k-bucket size | 20 (`kbucket.rs:101`) | no |
+| Pending-replacement timeout | 60 s (`kbucket.rs:102`) | no |
 | Kademlia packet size | 16 KiB (`protocol.rs:51`) | no |
-| Periodic bootstrap | 5 min (`behaviour.rs:236`) | no |
-| Write-back caching | on, 1 peer (`behaviour.rs:235`) | no |
-| Mode at construction | `Client`, automatic (`behaviour.rs:513-514`) | **set — see §11.4.3** |
+| Periodic bootstrap | 5 min (`behaviour.rs:235`) | no |
+| Write-back caching | on, 1 peer (`behaviour.rs:234`) | no |
+| Mode at construction | `Client`, automatic (`behaviour.rs:512-513`) | **set — see §11.4.3** |
 
 **Read the code, not the doc comment.** `set_record_ttl` documents "36 hours"
-and `set_publication_interval` documents "24 hours" (`behaviour.rs:295`, `:344`);
-`Config::new` writes 48 h and 22 h. Nothing here depends on either, but a reader
-who trusts the prose gets both wrong.
+and `set_publication_interval` documents "24 hours" (`behaviour.rs:293-294`,
+`:343`); `Config::new` writes 48 h and 22 h, and `0.49.0` still has both comments
+wrong. Nothing here depends on either, but a reader who trusts the prose gets both
+wrong.
 
 #### 11.4.2 What the client sets, and what it inherits
 
@@ -3178,30 +3342,34 @@ substreams and answers `FIND_NODE`, `GET_PROVIDERS`, `ADD_PROVIDER`, `PUT_VALUE`
 and `GET_VALUE` for strangers; in **client** mode the inbound upgrade is
 `upgrade::DeniedUpgrade` (`handler.rs:607-612`) and it answers nothing, while
 still making every query of its own. A behaviour is constructed as
-`Mode::Client` with automatic mode on (`behaviour.rs:513-514`), and automatic
+`Mode::Client` with automatic mode on (`behaviour.rs:512-513`), and automatic
 means: client while there is no confirmed external address, server once there is
-one (`behaviour.rs:1168-1198`).
+one (`determine_mode_from_external_addresses`, `behaviour.rs:1168-1216`, run on a
+change of the external set at `:2687`).
 
 This client uses all three positions:
 
-* **`set_mode(None)` at build** (`swarm.rs:345`) — the public behaviour follows
+* **`set_mode(None)` at build** (`net::swarm::build`) — the public behaviour follows
   libp2p's own rule. Pinning it to client was tried and measured: two clients
   each announced in the lobby and each read it about a hundred and thirty times
   over ten minutes, and never found each other, because a node that answers
   nobody is added to nobody's routing table and its walks never converge.
-* **`set_mode(Some(Mode::Client))` while seated** (`run::dht_effort`) — server
-  mode is bandwidth spent on the whole public network, and at a table that is
-  bandwidth taken from the game. Announcing and looking up continue; only the
-  service to strangers stops.
-* **`set_mode(None)` again on standing up** — restoring the rule, not asserting
-  server: a NATed client must not claim to serve queries it cannot be reached
-  for.
+* **`set_mode(Some(Mode::Client))` while a table this client sits at is closed**
+  — every seat taken, or a tournament that has started (`run::dht_effort`,
+  `run::table_is_closed`). Server mode is bandwidth spent on the whole public
+  network, and at a table being played that is bandwidth taken from the game.
+  Announcing and looking up continue; only the service to strangers stops. This
+  bullet said *while seated* until 2026-09-15; the code's test is the closed
+  table, so a client waiting at an open one still serves.
+* **`set_mode(None)` again once no table of this client is closed** — restoring
+  the rule, not asserting server: a NATed client must not claim to serve queries
+  it cannot be reached for.
 
 A player pinned to client mode is still **findable**: a provider record is held
 by the `k` closest server nodes, not by the announcer. What client mode costs is
 this node's contribution to everyone else's lookups.
 
-The second, private behaviour (`/p2p-poker/kad/1`, `swarm.rs:126`) is
+The second, private behaviour (`/p2p-poker/kad/1`, `swarm::PokerBehaviour::kademlia`) is
 constructed and never driven — no `set_mode`, no query — so it sits at the
 constructor default and does nothing at all.
 
@@ -3222,7 +3390,7 @@ the code, for the two reasons §10.1 gives (`S1-FI`).
 remote copies run out their own 48 h clock. So the lobby key accumulates
 providers who left up to two days ago. That is not a defect to be fixed at this
 layer; it is the reason the discovery loop dials at most `DIALS_PER_ANSWER = 8`
-fresh providers per cycle rather than everything an answer contains.
+fresh providers per answer rather than everything an answer contains.
 
 **Twenty nodes hold it, twenty providers each, and the twenty-first is dropped
 in silence.** A record goes to the `k` = 20 closest peers, and each caps its
@@ -3235,31 +3403,39 @@ is why the lobby must be read repeatedly rather than once.
 
 **A lookup returns as many providers as it meets, and this client never stops
 one early.** Each responding node returns every non-expired provider record it
-holds for the key except the asker (`behaviour.rs:1238-1248`), and each response
+holds for the key except the asker (`behaviour.rs:1242-1252`), and each response
 is emitted immediately as `GetProvidersOk::FoundProviders`
-(`behaviour.rs:2378-2394`). There is no provider ceiling; the walk ends when the
-`k` = 20 closest peers are resolved, at the 60 s timeout, or when the caller
-calls `QueryMut::finish()` (`behaviour.rs:3382-3384`) — **which this client does
-not do**. Every 60 s discovery cycle therefore pays a full `α` = 3 walk to
-completion, per key.
+(`behaviour.rs:2381-2397`), an empty one included. There is no provider ceiling;
+the walk ends when the `k` = 20 closest peers are resolved, when every peer it
+could reach has been contacted (`query/peers/closest.rs:374-380`), at the 60 s
+timeout, or when the caller calls `QueryMut::finish()` (`behaviour.rs:3377-3379`)
+— **which this client does not do**. Every 60 s discovery cycle therefore pays a
+full `α` = 3 walk to completion, per key.
 
 **An unresponsive peer has no expiry.** Addresses are dropped one at a time on
-dial failure and the last one is kept on purpose (`behaviour.rs:1998-2013`); a
+dial failure and the last one is kept on purpose (`behaviour.rs:2001-2016`); a
 peer leaves the routing table only when it is the least-recently-connected
 disconnected node in a full 20-slot bucket and a replacement has been pending for
-60 s (`kbucket/bucket.rs:326-346`). A table that has gone stale is refreshed by
-the 5 min periodic bootstrap, not by anything ageing entries out.
+60 s (`kbucket/bucket.rs:326-365` inserts the replacement, `:220-274` applies it,
+and a node that reconnects first keeps its place, `:299`), or when the application
+removes it — which this client never does. A table that has gone stale is
+refreshed by the 5 min periodic bootstrap, not by anything ageing entries out.
 
-> Verification: [SOURCE] `libp2p-kad-0.48.0/src/behaviour.rs:224-239, 513-514,
-> 1047-1054, 1168-1198, 1238-1248, 1998-2013, 2362-2396, 2553-2571, 3382-3384`;
+> Verification: [SOURCE] `libp2p-kad-0.49.0/src/behaviour.rs:223-238, 512-513,
+> 1047-1054, 1168-1216, 1242-1252, 2001-2016, 2365-2399, 2556-2574, 3377-3379`;
 > `src/lib.rs:91,101`; `src/query.rs:144-156, 270-279`;
-> `src/query/peers/closest.rs:81-89, 125`; `src/record/store/memory.rs:63-72,
-> 143-184`; `src/kbucket.rs:97-104`; `src/kbucket/bucket.rs:326-365`;
+> `src/query/peers/closest.rs:81-89, 125, 374-380`; `src/record/store/memory.rs:63-72,
+> 143-184`; `src/kbucket.rs:98-105`; `src/kbucket/bucket.rs:220-274, 299, 326-365`;
 > `src/jobs.rs:80-83, 268-279`; `src/handler.rs:607-612`; `src/protocol.rs:51`.
-> Version pinned by `Cargo.lock` (`libp2p-kad 0.48.0`). Client side:
-> `src/net/swarm.rs:315-345`, `src/net/run.rs:110, 984-988, 1885-1935,
-> 2243-2265, 4323-4334`. [MEASURED] the pinned-client-mode failure in §11.4.3 is
-> the run recorded in the `set_mode(None)` comment at `src/net/swarm.rs:330-344`.
+> Version pinned by `Cargo.lock` (`libp2p-kad 0.49.0`); the `0.48.0` ranges this
+> block cited until 2026-09-15 were `behaviour.rs:224-239, 513-514, 1047-1054,
+> 1168-1198, 1238-1248, 1998-2013, 2362-2396, 2553-2571, 3382-3384` and
+> `kbucket.rs:97-104`, the rest unchanged. Client side, by name because line
+> numbers into it go stale: `net::swarm::build` (both behaviours, the query
+> timeouts, `set_mode(None)`), `run::DIALS_PER_ANSWER`, `run::dht_effort`, and the
+> provider-answer arm of `run::run`. [MEASURED] the pinned-client-mode failure in
+> §11.4.3 is the run recorded in the `set_mode(None)` comment in
+> `net::swarm::build`.
 
 ### 11.5 Eviction: what the transport may do on its own, and what it may never do
 
@@ -3518,7 +3694,7 @@ network.
 
 | # | Question | Blocks | Owner phase |
 |---|---|---|---|
-| **OQ-1** | **Re-aimed 2026-09-02.** The ~45 min figure and the 10-minute re-announce are both gone with Mainline. The open question is now: **what provider-record TTL do the go-libp2p nodes that actually store our record apply?** `libp2p-kad 0.48.0`'s own default is 48 h, but the storing node stamps expiry from *its* config, and the Amino DHT is overwhelmingly go-libp2p. The operative number is unknown and bounds both §10.1 and §3.5's disclosure. Do not quote 48 h as measured. | §10.1, §3.5 | 8 |
+| **OQ-1** | **Re-aimed 2026-09-02.** The ~45 min figure and the 10-minute re-announce are both gone with Mainline. The open question is now: **what provider-record TTL do the go-libp2p nodes that actually store our record apply?** `libp2p-kad`'s own default is 48 h (in `0.48.0` and `0.49.0` alike), but the storing node stamps expiry from *its* config, and the Amino DHT is overwhelmingly go-libp2p. The operative number is unknown and bounds both §10.1 and §3.5's disclosure. Do not quote 48 h as measured. | §10.1, §3.5 | 8 |
 | **OQ-2** | Adopt an epoch-rotating **namespace** for privacy? The same trade as the epoch-rotating infohash was — cross-version compatibility, a midnight rotation race, no help against a live observer — **plus one new cost this mechanism adds**: with a 48 h record TTL the previous day's key stays populated for two more days, so rotation blunts a historical crawl far less than it looks. Still **not** adopted. | §3.5 | later |
 | **OQ-3** | ~~Does the one-port rule hold, and does QUIC-then-TCP fallback on a single DHT hint behave?~~ **Closed by the change of mechanism, not by an answer.** A provider record carries every address the swarm holds, so there is no single hint to fall back from and no port to reconcile. The same numeric port is still bound on QUIC, TCP and now IPv6, but for a human writing one router rule rather than for discovery (§4.4). | §4.4 | — |
 | **OQ-4** | ~~Ship libp2p Kademlia after all?~~ **Answered by `56b0b50`: it is shipped, and it is the only discovery mechanism.** The cost this question named — a second eclipse surface — was accepted rather than avoided, and the reason is in §5.7: a Mainline announce carries one `IP:port`, so the mechanism `SPEC_CS.md` §1 names cannot make a NATed player findable at all. | §5.7 | — |
@@ -3601,7 +3777,7 @@ parameters beside it genuinely are local: a denser mesh costs only its owner.
 | Decision | Sections |
 |---|---|
 | **D-001** relays permitted; costs documented; two roles never blurred | §9.5, §9.7, §12.7, §12.8 |
-| **D-002** publicly reachable client volunteers as relay, off by default, admission via a **named type implementing `libp2p::relay::RateLimiter`** — the trait is re-exported at the crate root (`libp2p-relay-0.21.1/src/lib.rs:42`), the type holds the live admitted-peer set, and it is installed into **both** `reservation_rate_limiters` and `circuit_src_rate_limiters`; open question settled | §9.6 |
+| **D-002** publicly reachable client volunteers as relay, off by default, admission via a **named type implementing `libp2p::relay::RateLimiter`** — the trait is re-exported at the crate root (`libp2p-relay-0.22.0/src/lib.rs:42-44`), the type holds the live admitted-peer set, and it is installed into **both** `reservation_rate_limiters` and `circuit_src_rate_limiters`; open question settled | §9.6 |
 | **D-003** global lobby visibility is the acceptance criterion; the bridge is the load-bearing step; there is no port to announce, because a provider record carries the swarm's external addresses — D-003's *announce `Some(external_quic_port)`* was Mainline's rule and is history | §2, §4, §4.4, §12 |
 | **D-004** lobby visible even if every client is behind NAT; four layers; symmetric-both-ends stated | §9.7, §9.3, §12.1 |
 | **D-005** absent seat and mid-hand abort — **not** a transport concern. Its forfeiture rule is **revised by D-010**: an abort is neutral, stacks are restored, and the signed attribution has no automatic consequence at any layer | §1.2 rule 3, §8.4, §10.4 |
@@ -3637,12 +3813,14 @@ direction (131 072 / 8 979). An earlier revision of §9.5 carried those numbers
 verbatim, as instructed.
 
 **The objection.** The "per direction" half does not hold in
-`libp2p-relay 0.21.1`. A circuit is relayed by a single `CopyFuture` holding one
-`bytes_sent: u64` counter, and **both** directions increment that one counter
-before it is compared against the cap:
+`libp2p-relay 0.21.1`, nor in the `0.22.0` the build uses since `S1-FF`, whose
+`src/copy_future.rs` is the same file apart from test formatting. A circuit is
+relayed by a single `CopyFuture` holding one `bytes_sent: u64` counter, and
+**both** directions increment that one counter before it is compared against the
+cap:
 
 ```rust
-// src/copy_future.rs:41-48, 78, 88-104
+// src/copy_future.rs:41-48, 78, 88-106 (the same lines in 0.21.1 and 0.22.0)
 if this.max_circuit_bytes > 0 && this.bytes_sent > this.max_circuit_bytes { … }
 let src_status = match forward_data(&mut this.src, &mut this.dst, cx) { … this.bytes_sent += i … };
 let dst_status = match forward_data(&mut this.dst, &mut this.src, cx) { … this.bytes_sent += i … };

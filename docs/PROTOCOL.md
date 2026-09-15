@@ -62,7 +62,7 @@ that no later section has to repeat it and no reader has to assemble it:
 > or fault the table and get their chips back. D-005 closed that with forfeiture;
 > D-010 reopens it knowingly, because forfeiture was measured over four passes to
 > take chips from honest players, and an exploit that harms an honest player is
-> worse than one that merely lets a dishonest player escape a loss. `THREAT_MODEL.md` §8 limitation 4 carries
+> worse than one that merely lets a dishonest player escape a loss. `THREAT_MODEL.md` §9.1.2 limitation 4 carries
 > it as an unfixed limitation and §4.10 states the trade in full.
 
 Two structural consequences follow, and both are stated where they belong rather
@@ -4494,8 +4494,8 @@ table (§6.4), and recover its commitment in each case. Nothing in the protocol
 charges for it. The only pressure left is the one play money could ever have
 delivered: repeated aborts attributable to one identity are visible in the
 transcript, to everyone, permanently, and declining to sit with such a player is a
-**user** decision (D-010 point 3). `THREAT_MODEL.md` §8 limitation 4 carries this and
-`THREAT_MODEL.md` must carry it as one too.
+**user** decision (D-010 point 3). `THREAT_MODEL.md` §9.1.2 limitation 4 carries this
+as an unfixed limitation.
 
 **The `cause` values are evidence, not dispositions.** They no longer select
 between chip outcomes, because there is exactly one chip outcome. What they still
@@ -7983,7 +7983,7 @@ about the wire and not about the threat model:**
   defect D-010 closed. A reader who reads the rest of the left column as a list of
   things that are punished has still read the wrong document.
 * **§11's old bullet list is where the rage-quit escape was disclosed**, and the
-  disclosure is not weakened by moving it: `THREAT_MODEL.md` §8 limitation 4 and
+  disclosure is not weakened by moving it: `THREAT_MODEL.md` §9.1.2 limitation 4 and
   X8 carry it in full, in the terms `SPEC_CS.md` §18 requires, and §4.10 states
   the wire half — every abort restores every stack, at every table size, on every
   path, and nothing in this protocol charges for it.

@@ -1354,7 +1354,7 @@ attacks targeted is gone, along with what it was for.
 | X18 | The relay reads game content | **CP** | End-to-end Noise/TLS terminated at the peers; the relay is a byte pipe holding no key share (**D-001**). |
 | X19 | The relay forges or alters events | **CP** | Every event is application-signed and every receiver re-validates the signature and the hash chain independently (**D-001**). *Inherits A5, A6.* |
 | X20 | The relay drops, delays or resets a target peer's connection | **OOS** | A liveness dependency and a DoS lever, acknowledged in **D-001**. It includes the *default* case, not only the malicious one: a public relay's circuit limits will reset a poker session mid-hand, and the **duration** limit is what a session reaches first. **[R12]** The limits, the byte accounting, the per-hand arithmetic and the required client behaviour are `NETWORK_STACK.md` §9.5 and §16.1's, and the derivation this cell reproduced — the same one §3.5 also reproduced, so the document carried it twice — is deleted under D-011 rule 1. It had already been wrong once by a factor of two, in both copies, which is the argument for having one. What this row classifies: the capability is real, it is out of the protocol's reach, and its consequence is bounded to what any disconnect costs, because **a relayed connection loss is treated exactly like any other disconnect** (§7) and under D-010 that is a neutral abort. Nothing about it block-lists or unseats anybody (D-011 rule 3), so a relay operator cannot escalate a reset into the loss of a victim's seat or key. |
-| X21 | Abusing a D-002 volunteer relay's bandwidth | **OOS** (resource abuse), with mandatory mitigation | Circuit Relay v2 is **not protocol-selective**: its protocol names are compile-time constants and its behaviour decides accept-or-deny purely on resource limits, with no application ACL hook. Left alone, enabling the relay server makes the user an **open relay for the entire libp2p network**, IPFS traffic included, on their own line. **[R13]** The admission-control construction — which hook it installs into, the trait, the named type holding the admitted-peer set, and the requirement that *both* rate-limiter vectors be gated — is `NETWORK_STACK.md` §9.6's, and the copy this cell carried is deleted under D-011 rule 1. What this row classifies: admission control is **mandatory and not a hardening option**, because without it the user is running an open relay; it is nonetheless **mitigation, not prevention**, because an attacker running our own client is admitted by construction and still consumes capacity. Note the boundary that keeps this compatible with D-011 rule 3: relay admission is a *resource* decision about strangers, made before any table exists and keyed on whether a peer is one of ours — it is never driven by a protocol proof and never removes a peer from a table. Relaying is off by default and must be disclosed plainly before it is enabled (**D-002**, OQ7, OQ10). |
+| X21 | Abusing a D-002 volunteer relay's bandwidth | **OOS** (resource abuse), with mandatory mitigation | Circuit Relay v2 is **not protocol-selective**: its protocol names are compile-time constants and its behaviour decides accept-or-deny purely on resource limits, with no application ACL hook. Left alone, enabling the relay server makes the user an **open relay for the entire libp2p network**, IPFS traffic included, on their own line. **[R13]** The admission-control construction — which hook it installs into, the trait, the named type holding the admitted-peer set, and the requirement that *both* rate-limiter vectors be gated — is `NETWORK_STACK.md` §9.6's, and the copy this cell carried is deleted under D-011 rule 1. What this row classifies: admission control is **mandatory and not a hardening option**, because without it the user is running an open relay; it is nonetheless **mitigation, not prevention**, because an attacker running our own client is admitted by construction and still consumes capacity. Note the boundary that keeps this compatible with D-011 rule 3: relay admission is a *resource* decision about strangers, made before any table exists and keyed on whether a peer is one of ours — it is never driven by a protocol proof and never removes a peer from a table. Relaying is off by default and must be disclosed plainly before it is enabled (**D-002**, OQ7, OQ10). **Neither is built as of 2026-09-15:** every client is built as a volunteer, with no setting, no disclosure and no admission set, so a client with a confirmed external address serves any libp2p peer within the crate's limits (`S1-FK`). |
 | X22 | State divergence caused by an honest implementation bug | **DNA** | `STATE_HASH` detects it and play stops (G10), but the transcript shows only that two clients disagree, not who is wrong — there is no signed event to attribute, because both peers believe they followed the rules. Resolving it requires human diagnosis. It is the reason A15 and the §26 property tests exist. Note that the *deliberate* version of the same divergence — a peer publishing a `state_hash` it did not derive — is X29, and no live rule distinguishes the two, which is why neither is attributable. |
 | X23 | Timing side channel on the secret permutation or on `sk_i` | **OOS** for the play-money prototype, pending measurement | Only throughput was measured, never constant-time behaviour, and arkworks is not written with curve25519-dalek's constant-time discipline (`research/MENTAL_POKER.md` §9 risk 4). Declaring it out of scope is defensible for play money and **is not defensible for real money**. Settled by `dudect`-style analysis of `shuffle_deck` and `reveal_token`, or by an explicit decision. OQ4. |
 | X24 | Endpoint compromise (malware reading the player's own cards or stealing their signing key) | **OOS** | §6, and assumption A8. |
@@ -2160,12 +2160,13 @@ Every client provides one fixed key on the public DHT, and anyone who reads the
 source can compute it (`NETWORK_STACK.md` §3.2). A provider record carries the
 player's **persistent `PeerId`** — the identity that later sits at the table — and
 the swarm's confirmed external addresses, relay circuit addresses included. When
-the node answers a query about itself, and in the `identify` exchange with every
-peer it connects to, its **listen** addresses go out as well, LAN and
-virtual-adapter addresses among them, until that half is hidden
-(`NETWORK_STACK.md` §3.5, `S1-Z`). There is no access control and no unlisted
-mode, and the only authentication is that a record must name the peer that sent
-it.
+the node, serving the DHT, answers a lookup of the lobby key, `libp2p-kad` fills in
+its own record with its **listen** addresses as well, LAN and virtual-adapter
+addresses among them (`NETWORK_STACK.md` §3.5, `S1-FJ`). The same union went out in
+the `identify` exchange with every peer until 2026-09-02, when `S1-Z` hid it there;
+this paragraph said on 2026-09-15 that both halves were still to hide, and was
+corrected the same day. There is no access control and no unlisted mode, and the
+only authentication is that a record must name the peer that sent it.
 
 ### 8.2 How long it stays, and who receives it
 
@@ -2202,8 +2203,8 @@ it.
 4. **Linkage across time, without dialling anybody.** Under Mainline an observer
    had to dial an announced address to learn the persistent `PeerId` behind it.
    The provider record hands over both at once — a **stable cryptographic identity
-   bound to a physical location** — with the LAN layout attached for as long as the
-   listen addresses leak.
+   bound to a physical location** — with the LAN layout attached for anyone this
+   client answers while the provider-record half of the leak is open (`S1-FJ`).
 5. **A target list.** The roster doubles as a list of hosts to DoS, port scan, or
    attempt to de-anonymise. Poker supplies the motive: knowing which address is at
    which table is the first step in targeted collusion, or in DoSing the opponent
@@ -2232,8 +2233,8 @@ in both directions.
 ### 8.5 Honest mitigations
 
 None eliminates the disclosure. The spec forbids a central fallback, and rightly.
-None of the following is built yet; `NETWORK_STACK.md` §3.5 carries the same list
-against the mechanism.
+Of the following only the `identify` half of hiding the listen addresses is built;
+`NETWORK_STACK.md` §3.5 carries the same list against the mechanism.
 
 * **Tell the user before the first announce.** A one-time, plain-language consent
   screen, which must now say *a name that follows you between sessions* and
@@ -2243,9 +2244,10 @@ against the mechanism.
   nothing in privacy.
 * **Announce only while actually looking for a game** — weaker than it sounds,
   because the record outlives the search.
-* **Hide the listen addresses** (`with_hide_listen_addrs(true)`), so neither the
-  record nor the `identify` banner carries LAN and virtual-adapter addresses
-  (`S1-Z`).
+* **Hide the listen addresses** from both doors. The `identify` banner has been
+  hidden since 2026-09-02 (`with_hide_listen_addrs(true)`, `S1-Z`); the record
+  `libp2p-kad` hands out when it answers a lookup is not, because that setting does
+  not reach it (`S1-FJ`).
 * **Nothing but a `PeerId` and addresses in the DHT** — no nicknames, no table
   metadata. That much is still the design. This bullet used to promise *no
   `PeerId`* as well; a provider record cannot keep that promise, and it is not

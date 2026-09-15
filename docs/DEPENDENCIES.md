@@ -703,7 +703,7 @@ directly (§3.5). No open advisory on any of them at these versions; the histori
 | `libp2p-tls` | 0.7.0 | TLS 1.3 security upgrade | no open advisory. **Since 0.7 its `rustls` runs on AWS-LC**, post-quantum key exchange preferred -- §5.6 |
 | `libp2p-yamux` | 0.48.0 | stream muxer; mandatory for relay | no open advisory. links one `yamux` major since 0.48 (two before, §5.6) |
 | `libp2p-gossipsub` | 0.50.0 | lobby topics | no open advisory. Parses attacker-controlled protobuf from unauthenticated peers |
-| `libp2p-kad` | 0.49.0 | Kademlia DHT | no open advisory. **Enabled in `Cargo.toml`; `NETWORK_STACK.md` §5.2 says it is not** — §9 |
+| `libp2p-kad` | 0.49.0 | Kademlia DHT | no open advisory. Enabled in `Cargo.toml`, and it is the discovery mechanism; `NETWORK_STACK.md` §5.1.1 and §5.2 say so since 2026-09-15 and said it was not until then — §9 |
 | `libp2p-identify` | 0.48.0 | address candidates | no open advisory. Peer-supplied addresses are attacker-controlled input |
 | `libp2p-ping` | 0.48.0 | liveness | no open advisory |
 | `libp2p-autonat` | 0.16.0 | reachability probing | no open advisory. Pulls `rand_core 0.6.4` |
@@ -715,7 +715,7 @@ directly (§3.5). No open advisory on any of them at these versions; the histori
 | `libp2p-connection-limits` | 0.7.0 | connection caps | no open advisory. **There is no `connection-limits` cargo feature** — it is a non-optional dependency and `libp2p::connection_limits` is always available; asking for the feature is a hard resolver error |
 | `libp2p-memory-connection-limits` | 0.6.0 | memory-based caps | no open advisory. This one *is* a feature, spelled `memory-connection-limits` |
 | `libp2p-allow-block-list` | 0.7.0 | peer blocklist | no open advisory; non-optional, like `connection-limits`. **Its presence in the build is not permission to drive it from a protocol proof** — D-010 point 3 and D-011 rule 3 forbid automated eviction at every layer, transport included, and this crate is the transport-layer mechanism they were written about. A user-initiated block is a user decision and is fine; a block triggered by an `EquivocationProof` or a `TIMEOUT_CERT` is a defect. `NETWORK_STACK.md` owns the rule (D-011). **D-014 does not reopen this and the distinction is the layer:** a removal for cause takes a seat out of the *table* — dead, blinded off, one-way (`STATE_MACHINE.md` T64, T65, I34) — and never out of the *transport*. The removed peer keeps its connections, and an implementation that reaches for this crate on a `CheatProven` has rebuilt the eviction D-011 rule 3 forbids, with the one decision that sounds like a licence for it |
-| `libp2p-metrics` | 0.18.0 | Prometheus metrics | no open advisory. Enabled in `Cargo.toml`; absent from `NETWORK_STACK.md` §5.1.1 — §9 |
+| `libp2p-metrics` | 0.18.0 | Prometheus metrics | no open advisory. Enabled in `Cargo.toml`, and nothing in `src/` reads it; registered in `NETWORK_STACK.md` §5.1.1 since 2026-09-15, absent from it until then — §9 |
 
 > **Correction, verified in source, that must be carried everywhere it appears.**
 > The fix plan's A-8 replacement text described `max_circuit_bytes` as "per circuit
@@ -1146,12 +1146,18 @@ that only ever records other documents' errors is a register nobody has audited.
    which the manifest contradicts. **Either the manifest or `NETWORK_STACK.md` §5.2
    is wrong, and this register cannot settle which** — it records what is built. The
    discrepancy needs an owner in `NETWORK_STACK.md`, and if `kad` is meant to be off
-   then §3.2's trade-off changes with it. **(a)(b)**
+   then §3.2's trade-off changes with it. **(a)(b)** **Resolved 2026-09-15 in
+   `NETWORK_STACK.md`: the manifest was right.** §5.1.1 registers
+   `libp2p-kad 0.49.0` and `libp2p-metrics 0.18.0`, and §5.2 shows `Cargo.toml`'s
+   block as it stands and says `kad` is the discovery mechanism. `libp2p-mdns`
+   stays in §5.1.1, at 0.49.0, because `mdns` has been enabled since `f41efed`
+   (2026-08-29), the day after this entry was written.
 2. **`NETWORK_STACK.md` §5.1.1's closing verification note says "No `cargo audit`
    run has been performed against the assembled transport tree — the tree does not
    exist yet, there is no `Cargo.lock`".** Both conditions are now false: the tree
    compiles, `Cargo.lock` is committed, and §4 is the audit. The note is stale, not
-   wrong-in-spirit, and should point here.
+   wrong-in-spirit, and should point here. **Resolved 2026-09-15:** the note names
+   §4 as the audit of record and says what it used to claim.
 3. **`research/INTEGRATION.md` §2 attributes all three `rand` majors to
    `libp2p-autonat` and the arkworks crates.** Measured provenance is wider and only
    partly overlaps: `rand 0.8.8 ← ark-std`; `rand 0.9.5 ← hickory-proto, igd-next,
