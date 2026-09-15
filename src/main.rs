@@ -206,6 +206,28 @@ fn main() {
     let dir = value_of("--profile")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(p2p_poker::storage::profile::profile_dir);
+    // `S1-FV`: one client to a profile, held until this process ends. Taken
+    // before the identity is read, so two copies started together cannot both
+    // make one on a fresh profile either.
+    let profile_lock = match p2p_poker::storage::profile::lock_profile(&dir) {
+        Ok(lock) => lock,
+        Err(p2p_poker::storage::profile::LockError::InUse) => {
+            let words = format!(
+                "P2Poker is already running with this profile:\n\n{}\n\nClose that client first. \
+                 Two clients with one profile are one player sitting down twice.",
+                dir.display()
+            );
+            eprintln!("{words}");
+            if !has("--headless") {
+                tell_the_player("P2Poker is already running", &words);
+            }
+            std::process::exit(3);
+        }
+        Err(p2p_poker::storage::profile::LockError::Unavailable(e)) => {
+            eprintln!("the profile could not be locked ({e}); starting without the lock");
+            p2p_poker::storage::profile::ProfileLock::none()
+        }
+    };
     let identity = match p2p_poker::storage::profile::load_or_create_identity(&dir) {
         Ok(k) => k,
         Err(e) => {
@@ -414,6 +436,9 @@ fn main() {
         if asked.is_none() {
             println!();
             println!("No OpenGL 2.0 on this machine. Starting again in software.");
+            // `S1-FV`: the child is this client, on this profile; the profile
+            // goes to it, or it would find its own parent holding it.
+            drop(profile_lock);
             std::process::exit(again_in_software(&args));
         }
         // Pinned by hand, so no second attempt is made — but the advice is
@@ -426,6 +451,24 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+/// `S1-FV`: a word to a player who started the client from its icon, where a
+/// line on the console would go by unseen -- a message box, and the client
+/// waits for it to be closed.
+#[cfg(windows)]
+fn tell_the_player(title: &str, words: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (text, caption) = (wide(words), wide(title));
+    // SAFETY: both strings are NUL-terminated UTF-16 that outlive the call, and
+    // a null owner window is a box of its own.
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONWARNING);
+    }
+}
+
+#[cfg(not(windows))]
+fn tell_the_player(_title: &str, _words: &str) {}
 
 /// The child's arguments: ours, with the renderer settled.
 ///

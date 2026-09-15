@@ -4006,6 +4006,70 @@ mod tests {
         assert!(!t.opponent_left && !t.opponent_out, "MIR is all in and in the game");
     }
 
+    /// `S1-FU`, the owner's game (2026-09-15): a client back at a hand it took up
+    /// again after a restart showed no cards on the board and had nothing to act
+    /// on. The window makes a hand at `HandBegan` and keeps nothing about a hand
+    /// it does not hold. Said in the node's order -- the start, the table, the
+    /// board, the turn, the cards -- the hand is all there; said as the node used
+    /// to after a take-up -- the table, the board and the turn first, the start
+    /// with the next frame from the table -- the board and the turn are gone.
+    #[test]
+    fn a_hand_taken_up_is_said_from_its_start_so_its_board_and_turn_stay() {
+        use crate::gui::table::Facing;
+        let key = [7u8; 32];
+        let back = || {
+            let mut s = AppState::new();
+            s.apply(NodeEvent::Seated { key, seat: 0 });
+            s.apply(NodeEvent::Roster { key, seats: vec![(0, "me".into(), 10_000), (1, "MIR".into(), 10_000)] });
+            s.apply(NodeEvent::TableReal { key, session: [9u8; 32] });
+            s.apply(NodeEvent::SessionResumed { hand_id: 9, member: true });
+            s
+        };
+        let began = NodeEvent::HandBegan { hand_id: 9, button: 0, dealt_in: vec![0, 1], small_blind: 50, big_blind: 100 };
+        let table = NodeEvent::TableState {
+            hand_id: 9,
+            street: 3,
+            pot: 400,
+            to_act: Some(0),
+            stacks: vec![9_800, 9_800],
+            bets: vec![0, 0],
+            folded: vec![false, false],
+        };
+        let board = NodeEvent::Board { hand_id: 9, cards: vec![1, 14, 27, 40, 5] };
+        let turn = NodeEvent::YourTurn {
+            hand_id: 9,
+            street: 3,
+            to_call: 0,
+            pot: 400,
+            can_check: true,
+            can_call: false,
+            can_bet: true,
+            can_raise: false,
+            min_raise_to: 100,
+            max_raise_to: 9_800,
+            elapsed_ms: 0,
+        };
+        let cards = [NodeEvent::CardsDealt { hand_id: 9, seats: vec![0, 1] }, NodeEvent::HoleCards { hand_id: 9, cards: [10, 23] }];
+        let up = |v: &crate::gui::table::TableView| v.board.iter().filter(|f| matches!(f, Facing::Up(_))).count();
+
+        let mut s = back();
+        for e in [began.clone(), table.clone(), board.clone(), turn.clone()].into_iter().chain(cards.clone()) {
+            s.apply(e);
+        }
+        let v = s.table_view();
+        assert_eq!(up(&v), 5, "the river's board, all of it");
+        assert!(v.can_act, "and the turn to act on");
+        assert!(s.hand.as_ref().is_some_and(|h| h.cards.is_some()), "and the seat's own two cards");
+
+        let mut s = back();
+        for e in [table, board, turn, began].into_iter().chain(cards) {
+            s.apply(e);
+        }
+        let v = s.table_view();
+        assert_eq!(up(&v), 0, "the board said before the start is lost");
+        assert!(!v.can_act, "and so is the turn");
+    }
+
     /// `S1-FR`, the owner's test (2026-09-15): a client killed and started again
     /// is shown its way back from the seat it takes up again -- not the words for
     /// a table before its first hand -- until it is dealt in.

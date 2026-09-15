@@ -196,9 +196,89 @@ pub fn load_or_create_tox_key(dir: &Path) -> io::Result<[u8; 32]> {
     Ok(key)
 }
 
+/// Where the profile's lock lives.
+pub fn lock_path(dir: &Path) -> PathBuf {
+    dir.join("profile.lock")
+}
+
+/// `S1-FV`: the profile, held by the one client running with it.
+///
+/// Two clients started with one profile are one player twice: one identity,
+/// one application key and one Tox key on the network at once, one session
+/// record written by both, and both taking the same seat back -- the owner
+/// did it by mistake (2026-09-15) and the table stood, each copy waiting for
+/// the other to let it in. Held for the life of the process and let go by the
+/// operating system when the process ends, however it ends, so a client that
+/// was killed leaves nothing behind to clear.
+///
+/// Enforced on Windows, the platform the portable client is built for: the
+/// lock file is opened with no sharing, which no other open can pass while it
+/// is held. Elsewhere nothing is held (`File::try_lock` is newer than this
+/// crate's `rust-version`).
+pub struct ProfileLock {
+    _file: Option<fs::File>,
+}
+
+/// Why the profile was not held.
+#[derive(Debug)]
+pub enum LockError {
+    /// Another running client holds it.
+    InUse,
+    /// The lock could not be taken for some other reason -- a read-only
+    /// folder, say. The client starts anyway: the guard is not worth a client
+    /// that will not start.
+    Unavailable(io::Error),
+}
+
+impl ProfileLock {
+    /// No lock held, for the client that starts without one.
+    pub fn none() -> ProfileLock {
+        ProfileLock { _file: None }
+    }
+}
+
+/// `S1-FV`: hold the profile, or say that another client holds it.
+pub fn lock_profile(dir: &Path) -> Result<ProfileLock, LockError> {
+    fs::create_dir_all(dir).map_err(LockError::Unavailable)?;
+    open_exclusive(&lock_path(dir)).map(|file| ProfileLock { _file: file })
+}
+
+#[cfg(windows)]
+fn open_exclusive(path: &Path) -> Result<Option<fs::File>, LockError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    /// `ERROR_SHARING_VIOLATION` and `ERROR_LOCK_VIOLATION`.
+    const HELD: [i32; 2] = [32, 33];
+    match fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).share_mode(0).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.raw_os_error().is_some_and(|code| HELD.contains(&code)) => Err(LockError::InUse),
+        Err(e) => Err(LockError::Unavailable(e)),
+    }
+}
+
+#[cfg(not(windows))]
+fn open_exclusive(_path: &Path) -> Result<Option<fs::File>, LockError> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `S1-FV`: a profile one client holds is refused to a second, and is
+    /// free again the moment the first lets it go.
+    #[cfg(windows)]
+    #[test]
+    fn a_profile_is_held_by_one_client_at_a_time() {
+        let dir = scratch("profile-lock");
+        let first = lock_profile(&dir).expect("the first client holds the profile");
+        assert!(matches!(lock_profile(&dir), Err(LockError::InUse)), "a second is refused while the first runs");
+        assert!(matches!(lock_profile(&dir), Err(LockError::InUse)), "and again");
+        drop(first);
+        let again = lock_profile(&dir).expect("free once the first has gone");
+        let other = lock_profile(&scratch("profile-lock-other")).expect("another profile is another lock");
+        assert!(matches!(lock_profile(&dir), Err(LockError::InUse)));
+        drop((again, other));
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("p2p-poker-test-{name}"));

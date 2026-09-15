@@ -1692,6 +1692,88 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     //
     // Every name it touches is declared above this point, which is what makes
     // `macro_rules!` hygiene resolve them to the loop's own bindings.
+    // `S1-FU`: a dealt hand's start, said once and before anything else about
+    // it. The window makes the hand at `HandBegan` and keeps nothing about a
+    // hand it does not hold, so a board, a table state or a turn said before it
+    // is lost -- and the `HandBegan` that follows makes the hand afresh, with no
+    // board and no turn. Only an incoming frame used to say it: a hand this
+    // client took up again after a restart had its board and its turn reported
+    // by the stall tick at once and its start said with the next frame from the
+    // table, 22 s later in the owner's game, and the window showed that hand
+    // with no board and nothing to act on until its own clock ran out.
+    macro_rules! say_hand_began {
+        ($t:ident, $h:expr) => {{
+            if $h.dealt() {
+                if !$t.hand_reported {
+                    $t.hand_reported = true;
+                    let init = $h.init();
+                    let _ = events
+                        .send(NodeEvent::HandBegan {
+                            hand_id: init.hand_id,
+                            button: init.button_position,
+                            dealt_in: init.dealt_in.clone(),
+                            small_blind: init.small_blind,
+                            big_blind: init.big_blind,
+                        })
+                        .await;
+                }
+                let deck = ($h.shuffler(), $h.shuffled());
+                if $t.deck_reported != Some(deck) {
+                    $t.deck_reported = Some(deck);
+                    let _ = events
+                        .send(NodeEvent::DeckProgress {
+                            hand_id: $h.hand_id(),
+                            shuffling: deck.0,
+                            ready: deck.1,
+                        })
+                        .await;
+                }
+            }
+        }};
+    }
+    // The cards, once and once only, after the report that names the street.
+    // They are read from a complete set of verified shares or not at all, so
+    // there is no partial state to report. `S1-FU`: on every road that reports
+    // a hand, as its start is.
+    macro_rules! say_the_cards {
+        ($t:ident, $h:expr) => {{
+            if let Some(cards) = $h.cards().filter(|_| !$t.cards_reported) {
+                $t.cards_reported = true;
+                let _ = events
+                    .send(NodeEvent::CardsDealt {
+                        hand_id: $h.hand_id(),
+                        seats: $h.init().dealt_in.clone(),
+                    })
+                    .await;
+                let _ = events
+                    .send(NodeEvent::HoleCards {
+                        hand_id: $h.hand_id(),
+                        cards: [cards[0].index(), cards[1].index()],
+                    })
+                    .await;
+            } else if !$t.cards_reported
+                && $h.street().is_some()
+                && (!$h.init().dealt_in.contains(&$h.my_seat()) || !$h.can_play_on())
+            {
+                // `S1-FH`: a seat this hand does not deal in -- a player out of
+                // the tournament watching, a seat following the hand -- opens no
+                // cards of its own, and only its own cards told the window the
+                // deal was done: its felt drew no backs at any seat, and no hand
+                // shown at the showdown. The betting street is the deal done.
+                // What it may then draw face up is what every seat sees: the
+                // engine opens a hand only from its owner's share, published
+                // when it shows. `S1-FU`: and a seat back without its card
+                // material (`D-033`), which is dealt in and reads no cards.
+                $t.cards_reported = true;
+                let _ = events
+                    .send(NodeEvent::CardsDealt {
+                        hand_id: $h.hand_id(),
+                        seats: $h.init().dealt_in.clone(),
+                    })
+                    .await;
+            }
+        }};
+    }
     // `S1-CW`: what every road that can end a hand does once its frames are
     // out -- the abort said once, the boundary armed, this client's clock
     // read. `hand_event!` below does it for an incoming event; the stall
@@ -1701,6 +1783,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // table sat on the ended hand for the rest of the run.
     macro_rules! hand_may_have_ended {
         ($t:ident, $h:expr) => {{
+            // `S1-FU`: the hand's start before any word about it.
+            say_hand_began!($t, $h);
             // `D-058`: the table's word about a certified seat before the word
             // that the hand is over. A certificate this client's own vote
             // completed at the stall tick was said at the next tick, two
@@ -1719,6 +1803,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
             $t.act_by = hurry(report.clock.apply($t.act_by, $h.action_deadline()), autoplay, $t.sitting_out);
             showdown_hold!($t, $h);
+            say_the_cards!($t, $h);
         }};
     }
     macro_rules! hand_event {
@@ -1822,30 +1907,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .await;
                                 }
                                 if $h.dealt() {
-                                    if !$t.hand_reported {
-                                        $t.hand_reported = true;
-                                        let init = $h.init();
-                                        let _ = events
-                                            .send(NodeEvent::HandBegan {
-                                                hand_id: init.hand_id,
-                                                button: init.button_position,
-                                                dealt_in: init.dealt_in.clone(),
-                                                small_blind: init.small_blind,
-                                                big_blind: init.big_blind,
-                                            })
-                                            .await;
-                                    }
-                                    let deck = ($h.shuffler(), $h.shuffled());
-                                    if $t.deck_reported != Some(deck) {
-                                        $t.deck_reported = Some(deck);
-                                        let _ = events
-                                            .send(NodeEvent::DeckProgress {
-                                                hand_id: $h.hand_id(),
-                                                shuffling: deck.0,
-                                                ready: deck.1,
-                                            })
-                                            .await;
-                                    }
+                                    say_hand_began!($t, $h);
                                 } else {
                                     let _ = events
                                         .send(NodeEvent::HandWaiting {
@@ -1863,11 +1925,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // on a hand that had ended, saying *waiting for seats*
                                 // with nobody named, for the rest of the run
                                 // (`run195623-3`, `run131730-3`).
-                                // The cards, once and once only. They
-                                // are read from a complete set of
-                                // verified shares or not at all, so
-                                // there is no partial state to report.
-                                        // How the count stands. A vote that is
+                                // How the count stands. A vote that is
                                 // never counted is the quietest way
                                 // this machinery can fail: everybody
                                 // says their clock ran out and nothing
@@ -1988,42 +2046,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 $t.act_by = hurry(report.clock.apply($t.act_by, $h.action_deadline()), autoplay, $t.sitting_out);
                                 showdown_hold!($t, $h);
-                                if let Some(cards) = $h.cards().filter(|_| !$t.cards_reported) {
-                                    $t.cards_reported = true;
-                                    let _ = events
-                                        .send(NodeEvent::CardsDealt {
-                                            hand_id: $h.hand_id(),
-                                            seats: $h.init().dealt_in.clone(),
-                                        })
-                                        .await;
-                                    let _ = events
-                                        .send(NodeEvent::HoleCards {
-                                            hand_id: $h.hand_id(),
-                                            cards: [cards[0].index(), cards[1].index()],
-                                        })
-                                        .await;
-                                } else if !$t.cards_reported
-                                    && $h.street().is_some()
-                                    && !$h.init().dealt_in.contains(&$h.my_seat())
-                                {
-                                    // `S1-FH`: a seat this hand does not deal in -- a
-                                    // player out of the tournament watching, a seat
-                                    // following the hand -- opens no cards of its own,
-                                    // and only its own cards told the window the deal
-                                    // was done: its felt drew no backs at any seat, and
-                                    // no hand shown at the showdown. The betting street
-                                    // is the deal done. What it may then draw face up
-                                    // is what every seat sees: the engine opens a hand
-                                    // only from its owner's share, published when it
-                                    // shows.
-                                    $t.cards_reported = true;
-                                    let _ = events
-                                        .send(NodeEvent::CardsDealt {
-                                            hand_id: $h.hand_id(),
-                                            seats: $h.init().dealt_in.clone(),
-                                        })
-                                        .await;
-                                }
+                                say_the_cards!($t, $h);
                                 // **Reported before leaving, or this
                                 // node forwards nothing.** Every arm of
                                 // this branch returns to the top of the
@@ -14899,5 +14922,33 @@ mod back_at_the_table {
         assert!(kept.is_empty(), "a leave carries these into the slot's next table: {kept:?}");
         let named: Vec<&str> = THE_SLOTS_OWN.iter().copied().filter(|f| !fields.contains(f)).collect();
         assert!(named.is_empty(), "named as the slot's own and no field of it: {named:?}");
+    }
+
+    /// `S1-FU`: a hand's start and its cards are said in one place each, and
+    /// both roads that report a hand -- an incoming frame, and the stall tick
+    /// that reports a hand taken up again after a restart -- say the start
+    /// before the report and the cards after it. The stall tick's road said
+    /// neither, and a hand taken up at a turn was reported with no start: the
+    /// window dropped its board and its turn.
+    #[test]
+    fn every_road_that_reports_a_hand_says_its_start_first_and_its_cards_after() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let body = |name: &str| -> &str {
+            let from = code.find(&format!("macro_rules! {name} {{")).unwrap_or_else(|| panic!("{name}"));
+            let to = from + code[from..].find("\n    }\n").expect("its end");
+            &code[from..to]
+        };
+        for (event, home) in [("NodeEvent::HandBegan {", "say_hand_began"), ("NodeEvent::HoleCards {", "say_the_cards")] {
+            assert_eq!(code.matches(event).count(), 1, "{event} is said in one place");
+            assert!(body(home).contains(event), "{event} is said by {home}!");
+        }
+        for road in ["hand_may_have_ended", "hand_event"] {
+            let b = body(road);
+            let began = b.find("say_hand_began!($t, $h)").unwrap_or_else(|| panic!("{road} says the start"));
+            let report = b.find("report_hand(").unwrap_or_else(|| panic!("{road} reports"));
+            let cards = b.find("say_the_cards!($t, $h)").unwrap_or_else(|| panic!("{road} says the cards"));
+            assert!(began < report && report < cards, "{road}: the start, the report, the cards");
+        }
     }
 }
