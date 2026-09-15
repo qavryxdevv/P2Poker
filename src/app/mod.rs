@@ -315,6 +315,8 @@ pub struct TableApp {
     /// `D-058`: the seats the node said a hand's cryptographic stage has stood
     /// on for a moment, and which hand; empty once it moved on.
     pub stands: (u64, Vec<u8>),
+    /// `S1-FM`: the hand the seats in `waiting_for` are owed for.
+    pub waiting_hand: u64,
     /// `D-058`: the last hand this window heard end -- one it may never have
     /// held, called off at its opening before the deal.
     pub last_ended: Option<u64>,
@@ -397,6 +399,8 @@ pub struct AppState {
     /// `D-058`: the seats the node said a hand's cryptographic stage has stood
     /// on for a moment, and which hand; empty once it moved on.
     pub stands: (u64, Vec<u8>),
+    /// `S1-FM`: the hand the seats in `waiting_for` are owed for.
+    pub waiting_hand: u64,
     /// `D-058`: the last hand this window heard end -- one it may never have
     /// held, called off at its opening before the deal.
     pub last_ended: Option<u64>,
@@ -855,6 +859,7 @@ impl AppState {
         std::mem::swap(&mut self.hand, &mut other.hand);
         std::mem::swap(&mut self.waiting_for, &mut other.waiting_for);
         std::mem::swap(&mut self.stands, &mut other.stands);
+        std::mem::swap(&mut self.waiting_hand, &mut other.waiting_hand);
         std::mem::swap(&mut self.last_ended, &mut other.last_ended);
         std::mem::swap(&mut self.hand_ended_at, &mut other.hand_ended_at);
         std::mem::swap(&mut self.last_stacks, &mut other.last_stacks);
@@ -1606,6 +1611,7 @@ impl AppState {
                     ));
                     self.waiting_for = seats;
                 }
+                self.waiting_hand = hand_id;
             }
             // `S1-FL`: a seat's place in the tournament, decided at the boundary.
             NodeEvent::Finished { hand_id, seat, place, tied, players_left, over } => {
@@ -2010,6 +2016,7 @@ impl AppState {
         self.hand = None;
         self.waiting_for.clear();
         self.stands = (0, Vec::new());
+        self.waiting_hand = 0;
         self.last_ended = None;
         self.hand_ended_at = None;
         self.last_stacks.clear();
@@ -2233,6 +2240,13 @@ impl AppState {
         });
     }
 
+    /// `S1-FM`: the stall the felt shows is the table's first hand, still
+    /// opening -- by the node's word about its stage, or by the hand's own before
+    /// this window has held any hand of this table.
+    fn first_hand_opening(&self) -> bool {
+        (!self.stands.1.is_empty() && self.stands.0 == 1) || (self.waiting_hand == 1 && self.hand.is_none())
+    }
+
     /// A reading of the table's group that says the seat is off the line. No
     /// reading at all is neither: the seats of a table still forming are not
     /// waited on over the felt (`S1-EI`'s rule).
@@ -2308,6 +2322,45 @@ impl AppState {
                         format!(
                             "{name} has not answered{}; when its clock runs out the other seats certify it out and play on. Nothing here is stuck",
                             quiet.map(|q| format!(" for {q} s")).unwrap_or_default()
+                        )
+                    };
+                    stalls.push(WaitView {
+                        title: format!("Waiting for {name}"),
+                        panel: RejoinView { for_s: w.since.elapsed().as_secs(), steps, detail: Some(detail), back: false },
+                    });
+                }
+                // `S1-FM`: the table's first hand, still opening. Before it a seat
+                // that is not in the table's group yet is not a seat that went
+                // quiet -- it is joining, and the table gives it a minute more
+                // than any other stage (the owner, 2026-09-15).
+                Some(Stands::Stage) if self.first_hand_opening() => {
+                    let in_group = self.links.get(seat).is_some_and(|(_, group, _, _)| *group);
+                    let steps = vec![
+                        (
+                            state(in_group, true),
+                            if in_group {
+                                format!("{name} is in the table's group")
+                            } else {
+                                format!("{name} joins the table's group – {} s", w.since.elapsed().as_secs())
+                            },
+                        ),
+                        (state(false, in_group && w.votes.is_none()), format!("{name} signs the first hand's opening")),
+                        (
+                            state(false, w.votes.is_some()),
+                            match w.votes {
+                                Some((held, need)) => format!("The other seats agree to deal without it – {held} of {need}"),
+                                None => "The other seats agree to deal without it".to_string(),
+                            },
+                        ),
+                        (Later, "The first hand is dealt without it".to_string()),
+                    ];
+                    let detail = if w.votes.is_some() {
+                        format!("{name} did not arrive in time; when every other seat agrees, the first hand is dealt without it")
+                    } else if in_group {
+                        format!("{name} is in the table's group; the first hand opens as soon as its part arrives. Nothing here is stuck")
+                    } else {
+                        format!(
+                            "{name} is not in the table's group yet; before the first hand the table gives it a minute more than usual to join, then deals without it. Nothing here is stuck"
                         )
                     };
                     stalls.push(WaitView {
@@ -3733,10 +3786,11 @@ mod tests {
         s.apply(NodeEvent::SeatLink { seat: 0, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
 
-        // The first hand's opening waits on a seat off the line: said at once, with
-        // no hand begun at this window and no sweep.
+        // A later hand's opening waits on a seat off the line -- a client back from
+        // a restart holds no hand yet (`S1-FM` says the first hand's otherwise):
+        // said at once, with no hand begun at this window and no sweep.
         s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: Some(30), away: false });
-        s.apply(NodeEvent::HandWaiting { hand_id: 1, seats: vec![2] });
+        s.apply(NodeEvent::HandWaiting { hand_id: 5, seats: vec![2] });
         let v = s.table_view_of(0);
         assert_eq!(v.waits.len(), 1, "{:?}", v.waits);
         assert_eq!(v.waits[0].title, "Waiting for b");
@@ -3748,7 +3802,7 @@ mod tests {
         s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         let v = s.table_view_of(0);
         assert!(v.waits.is_empty(), "heard, and not yet a stall: {:?}", v.waits);
-        s.apply(NodeEvent::StageStands { hand_id: 1, seats: vec![2] });
+        s.apply(NodeEvent::StageStands { hand_id: 5, seats: vec![2] });
         let v = s.table_view_of(0);
         assert_eq!(v.waits[0].title, "Waiting for b");
         assert_eq!(v.waits[0].panel.steps[0].1, "b stopped answering");
@@ -3758,17 +3812,17 @@ mod tests {
         // either order, for a hand this window never held -- and the felt says
         // the table goes on until the next hand's cards are out.
         s.apply(NodeEvent::TimeoutVotes { seat: 2, held: 1, need: 2 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![], shown: vec![], pots: vec![], gained: vec![] });
-        s.apply(NodeEvent::SeatCertified { seat: 2, hand_id: 1 });
+        s.apply(NodeEvent::HandEnded { hand_id: 5, stacks: vec![], shown: vec![], pots: vec![], gained: vec![] });
+        s.apply(NodeEvent::SeatCertified { seat: 2, hand_id: 5 });
         let v = s.table_view_of(0);
         assert_eq!(v.waits.len(), 1, "{:?}", v.waits);
         assert_eq!(v.waits[0].title, "The table goes on without b");
         assert_eq!(v.waits[0].panel.steps[3], (Now, "The next hand is dealt without it".to_string()));
-        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::NotYourTurn { hand_id: 2, seat: Some(0), elapsed_ms: 0 });
+        s.apply(NodeEvent::HandBegan { hand_id: 6, button: 0, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::NotYourTurn { hand_id: 6, seat: Some(0), elapsed_ms: 0 });
         let v = s.table_view_of(0);
         assert_eq!(v.waits.len(), 1, "dealt, no card out yet: {:?}", v.waits);
-        s.apply(NodeEvent::HoleCards { hand_id: 2, cards: [1, 2] });
+        s.apply(NodeEvent::HoleCards { hand_id: 6, cards: [1, 2] });
         let v = s.table_view_of(0);
         assert!(v.waits.is_empty(), "the next hand is being played: {:?}", v.waits);
     }
@@ -3847,6 +3901,46 @@ mod tests {
         s.apply(NodeEvent::AtTable { slot: 0, key: Some(a) });
         s.apply(NodeEvent::LeftTable { why: "the tournament is over".into() });
         assert!(s.joining.as_ref().is_some_and(|j| j.failed.is_none()), "{:?}", s.joining);
+    }
+
+    /// `S1-FM`: before the first hand, a seat not yet in the table's group is
+    /// said to be joining it -- not to have stopped answering -- and the step
+    /// turns when it is in.
+    #[test]
+    fn before_the_first_hand_a_seat_is_joining_the_group_not_gone() {
+        use crate::gui::table::StepState::{Done, Now};
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster {
+            key: [7u8; 32],
+            seats: vec![(0, "me".into(), 1_000), (1, "a".into(), 1_000), (2, "far".into(), 1_000)],
+        });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: None, away: false });
+        s.apply(NodeEvent::HandWaiting { hand_id: 1, seats: vec![2] });
+        let v = s.table_view_of(0);
+        assert_eq!(v.waits.len(), 1, "{:?}", v.waits);
+        assert_eq!(v.waits[0].title, "Waiting for far");
+        assert_eq!(v.waits[0].panel.steps[0].0, Now);
+        assert!(v.waits[0].panel.steps[0].1.starts_with("far joins the table's group"), "{:?}", v.waits[0].panel.steps);
+        assert!(!v.waits[0].panel.steps.iter().any(|(_, t)| t.contains("stopped answering") || t.contains("off the line")));
+
+        // In the group, the node's word keeps the stage standing on it: the step turns.
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::StageStands { hand_id: 1, seats: vec![2] });
+        let v = s.table_view_of(0);
+        assert_eq!(v.waits[0].panel.steps[0], (Done, "far is in the table's group".to_string()));
+        assert_eq!(v.waits[0].panel.steps[1], (Now, "far signs the first hand's opening".to_string()));
+
+        // A later hand's stall is the usual one.
+        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![], shown: vec![], pots: vec![], gained: vec![] });
+        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: Some(25), away: false });
+        s.apply(NodeEvent::StageStands { hand_id: 2, seats: vec![2] });
+        let v = s.table_view_of(0);
+        assert_eq!(v.waits[0].panel.steps[1], (Now, "The cards cannot move on without it".to_string()));
     }
 
     /// `D-058`, the owner's rule: nothing over a hand that is being played -- the

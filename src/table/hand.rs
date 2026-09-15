@@ -991,6 +991,24 @@ struct VerifiedCert {
 }
 
 /// The most subject digests one hand may bank. Four per seat is well past
+/// `S1-FM`: how much longer than its own budget the table's **first** hand's
+/// opening waits for a seat before anybody votes about it (the owner,
+/// 2026-09-15: *before the first hand, give a peer the time it takes to join
+/// the table's Tox group -- measured, and not so long that a peer with a bad
+/// line holds the table*).
+///
+/// Measured in the owner's own games across two networks, eight tables, the
+/// far seat's opening sent this long after its table was set: 15.6, 19.4,
+/// 22.6, 24.3, 30.1, 32.0, 42.0 and 73.7 s. Its client entered the group 0.5
+/// to 12 s after the table was set; the rest is its view of the other seats
+/// in the group completing, which is what `hand_one_may_open` waits for before
+/// it opens a hand at all. The seats that were there certified it out at
+/// 31.3 to 32 s -- the thirty-second budget -- four times in eight. A minute
+/// more is ninety seconds: the slowest measured with a quarter-minute to spare,
+/// and a table held a minute once, before its first hand, by a seat that never
+/// comes. Every later stage has its seats already talking.
+pub const FIRST_HAND_JOIN_ALLOWANCE_MS: u64 = 60_000;
+
 /// `S1-FL`: a seat's place in the tournament, decided at a hand's boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeatFinish {
@@ -8689,6 +8707,20 @@ impl Hand {
         place_seats(&occupied, &self.mine.stacks, &end, &playing_on)
     }
 
+    /// `S1-FM`: whether the table's first hand is still opening inside the
+    /// time a seat is given to join the table's group: the stage's own budget
+    /// plus [`FIRST_HAND_JOIN_ALLOWANCE_MS`]. While it is, nobody votes about a
+    /// seat the opening waits on; `and_then_ms` extends the same window for
+    /// the local abort, which gives a certificate its chance first.
+    pub fn first_hand_opening_held(&self, now_ms: u64, and_then_ms: u64) -> bool {
+        self.open.hand_id == 1
+            && matches!(self.phase, Phase::Init(_))
+            && now_ms.saturating_sub(self.stage_at_ms)
+                < u64::from(self.open.crypto_step_timeout_ms)
+                    .saturating_add(FIRST_HAND_JOIN_ALLOWANCE_MS)
+                    .saturating_add(and_then_ms)
+    }
+
     /// `S1-FL`: the places of [`Hand::finishes_at_boundary`], if nothing still
     /// to come at this boundary can change them -- which is every boundary but
     /// one: fewer than two seats play on while a seat holding chips sits
@@ -14447,6 +14479,24 @@ mod tests {
         // A boundary that busts nobody decides nothing.
         let r = place_seats(&[0, 1, 2], &[1_000; 3], &[900, 1_100, 1_000], &[0, 1, 2]);
         assert!(!r.0 && r.1.is_empty());
+    }
+
+    /// `S1-FM`: the first hand's opening waits a minute longer than its budget
+    /// for a seat to join the table's group; no other stage and no other hand
+    /// does.
+    #[test]
+    fn the_first_hands_opening_waits_a_minute_longer_for_its_seats() {
+        let o = opening3(0);
+        let budget = u64::from(o.crypto_step_timeout_ms);
+        let (h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
+        assert!(h.first_hand_opening_held(NOW + budget + 1, 0), "past the budget, still held");
+        assert!(h.first_hand_opening_held(NOW + budget + FIRST_HAND_JOIN_ALLOWANCE_MS - 1, 0));
+        assert!(!h.first_hand_opening_held(NOW + budget + FIRST_HAND_JOIN_ALLOWANCE_MS, 0), "and then not");
+        assert!(h.first_hand_opening_held(NOW + budget + FIRST_HAND_JOIN_ALLOWANCE_MS, budget), "the abort waits a budget more");
+        let mut o2 = opening3(0);
+        o2.hand_id = 2;
+        let (h2, _) = Hand::open(o2, &key(10), NOW, 30_000).unwrap();
+        assert!(!h2.first_hand_opening_held(NOW + budget + 1, 0), "a later hand waits its budget only");
     }
 
     /// `S1-FL`: the places are final the moment the hand ends -- said then --

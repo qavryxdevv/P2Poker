@@ -7720,7 +7720,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // the flood cause.
                     let flooders: Vec<u8> = t.flooders.keys().copied().collect();
                     h.note_flooders(&flooders);
-                    match h.vote_on_timeouts(&app_key, now, t.tox_sink.mid_delivery()) {
+                    // `S1-FM`: the table's first hand gives a seat a minute more to
+                    // join the table's group before anybody votes it out.
+                    let held = h.first_hand_opening_held(now, 0);
+                    match if held { Ok(Vec::new()) } else { h.vote_on_timeouts(&app_key, now, t.tox_sink.mid_delivery()) } {
                         Ok(sends) if !sends.is_empty() => {
                             // Said out loud, because a table that is waiting on
                             // somebody looks exactly like one that is stuck, and
@@ -7816,7 +7819,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // A vote that is owed and not cast, with every gate's value.
                     // Measured before this: eight seats waiting on one for 370 s,
                     // four votes, and no line saying what held the other four.
-                    if let Some(line) = h.vote_state(now, t.tox_sink.mid_delivery()) {
+                    if let Some(line) = h.vote_state(now, t.tox_sink.mid_delivery()).filter(|_| !h.first_hand_opening_held(now, 0)) {
                         if now.saturating_sub(t.vote_state_said) >= 30_000 {
                             t.vote_state_said = now;
                             let _ = events.send(NodeEvent::Warning(line)).await;
@@ -7849,6 +7852,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
 
                     let Some(h) = t.hand.as_mut() else { continue };
                     if !h.may_abandon(now) {
+                        continue;
+                    }
+                    // `S1-FM`: nor given up while the first hand's opening waits for
+                    // its seats -- and a budget more after, as everywhere, so the
+                    // certificate goes first.
+                    if h.first_hand_opening_held(now, u64::from(crate::protocol::constants::CRYPTO_STEP_MIN_MS)) {
                         continue;
                     }
                     t.act_by = None;
@@ -12881,7 +12890,7 @@ async fn hand_one_may_open(
             *said = true;
             let _ = events
                 .send(NodeEvent::Warning(format!(
-                    "not one of {want} other seats is in the table's group, so no hand is opened here: a hand dealt now would reach nobody. This client is isolated and the other seats will certify it out"
+                    "not one of {want} other seats is in the table's group, so no hand is opened here: a hand dealt now would reach nobody. The other seats give the first hand's opening a minute more than its budget for this client to arrive (S1-FM), and certify it out after that"
                 )))
                 .await;
         }
