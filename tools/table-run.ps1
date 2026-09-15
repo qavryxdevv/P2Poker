@@ -71,6 +71,13 @@ param(
     # back -- a client that crashed and was started again (S1-DU). Zero: it
     # stays dead.
     [ValidateRange(0, 600)][int]$KillFor = 0,
+    # `-Kill2At <s>`, `-Kill2Node <i>`, `-Kill2For <s>` (S1-FR): a second outright
+    # kill, of another node or the same one again, and its start again -- the
+    # owner's test of a heads-up table whose founder came back from a restart and
+    # whose other seat was killed next. Its second life logs to n<i>-again2.log.
+    [ValidateRange(0, 3600)][int]$Kill2At = 0,
+    [ValidateRange(0, 9)][int]$Kill2Node = 0,
+    [ValidateRange(0, 600)][int]$Kill2For = 0,
     # `-KickWithoutWordAt <s>`: the founder kicks its first other seat without the
     # table's word at that second (D-045), for measuring that no member honours
     # it. Needs --features fault-harness.
@@ -706,6 +713,34 @@ if ($KillAt -gt 0) {
         }
     }
 }
+if ($Kill2At -gt 0) {
+    Write-Host "==> n$Kill2Node is killed outright at $Kill2At s (the second kill)"
+    $kill2Profile = Join-Path $work "n$Kill2Node"
+    $null = Start-Job -Name 'killer2' -ArgumentList $Kill2At, $kill2Profile -ScriptBlock {
+        param($at, $profile)
+        Start-Sleep -Seconds $at
+        Get-CimInstance Win32_Process -Filter "Name = 'p2p-poker.exe'" |
+            Where-Object { $_.CommandLine -like "*$profile *" -or $_.CommandLine -like "*$profile" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    }
+    if ($Kill2For -gt 0) {
+        Write-Host "==> n$Kill2Node is started again at $($Kill2At + $Kill2For) s, same profile"
+        $spent2 = $Kill2At + $Kill2For
+        $jobs += Start-Job -Name 'killed-again2' -ArgumentList $Exe, $work, $table, $Seconds, $spent2, $Kill2Node -ScriptBlock {
+            param($exe, $work, $table, $seconds, $spent, $dn)
+            Start-Sleep -Seconds $spent
+            $p = Join-Path $work "n$dn"
+            $log = Join-Path $work "n$dn-again2.log"
+            $start = Get-Date
+            $inv = [System.Globalization.CultureInfo]::InvariantCulture
+            $left = $seconds - $spent
+            if ($left -lt 30) { $left = 30 }
+            & $exe --headless --autoplay --for "$left" --profile $p --join $table --resume 2>&1 |
+                ForEach-Object { ((((Get-Date) - $start).TotalSeconds).ToString('F1', $inv)).PadLeft(7) + '  ' + $_ } |
+                Out-File -FilePath $log -Encoding utf8
+        }
+    }
+}
 if ($RehostAt -gt 0) { Write-Host "==> at $RehostAt s n0 leaves and hosts $table-2; the joiners follow five seconds later" }
 if ($StartStack -gt 0) { Write-Host "==> every seat starts with $StartStack chips, so the tournament ends inside the run" }
 if ($TwoTables) { Write-Host "==> a second table $table-B: hosted by n$($Seats + $Watchers), joined by n$($Seats + $Watchers + 1), and by n1 as well at $AlsoAt s" }
@@ -744,6 +779,7 @@ if (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $LeaverSeconds -eq 0) {
 # table (run154928-2, where the restarted client had gone back to the lobby at
 # 2.1 s and played nothing).
 if ($KillAt -gt 0 -and $KillFor -gt 0) { $logs += @{ Name = "n$KillNode-again"; Path = (Join-Path $work "n$KillNode-again.log") } }
+if ($Kill2At -gt 0 -and $Kill2For -gt 0) { $logs += @{ Name = "n$Kill2Node-again2"; Path = (Join-Path $work "n$Kill2Node-again2.log") } }
 
 $nodes = @()
 foreach ($entry in $logs) {

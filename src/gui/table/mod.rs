@@ -801,7 +801,9 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi, settings: 
     pucks(&p, &l, view, sb, bb);
     flights(&p, &l, &state.motion, now);
     shown_hands(&p, &l, view);
-    if let Some(note) = felt_note(view) {
+    // `S1-FR`: the way back is the word while it is shown; the felt's note
+    // under it would say something else.
+    if let Some(note) = felt_note(view).filter(|_| view.rejoin.is_none()) {
         felt_message(&p, &l, note);
     }
 

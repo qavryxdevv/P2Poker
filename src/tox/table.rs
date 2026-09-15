@@ -2123,7 +2123,7 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
                             // toxcore keeps trying the address the peer had
                             // before it restarted for over two and a half
                             // minutes otherwise (see `Tox::forget_friend`).
-                            if matches!(t.setup.role, Role::Host) {
+                            if offers_the_group(&t.setup.role, t.group.is_some(), t.self_joined, t.settled) {
                                 if let Some(n) = friend_number(&friends, &key) {
                                     t.invited.retain(|f| *f != n);
                                     if !connected.contains(&n) {
@@ -2607,8 +2607,9 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
         }
 
         // --- the founder's invitations, one at a time -------------------------
+        // `S1-FR`: the founder's, and a founder back once it is in the group.
         for t in tables.values_mut() {
-            if matches!(t.setup.role, Role::Host) && t.closing.is_none() {
+            if offers_the_group(&t.setup.role, t.group.is_some(), t.self_joined, t.settled) && t.closing.is_none() {
                 // `S1-FB`: a member the group has just reported gone is no longer
                 // one this founder "has invited" -- that record was of an
                 // invitation to a membership that has ended. Forgotten here, the
@@ -3028,6 +3029,22 @@ fn group_short(confirmed: usize, others: usize) -> bool {
     confirmed < others
 }
 
+/// `S1-FR`: whether this client offers the table's group to the seats missing
+/// from it. The founder always has; the founder back after a restart (`D-037`)
+/// does too once it holds a copy that has confirmed a member -- the members'
+/// copy it was taken into, and by then the only copy there may be. Before this
+/// a founder back offered nobody anything, and a seat that restarted after it
+/// waited to be invited by nobody: the owner's test (2026-09-15), *0 of 1 in*
+/// for as long as both clients ran, the founder's copy holding the group alone
+/// with the seat's friendship up. A member offers only its founder (`D-037`).
+fn offers_the_group(role: &Role, in_group: bool, self_joined: bool, settled: bool) -> bool {
+    match role {
+        Role::Host => true,
+        Role::Back { .. } => in_group && self_joined && settled,
+        Role::Joiner { .. } => false,
+    }
+}
+
 /// Who is owed an invitation: connected, on the roster, not invited yet.
 ///
 /// Split out from [`invite_pending`] because it is the half that had the defect
@@ -3221,6 +3238,21 @@ fn millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `S1-FR`: the founder offers the group always; the founder back after a
+    /// restart once it is in a copy that has confirmed a member; a member never
+    /// offers it to anybody but its founder (which is not this question).
+    #[test]
+    fn a_founder_back_in_the_group_offers_it_and_a_member_does_not() {
+        let back = Role::Back { chat_id: Some([1u8; 32]) };
+        let member = Role::Joiner { founder: [2u8; 32], chat_id: Some([1u8; 32]) };
+        assert!(offers_the_group(&Role::Host, false, false, false));
+        assert!(offers_the_group(&back, true, true, true), "back in a settled copy: it offers");
+        assert!(!offers_the_group(&back, false, false, false), "not in the group yet: it waits to be offered it");
+        assert!(!offers_the_group(&back, true, true, false), "a copy still settling");
+        assert!(!offers_the_group(&back, true, false, true), "a join not finished");
+        assert!(!offers_the_group(&member, true, true, true));
+    }
 
     /// `S1-FE`: the group's counts are of OTHER seats, as the roster the driver
     /// holds is. The formula before this counted this client in as well, so a

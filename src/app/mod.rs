@@ -647,6 +647,8 @@ pub struct Rejoin {
     pub asked: Option<u64>,
     /// Dealt in again, or never out: when.
     pub back_at: Option<std::time::Instant>,
+    /// `S1-FR`: this client came back after a restart, from its session record.
+    pub restarted: bool,
 }
 
 impl Rejoin {
@@ -661,6 +663,7 @@ impl Rejoin {
             following: None,
             asked: None,
             back_at: None,
+            restarted: false,
         }
     }
 }
@@ -1836,6 +1839,8 @@ impl AppState {
                 self.note(format!("{how} opened port {external}"));
             }
             NodeEvent::Hosting { key } => {
+                // `S1-FR`: a founder back from its record is on its way back.
+                let restarted = self.joining.as_ref().is_some_and(|j| j.key == key && j.rejoin);
                 self.forget_the_table();
                 self.seated = Some(Seat {
                     key,
@@ -1844,8 +1849,14 @@ impl AppState {
                     ..Default::default()
                 });
                 self.note(format!("hosting {}", short(&key)));
+                if restarted {
+                    self.rejoin = Some(Rejoin { restarted: true, ..Rejoin::begin() });
+                }
             }
             NodeEvent::Seated { key, seat } => {
+                // `S1-FR`: read before the join is ended -- a seat taken up again
+                // from the session record, after a restart.
+                let restarted = self.joining.as_ref().is_some_and(|j| j.key == key && j.rejoin);
                 // `S1-CS`: a seat is the end of the join that asked for it.
                 if self.joining.as_ref().is_some_and(|j| j.key == key) {
                     self.joining = None;
@@ -1855,6 +1866,14 @@ impl AppState {
                 if t.seat != Some(seat) {
                     t.seat = Some(seat);
                     self.note(format!("seat {seat} at {}", short(&key)));
+                }
+                // `S1-FR`, the owner (2026-09-15): the window of a client back after
+                // a restart said only *the players are joining its group (0 of 1
+                // in)* -- the words for a table before its first hand -- and nothing
+                // about its own way back. The way back is shown from the seat on,
+                // as after a lost line (`D-057`).
+                if restarted && self.rejoin.is_none() {
+                    self.rejoin = Some(Rejoin { restarted: true, ..Rejoin::begin() });
                 }
             }
             NodeEvent::Roster { key, seats } => {
@@ -2504,10 +2523,16 @@ impl AppState {
         }
         let state = |done: bool, now: bool| if done { Done } else if now { Now } else { Later };
         let mut steps = Vec::new();
-        let first_done = back || r.reached || (r.line_lost && r.network_back);
+        let first_done = back || r.reached || (r.line_lost && r.network_back) || r.restarted;
         steps.push((
             state(first_done, true),
-            if r.line_lost { "Connection to the network lost".to_string() } else { "Nobody at the table answers".to_string() },
+            if r.restarted {
+                "Coming back after a restart".to_string()
+            } else if r.line_lost {
+                "Connection to the network lost".to_string()
+            } else {
+                "Nobody at the table answers".to_string()
+            },
         ));
         if r.line_lost {
             steps.push((state(back || r.network_back || r.reached, false), "Network back".to_string()));
@@ -3979,6 +4004,43 @@ mod tests {
         t.apply(NodeEvent::TableState { hand_id: 1, street: 1, pot: 20_100, to_act: Some(0), stacks: vec![9_950, 9_900, 0], bets: vec![50, 100, 10_000], folded: vec![false, false, false] });
         t.apply(NodeEvent::SeatLeft { seat: 0, quit: true, removed: false });
         assert!(!t.opponent_left && !t.opponent_out, "MIR is all in and in the game");
+    }
+
+    /// `S1-FR`, the owner's test (2026-09-15): a client killed and started again
+    /// is shown its way back from the seat it takes up again -- not the words for
+    /// a table before its first hand -- until it is dealt in.
+    #[test]
+    fn a_client_back_after_a_restart_is_shown_its_way_back() {
+        use crate::gui::table::StepState::{Done, Now};
+        let mut s = AppState::new();
+        s.apply(NodeEvent::UnfinishedSession { key: [7u8; 32], table_name: "New table".into(), seat: 1, stack: 10_000, hand_id: 6 });
+        assert!(s.rejoin_unfinished().is_some());
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "founder".into(), 10_000), (1, "me".into(), 10_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        let v = s.table_view().rejoin.expect("the way back, from the seat on");
+        assert_eq!(v.steps[0], (Done, "Coming back after a restart".to_string()));
+        assert_eq!(v.steps[1], (Now, "Back in the table's group".to_string()));
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
+        assert!(s.table_view().rejoin.is_some(), "another roster's seat does not start it again");
+        s.apply(NodeEvent::SeatLink { seat: 0, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::SessionResumed { hand_id: 6, member: false });
+        let v = s.table_view().rejoin.expect("still on its way");
+        assert!(v.steps.iter().any(|(st, t)| *st == Done && t == "Back in the table's group"), "{:?}", v.steps);
+        s.apply(NodeEvent::HandBegan { hand_id: 7, button: 0, dealt_in: vec![0, 1], small_blind: 50, big_blind: 100 });
+        s.apply(NodeEvent::HoleCards { hand_id: 7, cards: [1, 2] });
+        assert!(s.table_view().rejoin.is_none(), "dealt in: nothing over the hand");
+
+        // A founder back from its record, the same.
+        let mut f = AppState::new();
+        f.apply(NodeEvent::UnfinishedSession { key: [8u8; 32], table_name: "Mine".into(), seat: 0, stack: 10_000, hand_id: 3 });
+        assert!(f.rejoin_unfinished().is_some());
+        f.apply(NodeEvent::Hosting { key: [8u8; 32] });
+        assert_eq!(f.table_view().rejoin.map(|v| v.steps[0].1.clone()).as_deref(), Some("Coming back after a restart"));
+        // And a table founded fresh is no way back.
+        let mut g = AppState::new();
+        g.apply(NodeEvent::Hosting { key: [9u8; 32] });
+        assert!(g.table_view().rejoin.is_none());
     }
 
     /// `S1-FQ`, the owner's test (2026-09-15): a heads-up opponent's client
