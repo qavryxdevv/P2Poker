@@ -2767,6 +2767,63 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.hand_one_progress = None;
             $t.hand_one_forced_said = false;
             $t.why_no_hand_one_said = false;
+            // `S1-FT`: and all the rest the table left in the slot. The next table
+            // counts its hands from 1 again, numbers its seats from 0 again and
+            // its group's counters from nothing, and a slot that kept these read
+            // the last table's word as the next one's: `material_recorded` still
+            // named hand #1 of a table left in its first hand, so the next table's
+            // hand #1 never put its card material in the record, and a restart
+            // inside it came back able only to fold (the owner's game, 2026-09-15).
+            // `a_slot_forgets_every_table_field_when_it_leaves_the_table` holds
+            // every field of `TableRun` to this macro or to the slot's own few.
+            $t.material_recorded = None;
+            $t.hand_said_again_ms = 0;
+            $t.stage_waiting = (u64::MAX, 0);
+            $t.give_up_for = None;
+            $t.resume_said = None;
+            $t.required_seen = (0, Vec::new());
+            $t.stands_said = (0, Vec::new());
+            $t.late_settle_said = None;
+            $t.unsettled_abort_here = None;
+            $t.vote_state_said = 0;
+            $t.next_early_lost = (0, 0);
+            $t.delayed_certs.clear();
+            $t.releasing_certs = false;
+            $t.delay_said = false;
+            $t.show_at_expiry = false;
+            $t.out_words.clear();
+            $t.out_keys.clear();
+            $t.out_told = false;
+            $t.flooders.clear();
+            $t.strangers.clear();
+            $t.unsafe_said = None;
+            $t.ever_on_line = false;
+            $t.nobody_said = false;
+            $t.taught.clear();
+            $t.carrier_reported = None;
+            $t.chat_limits = super::tabletalk::Talk::default();
+            $t.chat_refused_said_ms = 0;
+            $t.my_chat = super::tabletalk::Budget::default();
+            #[cfg(feature = "fault-harness")]
+            {
+                $t.chat_spam_said = false;
+            }
+            $t.inbox_dropped_said = 0;
+            $t.claims_refused_said = 0;
+            $t.removed_said = 0;
+            $t.kicked_out_said = 0;
+            $t.tox_refused_said = 0;
+            $t.tox_invites_said = 0;
+            $t.udp_warned = false;
+            $t.recorded_refused_said = false;
+            $t.ratification_echo_ms = 0;
+            $t.ratification_asked_ms = 0;
+            $t.ratification_asked_said = false;
+            $t.resend_at = u64::MAX;
+            $t.resend_ticks = 0;
+            $t.joined_key = None;
+            $t.joined_ad = None;
+            $t.joined_advert_hash = None;
         }};
     }
 
@@ -8085,8 +8142,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // in `--help`.
                 // `D-049`: a seat already sitting out acts at once, and says so
                 // as the check or fold it is, not as a clock that ran out.
-                let playing_for_the_run = autoplay.is_some() && !afk_now() && !t.sitting_out;
-                let action = if turn.legal.can_check {
+                // `S1-FS`: a seat back without its card material folds by `D-033`
+                // whatever the clock says, and that fold is the lost material's and
+                // no player's who did not decide: it sits nobody out.
+                let lost_material = !h.can_play_on();
+                let playing_for_the_run = autoplay.is_some() && !afk_now() && !t.sitting_out && !lost_material;
+                let action = if lost_material {
+                    crate::poker::actions::Action::Fold
+                } else if turn.legal.can_check {
                     crate::poker::actions::Action::Check
                 } else if playing_for_the_run {
                     crate::poker::actions::Action::Call
@@ -8099,7 +8162,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(sends) => {
                         publish_hand(sends, &mut swarm, &mut t.said, &t.tox_sink);
                         let _ = events
-                            .send(NodeEvent::Warning(if playing_for_the_run {
+                            .send(NodeEvent::Warning(if lost_material {
+                                "folded: this seat's card material was lost with the client that stopped, so the hand cannot be played on (D-033)".to_string()
+                            } else if playing_for_the_run {
                                 format!("autoplay: {action:?}")
                             } else if was_sitting_out {
                                 format!("sitting out — {action:?} at once")
@@ -8110,7 +8175,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `D-049`, the owner's rule: a player who does not decide
                         // in time sits out -- this client checks or folds at once
                         // on every turn until the player is back.
-                        if !playing_for_the_run && !t.sitting_out {
+                        if !playing_for_the_run && !t.sitting_out && !lost_material {
                             t.sitting_out = true;
                             t.tox_sink.tell(super::toxsink::Seat::Away(true));
                             let _ = events.send(NodeEvent::SittingOut { on: true }).await;
@@ -13204,6 +13269,14 @@ async fn report_hand(
 
     match turn {
         Some(t) if t.mine => {
+            // `S1-FS`: the own clock and the window's countdown start at the same
+            // instant, and neither before the player could see the turn.
+            let began = own_clock_began_ms(
+                t.began_unix_ms,
+                t.shown_unix_ms,
+                t.taken_up,
+                h.action_deadline().as_millis() as u64,
+            );
             let _ = events
                 .send(NodeEvent::YourTurn {
                     hand_id,
@@ -13216,12 +13289,12 @@ async fn report_hand(
                     can_raise: t.legal.can_raise,
                     min_raise_to: t.legal.min_raise_to,
                     max_raise_to: t.legal.max_raise_to,
-                    elapsed_ms: turn_elapsed_ms(t.began_unix_ms),
+                    elapsed_ms: turn_elapsed_ms(began),
                 })
                 .await;
             return Report {
                 ended: None,
-                clock: Clock::Start { began_unix_ms: t.began_unix_ms },
+                clock: Clock::Start { began_unix_ms: began },
             };
         }
         Some(t) => {
@@ -13295,6 +13368,39 @@ fn turn_elapsed_ms(began_unix_ms: u64) -> u64 {
         return 0;
     }
     super::node::now_unix_ms().saturating_sub(began_unix_ms)
+}
+
+/// `S1-FS`: the least time a turn that reaches this client late leaves its
+/// player, from the moment the client can show it. A delivery a few seconds
+/// late takes its few seconds out of the thirty (`D-034`); a turn that comes
+/// with less than this left came through a line that was down, and that is no
+/// player deciding too slowly.
+const LATE_TURN_LEFT_MS: u64 = 10_000;
+
+/// `D-034`, amended by `S1-FS`: where this client's own clock for its own turn
+/// starts, on the unix clock -- and the window's countdown with it.
+///
+/// From when the turn was given, as `D-034` says, but never before the player
+/// could see it. A turn that already stood when this client took the hand up
+/// again after a restart (`D-033`) starts at the take-up: to this life of the
+/// client, that is when it was given. A turn that reaches this client with less
+/// than `LATE_TURN_LEFT_MS` of its time left gets that much from the moment it
+/// arrived. Zero -- the plain timeout -- where the stamp is unknown.
+///
+/// The owner's finding (2026-09-15): heads-up, a client killed at its own turn
+/// and started again found the turn still standing on it -- nobody can fold for
+/// a seat of two (`D-007`) -- and its clock, counted from the stamp a minute
+/// back, had its half-second floor left: *your clock ran out -- Fold for you*
+/// half a second after *your turn*, and `D-049` sat the player out.
+fn own_clock_began_ms(began_unix_ms: u64, shown_unix_ms: u64, taken_up: bool, timeout_ms: u64) -> u64 {
+    if began_unix_ms == 0 {
+        return 0;
+    }
+    if taken_up {
+        return began_unix_ms.max(shown_unix_ms);
+    }
+    let least = LATE_TURN_LEFT_MS.min(timeout_ms);
+    began_unix_ms.max(shown_unix_ms.saturating_sub(timeout_ms - least))
 }
 
 /// What a report says about the clock.
@@ -14680,5 +14786,118 @@ mod a_joiner_before_the_first_hand {
         assert!(joiner_leaves_because(false, false, None, false, true, false, true).is_some_and(|w| w.contains("silent")));
         assert!(joiner_leaves_because(false, false, None, false, false, false, true).is_some_and(|w| w.contains("answered nothing for 90 s")));
         assert_eq!(joiner_leaves_because(false, false, None, false, false, false, false), None);
+    }
+}
+
+#[cfg(test)]
+mod back_at_the_table {
+    use super::{own_clock_began_ms, LATE_TURN_LEFT_MS};
+
+    const T: u64 = 1_800_000_000_000;
+    const THIRTY: u64 = 30_000;
+
+    /// What the own clock leaves the player at the moment the turn is shown:
+    /// `Clock::apply`'s arithmetic, with `now` the showing.
+    fn left_when_shown(began: u64, shown: u64, timeout: u64) -> u64 {
+        (began + timeout).saturating_sub(shown).min(timeout).max(500)
+    }
+
+    /// `D-034` as it stood: a turn heard a delivery late counts from when it
+    /// was given, so the fold lands where every other window's countdown ends.
+    #[test]
+    fn a_turn_heard_in_time_counts_from_when_it_was_given() {
+        for late in [0, 400, 3_000, 20_000] {
+            let began = own_clock_began_ms(T, T + late, false, THIRTY);
+            assert_eq!(began, T, "{late} ms late");
+            assert_eq!(left_when_shown(began, T + late, THIRTY), THIRTY - late, "{late} ms late");
+        }
+        assert_eq!(own_clock_began_ms(0, T, false, THIRTY), 0, "an unknown stamp is the plain timeout");
+        assert_eq!(own_clock_began_ms(0, T, true, THIRTY), 0, "taken up or not");
+        assert_eq!(
+            own_clock_began_ms(T + 5_000, T, false, THIRTY),
+            T + 5_000,
+            "a stamp from a clock ahead stays, and `Clock::apply` gives the plain timeout for it"
+        );
+    }
+
+    /// `S1-FS`: a turn that comes through a line that was down leaves its
+    /// player ten seconds, and not the half-second floor.
+    #[test]
+    fn a_turn_heard_after_its_time_leaves_the_player_ten_seconds() {
+        for late in [20_001, 29_500, 64_000, 600_000] {
+            let began = own_clock_began_ms(T, T + late, false, THIRTY);
+            assert_eq!(left_when_shown(began, T + late, THIRTY), LATE_TURN_LEFT_MS, "{late} ms late");
+        }
+        let short = 5_000;
+        assert_eq!(
+            left_when_shown(own_clock_began_ms(T, T + 60_000, false, short), T + 60_000, short),
+            short,
+            "a table whose whole clock is shorter than that gives the whole of it"
+        );
+    }
+
+    /// `S1-FS`, the owner's game (2026-09-15): heads-up, a client killed at its
+    /// own turn came back 64 and 80 s later to the turn still standing on it,
+    /// and folded half a second after *your turn*. A turn that stood when the
+    /// client took the hand up again is the player's whole clock from the take-up.
+    #[test]
+    fn a_turn_standing_at_a_take_up_is_the_players_whole_clock_from_it() {
+        for back in [5_000, 64_000, 80_000] {
+            let began = own_clock_began_ms(T, T + back, true, THIRTY);
+            assert_eq!(began, T + back, "back {back} ms after the turn was given");
+            assert_eq!(left_when_shown(began, T + back, THIRTY), THIRTY, "back {back} ms after the turn was given");
+        }
+    }
+
+    /// `S1-FT`: every field of `TableRun` is forgotten by `leave_the_table!` or
+    /// is the slot's own, named here. A slot leaves one table and sits at the
+    /// next, whose hands count from 1 again and whose seats are numbered from 0
+    /// again; `material_recorded` outlived a leave and the next table's hand #1
+    /// never recorded its card material.
+    #[test]
+    fn a_slot_forgets_every_table_field_when_it_leaves_the_table() {
+        // The slot's number, its age (`S1-EA`) and its handle on the client's
+        // one Tox instance; the client's reach, which is no table's; the table,
+        // its topic and its group, which the callers drop with the swarm in
+        // hand; and the session record's rejoin, which the callers keep or
+        // forget (`S1-FG`).
+        const THE_SLOTS_OWN: &[&str] = &[
+            "slot",
+            "opened_at",
+            "tox_sink",
+            "alone_said",
+            "table",
+            "table_topic",
+            "table_announces",
+            "tox_group_said",
+            "resume",
+            "resuming",
+            "resume_since_ms",
+            "resume_last_peer_ms",
+        ];
+        let src = include_str!("run.rs");
+        let start = src.find("\nstruct TableRun {\n").expect("the struct");
+        let end = start + src[start..].find("\n}\n").expect("its end");
+        let fields: Vec<&str> = src[start..end]
+            .lines()
+            .filter_map(|l| {
+                let (name, _) = l.strip_prefix("    ")?.split_once(": ")?;
+                (!name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
+                    .then_some(name)
+            })
+            .collect();
+        assert!(fields.len() > 100, "the struct was read: {} fields", fields.len());
+        let from = src.find("macro_rules! leave_the_table {").expect("the macro");
+        let to = from + src[from..].find("\n    }\n").expect("its end");
+        let forgets = &src[from..to];
+        let kept: Vec<&str> = fields
+            .iter()
+            .copied()
+            .filter(|f| !THE_SLOTS_OWN.contains(f))
+            .filter(|f| !forgets.contains(&format!("$t.{f} ")) && !forgets.contains(&format!("$t.{f}.")))
+            .collect();
+        assert!(kept.is_empty(), "a leave carries these into the slot's next table: {kept:?}");
+        let named: Vec<&str> = THE_SLOTS_OWN.iter().copied().filter(|f| !fields.contains(f)).collect();
+        assert!(named.is_empty(), "named as the slot's own and no field of it: {named:?}");
     }
 }

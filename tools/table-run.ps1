@@ -312,6 +312,12 @@ param(
     # Needs a binary built with `--features fault-harness`.
     [ValidateRange(0, 100000)][int]$DropAtHand = 0,
     [ValidateRange(0, 600)][int]$DropFor = 20,
+    # `-ReturnAfk` (S1-FS): the dropper's return does not play -- its own clock
+    # acts for it, as for a player not back at the window yet -- so what that
+    # clock gives a turn standing on the seat when it takes the hand up again
+    # is in its log: *resumed at hand #N* to *your clock ran out*. Needs a binary
+    # built with `--features fault-harness`.
+    [switch]$ReturnAfk,
     # `-DropNodes`: which joiners drop (node numbers, comma-separated). One by
     # default; several stop at the same moment -- D-036's shape, where the
     # table certifies them together -- and each comes back on its own return.
@@ -658,8 +664,10 @@ if (($DropAt -gt 0 -or $DropAtHand -gt 0) -and $LeaverSeconds -eq 0) {
             Write-Host "==> n$dn stays away: its return would fall after the run"
             continue
         }
-        $return = Start-Job -ArgumentList $Exe, $work, $table, $Seconds, $delay, $spent, $dn -ScriptBlock {
-            param($exe, $work, $table, $seconds, $delay, $spent, $dn)
+        if ($ReturnAfk) { Write-Host "==> n$dn's return does not play: its own clock acts for it (S1-FS)" }
+        $return = Start-Job -ArgumentList $Exe, $work, $table, $Seconds, $delay, $spent, $dn, [bool]$ReturnAfk -ScriptBlock {
+            param($exe, $work, $table, $seconds, $delay, $spent, $dn, $returnAfk)
+            if ($returnAfk) { $env:P2P_POKER_AFK_AT = '0' }
             Start-Sleep -Seconds $delay
             # **The same profile, deliberately.** It carries the identity and the
             # application key, so this is the seat coming back rather than a new

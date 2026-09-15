@@ -1765,6 +1765,12 @@ pub struct Hand {
     /// start here rather than at delivery, so a late delivery does not add
     /// to the thirty seconds.
     turn_began_unix_ms: u64,
+    /// `S1-FS`: when this client applied the event that gave the seat now to
+    /// act its turn, on this client's own clock.
+    turn_heard_ms: u64,
+    /// `S1-FS`: when this client took the hand up again after a restart
+    /// (`D-033`), on its own clock; zero for a hand it did not restore.
+    taken_up_ms: u64,
     /// Seat → the genesis its sequence-0 `HAND_INIT` of this hand named, when
     /// that is not this client's. A roster seat's signed word that it opened
     /// this hand elsewhere: the evidence a client on a private branch can
@@ -2216,6 +2222,8 @@ impl Hand {
                 floor_said: false,
                 last_stamp_ms: opened_at_ms,
                 turn_began_unix_ms: opened_at_ms,
+                turn_heard_ms: opened_at_ms,
+                taken_up_ms: 0,
                 foreign_genesis: BTreeMap::new(),
                 genesis_note: None,
                 genesis_said: false,
@@ -3690,6 +3698,7 @@ impl Hand {
                 };
                 play.step = Step::Acting { to_act };
                 self.turn_began_unix_ms = began;
+                self.turn_heard_ms = now_ms;
                 Ok(Vec::new())
             }
             // Nobody can act. Either every remaining seat is all in — the
@@ -3928,6 +3937,7 @@ impl Hand {
                 };
                 play.step = Step::Acting { to_act };
                 self.turn_began_unix_ms = began;
+                self.turn_heard_ms = now_ms;
                 Ok(Vec::new())
             }
             None => self.close_round_and_open(key, now_ms),
@@ -8592,6 +8602,8 @@ impl Hand {
             legal: play.round.legal(to_act)?,
             pot: play.pot(),
             began_unix_ms: self.turn_began_unix_ms,
+            shown_unix_ms: self.turn_heard_ms.max(self.taken_up_ms),
+            taken_up: self.taken_up_ms != 0 && self.turn_heard_ms <= self.taken_up_ms,
         })
     }
 
@@ -9376,6 +9388,8 @@ impl Hand {
             return Ok(Vec::new());
         }
         self.restoring = false;
+        // `S1-FS`: from here this client can show the hand's turns to its player.
+        self.taken_up_ms = now_ms;
         let which = match &self.phase {
             Phase::Deck { .. } => 1,
             Phase::Shuffling { .. } => 2,
@@ -9690,6 +9704,13 @@ pub struct Turn {
     /// `D-034`: when this seat was given the turn, on the giver's clock
     /// (unix ms). Zero when unknown.
     pub began_unix_ms: u64,
+    /// `S1-FS`: when this client could first show the turn to its player --
+    /// when it applied the event that gave it, or took the hand up again after
+    /// a restart, whichever is later -- on this client's own clock (unix ms).
+    pub shown_unix_ms: u64,
+    /// `S1-FS`: the turn already stood when this client took the hand up again
+    /// after a restart (`D-033`).
+    pub taken_up: bool,
 }
 
 /// A board of exactly five cards, or nothing.
@@ -16267,5 +16288,84 @@ mod tests {
         pump(&mut hands, &keys, 1, sends);
         assert!(hands[0].over() && hands[1].over(), "the fold ends a hand of two");
         assert_eq!(hands[0].terminal(), hands[1].terminal());
+    }
+
+    /// `pump`, with every frame heard at `at` on the hearer's clock.
+    fn pump_at(hands: &mut [Hand; 2], keys: &[SigningKey; 2], from: usize, sends: Vec<Send>, at: u64) {
+        let mut queue: Vec<(usize, Vec<Send>)> = vec![(from, sends)];
+        while !queue.is_empty() {
+            let (from, sends) = queue.remove(0);
+            let to = 1 - from;
+            let mut more = Vec::new();
+            for Send::Broadcast(bytes) in &sends {
+                more.append(&mut hands[to].on_event(bytes, &keys[to], at).expect("a frame of the hand"));
+            }
+            if !more.is_empty() {
+                queue.push((to, more));
+            }
+        }
+    }
+
+    /// `S1-FS`: a turn says when it was given, on the giver's clock (`D-034`),
+    /// and when this client could first show it: when it heard of it, or --
+    /// for a turn that already stood when a restarted client took the hand up
+    /// again -- the take-up, which the turn says it stood at. The owner's game:
+    /// heads-up, a client killed at its own turn came back a minute later to
+    /// the turn still standing, and its own clock, counted from the stamp, left
+    /// its player half a second.
+    #[test]
+    fn a_turn_says_when_it_was_given_and_when_this_client_could_show_it() {
+        // Heard late, never restored: shown from when it was heard.
+        let (mut hands, keys, _, _, _) = heads_up_to_the_first_bet();
+        let up = usize::from(hands[0].turn().expect("somebody is to act").seat);
+        let turn = hands[up].turn().unwrap();
+        let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+        let sends = hands[up].act(action, &keys[up], NOW + 1_000).unwrap();
+        pump_at(&mut hands, &keys, up, sends, NOW + 45_000);
+        let other = hands[1 - up].turn().expect("the first to act preflop gives the big blind its option");
+        assert!(other.mine);
+        assert_eq!(other.began_unix_ms, NOW + 1_000, "given when the action was made");
+        assert_eq!(other.shown_unix_ms, NOW + 45_000, "shown when it was heard");
+        assert!(!other.taken_up, "a hand never restored takes nothing up");
+
+        // Standing at a take-up: shown from the take-up, and it says so.
+        let ([mut a, _b], keys, transcript, mut a_said, kept) = heads_up_to_the_first_bet();
+        if a.turn().is_some_and(|t| t.mine) {
+            let turn = a.turn().unwrap();
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            a_said.extend(bytes_of(&a.act(action, &keys[0], NOW).unwrap()));
+        }
+        let back = NOW + 64_000;
+        let o = Opening::adopt(heads_up_opening(1), &transcript[..2]).unwrap();
+        let mut b2 = Hand::open_restoring(o, &keys[1], back, 30_000, Some(&kept)).unwrap();
+        replay_from_the_table(&mut b2, &a, &a_said, &keys[1]);
+        let _ = b2.restore_done(&keys[1], back).unwrap();
+        let standing = b2.turn().expect("the turn stands on the seat that came back");
+        assert!(standing.mine && standing.taken_up, "it stood when the hand was taken up");
+        assert_eq!(standing.began_unix_ms, NOW, "given before the restart");
+        assert_eq!(standing.shown_unix_ms, back, "and shown from the take-up");
+
+        // Played on: the seat's next turn is heard after the take-up and did not stand at it.
+        let mut hands = [a, b2];
+        let mut at = back;
+        let mut next = None;
+        for _ in 0..40 {
+            let Some(turn) = hands[1].turn() else {
+                break;
+            };
+            let actor = usize::from(turn.seat);
+            if actor == 1 && at > back {
+                next = Some(turn);
+                break;
+            }
+            at += 1_000;
+            let turn = hands[actor].turn().unwrap();
+            let action = if turn.legal.can_check { Action::Check } else { Action::Call };
+            let sends = hands[actor].act(action, &keys[actor], at).unwrap();
+            pump_at(&mut hands, &keys, actor, sends, at);
+        }
+        let next = next.expect("the seat that came back is to act again");
+        assert!(!next.taken_up, "a turn given after the take-up did not stand at it");
+        assert_eq!(next.shown_unix_ms, at, "shown when it was heard");
     }
 }
