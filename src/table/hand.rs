@@ -7939,6 +7939,13 @@ impl Hand {
                 self.slot = self.slot.then(parent);
                 self.mark_stage(now_ms);
                 self.acted_for = Some((seat, action));
+                // `S1-FP`: the next turn is given now, by the table's word. The
+                // stamp it began at was the last signed action's -- the silent
+                // seat's own turn given, a whole clock and the vote ago -- and
+                // `D-034`'s clock gave the next seat its half-second floor: its
+                // own client folded for it and sat it out (the owner's game,
+                // 2026-09-15, facing an all-in).
+                self.last_stamp_ms = now_ms;
                 self.after_action(seat, key, now_ms)
             }
             // A cryptographic deadline. The hand ends and the seat is named —
@@ -12112,6 +12119,40 @@ mod tests {
         let _ = deliver(&mut lone, &from_c, &key(10));
         assert_eq!(lone.waiting_for(), vec![1, 2], "the deck stage, nobody's deck heard");
         assert!(lone.stall_now(NOW + WAIT_FROM_MS).is_some_and(|s| !s.countable), "two of three silent: nothing counts");
+    }
+
+    /// `S1-FP`, the owner's game (2026-09-15): the table acted for a silent seat,
+    /// and the next seat's own client folded for it half a second after the turn
+    /// came -- the turn began where the silent seat's had, at the last signed
+    /// action, a clock and a vote before. The turn after the table acts begins
+    /// when the table acts.
+    #[test]
+    fn the_turn_after_the_table_acts_for_a_seat_begins_when_the_table_acts() {
+        fn feed(h: &mut Hand, sends: &[Send], key: &SigningKey, at: u64) -> Vec<Send> {
+            let mut out = Vec::new();
+            for Send::Broadcast(bytes) in sends {
+                out.append(&mut h.on_event(bytes, key, at).expect("accepted"));
+            }
+            out
+        }
+        let (mut hands, keys) = three_to_the_bet();
+        let up = hands[0].turn().expect("somebody is to act").seat;
+        let voters: Vec<usize> = (0..3usize).filter(|s| *s != usize::from(up)).collect();
+        let (a, b) = (voters[0], voters[1]);
+        let before = hands[a].turn().expect("the silent seat's turn").began_unix_ms;
+        let late = NOW + 600_000;
+        let va = hands[a].vote_on_timeouts(&keys[a], late, 0).unwrap();
+        let vb = hands[b].vote_on_timeouts(&keys[b], late, 0).unwrap();
+        let ca = feed(&mut hands[a], &vb, &keys[a], late);
+        let cb = feed(&mut hands[b], &va, &keys[b], late);
+        assert!(!ca.is_empty() && !cb.is_empty(), "each voter seals its copy");
+        let _ = feed(&mut hands[a], &cb, &keys[a], late);
+        let _ = feed(&mut hands[b], &ca, &keys[b], late);
+        for v in [a, b] {
+            let turn = hands[v].turn().expect("the betting goes on");
+            assert_ne!(turn.seat, up, "the table acted for the silent seat");
+            assert_eq!(turn.began_unix_ms, late, "seat {v}: the next turn begins when the table acts, not at {before}");
+        }
     }
 
     /// `S1-BS` option 1: an unattributed abort arriving between one and two
