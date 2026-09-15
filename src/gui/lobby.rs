@@ -353,6 +353,14 @@ pub struct JoiningView {
     pub gone: bool,
 }
 
+/// `S1-FG`: the table asked for is one this client is at already: its name,
+/// and the slot whose window it is -- `None` for a join still under way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlreadyAtView {
+    pub name: String,
+    pub slot: Option<u8>,
+}
+
 /// Everything the pane draws, prepared away from the paint loop.
 ///
 /// `SPEC_CS.md` §33: cryptography never blocks the GUI event loop, and this is
@@ -374,6 +382,11 @@ pub struct LobbyView {
     pub unfinished: Option<crate::app::Unfinished>,
     /// `S1-CS`: a join in progress, for the small window that says so.
     pub joining: Option<JoiningView>,
+    /// `S1-FG`: the tables this client sits at or joins; joining one of them
+    /// again is refused, with the reason.
+    pub here: Vec<[u8; 32]>,
+    /// `S1-FG`: the word that the table asked for is one this client is at.
+    pub already_at: Option<AlreadyAtView>,
 }
 
 /// One line of lobby chat.
@@ -399,6 +412,8 @@ impl LobbyView {
             log: Vec::new(),
             unfinished: None,
             joining: None,
+            here: Vec::new(),
+            already_at: None,
         }
     }
 

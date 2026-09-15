@@ -67,7 +67,12 @@ pub enum LobbyAction {
     },
     /// `D-043`: turn to one of this client's tables, by slot.
     Focus(u8),
-    LeaveTable,
+    /// `S1-FG`: the table asked for is one this client is at: say so.
+    AlreadyAt([u8; 32]),
+    /// `S1-FG`: the word taken down.
+    DismissAlreadyAt,
+    /// `S1-FG`: taken down, and the table's window shown.
+    ShowTable(u8),
     /// `S1-CR`: rejoin the unfinished game on record. The app state holds
     /// the record's table and stack; the founder answers *already seated*
     /// and the buy-in figure is not read.
@@ -299,6 +304,12 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
             asked = Some(what);
         }
     }
+    // `S1-FG`: the table asked for is one this client is at already.
+    if let Some(a) = view.already_at.as_ref() {
+        if let Some(what) = already_at_window(ui.ctx(), a) {
+            asked = Some(what);
+        }
+    }
     // The chat box is in the middle column and the columns are drawn inside
     // closures, so what it produced is carried out here rather than assigned
     // through a borrow the closure does not have.
@@ -450,6 +461,35 @@ pub fn exit_window(ctx: &egui::Context) -> Option<bool> {
             });
         });
     answer
+}
+
+/// `S1-FG`: joining a table this client sits at, or joins, is refused -- said,
+/// with the way to that table's window (the owner, 2026-09-15).
+pub fn already_at_window(ctx: &egui::Context, a: &super::lobby::AlreadyAtView) -> Option<LobbyAction> {
+    let mut action = None;
+    egui::Window::new(RichText::new("Already at this table").size(19.0).strong())
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.set_min_width(320.0);
+            ui.label(match a.slot {
+                Some(_) => format!("You are already sitting at {}.", a.name),
+                None => format!("You are already joining {}.", a.name),
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if let Some(slot) = a.slot {
+                    if ui.button("Show the table").clicked() {
+                        action = Some(LobbyAction::ShowTable(slot));
+                    }
+                }
+                if ui.button("OK").clicked() {
+                    action = Some(LobbyAction::DismissAlreadyAt);
+                }
+            });
+        });
+    action
 }
 
 pub fn joining_window(ctx: &egui::Context, j: &super::lobby::JoiningView) -> Option<LobbyAction> {
@@ -973,13 +1013,22 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
                 );
                 if join.clicked() {
                     if let Some(row) = view.selected_row() {
-                        state.dialog = Some(Dialog::Sit(SitDown {
-                            key: row.key,
-                            buyin: row.default_buyin,
-                            password: String::new(),
-                            wants_password: row.password_required,
-                        }));
+                        // `S1-FG`: not a table this client is at: the lobby says so
+                        // instead of opening the dialog.
+                        if view.here.contains(&row.key) {
+                            action = LobbyAction::AlreadyAt(row.key);
+                        } else {
+                            state.dialog = Some(Dialog::Sit(SitDown {
+                                key: row.key,
+                                buyin: row.default_buyin,
+                                password: String::new(),
+                                wants_password: row.password_required,
+                            }));
+                        }
                     }
+                }
+                if view.selected_row().is_some_and(|r| view.here.contains(&r.key)) {
+                    ui.label(RichText::new("You are at this table").color(theme::WARN));
                 }
                 if !can_join {
                     // A grey button with no explanation is indistinguishable

@@ -101,8 +101,15 @@ pub enum NodeCommand {
     /// the node that builds a `JOIN_REQUEST` and a roster entry.
     SetNickname(String),
     /// Stop hosting or stop waiting. Formation only; leaving a table that has
-    /// started is a `PLAYER_LEAVE` and is not this.
+    /// started is a `PLAYER_LEAVE` and is not this. **The active table's**: the
+    /// table window turns to its table first, and the lobby never sends it
+    /// (`S1-FG`).
     LeaveTable,
+    /// `S1-FG`: give the join to this table up -- the slot holding it, and no
+    /// other. The lobby used to send `LeaveTable` for this, which the node
+    /// applies to the active table: the one being played, while the join went
+    /// on. `forget` false keeps the session record (a rejoin put off).
+    CancelJoin { key: [u8; 32], forget: bool },
     /// `S1-CR`: rejoin the unfinished session on record -- the node puts the
     /// recorded advert back on offer and says `TableSeen`; the caller then
     /// sits down at it with `JoinTable` like at any other table.
@@ -263,6 +270,10 @@ pub enum NodeEvent {
     /// said on change and empty once it moves on; before the deal as after it,
     /// and for a seat the group still hears as for one gone from the line.
     StageStands { hand_id: u64, seats: Vec<u8> },
+    /// `S1-FG`: the join asked for was not started -- this client already sits
+    /// at or joins that table (`already_here`), or the join could not begin.
+    /// Said so the window's join does not wait for an answer nobody will give.
+    JoinNotStarted { key: [u8; 32], why: String, already_here: bool },
     /// `S1-EI`: the table certified this seat's timeout in hand `hand_id`;
     /// the window says what happens next. `D-058`: the hand is named, since
     /// the word can reach the window after the hand it is about has ended --
@@ -655,6 +666,7 @@ impl NodeEvent {
             | Self::SitInAsked { .. }
             // `D-058`: the wait on another seat over the felt.
             | Self::StageStands { .. }
+            | Self::JoinNotStarted { .. }
             | Self::TimeoutVotes { .. }
             | Self::ReturnVotes { .. } => true,
 

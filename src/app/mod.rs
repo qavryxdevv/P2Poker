@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 
 use crate::gui::lobby::{LobbyView, NetworkStatus, RelayStatus};
 use crate::net::lobby::LobbyStore;
-use crate::net::node::NodeEvent;
+use crate::net::node::{NodeCommand, NodeEvent};
 
 /// `S1-CS`: the table window's view, derived here so it can be tested.
 mod table;
@@ -296,6 +296,15 @@ pub struct SlotView {
     pub active: bool,
 }
 
+/// `S1-FG`: where this client is at a table the lobby offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Here {
+    /// A seat at it, in this slot: its window is this client's.
+    Seated(u8),
+    /// A join to it under way.
+    Joining,
+}
+
 /// `D-043`: one table's state, for a slot the window is not looking at.
 /// The same fields `AppState` holds for the active slot; see `swap_slot`.
 #[derive(Debug, Default)]
@@ -422,6 +431,9 @@ pub struct AppState {
     pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, Option<u64>, std::time::Instant)>,
     /// `S1-CS`: the join in progress, if one is.
     pub joining: Option<Joining>,
+    /// `S1-FG`: the lobby's word that a table asked for is one this client is at
+    /// already. Shown only while that is still so (`view`).
+    pub already_at: Option<[u8; 32]>,
     /// `S1-CX`: the heads-up opponent this client cannot reach, if any.
     pub opponent_gone: Option<OpponentGone>,
     /// `S1-EC`: whether the opponent has been on the line once at this
@@ -1588,6 +1600,22 @@ impl AppState {
                     self.waiting_for = seats;
                 }
             }
+            // `S1-FG`: the node did not start the join asked for. At a table this
+            // client sits at, the lobby says so and the join goes; otherwise the
+            // join window says why -- and its Cancel gives up whatever the node
+            // still holds of that table.
+            NodeEvent::JoinNotStarted { key, why, already_here } => {
+                let seated_here = matches!(self.at_table(&key), Some(Here::Seated(_)));
+                if self.joining.as_ref().is_some_and(|j| j.key == key) {
+                    if already_here && seated_here {
+                        self.joining = None;
+                        self.already_at = Some(key);
+                    } else if let Some(j) = self.joining.as_mut() {
+                        j.failed = Some(why.clone());
+                    }
+                }
+                self.note(why);
+            }
             // `D-058`: the seats a hand's cryptographic stage stands on, by the
             // node's word after its moment -- before the deal as after it, so no
             // hand of this window's is asked for. Each gets its entry now, the
@@ -1839,7 +1867,7 @@ impl AppState {
                 // simply not want this player.
                 self.forget_the_table();
                 self.seated = None;
-                if let Some(j) = self.joining.as_mut() {
+                if let Some(j) = self.joining_of_this_slot() {
                     j.failed = Some(format!("the founder says no: {}", refusal(reason)));
                 }
                 self.note(format!("the founder says no: {}", refusal(reason)));
@@ -1889,7 +1917,7 @@ impl AppState {
             NodeEvent::LeftTable { why } => {
                 self.forget_the_table();
                 self.seated = None;
-                if let Some(j) = self.joining.as_mut() {
+                if let Some(j) = self.joining_of_this_slot() {
                     j.failed = Some(why.clone());
                 }
                 self.note(why);
@@ -2417,6 +2445,14 @@ impl AppState {
         Some(crate::gui::table::RejoinView { for_s: r.since.elapsed().as_secs(), steps, detail, back })
     }
 
+    /// `S1-FG`: the join this slot's word is about -- the join to the table the
+    /// slot held, by the node's last marker, or any join when the slot held no
+    /// table. The end of one table is not the end of a join to another.
+    fn joining_of_this_slot(&mut self) -> Option<&mut Joining> {
+        let key = self.slot_keys.get(&self.current_slot).copied().flatten();
+        self.joining.as_mut().filter(|j| key.is_none_or(|k| k == j.key))
+    }
+
     /// Whether this client holds its cards in a hand still being played.
     fn holds_cards(&self) -> bool {
         self.hand.as_ref().is_some_and(|h| !h.over && h.cards.is_some())
@@ -2657,6 +2693,7 @@ impl AppState {
     /// `S1-CS`: the window asked to sit down; the small window says so until
     /// a seat comes, a refusal comes, or the wait runs out.
     pub fn begin_join(&mut self, key: [u8; 32], name: String, buyin: u64, password: Option<Vec<u8>>) {
+        self.already_at = None;
         self.joining = Some(Joining {
             key,
             name,
@@ -2667,6 +2704,49 @@ impl AppState {
             rejoin: false,
             gone: false,
         });
+    }
+
+    /// `S1-FG`: where this client is at table `key` -- a seat in one of its
+    /// slots, the active one or another, or a join to it under way. Read from
+    /// the state that draws the table windows, so it cannot outlast a leave:
+    /// every road off a table clears that state (`LeftTable`, `JoinRefused`),
+    /// and a join that failed is under way no more.
+    pub fn at_table(&self, key: &[u8; 32]) -> Option<Here> {
+        if self.seated.as_ref().is_some_and(|s| s.key == *key) {
+            return Some(Here::Seated(self.active_slot));
+        }
+        if let Some((slot, _)) = self
+            .background
+            .iter()
+            .find(|(_, t)| t.seated.as_ref().is_some_and(|s| s.key == *key))
+        {
+            return Some(Here::Seated(*slot));
+        }
+        self.joining
+            .as_ref()
+            .filter(|j| j.key == *key && j.failed.is_none())
+            .map(|_| Here::Joining)
+    }
+
+    /// `S1-FG`: sit down at table `key` -- the command for the node, or none,
+    /// and the lobby says this client is at that table already (the owner:
+    /// joining a table one sits at must be refused, with the reason).
+    pub fn sit_down(&mut self, key: [u8; 32], name: String, buyin: u64, password: Option<Vec<u8>>) -> Option<NodeCommand> {
+        if self.at_table(&key).is_some() {
+            self.already_at = Some(key);
+            return None;
+        }
+        self.begin_join(key, name, buyin, password.clone());
+        Some(NodeCommand::JoinTable { key, buyin, seat: None, password })
+    }
+
+    /// `S1-FG`: the join under way given up -- that join, and nothing else.
+    /// The lobby used to send `LeaveTable` whenever this client sat anywhere,
+    /// and the node leaves the active table: the one being played, its window
+    /// closed, while the join went on (the owner, 2026-09-15).
+    pub fn cancel_join(&mut self) -> Option<NodeCommand> {
+        let j = self.joining.take()?;
+        Some(NodeCommand::CancelJoin { key: j.key, forget: !j.rejoin })
     }
 
     /// `S1-DE`: the player answered *rejoin*. The question is taken down at
@@ -2786,6 +2866,32 @@ impl AppState {
         v.log = self.log.iter().cloned().collect();
         v.me = self.me.clone();
         v.unfinished = self.unfinished.clone();
+        // `S1-FG`: the tables this client is at, and the word about one asked for
+        // again -- while it is still so, and never after a leave.
+        v.here = self
+            .seated
+            .iter()
+            .chain(self.background.values().filter_map(|t| t.seated.as_ref()))
+            .map(|s| s.key)
+            .chain(self.joining.iter().filter(|j| j.failed.is_none()).map(|j| j.key))
+            .collect();
+        v.already_at = self.already_at.and_then(|key| {
+            let here = self.at_table(&key)?;
+            let name = self
+                .lobby
+                .tables()
+                .find(|l| *l.key == key)
+                .map(|l| l.held.ad.table_name.clone())
+                .or_else(|| self.joining.as_ref().filter(|j| j.key == key).map(|j| j.name.clone()))
+                .unwrap_or_else(|| short(&key));
+            Some(crate::gui::lobby::AlreadyAtView {
+                name,
+                slot: match here {
+                    Here::Seated(slot) => Some(slot),
+                    Here::Joining => None,
+                },
+            })
+        });
         v.joining = self.joining.as_ref().map(|j| crate::gui::lobby::JoiningView {
             name: j.name.clone(),
             elapsed_s: j.since.elapsed().as_secs(),
@@ -3686,6 +3792,82 @@ mod tests {
         s.apply(NodeEvent::HoleCards { hand_id: 2, cards: [1, 2] });
         let v = s.table_view_of(0);
         assert!(v.waits.is_empty(), "the next hand is being played: {:?}", v.waits);
+    }
+
+    /// `S1-FG`, the owner's word (2026-09-15): an action in the lobby never closes
+    /// a table window. *Cancel* at a join to a second table gives that join up
+    /// -- never `LeaveTable`, which the node applies to the table being played --
+    /// and a join to a table this client sits at is refused with the reason, for
+    /// as long as it sits there and not a moment after.
+    #[test]
+    fn the_lobby_never_leaves_the_table_being_played() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let mut s = AppState::new();
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some(a) });
+        s.apply(NodeEvent::Seated { key: a, seat: 1 });
+        assert_eq!(s.at_table(&a), Some(Here::Seated(0)));
+
+        // A join to a second table, given up.
+        let cmd = s.sit_down(b, "second".into(), 1_000, None);
+        assert!(matches!(cmd, Some(NodeCommand::JoinTable { key, .. }) if key == b), "{cmd:?}");
+        assert_eq!(s.at_table(&b), Some(Here::Joining));
+        let cmd = s.cancel_join();
+        assert!(matches!(cmd, Some(NodeCommand::CancelJoin { key, forget: true }) if key == b), "{cmd:?}");
+        assert!(s.seated.as_ref().is_some_and(|x| x.key == a), "the table being played is untouched");
+        assert!(s.at_table(&b).is_none());
+
+        // The end of the second join at its own slot is not the first table's.
+        assert!(s.sit_down(b, "second".into(), 1_000, None).is_some());
+        s.apply(NodeEvent::AtTable { slot: 1, key: Some(b) });
+        s.apply(NodeEvent::Seated { key: b, seat: 2 });
+        assert_eq!(s.at_table(&b), Some(Here::Seated(1)));
+        assert_eq!(s.slots().len(), 2, "two windows");
+        s.apply(NodeEvent::LeftTable { why: "the join was given up".into() });
+        assert!(s.at_table(&b).is_none(), "that slot's table went");
+        assert_eq!(s.slots().len(), 1, "one window, the first table's");
+        assert!(s.seated.as_ref().is_some_and(|x| x.key == a));
+
+        // A join to the table this client sits at: refused, with the reason and
+        // the way to its window.
+        assert!(s.sit_down(a, "first".into(), 1_000, None).is_none());
+        let v = s.view();
+        assert!(v.here.contains(&a));
+        assert_eq!(v.already_at.as_ref().map(|x| x.slot), Some(Some(0)), "{:?}", v.already_at);
+
+        // Left: the refusal goes with the table, and joining works again.
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some(a) });
+        s.apply(NodeEvent::LeftTable { why: "left the table".into() });
+        let v = s.view();
+        assert!(v.already_at.is_none(), "not stuck after leaving: {:?}", v.already_at);
+        assert!(!v.here.contains(&a));
+        assert!(matches!(s.sit_down(a, "first".into(), 1_000, None), Some(NodeCommand::JoinTable { .. })));
+    }
+
+    /// `S1-FG`: the node's word that it did not start a join ends the join
+    /// window's wait -- at a table this client sits at, as the lobby's refusal;
+    /// otherwise with the reason -- and the end of another table fails no join.
+    #[test]
+    fn a_join_the_node_did_not_start_does_not_wait_for_ever() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let mut s = AppState::new();
+        assert!(s.sit_down(b, "gone".into(), 1_000, None).is_some());
+        s.apply(NodeEvent::JoinNotStarted { key: b, why: "that table is no longer advertised".into(), already_here: false });
+        assert_eq!(s.joining.as_ref().and_then(|j| j.failed.clone()).as_deref(), Some("that table is no longer advertised"));
+        assert!(s.at_table(&b).is_none(), "a failed join is under way no more");
+
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some(a) });
+        s.apply(NodeEvent::Seated { key: a, seat: 0 });
+        s.joining = None;
+        s.begin_join(a, "here".into(), 1_000, None);
+        s.apply(NodeEvent::JoinNotStarted { key: a, why: "this client already sits at or joins that table".into(), already_here: true });
+        assert!(s.joining.is_none());
+        assert!(s.view().already_at.is_some(), "the lobby says so");
+
+        // A join to b under way; table a ends at its slot: b's join goes on.
+        assert!(s.sit_down(b, "b".into(), 1_000, None).is_some());
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some(a) });
+        s.apply(NodeEvent::LeftTable { why: "the tournament is over".into() });
+        assert!(s.joining.as_ref().is_some_and(|j| j.failed.is_none()), "{:?}", s.joining);
     }
 
     /// `D-058`, the owner's rule: nothing over a hand that is being played -- the

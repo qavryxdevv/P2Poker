@@ -1836,6 +1836,15 @@ impl Client {
     /// starts is the rejoin; the node puts the recorded advert back on offer
     /// and the ordinary join follows.
     fn rejoin_unfinished(&mut self) {
+        // `S1-FG`: not a table this client sits at already -- the question is
+        // answered by being there.
+        if let Some(key) = self.state.unfinished.as_ref().map(|u| u.key) {
+            if matches!(self.state.at_table(&key), Some(p2p_poker::app::Here::Seated(_))) {
+                self.state.unfinished = None;
+                self.state.already_at = Some(key);
+                return;
+            }
+        }
         if let Some(u) = self.state.rejoin_unfinished() {
             self.tell(NodeCommand::ResumeSession);
             self.tell(NodeCommand::JoinTable {
@@ -1941,13 +1950,9 @@ impl eframe::App for Client {
                     .find(|l| l.held.ad.table_name == name)
                     .map(|l| (*l.key, l.held.ad.max_buyin));
                 if let Some((key, buyin)) = found {
-                    self.state.begin_join(key, name.clone(), buyin, None);
-                    self.tell(NodeCommand::JoinTable {
-                        key,
-                        buyin,
-                        seat: None,
-                        password: None,
-                    });
+                    if let Some(cmd) = self.state.sit_down(key, name.clone(), buyin, None) {
+                        self.tell(cmd);
+                    }
                 }
             }
         }
@@ -2008,37 +2013,47 @@ impl eframe::App for Client {
                             .find(|r| r.key == key)
                             .map(|r| r.name.clone())
                             .unwrap_or_else(|| short_key(&key));
-                        self.state.begin_join(key, name, buyin, password.clone());
-                        self.tell(NodeCommand::JoinTable {
-                            key,
-                            buyin,
-                            seat: None,
-                            password,
-                        });
+                        // `S1-FG`: not to a table this client is at already.
+                        if let Some(cmd) = self.state.sit_down(key, name, buyin, password) {
+                            self.tell(cmd);
+                        }
                     }
                     render::LobbyAction::RetryJoin => {
                         if let Some(j) = self.state.joining.clone() {
-                            self.state.retry_join();
-                            // `S1-DE`: a rejoin tried again needs the recorded
-                            // advert back on offer first.
-                            if j.rejoin {
-                                self.tell(NodeCommand::ResumeSession);
+                            // `S1-FG`: not to a table this client sits at by now.
+                            if matches!(self.state.at_table(&j.key), Some(p2p_poker::app::Here::Seated(_))) {
+                                self.state.joining = None;
+                                self.state.already_at = Some(j.key);
+                            } else {
+                                self.state.retry_join();
+                                // `S1-DE`: a rejoin tried again needs the recorded
+                                // advert back on offer first.
+                                if j.rejoin {
+                                    self.tell(NodeCommand::ResumeSession);
+                                }
+                                self.tell(NodeCommand::JoinTable {
+                                    key: j.key,
+                                    buyin: j.buyin,
+                                    seat: None,
+                                    password: j.password,
+                                });
                             }
-                            self.tell(NodeCommand::JoinTable {
-                                key: j.key,
-                                buyin: j.buyin,
-                                seat: None,
-                                password: j.password,
-                            });
                         }
                     }
+                    // `S1-FG`: the join given up, and nothing else: this sent
+                    // `LeaveTable` whenever the client sat anywhere, and the node
+                    // left the table being played while the join went on.
                     render::LobbyAction::CancelJoin => {
-                        self.state.joining = None;
-                        if self.state.seated.is_some() {
-                            self.tell(NodeCommand::LeaveTable);
+                        if let Some(cmd) = self.state.cancel_join() {
+                            self.tell(cmd);
                         }
                     }
-                    render::LobbyAction::LeaveTable => self.tell(NodeCommand::LeaveTable),
+                    render::LobbyAction::AlreadyAt(key) => self.state.already_at = Some(key),
+                    render::LobbyAction::DismissAlreadyAt => self.state.already_at = None,
+                    render::LobbyAction::ShowTable(slot) => {
+                        self.state.already_at = None;
+                        self.turn_to(slot);
+                    }
                     render::LobbyAction::Resume => self.rejoin_unfinished(),
                     render::LobbyAction::Forget => self.forget_unfinished(),
                     render::LobbyAction::Say(text) => self.tell(NodeCommand::SayInLobby(text)),

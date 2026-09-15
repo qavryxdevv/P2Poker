@@ -1116,7 +1116,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     let mut next_slot: u8 = 1;
     let mut marked: Option<(u8, Option<[u8; 32]>)> = None;
     // The join requests in flight, by the table each was sent for.
-    let mut join_pending: std::collections::HashMap<libp2p::request_response::OutboundRequestId, usize> =
+    // `S1-FG`: by the slot's number, which a closed slot does not shift.
+    let mut join_pending: std::collections::HashMap<libp2p::request_response::OutboundRequestId, u8> =
         std::collections::HashMap::new();
     let first = &mut tables[0];
     // Arm the boundary: fire now for phase 1, deal after the pause.
@@ -2341,7 +2342,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         };
         // `S1-DV`: with the reason the window shows -- a joiner taken back to
         // the lobby is told why.
-        ($t:ident, $why:expr) => {{
+        ($t:ident, $why:expr) => {
+            leave_table_now!($t, $why, true)
+        };
+        // `S1-FG`: and whether the session record may go at all -- not for a
+        // rejoin put off for now.
+        ($t:ident, $why:expr, $forget:expr) => {{
+            // `S1-FG`: the record this leave may forget is this table's. The
+            // profile holds one, and another table this client sits at may
+            // have written it since: a join given up used to forget the record
+            // of the table being played.
+            let leaving = $t
+                .table
+                .as_ref()
+                .map(|f| f.table_id())
+                .or($t.joined_key)
+                .or($t.resume.as_ref().map(|r| r.table_key));
             // The Tox group goes with the table: dropping the handle tells
             // the driver to leave and joins its thread, which flushes what it
             // still holds -- the last message of a hand sits in that queue.
@@ -2355,7 +2371,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             leave_the_table!($t);
             dht_effort(&mut swarm, false);
             // `S1-CR`: a seat that leaves by its own choice has no session to come back to.
-            let _ = crate::storage::session::forget(&profile_dir);
+            if $forget
+                && crate::storage::session::load(&profile_dir).is_none_or(|r| Some(r.table_key) == leaving)
+            {
+                let _ = crate::storage::session::forget(&profile_dir);
+            }
             $t.resume = None;
             $t.resuming = false;
             let _ = events.send(NodeEvent::LeftTable { why: $why }).await;
@@ -2619,7 +2639,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `D-043`: which table this event is for -- by its topic, by the
                 // table its join request names, by the request its join answer
                 // answers -- and the active table for everything else.
-                let which = table_for_event(&tables, &event, active, &join_pending);
+                let Some(which) = table_for_event(&tables, &event, active, &join_pending) else {
+                    // `S1-FG`: an answer to a join this client no longer waits for --
+                    // given up, its slot closed. It went to the active table before,
+                    // and the table being played read it as its own join gone wrong.
+                    let _ = events
+                        .send(NodeEvent::Warning(
+                            "an answer to a join this client no longer waits for is dropped; no table it sits at is touched".into(),
+                        ))
+                        .await;
+                    continue;
+                };
                 let t = &mut tables[which];
                 mark_table(&events, &mut marked, t).await;
                 match event {
@@ -3203,7 +3233,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             }
-                            request_response::Message::Response { response, .. } => {
+                            request_response::Message::Response { request_id, response } => {
+                                join_pending.remove(&request_id);
                                 let Some(f) = t.table.as_mut() else { continue };
                                 match f.on_join_answer(&response, now) {
                                     Ok(_) => {
@@ -3341,11 +3372,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Join(
-                        request_response::Event::OutboundFailure { error, .. },
+                        request_response::Event::OutboundFailure { request_id, error, .. },
                     )) => {
                         // A join that goes unanswered has to say so. Silence
                         // here is a player looking at a button that appears to
-                        // have done nothing.
+                        // have done nothing. `S1-FG`: at the slot that asked --
+                        // `table_for_event` sends it nowhere else.
+                        join_pending.remove(&request_id);
                         t.table = None;
                         // The Tox group goes with the table. Dropping the handle
                         // tells the driver to leave and joins its thread, which
@@ -4638,7 +4671,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let held: Vec<Option<[u8; 32]>> =
                     tables.iter().map(|x| x.table.as_ref().map(|f| f.table_id())).collect();
-                let (which, open) = slot_for_command(opening, join_key, &held, active);
+                // `S1-FG`: a join given up goes to the slot holding that table and to
+                // no other; one no slot holds any more has ended already, and there
+                // is nothing to give up.
+                let (which, open) = match &command {
+                    NodeCommand::CancelJoin { key, .. } => match slot_for_cancel(key, &held) {
+                        Some(i) => (i, false),
+                        None => continue,
+                    },
+                    _ => slot_for_command(opening, join_key, &held, active),
+                };
                 if open {
                     let sink = tables[0].tox_sink.share();
                     tables.push(TableRun::new(next_slot, &profile_dir, None, sink));
@@ -4756,6 +4798,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     NodeCommand::CreateTable {
                         kind, name, seats, min_players, buyin, password,
                     } => {
+                        // `S1-FG`: never over a table this slot holds. At the most
+                        // tables one client plays at, the command lands on the active
+                        // slot, and founding there replaced the table being played.
+                        if t.table.is_some() {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "this client sits at {MAX_TABLES} tables, the most it plays at once: leave one before founding another"
+                                )))
+                                .await;
+                            continue;
+                        }
                         // A fresh key per table, and that freshness is the only
                         // thing making two tables with the same players and the
                         // same rules different games (§4.3's `session_id`).
@@ -5001,18 +5054,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         {
                             continue;
                         }
-                        if t.table.is_some() {
-                            let _ = events
-                                .send(NodeEvent::Warning(
-                                    "already joining or seated at a table; leave it before joining another"
-                                        .into(),
-                                ))
-                                .await;
+                        if let Some(f) = t.table.as_ref() {
+                            // `S1-FG`: said to the window as well as the log, so the
+                            // join it started does not wait for an answer nobody will
+                            // give. `slot_for_command` sends a join for a table a slot
+                            // holds to that slot, so a table here that is not this one
+                            // is the limit's.
+                            let here = f.table_id() == key;
+                            let why = if here {
+                                "this client already sits at or joins that table".to_string()
+                            } else {
+                                format!("this client sits at {MAX_TABLES} tables, the most it plays at once: leave one before joining another")
+                            };
+                            let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                            let _ = events.send(NodeEvent::JoinNotStarted { key, why, already_here: here }).await;
                             continue;
                         }
                         let Some(held) = state.lobby.get(&key).cloned() else {
-                            let _ = events.send(NodeEvent::Warning(
-                                "that table is no longer advertised".into())).await;
+                            let why = "that table is no longer advertised".to_string();
+                            let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                            let _ = events.send(NodeEvent::JoinNotStarted { key, why, already_here: false }).await;
                             continue;
                         };
                         // `S1-DE`: a seat that sits down elsewhere is not resuming
@@ -5031,17 +5092,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let founder = match PeerId::from_bytes(&held.ad.founder_peer_id) {
                             Ok(p) => p,
                             Err(_) => {
-                                let _ = events.send(NodeEvent::Warning(
-                                    "that table advertises a peer id this client cannot read"
-                                        .into())).await;
+                                let why = "that table advertises a peer id this client cannot read".to_string();
+                                let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                                let _ = events.send(NodeEvent::JoinNotStarted { key, why, already_here: false }).await;
                                 continue;
                             }
                         };
                         let nonce = match crate::security::rng::secret_32() {
                             Ok(n) => n,
                             Err(e) => {
-                                let _ = events.send(NodeEvent::Warning(
-                                    format!("no randomness for a join nonce: {e}"))).await;
+                                let why = format!("no randomness for a join nonce: {e}");
+                                let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                                let _ = events.send(NodeEvent::JoinNotStarted { key, why, already_here: false }).await;
                                 continue;
                             }
                         };
@@ -5163,7 +5225,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .get_closest_peers(founder);
                                 }
                                 let asked = swarm.behaviour_mut().join.send_request(&founder, request);
-                                join_pending.insert(asked, which);
+                                join_pending.insert(asked, t.slot);
                             }
                             Err(e) => {
                         leave_the_table!(t);
@@ -5327,9 +5389,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     NodeCommand::ForgetSession => {
-                        let _ = crate::storage::session::forget(&profile_dir);
-                        t.resume = None;
-                        t.resuming = false;
+                        // `S1-FG`: the record of a table a slot holds is that table's,
+                        // and not the lobby's question to forget; nor is the resume a
+                        // slot is playing from.
+                        if !crate::storage::session::load(&profile_dir).is_some_and(|r| held.contains(&Some(r.table_key))) {
+                            let _ = crate::storage::session::forget(&profile_dir);
+                        }
+                        if t.table.is_none() {
+                            t.resume = None;
+                            t.resuming = false;
+                        }
                         // `S1-DE`: said as the record going, which is what the
                         // window acts on; a warning left its question standing.
                         let _ = events
@@ -5422,11 +5491,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         close_slot = true;
                         leave_table_now!(t);
                     }
+                    NodeCommand::CancelJoin { forget, .. } => {
+                        // `S1-FG`: the join to this slot's table given up in the lobby.
+                        // Left as at a leave -- its group, its topic, its formation --
+                        // and the slot closed; the record goes only when it names this
+                        // table and the join was not a rejoin put off.
+                        close_slot = true;
+                        leave_table_now!(t, "the join was given up".to_string(), forget);
+                    }
                 }
                 // `D-043`: a slot left while another table is open is closed.
+                // `S1-FG`: the window's table stays the node's active one: a slot
+                // closed beside it used to hand `active` to the first table found,
+                // and the next action from the window went to that table.
                 if close_slot && tables.len() > 1 {
+                    let keep = tables[active].slot;
                     tables.remove(which);
-                    active = tables.iter().position(|x| x.table.is_some()).unwrap_or(0);
+                    active = tables
+                        .iter()
+                        .position(|x| x.slot == keep)
+                        .unwrap_or_else(|| tables.iter().position(|x| x.table.is_some()).unwrap_or(0));
                 }
                 // And a slot that never got its table -- a join refused -- goes
                 // once the window has turned elsewhere.
@@ -9047,8 +9131,8 @@ fn table_for_event(
     tables: &[TableRun],
     event: &SwarmEvent<PokerBehaviourEvent>,
     active: usize,
-    join_pending: &std::collections::HashMap<libp2p::request_response::OutboundRequestId, usize>,
-) -> usize {
+    join_pending: &std::collections::HashMap<libp2p::request_response::OutboundRequestId, u8>,
+) -> Option<usize> {
     let by_topic = |topic: &gossipsub::TopicHash| {
         tables
             .iter()
@@ -9072,13 +9156,24 @@ fn table_for_event(
                     .iter()
                     .position(|t| t.table.as_ref().is_some_and(|f| f.table_id() == req.table_id))
             }),
-        SwarmEvent::Behaviour(PokerBehaviourEvent::Join(request_response::Event::Message {
-            message: request_response::Message::Response { request_id, .. },
-            ..
-        })) => join_pending.get(request_id).copied(),
+        // `S1-FG`: a join's answer, or its failure, goes to the slot that asked
+        // and to no other. An answer nobody waits for any more is for no table:
+        // it used to fall to the active one -- the table being played -- which
+        // took a stranger's refusal or failure for its own and left.
+        SwarmEvent::Behaviour(PokerBehaviourEvent::Join(
+            request_response::Event::Message {
+                message: request_response::Message::Response { request_id, .. },
+                ..
+            }
+            | request_response::Event::OutboundFailure { request_id, .. },
+        )) => {
+            return join_pending
+                .get(request_id)
+                .and_then(|slot| tables.iter().position(|t| t.slot == *slot));
+        }
         _ => None,
     };
-    found.unwrap_or(active).min(tables.len().saturating_sub(1))
+    Some(found.unwrap_or(active).min(tables.len().saturating_sub(1)))
 }
 
 /// `D-043`: tell the window which table what follows is about, when that
@@ -9346,6 +9441,14 @@ fn slot_for_command(
         return (held.len(), true);
     }
     (active, false)
+}
+
+/// `S1-FG`: the slot a join given up goes to -- the one holding that table --
+/// or none, when no slot holds it any more and the join has ended already.
+/// Never the active slot for want of a better one: that is the table being
+/// played.
+fn slot_for_cancel(key: &[u8; 32], held: &[Option<[u8; 32]>]) -> Option<usize> {
+    held.iter().position(|h| *h == Some(*key))
 }
 
 /// `D-042`: how long after a tournament's end its group is left. Two
@@ -14030,5 +14133,17 @@ mod a_join_finds_its_slot {
         let full = [Some(A), Some([3u8; 32]), Some([4u8; 32]), Some([5u8; 32])];
         assert_eq!(slot_for_command(true, Some(B), &full, 2), (2, false), "no fifth slot");
         assert_eq!(slot_for_command(false, None, &[Some(A), Some(B)], 1), (1, false), "the rest go to the active slot");
+    }
+
+    /// `S1-FG`, the owner's word: *Cancel* at a join to a second table closed the
+    /// table being played. The join given up goes to the slot holding that
+    /// table, wherever the active slot is, and a join that has ended goes
+    /// nowhere.
+    #[test]
+    fn a_join_given_up_goes_to_its_own_slot_and_to_no_other() {
+        assert_eq!(slot_for_cancel(&B, &[Some(A), Some(B)]), Some(1), "the slot joining it, not the active one");
+        assert_eq!(slot_for_cancel(&A, &[Some(B), Some(A), Some([3u8; 32])]), Some(1));
+        assert_eq!(slot_for_cancel(&B, &[Some(A)]), None, "ended already: nothing is touched");
+        assert_eq!(slot_for_cancel(&B, &[None, Some(A)]), None);
     }
 }
