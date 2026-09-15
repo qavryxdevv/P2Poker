@@ -6772,6 +6772,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // end, and the founder opening a hand every 31 s for the rest
                         // of the run). A founder that no longer holds the seat still
                         // refuses the rejoin, and that forgets the record (`S1-CR`).
+                        //
+                        // `S1-FN`, the owner's word (2026-09-15): *reading a table as
+                        // gone at a reconnect is nonsense -- a game under way is not in
+                        // the public lobby any more, and a table that really is over
+                        // says so another way*. Once the table is set here, nothing read
+                        // about the founder sends this seat away: not its exit, its
+                        // silence, its line down or an unanswered ping. The far seat's
+                        // client that day: the table set, its own Tox line gone for four
+                        // seconds, not one other seat in its copy of the group, and
+                        // *the founder never joined the table's group and its line is
+                        // down* 71 s after the set took it away from a table whose other
+                        // seats were still waiting for it. A founder absent from a set
+                        // table is the hand's to handle, like any seat: certified out,
+                        // or at heads-up its opponent's question. Only the founder's own
+                        // roster without this seat still sends it back.
                         let gone: Option<String> = t.table.as_ref().filter(|f| !f.is_founder() && !t.resuming).and_then(|f| {
                             let founder_peer = PeerId::from_bytes(f.founder_peer_id()).ok();
                             let founder_line = f
@@ -6818,48 +6833,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // 20:27 UTC: *the table is set* at 46.7 s, the founder's
                             // hand #1 to seats [0, 1, 2] and its answer with no table
                             // at 47.4 s, and this rule sent the seat back to the lobby
-                            // at 48.0 s with the deal on its way). A founder gone after
-                            // the set is still read by its exit, its group silence,
-                            // `GROUP_JOIN_GRACE` and `SEAT_SILENCE_MS`.
+                            // at 48.0 s with the deal on its way). Since `S1-FN` nothing
+                            // about the founder is read after the set at all -- see
+                            // `joiner_leaves_because`.
                             let withdrawn = f.session().is_none()
                                 && !founder_line.is_some_and(|k| t.tox_sink.in_group_line(&k))
                                 && answers
                                     .get(f.founder_peer_id())
                                     .is_some_and(|(named, at)| !named.contains(&f.table_id()) && *at > f.advert_time());
-                            if f.released_before_the_first_hand() {
-                                Some(
-                                    "the founder gave this seat away before the first hand -- this client had answered nothing for a while, or had left -- so there is nothing to sit at; join again from the lobby"
-                                        .to_string(),
-                                )
-                            } else if let Some(quit) = exit {
-                                Some(if quit {
-                                    "the founder left the table before the first hand: the table is gone".to_string()
-                                } else {
-                                    "the founder timed out of the table's group before the first hand: the table is gone"
-                                        .to_string()
-                                })
-                            } else if withdrawn {
-                                Some(
-                                    "the founder no longer offers this table before the first hand: it left, or went on without this client; back to the lobby"
-                                        .to_string(),
-                                )
-                            } else if quiet {
-                                Some(format!(
-                                    "the founder has been silent in the table's group for {QUIET_LIMIT_S} s before the first hand: the table is gone"
-                                ))
-                            } else if never_in {
-                                Some(format!(
-                                    "the founder never joined the table's group and its line is down, {} s after this client sat down: the table is gone",
-                                    GROUP_JOIN_GRACE.as_secs()
-                                ))
-                            } else if by_ping {
-                                Some(format!(
-                                    "the founder has answered nothing for {} s before the first hand: the table is gone",
-                                    SEAT_SILENCE_MS / 1000
-                                ))
-                            } else {
-                                None
-                            }
+                            joiner_leaves_because(
+                                f.released_before_the_first_hand(),
+                                f.session().is_some(),
+                                exit,
+                                withdrawn,
+                                quiet,
+                                never_in,
+                                by_ping,
+                            )
                         });
                         if let Some(why) = gone {
                             let _ = events.send(NodeEvent::Warning(why.clone())).await;
@@ -12764,6 +12754,67 @@ const SEAT_SILENCE_MS: u64 = 90_000;
 /// room for a far seat and a slow relay.
 const GROUP_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(40);
 
+/// `D-044`: why a joiner leaves its table before the first hand, from what it
+/// read about its founder -- or `None`, and it stays. `released`: the founder's
+/// roster said again without this seat; `set`: the table is set here; `exit`:
+/// the founder left the table's group (`true`) or timed out of it; `withdrawn`:
+/// the founder's lobby answer no longer offers the table; `quiet`, `never_in`
+/// and `by_ping`: its silence in the group, never in it with its line down
+/// `GROUP_JOIN_GRACE` after sitting down, no answer to a ping for
+/// `SEAT_SILENCE_MS`.
+///
+/// `S1-FN` (the owner, 2026-09-15): at a set table only `released` counts. A
+/// game under way is not in the lobby, the founder's line is read from a copy
+/// of the group a reconnect can empty, and a table that is really over says
+/// so another way.
+fn joiner_leaves_because(
+    released: bool,
+    set: bool,
+    exit: Option<bool>,
+    withdrawn: bool,
+    quiet: bool,
+    never_in: bool,
+    by_ping: bool,
+) -> Option<String> {
+    if released {
+        return Some(
+            "the founder gave this seat away before the first hand -- this client had answered nothing for a while, or had left -- so there is nothing to sit at; join again from the lobby"
+                .to_string(),
+        );
+    }
+    if set {
+        return None;
+    }
+    if let Some(quit) = exit {
+        Some(if quit {
+            "the founder left the table before the first hand: the table is gone".to_string()
+        } else {
+            "the founder timed out of the table's group before the first hand: the table is gone".to_string()
+        })
+    } else if withdrawn {
+        Some(
+            "the founder no longer offers this table before the first hand: it left, or went on without this client; back to the lobby"
+                .to_string(),
+        )
+    } else if quiet {
+        Some(format!(
+            "the founder has been silent in the table's group for {QUIET_LIMIT_S} s before the first hand: the table is gone"
+        ))
+    } else if never_in {
+        Some(format!(
+            "the founder never joined the table's group and its line is down, {} s after this client sat down: the table is gone",
+            GROUP_JOIN_GRACE.as_secs()
+        ))
+    } else if by_ping {
+        Some(format!(
+            "the founder has answered nothing for {} s before the first hand: the table is gone",
+            SEAT_SILENCE_MS / 1000
+        ))
+    } else {
+        None
+    }
+}
+
 /// How long hand 1 waits after the group **stops filling**.
 ///
 /// **A fixed deadline is wrong for one of the two cases, which is why this one
@@ -14479,5 +14530,52 @@ mod a_join_finds_its_slot {
         assert_eq!(slot_for_cancel(&A, &[Some(B), Some(A), Some([3u8; 32])]), Some(1));
         assert_eq!(slot_for_cancel(&B, &[Some(A)]), None, "ended already: nothing is touched");
         assert_eq!(slot_for_cancel(&B, &[None, Some(A)]), None);
+    }
+}
+
+#[cfg(test)]
+mod a_joiner_before_the_first_hand {
+    use super::*;
+
+    /// `S1-FN`, the owner's word (2026-09-15): the far seat's client read its
+    /// founder as never in the table's group with its line down, 71 s after the
+    /// table was set and a reconnect later, and left a table whose other seats
+    /// were still waiting for it. At a set table nothing read about the founder
+    /// sends a seat away; the founder's roster without it still does.
+    #[test]
+    fn a_set_table_is_not_left_on_what_is_read_about_the_founder() {
+        assert_eq!(joiner_leaves_because(false, true, None, false, false, true, false), None, "the far seat's reading");
+        for (exit, withdrawn, quiet, never_in, by_ping) in [
+            (Some(true), false, false, false, false),
+            (Some(false), false, false, false, false),
+            (None, true, false, false, false),
+            (None, false, true, false, false),
+            (None, false, false, false, true),
+            (Some(true), true, true, true, true),
+        ] {
+            assert_eq!(joiner_leaves_because(false, true, exit, withdrawn, quiet, never_in, by_ping), None);
+        }
+        assert!(
+            joiner_leaves_because(true, true, None, false, false, false, false).is_some_and(|w| w.contains("gave this seat away")),
+            "the founder's own roster without this seat"
+        );
+    }
+
+    /// `D-044` as built, before the table is set: the same words, in the same order.
+    #[test]
+    fn before_the_set_the_founder_gone_still_sends_the_joiner_back() {
+        assert_eq!(
+            joiner_leaves_because(false, false, None, false, false, true, false).as_deref(),
+            Some("the founder never joined the table's group and its line is down, 40 s after this client sat down: the table is gone")
+        );
+        assert_eq!(
+            joiner_leaves_because(false, false, Some(true), true, true, true, true).as_deref(),
+            Some("the founder left the table before the first hand: the table is gone"),
+            "its exit first"
+        );
+        assert!(joiner_leaves_because(false, false, None, true, true, false, false).is_some_and(|w| w.ends_with("back to the lobby")));
+        assert!(joiner_leaves_because(false, false, None, false, true, false, true).is_some_and(|w| w.contains("silent")));
+        assert!(joiner_leaves_because(false, false, None, false, false, false, true).is_some_and(|w| w.contains("answered nothing for 90 s")));
+        assert_eq!(joiner_leaves_because(false, false, None, false, false, false, false), None);
     }
 }
