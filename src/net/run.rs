@@ -2589,7 +2589,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 )
                             }))
                             .await;
-                        let _ = events.send(NodeEvent::SeatLeft { seat, quit: true }).await;
+                        let _ = events.send(NodeEvent::SeatLeft { seat, quit: true, removed: true }).await;
                         continue;
                     }
                     let quiet = [
@@ -7180,7 +7180,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         if let Some(seat) = t.table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
-                            let _ = events.send(NodeEvent::SeatLeft { seat, quit }).await;
+                            let _ = events.send(NodeEvent::SeatLeft { seat, quit, removed: false }).await;
                             let _ = events
                                 .send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false, quiet_s: None, away: false })
                                 .await;

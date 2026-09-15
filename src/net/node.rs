@@ -464,9 +464,11 @@ pub enum NodeEvent {
     /// wait is over, whichever way it ended.
     ShowdownChoice { hand_id: u64, open_ms: Option<u64> },
     /// `D-035`: a seat's client left the table's group -- on purpose
-    /// (`quit`) or by timing out. The seat is shown gone; heads-up a quit
-    /// ends the game.
-    SeatLeft { seat: u8, quit: bool },
+    /// (`quit`) or by timing out -- or, `S1-FO`, the table's word removed it for
+    /// good (`removed`, with `quit`: D-047's fourth absence, D-051's flood).
+    /// The seat is shown gone; heads-up a quit by the seat's own client, held
+    /// long enough to be no rejoin, ends the game. A removal never does.
+    SeatLeft { seat: u8, quit: bool, removed: bool },
     /// `D-047`: this client's own seat is out of the table for good -- the
     /// table's word about its fourth absence, verified. The window says so
     /// and holds the table until the player closes it. `D-051`: `flooded`

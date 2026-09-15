@@ -341,6 +341,7 @@ pub struct TableApp {
     pub gone: std::collections::BTreeSet<u8>,
     pub left_for_good: std::collections::BTreeSet<u8>,
     pub opponent_left: bool,
+    pub quit_pending: Option<(u8, std::time::Instant)>,
     pub table_log: VecDeque<crate::gui::table::LogLine>,
     pub turn_warned: u64,
     pub sitting_out: bool,
@@ -472,6 +473,10 @@ pub struct AppState {
     /// `D-035`: the heads-up opponent quit the table on purpose; the game is
     /// over, and the one thing left to do is leave.
     pub opponent_left: bool,
+    /// `S1-FO`: the heads-up opponent's leave of the table's group, and since
+    /// when, held for `OPPONENT_QUIT_HOLDS_MS` before the game is said to be
+    /// over; a seat back in the group within it had not left.
+    pub quit_pending: Option<(u8, std::time::Instant)>,
     /// The table's history, PokerTH's *Log* panel: the hand's header, the
     /// blinds, every action, the streets, the showdown and the winners.
     pub table_log: VecDeque<crate::gui::table::LogLine>,
@@ -791,6 +796,14 @@ pub struct OpponentGone {
 /// than a reconnection takes, shorter than a player's patience.
 pub const OPPONENT_GONE_MS: u64 = 15_000;
 
+/// `S1-FO`: how long a heads-up opponent's leave of the table's group is held
+/// before the game is said to be over. The library reports a member that left
+/// on purpose whenever that member's client leaves its copy of the group, and a
+/// client that merely rejoins does: toxcore's own rejoin says the goodbye first,
+/// and so does the driver giving up a join that stalled. A client back from
+/// that is in the group again within this.
+pub const OPPONENT_QUIT_HOLDS_MS: u64 = 30_000;
+
 /// `D-046`: how long a player's *Wait* holds before the question about an
 /// opponent still out of reach is asked again -- the owner's "a few tens of
 /// seconds", so that a wait is never for ever.
@@ -884,6 +897,7 @@ impl AppState {
         std::mem::swap(&mut self.gone, &mut other.gone);
         std::mem::swap(&mut self.left_for_good, &mut other.left_for_good);
         std::mem::swap(&mut self.opponent_left, &mut other.opponent_left);
+        std::mem::swap(&mut self.quit_pending, &mut other.quit_pending);
         std::mem::swap(&mut self.table_log, &mut other.table_log);
         std::mem::swap(&mut self.turn_warned, &mut other.turn_warned);
         std::mem::swap(&mut self.sitting_out, &mut other.sitting_out);
@@ -913,10 +927,12 @@ impl AppState {
     /// seats the table waits on are read afresh first, every frame.
     pub fn table_view_of(&mut self, slot: u8) -> crate::gui::table::TableView {
         if slot == self.active_slot || !self.background.contains_key(&slot) {
+            self.tick_quit();
             self.tick_waits();
             return self.table_view();
         }
         self.swap_slot(slot);
+        self.tick_quit();
         self.tick_waits();
         let view = self.table_view();
         self.swap_slot(slot);
@@ -1227,6 +1243,13 @@ impl AppState {
                     self.ever_on_line = true;
                 }
                 self.links.insert(seat, (rtt_ms, group, quiet_s, std::time::Instant::now()));
+                // `S1-FO`: a leave held and the seat back in the table's group:
+                // it rejoined, it had not left.
+                if group && self.quit_pending.is_some_and(|(s, _)| s == seat) {
+                    self.quit_pending = None;
+                    self.left_for_good.remove(&seat);
+                    self.note(format!("seat {seat} is back in the table's group: it had rejoined, not left the table"));
+                }
                 // `D-035`: a reading from the table's group is a seat back in it.
                 if reachable {
                     self.gone.remove(&seat);
@@ -1238,7 +1261,7 @@ impl AppState {
             // `D-035`: a seat's client left the table's group. On purpose,
             // heads-up, that is the end of the game; by a timeout it is an
             // absence the seat may come back from (D-031, D-032).
-            NodeEvent::SeatLeft { seat, quit } => {
+            NodeEvent::SeatLeft { seat, quit, removed } => {
                 // `S1-EE`: never the player's own seat -- the player is here, and no
                 // reading about their own seat would ever clear it.
                 if self.seated.as_ref().and_then(|s| s.seat) == Some(seat) {
@@ -1252,23 +1275,23 @@ impl AppState {
                 if quit {
                     self.left_for_good.insert(seat);
                 }
-                self.note(format!(
-                    "seat {seat} left the table{}",
-                    if quit { "" } else { " (its connection timed out)" }
-                ));
-                if quit && was_opponent && !self.opponent_out {
-                    self.opponent_out = true;
-                    self.opponent_left = true;
-                    self.opponent_gone = Some(OpponentGone {
-                        since: std::time::Instant::now()
-                            .checked_sub(std::time::Duration::from_millis(OPPONENT_GONE_MS))
-                            .unwrap_or_else(std::time::Instant::now),
-                        said: true,
-                        dismissed_at: None,
-                        slow: false,
-                        alone: false,
-                    });
-                    self.note("your opponent left the table (D-035): the game is over -- leave the table".into());
+                self.note(if removed {
+                    format!("seat {seat} is out of the table for good: removed by the table's word")
+                } else {
+                    format!("seat {seat} left the table{}", if quit { "" } else { " (its connection timed out)" })
+                });
+                // `S1-FO`, the owner's word (2026-09-15: *never on a false
+                // detection*): the table's word removing a seat is no opponent who
+                // left -- the certificate had two voters beside it, who play on --
+                // and a leave by the seat's own client is held before the game is
+                // said to be over, since a client rejoining the group says the same
+                // goodbye (`OPPONENT_QUIT_HOLDS_MS`).
+                if quit && !removed && was_opponent && !self.opponent_out {
+                    self.quit_pending = Some((seat, std::time::Instant::now()));
+                    self.note(format!(
+                        "seat {seat}, the only other seat in the game, left the table's group on purpose; if it is not back within {} s, the game is over",
+                        OPPONENT_QUIT_HOLDS_MS / 1_000
+                    ));
                 }
             }
             NodeEvent::HandBegan {
@@ -1691,6 +1714,7 @@ impl AppState {
             NodeEvent::Swept { now_ms } => {
                 self.last_sweep_ms = now_ms;
                 self.tick_opponent();
+                self.tick_quit();
                 self.tick_waits();
                 // `D-057`: *Back in the game* for a moment, then nothing; and no
                 // way back at a table this client no longer plays at.
@@ -2031,6 +2055,7 @@ impl AppState {
         self.gone.clear();
         self.left_for_good.clear();
         self.opponent_left = false;
+        self.quit_pending = None;
         self.clock_for(None, 0);
         self.table_chat.clear();
         self.muted.clear();
@@ -2111,17 +2136,60 @@ impl AppState {
         // chips -- and not how many the table was founded for: a table founded
         // for more is heads-up once the others are gone (the owner: the question
         // never came at a table with dead seats).
+        // `S1-FO`: and while a hand is under way, a seat that began it with chips
+        // or plays in it is in the game -- an all-in seat has nothing behind
+        // and plays on. The owner's game (2026-09-15): one seat all in at a hand
+        // of three read as out, the third seat as the only opponent, and the
+        // table's removal of that third seat as *your opponent left the table,
+        // the game is over*.
+        let under_way = self.hand.as_ref().filter(|h| !h.over);
         let live: Vec<u8> = s
             .roster
             .iter()
             .filter(|(n, _, stack)| {
+                let i = usize::from(*n);
                 *n != me
                     && !self.left_for_good.contains(n)
-                    && self.last_stacks.get(usize::from(*n)).copied().unwrap_or(*stack) > 0
+                    && (self.last_stacks.get(i).copied().unwrap_or(*stack) > 0
+                        || under_way.is_some_and(|h| {
+                            h.start_stacks.get(i).is_some_and(|c| *c > 0)
+                                || (h.dealt_in.contains(n) && !h.folded.get(i).copied().unwrap_or(false))
+                        }))
             })
             .map(|(n, _, _)| *n)
             .collect();
         (live.len() == 1).then(|| live[0])
+    }
+
+    /// `S1-FO`: a heads-up opponent's leave that has held -- not back in the
+    /// table's group for `OPPONENT_QUIT_HOLDS_MS`, and no other seat in the game
+    /// -- is the end of the game.
+    pub fn tick_quit(&mut self) {
+        let Some((seat, since)) = self.quit_pending else {
+            return;
+        };
+        if (since.elapsed().as_millis() as u64) < OPPONENT_QUIT_HOLDS_MS {
+            return;
+        }
+        self.quit_pending = None;
+        if self.opponent_out || self.heads_up_opponent().is_some() {
+            return;
+        }
+        self.opponent_out = true;
+        self.opponent_left = true;
+        self.opponent_gone = Some(OpponentGone {
+            since: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(OPPONENT_GONE_MS))
+                .unwrap_or_else(std::time::Instant::now),
+            said: true,
+            dismissed_at: None,
+            slow: false,
+            alone: false,
+        });
+        self.note(format!(
+            "your opponent left the table (D-035): seat {seat} has not come back to the table's group in {} s -- the game is over, leave the table",
+            OPPONENT_QUIT_HOLDS_MS / 1_000
+        ));
     }
 
     /// A reading about the heads-up opponent: reachable clears the episode,
@@ -3775,7 +3843,7 @@ mod tests {
         assert_eq!(v.waits[0].title, "The table goes on without Founder");
         assert_eq!(v.waits[0].panel.steps[3], (Now, "The next hand is dealt without it".to_string()));
         s.apply(NodeEvent::StageStands { hand_id: 12, seats: vec![] });
-        s.apply(NodeEvent::SeatLeft { seat: 0, quit: false });
+        s.apply(NodeEvent::SeatLeft { seat: 0, quit: false, removed: false });
         s.apply(NodeEvent::HandBegan { hand_id: 13, button: 2, dealt_in: vec![1, 2], small_blind: 100, big_blind: 200 });
         s.apply(NodeEvent::Swept { now_ms: 4 });
         assert_eq!(s.table_view().waits.len(), 1, "dealt, but no card is out yet");
@@ -3900,6 +3968,80 @@ mod tests {
         assert!(s.table_log.iter().any(|l| l.text == "Carol made the table wait (3 of 3): 10 s at a step from now on"));
         s.apply(NodeEvent::SeatWaited { seat: 2, waits: 4, step_ms: 30_000 });
         assert!(s.table_log.iter().any(|l| l.text == "Carol made the table wait again: 10 s at a step"));
+    }
+
+    /// `S1-FO`, the owner's game (2026-09-15): three seats, one all in, and the
+    /// table removed the third for its fourth absence -- the window said *your
+    /// opponent left the table, the game is over* while the all-in seat played
+    /// on. An all-in seat is in the game, and the table's word removing a seat is
+    /// no opponent leaving.
+    #[test]
+    fn an_all_in_seat_is_in_the_game_and_a_removal_is_no_opponent_leaving() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
+        s.apply(NodeEvent::Roster {
+            key: [7u8; 32],
+            seats: vec![(0, "far".into(), 10_000), (1, "me".into(), 10_000), (2, "MIR".into(), 10_000)],
+        });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        for seat in [0u8, 2] {
+            s.apply(NodeEvent::SeatLink { seat, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        }
+        s.apply(NodeEvent::HandEnded { hand_id: 36, stacks: vec![2_000, 2_800, 21_850], shown: vec![], pots: vec![], gained: vec![] });
+        s.apply(NodeEvent::HandBegan { hand_id: 37, button: 2, dealt_in: vec![0, 1, 2], small_blind: 400, big_blind: 800 });
+        s.apply(NodeEvent::TableState {
+            hand_id: 37,
+            street: 1,
+            pot: 23_050,
+            to_act: Some(0),
+            stacks: vec![1_600, 2_400, 0],
+            bets: vec![400, 400, 21_850],
+            folded: vec![false, false, false],
+        });
+        assert_eq!(s.heads_up_opponent(), None, "three in the game, one of them all in");
+        s.apply(NodeEvent::SeatLeft { seat: 0, quit: true, removed: true });
+        assert!(!s.opponent_left && !s.opponent_out && s.quit_pending.is_none(), "no opponent left");
+        assert!(s.log.back().unwrap().contains("removed by the table's word"), "{}", s.log.back().unwrap());
+        assert_eq!(s.heads_up_opponent(), Some(2), "heads-up against the all-in seat, which plays on");
+        // And a leave by a seat's own client while another seat is in the game
+        // is no end of it either.
+        let mut t = AppState::new();
+        t.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
+        t.apply(NodeEvent::Roster {
+            key: [7u8; 32],
+            seats: vec![(0, "far".into(), 10_000), (1, "me".into(), 10_000), (2, "MIR".into(), 10_000)],
+        });
+        t.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        t.apply(NodeEvent::HandBegan { hand_id: 1, button: 2, dealt_in: vec![0, 1, 2], small_blind: 50, big_blind: 100 });
+        t.apply(NodeEvent::TableState { hand_id: 1, street: 1, pot: 20_100, to_act: Some(0), stacks: vec![9_950, 9_900, 0], bets: vec![50, 100, 10_000], folded: vec![false, false, false] });
+        t.apply(NodeEvent::SeatLeft { seat: 0, quit: true, removed: false });
+        assert!(t.quit_pending.is_none() && !t.opponent_left, "MIR is all in and in the game");
+    }
+
+    /// `S1-FO`: a heads-up opponent's leave of the table's group is held -- the
+    /// library says the same goodbye when a client rejoins the group -- and a
+    /// seat back in the group within `OPPONENT_QUIT_HOLDS_MS` had not left.
+    #[test]
+    fn a_heads_up_leave_is_held_and_undone_by_the_seat_coming_back() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 0 });
+        s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::SeatLeft { seat: 1, quit: true, removed: false });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None, away: false });
+        s.tick_quit();
+        assert!(!s.opponent_left && s.quit_pending.is_some(), "inside the hold nothing is said");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        assert!(s.quit_pending.is_none() && !s.left_for_good.contains(&1), "back in the group: it had rejoined");
+        assert_eq!(s.heads_up_opponent(), Some(1));
+        s.tick_quit();
+        assert!(!s.opponent_left && !s.opponent_out);
+        // A leave that holds is the end of the game.
+        s.apply(NodeEvent::SeatLeft { seat: 1, quit: true, removed: false });
+        s.quit_pending = s.quit_pending.map(|(seat, _)| (seat, std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_QUIT_HOLDS_MS)));
+        s.tick_quit();
+        assert!(s.opponent_left && s.opponent_out);
     }
 
     /// `S1-FG`, the owner's word (2026-09-15): an action in the lobby never closes
@@ -4094,12 +4236,15 @@ mod tests {
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
         assert!(s.heads_up_opponent().is_none(), "three in the game: no heads-up");
-        s.apply(NodeEvent::SeatLeft { seat: 2, quit: true });
+        s.apply(NodeEvent::SeatLeft { seat: 2, quit: true, removed: false });
         assert_eq!(s.heads_up_opponent(), Some(1), "one left for good: heads-up against the other");
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: Some(21), away: false });
         assert!(s.opponent_gone.is_some(), "the opponent out of reach opens the question");
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
-        s.apply(NodeEvent::SeatLeft { seat: 1, quit: true });
+        s.apply(NodeEvent::SeatLeft { seat: 1, quit: true, removed: false });
+        assert!(!s.opponent_left, "a leave is held first (S1-FO)");
+        s.quit_pending = s.quit_pending.map(|(seat, _)| (seat, std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_QUIT_HOLDS_MS)));
+        s.tick_quit();
         assert!(s.opponent_left && s.opponent_out, "the opponent left: the game is over, said as at two seats");
     }
 
@@ -4144,10 +4289,10 @@ mod tests {
         s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 2 });
         s.apply(NodeEvent::Roster { key: [7u8; 32], seats: vec![(0, "a".into(), 1_000), (2, "me".into(), 1_000), (8, "b".into(), 1_000)] });
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
-        s.apply(NodeEvent::SeatLeft { seat: 2, quit: false });
+        s.apply(NodeEvent::SeatLeft { seat: 2, quit: false, removed: false });
         assert!(!s.gone.contains(&2), "the player is here");
         assert!(!s.table_view().seats.iter().any(|v| v.seat == 2 && v.left), "and is not drawn as left");
-        s.apply(NodeEvent::SeatLeft { seat: 8, quit: false });
+        s.apply(NodeEvent::SeatLeft { seat: 8, quit: false, removed: false });
         assert!(s.gone.contains(&8), "another seat still is");
     }
 
@@ -4318,18 +4463,21 @@ mod tests {
         s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(20), group: false, quiet_s: None, away: false });
         // A timeout: gone from the felt, not the end of the game.
-        s.apply(NodeEvent::SeatLeft { seat: 1, quit: false });
+        s.apply(NodeEvent::SeatLeft { seat: 1, quit: false, removed: false });
         assert!(s.gone.contains(&1));
         assert!(s.table_view().seats.iter().any(|v| v.seat == 1 && v.left), "drawn as left");
         assert!(!s.opponent_out && !s.opponent_left);
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false, quiet_s: None, away: false });
         assert!(!s.gone.contains(&1), "seen in the group again: back");
         assert!(!s.table_view().seats.iter().any(|v| v.seat == 1 && v.left));
-        // A quit ends a game of two, at once.
-        s.apply(NodeEvent::SeatLeft { seat: 1, quit: true });
+        // A quit ends a game of two once it has held (S1-FO): a rejoin says the
+        // same goodbye.
+        s.apply(NodeEvent::SeatLeft { seat: 1, quit: true, removed: false });
+        assert!(!s.opponent_out && !s.opponent_left, "held first");
+        s.quit_pending = s.quit_pending.map(|(seat, _)| (seat, std::time::Instant::now() - std::time::Duration::from_millis(OPPONENT_QUIT_HOLDS_MS)));
+        let v = s.table_view_of(0);
         assert!(s.opponent_out && s.opponent_left, "the game is over");
-        let v = s.table_view();
-        assert!(v.opponent_left && v.opponent_gone_s.is_some(), "the window is told at once");
+        assert!(v.opponent_left && v.opponent_gone_s.is_some(), "the window is told the frame it holds");
         assert!(s.log.back().unwrap().contains("left the table"), "{}", s.log.back().unwrap());
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(25), group: false, quiet_s: None, away: false });
         assert!(s.opponent_out && s.opponent_left, "nothing on the line undoes a quit");
