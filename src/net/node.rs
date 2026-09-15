@@ -463,12 +463,17 @@ pub enum NodeEvent {
     /// player, who may show it instead, for `open_ms` more; `None` when the
     /// wait is over, whichever way it ended.
     ShowdownChoice { hand_id: u64, open_ms: Option<u64> },
-    /// `D-035`: a seat's client left the table's group -- on purpose
-    /// (`quit`) or by timing out -- or, `S1-FO`, the table's word removed it for
-    /// good (`removed`, with `quit`: D-047's fourth absence, D-051's flood).
-    /// The seat is shown gone; heads-up a quit by the seat's own client, held
-    /// long enough to be no rejoin, ends the game. A removal never does.
+    /// `D-035`: a seat's client left the table's group -- on purpose by the
+    /// carrier's word (`quit`) or by timing out -- or, `S1-FO`, the table's word
+    /// removed it for good (`removed`, with `quit`: D-047's fourth absence,
+    /// D-051's flood). The seat is shown gone. `S1-FQ`: none of it is a player
+    /// leaving -- the carrier says *on purpose* of a client that merely rejoins
+    /// -- and nothing here ends a game.
     SeatLeft { seat: u8, quit: bool, removed: bool },
+    /// `S1-FQ`: a seat's own client said -- signed by its key, for this table --
+    /// that its player left the table (`PROTOCOL.md` §7.10). The one word that a
+    /// player left; heads-up, the end of the game.
+    SeatLeftTable { seat: u8 },
     /// `D-047`: this client's own seat is out of the table for good -- the
     /// table's word about its fourth absence, verified. The window says so
     /// and holds the table until the player closes it. `D-051`: `flooded`
@@ -685,7 +690,9 @@ impl NodeEvent {
             | Self::TimeoutVotes { .. }
             | Self::ReturnVotes { .. }
             // `D-059`: a seat made the table wait.
-            | Self::SeatWaited { .. } => true,
+            | Self::SeatWaited { .. }
+            // `S1-FQ`: a player left the table, by its own word.
+            | Self::SeatLeftTable { .. } => true,
 
             // Log only. Chatty, repetitive, and worth a second's delay.
             //

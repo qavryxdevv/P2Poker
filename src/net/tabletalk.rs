@@ -329,6 +329,81 @@ pub fn receive(
     })
 }
 
+/// `S1-FQ`: the one reason a `TABLE_LEAVE` carries: the player left the table.
+pub const LEAVE_BY_THE_PLAYER: u16 = 1;
+
+#[derive(Debug, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+struct LeaveBody {
+    /// The table left, so the word cannot be carried to another.
+    #[cbor(n(0), with = "minicbor::bytes")]
+    table_id: [u8; 32],
+    #[n(1)]
+    reason: u16,
+}
+
+/// `S1-FQ`, `PROTOCOL.md` §7.10: this client's player leaves the table, said
+/// to its seats -- signed by the seat's key, for this table. The only word from
+/// which another seat may say that a player left: the carrier's own report of a
+/// member leaving on purpose is also made of a client that merely rejoins.
+pub fn leave_word(key: &SigningKey, table_id: &[u8; 32], now_ms: u64) -> Result<Vec<u8>, &'static str> {
+    let body = LeaveBody { table_id: *table_id, reason: LEAVE_BY_THE_PLAYER };
+    let body_bytes = to_canonical(&body).map_err(|_| "the body does not encode")?;
+    let envelope = EventBody::unchained(EventType::TableLeave, key.verifying_key().to_bytes(), body_bytes, now_ms)
+        .ok_or("a table leave is an unchained event")?;
+    let envelope_bytes = to_canonical(&envelope).map_err(|_| "the envelope does not encode")?;
+    let signature = {
+        use ed25519_dalek::Signer;
+        key.sign(&to_be_signed(&envelope_bytes))
+    };
+    to_canonical(&SignedEvent { body: envelope_bytes, signature: signature.to_bytes() })
+        .map_err(|_| "the signed event does not encode")
+}
+
+/// `S1-FQ`: take a seat's word that its player left off the wire, for the table
+/// `table_id` -- the seat it holds, or why not. Charged to the carrier first,
+/// as a line is (`D-054`); then the type, the clock, the seat, the signature,
+/// the table and the reason.
+pub fn receive_leave(
+    bytes: &[u8],
+    table_id: &[u8; 32],
+    carrier: &[u8; 32],
+    seat_of: impl Fn(&[u8; 32]) -> Option<u8>,
+    now_ms: u64,
+    limits: &mut Talk,
+) -> Result<u8, NotHeard> {
+    if bytes.len() > LOBBY_MSG_MAX {
+        return Err(NotHeard::TooLong("the message is over the cap"));
+    }
+    if !limits.carried(carrier, now_ms, bytes.len() as u64) {
+        return Err(NotHeard::TooMuchCarried);
+    }
+    let signed: SignedEvent =
+        from_canonical(bytes, LOBBY_MSG_MAX).map_err(|_| NotHeard::Malformed("not a signed event"))?;
+    let envelope: EventBody = from_canonical(&signed.body, LOBBY_MSG_MAX)
+        .map_err(|_| NotHeard::Malformed("not an envelope"))?;
+    let kind = EventType::try_from(envelope.event_type)
+        .map_err(|_| NotHeard::Malformed("an event type this client does not know"))?;
+    if kind != EventType::TableLeave {
+        return Err(NotHeard::Malformed("not a table leave"));
+    }
+    if envelope.emitted_at_unix_ms.abs_diff(now_ms) > CLOCK_SLACK_MS {
+        return Err(NotHeard::Stale);
+    }
+    let who = envelope.sender_public_key;
+    let seat = seat_of(&who).ok_or(NotHeard::NotASeat)?;
+    verify(&who, &signed).map_err(|_| NotHeard::Forged)?;
+    let body: LeaveBody = from_canonical(&envelope.payload, LOBBY_CHAT_MAX)
+        .map_err(|_| NotHeard::Malformed("not a table leave"))?;
+    if &body.table_id != table_id {
+        return Err(NotHeard::AnotherTable);
+    }
+    if body.reason != LEAVE_BY_THE_PLAYER {
+        return Err(NotHeard::Malformed("a leave reason this client does not know"));
+    }
+    Ok(seat)
+}
+
 fn plain(s: &str) -> Result<(), crate::net::plaintext::NotPlain> {
     crate::net::plaintext::is_plain_line(s)
 }
@@ -366,6 +441,41 @@ mod tests {
 
     fn hear(bytes: &[u8], carrier: &[u8; 32], now: u64, talk: &mut Talk) -> Result<Said, NotHeard> {
         receive(bytes, &TABLE, carrier, seat_of, now, talk)
+    }
+
+    /// `S1-FQ`: a seat's word that its player left the table is heard only from
+    /// that seat's own key, for this table, on time -- and a line of chat is no
+    /// such word, nor the word a line.
+    #[test]
+    fn a_leave_word_is_heard_only_from_its_seat_for_its_table() {
+        let mut talk = Talk::default();
+        let word = leave_word(&key(2), &TABLE, NOW).unwrap();
+        assert_eq!(receive_leave(&word, &TABLE, &CARRIER, seat_of, NOW, &mut talk), Ok(2));
+        let stranger = leave_word(&key(9), &TABLE, NOW).unwrap();
+        assert_eq!(receive_leave(&stranger, &TABLE, &CARRIER, seat_of, NOW, &mut talk), Err(NotHeard::NotASeat));
+        let elsewhere = leave_word(&key(5), &[8u8; 32], NOW).unwrap();
+        assert_eq!(
+            receive_leave(&elsewhere, &TABLE, &OTHER_CARRIER, seat_of, NOW, &mut talk),
+            Err(NotHeard::AnotherTable)
+        );
+        let mut broken = leave_word(&key(5), &TABLE, NOW).unwrap();
+        let at = broken.len() / 2;
+        broken[at] ^= 0xff;
+        assert!(receive_leave(&broken, &TABLE, &OTHER_CARRIER, seat_of, NOW, &mut talk).is_err());
+        let old = leave_word(&key(5), &TABLE, NOW).unwrap();
+        assert_eq!(
+            receive_leave(&old, &TABLE, &CARRIER, seat_of, NOW + CLOCK_SLACK_MS + 1, &mut Talk::default()),
+            Err(NotHeard::Stale)
+        );
+        let line = say(&key(2), &TABLE, "Bob", "bye", NOW).unwrap();
+        assert!(matches!(
+            receive_leave(&line, &TABLE, &CARRIER, seat_of, NOW, &mut Talk::default()),
+            Err(NotHeard::Malformed(_))
+        ));
+        assert!(matches!(
+            receive(&word, &TABLE, &CARRIER, seat_of, NOW, &mut Talk::default()),
+            Err(NotHeard::Malformed(_))
+        ));
     }
 
     #[test]

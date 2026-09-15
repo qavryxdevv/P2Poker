@@ -62,6 +62,8 @@ pub enum EventType {
     LobbyChat = 0x0106,
     /// A line among the seats of one table (`S1-CS`, §7.8).
     TableChat = 0x0107,
+    /// `S1-FQ`: a seat's own word that its player left the table (§7.10).
+    TableLeave = 0x0108,
 
     JoinRequest = 0x0201,
     JoinAccept = 0x0202,
@@ -130,7 +132,7 @@ impl EventType {
     pub const RESERVED: core::ops::RangeInclusive<u16> = 0xF000..=0xFFFF;
 
     /// Every type, in wire-code order.
-    pub const ALL: [EventType; 42] = [
+    pub const ALL: [EventType; 43] = [
         EventType::Hello,
         EventType::Capabilities,
         EventType::LobbyTableAd,
@@ -140,6 +142,7 @@ impl EventType {
         EventType::LobbySnapshotResponse,
         EventType::LobbyChat,
         EventType::TableChat,
+        EventType::TableLeave,
         EventType::JoinRequest,
         EventType::JoinAccept,
         EventType::JoinReject,
@@ -189,7 +192,7 @@ impl EventType {
         use EventType::*;
         match self {
             Hello | Capabilities | LobbyTableAd | LobbyTableRemove | LobbyPlayerPresence
-            | LobbySnapshotRequest | LobbySnapshotResponse | LobbyChat | TableChat | JoinRequest
+            | LobbySnapshotRequest | LobbySnapshotResponse | LobbyChat | TableChat | TableLeave | JoinRequest
             | JoinAccept | JoinReject | PlayerList | Dispute => 0,
             _ => 1,
         }
@@ -211,7 +214,7 @@ impl EventType {
         match self {
             // Unchained: no stage at all.
             Hello | Capabilities | LobbyTableAd | LobbyTableRemove | LobbyPlayerPresence
-            | LobbySnapshotRequest | LobbySnapshotResponse | LobbyChat | TableChat | JoinRequest
+            | LobbySnapshotRequest | LobbySnapshotResponse | LobbyChat | TableChat | TableLeave | JoinRequest
             | JoinAccept | JoinReject | PlayerList => StageKind::Unchained,
 
             // Chained, but legal outside its stage.
@@ -263,6 +266,7 @@ impl EventType {
             LobbySnapshotResponse => "LOBBY_SNAPSHOT_RESPONSE",
             LobbyChat => "LOBBY_CHAT",
             TableChat => "TABLE_CHAT",
+            TableLeave => "TABLE_LEAVE",
             JoinRequest => "JOIN_REQUEST",
             JoinAccept => "JOIN_ACCEPT",
             JoinReject => "JOIN_REJECT",
@@ -695,15 +699,15 @@ mod tests {
 
     #[test]
     fn the_catalogue_has_exactly_thirty_nine_types() {
-        assert_eq!(EventType::ALL.len(), 42, "PROTOCOL.md section 4.11 lists 42");
+        assert_eq!(EventType::ALL.len(), 43, "PROTOCOL.md section 4.11 lists 43");
     }
 
     #[test]
     fn every_code_is_distinct_and_every_name_is_distinct() {
         let codes: BTreeSet<u16> = EventType::ALL.iter().map(|t| t.code()).collect();
-        assert_eq!(codes.len(), 42, "two types share a wire code");
+        assert_eq!(codes.len(), 43, "two types share a wire code");
         let names: BTreeSet<&str> = EventType::ALL.iter().map(|t| t.name()).collect();
-        assert_eq!(names.len(), 42, "two types share a name");
+        assert_eq!(names.len(), 43, "two types share a name");
     }
 
     #[test]
@@ -718,7 +722,7 @@ mod tests {
     /// condition and must be a rejection rather than a forgotten match arm.
     #[test]
     fn an_uncatalogued_code_is_rejected() {
-        for code in [0x0000u16, 0x0003, 0x0108, 0x0206, 0x0308, 0x0506, 0x0704, 0x0806, 0x1234] {
+        for code in [0x0000u16, 0x0003, 0x0109, 0x0206, 0x0308, 0x0506, 0x0704, 0x0806, 0x1234] {
             assert_eq!(
                 EventType::try_from(code),
                 Err(UnknownEventType::Unknown(code)),
@@ -752,7 +756,7 @@ mod tests {
             .into_iter()
             .filter(|t| t.chain_scope() == 0)
             .collect();
-        assert_eq!(unchained.len(), 14, "got {unchained:?}");
+        assert_eq!(unchained.len(), 15, "got {unchained:?}");
 
         for t in unchained {
             assert!(!t.is_chained(), "{t}");
@@ -788,6 +792,7 @@ mod tests {
                 EventType::Hello,
                 EventType::Capabilities,
                 EventType::TableChat,
+                EventType::TableLeave,
                 EventType::PlayerList,
                 EventType::Dispute
             ],

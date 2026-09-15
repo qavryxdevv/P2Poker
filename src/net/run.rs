@@ -2516,6 +2516,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // says so. Read at the certificate's own moment and again on the stall
     // tick; a hand that is over is not skipped, since a timeout certificate
     // ends the hand it certifies in.
+    // `S1-FQ`: this client's player leaves the table: said first -- signed, for
+    // this table, over its group -- as the one word from which the seats left
+    // may say that a player left; the group's own goodbye is said by a client
+    // that merely rejoins. Only at a set table where this client holds a seat.
+    // Flushed with the rest when the leave drops the group's handle.
+    macro_rules! say_the_leave {
+        ($t:ident) => {{
+            if let Some(f) = $t.table.as_ref().filter(|f| f.session().is_some() && f.my_seat().is_some()) {
+                if let Ok(bytes) = super::tabletalk::leave_word(&app_key, &f.table_id(), super::node::now_unix_ms()) {
+                    let _ = $t.tox_sink.try_broadcast(&bytes);
+                }
+            }
+        }};
+    }
     macro_rules! remove_by_the_word {
         ($t:ident, $h:expr) => {{
             let id = $h.hand_id();
@@ -3595,8 +3609,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // metered. So the line rides there and only there, and a
                         // chat frame arriving here is a client that is not this
                         // build: refused, and not forwarded for it.
-                        if let Ok((crate::protocol::messages::EventType::TableChat, _, _)) =
-                            crate::net::chained::peek(&message.data, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
+                        if let Ok((
+                            crate::protocol::messages::EventType::TableChat | crate::protocol::messages::EventType::TableLeave,
+                            _,
+                            _,
+                        )) = crate::net::chained::peek(&message.data, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
                         {
                             let _ = swarm.behaviour_mut().gossipsub.report_message_validation_result(
                                 &message_id,
@@ -5648,6 +5665,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     NodeCommand::LeaveTable => {
+                        say_the_leave!(t);
                         close_slot = true;
                         leave_table_now!(t);
                     }
@@ -5860,6 +5878,45 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         )))
                                         .await;
                                 }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // `S1-FQ`: a seat's own word that its player left the table, over the
+                // group alone, charged to the member that carried it like a line.
+                if let Ok((crate::protocol::messages::EventType::TableLeave, _, _)) =
+                    crate::net::chained::peek(&item.bytes, LOBBY_MSG_MAX.max(TABLE_FRAME_PEEK))
+                {
+                    if let (Some(f), Some(gk)) = (t.table.as_ref(), item.claimed) {
+                        let now = super::node::now_unix_ms();
+                        match super::tabletalk::receive_leave(
+                            &item.bytes,
+                            &f.table_id(),
+                            &gk,
+                            |k| f.roster().seat_of(k),
+                            now,
+                            &mut t.chat_limits,
+                        ) {
+                            Ok(seat) if Some(seat) != f.my_seat() => {
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "seat {seat} left the table: its own signed word (S1-FQ)"
+                                    )))
+                                    .await;
+                                let _ = events.send(NodeEvent::SeatLeftTable { seat }).await;
+                            }
+                            Ok(_) => {}
+                            Err(why) => {
+                                t.tox_sink.tell(super::toxsink::Seat::Noise {
+                                    member_key: gk,
+                                    points: super::tabletalk::noise_points(why),
+                                });
+                                let _ = events
+                                    .send(NodeEvent::Warning(format!(
+                                        "a table leave was refused and counted against the member that carried it: {why:?}"
+                                    )))
+                                    .await;
                             }
                         }
                     }
@@ -6577,6 +6634,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // the others' lobbies learn that a table is gone (D-040).
                     if t.table.is_some() && leave_table_due() {
                         println!("fault-harness: leaving the table, as P2P_POKER_LEAVE_TABLE_AT asked");
+                        say_the_leave!(t);
                         leave_table_now!(t);
                     }
                     // **Give back the seat of anybody who has stopped answering,

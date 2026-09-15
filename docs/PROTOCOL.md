@@ -369,6 +369,7 @@ per message code.
 | `LOBBY_TABLE_AD`, `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE` | lobby broadcast |
 | `LOBBY_CHAT` | lobby chat broadcast |
 | `TABLE_CHAT` | table mesh: the table's group, or its topic where there is no group (§7.8) |
+| `TABLE_LEAVE` | table mesh: the table's group only (§7.10) |
 | `LOBBY_SNAPSHOT_REQUEST`, `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC |
 | `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT` | join RPC |
 | everything else (`PLAYER_LIST`, `TABLE_READY`, and all of groups 3–8) | table mesh |
@@ -534,7 +535,7 @@ anything else in those four fields.
 Unchained message types, exhaustively: `HELLO`, `CAPABILITIES`, `JOIN_REQUEST`,
 `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST`, `LOBBY_TABLE_AD`,
 `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE`, `LOBBY_SNAPSHOT_REQUEST`,
-`LOBBY_SNAPSHOT_RESPONSE`, `LOBBY_CHAT`, `TABLE_CHAT`, **`DISPUTE`**. Everything
+`LOBBY_SNAPSHOT_RESPONSE`, `LOBBY_CHAT`, `TABLE_CHAT`, `TABLE_LEAVE`, **`DISPUTE`**. Everything
 else is chained.
 
 `DISPUTE` is on this list and it is the only table-mesh message that is, which is
@@ -4830,6 +4831,7 @@ means it does not and never can be.
 | `0x0105` | `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC | 0 | — | any peer |
 | `0x0106` | `LOBBY_CHAT` | lobby chat broadcast | 0 | — | any peer |
 | `0x0107` | `TABLE_CHAT` | table mesh (the table's group; its topic where there is no group) | 0 | — | a seated application key (§7.8) |
+| `0x0108` | `TABLE_LEAVE` | table mesh (the table's group) | 0 | — | a seated application key, of its own seat (§7.10) |
 | `0x0201` | `JOIN_REQUEST` | join RPC | 0 | — | joiner |
 | `0x0202` | `JOIN_ACCEPT` | join RPC | 0 | — | table key |
 | `0x0203` | `JOIN_REJECT` | join RPC | 0 | — | table key |
@@ -6705,7 +6707,7 @@ does.
 seats, and **nothing else** (D-054). Not the table's GossipSub topic: that
 topic's name is derived from a `table_id` every advertisement carries, so any
 peer of the network may publish into it, and what it publishes is bytes on
-every seat's link that the group's own meter (D-051 §7.10) never sees. Never
+every seat's link that the group's own meter (D-051) never sees. Never
 the lobby's chat topic: a line at a table is for the seats at it. A receiver
 that sees a `TABLE_CHAT` on any carrier but the group refuses it and does not
 forward it.
@@ -6762,6 +6764,35 @@ binds to the seat (the most recently heard entry, S1-DU) and shows the seat
 sitting out only while the group holds it. The status is display data: it is
 not signed by the application key, never evidence, never hashed, and never
 changes what any seat may do.
+
+### 7.10 `0x0108 TABLE_LEAVE`
+
+`S1-FQ`. A seat's own word that its player has left the table -- the only word
+from which another seat may say that a player left. The carrier's own report
+that a member left on purpose is no such word: a client that merely rejoins the
+group says the same goodbye.
+
+*Channel:* the table's group, and nothing else, as for §7.8. A receiver that
+sees one on any other carrier refuses it and does not forward it.
+*Signed by:* the leaving seat's application key, which must hold a seat in the
+receiver's roster for the table the word names; a word from any other key is
+refused, and one naming another table is dropped.
+*Sent:* once, when the player leaves the table, before the client leaves the
+group. Never for a restart, a lost line or a rejoin, and never required: a seat
+whose client vanishes without it is an absent seat, as §8 treats one.
+*Envelope:* unchained, per the rule at the head of §7 (`chain_scope = 0`).
+
+| Field | Type | Limit / rule |
+|---|---|---|
+| `n(0) table_id` | `bytes(32)` | the table left |
+| `n(1) reason` | `u16` | `1`, the player left; any other value is refused |
+
+Payload cap `LOBBY_CHAT_MAX = 2 048 B`, shared with §7.7. The emitter's clock
+must be within `CLOCK_SLACK_MS` of the receiver's, and §7.8's carrier budget is
+charged before anything is read. A receiver marks the seat gone from the table
+for good; where it was the only other seat still in the game, the game is over
+at that receiver. It changes no roster and moves no chip: to every rule of §8
+the seat is an absent one.
 
 ---
 
