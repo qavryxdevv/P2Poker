@@ -954,7 +954,7 @@ reach a relay is invisible rather than merely unplayable.
 | 2 | **Build the swarm** (§5) and `listen_on` `/ip4/0.0.0.0/udp/P/quic-v1`, `/ip4/0.0.0.0/tcp/P`, plus the `/ip6/::` equivalents. `P` is chosen once, persisted, reused every run. **The `/ip6/::` half of this row was specified here and not implemented for the whole life of the client** — `S1-Y`, fixed 2026-09-02, and an IPv6 bind failure is reported rather than fatal. | port `P` in use | try `P` once, then fall back to an ephemeral port and persist the new value. Log it. |
 | 3 | ~~**Start the Mainline DHT** on its own UDP socket, `.port(0)`, with a deny-all `RequestFilter`.~~ **Gone.** There is no separate DHT socket and no request filter: discovery is a `kad::Behaviour` inside the same swarm, on the same transports, and §11.4 explains why this client deliberately *does* answer strangers' queries. | — | there is no "no-discovery mode" any more: if the swarm cannot bind, nothing runs. |
 | 4 | **Bootstrap the public Kademlia.** Dial the compiled entry point — one name, `/dnsaddr/bootstrap.libp2p.io` (`run::PUBLIC_ENTRY`), never a list of addresses — beside the peers the profile remembers (step 1). On the first `identify` from a peer that speaks `/ipfs/kad/1.0.0`, add its reachable listen addresses to the routing table and call `bootstrap()` once; after that `libp2p-kad`'s own periodic bootstrap keeps the table up (§11.4.1). | the entry is unreachable, or `bootstrap()` has no peer to start from (*"public DHT has no peers yet"*) | **normal**, never fatal, and there is no backoff ladder: while no relay has been seen after three relay searches, every discovery cycle dials the entry again (§9.5). The remembered peers are the way in on a day the entry is down. The failure figures this row carried until 2026-09-15 — *~3 of 35 cold starts failed on the first attempt*, *`router.bittorrent.com` is dead from this network* — were measured against Mainline's bootstrap and describe nothing that runs. |
-| 5 | **`start_providing(lobby_namespace())`** (§3.2), **once**, at the moment a confirmed external address first exists — not on a timer. `libp2p-kad` owns the republish loop and runs it every 12 h, so a session shorter than that announces exactly once (§10.1). | announce error; or a walk that reached few storing nodes | there is no repair. The one walk happens seconds after the relay reservation, when the routing table is thinnest, and nothing widens it until the client restarts. This is a known weakness and it is stated rather than mitigated. |
+| 5 | **`start_providing(lobby_namespace())`** (§3.2) at the moment an external address first exists — for a client behind a NAT, the relay circuit's arrival — and **again every 300 s (`REANNOUNCE_EVERY`) until the announcement is confirmed**: a walk of this session has handed the record to at least one node, and a node has since answered a lookup of the lobby key with this client's own record. From then on `libp2p-kad` owns the republish loop at its 12 h interval (§10.1). | announce error; or a walk that reached few storing nodes, which `start_providing`'s `Ok` cannot show — it comes back `Ok` from a walk that asked nobody | the next walk is the repair: the first happens seconds after the relay reservation, when the routing table is thinnest, and the next five minutes later against a fuller one. **Until 2026-09-15 this row said *once … there is no repair*, and for a client behind a NAT that was what ran** although `79ea1d5` (2026-09-03) had written the repair — the circuit arm latched at dispatch, and the self-sighting meant to confirm was answered by the client's own store (§10.1, `S1-FI`). |
 | 6 | **`get_providers(lobby_namespace())`** → `HashSet<PeerId>` per responding node, emitted as each answers. Repeated every **60 s**. | zero providers | not an error, and the client says so out loud — *"public lobby: nobody else yet"* — because an answer of nobody and a question never asked look identical in a log that only reports findings. |
 | 7 | **Dial the providers** (§4.3), by `PeerId`, at most `DIALS_PER_ANSWER = 8` fresh ones **per answer, not per cycle** — the counter is declared inside the `FoundProviders` arm and resets on every response, and one query draws one response per node that answers (707 of them in a measured 420-second run). This table said *per cycle* until 2026-09-02, and so did the constant's own name; both were wrong, and the effect was to make the crawl read sixty times slower than it is. Start on the first responder's answer — do not wait for the walk to finish. | most candidates fail | expected: a lobby key holds providers who left up to 48 h ago. |
 | 8 | **identify + AutoNAT v2 settle our external address.** Filter private/reserved addresses ourselves — AutoNAT v2 has no such guard and was measured confirming an RFC 1918 address as external [MEASURED]. `run::reachable` is that filter, and its IPv6 arm was blind to `fc00::/7` until 2026-09-02 (`S1-Y`). | no confirmation | stay in `Reachability::Unknown`; continue — but note that with no external address this client is **not in the lobby at all**, per the paragraph above. |
@@ -1171,12 +1171,18 @@ price §3.3 says is worth paying — but the user is the one paying it.
   times longer.** `DIALS_PER_ANSWER = 8` exists precisely because of this: *"a
   lobby key outlives the clients in it"*.
 
-* **And while it is running it barely refreshes.** `AddProviderJob` waits a full
-  interval before its first run (`jobs.rs:268-279`), so **a session shorter than
-  12 hours publishes exactly once**, to the 20 nodes closest to the key at that
-  moment. Fewer disclosure events than Mainline's 10-minute re-announce — better
-  for privacy, and a functional risk in the other direction, because those 20
-  nodes churn and nothing notices. `[UNMEASURED]`
+* **And while it is running it refreshes only until somebody returns it.**
+  `AddProviderJob` waits a full interval before its first run
+  (`jobs.rs:268-279`), so inside a session shorter than 12 hours the crate never
+  republishes. The client walks the announcement itself: on its first external
+  address, and again every 300 s until a node returns this client's own record
+  (§10.1). Measured on 2026-09-15, a node returned it within about a minute of
+  the first walk, so a session ordinarily publishes once, to the 20 nodes closest
+  to the key at that moment; one whose record nobody returns publishes every five
+  minutes, more often than Mainline's 10-minute re-announce did. Until
+  2026-09-15 this bullet said *publishes exactly once*, which was what ran for a
+  client behind a NAT whatever happened to its walk (`S1-FI`). Those 20 nodes
+  churn, and once confirmed nothing notices. `[UNMEASURED]`
 
 * **Reading the lobby discloses more than writing it, and far more often.** Every
   `get_providers` runs over an authenticated libp2p connection, so each node on
@@ -2845,19 +2851,54 @@ record that outlives the old one by a factor of about sixty.
 | Provider record TTL | **48 h** | `libp2p-kad 0.48.0` `behaviour.rs:233` [SOURCE] |
 | Re-announce interval | **12 h**, and the crate runs it | `behaviour.rs:232`, `jobs.rs:268-279` [SOURCE] |
 | First re-announce | **now + 12 h**, not now | `AddProviderJob::new` sets its first deadline a full interval out [SOURCE] |
-| Explicit announce | once, the moment a confirmed external address exists | `run.rs:984`, `run.rs:2248`, latched by `in_public_lobby` |
+| Explicit announce | the moment an external address first exists, then every **300 s** until confirmed | `run::LobbyAnnounce`, `REANNOUNCE_EVERY`. Until 2026-09-15 this row read *once … latched by `in_public_lobby`*, and the latch was the defect (`S1-FI`) |
 | Re-run `get_providers` | **every 60 s** | `run.rs:656`, `run.rs:2264` |
 | Un-announce | **never, and it could not help** | `stop_providing` is never called, and is documented local-only: remote copies run their own 48 h clock (`behaviour.rs:1047-1054`) [SOURCE] |
 
 Three consequences follow, and none of them is the old section's.
 
-**A session shorter than twelve hours announces exactly once.** The crate's job
-does not fire, so the only announcement a poker session ever makes is the
-explicit `start_providing`. That walk happens seconds after the relay
-reservation, when the routing table is at its thinnest, and **nothing repairs
-it** — if it reached three storing nodes it reached three until the client
-restarts. This is the opposite of the old measured property that repeated
-announces *widen* the storing set: there are no repeated announces.
+**Until the record is confirmed the client walks it again; after that, a session
+shorter than twelve hours walks it no more.** The crate's job does not fire inside
+twelve hours, so the client repeats the explicit `start_providing` every 300 s
+until two things have happened: a walk of this session has finished having
+reached at least one node, which is what hands the record on, and a node has
+since answered a lookup of the lobby key with this client's own record. The first
+walk happens seconds after the relay reservation, when the routing table is at
+its thinnest; the next ones are made against a fuller one.
+
+**This paragraph said *announces exactly once … nothing repairs it* until
+2026-09-15, and for a client behind a NAT that is what ran** — although `79ea1d5`
+had written the repair on 2026-09-03. Two things kept it from running, both an
+intent recorded as a result. The relay-circuit arm, where a NATed client's first
+announcement comes from, set the confirmed flag the moment `start_providing`
+returned `Ok`, and the re-walk waits for that flag to be false. And the
+confirmation — this client seeing its own `PeerId` among the lobby's providers —
+was answered by the client's own store: `start_providing` puts the record there
+first, and `get_providers` reports that store as a `FoundProviders` before any
+request leaves, with empty statistics (`libp2p-kad-0.49.0` `behaviour.rs:1024-1034`,
+`1060-1105`; `the_local_store_names_this_client_before_any_request_is_made` pins
+it). A sighting now counts only from an answer a request was made for, and only
+after delivery. The nodes that can send one are go-libp2p's, which do not filter
+the asker out of a provider list; a rust-libp2p node does (`behaviour.rs:1252`).
+
+Measured on 2026-09-15 with one headless client and `--no-mdns`, each run under an
+identity of its own. Before the fix (`announce-before-121050`, 482.7 s): the
+circuit at 4.4 s, *announced in the public lobby* once at 16.7 s, and no second
+walk in the 466 s after, though one was due from 304 s. After the latch fix
+(`announce-after-122327`, 720 s): one walk, confirmed at once — and that run is
+why delivery is required: a fresh identity's first sighting from a node came half
+a second after the dispatch and twenty-two seconds before its walk had sent the
+record anywhere, from a source neither library explains. Instrumented
+(`announce-probe-123805`, 420 s): the walk at 4.0 s, this client's own store
+answering the lookup issued with it at once with no request made, the walk
+finished at 15.0 s having reached 81 nodes, and the first node to return the
+record at 62.9 s. With the rule as committed (`announce-final-125214`, 422.7 s):
+the walk at 3.0 s, finished at 16.0 s having reached 84 nodes, confirmed at 62.7 s
+on the first node's answer after the store's own, and one walk in the whole run.
+A re-walk was not seen live, because a node returned the record inside a minute
+every time; the 300 s path is held by `an_unconfirmed_lobby_announcement_is_walked_again`.
+**What a confirmation does not prove:** that the record is this session's. One stored by an earlier session under the same identity is returned
+just the same until it expires, with that session's addresses.
 
 **Leaving does not un-announce.** A player who closes the client stays in the
 lobby, by persistent `PeerId` and address, for up to 48 hours. That is not a
@@ -3166,14 +3207,15 @@ constructor default and does nothing at all.
 
 #### 11.4.4 What this means for a lobby that must stay findable
 
-**A session shorter than twelve hours announces exactly once.**
-`AddProviderJob::new` sets its first deadline to *now + interval*
-(`jobs.rs:268-279`), and the interval is the 12 h default. The only announcement
-a normal poker session makes is the explicit `start_providing` at the moment the
-client first has an external address. That walk happens seconds after a relay
-reservation, when the routing table is at its thinnest, and **nothing repairs
-it**: if it reached three storing nodes it reached three, until the client
-restarts.
+**Inside twelve hours the crate never republishes, so the client repairs its own
+first walk.** `AddProviderJob::new` sets its first deadline to *now + interval*
+(`jobs.rs:268-279`), and the interval is the 12 h default. The explicit
+`start_providing` at the moment the client first has an external address happens
+seconds after a relay reservation, when the routing table is at its thinnest, and
+it is walked again every 300 s until a walk has handed the record to somebody and
+a node has returned it (§10.1). This paragraph said *announces exactly once …
+nothing repairs it* until 2026-09-15; for a client behind a NAT that was true of
+the code, for the two reasons §10.1 gives (`S1-FI`).
 
 **Leaving does not un-announce, and could not.** The client never calls
 `stop_providing`, and that call is local anyway (`behaviour.rs:1047-1054`) —
@@ -3484,7 +3526,7 @@ network.
 | **OQ-6** | How often does the relay admission race actually deny an honest peer (reservation request arriving before `identify` completes)? A denial closes the circuit listener with no automatic retry, so our own `listen_on` backoff must cover it. | §9.6 | 7 |
 | **OQ-7** | What is the real per-hand byte count over **one** relayed circuit **counting both directions together**, measured against the `Limit` a real relay actually returns? `max_circuit_bytes` is a single bidirectional counter per circuit (§16.1), so a measurement that records one direction and doubles the headroom is wrong by a factor of two — measure the sum, and compare it against `Limit::data_in_bytes()`, which is the same bidirectional figure. The estimate is `2 × 8 979 = 17 958 B` of shuffle plus the signed event stream, order ~20 KB per hand per circuit, against a 131 072 B public-relay budget — roughly five to seven hands, so the binding public-relay limit is still the 120 s `max_circuit_duration` and not the byte cap (§9.5). The measurement is what gives the "refuse to seat rather than start a hand that will drop" rule a number. | §9.5 | 5 → 8 |
 | **OQ-8** | What fraction of real peers does AutoNAT v2 confirm as publicly reachable? This sizes the D-002 volunteer relay pool, which is the project's real single point of failure. | §9.6, §12.8 | 8 |
-| **OQ-9** | ~~Upstream `mainline`: `announce_peer_detailed` returning `PutOutcome { stored_at }`.~~ **Void — the crate is gone.** The underlying need survives and is sharper: `libp2p-kad`'s `StartProviding` result says the query started, not how many nodes stored the record, so the GUI's health indicator still has no real number and a thin first walk is invisible. There is no second announce to repair it (§10.1). | §2.1 step 5, §10.1 | 8 |
+| **OQ-9** | ~~Upstream `mainline`: `announce_peer_detailed` returning `PutOutcome { stored_at }`.~~ **Void — the crate is gone.** The underlying need survives and is sharper: `libp2p-kad`'s `StartProviding` result says the query ended, not how many nodes stored the record — it comes back `Ok` from a walk that asked nobody — so the GUI's health indicator still has no real number. **A thin first walk is repaired now**: the announcement is walked again every 300 s until a node returns this client's own record after a walk has handed it on (§10.1). Until 2026-09-15 this row said *there is no second announce to repair it*, and for a client behind a NAT that was so (`S1-FI`). What stays open is the number. | §2.1 step 5, §10.1 | 8 |
 | **OQ-10** | Licence for the project. Unrelated to this document but still open in `DECISIONS.md`. | publication | — |
 
 ---

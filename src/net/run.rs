@@ -148,6 +148,97 @@ const REDIAL_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 /// seconds to find a founder looks like from the other side.
 const REANNOUNCE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// This client's record in the public lobby: when it was last walked, and
+/// whether the network has shown that somebody stores it.
+///
+/// **`79ea1d5` wrote this rule and two things kept it from ever running.** Both
+/// have the shape that commit was named for, an intent recorded as a result:
+///
+/// * **The relay-circuit arm latched at dispatch.** A client behind a NAT gets
+///   its first external address as a circuit address and announces from that
+///   arm, and the arm set the flag the moment `start_providing` returned `Ok` —
+///   so the discovery tick's re-walk, which waits for the flag to be false, never
+///   ran for exactly the player it was written for.
+/// * **The confirmation confirmed nothing.** Seeing its own `PeerId` in a
+///   provider answer was taken as the record having reached somebody and come
+///   back. But `start_providing` puts the record in this client's own
+///   `MemoryStore` first, and `get_providers` reports what that store holds as
+///   a `FoundProviders` of its own before any request leaves
+///   (`libp2p-kad-0.49.0/src/behaviour.rs:1024-1034, 1060-1105`) — so the
+///   lookup the same tick issues "confirmed" every announcement at once, on
+///   either road, with nothing on the network involved.
+///
+/// So a sighting counts only when a request was made for it. The local answer
+/// carries `QueryStats::empty()`; an answer from a node carries the query's
+/// statistics, and those count the request that reached it
+/// (`query.rs:397-403`, `behaviour.rs:2365-2398`). The nodes that can return
+/// this client its own record are go-libp2p ones, which do not filter the asker
+/// out of the provider list; a rust-libp2p node does (`behaviour.rs:1252`).
+///
+/// **And only once this session's walk has handed the record to somebody.**
+/// `StartProviding(Ok)` comes back from a walk that asked nobody; a walk that
+/// reached nodes finishes with successes counted, and those nodes are exactly
+/// the ones it then sends the record to (`closest.rs:395-406`,
+/// `behaviour.rs:1557-1576`). A walk that times out sends nothing
+/// (`behaviour.rs:1730-1743`). Measured 2026-09-15, `announce-after-122327`: a
+/// fresh identity's first sighting from a node arrived half a second after the
+/// dispatch and twenty-two seconds before its walk had sent the record anywhere,
+/// from a source nothing in either library explains — while in
+/// `announce-probe-123805` the walk finished at 15.0 s and the first node to
+/// return the record did so at 62.9 s. A sighting before delivery is not
+/// counted.
+///
+/// **What a confirmation does not prove:** that the record is this session's. A
+/// record stored by an earlier session under the same identity is returned just
+/// the same until the storing node expires it, and it carries the addresses of
+/// that session.
+#[derive(Debug, Default, Clone, Copy)]
+struct LobbyAnnounce {
+    /// When `start_providing` last returned `Ok` — a query left this process,
+    /// and nothing more.
+    dispatched: Option<std::time::Instant>,
+    /// Whether a walk of this session has finished having reached at least one
+    /// node, which is what hands the record to somebody.
+    delivered: bool,
+    /// Whether a node has answered a lookup of the lobby key with this client's
+    /// own record since.
+    confirmed: bool,
+}
+
+impl LobbyAnnounce {
+    /// Whether to walk the announcement now: at once if it was never walked,
+    /// again every [`REANNOUNCE_EVERY`] while nobody has returned it, and never
+    /// once somebody has — `libp2p-kad` republishes on its own from then on.
+    fn due(&self, now: std::time::Instant) -> bool {
+        !self.confirmed
+            && self
+                .dispatched
+                .is_none_or(|at| now.saturating_duration_since(at) >= REANNOUNCE_EVERY)
+    }
+
+    /// `start_providing` returned `Ok`. Records the walk; confirms nothing.
+    fn record_dispatch(&mut self, now: std::time::Instant) {
+        self.dispatched = Some(now);
+    }
+
+    /// A walk of the lobby key finished `Ok`; `successes` is its
+    /// `QueryStats::num_successes()`. Nothing was sent unless it is above zero.
+    fn record_walk_finished(&mut self, successes: u32) {
+        self.delivered |= successes > 0;
+    }
+
+    /// A lobby answer named this client; `requests` is that answer's
+    /// `QueryStats::num_requests()`. Returns `true` on the answer that confirms,
+    /// once.
+    fn hear_own_record(&mut self, requests: u32) -> bool {
+        if self.confirmed || requests == 0 || !self.delivered {
+            return false;
+        }
+        self.confirmed = true;
+        true
+    }
+}
+
 /// How often a frozen peer looks again at whether it may deal.
 ///
 /// A freeze is `§6.3`'s answer to two peers disagreeing at a boundary
@@ -1485,22 +1576,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // dialled and asked for a reservation on its own account.
     let mut asked_public_dht = false;
 
-    // Whether this client's own record is in the public lobby. Set once the
-    // announcement has an address in it, because one without is discarded.
-    // **Confirmed, not merely dispatched.**
+    // Whether this client's own record is in the public lobby, and when it was
+    // last walked there. Walked once the announcement has an address in it,
+    // because one without is discarded. **Confirmed, not merely dispatched.**
     //
     // `start_providing` returning `Ok` means a query left this process; it says
     // nothing about whether any peer stored the record, which is the ordinary
     // failure when the walk happens seconds after the first reservation and the
-    // routing table is at its thinnest. `NETWORK_STACK.md` §3 step 5 says so in
-    // terms — *there is no repair … nothing widens it until the client
-    // restarts* — and this is that repair.
-    //
-    // The confirmation costs nothing because it is already in the log: this
-    // client provides the lobby key, so it appears in its own `get_providers`
-    // answers. Seeing itself is proof the record reached somebody and came back.
-    let mut in_public_lobby = false;
-    let mut announced_at: Option<std::time::Instant> = None;
+    // routing table is at its thinnest. An unconfirmed announcement is therefore
+    // walked again every `REANNOUNCE_EVERY`, and a node returning this client's
+    // own record is the confirmation. `LobbyAnnounce` says why both halves of
+    // that were dead letters until 2026-09-15.
+    let mut announce = LobbyAnnounce::default();
+
+    // Every lookup of the lobby key still running, and whether it has found a
+    // player other than this client. `public lobby: nobody else yet` is said
+    // when one finishes having found nobody — about that lookup, and only a
+    // lobby one. It used to be said at the end of every provider lookup while
+    // this client's record was unconfirmed, relay lookups included, and the
+    // vacuous confirmation was all that kept it quiet.
+    let mut lobby_lookups: std::collections::HashMap<libp2p::kad::QueryId, bool> =
+        std::collections::HashMap::new();
 
     // Whether this client has offered itself as a relay. Once only: the record
     // is republished by Kademlia on its own.
@@ -2710,13 +2806,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // reservation, and the lobby was asked once between
                         // them. Neither ever announced, so neither found the
                         // other.
-                        if asked_public_dht && !in_public_lobby {
+                        //
+                        // **Dispatch is recorded, not taken as a result.** This
+                        // arm set the lobby flag the moment `start_providing`
+                        // returned `Ok`, and the discovery tick's re-walk waits
+                        // for that flag to be false — so a client behind a NAT,
+                        // whose first external address is exactly this one, was
+                        // walked once and never again (`LobbyAnnounce`).
+                        let now = std::time::Instant::now();
+                        if asked_public_dht && announce.due(now) {
                             let kad = &mut swarm.behaviour_mut().ipfs_kad;
                             if kad.start_providing(lobby_namespace()).is_ok() {
-                                in_public_lobby = true;
+                                announce.record_dispatch(now);
                                 let _ = events.send(NodeEvent::Announced).await;
                             }
-                            kad.get_providers(lobby_namespace());
+                            let lookup = kad.get_providers(lobby_namespace());
+                            lobby_lookups.insert(lookup, false);
                         }
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
@@ -3993,7 +4098,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::IpfsKad(
-                        libp2p::kad::Event::OutboundQueryProgressed { result, .. },
+                        libp2p::kad::Event::OutboundQueryProgressed { id, result, stats, .. },
                     )) => {
                         use libp2p::kad::{GetProvidersOk, QueryResult};
                         // A query that fails is worth a line. Without one, a
@@ -4001,6 +4106,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // exactly like a lobby with nobody in it.
                         match &result {
                             QueryResult::GetProviders(Err(e)) => {
+                                lobby_lookups.remove(&id);
                                 let _ = events
                                     .send(NodeEvent::Warning(format!("DHT lookup failed: {e}")))
                                     .await;
@@ -4012,6 +4118,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         Err(e) => format!("could not announce: {e}"),
                                     }))
                                     .await;
+                                // A walk of the lobby key that reached somebody
+                                // has handed the record on, and only after that
+                                // can a node's answer confirm it
+                                // (`LobbyAnnounce`). `Ok` alone is no evidence.
+                                if matches!(r, Ok(done) if done.key == lobby_namespace()) {
+                                    announce.record_walk_finished(stats.num_successes());
+                                }
                             }
                             QueryResult::Bootstrap(Err(e)) => {
                                 let _ = events
@@ -4027,8 +4140,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // Said out loud. An answer of nobody and a question
                             // never asked look the same in a log that only
                             // reports findings, and the first is a working lobby
-                            // with no players in it.
-                            if !in_public_lobby {
+                            // with no players in it. Said of a lobby lookup that
+                            // ends having found nobody but this client.
+                            if lobby_lookups.remove(&id) == Some(false) {
                                 let _ = events
                                     .send(NodeEvent::Warning(
                                         "public lobby: nobody else yet".into(),
@@ -4111,12 +4225,26 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     // a connection that cannot succeed.
                                     if peer == me {
                                         // **And this is the announce
-                                        // confirmation.** The record came back
-                                        // from the network, so somebody stored
-                                        // it. Nothing else in the client can say
-                                        // that.
-                                        in_public_lobby = true;
+                                        // confirmation — when a node sent it.**
+                                        // The record came back from the network,
+                                        // so somebody stored it. This client's
+                                        // own store answers too, with no request
+                                        // made, and that answer proves nothing
+                                        // (`LobbyAnnounce`).
+                                        if key == lobby_namespace()
+                                            && announce.hear_own_record(stats.num_requests())
+                                        {
+                                            let _ = events
+                                                .send(NodeEvent::Warning(
+                                                    "public lobby: this client's own record came back from the network"
+                                                        .into(),
+                                                ))
+                                                .await;
+                                        }
                                         continue;
+                                    }
+                                    if let Some(found) = lobby_lookups.get_mut(&id) {
+                                        *found = true;
                                     }
                                     // Recently tried, so not again yet. Not
                                     // *ever* again: see `REDIAL_AFTER`.
@@ -4575,16 +4703,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // nobody can join.
                 if asked_public_dht {
                     let reachable_here = swarm.external_addresses().next().is_some();
-                    if reachable_here
-                        && !in_public_lobby
-                        && !announced_at.is_some_and(|at| at.elapsed() < REANNOUNCE_EVERY)
-                    {
+                    let now = std::time::Instant::now();
+                    if reachable_here && announce.due(now) {
                         match swarm.behaviour_mut().ipfs_kad.start_providing(lobby_namespace())
                         {
                             Ok(_) => {
-                                // Dispatched. `in_public_lobby` waits for this
-                                // client to see its own record come back.
-                                announced_at = Some(std::time::Instant::now());
+                                // Dispatched. The confirmation waits for a node
+                                // to return this client's own record.
+                                announce.record_dispatch(now);
                                 let _ = events.send(NodeEvent::Announced).await;
                             }
                             Err(e) => {
@@ -4599,7 +4725,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // Read it every cycle either way: a client with nothing
                     // to announce can still see who is there, and a table it
                     // can reach is a table it can sit at.
-                    swarm.behaviour_mut().ipfs_kad.get_providers(lobby_namespace());
+                    let lookup = swarm.behaviour_mut().ipfs_kad.get_providers(lobby_namespace());
+                    lobby_lookups.insert(lookup, false);
                     // `S1-EX`: and the same for each slice of the lobby this
                     // client listens to, which is what makes a sliced lobby
                     // able to hold a mesh at all -- see `shard_namespace`. At
@@ -13146,6 +13273,124 @@ mod tests {
     }
 
     use super::*;
+
+    /// **An announcement nobody has returned is walked again, whichever road
+    /// walked it first.** `LobbyAnnounce`.
+    ///
+    /// The circuit's arrival is the first walk of a client behind a NAT, and it
+    /// used to latch the flag the re-walk waits on; this client's own store
+    /// answers the lookup issued in the same breath, and it used to confirm.
+    /// Either alone kept the re-walk from ever running.
+    #[test]
+    fn an_unconfirmed_lobby_announcement_is_walked_again() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let mut a = LobbyAnnounce::default();
+
+        assert!(a.due(t0), "never walked: the circuit's arrival announces at once");
+        a.record_dispatch(t0);
+        assert!(!a.due(t0), "a dispatch is a walk, and the next one waits");
+
+        // The lookup the same arm issues is answered first by this client's own
+        // store, with no request made. That is not the network.
+        assert!(!a.hear_own_record(0), "the local store's copy confirms nothing");
+        // Nor is a node's answer that arrives before the walk has handed the
+        // record to anybody (`announce-after-122327`).
+        assert!(!a.hear_own_record(4), "a sighting before delivery confirms nothing");
+        // A walk that reached nobody comes back Ok and delivered nothing.
+        a.record_walk_finished(0);
+        assert!(!a.hear_own_record(4), "a walk that asked nobody handed nothing on");
+        assert!(!a.due(t0 + REANNOUNCE_EVERY - Duration::from_millis(1)));
+        assert!(
+            a.due(t0 + REANNOUNCE_EVERY),
+            "still unconfirmed at REANNOUNCE_EVERY, so it is walked again"
+        );
+
+        a.record_dispatch(t0 + REANNOUNCE_EVERY);
+        assert!(!a.due(t0 + REANNOUNCE_EVERY + Duration::from_secs(1)));
+        assert!(a.due(t0 + REANNOUNCE_EVERY * 2), "and again, for as long as nobody returns it");
+
+        // This walk reaches nodes; a node then returns the record: confirmed,
+        // once, and never walked again — `libp2p-kad` republishes on its own.
+        a.record_walk_finished(81);
+        assert!(!a.hear_own_record(0), "the local store still confirms nothing");
+        assert!(a.hear_own_record(3), "a node's answer after delivery confirms");
+        assert!(!a.hear_own_record(7), "and says so once");
+        assert!(!a.due(t0 + REANNOUNCE_EVERY * 100));
+    }
+
+    /// **The premise `LobbyAnnounce` rests on, pinned against the library.**
+    ///
+    /// `start_providing` stores this client's own record locally, and
+    /// `get_providers` reports that store as a `FoundProviders` naming this
+    /// client before any request leaves — with empty statistics, which is the
+    /// only thing that tells it from an answer a node sent. And `start_providing`
+    /// comes back `Ok` from a walk that reached nobody, which is why its log
+    /// line, *announced in the public lobby*, is not evidence either.
+    ///
+    /// No swarm and no network: a `kad::Behaviour` with an empty routing table,
+    /// polled by hand. If a `libp2p-kad` upgrade stops reporting the local
+    /// store, or starts counting requests for it, this fails and the
+    /// confirmation rule must be read again.
+    #[test]
+    fn the_local_store_names_this_client_before_any_request_is_made() {
+        use libp2p::kad::{Event, GetProvidersOk, QueryResult};
+        use libp2p::swarm::{NetworkBehaviour, ToSwarm};
+        use std::task::{Context, Poll, Waker};
+
+        let me = PeerId::from(identity::Keypair::generate_ed25519().public());
+        let mut kad = libp2p::kad::Behaviour::with_config(
+            me,
+            libp2p::kad::store::MemoryStore::new(me),
+            libp2p::kad::Config::new(libp2p::StreamProtocol::new("/ipfs/kad/1.0.0")),
+        );
+        let walk = kad
+            .start_providing(lobby_namespace())
+            .expect("an empty store takes the record");
+        let lookup = kad.get_providers(lobby_namespace());
+
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut local_answer = None;
+        let mut walk_done = None;
+        for _ in 0..256 {
+            match kad.poll(&mut cx) {
+                Poll::Ready(ToSwarm::GenerateEvent(Event::OutboundQueryProgressed {
+                    id,
+                    result,
+                    stats,
+                    ..
+                })) => match result {
+                    QueryResult::GetProviders(Ok(GetProvidersOk::FoundProviders {
+                        providers,
+                        ..
+                    })) if id == lookup => local_answer = Some((providers, stats)),
+                    QueryResult::StartProviding(r) if id == walk => {
+                        walk_done = Some((r.is_ok(), stats))
+                    }
+                    _ => {}
+                },
+                Poll::Ready(_) => {}
+                Poll::Pending => break,
+            }
+            if local_answer.is_some() && walk_done.is_some() {
+                break;
+            }
+        }
+
+        let (providers, stats) =
+            local_answer.expect("get_providers reports the local store without a network");
+        assert!(providers.contains(&me), "and the local store names this client");
+        assert_eq!(stats.num_requests(), 0, "with no request made for it");
+
+        let (ok, stats) = walk_done.expect("a walk with nobody to ask still ends");
+        assert!(ok, "start_providing reports Ok");
+        assert_eq!(stats.num_requests(), 0, "from a walk that asked nobody");
+        assert_eq!(
+            stats.num_successes(),
+            0,
+            "and handed the record to nobody, which is what `record_walk_finished` reads"
+        );
+    }
 
     /// A table name is bounded in **bytes**, because that is what goes on the
     /// wire, and the first version counted characters.
