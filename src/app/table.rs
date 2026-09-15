@@ -447,6 +447,35 @@ mod tests {
         Card::new(r, s).index()
     }
 
+    /// `S1-FH`: a player out of the tournament watching the table sees backs at
+    /// the seats a hand deals in and the hands shown at the showdown face up;
+    /// its own seat, dealt nothing, stays empty, and a hand not shown stays
+    /// covered.
+    #[test]
+    fn a_player_out_of_the_tournament_sees_the_hands_shown_at_the_showdown() {
+        let mut s = seated(2);
+        s.apply(NodeEvent::HandBegan { hand_id: 9, button: 0, dealt_in: vec![0, 1], small_blind: 50, big_blind: 100 });
+        let cards_at = |s: &AppState, n: u8| s.table_view().seats.iter().find(|x| x.seat == n).map(|x| x.cards).unwrap();
+        assert_eq!(cards_at(&s, 0), [Facing::Empty, Facing::Empty], "before the deal, nothing");
+        s.apply(NodeEvent::CardsDealt { hand_id: 9, seats: vec![0, 1] });
+        assert_eq!(cards_at(&s, 0), [Facing::Down, Facing::Down], "dealt: backs");
+        assert_eq!(cards_at(&s, 2), [Facing::Empty, Facing::Empty], "this seat is dealt nothing");
+        let shown = [card(Rank::Ace, Suit::Spades), card(Rank::King, Suit::Hearts)];
+        s.apply(NodeEvent::HandEnded {
+            hand_id: 9,
+            stacks: vec![1_100, 900, 0],
+            shown: vec![Some(shown), None, None],
+            pots: vec![],
+            gained: vec![200, 0, 0],
+        });
+        assert!(
+            matches!(cards_at(&s, 0), [Facing::Up(_), Facing::Up(_)]),
+            "the hand shown at the showdown, face up: {:?}",
+            cards_at(&s, 0)
+        );
+        assert_eq!(cards_at(&s, 1), [Facing::Down, Facing::Down], "a hand not shown stays covered");
+    }
+
     /// Three seats at a real table, buy-ins of a thousand, this client at
     /// `hero`.
     fn seated(hero: u8) -> AppState {

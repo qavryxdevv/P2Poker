@@ -1897,6 +1897,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             cards: [cards[0].index(), cards[1].index()],
                                         })
                                         .await;
+                                } else if !$t.cards_reported
+                                    && $h.street().is_some()
+                                    && !$h.init().dealt_in.contains(&$h.my_seat())
+                                {
+                                    // `S1-FH`: a seat this hand does not deal in -- a
+                                    // player out of the tournament watching, a seat
+                                    // following the hand -- opens no cards of its own,
+                                    // and only its own cards told the window the deal
+                                    // was done: its felt drew no backs at any seat, and
+                                    // no hand shown at the showdown. The betting street
+                                    // is the deal done. What it may then draw face up
+                                    // is what every seat sees: the engine opens a hand
+                                    // only from its owner's share, published when it
+                                    // shows.
+                                    $t.cards_reported = true;
+                                    let _ = events
+                                        .send(NodeEvent::CardsDealt {
+                                            hand_id: $h.hand_id(),
+                                            seats: $h.init().dealt_in.clone(),
+                                        })
+                                        .await;
                                 }
                                 // **Reported before leaving, or this
                                 // node forwards nothing.** Every arm of

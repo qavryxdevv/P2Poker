@@ -14258,6 +14258,27 @@ mod tests {
         (hands, keys, settlements, init_frames)
     }
 
+    /// `S1-FH`: a busted seat watching the table opens exactly the hands shown
+    /// at the showdown -- from the shares every seat broadcasts at the deal and
+    /// the owner's own, published only when it shows -- and no other: the cards
+    /// every seat at the table sees, at the same moment, and nothing more.
+    #[test]
+    fn a_busted_seat_watching_opens_the_hands_shown_at_the_showdown_and_no_other() {
+        let (hands, _, _, _) = a_settled_hand_with_a_bystander_holding(0);
+        let watcher = &hands[2];
+        assert!(watcher.cards().is_none(), "dealt nothing, opens nothing of its own");
+        let mut shown = 0;
+        for seat in 0..2u8 {
+            let owner = hands[usize::from(seat)].shown(seat);
+            let opponent = hands[usize::from(1 - seat)].shown(seat);
+            assert_eq!(opponent, owner, "seat {seat}: the table agrees");
+            assert_eq!(watcher.shown(seat), owner, "seat {seat}: the watcher sees what the table sees");
+            shown += usize::from(owner.is_some());
+        }
+        assert!(shown >= 1, "the first to show may not muck, so a hand was shown");
+        assert_eq!(watcher.shown(2), None, "and no card of a seat dealt nothing");
+    }
+
     /// Four seats: 0 and 1 the roster, 2 and 3 bystanders with chips.
     fn opening4(my_seat: SeatIdx) -> Opening {
         let mut o = opening3(my_seat);
