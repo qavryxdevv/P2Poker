@@ -832,59 +832,58 @@ mod tests {
         assert!(s.away.is_empty() && !s.sitting_out, "nothing of it outlives the table");
     }
 
-    /// Out of chips: the place is the seats still holding chips plus one, and
-    /// of two seats busted in one hand the one that began it with more
-    /// finishes ahead. The window waits ten seconds.
+    /// `S1-FL`: out of chips, the window says the place the node decided at the
+    /// boundary -- shared or not -- ten seconds after the deciding hand, once;
+    /// the other seats' places go to the table's log.
     #[test]
     fn a_busted_player_is_told_the_place() {
         let mut s = seated(0);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![600, 1_400, 1_000], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
-        assert_eq!(s.table_view().finished, None, "still in");
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        // Seat 0 (600) and seat 2 (1 000) both lose everything to seat 1.
         s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
+        assert_eq!(s.table_view().finished, None, "the node's word decides, not the stacks");
+        s.apply(NodeEvent::Finished { hand_id: 2, seat: 2, place: 2, tied: false, players_left: 1, over: true });
+        assert_eq!(s.table_view().finished, None, "another seat's place");
+        assert!(s.table_log.iter().any(|l| l.text == "Carol finished in 2nd place"), "{:?}", s.table_log);
+        s.apply(NodeEvent::Finished { hand_id: 2, seat: 0, place: 3, tied: false, players_left: 1, over: true });
         let b = s.table_view().finished.expect("the window says the place");
-        assert_eq!((b.place, b.players_left), (3, 1), "seat 2 began with more and finishes second");
+        assert_eq!((b.place, b.tied, b.players_left), (3, false, 1));
         assert!(b.show_in_ms > 9_000, "the deciding hand is looked at first: {} ms", b.show_in_ms);
-        assert!(s.table_log.iter().any(|l| l.text.contains("finished in 3rd place")));
-        // Said once.
-        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
-        assert_eq!(s.table_log.iter().filter(|l| l.text.contains("finished in")).count(), 1);
+        assert!(s.table_log.iter().any(|l| l.text == "Alice finished in 3rd place"));
+        assert!(s.log.iter().any(|l| l.contains("finished in 3rd place")));
 
-        // A hand ended without a settlement busts nobody.
+        // A place shared: busted in one hand with the same chips at its start.
         let mut s = seated(0);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![], shown: vec![], pots: Vec::new(), gained: Vec::new() });
-        assert_eq!(s.table_view().finished, None);
+        s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
+        s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![0, 3_000, 0], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
+        s.apply(NodeEvent::Finished { hand_id: 2, seat: 0, place: 2, tied: true, players_left: 1, over: true });
+        let b = s.table_view().finished.expect("out");
+        assert!(b.tied && b.place == 2);
+        assert!(s.table_log.iter().any(|l| l.text == "Alice finished tied for 2nd place"), "{:?}", s.table_log);
 
-        // Out while two others play on: fourth of four, two still in... of three, third.
+        // Out while the others play on: the seats still in, said.
         let mut s = seated(0);
         s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 1_900, 1_100], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
+        s.apply(NodeEvent::Finished { hand_id: 1, seat: 0, place: 3, tied: false, players_left: 2, over: false });
         let b = s.table_view().finished.expect("out");
         assert_eq!((b.place, b.players_left), (3, 2));
     }
 
-    /// The last seat holding chips has won, and is told so -- once the hand
-    /// that won it has been looked at.
+    /// `S1-FL`: the winner is congratulated by the node's word -- once the hand
+    /// that won it has been looked at -- and the log says who won the game when
+    /// the showdown's own line did not.
     #[test]
     fn the_winner_is_congratulated() {
         let mut s = seated(0);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![2_000, 1_000, 0], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
-        assert_eq!(s.table_view().finished, None, "two still hold chips: nobody has won yet");
         s.apply(NodeEvent::HandBegan { hand_id: 2, button: 1, dealt_in: vec![0, 1], small_blind: 10, big_blind: 20 });
         s.apply(NodeEvent::HandEnded { hand_id: 2, stacks: vec![3_000, 0, 0], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
+        assert_eq!(s.table_view().finished, None, "not before the node's word");
+        s.apply(NodeEvent::Finished { hand_id: 2, seat: 0, place: 1, tied: false, players_left: 1, over: true });
         let f = s.table_view().finished.expect("the winner is told");
         assert_eq!((f.place, f.players_left), (1, 1));
         assert!(f.show_in_ms > 9_000, "ten seconds to look at the winning hand: {} ms", f.show_in_ms);
-
-        // Holding chips while another seat still does is not a win.
-        let mut s = seated(1);
-        s.apply(NodeEvent::HandBegan { hand_id: 1, button: 0, dealt_in: vec![0, 1, 2], small_blind: 10, big_blind: 20 });
-        s.apply(NodeEvent::HandEnded { hand_id: 1, stacks: vec![0, 2_500, 500], shown: vec![None; 3], pots: Vec::new(), gained: Vec::new() });
-        assert_eq!(s.table_view().finished, None);
+        assert!(s.log.iter().any(|n| n.contains("won the tournament")), "{:?}", s.log);
+        assert_eq!(s.table_log.iter().filter(|l| l.text.ends_with("wins game 1!")).count(), 1, "said once: {:?}", s.table_log);
     }
 
     /// `D-050`: the showdown's wait for this player reaches the window, and
@@ -1155,7 +1154,9 @@ mod tests {
     fn a_removed_seats_chips_do_not_keep_the_tournament_open() {
         use crate::net::node::PotEnd;
         // Three sat down; the table certified seat 0 out, so hands are dealt
-        // between 1 and 2 while seat 0's chips stay where they were.
+        // between 1 and 2 while seat 0's chips stay where they were. `S1-FL`:
+        // the node decides the tournament is over and says the places -- the
+        // showdown's own line named no winner, with two seats holding chips.
         let mut s = seated(1);
         s.apply(NodeEvent::HandBegan { hand_id: 57, button: 1, dealt_in: vec![1, 2], small_blind: 1_600, big_blind: 3_200 });
         s.apply(NodeEvent::TableState { hand_id: 57, street: 0, pot: 0, to_act: None, stacks: vec![10_600, 17_200, 2_200], bets: vec![0; 3], folded: vec![false; 3] });
@@ -1166,6 +1167,10 @@ mod tests {
             pots: vec![PotEnd { size: 4_400, winners: vec![1] }],
             gained: vec![0, 2_200, 0],
         });
+        assert!(!s.table_log.iter().any(|l| l.text.contains("wins game")), "two seats hold chips: the showdown names no winner");
+        s.apply(NodeEvent::Finished { hand_id: 57, seat: 1, place: 1, tied: false, players_left: 1, over: true });
+        s.apply(NodeEvent::Finished { hand_id: 57, seat: 2, place: 2, tied: false, players_left: 1, over: true });
+        s.apply(NodeEvent::Finished { hand_id: 57, seat: 0, place: 3, tied: false, players_left: 1, over: true });
 
         let v = s.table_view();
         let finish = v.finished.expect("the tournament ended and the window was told");
@@ -1176,6 +1181,9 @@ mod tests {
             "the winner is congratulated: {:?}",
             s.log
         );
+        assert!(s.table_log.iter().any(|l| l.text == "Bob wins game 1!"), "{:?}", s.table_log);
+        assert!(s.table_log.iter().any(|l| l.text == "Carol finished in 2nd place"));
+        assert!(s.table_log.iter().any(|l| l.text == "Alice finished in 3rd place"));
         // And the line is not reported down: this client's own group goes ten
         // seconds after the last hand, by `D-042`, which is not a fault.
         assert_eq!(v.unsafe_note, None);

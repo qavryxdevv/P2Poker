@@ -1334,7 +1334,7 @@ fn preview_table(args: &[String]) {
         }
     }
     if has("--preview-bust") {
-        view.finished = Some(table::Finish { place: 4, players_left: 3, show_in_ms: 0 });
+        view.finished = Some(table::Finish { place: 4, tied: false, players_left: 3, show_in_ms: 0 });
     }
     if has("--preview-show") {
         view.show_cards_in_ms = Some(2_400);
@@ -1344,7 +1344,7 @@ fn preview_table(args: &[String]) {
         }
     }
     if has("--preview-won") {
-        view.finished = Some(table::Finish { place: 1, players_left: 1, show_in_ms: 0 });
+        view.finished = Some(table::Finish { place: 1, tied: false, players_left: 1, show_in_ms: 0 });
     }
     if has("--preview-out") {
         view.out_for_good = Some("certified out after the fourth absence (hand 128)".into());

@@ -624,6 +624,8 @@ struct TableRun {
     /// copies it had already heard. Keyed by hand id, so a re-opened hand
     /// (`S1-BS`) does not run its predecessor's boundary again either.
     boundary_done_for: Option<u64>,
+    /// `S1-FL`: the hand whose boundary's places have been said.
+    finish_said_for: Option<u64>,
     /// When this client stops waiting for its own player and acts for them.
     ///
     /// Version 1's whole answer to a stalled betting stage (D-015): there is no
@@ -959,6 +961,7 @@ impl TableRun {
             deal_at: None,
             return_hold: None,
             boundary_done_for: None,
+            finish_said_for: None,
             act_by: None,
             said: Vec::new(),
             ever_dealt: false,
@@ -2651,6 +2654,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.deal_at = None;
             $t.return_hold = None;
             $t.boundary_done_for = None;
+            $t.finish_said_for = None;
             $t.act_by = None;
             $t.stage_waiting = (u64::MAX, 0);
             $t.boundaries = crate::table::boundary::Boundaries::new();
@@ -2709,6 +2713,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.deal_at = None;
             $t.return_hold = None;
             $t.boundary_done_for = None;
+            $t.finish_said_for = None;
             $t.act_by = None;
             // Keyed by hand id, and the next table starts again at 1.
             $t.boundaries = crate::table::boundary::Boundaries::new();
@@ -8598,6 +8603,31 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 let next = t.hand.as_ref().and_then(|h| h.next_hand());
+                // `S1-FL`: what this boundary decided about the tournament --
+                // every seat's place, from the stacks every peer agreed the hand
+                // began with, the stacks it ended with, and `R(k+1)` as just
+                // derived, with the returns banked in this window -- said once
+                // per hand. The window used to work it out from its own copies
+                // of the stacks, which a client back from a restart did not
+                // hold, and only for a hand it was dealt into.
+                if let Some(h) = t.hand.as_ref() {
+                    if t.finish_said_for != Some(h.hand_id()) {
+                        t.finish_said_for = Some(h.hand_id());
+                        let (over, finishes) = h.finishes_at_boundary();
+                        for f in finishes {
+                            let _ = events
+                                .send(NodeEvent::Finished {
+                                    hand_id: h.hand_id(),
+                                    seat: f.seat,
+                                    place: u8::try_from(f.place).unwrap_or(u8::MAX),
+                                    tied: f.tied,
+                                    players_left: u8::try_from(f.players_left).unwrap_or(u8::MAX),
+                                    over,
+                                })
+                                .await;
+                        }
+                    }
+                }
                 // The derivation just made holds every certificate banked so
                 // far, of either direction (`S1-BM`), so the late-roster flag a
                 // bank on the live hand raised is spent here: re-derived from

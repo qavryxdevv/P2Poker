@@ -270,6 +270,14 @@ pub enum NodeEvent {
     /// said on change and empty once it moves on; before the deal as after it,
     /// and for a seat the group still hears as for one gone from the line.
     StageStands { hand_id: u64, seats: Vec<u8> },
+    /// `S1-FL`: a seat's place in the tournament, decided at hand `hand_id`'s
+    /// boundary by the node from the figures every peer holds alike -- one
+    /// event per seat that finished there: out of chips, out for good, or the
+    /// winner (`place` 1 with `over`). `tied`: another seat shares the place.
+    /// `players_left`: the seats still in the tournament after it. The window
+    /// used to work its own place out from its copies of the stacks, which a
+    /// client back from a restart did not hold.
+    Finished { hand_id: u64, seat: u8, place: u8, tied: bool, players_left: u8, over: bool },
     /// `S1-FG`: the join asked for was not started -- this client already sits
     /// at or joins that table (`already_here`), or the join could not begin.
     /// Said so the window's join does not wait for an answer nobody will give.
@@ -667,6 +675,7 @@ impl NodeEvent {
             // `D-058`: the wait on another seat over the felt.
             | Self::StageStands { .. }
             | Self::JoinNotStarted { .. }
+            | Self::Finished { .. }
             | Self::TimeoutVotes { .. }
             | Self::ReturnVotes { .. } => true,
 

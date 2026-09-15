@@ -443,6 +443,9 @@ pub struct Link {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Finish {
     pub place: usize,
+    /// `S1-FL`: another seat shares the place -- busted in the same hand with
+    /// the same chips at its start.
+    pub tied: bool,
     pub players_left: usize,
     pub show_in_ms: u64,
 }
@@ -1805,7 +1808,16 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
                         ui.label(RichText::new("The tournament is over.").color(style::PANEL_MUTED));
                     } else {
                         window_heading(ui, "Out of the tournament", false);
-                        ui.label(RichText::new(format!("You finished in {} place.", ordinal(f.place))).size(18.0).strong().color(style::COLOR_ACCENT));
+                        ui.label(
+                            RichText::new(if f.tied {
+                                format!("You finished tied for {} place.", ordinal(f.place))
+                            } else {
+                                format!("You finished in {} place.", ordinal(f.place))
+                            })
+                            .size(18.0)
+                            .strong()
+                            .color(style::COLOR_ACCENT),
+                        );
                         if watch {
                             ui.label(format!("{} players are still playing. Watch the table, or leave it.", f.players_left));
                         } else {

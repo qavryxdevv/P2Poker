@@ -991,6 +991,68 @@ struct VerifiedCert {
 }
 
 /// The most subject digests one hand may bank. Four per seat is well past
+/// `S1-FL`: a seat's place in the tournament, decided at a hand's boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeatFinish {
+    pub seat: SeatIdx,
+    /// 1 is the winner.
+    pub place: usize,
+    /// Another seat shares the place: busted in the same hand with the same
+    /// chips at its start.
+    pub tied: bool,
+    /// The seats still in the tournament after this boundary; 1 once it is
+    /// won.
+    pub players_left: usize,
+}
+
+/// `S1-FL`: the places a boundary decides (the owner, 2026-09-15: *the client
+/// must know reliably where it finished, also when several seats bust in one
+/// hand -- by the international tournament rules*).
+///
+/// The tournament rule: of the seats out of chips in one hand, the one that
+/// began the hand with more chips finishes higher, and the same chips tie.
+/// Ahead of them are the seats that play on (`R(k+1)`) and, while the
+/// tournament goes on, the seats holding chips outside it -- absent, and free
+/// to return. When the boundary ends the tournament (fewer than two play on),
+/// the seat that plays on has won, the seats busted in that hand follow it,
+/// and the absent seats holding chips come last, by their chips -- the seat
+/// that stayed at the table to the end finishes ahead of one that left it
+/// (`S1-FA`, the owner: busting heads-up beside an absent seat's chips is
+/// second, not third). A seat out of the table for good busted at this
+/// boundary, its chips leaving with it.
+fn place_seats(occupied: &[SeatIdx], start: &[Chips], end: &[Chips], playing_on: &[SeatIdx]) -> (bool, Vec<SeatFinish>) {
+    let at = |v: &[Chips], s: SeatIdx| v.get(usize::from(s)).copied().unwrap_or(0);
+    let over = playing_on.len() < 2;
+    let absent: Vec<SeatIdx> = occupied.iter().copied().filter(|s| at(end, *s) > 0 && !playing_on.contains(s)).collect();
+    let busted: Vec<SeatIdx> = occupied.iter().copied().filter(|s| at(start, *s) > 0 && at(end, *s) == 0).collect();
+    let players_left = if over { playing_on.len().min(1) } else { playing_on.len() + absent.len() };
+    let ranked = |seats: &[SeatIdx], by: &[Chips], base: usize, out: &mut Vec<SeatFinish>| {
+        for s in seats {
+            let more = seats.iter().filter(|o| at(by, **o) > at(by, *s)).count();
+            let tied = seats.iter().any(|o| *o != *s && at(by, *o) == at(by, *s));
+            out.push(SeatFinish { seat: *s, place: base + more + 1, tied, players_left });
+        }
+    };
+    let mut out = Vec::new();
+    if over {
+        for s in playing_on {
+            out.push(SeatFinish { seat: *s, place: 1, tied: false, players_left });
+        }
+        if playing_on.is_empty() {
+            // Nobody plays on: the seats holding chips rank by them.
+            ranked(&absent, end, 0, &mut out);
+            ranked(&busted, start, absent.len(), &mut out);
+        } else {
+            ranked(&busted, start, playing_on.len(), &mut out);
+            ranked(&absent, end, playing_on.len() + busted.len(), &mut out);
+        }
+    } else {
+        ranked(&busted, start, playing_on.len() + absent.len(), &mut out);
+    }
+    out.sort_by_key(|f| (f.place, f.seat));
+    (over, out)
+}
+
 /// `MAX_CONSECUTIVE_AUTO_ACTIONS` and bounds what a flood can cost.
 const BANKED_CAP: usize = crate::protocol::constants::MAX_SEATS as usize * 4;
 
@@ -8566,6 +8628,56 @@ impl Hand {
         self.next_hand_with(terminal, stacks)
     }
 
+    /// `S1-FL`: `R(k+1)` as [`Hand::next_hand_with`] derives it, read alone --
+    /// the seats that play on from this boundary -- for the places below. A
+    /// mirror, and tested to agree with the derivation whenever there is a next
+    /// hand: the derivation also folds the bank forward and is left as it is.
+    fn required_next(&self, end: &[Chips]) -> Vec<SeatIdx> {
+        let alive = |s: SeatIdx| end.get(usize::from(s)).copied().unwrap_or(0) > 0;
+        let mut required: Vec<SeatIdx> = self
+            .open
+            .required
+            .iter()
+            .copied()
+            .filter(|s| self.took_part(*s) && alive(*s))
+            .collect();
+        if self.open.required.len() == 2 {
+            required = self.open.required.iter().copied().filter(|s| alive(*s)).collect();
+        }
+        for seat in &self.returned {
+            if alive(*seat) && !required.contains(seat) {
+                required.push(*seat);
+            }
+        }
+        required.sort_unstable();
+        required.dedup();
+        required
+    }
+
+    /// The stacks at this boundary as the next hand reads them: settled or
+    /// restored, and a seat out of the table for good holds nothing (`D-047`).
+    fn end_stacks_at_boundary(&self) -> Vec<Chips> {
+        let mut end = self.boundary_stacks();
+        for seat in self.out_for_good() {
+            if let Some(e) = end.get_mut(usize::from(seat)) {
+                *e = 0;
+            }
+        }
+        end
+    }
+
+    /// `S1-FL`: what this boundary decided about the tournament -- whether it
+    /// is over, and the place of every seat that finished at it: out of chips,
+    /// out of the table for good, or the winner. From figures every peer holds
+    /// alike: the stacks the hand began with (bound into its roster hash), the
+    /// stacks it ended with, and `R(k+1)`. See [`place_seats`] for the rule.
+    pub fn finishes_at_boundary(&self) -> (bool, Vec<SeatFinish>) {
+        let end = self.end_stacks_at_boundary();
+        let occupied: Vec<SeatIdx> = self.open.seats.iter().map(|(s, _, _)| *s).collect();
+        let playing_on = self.required_next(&end);
+        place_seats(&occupied, &self.mine.stacks, &end, &playing_on)
+    }
+
     /// `S1-CX`: the genesis the next hand would open at if this hand were
     /// given up now -- an abort's terminal is a function of this hand's
     /// genesis and moves no chips, so the answer is known before the fact.
@@ -14277,6 +14389,53 @@ mod tests {
         }
         assert!(shown >= 1, "the first to show may not muck, so a hand was shown");
         assert_eq!(watcher.shown(2), None, "and no card of a seat dealt nothing");
+    }
+
+    /// `S1-FL`: the places a boundary decides, by the tournament rule.
+    #[test]
+    fn the_places_a_boundary_decides() {
+        let places = |r: &(bool, Vec<SeatFinish>)| -> Vec<(SeatIdx, usize, bool)> { r.1.iter().map(|f| (f.seat, f.place, f.tied)).collect() };
+        // Two seats out of chips in one hand: the one that began it with more
+        // finishes higher; the last seat playing on has won.
+        let r = place_seats(&[0, 1, 2], &[600, 1_400, 1_000], &[0, 3_000, 0], &[1]);
+        assert!(r.0, "won");
+        assert_eq!(places(&r), vec![(1, 1, false), (2, 2, false), (0, 3, false)]);
+        assert!(r.1.iter().all(|f| f.players_left == 1));
+        // The same chips at the start: the place is shared.
+        let r = place_seats(&[0, 1, 2], &[500, 2_000, 500], &[0, 3_000, 0], &[1]);
+        assert_eq!(places(&r), vec![(1, 1, false), (0, 2, true), (2, 2, true)]);
+        // The tournament goes on: a seat holding chips outside it -- absent,
+        // free to return -- is ahead of the seat busted now.
+        let r = place_seats(&[0, 1, 2, 3], &[1_000; 4], &[1_500, 1_500, 1_000, 0], &[0, 1]);
+        assert!(!r.0);
+        assert_eq!(places(&r), vec![(3, 4, false)]);
+        assert_eq!(r.1[0].players_left, 3, "three seats still hold chips");
+        // `S1-FA`: the tournament ends heads-up beside an absent seat's chips --
+        // the loser of that hand is second, the absent seat last.
+        let r = place_seats(&[0, 1, 2], &[10_600, 17_200, 2_200], &[10_600, 19_400, 0], &[1]);
+        assert!(r.0);
+        assert_eq!(places(&r), vec![(1, 1, false), (2, 2, false), (0, 3, false)]);
+        // A seat out of the table for good: its chips left at this boundary.
+        let r = place_seats(&[0, 1, 2], &[1_000; 3], &[1_000, 1_000, 0], &[0, 1]);
+        assert_eq!(places(&r), vec![(2, 3, false)]);
+        assert_eq!(r.1[0].players_left, 2);
+        // A boundary that busts nobody decides nothing.
+        let r = place_seats(&[0, 1, 2], &[1_000; 3], &[900, 1_100, 1_000], &[0, 1, 2]);
+        assert!(!r.0 && r.1.is_empty());
+    }
+
+    /// `S1-FL`: the read-only `R(k+1)` agrees with the derivation, and a settled
+    /// hand that busts nobody decides no place -- at the seats playing it and
+    /// at a busted bystander alike.
+    #[test]
+    fn the_places_read_the_roster_the_next_hand_is_derived_from() {
+        let (hands, _, _, _) = a_settled_hand_with_a_bystander_holding(0);
+        for (i, h) in hands.iter().enumerate() {
+            let next = h.next_hand().map(|o| o.required).expect("a next hand");
+            assert_eq!(next, h.required_next(&h.end_stacks_at_boundary()), "seat {i}");
+            let (over, finishes) = h.finishes_at_boundary();
+            assert!(!over && finishes.is_empty(), "seat {i}: {finishes:?}");
+        }
     }
 
     /// Four seats: 0 and 1 the roster, 2 and 3 bystanders with chips.
