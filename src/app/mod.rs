@@ -584,6 +584,10 @@ pub struct Seat {
     /// The small blind of the last hand and how many times it has gone up in
     /// this game, for PokerTH's blind raise sound.
     pub blinds_seen: (u64, u32),
+    /// `D-059`: how many times each seat has made this table wait and the
+    /// table's cryptographic step, by the node's count -- for the table's log
+    /// and the wait panel.
+    pub patience: std::collections::BTreeMap<u8, (u8, u64)>,
 }
 
 /// `S1-CS`: a line said at the table, filed under the seat that said it.
@@ -1086,6 +1090,24 @@ impl AppState {
                     w.heard_return(hand);
                     w.return_votes = Some((held, need));
                 }
+            }
+            // `D-059`: a seat made the table wait, and the table waits less for it
+            // at a cryptographic step from now on.
+            NodeEvent::SeatWaited { seat, waits, step_ms } => {
+                if let Some(s) = self.seated.as_mut() {
+                    s.patience.insert(seat, (waits, step_ms));
+                }
+                let name = self.seat_name(seat);
+                let cuts = crate::protocol::constants::MAX_PATIENCE_CUTS;
+                let next_s = crate::table::hand::patience_ms(step_ms, waits) / 1_000;
+                self.log_table(
+                    crate::gui::table::LogKind::SitOut,
+                    if waits <= cuts {
+                        format!("{name} made the table wait ({waits} of {cuts}): {next_s} s at a step from now on")
+                    } else {
+                        format!("{name} made the table wait again: {next_s} s at a step")
+                    },
+                );
             }
             NodeEvent::SitInAsked { seat, hand_id } if self.seated.as_ref().and_then(|s| s.seat) != Some(seat) => {
                 // `D-058`: another seat on its way back -- said at its seat, and
@@ -2381,11 +2403,27 @@ impl AppState {
                         ),
                         (Later, "The next hand is dealt without it".to_string()),
                     ];
+                    // `D-059`: and how much the table waits for it at a step now.
+                    let patience = seated
+                        .patience
+                        .get(seat)
+                        .map(|(waits, step_ms)| {
+                            format!(
+                                ". It has made the table wait {}: {} s at a step from now on",
+                                match waits {
+                                    1 => "once".to_string(),
+                                    2 => "twice".to_string(),
+                                    n => format!("{n} times"),
+                                },
+                                crate::table::hand::patience_ms(*step_ms, *waits) / 1_000
+                            )
+                        })
+                        .unwrap_or_default();
                     let detail = if w.votes.is_some() {
-                        "Its time ran out; when every other seat agrees, this hand ends and the next is dealt without it".to_string()
+                        format!("Its time ran out; when every other seat agrees, this hand ends and the next is dealt without it{patience}")
                     } else {
                         format!(
-                            "The cards need {name}'s part{}; when its time runs out the other seats end this hand and deal the next without it. Nothing here is stuck",
+                            "The cards need {name}'s part{}; when its time runs out the other seats end this hand and deal the next without it{patience}. Nothing here is stuck",
                             quiet.map(|q| format!(", silent {q} s")).unwrap_or_default()
                         )
                     };
@@ -3825,6 +3863,43 @@ mod tests {
         s.apply(NodeEvent::HoleCards { hand_id: 6, cards: [1, 2] });
         let v = s.table_view_of(0);
         assert!(v.waits.is_empty(), "the next hand is being played: {:?}", v.waits);
+    }
+
+    /// `D-059`: a seat that made the table wait is said in the table's log with
+    /// the time a cryptographic step gives it from now on, and the wait panel
+    /// over a step it holds says the same.
+    #[test]
+    fn a_seat_that_made_the_table_wait_is_said_with_its_time_at_a_step() {
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key: [7u8; 32], seat: 1 });
+        s.apply(NodeEvent::Roster {
+            key: [7u8; 32],
+            seats: vec![(0, "Founder".into(), 1_000), (1, "me".into(), 1_000), (2, "Carol".into(), 1_000)],
+        });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        s.apply(NodeEvent::SeatLink { seat: 0, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::HandBegan { hand_id: 12, button: 0, dealt_in: vec![0, 1, 2], small_blind: 100, big_blind: 200 });
+        s.apply(NodeEvent::SeatWaited { seat: 2, waits: 1, step_ms: 30_000 });
+        assert!(
+            s.table_log.iter().any(|l| l.text == "Carol made the table wait (1 of 3): 20 s at a step from now on"),
+            "{:?}",
+            s.table_log
+        );
+        s.apply(NodeEvent::NotYourTurn { hand_id: 12, seat: None, elapsed_ms: 0 });
+        s.apply(NodeEvent::StageStands { hand_id: 12, seats: vec![2] });
+        let v = s.table_view_of(0).waits;
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].title, "Waiting for Carol");
+        assert!(
+            v[0].panel.detail.as_deref().is_some_and(|d| d.contains("It has made the table wait once: 20 s at a step from now on")),
+            "{:?}",
+            v[0].panel.detail
+        );
+        s.apply(NodeEvent::SeatWaited { seat: 2, waits: 3, step_ms: 30_000 });
+        assert!(s.table_log.iter().any(|l| l.text == "Carol made the table wait (3 of 3): 10 s at a step from now on"));
+        s.apply(NodeEvent::SeatWaited { seat: 2, waits: 4, step_ms: 30_000 });
+        assert!(s.table_log.iter().any(|l| l.text == "Carol made the table wait again: 10 s at a step"));
     }
 
     /// `S1-FG`, the owner's word (2026-09-15): an action in the lobby never closes

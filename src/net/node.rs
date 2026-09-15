@@ -547,6 +547,10 @@ pub enum NodeEvent {
     TimeoutVotes { seat: u8, held: u8, need: u8 },
     /// `D-058`: how the votes on a seat's return stand.
     ReturnVotes { seat: u8, held: u8, need: u8 },
+    /// `D-059`: a seat made the table wait, `waits` times now by this client's
+    /// count; from its next cryptographic step on, the table waits
+    /// `hand::patience_ms(step_ms, waits)` for it.
+    SeatWaited { seat: u8, waits: u8, step_ms: u64 },
 }
 
 impl NodeEvent {
@@ -677,7 +681,9 @@ impl NodeEvent {
             | Self::JoinNotStarted { .. }
             | Self::Finished { .. }
             | Self::TimeoutVotes { .. }
-            | Self::ReturnVotes { .. } => true,
+            | Self::ReturnVotes { .. }
+            // `D-059`: a seat made the table wait.
+            | Self::SeatWaited { .. } => true,
 
             // Log only. Chatty, repetitive, and worth a second's delay.
             //

@@ -3374,6 +3374,19 @@ Codes `0x0600`–`0x06FF`. Full semantics in §8.
 (§8.2) **and** this client has not accepted a valid event for that stage **from
 `subject_seat`**.
 
+**D-059: a shorter timer, at a cryptographic step, for a seat that has made the
+table wait.** Each client counts, on its own clock and once each stall is over,
+every stage that stood on a seat for ten seconds and every turn of that seat
+that ran past its deadline -- none during which it heard none of the other seats
+for fourteen seconds, which is its own line gone -- and times its vote about the
+seat at a cryptographic step to the step's budget less ten seconds for every
+such wait counted before: at most three, and never less than ten seconds. A
+turn's timer is never shortened. The
+vote still names the parent's `next_deadline_ms` in `deadline_ms`; a receiver
+checks that value and nothing about when the vote was cast, and a certificate
+needs a vote from every seat of `V(S)`, so a seat is voted out when the most
+patient of them says so. Nothing on the wire changes.
+
 **`subject_event_type` for a betting stage, normatively.** A cryptographic
 stage has one type and every voter names it. A **betting** stage has five —
 `ACTION_CHECK` through `ACTION_FOLD` are all legal at one `sequence`, and which
@@ -6797,6 +6810,11 @@ tens or hundreds of milliseconds — not by their clock offset, which can be hou
 relay hops for CGNAT peers, and signature verification. Every peer must use the
 identical constant, because peers disagreeing about whether a timeout fired is a
 consensus fault, not a UX detail. [RULES B4]
+
+The constant is the same at every peer. What `D-059` shortens is the moment a
+client votes about a seat that has made the table wait, at a cryptographic step
+(see `TIMEOUT_VOTE`), and a certificate absorbs a difference in that moment
+because it needs every voter.
 
 **The subject of a certificate is read from the votes it carries, never rebuilt
 from the receiver's own stage.** The first carried vote's payload is the

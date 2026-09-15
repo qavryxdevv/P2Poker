@@ -4960,3 +4960,67 @@ heard; the certificate after the hand's end), `app::tests::no_wait_is_said_over_
 rewritten end of `app::tests::the_way_back_is_shown_step_by_step_until_dealt_in_again`; `--table-preview` with
 `--preview-waits`, `--preview-waits-gap` and `--preview-waits-back`. Not measured on the bed: the panel is not drawable
 there, and the four failures were read off the code against the owner's screenshot.
+
+## D-059 — every wait for a seat shortens the next one at a cryptographic step
+
+**Decided 2026-09-15, the owner's ruling** (*"chtěl bych vylepšit systém certifikací pro peera se špatným spojením,
+taky pravidlem 3x a dost, tzn. že pokaždé, kdy bude celý stůl nucen čekat na peera, tak při každém zastavení hry
+(každém čekání) mu odebrat 10 sekund času potřebného k certifikaci peera ven (je to i proti zneužívání rogue peerem,
+který by si prodlužoval čas na přemýšlení nebo zdržoval hru)"*; asked whether a turn's time is cut as well, the owner
+chose *only the cryptographic steps*; shown the measurement in point 1, *count from ten seconds, and never less than
+ten*).
+
+1. **A wait** is a cryptographic stage -- the hand's opening, the deck, the shuffle, a deal, a reveal, the showdown --
+   that has stood on a seat for `WAIT_FROM_MS` = 10 000, or the seat's turn run past its deadline (the decision's time,
+   the network's share and any reserve: the moment the other seats vote). Ten seconds is twice the slowest honest step
+   measured: in the owner's games that day the far seat shuffled with its proof in 1 to 3 s, and in one game
+   (`bc8304bd`) 4 shuffles of 22 took over five seconds, 5.3 s at the slowest -- the window's wait panel, which still
+   appears at five, would have counted a slow machine. Each client counts on its own clock, once a stall, **when the
+   stall is over** (`Hand::stall_now`, `hand::Waits`): the stage moved or the hand ended. Never this client's own seat;
+   nothing at the table's first hand's opening while `S1-FM`'s minute for joining the table's group holds; nothing where
+   no certificate could remove the seat (`D-036`'s floor); and **nothing for a stall during which this client heard none
+   of the other seats of the table for `DEAF_AFTER_S` (14 s)** -- the group's members ping every twelve seconds, so a
+   client that hears nobody for that long is the one cut off, and the library's own word on its line comes a minute
+   late. The bed taught this one: in `run181556-3` the node whose line was cut counted the seat it could not hear.
+2. **The cut** (`hand::patience_ms`): at a cryptographic step a client votes about the seat after the step's budget
+   less `PATIENCE_CUT_MS` for every wait counted before, at most `MAX_PATIENCE_CUTS` of them, and never under
+   `WAIT_FROM_MS`: at the table's thirty-second step 30 s, 20 s, and 10 s from then on (the third wait is counted and
+   cuts nothing more there). A stall is counted when it is over, so it cuts only the steps after it. The carrier's
+   reprieve for a seat whose traffic is still being delivered (`S1-BK`) is twice the seat's own time. **A turn is never
+   cut** -- the owner's choice: the thirty seconds to decide and the three for the network are the player's (`D-034`),
+   and a turn that runs out counts as a wait all the same.
+3. **What it stops.** A client cannot stretch a turn past the network's share, but it could hold the deal back -- the
+   shuffle, a deal, the reveal before its own turn, where no clock of its own runs -- and think for thirty seconds at
+   every step. Now it gets that once, then twenty seconds, then ten, and every stall of ten counts again. A seat with a
+   bad line costs the table the same way, less each time, and `D-032`'s three returns still bound how often it comes
+   back.
+4. **Local, the wire unchanged.** A vote still names the stage's own `deadline_ms`; a receiver checks that value and
+   nothing about when the vote was cast, and a certificate needs a vote from every seat of `V(S)`, so the table votes a
+   seat out when the most patient voter's clock says so. A client on an older build waits the whole budget, and a
+   client back from a restart counts from nothing, so every seat should run the same build. The count is kept for the
+   table for the whole tournament (`TableRun::patience`, cleared when the table is left); a return restores nothing.
+   The bare abort (`may_abandon`, twice and three times the budget) is unchanged: the certificate still goes first.
+5. **Said** in the client log (*seat 2 made the table wait (1 of 3): from now on this client waits 20 s for it at a
+   cryptographic step before voting*), in the table's log (*Carol made the table wait (1 of 3): 20 s at a step from
+   now on*), and in the wait panel's sentence (*It has made the table wait once: 20 s at a step from now on*).
+   `PROTOCOL.md` says the shorter timer at `TIMEOUT_VOTE` and in §8.2.
+
+**Measured on the bed** (`run181556-3`, `run183647-3`: three local seats, node n2's internet cut at the socket for 25 s
+at 70 s and every 100 s after). The first build counted a wait the moment a stall passed ten seconds, and the cut node
+counted the seat it could not hear -- *seat 1 made the table wait* at 81 s, eleven seconds into its own outage, and
+again as its line came back; the certificate still needed the healthy node's vote, so nothing moved, but the word was
+false -- which is point 1's counting when the stall is over and never through deafness. With that, the cut node
+counted nothing through four outages. Both healthy nodes counted seat 2's first stall when it ended (100 s); its next
+stall was voted about some twenty seconds into its stage (the vote at 120.3 s, the stall counted at the tick of
+100.2 s) and certified unanimously; the ones after that ten seconds in (10.7 s and 11.7 s from the stage's
+*waiting for seat 2*, on the two-second tick), and the fourth count said the least. Both healthy nodes held one genesis
+on all 46 hands. The cut node came back each time by the return certificate (harness verdict BEHIND-REJOINED in both
+runs), and twice in the second run opened a hand on its own view before the table's certificate reached it -- hand #8
+re-derived at the certificate (`S1-BS`), hand #28 dropped for the table's copies (`D-038`) -- the roads a node back
+from an outage takes, which the harness reports as *2 of 39 on a different genesis* for that node.
+
+**Guard.** `table::hand::tests::the_table_waits_less_at_a_step_for_a_seat_that_made_it_wait`,
+`a_wait_is_counted_once_when_the_stall_is_over`, `a_stall_this_client_was_deaf_through_counts_nothing`,
+`a_turn_run_out_is_a_wait_and_its_time_is_never_cut`,
+`no_wait_counts_while_the_first_hand_waits_for_its_seats_or_where_nobody_could_be_voted_out`;
+`app::tests::a_seat_that_made_the_table_wait_is_said_with_its_time_at_a_step`.

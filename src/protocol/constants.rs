@@ -599,6 +599,24 @@ pub const HEADS_UP_STAGE_BUDGET_MS: u32 = 100_000;
 /// dropping out again and again.
 pub const MAX_RETURNS: u8 = 3;
 
+/// `D-059`: when a stage standing on a seat is the whole table waiting for it,
+/// and the least a cryptographic step ever waits for a seat that has made the
+/// table wait. Twice the slowest honest step measured, so a slow machine is not
+/// a wait: the owner's far seat shuffled with its proof in 1 to 3 s, and at
+/// 5.3 s at the slowest (2026-09-15, 4 shuffles of 22 over 5 s in one game).
+/// The window's wait panel still appears at five seconds.
+pub const WAIT_FROM_MS: u64 = 10_000;
+
+/// `D-059`, the owner's rule (2026-09-15): every time the whole table is made to
+/// wait for a seat, it waits this much less for that seat at the cryptographic
+/// steps after, before voting it out -- a seat with a bad line, or a client
+/// that holds the deal back to stretch its own thinking. A turn is never cut.
+pub const PATIENCE_CUT_MS: u64 = 10_000;
+
+/// `D-059`: *three times and enough* -- the cuts stop after this many, and at
+/// the table's thirty-second step [`WAIT_FROM_MS`] stops them after two.
+pub const MAX_PATIENCE_CUTS: u8 = 3;
+
 /// `D-034`: how long a seat at one of this client's own tables has to decide,
 /// once it is its turn -- the owner's rule, thirty seconds when the client is
 /// on the line, then the forced fold. The window's clock runs over exactly

@@ -1009,6 +1009,86 @@ struct VerifiedCert {
 /// comes. Every later stage has its seats already talking.
 pub const FIRST_HAND_JOIN_ALLOWANCE_MS: u64 = 60_000;
 
+/// `D-059`: how long a cryptographic step waits for a seat that has made the
+/// table wait `waits` times: the step's budget less `PATIENCE_CUT_MS` a time, at
+/// most `MAX_PATIENCE_CUTS` times, and never less than `WAIT_FROM_MS` -- nor
+/// more than the budget itself, where that is shorter. Thirty seconds at the
+/// table's step, then twenty, and ten from then on.
+pub fn patience_ms(budget_ms: u64, waits: u8) -> u64 {
+    use crate::protocol::constants::{MAX_PATIENCE_CUTS, PATIENCE_CUT_MS, WAIT_FROM_MS};
+    let cut = u64::from(waits.min(MAX_PATIENCE_CUTS)).saturating_mul(PATIENCE_CUT_MS);
+    budget_ms.saturating_sub(cut).max(WAIT_FROM_MS.min(budget_ms))
+}
+
+/// `D-059`: a stage standing on seats, as [`Hand::stall_now`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stall {
+    /// The hand and the stage: a stall is one stage of one hand.
+    pub key: (u64, u64),
+    /// The seats it counts as the table waiting for already -- a
+    /// cryptographic stage standing on them for `WAIT_FROM_MS`, a turn run past
+    /// its deadline.
+    pub waits: Vec<SeatIdx>,
+    /// Whether a wait may count here at all: not while the table's first
+    /// hand's opening holds for its seats (`S1-FM`), not below `D-036`'s floor.
+    pub countable: bool,
+}
+
+/// `D-059`: this client's count of the times each seat made the table wait,
+/// kept by the node for the table. A stall is watched while it stands and
+/// counted once it is over -- the stage moved, the hand ended -- and not at all
+/// if at any moment of it this client heard none of the other seats, or the
+/// stall could not count: a client whose own line went is looking at its own
+/// stall, and the library says so a minute late (the bed, `run181556-3`: the
+/// seat whose line was cut counted the others while it heard nobody).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Waits {
+    watching: Option<(u64, u64)>,
+    seats: Vec<SeatIdx>,
+    spoilt: bool,
+    counts: Vec<u8>,
+}
+
+impl Waits {
+    /// How many times each seat has made the table wait, indexed by seat.
+    pub fn counts(&self) -> &[u8] {
+        &self.counts
+    }
+
+    /// One tick: the stall now, if any, and whether this client hears none of
+    /// the other seats. Returns the waits counted on this tick -- the stall
+    /// just over -- each with its seat's new count.
+    pub fn tick(&mut self, stall: Option<Stall>, deaf: bool) -> Vec<(SeatIdx, u8)> {
+        let key = stall.as_ref().map(|s| s.key);
+        let mut counted = Vec::new();
+        if self.watching.is_some() && self.watching != key {
+            let seats = std::mem::take(&mut self.seats);
+            if !self.spoilt {
+                for seat in seats {
+                    let i = usize::from(seat);
+                    if self.counts.len() <= i {
+                        self.counts.resize(i + 1, 0);
+                    }
+                    self.counts[i] = self.counts[i].saturating_add(1);
+                    counted.push((seat, self.counts[i]));
+                }
+            }
+            self.watching = None;
+            self.spoilt = false;
+        }
+        if let Some(st) = stall {
+            self.watching = Some(st.key);
+            self.spoilt |= deaf || !st.countable;
+            for seat in st.waits {
+                if !self.seats.contains(&seat) {
+                    self.seats.push(seat);
+                }
+            }
+        }
+        counted
+    }
+}
+
 /// `S1-FL`: a seat's place in the tournament, decided at a hand's boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeatFinish {
@@ -1751,6 +1831,10 @@ pub struct Hand {
     /// Consecutive certificates against each seat, towards
     /// [`MAX_CONSECUTIVE_AUTO_ACTIONS`].
     strikes: Vec<u8>,
+    /// `D-059`: how many times each seat has made this table wait, by this
+    /// client's count, indexed by seat -- set by the node, which keeps the
+    /// counts from hand to hand ([`Hand::set_patience`]).
+    patience: Vec<u8>,
     /// When the stage now open was reached, on this peer's own clock.
     ///
     /// A **cryptographic** stage that stalls is what
@@ -2165,6 +2249,7 @@ impl Hand {
                 certifying: None,
                 certified: Vec::new(),
                 strikes: vec![0; usize::from(o.max_players)],
+                patience: Vec::new(),
                 opened_at_ms,
                 stage_at_ms: opened_at_ms,
                 stage_seq: 0,
@@ -6620,13 +6705,26 @@ impl Hand {
         now_ms: u64,
         mid_delivery: u32,
     ) -> Result<Vec<Send>, Failed> {
-        if self.over() || !self.past_stage_deadline(now_ms) {
+        if self.over() {
             return Ok(Vec::new());
         }
+        let Some(owed) = self.owed_type() else {
+            return Ok(Vec::new());
+        };
+        let age = now_ms.saturating_sub(self.stage_at_ms);
         let mut out = Vec::new();
         for seat in self.waiting_for() {
             // Never about oneself, and never twice.
             if seat == self.open.my_seat {
+                continue;
+            }
+            // `D-059`: each seat on its own clock -- the stage's budget, less the
+            // table's patience the seat has used up, at a cryptographic step. The
+            // vote still names the stage's own `deadline_ms`, which is all a
+            // receiver checks, and a certificate needs every voter: the table
+            // votes a seat out when the most patient voter's clock says so.
+            let after = self.vote_after_ms(seat, owed);
+            if age < after {
                 continue;
             }
             // **A seat the carrier is mid-delivery with is late, not silent.**
@@ -6644,7 +6742,9 @@ impl Hand {
             // beyond the point where the carrier itself gives a confirmed peer
             // up at 58 s — the suppression stops and the vote goes ahead
             // whatever the carrier says. `D-026` is what that bound is for.
-            if !self.long_past_stage(now_ms)
+            // `D-059`: twice the seat's own time, which is twice the budget for a
+            // seat that has not made the table wait.
+            if age < after.saturating_mul(2)
                 && mid_delivery & (1u32 << u32::from(seat.min(31))) != 0
             {
                 continue;
@@ -8719,6 +8819,58 @@ impl Hand {
                 < u64::from(self.open.crypto_step_timeout_ms)
                     .saturating_add(FIRST_HAND_JOIN_ALLOWANCE_MS)
                     .saturating_add(and_then_ms)
+    }
+
+    /// `D-059`: how many times each seat has made this table wait, as the node
+    /// keeps them for the table, indexed by seat.
+    pub fn set_patience(&mut self, waits: &[u8]) {
+        self.patience = waits.to_vec();
+    }
+
+    /// `D-059`: the table's cryptographic step, in milliseconds.
+    pub fn crypto_step_ms(&self) -> u64 {
+        u64::from(self.open.crypto_step_timeout_ms)
+    }
+
+    /// `D-059`: the stall at the open stage, if the stage waits on any seat but
+    /// this client's own: its key, the seats it already counts as a wait for,
+    /// and whether a wait may count here -- see [`Stall`].
+    pub fn stall_now(&self, now_ms: u64) -> Option<Stall> {
+        if self.over() {
+            return None;
+        }
+        self.owed_type()?;
+        let seats: Vec<SeatIdx> = self
+            .waiting_for()
+            .into_iter()
+            .filter(|s| *s != self.open.my_seat && !self.certified.contains(s))
+            .collect();
+        if seats.is_empty() {
+            return None;
+        }
+        let stood = if self.crypto_stage() {
+            now_ms.saturating_sub(self.stage_at_ms) >= crate::protocol::constants::WAIT_FROM_MS
+        } else {
+            self.past_stage_deadline(now_ms)
+        };
+        Some(Stall {
+            key: (self.open.hand_id, self.stage_seq),
+            waits: if stood { seats } else { Vec::new() },
+            countable: !self.first_hand_opening_held(now_ms, 0) && self.certificate_possible(),
+        })
+    }
+
+    /// `D-059`: how long this client waits at the open stage before voting about
+    /// `seat`: at a cryptographic step, `patience_ms` of the stage's budget for
+    /// the waits counted before -- a stall is counted once it is over, so never
+    /// this one; at a turn, the budget -- the owner's choice, a player's time to
+    /// decide is never cut.
+    fn vote_after_ms(&self, seat: SeatIdx, owed: EventType) -> u64 {
+        let budget = u64::from(self.next_deadline_for(owed));
+        if !self.crypto_stage() {
+            return budget;
+        }
+        patience_ms(budget, self.patience.get(usize::from(seat)).copied().unwrap_or(0))
     }
 
     /// `S1-FL`: the places of [`Hand::finishes_at_boundary`], if nothing still
@@ -11834,6 +11986,132 @@ mod tests {
         let sends = c.abort_now(Abort::Deadline, &keys[2], t1).unwrap();
         let Send::Broadcast(abort) = &sends[0];
         (a, b, keys, va.clone(), vb.clone(), abort.clone())
+    }
+
+    /// `D-059`, the owner's rule (2026-09-15): a seat that has made the table
+    /// wait is voted about sooner at a cryptographic step -- ten seconds a wait,
+    /// three times and enough, never under `WAIT_FROM_MS` (ten) -- and the carrier's
+    /// reprieve is twice the seat's own time.
+    #[test]
+    fn the_table_waits_less_at_a_step_for_a_seat_that_made_it_wait() {
+        use crate::protocol::constants::WAIT_FROM_MS;
+        assert_eq!(patience_ms(30_000, 0), 30_000);
+        assert_eq!(patience_ms(30_000, 1), 20_000);
+        assert_eq!(patience_ms(30_000, 2), 10_000);
+        assert_eq!(patience_ms(30_000, 3), WAIT_FROM_MS, "ten seconds, the least");
+        assert_eq!(patience_ms(30_000, 9), WAIT_FROM_MS, "three times and enough");
+        assert_eq!(patience_ms(4_000, 3), 4_000, "never longer than the step's own budget");
+
+        let (mut a, _, _, keys) = three_at_the_deck_stage();
+        assert!(a.vote_on_timeouts(&keys[0], NOW + 29_999, 0).unwrap().is_empty());
+        assert!(!a.vote_on_timeouts(&keys[0], NOW + 30_000, 0).unwrap().is_empty(), "no wait before: the whole budget");
+
+        let (mut a, _, _, keys) = three_at_the_deck_stage();
+        a.set_patience(&[0, 0, 1]);
+        assert!(a.vote_on_timeouts(&keys[0], NOW + 19_999, 0).unwrap().is_empty());
+        assert!(!a.vote_on_timeouts(&keys[0], NOW + 20_000, 0).unwrap().is_empty(), "one wait before: twenty seconds");
+
+        for waits in [3u8, 7] {
+            let (mut a, _, _, keys) = three_at_the_deck_stage();
+            a.set_patience(&[0, 0, waits]);
+            assert!(a.vote_on_timeouts(&keys[0], NOW + WAIT_FROM_MS - 1, 0).unwrap().is_empty());
+            assert!(!a.vote_on_timeouts(&keys[0], NOW + WAIT_FROM_MS, 0).unwrap().is_empty(), "{waits} waits: ten seconds");
+        }
+
+        let (mut a, _, _, keys) = three_at_the_deck_stage();
+        a.set_patience(&[0, 0, 1]);
+        let held = 1u32 << 2;
+        assert!(a.vote_on_timeouts(&keys[0], NOW + 39_999, held).unwrap().is_empty(), "still delivered: twice its time");
+        assert!(!a.vote_on_timeouts(&keys[0], NOW + 40_000, held).unwrap().is_empty());
+    }
+
+    /// `D-059`: a stall is watched while it stands and counted once when it is
+    /// over, however long it lasted; the step it stood at keeps the time it
+    /// began with, and the next stall is counted on its own.
+    #[test]
+    fn a_wait_is_counted_once_when_the_stall_is_over() {
+        use crate::protocol::constants::WAIT_FROM_MS;
+        let (a, _, _, _) = three_at_the_deck_stage();
+        let early = a.stall_now(NOW + WAIT_FROM_MS - 1).expect("the deck stage waits on seat 2");
+        assert!(early.waits.is_empty() && early.countable, "a moment is no wait: {early:?}");
+        let stood = a.stall_now(NOW + WAIT_FROM_MS).expect("still");
+        assert_eq!((stood.waits.clone(), stood.key), (vec![2], early.key));
+
+        let mut w = Waits::default();
+        assert!(w.tick(Some(early), false).is_empty());
+        assert!(w.tick(Some(stood.clone()), false).is_empty(), "counted when it is over, not while it stands");
+        assert!(w.tick(Some(stood.clone()), false).is_empty());
+        assert_eq!(w.tick(None, false), vec![(2, 1)], "over: one wait");
+        assert_eq!(w.counts(), &[0, 0, 1]);
+        assert!(w.tick(None, false).is_empty(), "and only once");
+
+        // A stall that runs into the next stage's stall: the first is counted as
+        // the second begins.
+        let next = Stall { key: (stood.key.0, stood.key.1 + 1), waits: vec![2], countable: true };
+        assert!(w.tick(Some(stood), false).is_empty());
+        assert_eq!(w.tick(Some(next), false), vec![(2, 2)]);
+        assert_eq!(w.tick(None, false), vec![(2, 3)]);
+    }
+
+    /// `D-059`, the bed's lesson (`run181556-3`): a client that heard none of the
+    /// other seats at any moment of a stall counts nothing for it -- its own
+    /// line went -- and neither does a stall that could not count.
+    #[test]
+    fn a_stall_this_client_was_deaf_through_counts_nothing() {
+        let stall = |stage: u64, waits: Vec<SeatIdx>| Stall { key: (4, stage), waits, countable: true };
+        let mut w = Waits::default();
+        assert!(w.tick(Some(stall(3, Vec::new())), true).is_empty(), "deaf before the stall counts");
+        assert!(w.tick(Some(stall(3, vec![1])), false).is_empty());
+        assert!(w.tick(None, false).is_empty(), "the seat it waited on is not blamed");
+        assert!(w.counts().iter().all(|c| *c == 0));
+
+        assert!(w.tick(Some(Stall { key: (4, 5), waits: vec![1], countable: false }), false).is_empty());
+        assert!(w.tick(None, false).is_empty(), "a stall that could not count counts nothing");
+
+        assert!(w.tick(Some(stall(7, vec![1])), false).is_empty());
+        assert_eq!(w.tick(None, false), vec![(1, 1)], "a stall heard through counts");
+    }
+
+    /// `D-059`, the owner's choice: a turn that runs out is a wait, and a turn's
+    /// time is never cut, however many times the seat made the table wait.
+    #[test]
+    fn a_turn_run_out_is_a_wait_and_its_time_is_never_cut() {
+        let (mut hands, keys) = three_to_the_bet();
+        let up = hands[0].turn().expect("somebody is to act").seat;
+        let voter = (0..3u8).find(|s| *s != up).expect("a third seat");
+        let v = &mut hands[usize::from(voter)];
+        let mut waits = vec![0u8; 3];
+        waits[usize::from(up)] = 3;
+        v.set_patience(&waits);
+        // `opening3`: twenty seconds to decide, five for the network, no reserve.
+        assert!(v.stall_now(NOW + 24_999).is_some_and(|s| s.waits.is_empty()), "inside its time a turn is no wait");
+        assert!(v.vote_on_timeouts(&keys[usize::from(voter)], NOW + 24_999, 0).unwrap().is_empty(), "the turn's time is not cut");
+        assert_eq!(v.stall_now(NOW + 25_000).map(|s| s.waits), Some(vec![up]), "run out, the table waits");
+        assert!(!v.vote_on_timeouts(&keys[usize::from(voter)], NOW + 25_000, 0).unwrap().is_empty());
+    }
+
+    /// `D-059`: no wait counts while the table's first hand gives its seats
+    /// `S1-FM`'s minute to join the table's group, and none where no certificate
+    /// could remove the seat -- a client that hears nobody is looking at its own
+    /// stall.
+    #[test]
+    fn no_wait_counts_while_the_first_hand_waits_for_its_seats_or_where_nobody_could_be_voted_out() {
+        use crate::protocol::constants::WAIT_FROM_MS;
+        let (mut a, from_a) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
+        let _ = deliver(&mut a, &from_b, &key(10));
+        let _ = deliver(&mut b, &from_a, &key(11));
+        assert_eq!(a.waiting_for(), vec![2], "the opening waits on seat 2's copy");
+        assert!(a.stall_now(NOW + WAIT_FROM_MS).is_some_and(|s| !s.countable), "joining the table's group is no wait");
+        assert!(a.stall_now(NOW + 90_000).is_some_and(|s| s.countable && s.waits == vec![2]), "past the minute it is");
+
+        let (mut lone, _) = Hand::open(opening3(0), &key(10), NOW, 30_000).unwrap();
+        let (_, from_b) = Hand::open(opening3(1), &key(11), NOW, 30_000).unwrap();
+        let (_, from_c) = Hand::open(opening3(2), &key(12), NOW, 30_000).unwrap();
+        let _ = deliver(&mut lone, &from_b, &key(10));
+        let _ = deliver(&mut lone, &from_c, &key(10));
+        assert_eq!(lone.waiting_for(), vec![1, 2], "the deck stage, nobody's deck heard");
+        assert!(lone.stall_now(NOW + WAIT_FROM_MS).is_some_and(|s| !s.countable), "two of three silent: nothing counts");
     }
 
     /// `S1-BS` option 1: an unattributed abort arriving between one and two

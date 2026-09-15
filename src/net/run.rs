@@ -705,6 +705,9 @@ struct TableRun {
     /// `D-058`: the seats a hand's cryptographic stage was last said to stand
     /// on, and in which hand.
     stands_said: (u64, Vec<u8>),
+    /// `D-059`: how many times each seat has made this table wait, by this
+    /// client's count -- for the whole tournament -- and the stall it watches.
+    patience: crate::table::hand::Waits,
     /// The hand whose "a certificate about the previous hand arrived too late
     /// to be kept" line has been said.
     late_cert_said: Option<u64>,
@@ -973,6 +976,7 @@ impl TableRun {
             frozen_said: false,
             vote_state_said: 0,
             stands_said: (0, Vec::new()),
+            patience: crate::table::hand::Waits::default(),
             late_cert_said: None,
             late_settle_said: None,
             unsettled_abort_here: None,
@@ -2714,6 +2718,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.return_hold = None;
             $t.boundary_done_for = None;
             $t.finish_said_for = None;
+            $t.patience = crate::table::hand::Waits::default();
             $t.act_by = None;
             // Keyed by hand id, and the next table starts again at 1.
             $t.boundaries = crate::table::boundary::Boundaries::new();
@@ -7699,6 +7704,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    // `D-059`, the owner's rule (2026-09-15): every time the whole table
+                    // is made to wait for a seat -- a cryptographic step standing on it
+                    // for `WAIT_FROM_MS`, or its turn run out -- this client waits
+                    // `PATIENCE_CUT_MS` less for it at the cryptographic steps after,
+                    // three times and enough. Counted once the stall is over, kept for
+                    // the table, read by the hand's own clock for each seat. Not a stall
+                    // during which this client heard none of the other seats for
+                    // `DEAF_AFTER_S`: its own line went, and the library's word on that
+                    // comes a minute late (`run181556-3`).
+                    {
+                        let me = h.my_seat();
+                        let deaf = t.tox_sink.is_on_tox()
+                            && h.required()
+                                .iter()
+                                .filter(|s| **s != me)
+                                .filter_map(|s| h.key_of(*s))
+                                .all(|k| t.tox_sink.quiet_secs(&k).is_none_or(|q| q >= DEAF_AFTER_S));
+                        let stall = h.stall_now(now);
+                        let step_ms = h.crypto_step_ms();
+                        for (s, waits) in t.patience.tick(stall, deaf) {
+                            let next_s = crate::table::hand::patience_ms(step_ms, waits) / 1_000;
+                            let cuts = crate::protocol::constants::MAX_PATIENCE_CUTS;
+                            let _ = events
+                                .send(NodeEvent::Warning(if waits <= cuts {
+                                    format!("seat {s} made the table wait ({waits} of {cuts}): from now on this client waits {next_s} s for it at a cryptographic step before voting (D-059)")
+                                } else {
+                                    format!("seat {s} made the table wait again ({waits} times): this client waits {next_s} s for it at a cryptographic step, the least (D-059)")
+                                }))
+                                .await;
+                            let _ = events.send(NodeEvent::SeatWaited { seat: s, waits, step_ms }).await;
+                        }
+                        h.set_patience(t.patience.counts());
+                    }
+
                     // Say so first, if this client's own timer has run out on
                     // somebody. A vote is not an accusation and does nothing
                     // alone; only a complete set becomes a certificate, and only a
@@ -9667,6 +9706,12 @@ pub const TOURNAMENT_LEAVE_GRACE: std::time::Duration = std::time::Duration::fro
 /// seconds, so a live one is never this quiet; a client that died is, long
 /// before the library gives it up at 58 s.
 pub const QUIET_LIMIT_S: u64 = 20;
+
+/// `D-059`: how long this client may hear none of the other seats of a table
+/// before a stall it watches is its own and counts against nobody. Members ping
+/// each other every twelve seconds, so a client that hears the group is never
+/// this deaf.
+const DEAF_AFTER_S: u64 = 14;
 
 /// Cut a string to at most `max` bytes, without cutting a character in half.
 ///
