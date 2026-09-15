@@ -8294,7 +8294,10 @@ MAX_AD_LIFETIME_MS              = 300 000       (bound on expires_at vs local ti
 MAX_CLOCK_SKEW_MS               = 120 000
 PRESENCE_TTL_MS                 = 120 000
 PRESENCE_HEARTBEAT_MS           = 40 000
-REANNOUNCE_INTERVAL_MS          = 600 000
+  (REANNOUNCE_INTERVAL_MS, 600 000, stood here until 2026-09-15: Mainline's
+  ten-minute re-announce, read by nothing since 56b0b50. A provider record is
+  republished by the Kademlia library on its own interval; NETWORK_STACK.md
+  section 10.1. No peer ever parsed it, so its removal changes no wire.)
 IDLE_CONNECTION_TIMEOUT_MS      = 60 000
 MDNS_QUERY_INTERVAL_MS          = 15 000
 SNAPSHOT_PEER_COUNT             = 4

@@ -244,10 +244,12 @@ pub const MAX_CLOCK_SKEW_MS: u64 = 120_000;
 pub const PRESENCE_TTL_MS: u64 = 120_000;
 pub const PRESENCE_HEARTBEAT_MS: u64 = 40_000;
 
-/// How often the DHT announce is repeated. A legitimate `600_000`, and the
-/// only one in the protocol: a Mainline record is short-lived and the announce
-/// must be renewed.
-pub const REANNOUNCE_INTERVAL_MS: u64 = 600_000;
+// **`REANNOUNCE_INTERVAL_MS` is gone as well (2026-09-15).** It was Mainline's
+// ten-minute re-announce, sized against a record that lived about forty-five
+// minutes, and nothing had read it since `56b0b50`. A provider record is
+// republished by `libp2p-kad` on its own twelve-hour interval, and the one walk
+// this client repeats - an announcement it has not yet seen come back - is
+// `net::run::REANNOUNCE_EVERY`, which is local and no protocol value.
 
 pub const IDLE_CONNECTION_TIMEOUT_MS: u64 = 60_000;
 pub const MDNS_QUERY_INTERVAL_MS: u64 = 15_000;

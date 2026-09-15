@@ -2,55 +2,41 @@
 
 Specification of the transport and discovery layer of `p2p-poker`.
 
-> ## ⚠ The discovery layer this document specifies is not the one the client runs
+> ## Discovery: Mainline is history here, as it is in the client
 >
-> **Measured 2026-08-31.** `56b0b50` (2026-08-30) replaced Mainline DHT discovery
-> with a **libp2p Kademlia provider record**, and removed the `mainline` crate,
-> `src/net/dht.rs` and both infohashes from the build. This document was not
-> rewritten.
+> **Until 2026-09-15 this box warned that the discovery layer specified below was
+> not the one the client runs.** `56b0b50` (2026-08-30) replaced Mainline DHT
+> discovery with a **libp2p Kademlia provider record** and removed the
+> `mainline` crate, `src/net/dht.rs` and both infohashes from the build, and this
+> document went on specifying Mainline. The survey behind `S1-E` counted **98
+> discrete Mainline claims in 27 sections**. The largest blocks — §§2, 3, 3.5, 4,
+> 5.7, 5.8, 10.1, 11.2, 11.4 and 12 — were rewritten on 2026-09-02, the three
+> claims that were inverted rather than stale first among them: §5.7's
+> *"libp2p Kademlia is not enabled in v1"*, §11.4's deny-all request filter, and
+> §10.1's *"the application owns the re-announce loop"*. The residue went on
+> 2026-09-15: §§0.3, 1.2, 1.3, 2, 2.1, 3, 4.1, 4.6, 5.2, 5.3, 8, 9.5, 9.7, 9.8,
+> 11.5.2, 12, 14 and 15. A sentence that still names Mainline, `get_peers`, an
+> infohash or a `SocketAddrV4` says in the same breath that it is history.
 >
-> What the client actually does: `net::run::lobby_namespace` announces under
-> `sha2-256("p2p-poker/main-lobby/v1")` and `relay_namespace` under
-> `sha2-256("/libp2p/relay")`, keyed the way go-libp2p's routing discovery keys a
-> namespace. A provider record carries whatever multiaddrs a node has — circuit
-> addresses included — which is why the change was made: a Mainline announcement
-> can say one `IP:port`, and a player behind a NAT has none worth saying.
+> What the client does: `net::run::lobby_namespace` provides and looks up
+> `sha2-256("p2p-poker/main-lobby/v1")` on the public IPFS Kademlia
+> (`/ipfs/kad/1.0.0`), and `relay_namespace` does the same for
+> `sha2-256("/libp2p/relay")`, both keyed the way go-libp2p's routing discovery
+> keys a namespace (§3.2). A provider record carries whatever multiaddrs a node
+> has — circuit addresses included — which is why the change was made: a
+> Mainline announcement can say one `IP:port`, and a player behind a NAT has
+> none worth saying.
 >
-> **What is left, counted rather than estimated (2026-09-02).** §§3, 3.5, 4, 5.7,
-> 5.8, 10.1 and 11.4 have been rewritten and are current. The survey that
-> produced this list found **98 discrete Mainline claims in 27 sections**; the
-> rewrites above take the largest blocks, and what remains is smaller and named
-> in `S1-E`. The earlier figure of *"33 sections"* was never verified and is not
-> restated here: the two counts use different units — a claim, roughly a line or
-> a table row, against a section — and neither confirms the other.
->
-> **The three claims that are not stale but inverted** were the ones to fix
-> first, because an implementer who trusts a stale sentence builds nothing while
-> one who trusts an inverted sentence builds the opposite of what runs. They
-> were §5.7 (*"libp2p Kademlia is not enabled in v1"*, while `swarm.rs` builds
-> two `kad::Behaviour`s), §11.4 (*ship a deny-all `RequestFilter`*, while
-> `set_mode(None)` deliberately opts **into** answering strangers' queries), and
-> §10.1 (*"nothing re-announces for us; the application owns the loop"*, while
-> `libp2p-kad` republishes on its own 12 h interval). All three are rewritten.
->
-> **Two more carried decisions rather than descriptions.** §2's *"every step is
-> an outbound operation"* is false for the announce half — `start_providing` is
-> gated on a confirmed external address, so a NATed player cannot **appear** in
-> the lobby until a relay has given it a circuit address, which puts layer 1
-> under layer 3 and reverses §9.7's ordering. And §§5.3, 5.8, 9.3 and 12 say
-> discovery dies with UDP and is IPv4-only; both are now false **in the client's
-> favour**, because Kademlia rides the same QUIC + TCP + IPv6 stack as
-> everything else.
->
-> **Read as history:** §§1.1, 2, 5.1–5.3, 7.2, 8.3, 9.1, 9.3, 9.7, 9.8, 11.2, 12,
-> 13 and 14, wherever they name Mainline, `get_peers`, an infohash or a
-> `SocketAddrV4`. `S1-E`.
->
-> **One thing in this file cannot be fixed in this file.** `SPEC_CS.md` §1 and §3
-> mandate Mainline, and the authority order below says the specification wins.
-> Three passages here (§1.2, §2, §9.1) quote it verbatim, so rewriting them in
-> place would put this document in front of its own authority. They are left
-> quoted and marked; amending `SPEC_CS.md` is an owner's decision and is filed.
+> **`SPEC_CS.md` still names Mainline, and it stays that way on the owner's word
+> (2026-09-15).** It is the owner's original assignment and is kept unamended, as
+> history. Where it says *Mainline DHT*, `LOBBY_INFOHASH`, `announce_peer()` or
+> `get_peers()` it names the mechanism the first implementation used; the
+> requirements those sentences carry — one fixed rendezvous every client can
+> recompute, a peer list that is a hint and never an identity, no central lobby
+> server, the disclosure told to the player, no game state on the DHT — bind the
+> provider record unchanged. The passages here that quote it (§1.2, §2, §4.1 and
+> §8) keep its words and say so. What `S1-E` still holds open is §3.5's three
+> unmeasured figures.
 
 **Status:** Phase 0 output, binding for Phase 7 (libp2p transport) and Phase 8
 (discovery + GossipSub lobby). **The status line said "No implementation exists
@@ -58,8 +44,11 @@ yet" until 2026-08-31**; the transport is implemented, and two-network runs are
 measured in `NEXT.md`.
 
 **Authority order.** `docs/SPEC_CS.md` is the specification and wins over
-everything here. `docs/DECISIONS.md` (D-001 … D-013) is binding owner decision and
-outranks the research documents and any preference of this document. **D-007
+everything here — read as the owner fixed on 2026-09-15: it is the original
+assignment, kept unamended, and where it names the Mainline DHT the requirement
+wins and the mechanism is history (the note above). `docs/DECISIONS.md`
+(D-001 … D-013) is binding owner decision and outranks the research documents
+and any preference of this document. **D-007
 corrects D-006, and D-008 generalises D-007**; both win over D-006. An action
 deadline is advisory and a fold-effect timeout certificate is forbidden whenever
 the required voter set `V` (`PROTOCOL.md` §8.3) has fewer than two members. That
@@ -89,7 +78,9 @@ definition it names the owning section of `PROTOCOL.md` and does not reproduce
 it. The research
 notes under `docs/research/` are the evidence base:
 `LIBP2P.md`, `MAINLINE_DHT.md`, `NAT_AND_DISCOVERY.md` are the three this document
-is built on; `MENTAL_POKER.md` is used only for measured per-hand byte counts.
+is built on — `MAINLINE_DHT.md` now as the record of the mechanism `56b0b50`
+replaced, and of the one first-hand measurement of DHT surveillance this project
+has; `MENTAL_POKER.md` is used only for measured per-hand byte counts.
 All seven research documents exist — nothing was missing and nothing here is
 invented to paper over a gap.
 
@@ -281,8 +272,10 @@ as free of disagreements.
 What this document does own, and what no other document may restate: the
 transport and behaviour configuration of §5, the discovery mechanisms of §3, §4
 and §10.1, the connectivity mechanisms of §9 including the D-002 relay `Config`
-of §9.6, and the resource limits of §11. One value is deliberately written twice
-and the reason is argued where it stands: the two derived infohashes of §3.2.
+of §9.6, and the resource limits of §11. One pair of values is deliberately written
+twice and the reason is argued where it stands: the two derived rendezvous keys of
+§3.2, which `PROTOCOL.md` §13 publishes as `LOBBY_NAMESPACE_KEY` and
+`RELAY_NAMESPACE_KEY` (the two infohashes they replaced left with `56b0b50`).
 
 ### 0.4 The sweep: all ten sites and what happened to each
 
@@ -780,7 +773,11 @@ layer must **not**:
 The network layer **must**:
 
 1. bootstrap the public Kademlia and the libp2p swarm (one swarm, §5.7);
-2. publish and read `LOBBY_INFOHASH` presence hints;
+2. publish and read the fixed lobby rendezvous as presence hints (§3). `SPEC_CS.md`
+   §1 words items 1 and 2 as *bootstrap do Mainline DHT* and discovery *pod pevným
+   LOBBY_INFOHASH*: the fixed rendezvous is the requirement and still binds, and
+   Mainline with its infohash was the mechanism, which is history (the note at the
+   head of this document);
 3. carry the GossipSub lobby;
 4. do NAT traversal (AutoNAT v2, DCUtR) and relay fallback (Circuit Relay v2);
 5. give every peer connection confidentiality, integrity and a cryptographically
@@ -798,13 +795,14 @@ Because the layer above only ever sees "bytes arrived from `PeerId` X" and
 run on `InMemoryTransport` with no DHT and no libp2p (`SPEC_CS.md` §24). The
 interface between `net/` and everything above it is therefore a narrow trait, and
 that trait — not the libp2p types — is what the rest of the program is written
-against. Two more reasons the same boundary is required: `libp2p-stream` is
-`0.4.0-alpha` and semver-exempt, and `mainline` may one day need replacing by a
-hand-written KRPC client (`MAINLINE_DHT.md` §6 sizes that escape hatch at
-1500–2400 lines and recommends against it).
+against. One more reason the same boundary is required: `libp2p-stream` is an
+alpha release and semver-exempt. A second reason stood here until 2026-09-15 —
+that `mainline` might one day need replacing by a hand-written KRPC client, an
+escape hatch `MAINLINE_DHT.md` §6 sized at 1500–2400 lines — and it left with the
+crate in `56b0b50`.
 
-> Verification: [RESEARCH] `LIBP2P.md` §7 (alpha containment),
-> `MAINLINE_DHT.md` §6, §8.
+> Verification: [RESEARCH] `LIBP2P.md` §7 (alpha containment);
+> `MAINLINE_DHT.md` §6 for the withdrawn second reason.
 
 #### 1.3.1 The upward trait, specified
 
@@ -906,22 +904,21 @@ from its seed, and every `THREAT_MODEL.md` §5.5 cheater exercised against it.
 
 ## 2. Startup sequence
 
-`SPEC_CS.md` §3 draws this chain:
+The chain, as the client runs it:
 
 ```
-start → load persistent libp2p keypair → bootstrap Mainline DHT
-      → announce_peer(LOBBY_INFOHASH) → get_peers(LOBBY_INFOHASH)
-      → dial peers over libp2p → subscribe GossipSub lobby topic
+start → load persistent libp2p keypair → bootstrap the public Kademlia
+      → start_providing(lobby key) → get_providers(lobby key)
+      → dial the providers by PeerId → subscribe GossipSub lobby topic
       → request table snapshot from several peers → receive available tables
 ```
 
-> **That chain is quoted from `SPEC_CS.md` §3 and is left standing for that
-> reason.** The specification outranks this document (see the authority order
-> above), and rewriting its words here would put `NETWORK_STACK.md` in front of
-> its own authority. What runs is: *bootstrap the public libp2p Kademlia →
-> `start_providing(lobby_namespace())` → `get_providers(lobby_namespace())` →
-> dial the providers by `PeerId`*, and §§3 and 4 specify it. Amending
-> `SPEC_CS.md` §§1 and 3 is an owner's decision and is filed as part of `S1-E`.
+This is `SPEC_CS.md` §3's chain with its three Mainline steps replaced. The
+assignment draws them as *bootstrap Mainline DHT → announce_peer(LOBBY_INFOHASH) →
+get_peers(LOBBY_INFOHASH)*, and that drawing is kept there as history: the
+original assignment stays unamended on the owner's word of 2026-09-15 (the note at
+the head of this document), and `56b0b50` replaced those steps with the provider
+record §§3 and 4 specify. Every other step is the assignment's, in its order.
 
 The implementation follows it in that order, with two structural additions that
 the spec's chain implies but does not draw: the libp2p listeners must be bound
@@ -956,7 +953,7 @@ reach a relay is invisible rather than merely unplayable.
 | 1 | **Load the cached DHT bootstrap list** and the per-peer DCUtR failure cache from the profile. | missing/corrupt | fall back to the compiled defaults; not fatal. |
 | 2 | **Build the swarm** (§5) and `listen_on` `/ip4/0.0.0.0/udp/P/quic-v1`, `/ip4/0.0.0.0/tcp/P`, plus the `/ip6/::` equivalents. `P` is chosen once, persisted, reused every run. **The `/ip6/::` half of this row was specified here and not implemented for the whole life of the client** — `S1-Y`, fixed 2026-09-02, and an IPv6 bind failure is reported rather than fatal. | port `P` in use | try `P` once, then fall back to an ephemeral port and persist the new value. Log it. |
 | 3 | ~~**Start the Mainline DHT** on its own UDP socket, `.port(0)`, with a deny-all `RequestFilter`.~~ **Gone.** There is no separate DHT socket and no request filter: discovery is a `kad::Behaviour` inside the same swarm, on the same transports, and §11.4 explains why this client deliberately *does* answer strangers' queries. | — | there is no "no-discovery mode" any more: if the swarm cannot bind, nothing runs. |
-| 4 | **Bootstrap the DHT.** | ~3 of 35 cold starts failed on the first attempt [MEASURED]; `router.bittorrent.com` is dead from this network, confirmed twice ~50 min apart | retry with exponential backoff (2 s, 5 s, 15 s, 60 s, then every 5 min). A failed bootstrap is **normal**, never fatal. Merge the cached node list with the compiled defaults — do not overwrite the cache with a bad session's routing table. |
+| 4 | **Bootstrap the public Kademlia.** Dial the compiled entry point — one name, `/dnsaddr/bootstrap.libp2p.io` (`run::PUBLIC_ENTRY`), never a list of addresses — beside the peers the profile remembers (step 1). On the first `identify` from a peer that speaks `/ipfs/kad/1.0.0`, add its reachable listen addresses to the routing table and call `bootstrap()` once; after that `libp2p-kad`'s own periodic bootstrap keeps the table up (§11.4.1). | the entry is unreachable, or `bootstrap()` has no peer to start from (*"public DHT has no peers yet"*) | **normal**, never fatal, and there is no backoff ladder: while no relay has been seen after three relay searches, every discovery cycle dials the entry again (§9.5). The remembered peers are the way in on a day the entry is down. The failure figures this row carried until 2026-09-15 — *~3 of 35 cold starts failed on the first attempt*, *`router.bittorrent.com` is dead from this network* — were measured against Mainline's bootstrap and describe nothing that runs. |
 | 5 | **`start_providing(lobby_namespace())`** (§3.2), **once**, at the moment a confirmed external address first exists — not on a timer. `libp2p-kad` owns the republish loop and runs it every 12 h, so a session shorter than that announces exactly once (§10.1). | announce error; or a walk that reached few storing nodes | there is no repair. The one walk happens seconds after the relay reservation, when the routing table is thinnest, and nothing widens it until the client restarts. This is a known weakness and it is stated rather than mitigated. |
 | 6 | **`get_providers(lobby_namespace())`** → `HashSet<PeerId>` per responding node, emitted as each answers. Repeated every **60 s**. | zero providers | not an error, and the client says so out loud — *"public lobby: nobody else yet"* — because an answer of nobody and a question never asked look identical in a log that only reports findings. |
 | 7 | **Dial the providers** (§4.3), by `PeerId`, at most `DIALS_PER_ANSWER = 8` fresh ones **per answer, not per cycle** — the counter is declared inside the `FoundProviders` arm and resets on every response, and one query draws one response per node that answers (707 of them in a measured 420-second run). This table said *per cycle* until 2026-09-02, and so did the constant's own name; both were wrong, and the effect was to make the crawl read sixty times slower than it is. Start on the first responder's answer — do not wait for the walk to finish. | most candidates fail | expected: a lobby key holds providers who left up to 48 h ago. |
@@ -1002,9 +999,8 @@ which may read them as hints and never as state (§1.2 prohibitions 3 and 8).
 > **Rewritten 2026-09-02 to the mechanism the client runs.** §§3.1–3.4 specified
 > a 20-byte BitTorrent infohash and a Mainline announce; `56b0b50` replaced that
 > with a libp2p Kademlia **provider record** and deleted both infohashes from the
-> build. §3.5 below is **not** rewritten and is still Mainline's — see its own
-> note. The rest of this document's Mainline sections are listed in the warning
-> at the head of the file.
+> build. §3.5 was re-derived for the provider record the same day; its own note
+> says how, and which three figures are still unmeasured.
 
 ### 3.1 Requirement
 
@@ -1047,6 +1043,12 @@ on it; a client that also serves as a relay provides the relay key as well. That
 is the whole of the lobby: a place all clients agree on, where each finds the
 others' addresses, after which table advertisements travel over GossipSub exactly
 as §6 describes.
+
+A lobby cut into slices (`S1-EX`) adds one key per slice it listens to,
+`p2p-poker/main-lobby/v1/<slice>`, derived the same way: the peers of a slice
+provide and look up that key, so the slice's GossipSub mesh has connected peers
+to form from. The slice strings and depths are `PROTOCOL.md` §1.1's; at depth
+zero there are no slices and only the lobby key above is used.
 
 **The derivation is in `src/net/run.rs`'s `namespace`, computed rather than
 pasted**, and the test above writes the expected bytes out rather than
@@ -1303,11 +1305,19 @@ in this document assumes it works.
 > claim about **who is there**. Identity is decided only by the libp2p handshake
 > and by the signature on the application message.
 
+The quotation keeps the assignment's words, and its first sentence names a
+mechanism that is history: `SPEC_CS.md` stays unamended as the original
+assignment (the note at the head of this document), and the DHT in question is
+now the public Kademlia of §3. The rule binds that DHT without a word changed.
+
 Nothing in the bridge may weaken this. In particular the bridge must not add a
 "signed DHT record" scheme to make the hint trustworthy — that would be a new
-protocol where none is needed, and `dht 7.0.0`'s signed-peer variant was measured
-reaching only **2–3 storing nodes versus 19–32** for a plain announce, a 10× loss
-of redundancy for a property we do not need [MEASURED, `MAINLINE_DHT.md` §3.4].
+protocol where none is needed. The measurement that first argued it was
+Mainline's — `dht 7.0.0`'s signed-peer variant reached only **2–3 storing nodes
+versus 19–32** for a plain announce [MEASURED, `MAINLINE_DHT.md` §3.4] — and the
+conclusion does not rest on it: a provider record already names its sender, as
+the next paragraph says, and nothing a table needs from discovery goes beyond a
+place to try connecting.
 
 **The rule survives the change of mechanism, and one clause of it got stronger
 without anybody deciding that it should.** A Mainline record was six bytes that
@@ -1488,10 +1498,10 @@ which is a case this project explicitly cares about.
 |---|---|---|---|
 | **A real BitTorrent client** squatting on the port, or any non-libp2p listener | **cannot happen any more.** The dial names a `PeerId` and the addresses come from a libp2p DHT record, so a non-libp2p listener is not in the candidate set at all | none | this row is kept because the *lobby key is still public* and anything may provide it — but what it provides is a libp2p peer, and that is the row below. |
 | **A libp2p node that is not a poker client** | the handshake succeeds and we get a proven `PeerId`, but `identify` reports a different protocol set | one connection | disconnect after `identify` unless the peer advertises `/p2p-poker/1`; never admit it to the D-002 relay admission set (§9.6). Both are decisions about *our own* sockets and uplink, not verdicts about the peer — no proof is involved, nothing is recorded against it, and it may reconnect (§0.2). |
-| **Stale entry** — the peer went offline, or announced a port nobody can reach | dial timeout | one timeout slot | expected and normal. Bounded budget (§11.2). No retry storm. |
-| **Wrong-port entry** — a NATed peer announced a port that is not its external port | dial timeout | as above | self-heals on that peer's next announce cycle. |
-| **Attacker announces a third party's `IP:port`** (reflection) | we send a QUIC Initial / TCP SYN to an innocent host | small packet, no amplification beyond one handshake attempt per address per cycle | bounded dial budget, per-IP dial rate limit, no retries, deduplicate. This is inherent to BEP 5 — every BitTorrent client on earth has the same property. We reduce our contribution; we cannot remove it. |
-| **Attacker floods the infohash with thousands of junk entries** (discovery DoS / eclipse attempt) | our candidate list is mostly junk, so real peers are found slowly or not at all | latency, wasted dials | (a) hard cap on candidates dialled per cycle; (b) prefer candidates returned by **more independent responding nodes** — `FoundProviders` is emitted once per responder, so multiplicity is observable and a single Sybil writer is visible as a low-multiplicity set. **Not implemented**: this client takes the first `DIALS_PER_ANSWER` fresh providers in iteration order and weighs nothing; (c) random sample from the remainder so a flooder cannot deterministically fill the sample; (d) keep a persistent list of peers that previously completed a poker handshake and dial those first. **None of this defeats a well-resourced flooder** — see §12. |
+| **Stale entry** — the provider went offline (its record outlives it, §10.1), or the addresses it published no longer answer | a dial that fails, at once or at the handshake timeout | one dial slot | expected and normal. Bounded budget (§11.2); a provider that did not answer is tried again after a cooldown, never in a storm. |
+| ~~**Wrong-port entry** — a NATed peer announced a port that is not its external port~~ | **cannot happen any more**: a provider record carries addresses, not a chosen port (§4.4) | — | kept for the record. It was a Mainline row, self-healing on that peer's next announce cycle; the nearest case today is an address that went stale, which is the row above. |
+| **Attacker provides the lobby key with a third party's addresses** (reflection) | the dial names the attacker's `PeerId` and uses the addresses the attacker published, so we send a QUIC Initial / TCP SYN to an innocent host, whose handshake fails because it does not hold that key | small packet, no amplification beyond one handshake attempt per address per dial | bounded dial budget per answer, a cooldown before the same provider is dialled again, deduplication by `PeerId` (§4.3), and §4.5's filter, which refuses private and reserved addresses but not a public victim. No per-IP dial limit exists (§11.2). This is inherent to any DHT whose records carry self-asserted addresses — the provider record as much as the BEP 5 announce it replaced (§4.1). We reduce our contribution; we cannot remove it. |
+| **Attacker floods the lobby key with thousands of junk provider records** (discovery DoS / eclipse attempt) — one generated identity per record, because a record must name its sender (§4.1) | our candidate list is mostly junk, so real peers are found slowly or not at all | latency, wasted dials | (a) hard cap on providers dialled per answer; (b) prefer candidates returned by **more independent responding nodes** — `FoundProviders` is emitted once per responder, so multiplicity is observable and a single Sybil writer is visible as a low-multiplicity set. **Not implemented**: this client takes the first `DIALS_PER_ANSWER` fresh providers in iteration order and weighs nothing; (c) random sample from the remainder so a flooder cannot deterministically fill the sample; (d) keep a persistent list of peers that previously completed a poker handshake and dial those first. **None of this defeats a well-resourced flooder** — see §12. |
 | **Attacker announces its own address and completes the handshake** | it is now a connected libp2p peer with a proven `PeerId` | one connection slot | this is *allowed*. The DHT was never an authorisation. The peer can now gossip, and everything it says is subject to application signature verification and to the lobby validation of §6.4. It cannot forge another player's table ad, and it cannot join a table it is not admitted to. |
 
 ### 4.7 What the bridge establishes, and what it does not
@@ -1595,16 +1605,17 @@ places.
 libp2p = { version = "0.56.0", features = [
     "tokio", "macros",
     "quic", "tcp", "noise", "tls", "yamux", "dns",
-    "gossipsub", "identify", "ping", "autonat", "dcutr", "relay",
+    "gossipsub", "kad", "identify", "ping", "autonat", "dcutr", "relay",
     "request-response", "cbor",
     "mdns", "upnp", "memory-connection-limits",
     "ed25519", "serde",
 ] }
 libp2p-stream = "0.4.0-alpha"
-# mainline = { version = "=8.0.0", … }   <- removed in 56b0b50; see 5.7
 ```
 
-`kad` is **not** enabled in v1 — see §5.7.
+`kad` **is** enabled, and it is the discovery mechanism (§5.7). Until 2026-09-15
+this block left it out, said *"`kad` is not enabled in v1"* and carried a
+commented-out `mainline = "=8.0.0"` line; that crate left the build in `56b0b50`.
 
 ### 5.3 Why QUIC first and TCP anyway
 
@@ -1627,7 +1638,7 @@ TCP stays in the build for three structural reasons, not as a preference:
 3. Peers learned from the DHT or from a relay may be listening only on TCP.
 
 ~~Note honestly: TCP does not rescue discovery, because the Mainline DHT is UDP.~~ **That stopped being true in `56b0b50`.** Kademlia is a behaviour on this same swarm, so it rides QUIC *and* TCP: a UDP-blocked network now keeps its discovery as well as its transport. What TCP does not rescue is *playing* against another unreachable peer, which needs §9.
-On a UDP-blocked network the client cannot discover anybody at all (§12).
+§12 item 2 records the same correction.
 
 > Verification: [RESEARCH+COMPILED] `LIBP2P.md` §9 (both the failing and passing
 > states of the QUIC-only probe), §5 (`hole_punching` module).
@@ -2181,7 +2192,9 @@ would have been the wrong fix, and this document was right not to invent one.
 ## 8. Per-table transport
 
 `SPEC_CS.md` §1: *the poker game state is sent only between the participants of
-that table, over direct libp2p streams, never over the Mainline DHT.*
+that table, over direct libp2p streams, never over the Mainline DHT.* The DHT the
+assignment names is history (the note at the head of this document); the rule
+binds the public Kademlia that replaced it, and §8.3 applies it.
 
 ### 8.1 Mechanism
 
@@ -2491,12 +2504,21 @@ one, because we have a better source that costs nothing and is self-healing:
 1. Peers we are already connected to whose `identify` reports
    `/libp2p/circuit/relay/0.2.0/hop` — free, and observed working at runtime
    [MEASURED `NAT_AND_DISCOVERY.md` §2.1].
-2. `get_peers(RELAY_INFOHASH)` — the D-002 volunteer pool, dialled by the same
-   bridge as §4. Emergent, self-healing, nothing compiled in, nobody structurally
-   privileged.
+2. `get_providers` on the relay key (§3.2) — the `/libp2p/relay` namespace that
+   go-libp2p's own AutoRelay advertises under, where public relays and D-002
+   volunteers both appear, asked every discovery cycle while this client holds no
+   reservation and dialled by the same bridge as §4; a peer whose `identify`
+   shows the hop protocol is asked for a reservation. Emergent, self-healing,
+   nothing compiled in, nobody structurally privileged. Until 2026-09-15 this item
+   named `get_peers(RELAY_INFOHASH)`, a Mainline infohash for volunteers alone,
+   which left the build in `56b0b50`.
 3. A compiled-in bootstrap relay list — **permitted by D-001**, not shipped in v1,
    and if ever added it must be visibly labelled and always outranked by runtime
-   discovery.
+   discovery. The one name the client does compile in,
+   `/dnsaddr/bootstrap.libp2p.io`, is its way on to the public DHT (§2.1 step 4)
+   and not a relay list: those nodes advertise the hop protocol and refuse
+   reservations, measured and recorded in `NEXT.md` as a correction to D-001's
+   addendum.
 
 The client **must read the `Limit` the relay returns** rather than assume:
 `relay::client::Event::{ReservationReqAccepted, OutboundCircuitEstablished,
@@ -2743,7 +2765,7 @@ D-004 requires the lobby to be visible **even if every client is behind NAT**.
 
 | Layer | Mechanism | What it needs | Gives |
 |---|---|---|---|
-| **0** | Kademlia lookup and announce | **the lookup half is outbound only and survives an all-NAT world; the announce half does not.** A provider record carries `external_addresses`, so `start_providing` is gated on holding one, and a NATed client has none until layer 3 gives it a circuit address. Also unlike `Dht::client()`, this node *does* serve queries once it has a confirmed external address (§11.4.3). | *seeing* other players unconditionally; *being seen* only after layer 3 |
+| **0** | Kademlia lookup and announce | **the lookup half is outbound only and survives an all-NAT world; the announce half does not.** A provider record carries `external_addresses`, so `start_providing` is gated on holding one, and a NATed client has none until layer 3 gives it a circuit address. Also unlike the Mainline client it replaced (`mainline`'s `Dht::client()`, which never served), this node *does* serve queries once it has a confirmed external address (§11.4.3). | *seeing* other players unconditionally; *being seen* only after layer 3 |
 | **1** | **Mutual dialling** | both peers provide the key and both call `get_providers`, so both learn the other's addresses at roughly the same time; both dial, and the outbound packets open each NAT mapping. **No relay, no coordination server** — the DHT delivered the information symmetrically. Needs endpoint-independent mapping on at least one side. The port rule of the old §4.4 is gone: a provider record carries every address the swarm holds. **But see layer 0** — this symmetry now presupposes that both peers got themselves announced, which a NATed peer cannot do without layer 3. | a direct connection, with nothing but the DHT |
 | **2** | DCUtR over a public relay | a relay for the coordination only; public relays are adequate and free here | a direct connection when blind mutual dialling does not converge |
 | **3** | **Lobby gossip over a public relay** | a public relay's 128 KiB / 2 min budget — the 128 KiB is a bidirectional total (§16.1), which is still ample for a few hundred bytes per table ad, and the 2-minute reset is survivable because the client simply reconnects | **lobby visibility with no punch succeeding anywhere.** This is the floor under D-003 and what makes the requirement unconditional |
@@ -2765,9 +2787,10 @@ neither is available, they cannot play.
 ### 9.8 mDNS and the same-router case
 
 Two clients behind the same router is a case this project explicitly cares about,
-and the DHT path handles it **badly**: both announce the *same* public IP with
-different ports, so dialling that public `IP:port` from inside requires NAT
-hairpinning, which many consumer routers do poorly.
+and the DHT path handles it **badly**: both players' provider records carry the
+*same* public IP with different ports, or only circuit addresses through a relay,
+so a dial between them over the public address needs NAT hairpinning, which many
+consumer routers do poorly, and otherwise the two neighbours meet through a relay.
 
 `libp2p::mdns::tokio::Behaviour` is therefore **mandatory, not decorative**. It was
 measured discovering the LAN peer on all interfaces, and mDNS records carry the
@@ -3261,21 +3284,27 @@ needs any belief about whether the peer is honest:
 |---|---|---|---|
 | Connection limits | our pending/established connection counts | refuse the new connection | §11.1 |
 | Memory limit | process holds ≥ 25 % of system memory | refuse new connections | §11.1 |
-| Discovery budget | dials per cycle, per `/24`, concurrency | do not dial | §11.2 |
+| Discovery budget | fresh dials and re-dials per DHT answer, and a provider's cooldown | do not dial | §11.2 |
+| DHT-derived address filter | an address from the public DHT carries a private or reserved IP | the dial does not use it | §4.5 |
 | Size and canonicality | over cap, non-canonical, unparseable | drop the message or refuse the frame | §6.4, §11.3 |
 | Lobby rate budget | this socket exceeds its token bucket | `Ignore` the excess → stop dialling → disconnect | §6.6 |
 | GossipSub peer scoring | IP colocation, behaviour penalty (defaults only in v1) | the mesh deprioritises the peer | §6.7 |
 | Relay admission (D-002) | the peer is not in the admitted set, or is over its tier's circuit ceiling | refuse the reservation or the circuit | §9.6 |
 | Relay capacity | the circuit's advertised `Limit` cannot carry a hand | **we** do not sit down over it and say so; never a refusal of anyone else's seat (§0.5.5) | §9.5 |
 | Table membership | the signed roster does not list this `PeerId` | close the stream unread | §8.4 |
-| Mainline DHT request filter | any inbound DHT request at all | deny-all `RequestFilter` | §11.4 |
+| Kademlia client mode at a table | a table this client sits at is closed: every seat taken, or a tournament that has started | `set_mode(Some(Mode::Client))`: no stranger's DHT query is answered until no table of this client is closed | §11.4.3 |
+
+Until 2026-09-15 the last row was *Mainline DHT request filter — any inbound DHT
+request at all — deny-all `RequestFilter`*. That filter left with the `mainline`
+crate, and the public Kademlia answers strangers' queries on purpose (§11.4.3), so
+the row that replaces it is the one moment the client stops answering them.
 
 Three properties hold across every row and are what make them safe to keep:
 
 1. **No refusal is persisted.** No row writes a peer's name to disk as refused.
    Every one is live state rebuilt from the current connection and lobby sets, or
-   a standing rule that applies equally to everybody (the DHT filter refuses
-   *all* inbound requests, naming nobody), and every one lifts as soon as the
+   a standing rule that applies equally to everybody (client mode at a table
+   answers nobody's query, naming nobody), and every one lifts as soon as the
    condition behind it does. The one persistent per-peer list this layer keeps —
    §4.6's record of peers that previously completed a poker handshake, dialled
    first on the next start — is a *preference*, never a refusal: being absent
@@ -3414,6 +3443,15 @@ network.
     the D-002 relay disabled — is Phase 8 work and is the criterion this design is
     judged by. It has **not** been passed yet.
 
+    **That paragraph is the Phase 0 record, and its first sentence is no longer
+    true (noted 2026-09-15).** Its one live DHT round trip was a Mainline announce.
+    With the provider record, two machines on different VLANs, with a firewall
+    blocking inbound connections between them, each listed the other's tables —
+    and multicast does not cross a VLAN, so the DHT found them. `NEXT.md` records
+    that as D-003's test passed by the awkward case. What
+    is still untested is a NAT **between** the two, which needs an endpoint
+    outside the building, so D-004's variant is not demonstrated.
+
     **The acceptance test runs on a `CUSTOM` two-seat table**, not on
     `RATED_SNG_POKERTH_V1`. That preset is fully specified but pins `seats = 10`
     and `min_players_to_start = 10`, while `SPEC_CS.md` §32 requires two-player
@@ -3461,14 +3499,17 @@ TTL and interval that both sides must agree on. The names in `PROTOCOL.md` §13
 are the names a Rust `constants` module carries, and no value has two names
 anywhere in the corpus.
 
-> **That last sentence is currently false, and it fails from the other end.**
-> `PROTOCOL.md` §13 still defines `LOBBY_DERIVATION_STRING =
-> "p2p-poker/mainline-lobby/v1"` and `LOBBY_INFOHASH = fd7c0d69…`, while
-> `run::lobby_namespace` and §3.2 use `"p2p-poker/main-lobby/v1"` and the 34-byte
-> multihash `12207e3429…`. One name, two values. **This is the one constant on
-> which two independent implementations find each other or do not**, so it is not
-> a tidying job. `S1-AB`. Earlier revisions of this document and of `PROTOCOL.md` gave several
-of these values two different names and two different numbers; that is
+> **That last sentence was false until 2026-09-02, from the other end.**
+> `PROTOCOL.md` §13 went on defining `LOBBY_DERIVATION_STRING =
+> "p2p-poker/mainline-lobby/v1"` and a 20-byte `LOBBY_INFOHASH` four days after
+> `56b0b50`, while `run::lobby_namespace` and §3.2 used
+> `"p2p-poker/main-lobby/v1"` and the 34-byte multihash `12207e3429…` — one name,
+> two values, on the one constant two independent implementations find each other
+> by. `S1-AB` corrected §13, which now carries `LOBBY_NAMESPACE_KEY` and
+> `RELAY_NAMESPACE_KEY` beside their derivation strings.
+
+Earlier revisions of this document and of `PROTOCOL.md` gave several of these
+values two different names and two different numbers; that is
 `PHASE0_REVIEW.md` C-1, and one home is the fix.
 
 **Under D-011 rule 1 this discipline reaches every table in the document.** §6.5
@@ -3482,11 +3523,13 @@ constants but definitions — the lobby validation checklist, the snapshot bodie
 the table-stream framing and the lobby freshness rules — and §0.3 lists all seven
 sites with their owners.
 
-**One deliberate exception, argued in place:** §3.2 keeps the literal
-`LOBBY_INFOHASH` and `RELAY_INFOHASH` bytes alongside their derivation, because
-those two constants are *derived rather than chosen* and one shell command
-resolves any disagreement between the copies. Nothing else in this document
-carries a two-sided value.
+**One deliberate exception, argued in place:** §3.2 keeps the literal lobby and
+relay rendezvous keys — `PROTOCOL.md` §13's `LOBBY_NAMESPACE_KEY` and
+`RELAY_NAMESPACE_KEY` — alongside their derivation, because those two values are
+*derived rather than chosen*, one shell command resolves any disagreement between
+the copies, and `the_lobby_rendezvous_key_is_the_published_one` pins the bytes.
+Until `56b0b50` the pair was `LOBBY_INFOHASH` and `RELAY_INFOHASH`. Nothing else
+in this document carries a two-sided value.
 
 What remains here is the genuinely **local** tuning — values a peer may change
 without breaking interoperability, because no other peer parses or depends on
@@ -3499,11 +3542,7 @@ them.
 | GossipSub `duplicate_cache_time` | 120 s | §6.2 — must exceed `AD_REBROADCAST_MS` with margin |
 | GossipSub `flood_publish` | `false` | §6.2 |
 | Per-peer lobby rate budgets (ads, presence, chat, bytes) | §6.6's table | §6.6 |
-| DHT candidates dialled per cycle | ≤ 64 | §11.2 |
-| Concurrent dials from DHT hints | ≤ 8 | §11.2 |
-| Per-address dial timeout | 10 s | §11.2 |
-| Dials to the same `/24` per cycle | ≤ 4 | §11.2 |
-| Bootstrap retry backoff | 2 s, 5 s, 15 s, 60 s, then 5 min | §2.1 step 4, §11.2 |
+| Discovery budget: providers dialled per DHT answer, the discovery cycle, query timeouts | §11.2's table | §11.2 — five rows stood here until 2026-09-15 (candidates per cycle, concurrent dials, a per-address timeout, a `/24` cap, a bootstrap backoff ladder); they were the Mainline-era budget, and §11.2 keeps them as the record of what was never built |
 | `connection_limits` (pending in/out, established in/out, total, per peer) | 32 / 64 / 128 / 128 / 192 / 2 | §11.1 |
 | `memory_connection_limits` share of system memory | 0.25 | §11.1 |
 | Relay `Config` (D-002 volunteer) | §9.6's block | §9.6 — local, because a relay's limits are its operator's choice; a client reads the `Limit` the relay actually returns rather than assuming |
@@ -3521,7 +3560,7 @@ parameters beside it genuinely are local: a denser mesh costs only its owner.
 |---|---|
 | **D-001** relays permitted; costs documented; two roles never blurred | §9.5, §9.7, §12.7, §12.8 |
 | **D-002** publicly reachable client volunteers as relay, off by default, admission via a **named type implementing `libp2p::relay::RateLimiter`** — the trait is re-exported at the crate root (`libp2p-relay-0.21.1/src/lib.rs:42`), the type holds the live admitted-peer set, and it is installed into **both** `reservation_rate_limiters` and `circuit_src_rate_limiters`; open question settled | §9.6 |
-| **D-003** global lobby visibility is the acceptance criterion; the bridge is the load-bearing step; announce `Some(external_quic_port)` | §2, §4, §4.4, §12 |
+| **D-003** global lobby visibility is the acceptance criterion; the bridge is the load-bearing step; there is no port to announce, because a provider record carries the swarm's external addresses — D-003's *announce `Some(external_quic_port)`* was Mainline's rule and is history | §2, §4, §4.4, §12 |
 | **D-004** lobby visible even if every client is behind NAT; four layers; symmetric-both-ends stated | §9.7, §9.3, §12.1 |
 | **D-005** absent seat and mid-hand abort — **not** a transport concern. Its forfeiture rule is **revised by D-010**: an abort is neutral, stacks are restored, and the signed attribution has no automatic consequence at any layer | §1.2 rule 3, §8.4, §10.4 |
 | **D-006** action timeout is auto check/fold, never an abort; timeout certificate; no timeout ends the game — **as corrected by D-007 and generalised by D-008** | §1.2 rule 3, §8.4, §10.4 |

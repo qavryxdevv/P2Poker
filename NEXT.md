@@ -2150,7 +2150,49 @@ asking whether the **name** was defined twice. The corpus's number was in the
 code, in a constant with the right name, guarded by a passing assertion. Nothing
 was missing. There was a second one, and the second one was the one that ran.
 
-## And one step further: the transport spec describes a discovery layer we do not run
+## And one step further: the transport spec described a discovery layer we did not run
+
+> **Paid off on 2026-09-15, apart from three measurements.** What this entry says
+> could not be done was done in two passes. On 2026-09-02 `S1-E`'s survey counted
+> **98 discrete Mainline claims in 27 sections** — the *33 sections* below was
+> never verified and is withdrawn there — and §§2, 3, 3.5, 4, 4.5, 5.7, 5.8, 10.1,
+> 11.2, 11.4 and 12 of `NETWORK_STACK.md` were rewritten against `libp2p-kad`'s
+> source, the three inverted claims first. What stopped the rest was `SPEC_CS.md`,
+> which names Mainline and outranks the transport spec. **On 2026-09-15 the owner
+> settled it: `SPEC_CS.md` is the original assignment and stays unamended, as
+> history.** So the passages that quote it keep its words and say what they are,
+> the authority order reads the specification that way, and the residue went in
+> one pass:
+>
+> * `NETWORK_STACK.md` — the head warning became a dated note; §§0.3, 1.2, 1.3, 2,
+>   2.1 (the bootstrap row still carried Mainline's failure figures), 3, 4.1, 4.6,
+>   5.2 (its feature list still left `kad` out), 5.3, 8, 9.5 (the relay source was
+>   still `get_peers(RELAY_INFOHASH)`), 9.7, 9.8, 11.5.2 (a *Mainline DHT request
+>   filter* row among the defences kept), 12, 14 and 15.
+> * `THREAT_MODEL.md` — §8 was a whole section of Mainline measurements presented
+>   as this client's privacy exposure. It is rewritten for the provider record,
+>   whose facts stay `NETWORK_STACK.md` §3.5's, and the Mainline numbers are kept as
+>   history in §8.7. §§1.1–1.3, 2.1, 3.3 and 3.4, the catalogue rows 15, X16 and
+>   X28, §6's traffic analysis, limitation 9 (*discovery is IPv4-only*) and OQ11
+>   moved with it.
+> * `DECISIONS.md` — D-003 and D-004 carry a note that their mechanism paragraphs
+>   are history while the requirements stand; the Mainline-only option on the open
+>   list is void; `S1-E` and the index of what waits on the owner record the ruling.
+> * `DEPENDENCIES.md` §1, §3.2 and §5.2 (the `ed25519-dalek` row) and
+>   `CONTRIBUTING.md` §6 stopped pointing at the void option, at `mainline` as a
+>   crate that links anything, and at a `mainline` pin.
+> * `REANNOUNCE_INTERVAL_MS = 600 000` — Mainline's ten-minute re-announce,
+>   published in `PROTOCOL.md` §13 and read by nothing — is deleted from both
+>   places: the same shape as the four infohash constants above.
+> * `Cargo.toml`'s description; the header and two checks of
+>   `tools/two-network-test.ps1`, which matched log lines the client stopped
+>   printing when Mainline left; and three source comments, among them `ipfs_kad`'s,
+>   which still said *client mode* over a `set_mode(None)`.
+>
+> **Still owed:** `NETWORK_STACK.md` §3.5's three `[UNMEASURED]` figures — the
+> TTL the go-libp2p nodes storing our record apply, how many nodes one lookup
+> walks, and what placing a node beside the lobby key costs. `docs/SPEC_CS.md`
+> itself is untouched. The entry below is as it stood on 2026-08-31.
 
 The register above was stale because a crate left. The crate left because the
 **mechanism** changed. The document that specifies the mechanism was never told.

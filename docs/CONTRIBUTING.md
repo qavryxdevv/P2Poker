@@ -642,11 +642,12 @@ A dependency change is a security-critical change whenever the crate is in
    mechanical row check over the *whole* register — with its match count checked, or
    a regex that matched nothing reports the same clean result as a register that is
    current.
-3. **Do not remove a `=` pin without reading why it is there.** `ziffle`, `mainline`
-   and `rs_poker` are exact-pinned for recorded reasons — an unaudited single-author
-   crate, an internals dependency that is not semver-stable in practice, and a
-   version of `rs_poker` that a `^` requirement would upgrade into a build failure.
-   "Modernising" any of those three to a caret is a defect.
+3. **Do not remove a `=` pin without reading why it is there.** `ziffle` and
+   `rs_poker` are exact-pinned for recorded reasons — an unaudited single-author
+   crate, and a version of `rs_poker` that a `^` requirement would upgrade into a
+   build failure. "Modernising" either to a caret is a defect. (`mainline` was the
+   third, pinned because its internals were not semver-stable in practice; it left
+   the build in `56b0b50`.)
 4. **Determine reachability in source, not by severity label.** If a new advisory
    lands, find the vulnerable function, check whether the feature that compiles it is
    on, and check whether our call pattern meets its preconditions. Cite file and

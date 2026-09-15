@@ -10,7 +10,10 @@
     PROVES:
       * Two nodes on DIFFERENT SUBNETS, neither on the other's LAN broadcast
         domain, so mDNS cannot be what finds them.
-      * The Mainline announce and lookup work from both, independently.
+      * The lobby announce - a provider record on the public Kademlia DHT - and
+        the lobby lookup work from both, independently. (Until 2026-09-15 this
+        line and its two checks below read a Mainline announce, which left the
+        client in 56b0b50; the log lines they matched are no longer printed.)
       * A dial across the subnet boundary completes a libp2p handshake.
       * A signed table advert crosses GossipSub and is admitted under the
         section 7.2 rules at the far end.
@@ -185,8 +188,8 @@ try {
     # and a client that failed to start produces the same empty log as one that
     # started and found nobody.
     Check 'the client started at all'          '^peer id ' '^peer id '
-    Check 'announced under the lobby infohash' 'announce udp' 'announce udp'
-    Check 'discovered peers through the DHT'   'discover \d+ usable' 'discover \d+ usable'
+    Check 'listed in the public lobby'         'listed in the public lobby' 'listed in the public lobby'
+    Check 'found a peer in the public lobby'   'found \S+ in the public lobby' 'found \S+ in the public lobby'
     Check 'completed a libp2p handshake'       '^connect ' '^connect '
     Check 'reserved a relay circuit'           '^relay .*limit' '^relay .*limit'
     Check 'a table advert crossed'             '^publish ' '^table '

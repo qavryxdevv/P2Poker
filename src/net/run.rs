@@ -372,8 +372,10 @@ fn listen_addrs_v6(port: u16) -> Vec<Multiaddr> {
 
 /// The QUIC port out of a listen address, if it has one.
 ///
-/// This is what gets announced to Mainline, so it is read from what the swarm
-/// actually bound rather than from what was asked for.
+/// This is the port the router is asked to open, so it is read from what the
+/// swarm actually bound rather than from what was asked for. Until `56b0b50` it
+/// was also what got announced to Mainline; a provider record announces
+/// addresses and no port.
 pub fn quic_port(addr: &Multiaddr) -> Option<u16> {
     use libp2p::multiaddr::Protocol;
     let mut udp = None;

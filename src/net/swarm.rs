@@ -328,7 +328,7 @@ pub struct PokerBehaviour {
     /// Peer routing. **Not** the global lobby — that is a provider record on
     /// the public Kademlia below, and lives in [`super::run`].
     pub kademlia: kad::Behaviour<MemoryStore>,
-    /// The **public** Kademlia, and the only reason it exists is relays.
+    /// The **public** Kademlia, where the relays are and where the lobby is.
     ///
     /// `kademlia` above speaks `/p2p-poker/kad/1`, which is right: this
     /// project's records are its own and have no business in anybody else's
@@ -339,12 +339,16 @@ pub struct PokerBehaviour {
     /// libp2p's answer to "where are the relays" is not a file. A relay host
     /// advertises itself in the DHT under the namespace `/libp2p/relay`, and
     /// AutoRelay looks it up there; that is the list, and it maintains itself.
-    /// Reading it means speaking `/ipfs/kad/1.0.0`.
+    /// Reading it means speaking `/ipfs/kad/1.0.0`. Since `56b0b50` the lobby is
+    /// a provider record on this same DHT (`run::lobby_namespace`), where it used
+    /// to be a Mainline announce.
     ///
-    /// In **client mode**: this node queries and does not answer. Serving other
-    /// people's routing queries is a service to a network this client is only
-    /// visiting, and it would be paid for with the bandwidth of somebody trying
-    /// to play poker.
+    /// **Automatic mode, not client mode.** This comment called it client mode —
+    /// query, never answer — after `build` had moved to `set_mode(None)` in
+    /// `56b0b50`: client until there is a confirmed external address, server
+    /// after, because a node that answers nobody is added to nobody's routing
+    /// table. The bandwidth argument for client mode is honoured where it
+    /// matters, at a closed table (`run::dht_effort`).
     pub ipfs_kad: Bogonless<kad::Behaviour<MemoryStore>>,
     pub identify: identify::Behaviour,
     pub ping: ping::Behaviour,

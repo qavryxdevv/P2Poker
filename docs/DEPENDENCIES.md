@@ -95,9 +95,11 @@ brought a new licence into the tree; §6 has the measurement.
 
 **461 is a lot** against §28's "use the minimum number of dependencies", and it is
 recorded here rather than glossed over. It is what libp2p, arkworks and egui cost
-together. The open decision in `DECISIONS.md` to run all discovery through Mainline
-DHT and drop the libp2p `dns` and `kad` features would remove roughly twelve of
-them; nothing else on the table moves the number materially.
+together. The option that would have removed roughly twelve of them — all discovery
+through Mainline DHT, dropping the libp2p `dns` and `kad` features — went the other
+way in `56b0b50`: Mainline left the build and `kad` is the discovery mechanism, and
+`DECISIONS.md`'s open list marks the question void. Nothing on the table moves the
+number materially.
 
 ### Why 186 crates are in the lockfile and not in the build
 
@@ -283,9 +285,12 @@ first.
 **Decision in force.** The `dns` feature is **kept for now**. Removing it would
 quietly narrow **D-004**: layers 2 and 3 of the all-NAT story lean on reaching public
 relays, whose usual bootstrap addresses are `/dnsaddr/` names. Silently dropping that
-capability to make a scanner quiet is the wrong trade. The alternative — all
-discovery through Mainline DHT, relay volunteers under a second infohash, dropping
-both `dns` and `kad` — is on `DECISIONS.md`'s open list with its cost stated.
+capability to make a scanner quiet is the wrong trade, and since `56b0b50` it is also
+how the client reaches the public DHT at all: its one compiled-in entry point is
+`/dnsaddr/bootstrap.libp2p.io`. The alternative that was on `DECISIONS.md`'s open
+list — all discovery through Mainline DHT, relay volunteers under a second infohash,
+dropping both `dns` and `kad` — is void: that commit removed Mainline and made `kad`
+the discovery mechanism.
 
 ### 3.3 `lru 0.16.4` — RUSTSEC-2026-0253, unsound. **Spent: the crate left the build.**
 
@@ -616,7 +621,7 @@ no open advisory) is a proc-macro and is counted with the unregistered remainder
 
 | Name | Version | Purpose | Repository | Licence | Security status |
 |---|---|---|---|---|---|
-| `ed25519-dalek` | 3.0.0 | application event signatures, `verify_strict` only | `github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek` | BSD-3-Clause | no open advisory; RUSTSEC-2022-0093 patched `>= 2`. **Never enable `hazmat`** (`CRYPTOGRAPHY.md` §10.1). Also linked by `mainline` for DHT mutable items — same crate, different keys |
+| `ed25519-dalek` | 3.0.0 | application event signatures, `verify_strict` only | `github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek` | BSD-3-Clause | no open advisory; RUSTSEC-2022-0093 patched `>= 2`. **Never enable `hazmat`** (`CRYPTOGRAPHY.md` §10.1). `mainline` also linked it, for DHT mutable items, until that crate left the build in `56b0b50` |
 | `ed25519` | 3.0.0 | signature encoding types for the above | `github.com/RustCrypto/signatures` | Apache-2.0 OR MIT | no open advisory |
 | `signature` | 3.0.0 | `Signer` / `Verifier` traits | `github.com/RustCrypto/traits` | Apache-2.0 OR MIT | no open advisory |
 | `curve25519-dalek` | 5.0.0 | the Ed25519 group arithmetic under the above | `github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek` | BSD-3-Clause | no open advisory at 5.x; constant-time discipline is this crate's stated design goal |

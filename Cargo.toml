@@ -3,7 +3,7 @@ name = "p2p-poker"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Decentralised No-Limit Texas Hold'em over libp2p and BitTorrent Mainline DHT"
+description = "Decentralised No-Limit Texas Hold'em: the lobby over libp2p and its public Kademlia DHT, the tables over Tox groups"
 # **GPL-3.0-or-later, and it is not a preference.** D-019 puts a table's game
 # traffic on a Tox group; `c-toxcore` declares `GPL-3.0-or-later` in every
 # source file, and linking it makes this whole client that. The decision is

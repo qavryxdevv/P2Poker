@@ -258,7 +258,7 @@ rule 1 addresses between documents. Every other mention in this file elaborates
 5. [Attack catalogue](#5-attack-catalogue)
 6. [What cryptography does not solve](#6-what-cryptography-does-not-solve)
 7. [The disconnect / abort problem](#7-the-disconnect--abort-problem)
-8. [Privacy exposure from a fixed public infohash](#8-privacy-exposure-from-a-fixed-public-infohash)
+8. [Privacy exposure from a fixed public rendezvous](#8-privacy-exposure-from-a-fixed-public-rendezvous)
 9. [Known limitations and open questions](#9-known-limitations-and-open-questions)
 * [Objections to the fix plan](#objections-to-the-fix-plan)
 
@@ -283,7 +283,7 @@ GUI
  ├── Poker state machine          <- deterministic, no clocks, no network
  ├── Mental poker / deck crypto   <- n-of-n threshold ElGamal + verifiable shuffle
  ├── Protocol / signed event log  <- canonical CBOR, Ed25519, hash chain
- └── P2P transport                <- libp2p; Mainline DHT for discovery only
+ └── P2P transport                <- libp2p; the public Kademlia DHT for discovery only
 ```
 
 Two independent signature domains exist and must never be confused
@@ -332,15 +332,24 @@ player's time, spam them, or hide tables from them. It cannot affect a hand that
 has started. Any advert is only a claim; the table parameters that bind are the
 ones all participants agreed on and signed before the first hand.
 
-**Mainline DHT.** A public, adversarial, unauthenticated bulletin board. It
-stores 6-byte compact `IP:port` records under one fixed, world-readable
-`LOBBY_INFOHASH`. `SPEC_CS.md` §1 states its status precisely: the peer list is a
-**hint about where to try connecting, never a claim about who is there**. Anyone
-can write anything into it — measured directly: an infohash generated from 20
-random bytes on the development machine and published nowhere else had a stranger
-announcing under it within 24 minutes (`research/MAINLINE_DHT.md` §7). Identity is
-settled only by the libp2p handshake and then by the application signature. The
-DHT never carries game state, nicknames, `PeerId`s or table metadata.
+**The public DHT.** A public, adversarial bulletin board: the IPFS Kademlia DHT
+(`/ipfs/kad/1.0.0`), which the client joins as one node among strangers running
+unrelated software. It stores **provider records** — a `PeerId` and the addresses
+that peer published — under one fixed, world-readable lobby key
+(`NETWORK_STACK.md` §3.2). `SPEC_CS.md` §1 states its status precisely: the peer
+list is a **hint about where to try connecting, never a claim about who is
+there**. The assignment wrote that of the Mainline DHT, which `56b0b50` replaced
+and which is kept in `SPEC_CS.md` as history; the rule binds the provider record
+unchanged. A storing node accepts a record only from the peer it names, so nobody
+can announce somebody else's `PeerId`, but anyone may provide the key for
+themselves with whatever addresses they like (`NETWORK_STACK.md` §4.1). Identity
+is settled only by the libp2p handshake and then by the application signature.
+The DHT never carries game state, nicknames or table metadata — but, unlike the
+Mainline record it replaced, every record carries its player's **persistent
+`PeerId`** (§8). Under Mainline, *anyone can write anything* was measured
+directly: an infohash generated from 20 random bytes on the development machine
+and published nowhere else had a stranger announcing under it within 24 minutes
+(`research/MAINLINE_DHT.md` §7; §8.7 below).
 
 **Relay (Circuit Relay v2).** Permitted by **D-001**. A relay carries an
 already end-to-end encrypted, mutually authenticated libp2p stream whose payload
@@ -371,7 +380,7 @@ observer and a denial-of-service lever. Those two costs are real and appear in
  our own client binary                |  every other player, incl. all n-1 of them
  our own OS CSPRNG and key store      |  every table-mate's claims about state
  our own copy of the engine rules     |  the lobby, and every advert in it
- the assumptions A1-A7 of §2          |  the Mainline DHT and every record in it
+ the assumptions A1-A7 of §2          |  the public DHT and every record in it
                                       |  every relay
                                       |  every wall clock, ours included
                                       |  message ordering, delivery and timing
@@ -647,7 +656,7 @@ lobby, because reading the lobby only requires an outbound connection.
 ### 2.1 What we explicitly do not trust
 
 * Any other player, individually or as a coalition of up to `n-1`.
-* The Mainline DHT, and every record retrieved from it.
+* The public Kademlia DHT, and every provider record retrieved from it.
 * The GossipSub lobby, and every advertisement in it.
 * Any relay, including one we ourselves are relaying through.
 * Any `PeerId`, as a statement about who is playing.
@@ -728,16 +737,19 @@ secrecy and deck integrity do not depend on being in the majority.**
 
 An adversary who never joins the table. They can:
 
-* enumerate the player roster continuously by polling
-  `get_peers(LOBBY_INFOHASH)`, and can run Sybil DHT nodes near the infohash in
-  the keyspace to see the write stream directly (§8);
+* enumerate the player roster continuously by polling `get_providers` on the lobby
+  key — every provider's persistent `PeerId` and published addresses — and can
+  place a node among those closest to the key, by grinding a keypair until its
+  hash lands there, to receive every announcement directly (§8);
 * dial any player and complete a libp2p handshake, learning their `PeerId` and
   binding it to an IP address;
 * flood the lobby with signed junk adverts, subscribe us to junk topics, or try to
   eclipse our GossipSub mesh with inbound-only Sybils;
-* pollute `LOBBY_INFOHASH` with junk `IP:port` records so that discovery burns
-  dial attempts on hosts that never ran this software — observed happening in the
-  wild on a private random infohash (§8);
+* pollute the lobby key with junk provider records — one generated identity per
+  record, each naming whatever addresses it likes — so that discovery burns dial
+  attempts on peers that are not poker clients or are not there at all; under
+  Mainline the same pollution was observed in the wild on a private random
+  infohash (§8.7);
 * attempt resource exhaustion: connection floods, oversized frames, deep-nested
   CBOR, hostile length prefixes;
 * deny service to a specific player at the network level, at exactly the moment
@@ -749,23 +761,28 @@ key share.
 
 ### 3.4 A passive DHT observer
 
-The Mainline DHT is heavily crawled by anti-piracy monitors, academic scanners and
-Sybil nodes. A passive observer needs no capability beyond running a DHT node and
-polling. Measured on the development machine (`research/MAINLINE_DHT.md` §3.4,
-§3.6, §7):
+The lobby lives on the public IPFS DHT, which anyone joins by running a node, and
+its key is a published constant (`NETWORK_STACK.md` §3.2). A passive observer
+needs one always-on node and a loop:
 
-* one `announce_peer` lands on **19–32 independent storing nodes**, and a
-  different process retrieved the record within **~113 ms**;
-* one `get_peers` contacts **105–176 distinct DHT nodes**, each of which learns
-  the tuple (our IP, the infohash we asked for), plus another ~130–140 that learn
-  our IP alone;
-* at the recommended 10-minute re-announce cadence that is on the order of **150
-  disclosure events per day** to a rotating set of strangers;
-* a record left unrefreshed was retrievable for ~45 minutes and gone by ~50, so
-  presence is a ~10-minute-resolution online/offline signal per IP.
+* polling the key returns the live lobby — every provider's persistent `PeerId`
+  and the addresses it published — and a log kept for a month is every player
+  who ever sat there, with the times each appeared;
+* a node placed among those closest to the key receives every announcement and
+  republish without announcing anything itself, and where to stand is computable
+  from the published key alone; what the placement costs is unmeasured;
+* every lobby read a client makes tells each node on its walk the reader's
+  `PeerId`, IP address, software name and the key asked for, and a client reads
+  the lobby every discovery cycle;
+* a record outlives the player who made it, and nothing withdraws it.
 
-This is the cheapest attack in the whole document and it requires no interaction
-with us at all. Consequences are enumerated in §8.
+The mechanism facts, their sources and the three figures still unmeasured are
+`NETWORK_STACK.md` §3.5's and are not restated here (D-011 rule 1). This is the
+cheapest attack in the whole document and it requires no interaction with us at
+all. Consequences are enumerated in §8. What the same kind of observer saw of the
+Mainline announce this replaced — storing nodes per announce, strangers per
+lookup, disclosure events per day, a record's lifetime — was measured on the
+development machine and is kept as history in §8.7.
 
 ### 3.5 An attacker who controls the relay
 
@@ -1175,7 +1192,7 @@ to judgement.
 | 12 | Changing an already-signed action | **CP** | Ed25519 EUF-CMA over the exact received bytes. Two further rules make this hold in practice: the signature is verified over the **bytes as received**, never over a re-encoding (canonicalise-then-verify would let a signature migrate onto bytes it never signed), and `verify_strict` is mandatory. *Inherits A5.* |
 | 13 | Replay of old actions | **CP** | The signed body binds `protocol_version`, `table_id`, `hand_id`, `sequence` and `previous_event_hash`, so an event is valid at exactly one position of one chain. Shuffle and reveal proofs additionally bind `ctx` (A11); probes confirmed proofs do not transfer across different `ctx` values. *This row is contingent on our own `ctx` construction being right, which is why an adversarial test that replays a valid shuffle proof from hand `h` into hand `h+1` and asserts rejection is mandatory, not optional.* *Inherits A5, A11.* |
 | 14 | Rewriting a hand's history | **CP** | The transcript is a hash chain from `GENESIS`; changing any past event changes every subsequent `previous_event_hash`, which requires a BLAKE3 collision, and every event is independently signed. *Inherits A5, A6.* |
-| 15 | Impersonating another participant | **CP** | Authorisation comes from the application Ed25519 signature alone. The `PeerId` is never authentication (`SPEC_CS.md` §20), the DHT record is never an identity claim, and a GossipSub `Signed`/`Strict` message proves only which socket spoke. Announcing someone else's `IP:port` under `LOBBY_INFOHASH` is possible and meaningless — it produces a dead dial, not an identity. *Inherits A5.* |
+| 15 | Impersonating another participant | **CP** | Authorisation comes from the application Ed25519 signature alone. The `PeerId` is never authentication (`SPEC_CS.md` §20), the DHT record is never an identity claim, and a GossipSub `Signed`/`Strict` message proves only which socket spoke. A provider record naming someone else's `PeerId` is refused by the node asked to store it, and one naming the provider's own `PeerId` beside someone else's addresses is possible and meaningless — the dial names the `PeerId`, so it ends in a failed handshake, not an identity (`NETWORK_STACK.md` §4.1, §4.3). The same was true of an `IP:port` announced under Mainline's `LOBBY_INFOHASH`, which is history. *Inherits A5.* |
 | 16 | Different histories to different players (equivocation) | **D&A** | Not preventable: a modified client can sign two conflicting events. What the design delivers is **narrower than this row claimed for six revisions**, and the correction is the substance of the cell rather than a footnote to it. The intended delivery was that the pair is self-authenticating evidence — two chained events by one key in one anti-replay slot with different `event_hash` values — resting on `PROTOCOL.md` §5.2.1's slot key. **That key is not computed by any client and has been deleted from the tree**, because against this message set it convicts honest peers (§5.2.1's header). What actually runs is `table/stage.rs` `Collective::hear`, which names a double signer at a **collective** stage only, produces a local `Failed::Equivocation` rather than a transferable object, and is consumed by nothing — see G7 and `PROTOCOL.md` §5.2.5, which this row does not reproduce. At a **single-writer** stage — every betting action, both shuffle events — a second differing body is dropped under the stage cursor and is never compared, so no evidence of any kind is produced. **[R7]** The earlier revision of this cell printed a five-field version of it, which was already stale when it was written. That is evidence of misbehaviour **only** while no honest peer can be made to fill one slot twice by following the rules, which is a property of the message set rather than of the signature scheme, is not implied by A1–A7, and has failed **five** times already (X31, X32, G7's table, §9.1.2 limitation 12). Under **D-010** what a proof buys is smaller than it was, and under **D-011 rule 3** smaller again: the pair is evidence in the transcript, consuming it moves no chips, unseats nobody, and — the half that only became true with D-011 — causes no layer to block-list the accused key. So the worst case at the end of this row, for the equivocator and for a peer falsely accused alike, is **a wasted hand**; where the accused's transport was dropped for other reasons it is a wasted hand and a connection they re-establish. Detection is fast in practice because all `n` peers at a table are mutually connected and exchange `STATE_HASH` after critical transitions, and because an equivocator cannot carry two divergent hands to showdown: opening any card needs every player's share, so both branches stall. The honest limit: the evidence only exists once both halves reach one honest party, and a partition can delay that. |
 | 17 | Malformed packets | **D&A**, with a residual risk | The event decoder is bounded by construction: `minicbor` validates a claimed length against the remaining input *before* allocating — measured at **0 bytes allocated** for a byte string claiming 4 GiB, for one claiming `u64::MAX`, and for an array claiming 4 GiB of elements, and 20 000 levels of nesting produced an error rather than a stack overflow (`research/CRYPTO_LIBS.md` §4.8). No `eval`, no `pickle`, explicit schema validation. **Residual risk, stated rather than hidden:** the *cryptographic* deserialisers (arkworks / `ziffle`) have **not** been fuzzed, and `ziffle`'s `Transcript::update_with_serialized` contains an `assert!` panic path if a serialised element exceeds a 256-byte buffer. Unreachable for 33-byte points, but it is a panic on network-derived data. Until `SPEC_CS.md` §27 fuzzing lands over `ShuffleProof`, `MaskedDeck`, `RevealToken` and `OwnershipProof`, a malformed crypto object is a plausible remote panic, i.e. a DoS. |
 | 18 | Oversized packets | **D&A** | Hard caps at every boundary, and an over-cap frame is dropped rather than parsed. **[R20]** Which caps exist, their values, and the fact that the gossip cap is a two-sided constant a peer cannot tune per build are `NETWORK_STACK.md` §11.3 and §6.5's, and the enumeration this cell carried is deleted under D-011 rule 1. What is classified here: the caps are **structural**, applied before decoding, so an oversized frame costs a receiver nothing beyond the bytes it already read; and the response to one is volume-keyed, never keyed on fault or attribution, so it is not an eviction and is untouched by D-011 rule 3. |
@@ -1332,7 +1349,7 @@ attacks targeted is gone, along with what it was for.
 | X13 | Table-advert bait and switch: advertised parameters differ from those actually played | **D&A** | The advert is signed and carries the full parameter set (blinds, stacks, schedule, timers, seats). The parameters that bind are the ones every participant agreed and signed before the first hand (`SPEC_CS.md` §4), and every event carries them transitively through the chain. A mismatch is rejected before any hand starts. |
 | X14 | Protocol-version downgrade | **D&A** | `protocol_version` is inside every signed body and inside `ctx`. A peer offering an older version is refused rather than accommodated (A14). |
 | X15 | Lobby spam: advert spam, pinning a table in every lobby forever, or flooding `LOBBY_CHAT` | **D&A** per peer (residual DoS is out of scope) | **Scope includes lobby chat**, which carries no security claim of any kind — see §6. **[R11]** The mechanisms that bound this row are their owners' and are not reproduced here: the chat message and its size cap are `PROTOCOL.md` §7.6's, the per-peer rate limits, the GossipSub validation mode, the message-id override and the freshness window are `NETWORK_STACK.md` §6.2, §6.4, §6.5 and §6.6's, and the advert-eviction rule is §10.3's. The earlier revision of this cell printed the numbers, which meant a tuning change in either owner silently made the threat model wrong. What this row classifies is the shape: **every lobby message is validated by the application before it is forwarded**, so junk is rejected rather than relayed and the forwarder pays a peer-score penalty; deduplication keys on content rather than on a sender-chosen sequence number, so one peer cannot republish identical content forever; and freshness is judged on age-since-receipt rather than on the sender's own clock. None of that is a penalty applied to a *proven protocol violation* — it is volume- and validity-keyed, identical for a buggy peer and a hostile one, and therefore untouched by D-010 point 3 and D-011 rule 3, which forbid only eviction driven by a protocol proof. Per-peer it is D&A; in aggregate an adversary with bandwidth defeats it, which is row 19. |
-| X16 | Polluting `LOBBY_INFOHASH` with junk `IP:port` records | **OOS** | Structural: a DHT announce carries no proof of possession beyond the storing node's IP check, so anyone can write anything. Observed in the wild on a private random infohash within 24 minutes (§8). Cost is bounded — a bounded dial budget, deduplication, dropping private/reserved ranges, and the handshake filtering non-libp2p listeners — so the impact is dial timeouts, not a correctness failure. `SPEC_CS.md` §1 already declares the list a hint. |
+| X16 | Polluting the lobby key with junk provider records | **OOS** | Structural: a provider record must name its sender's authenticated `PeerId`, but identities are free and the addresses inside are checked by nobody, so a flooder spends one generated keypair per record and writes what it likes (`NETWORK_STACK.md` §4.1, §4.6). A storing node keeps a bounded number of providers per key, and a rust-libp2p one ignores newcomers once full, so a flooder that arrives first is not displaced by real players; what the go-libp2p nodes that store most records do is unmeasured (`NETWORK_STACK.md` §3.5). The cost to us is bounded — a dial budget per DHT answer, a cooldown before a provider is dialled again, a filter refusing private and reserved addresses from the DHT, and a dial that names the `PeerId`, so a non-libp2p listener or a stranger's address fails the handshake — so the impact is wasted dials and slower discovery, not a correctness failure. Under Mainline, where an announce was an unauthenticated `IP:port`, the same pollution was observed in the wild on a private random infohash within 24 minutes (§8.7). `SPEC_CS.md` §1 already declares the list a hint. |
 | X17 | Sybil eclipse of the GossipSub lobby mesh | **OOS** | Sybil resistance is out of scope without an identity/reputation layer (§6). Mitigations: `mesh_outbound_min = 3` raises the cost of an eclipse by inbound-only Sybils, the snapshot fetch queries several independent peers, and the DHT provides a peer source independent of the mesh. None of these is a proof. |
 | X18 | The relay reads game content | **CP** | End-to-end Noise/TLS terminated at the peers; the relay is a byte pipe holding no key share (**D-001**). |
 | X19 | The relay forges or alters events | **CP** | Every event is application-signed and every receiver re-validates the signature and the hash chain independently (**D-001**). *Inherits A5, A6.* |
@@ -1344,7 +1361,7 @@ attacks targeted is gone, along with what it was for.
 | X25 | Out-of-band collusion (a voice channel, a shared screen, one person at two machines in a room) | **OOS** | §6. This is the single most damaging real-world attack on any poker system and no cryptography addresses it. |
 | X26 | Multi-accounting / Sybil identities at one table | **OOS** | §6. Identity is free: a new profile is a new Ed25519 key. |
 | X27 | Coercion of a player | **OOS** | §6. |
-| X28 | Traffic analysis of relayed and DHT traffic | **OOS** | §6 and §8. The relay sees who talks to whom, when and how much; the DHT publishes presence to strangers on a schedule. |
+| X28 | Traffic analysis of relayed and DHT traffic | **OOS** | §6 and §8. The relay sees who talks to whom, when and how much; the DHT holds each player's persistent identity and addresses for strangers long after the session, and every lobby read tells the nodes it walks who is asking. |
 | X29 | Fault any table on demand by publishing a false `state_hash` at a checkpoint | **DNA** | A `state_hash` is a one-field value in a message every peer must emit. A single peer that publishes a value it did not derive forces the `PROTOCOL.md` §6.3 case (c) path: the hand aborts with `cause = 4`, stacks are restored, and the table closes, with no attribution live. It needs no invalid signature and no divergent transcript, and "at least two peers disagreeing" is satisfied by one liar plus the honest victim. Bounded by three things — it costs the attacker the table and, in a tournament, their own equity in it; checkpoint 7 sits **before `SHOWDOWN_REVEAL`**, and no checkpoint is placed after a hole card has been opened **to anyone but its owner** (every player opens its own two cards at `DEAL_PRIVATE`, which precedes checkpoints 3–7, so the rule is about *public* opening and is stated that way rather than in the falsifiable shorter form an earlier revision used), so the attacker must commit while it still knows only its own hand; and the evidence, the unanimous transcript plus every peer's signed `STATE_HASH`, is written to the profile directory and **is preserved in a form sufficient for a human, or for a future adjudicator, to diagnose the divergence — no adjudication procedure is specified.** An earlier revision of this row claimed the evidence was "deterministically adjudicable offline by any third party running the reference engine over it, forever". **That claim is withdrawn.** No document in this corpus defines, versions against `protocol_version`, or authorises such a reference engine, and moving a derivation offline does not manufacture the observer-independent reference that this row's own argument says does not exist. Whether a canonical reference engine is named is an open decision, recorded in `docs/DECISIONS.md`'s open list. Until it is, this third bound is **evidence preservation, not recourse**: neither live nor offline adjudication is available, and neither is claimed. An earlier draft resolved case (c) by removing the odd peer out under a "unanimity minus one" rule; that rule was **deleted**, because it let `n-1` colluders take an honest player's committed chips at `n >= 3` (two colluders suffice at `n = 3`), and because there is no observer-independent derivation at run time by which anyone could be named — every peer derives with its own engine, so "attribute whoever disagrees" is a vote over the facts, which `SPEC_CS.md` §15 forbids. Not solved. Related: X8, X22, and **OQ-A** — the reference engine this row's withdrawn third bound would need.<br><br>**Under D-010 two of this row's bounds change, one for the better and one for the worse.** Better: the deleted "unanimity minus one" rule can no longer be missed, because there is nothing for it to have done — no proof and no attribution moves a chip, so even a correctly named liar would forfeit nothing, and `cause = 4`'s restoration is no longer a *disposition chosen among alternatives* but the only disposition the MVP has. The `cause = 4` chip question therefore shrinks from "who pays" to "does anything distinguish this abort from any other", and the answer is no; of what that question used to bundle together, the *settle-from-the-last-agreed-checkpoint* half is now `PROTOCOL.md` **Q-07** and the *adjudication* half is **OQ-A** (§9.2). Worse, and it must be said: this row used to be one of the two ways to escape a losing pot, and it was the expensive one — it cost the attacker the table. **X8 is now the cheap one**, so an attacker with that motive has no reason to come here at all. What survives as this row's own attack is the griefing use — faulting a table on demand, at the cost of one's own equity in it — and that is unchanged. |
 | X30 | Shrinking the required voter set to one seat — itself — and then taking the subject's committed chips with a certificate that seat signs alone, at **any** table size | **D&A**, and only because of a rule our own client enforces | **The attack.** `V(subject)` was the other dealt-in seats minus any seat "named as the subject of an outstanding, older unmet deadline", and a seat is *named* by any peer emitting a `TIMEOUT_VOTE` against it — an assertion the protocol concedes is unprovable when the voter lies ("there is no artefact that settles the race when a voter lies about what it saw", `PROTOCOL.md` §8.3). Nothing bounded how many seats one client could name. Six-seat table, one modified client at seat 1: Mallory votes against seats 2, 3, 4 and 5 at one stage; at the next she declares seat 6 the subject, and `V(6) = {1,2,3,4,5} \ {2,3,4,5} = {Mallory}`. She emits the one required vote, assembles a complete certificate from her own signature, the stage completes, a `kind = 2` certificate aborts the hand with seat 6 attributed, and under **D-005** seat 6's committed chips are forfeited to the remaining seats — which is mostly to her.<br><br>**The earlier scoping on `n` did not stop it, and that is the point.** Every protection D-007 wrote was conditioned on `n == 2`; here `n` is six and stays six, so nothing rejected the certificate. The nominal `\|V\| = n - 1` table printed in three documents was never the operative rule — `\|V\|` was `n - 1 - \|excluded\|`, and the attacker controlled `\|excluded\|`. This is the A-1 attack reappearing above heads-up, and worse than A-1, which cost a folded hand rather than chips.<br><br>**The mitigation.** **D-008**: every rule that weakens, disables or gates the certificate is scoped on `\|V\|` and never on `n`; a certificate whose required voter set has fewer than two members **has no effect**; and **a seat leaves `V` only once a completed, valid certificate names it — being voted against is not exclusion.** The second half is what makes the first hold inductively: each exclusion now costs a completed certificate, and each such certificate needed `\|V\| >= 2` at the moment it formed, so `V` cannot be collapsed by assertion at any seat count. Normative in `PROTOCOL.md` §8.3/§8.4 and `STATE_MACHINE.md` §8.4; checkable by any verifier replaying the transcript, with no new cryptography.<br><br>**Why D&A and not CP, stated rather than rounded up.** The message stays constructible: a modified client can always sign and broadcast a one-signer certificate. What changed is that an honest client gives it no effect, so the state does not advance and no chips move; the artefact names its signers, so it is bound to a key. The attribution half is deliberately weak and must not be overstated — under D-008 an inert certificate is *not evidence of misbehaviour*, so no seat is sanctioned for emitting one and nothing is forfeited; what is transferable is the artefact, not a verdict. And the rejection rests on our own clients enforcing the `\|V\|` floor, an implementation obligation in the class of A12 and A14, not on A1–A7 — which is exactly why this row is not CP.<br><br>**Residual.** D-008 closes the *manufactured* `\|V\| = 1`, not the earned one. Where the voter set is honestly small or honestly hostile, X10 stands unchanged (**DNA**), and two or more seats going silent together is still X7's DNA case.<br><br>**D-010 deletes the prize, and the row's title is now historical.** "Taking the subject's committed chips" is what this attack was *for*; a completed certificate no longer moves a chip, so a modified client that succeeded in manufacturing `\|V\| = 1` today would end a hand neutrally and gain nothing that X8 does not give it for less effort. The class stays **D&A** and the floor stays in the client, for two reasons that survive the deletion of the payoff: the certificate is a chained event that **names a seat**, and a corpus that let one peer manufacture a naming would be putting a false attribution into the permanent record that D-010 point 2 says a human may later adjudicate on; and D-010 is explicitly revisitable before real money, at which point the payoff returns and this floor is the only thing standing between it and X30. A defence kept because the decision that removed its necessity is scheduled to be reconsidered is worth saying out loud rather than quietly dropping. |
 | X31 | Two Sybil seats stall one collective stage so that **an honest voter's own two required timeout votes become an `EquivocationProof` against itself** — under D-005 that forfeited the honest player's committed chips and blocked their key; under **D-010** and **D-011 rule 3** it costs a wasted hand | **D&A**, and only because of a slot key our own client enforces | **When it was found this was the most damaging attack any review pass of this corpus had produced**, and it is recorded in its own right rather than folded into X7, because unlike every other row here the victim's *compliance* is the entire exploit. It needs no coalition majority, no cryptographic break, no modified victim and no capability against the victim's connection.<br><br>**The mechanism. [R9]** The wire shape that made it possible is `PROTOCOL.md` §4.8's and the slot it collided in is §5.2's; neither is reproduced here any more, and the tuples this cell used to print are deleted under D-011 rule 1 — printing a superseded key beside a live one is how a reader certifies the next X31 as clean. In classification terms: `TIMEOUT_VOTE` named the seat it was *about* in its body only, so **which seat a vote concerned did not change its slot**, while `PROTOCOL.md` §8.4 specifies two simultaneous subjects at one stage as *normal*. The protocol therefore both required an honest voter to vote against each seat that owed it something, and treated two distinct bodies in that one slot as proof of misbehaviour.<br><br>**The attack.** Identity is free (X26, §6): Mallory seats two keys, `M1` and `M2`, at one table. Both go silent at one collective crypto stage `s` — the capability X7 already concedes to everyone, at zero cost. Honest Bob's timers expire and he does exactly what the protocol asks: `TIMEOUT_VOTE{subject_seat = M1, sequence = s}` and `TIMEOUT_VOTE{subject_seat = M2, sequence = s}`. Two distinct bodies, one slot. Mallory holds both, wraps them as `EquivocationProof{accused = Bob}` — which by design verifies with no table state, no transcript and no knowledge of the game — and files it. `STATE_MACHINE.md` T55 aborts the hand, raises `Fault{Equivocation}`, writes `AbortRecord{kind: Equivocation, attributed: [Bob]}` and — **as the corpus stood under D-005** — applied the forfeiture formula that then existed: Bob's committed chips were distributed to the remaining seats, two of which are Mallory's, and the transport layer put Bob's key on its block list. Repeatable every hand, against a different honest seat each time, at the price of two free keypairs and silence.<br><br>**Both consequences are deleted — the first by D-010, the second only by D-011 rule 3, and the difference is worth recording.** D-010 removed the forfeiture formula, so the filed proof ends a hand neutrally and Bob's stack is restored. This cell then asserted that "Bob's key is not block-listed", and **that assertion was true of this document and false of the corpus**: `NETWORK_STACK.md` still called `block_peer` on an `EquivocationProof` in two places, and `STATE_MACHINE.md` T55/T56 still cited that consequence as live. A threat model that classified the attack on the strength of its own text, while the transport layer went on executing the payoff, is exactly the drift D-011 rule 1 exists to stop — and it was found by a sweep, not by reading this file. With D-011 rule 3 the claim is now true at every layer: Bob keeps his stack **and** his connections, and Mallory has spent two identities and a stall to buy one wasted hand, which X7 already gives her for nothing. The attack's economics collapse entirely. What survives is the *defect*: a specification that requires an honest peer to manufacture verifying evidence against itself is wrong on its own terms, the record is permanent and D-010 point 2 says a human may later adjudicate on it, and D-010 is revisitable before real money. That is why the mitigation below is a change to the canonical predicate rather than a note that it no longer matters.<br><br>**The mitigation is D-009 rule 1, now carried by D-011 rule 2. [R8]** The rule is normative in `PROTOCOL.md` §5.2 and the concrete key change — the subject becoming part of the key rather than of the body alone — is §5.2's and §5.3's to state; the index and tuple this cell used to print are deleted. What the row asserts is the classification consequence: two votes about two subjects occupy two slots, the predicate is not satisfied, and what Mallory files is not a proof of anything. D-011 rule 2 is what makes that durable rather than re-derived — one literal key, one site, `event_type` included — and the property is a standing obligation on every future message type, checked before it is added (G7, §5.5).<br><br>**Why D&A and not CP, stated rather than rounded up.** The artefact stays constructible — anyone can concatenate two of Bob's genuine signed votes and call the result a proof. What changed is that an honest client's predicate no longer matches, so the object verifies as nothing, the state does not advance, and no chips move. The rejection rests on **our own clients implementing the corrected slot key** — an implementation obligation in the class of A12 and A14, not on A1–A7 — which is exactly why this row is not CP. The attribution half is deliberately weak: a purported proof that fails the predicate is *not* evidence of misbehaviour by whoever filed it, so nothing is forfeited from Mallory either, and what is transferable is the artefact, not a verdict.<br><br>**Residual, and it is now the important half.** D-009 rule 1 closes the manufactured proof, not the stall behind it. Two seats going silent together still voids the hand for free, with nobody named and stacks restored — X7's DNA case, open as OQ-E — and Bob still gets no attribution against Mallory for it. **And the rule has since been violated twice more, taking the count to five.** The fourth was `STATE_HASH` re-emission during divergence recovery, **now closed**: a reconciliation round is its own stage with its own `sequence`, so the reconciling peer occupies a fresh slot rather than re-signing into an occupied one (`PROTOCOL.md` §4.9). The fifth is the terminal `HAND_ABORT`, and it is the sharpest of the five because it needs no Sybil pair and no dropped stream — it fires on the shipped heads-up configuration when an opponent simply goes quiet. It is catalogued in its own right as **X32** rather than left as a footnote here, and it is closed by D-011 rule 2. G7's table carries all five; §9.1.2 limitation 12 states why the property is asserted rather than demonstrated until the mirror test exists, and §5.5 is where it is caught. |
@@ -1687,8 +1704,9 @@ outside every technical boundary this document draws.
 
 **Traffic analysis.** Three separate exposures compound here. (i) A relay sees which
 peers talk to each other, when, how much and for how long — this is the metadata
-cost D-001 requires be documented rather than glossed. (ii) The Mainline DHT
-publishes presence, on a schedule, to strangers (§8). (iii) Even on a direct
+cost D-001 requires be documented rather than glossed. (ii) The public DHT
+publishes a player's persistent identity and addresses to strangers, and each
+lobby read tells the nodes it walks that this identity is online now (§8). (iii) Even on a direct
 connection, packet timing and volume around each action leak: a long think followed
 by a large burst is visible. No padding or cover traffic is planned. A relay
 operator is in the strongest position of the three, and under D-002 a relay
@@ -2115,88 +2133,95 @@ be documented and not hidden — which is what §7.4, X8 and §9.1.2 limitation 
 
 ---
 
-## 8. Privacy exposure from a fixed public infohash
+## 8. Privacy exposure from a fixed public rendezvous
 
-`SPEC_CS.md` §3 mandates one fixed `LOBBY_INFOHASH` shipped in every client, and
-requires the resulting limitation to be documented: DHT records are unverified,
-short-lived, must be re-announced, and a public infohash is continuously watched,
-so announcing publishes the player's IP address as someone interested in this one
-specific value. None of it justifies a central server. The player should know it.
+> **Rewritten 2026-09-15 for the provider record.** Until then this section was
+> the Mainline measurement: one fixed `LOBBY_INFOHASH`, `announce_peer` and
+> `get_peers` on the BitTorrent DHT, and the numbers the development machine
+> recorded against them. `56b0b50` (2026-08-30) moved discovery to a libp2p
+> Kademlia provider record on the public IPFS DHT, and `NETWORK_STACK.md` §3.5
+> re-derived the disclosure for it on 2026-09-02 from the crate's source. The
+> mechanism facts are that section's and are not restated here (D-011 rule 1);
+> what this section keeps is the classification. §8.7 keeps the Mainline
+> measurement as history, because it is the one first-hand observation of DHT
+> surveillance this project has.
 
-This section states it with numbers, all measured
-(`research/MAINLINE_DHT.md` §3.4, §3.6, §7).
+`SPEC_CS.md` §3 — the owner's original assignment, which names a fixed Mainline
+infohash and stays unamended as history — requires the limitation to be
+documented: DHT records are unverified, a public rendezvous is watched, and
+announcing publishes the player as someone interested in this one value. None of
+it justifies a central server. The player should know it. The requirement
+survived the change of mechanism; the facts that discharge it did not, and several
+of them got worse.
 
 ### 8.1 What is published, by construction
 
-`announce_peer(LOBBY_INFOHASH, Some(external_quic_port))` writes the tuple
-`(public IPv4, port)` into a public network with **no authentication and no access
-control**. `LOBBY_INFOHASH` ships in every binary, so *everyone* knows it. There is
-no unlisted mode.
+Every client provides one fixed key on the public DHT, and anyone who reads the
+source can compute it (`NETWORK_STACK.md` §3.2). A provider record carries the
+player's **persistent `PeerId`** — the identity that later sits at the table — and
+the swarm's confirmed external addresses, relay circuit addresses included. When
+the node answers a query about itself, and in the `identify` exchange with every
+peer it connects to, its **listen** addresses go out as well, LAN and
+virtual-adapter addresses among them, until that half is hidden
+(`NETWORK_STACK.md` §3.5, `S1-Z`). There is no access control and no unlisted
+mode, and the only authentication is that a record must name the peer that sent
+it.
 
-Measured: one announce landed on **19–32 independent storing nodes**, and an
-unrelated process retrieved it **~113 ms** after asking. Repeated announces widen
-the storing set rather than merely refreshing it — five announces put the record on
-**54** nodes.
+### 8.2 How long it stays, and who receives it
 
-### 8.2 How many strangers learn it
-
-A single `get_peers` contacts **105–176 distinct DHT nodes**, each of which learns
-(our IP, this infohash); the accompanying self-lookup tells another ~130–140 our IP
-alone. At the 10-minute re-announce cadence that is roughly **150 disclosure events
-per day**, to a rotating, self-selected set of strangers. Mainline is heavily
-crawled by anti-piracy monitors, academic scanners and Sybil nodes, all of whom log
-exactly this.
-
-**This is not hypothetical, and it was observed first-hand.** During the TTL
-experiment, an infohash of 20 bytes generated on the development machine — never
-published anywhere, referenced by exactly one `announce_peer` — returned a
-**stranger's address** 24 minutes later:
-
-```
---- t+24 min
-get_peers(2f59ec56c7dd6013e5b070a42762a20a496d1f8c) ... unique_peers=2
-    peer 203.0.113.28:31786      <- not us
-    peer 198.51.100.17:45888       <- us
-```
-
-Somebody is harvesting announce traffic near the keyspace and re-announcing under
-whatever infohashes they see. A *publicly known, hard-coded* infohash is a far
-easier target than a random one, so treat this as a floor on the surveillance, not
-a ceiling. It is simultaneously a live demonstration of X16: the DHT will hand our
-client addresses that never ran this software.
+* **The record outlives the player, and nobody takes it back.** The node that
+  stores it stamps the expiry from its own configuration, the client never
+  withdraws it, and a withdrawal would be local anyway. Closing the client changes
+  nothing anyone else can see (`NETWORK_STACK.md` §3.5, §10.1).
+* **The storing nodes are a fixed audience, and anyone may join it.** They are the
+  nodes closest to a published key, the same for everybody, and a node can be
+  placed among them by grinding a keypair, at a cost nobody has measured.
+* **Reading discloses more than writing, and far more often.** Every lobby read
+  runs over authenticated connections, so each node on the walk learns the
+  reader's `PeerId`, IP address, software name and the key asked for — once per
+  discovery cycle, all session long.
+* **The software says what it is.** `identify` names `p2p-poker` and its version
+  to every peer the client connects to on the public DHT, whether or not that
+  peer ever sees the lobby key.
+* **A player in the lobby also works for strangers.** Once it has a confirmed
+  external address the client serves the public DHT (§8.6).
 
 ### 8.3 What an observer can derive
 
-1. **The player roster.** Poll `get_peers(LOBBY_INFOHASH)` on a loop and you get a
-   near-complete list of IPs running this client. Each node returns a random ≤10
-   subset, so one query undercounts, but repeated polling converges — and Sybil
-   nodes placed near the infohash in the keyspace receive the write stream directly.
-2. **Session times.** A record dies without re-announce (measured: retrievable ~45
-   minutes, gone by ~50, thinning from t+30), and we re-announce every 10 minutes.
-   Presence is therefore a ~10-minute-resolution online/offline signal per IP; over
-   weeks it is a behavioural profile — when this person plays, how long, how often,
-   which time zone.
-3. **Geolocation and ISP** by trivial GeoIP, often with a reverse-DNS hostname.
-4. **Linkage across time, and a stronger identifier than either half.** A
-   residential IP is stable for days to months. Combined with the deliberately
-   persistent `PeerId` (§3 requires persistence), an observer who dials us obtains
-   a **stable cryptographic identity bound to a physical location** — a stronger
-   link than either identifier alone.
+1. **The player roster.** Poll the key and you get the live lobby; keep polling
+   and you have the historical one — every `PeerId` that ever sat there, and the
+   addresses it was reachable at.
+2. **Attendance, per player rather than per IP.** A `PeerId` is persistent, so the
+   log is an attendance record that survives a change of address. The record
+   itself says *played recently* rather than *online now*, because it outlives the
+   session; *online now* comes from the lobby reads, which a node on the walk sees
+   every cycle. Over weeks either is a behavioural profile — when this person
+   plays, how long, how often, which time zone.
+3. **Geolocation and ISP** by trivial GeoIP on the published addresses, often with
+   a reverse-DNS hostname.
+4. **Linkage across time, without dialling anybody.** Under Mainline an observer
+   had to dial an announced address to learn the persistent `PeerId` behind it.
+   The provider record hands over both at once — a **stable cryptographic identity
+   bound to a physical location** — with the LAN layout attached for as long as the
+   listen addresses leak.
 5. **A target list.** The roster doubles as a list of hosts to DoS, port scan, or
-   attempt to de-anonymise. Poker supplies the motive: knowing which IP is at which
-   table is the first step in targeted collusion, or in DoSing the opponent who is
-   about to act (X9).
-6. **A trivially greppable signature.** For anyone who can observe the user's
-   network — ISP, employer, household, a legal request — a UDP packet carrying a
-   well-known 20-byte constant identifies the application immediately. Announcing
-   on `LOBBY_INFOHASH` is in no way steganographic.
+   attempt to de-anonymise. Poker supplies the motive: knowing which address is at
+   which table is the first step in targeted collusion, or in DoSing the opponent
+   who is about to act (X9).
+6. **A signature — for whoever is on the DHT, no longer for whoever is on the
+   wire.** DHT traffic rides libp2p's encrypted connections, so an on-path
+   observer (ISP, employer, household) no longer reads a well-known constant out
+   of a UDP packet, as it could under Mainline; it sees connections to the public
+   IPFS network. Every DHT peer, on the other hand, is told the software's name by
+   `identify` and the lobby key by the query itself.
 
 ### 8.4 What it does not leak
 
-Nothing about cards, stacks, table membership or game state. All of that travels
-over libp2p between table participants only, and never through the DHT
-(`SPEC_CS.md` §1). And a DHT record is not an identity claim — the token check
-binds only to an IP, so anyone can announce any `IP:port` under our infohash. The
+Nothing about cards, stacks, table membership or game state: none of it goes
+through the DHT (`SPEC_CS.md` §1, a rule the assignment wrote about Mainline and
+that binds the provider record unchanged). And a provider record is not an
+identity claim about a player: it shows only that a peer holding some key chose to
+provide the lobby key, and the addresses inside are that peer's own assertion. The
 list is a hint, exactly as the spec says.
 
 Add to this the relay's metadata view under D-001 (who talks to whom, when, how
@@ -2207,37 +2232,96 @@ in both directions.
 ### 8.5 Honest mitigations
 
 None eliminates the disclosure. The spec forbids a central fallback, and rightly.
+None of the following is built yet; `NETWORK_STACK.md` §3.5 carries the same list
+against the mechanism.
 
 * **Tell the user before the first announce.** A one-time, plain-language consent
-  screen: joining the lobby publishes your IP address to a public network, and
-  anyone can see that this computer is running this poker client. §3 requires this
-  be documented; making it a UI element is the honest version.
-* **Ship a no-announce direct-invite mode from day one.** Join a table by an
-  out-of-band ticket (multiaddr plus table key). Discovery cost zero, privacy cost
-  zero.
-* **Announce only while actually looking for a game**, and stop once seated.
-* **Put nothing but `IP:port` in the DHT** — no nicknames, no `PeerId`, no table
-  metadata. This is already the design; keep it.
-* **VPN works, Tor does not.** Mainline is UDP and Tor is not, so Tor cannot carry
-  the DHT. A VPN moves the exposure to the VPN operator; say so plainly rather than
-  recommending it as a fix.
-* **An epoch-rotating infohash** (`H("p2p-poker/lobby/v1" ‖ floor(day))`) would stop
-  a historical crawl of one constant from indexing the whole user base forever. It
-  does not stop a live observer, costs cross-version compatibility, and the spec
-  currently mandates one fixed constant — so it is an improvement, not a fix, and
-  it would need a numbered decision.
+  screen, which must now say *a name that follows you between sessions* and
+  *leaving does not take it back*, not only *your IP address*.
+* **Ship a no-announce direct-invite mode.** Join a table by an out-of-band ticket
+  (multiaddr plus table key): no announce and no lobby read, so discovery costs
+  nothing in privacy.
+* **Announce only while actually looking for a game** — weaker than it sounds,
+  because the record outlives the search.
+* **Hide the listen addresses** (`with_hide_listen_addrs(true)`), so neither the
+  record nor the `identify` banner carries LAN and virtual-adapter addresses
+  (`S1-Z`).
+* **Nothing but a `PeerId` and addresses in the DHT** — no nicknames, no table
+  metadata. That much is still the design. This bullet used to promise *no
+  `PeerId`* as well; a provider record cannot keep that promise, and it is not
+  repeated here.
+* **A VPN works; Tor is not offered.** A VPN moves the exposure to the VPN
+  operator; say so plainly rather than recommending it as a fix. The old reason
+  Tor could not help — Mainline is UDP — is gone, since Kademlia also rides TCP,
+  but the client has no Tor transport, so the answer is still no.
+* **An epoch-rotating namespace** (`"p2p-poker/main-lobby/v1" ‖ floor(day)`) would
+  stop a historical crawl of one constant from indexing the whole user base
+  forever. It does not stop a live observer and costs cross-version compatibility,
+  and because a record outlives a day, the previous day's key stays populated and
+  rotation blunts a crawl less than it looks (`NETWORK_STACK.md` OQ-2). The
+  rendezvous is one fixed key today, so this is an improvement, not a fix, and it
+  would need a numbered decision.
 
-### 8.6 One further exposure that is not the DHT's fault
+### 8.6 One further exposure: the client serves the public DHT
 
-`mainline` 8.0.0 starts in *adaptive mode* and, on a routing-table refresh tick,
-**silently promotes itself to a public DHT server** if it is not firewalled, at
-which point it begins answering strangers' queries and **storing other people's
-data** — up to 2000 infohashes × 500 peers, plus BEP 44 values. There is no
-opt-out flag. For a poker client that is unexpected inbound traffic, unexpected
-bandwidth and unexpected third-party content on the user's machine. The supported
-block is a deny-all `RequestFilter` with minimal `ServerSettings`, verified to
-compile and run (`research/MAINLINE_DHT.md` §4.1). **Ship that filter.** If we ever
-want to be a good DHT citizen, make it a deliberate opt-in toggle, not an accident.
+The public Kademlia behaviour follows libp2p's automatic rule: client while there
+is no confirmed external address, **server** once there is one. In server mode
+this machine answers strangers' queries and **stores other people's provider
+records** — for arbitrary IPFS content, having nothing to do with poker — and its
+address sits in strangers' routing tables. For a poker client that is inbound
+traffic, bandwidth and third-party records on the user's machine.
+
+**It is deliberate, and it is the opposite of what this section used to demand.**
+Pinned to client mode, two clients each announced and read the lobby for ten
+minutes and never found each other, because a node that answers nobody is added
+to nobody's routing table (`NETWORK_STACK.md` §11.4.3). The client drops to client
+mode while it sits at a closed table, which is a bandwidth decision and the only
+mitigation that exists. Until 2026-09-15 this subsection described `mainline`
+8.0.0's adaptive mode and asked for a deny-all `RequestFilter`; that crate is gone,
+and §8.7 keeps the record.
+
+### 8.7 History: the Mainline measurement
+
+Everything in this subsection describes the mechanism `56b0b50` removed, and none
+of it describes the client that runs. It is kept because it was measured rather
+than assumed, and because the surveillance it caught is the kind a provider record
+faces too. Source: `research/MAINLINE_DHT.md` §3.4, §3.5, §3.6, §4.1 and §7.
+
+* **What was published.** `announce_peer(LOBBY_INFOHASH, Some(external_quic_port))`
+  wrote `(public IPv4, port)` into a network with no authentication and no access
+  control. One announce landed on **19–32 independent storing nodes**, and an
+  unrelated process retrieved it **~113 ms** after asking; five announces put the
+  record on **54** nodes.
+* **How many strangers learned it.** A single `get_peers` contacted **105–176
+  distinct DHT nodes**, each of which learned (our IP, this infohash); the
+  accompanying self-lookup told another ~130–140 our IP alone. At the 10-minute
+  re-announce cadence that was roughly **150 disclosure events per day**, to a
+  rotating, self-selected set of strangers on a network heavily crawled by
+  anti-piracy monitors, academic scanners and Sybil nodes.
+* **How long it lasted.** A record left unrefreshed was retrievable for ~45 minutes
+  and gone by ~50, so presence was a ~10-minute-resolution online/offline signal
+  per IP.
+* **What its own node did.** `mainline` 8.0.0 started in adaptive mode and silently
+  promoted itself to a public DHT server when not firewalled, storing up to 2000
+  infohashes × 500 peers plus BEP 44 values; the recommendation was a deny-all
+  `RequestFilter` with minimal `ServerSettings`.
+* **Surveillance, observed first-hand.** During the TTL experiment an infohash of
+  20 bytes generated on the development machine — never published anywhere,
+  referenced by exactly one `announce_peer` — returned a **stranger's address** 24
+  minutes later:
+
+```
+--- t+24 min
+get_peers(2f59ec56c7dd6013e5b070a42762a20a496d1f8c) ... unique_peers=2
+    peer 203.0.113.28:31786      <- not us
+    peer 198.51.100.17:45888       <- us
+```
+
+Somebody was harvesting announce traffic near the keyspace and re-announcing under
+whatever infohashes they saw, and a publicly known, hard-coded key is a far easier
+target than a random one — a floor on the surveillance, not a ceiling. It was also
+X16 in its Mainline form, live: the DHT handed our client addresses that had never
+run this software.
 
 ---
 
@@ -2542,9 +2626,12 @@ carrying its own list.
    available, cannot play each other.** Address prediction fails, so mutual dialing
    and DCUtR both fail; they still see the lobby (D-004 layers 0 and 3) but cannot
    start a hand. Real, and not hidden.
-9. **Discovery is IPv4-only.** `mainline`'s KRPC socket calls `unimplemented!()` on
-   IPv6, matching the fact that Mainline is an IPv4 network. The libp2p layer can
-   be dual-stack; discovery cannot.
+9. ~~**Discovery is IPv4-only.**~~ **No longer by construction (noted
+   2026-09-15).** The reason was `mainline`'s KRPC socket, which called
+   `unimplemented!()` on IPv6; that crate left the build in `56b0b50`, discovery
+   now rides libp2p's dual-stack transports, and the client binds IPv6 as well as
+   IPv4 (`NETWORK_STACK.md` §5.8). Reachability over a global IPv6 address is
+   unmeasured, because neither machine this project can reach has one (`S1-Y`).
 10. **A liveness dependency on relays for CGNAT-only clients.** If every reachable
     relay is down, such a client cannot connect at all. The failure must be reported
     honestly in the UI — "no direct route and no relay available" — never disguised
@@ -2719,7 +2806,7 @@ document records the disagreement as a finding rather than picking a side.
 | **OQ8** | **CLOSED by D-015, by deletion rather than by a construction — and that is `SPEC_CS.md` §36's preferred answer, not an answer to the question asked.** No certificate is produced, so there is no forgery to defend against and X10 is CP by structural exclusion (§5.3). **The question returns intact, unanswered, the moment a later version reinstates the object**, and it should be read then as it was written: Is there any defence against a forged timeout certificate signed by all the other dealt-in seats (X10) that does not introduce a trusted clock? None is currently known. Where `\|V\| < 2` — heads-up always — the mechanism is inert and the deadline is advisory (D-007, D-008), so there is nothing left for this question to protect there; the *manufactured* `\|V\| = 1` is closed by D-008 (X30) rather than left to this question. **D-010 halves what the question is worth without answering it:** a forged certificate no longer takes the subject's chips, so what is at stake is a stolen action and a wasted hand. The question stays open at that reduced stake, and returns at full stake whenever D-010 is revisited. | X10 | `docs/PROTOCOL.md` |
 | **OQ9** | **D-015 sharpens this again and the sharpening is not rhetorical: the abort record no longer names anybody on `cause = 1`** (§9.1.0 item 5(b)), so what the UI would be showing is a per-identity count of hands that ended in a stall, attributed by inference from a gap rather than by a signature. If the honest answer to this question was already *no*, it is now *no* about a weaker artefact. Is a visible abort record a meaningful sanction when identity is free? If not, say so plainly in the UI rather than implying a reputation system exists. **D-010 promotes this from a fair question to a load-bearing one:** the abort record and the per-identity lobby abort count are now the *only* mitigations against X7 and X8, so if the answer is no, the honest statement is that those two attacks have no mitigation at all — which §9.1.2 limitation 4 already says, and which the UI must not contradict. | §6, §9.1.2 limitations 4 and 7 | `docs/PROTOCOL.md` |
 | **OQ10** | Is it acceptable for a client to spend its own bandwidth relaying strangers' games (D-002)? Must be a visible, consenting setting, never silently on. | X21 | project owner (D-001 addendum) |
-| **OQ11** | Should the epoch-rotating `LOBBY_INFOHASH` of §8.5 be adopted, at the cost of cross-version compatibility? The spec currently mandates one fixed constant, so this needs a numbered decision. | §8 | `docs/DECISIONS.md` |
+| **OQ11** | Should an epoch-rotating lobby namespace (§8.5, `NETWORK_STACK.md` OQ-2) be adopted, at the cost of cross-version compatibility? The rendezvous is one fixed key — the requirement `SPEC_CS.md` §3 set, in the Mainline infohash form that is now history — so this needs a numbered decision. | §8 | `docs/DECISIONS.md` |
 | **OQ12** | What is the real per-hand byte count over **one relayed circuit, counting both directions together**, measured against the `Limit` a real relay returns? **The measurement must be bidirectional**, because the byte cap is one budget for the whole circuit; measuring one direction reports twice the headroom there is, which is the mistake this corpus already made in two places at once. **[R25]** The estimates, the caps and the arithmetic behind them are `NETWORK_STACK.md` §9.5 and §16.1's and are not restated here — an open question that carries its own copy of the numbers it is asking about will be closed against the copy. What this row asks is unchanged: measure it, bidirectionally, against a real relay's returned limit, and confirm what the owner document predicts — that the **duration** limit binds long before the byte cap does. | X20 | Phase 5 measurement, then Phase 8 |
 | **OQ13** | Open-source licence. `zshuffle` was rejected partly on GPL-3.0-only; the recommended set is permissive. Needed before publication. | — | project owner (already open in `DECISIONS.md`) |
 

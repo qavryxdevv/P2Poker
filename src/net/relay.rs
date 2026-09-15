@@ -9,9 +9,13 @@
 //!
 //! Two consequences, and they pull in opposite directions:
 //!
-//! * **Discovery works.** The Mainline announce is outbound UDP, so the router
-//!   holds the mapping and the reply comes back down it. Two clients behind two
-//!   NATs find each other with no help at all, and that half of D-004 is proven.
+//! * **Seeing the lobby works; appearing in it needs a relay.** Reading the
+//!   public DHT is outbound, so the router holds the mapping and the reply comes
+//!   back down it. But a provider record carries the swarm's confirmed external
+//!   addresses, and a client behind a NAT has none until a relay hands it a
+//!   circuit address. Until `56b0b50` this bullet said *discovery works* with no
+//!   help at all — true of the Mainline announce it described, which published
+//!   an `IP:port` whether or not anything answered there.
 //! * **A peer can never be reached cold.** Unsolicited inbound is impossible, so
 //!   two clients that have found each other still cannot connect. Hole punching
 //!   works *only* because both sides transmit outward first — which is what
@@ -21,7 +25,8 @@
 //!
 //! So when everybody is behind NAT there must still be a relay, and it cannot
 //! come from inside the game — which is why D-002 has publicly reachable clients
-//! volunteer, and why they announce under a swarm of their own.
+//! volunteer, and why they advertise under `/libp2p/relay`, the namespace every
+//! libp2p client already looks in, rather than under a swarm of their own.
 //!
 //! # The default relay limits carry less than one hand
 //!
