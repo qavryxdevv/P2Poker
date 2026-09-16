@@ -328,6 +328,7 @@ pub struct TableApp {
     pub strength: Option<crate::poker::strength::Strength>,
     pub turn_seat: Option<u8>,
     pub turn_since: Option<std::time::Instant>,
+    pub turn_floor: Option<(u8, std::time::Instant)>,
     pub table_chat: VecDeque<TableLine>,
     pub muted: std::collections::BTreeSet<u8>,
     pub links: std::collections::BTreeMap<u8, (Option<u64>, bool, Option<u64>, std::time::Instant)>,
@@ -433,6 +434,10 @@ pub struct AppState {
     /// frame.
     pub turn_seat: Option<u8>,
     pub turn_since: Option<std::time::Instant>,
+    /// `S1-FX`: heads-up, when the opponent whose turn stands came back on the
+    /// line: its countdown runs from there, and no later word about the same
+    /// turn moves the start before it.
+    pub turn_floor: Option<(u8, std::time::Instant)>,
     /// `S1-CS`: what the seats have said, newest last; capped like the lobby's.
     pub table_chat: VecDeque<TableLine>,
     /// `S1-CS`: seats this player does not want to hear. Local, never sent.
@@ -874,6 +879,7 @@ impl AppState {
         std::mem::swap(&mut self.strength, &mut other.strength);
         std::mem::swap(&mut self.turn_seat, &mut other.turn_seat);
         std::mem::swap(&mut self.turn_since, &mut other.turn_since);
+        std::mem::swap(&mut self.turn_floor, &mut other.turn_floor);
         std::mem::swap(&mut self.table_chat, &mut other.table_chat);
         std::mem::swap(&mut self.muted, &mut other.muted);
         std::mem::swap(&mut self.links, &mut other.links);
@@ -2188,10 +2194,10 @@ impl AppState {
         }
         if reachable {
             self.opponent_was_reachable = true;
+            let episode = self.opponent_gone.take();
             // `D-032`: an absence worth asking about that ended is a return.
-            if self
-                .opponent_gone
-                .take()
+            if episode
+                .as_ref()
                 .is_some_and(|g| !g.slow && g.since.elapsed().as_millis() as u64 >= OPPONENT_GONE_MS)
             {
                 self.opponent_returns = self.opponent_returns.saturating_add(1);
@@ -2200,6 +2206,19 @@ impl AppState {
                     self.opponent_returns,
                     crate::protocol::constants::MAX_RETURNS
                 ));
+            }
+            // `S1-FX`, the owner (2026-09-16): an opponent back on the line at
+            // its own turn has its countdown from here. Its client, back from a
+            // restart, took the hand up with its whole clock (`S1-FS`), and
+            // nobody can fold for it meanwhile (`D-007`) -- but this window
+            // counted from the turn's stamp a minute back: the clock drawn
+            // empty, and *taking too long* asked the moment it was back.
+            if episode.is_some_and(|g| !g.slow) {
+                if let Some(opponent) = self.heads_up_opponent().filter(|o| self.turn_seat == Some(*o)) {
+                    let now = std::time::Instant::now();
+                    self.turn_floor = Some((opponent, now));
+                    self.turn_since = Some(now);
+                }
             }
         // `S1-EJ`: or any seat was -- the opponent may have become the opponent
         // only when the others left for good, having been on the line before
@@ -2934,14 +2953,18 @@ impl AppState {
     /// the countdown and the seat's own fold end together. A later word
     /// about the same seat only ever moves the start earlier.
     fn clock_for(&mut self, seat: Option<u8>, elapsed_ms: u64) {
+        // `S1-FX`: never before the moment the opponent came back to this turn.
+        let floor = self.turn_floor.filter(|(s, _)| seat == Some(*s)).map(|(_, at)| at);
         let anchored = seat.map(|_| {
-            std::time::Instant::now()
+            let at = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_millis(elapsed_ms))
-                .unwrap_or_else(std::time::Instant::now)
+                .unwrap_or_else(std::time::Instant::now);
+            floor.map_or(at, |f| at.max(f))
         });
         if seat != self.turn_seat {
             self.turn_seat = seat;
             self.turn_since = anchored;
+            self.turn_floor = None;
             // `D-034`: the slow opponent acted; the question is withdrawn.
             if self.opponent_gone.as_ref().is_some_and(|g| g.slow) {
                 self.opponent_gone = None;
@@ -4613,6 +4636,55 @@ mod tests {
         s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: Some(30), group: false, quiet_s: None, away: false });
         assert!(s.opponent_gone.is_none(), "a reading that reaches them ends any episode");
         assert_eq!(s.opponent_returns, 0, "but a slow one was no absence");
+    }
+
+    /// `S1-FX`, the owner (2026-09-16, with a screenshot): an opponent back on
+    /// the line at its own turn after a restart had its clock drawn empty, and
+    /// was asked about as taking too long the moment it was back -- its client
+    /// had its whole clock from taking the hand up (`S1-FS`). Its countdown runs
+    /// from its return now, the node's later word about the same turn moves it
+    /// back to nothing, and it is asked about only past that clock.
+    #[test]
+    fn an_opponent_back_at_its_turn_has_its_clock_from_the_return() {
+        let key = [7u8; 32];
+        let ago = |ms: u64| std::time::Instant::now() - std::time::Duration::from_millis(ms);
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key, seat: 0 });
+        s.apply(NodeEvent::Roster { key, seats: vec![(0, "me".into(), 1_000), (1, "them".into(), 1_000)] });
+        s.apply(NodeEvent::TableReal { key, session: [9u8; 32] });
+        s.apply(NodeEvent::TableParams { key, name: "t".into(), seats: 2, needed: 2, small_blind: 50, big_blind: 100, action_ms: 30_000 });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        s.apply(NodeEvent::HandBegan { hand_id: 7, button: 0, dealt_in: vec![0, 1], small_blind: 50, big_blind: 100 });
+        s.apply(NodeEvent::NotYourTurn { hand_id: 7, seat: Some(1), elapsed_ms: 5_000 });
+        let clock = |s: &AppState| s.table_view().seats.iter().find(|x| x.seat == 1).and_then(|x| x.clock);
+
+        // Their client stops at their turn, and is back a minute later.
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: false, quiet_s: None, away: false });
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| !g.slow), "gone from the line");
+        s.opponent_gone.as_mut().expect("the episode").since = ago(60_000);
+        s.turn_since = Some(ago(70_000));
+        assert_eq!(clock(&s), Some(0.0), "the turn's own clock long run out");
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        assert_eq!(s.opponent_returns, 1, "a return");
+        assert!(clock(&s).is_some_and(|c| c > 0.95), "their whole clock from the return: {:?}", clock(&s));
+        s.tick_opponent();
+        assert!(s.opponent_gone.is_none(), "and nothing is asked while it runs");
+
+        // The node's word about the same turn, counted from its stamp, moves nothing back.
+        s.apply(NodeEvent::NotYourTurn { hand_id: 7, seat: Some(1), elapsed_ms: 75_000 });
+        s.apply(NodeEvent::SeatLink { seat: 1, rtt_ms: None, group: true, quiet_s: Some(3), away: false });
+        assert!(clock(&s).is_some_and(|c| c > 0.95), "{:?}", clock(&s));
+        s.tick_opponent();
+        assert!(s.opponent_gone.is_none());
+
+        // Past that clock and the question's own wait, asked as any slow opponent is.
+        s.turn_since = Some(ago(30_000 + OPPONENT_GONE_MS + 1_000));
+        s.tick_opponent();
+        assert!(s.opponent_gone.as_ref().is_some_and(|g| g.slow), "slow past the new clock");
+
+        // Their action moves the turn, and the return's start goes with it.
+        s.apply(NodeEvent::NotYourTurn { hand_id: 7, seat: None, elapsed_ms: 0 });
+        assert!(s.turn_floor.is_none() && s.opponent_gone.is_none());
     }
 
     /// `D-035`: a seat whose client left the table's group is shown gone, and
