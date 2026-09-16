@@ -1023,6 +1023,31 @@ impl TableSink {
         }
     }
 
+    /// `S1-GO`: give the table up as [`TableSink::clear`] does, but stay in the
+    /// table's group for `linger` first. A member that got this client's later
+    /// messages and missed an earlier one asks this client for it, and a client
+    /// gone from the group answers nobody: two players left a table of ten the
+    /// moment it dealt, their openings of hand #1 reached some seats and not
+    /// others, and the seats split between two stages of the hand
+    /// (`churn193840-10`). Nothing reads the table's inbox meanwhile; the driver
+    /// drops what does not fit.
+    pub fn clear_lingering(&mut self, linger: std::time::Duration) {
+        #[cfg(feature = "tox")]
+        {
+            if let Some(table) = self.inner.take() {
+                tokio::spawn(async move {
+                    tokio::time::sleep(linger).await;
+                    drop(table);
+                });
+            }
+            self.wants_tox = false;
+        }
+        #[cfg(not(feature = "tox"))]
+        {
+            let _ = linger;
+        }
+    }
+
     /// Send one whole protocol message. **Not async, and not blocking.**
     ///
     /// `publish_hand` is called from inside the node loop, from arms that

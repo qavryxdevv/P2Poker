@@ -2639,7 +2639,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             // The Tox group goes with the table: dropping the handle tells
             // the driver to leave and joins its thread, which flushes what it
             // still holds -- the last message of a hand sits in that queue.
-            $t.tox_sink.clear();
+            // `S1-GO`: the player's own leave stays in the group `LEAVE_LINGER`
+            // first, for a member still asking for its last messages.
+            if $asked {
+                $t.tox_sink.clear_lingering(LEAVE_LINGER);
+            } else {
+                $t.tox_sink.clear();
+            }
             $t.tox_group_said = false;
             $t.table_announces = 0;
             if let Some(t) = $t.table_topic.take() {
@@ -11150,6 +11156,12 @@ const HEARING_FRESH: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// `D-060`: one hearing word a second from one carrier, at most.
 const HEARING_TAKEN_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `S1-GO`: how long a player's own leave keeps its client in the table's group.
+/// A member that misses a message and holds a later one asks the sender after two
+/// quiet seconds, and again; six seconds is two rounds of that, and within the
+/// eight seconds of silence after which the others read the seat as gone (`S1-GK`).
+const LEAVE_LINGER: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// `S1-GK`: how long after a seat's signed leave its client may still be heard in
 /// the table's group for the word to count. A client that says it leaves leaves
