@@ -101,6 +101,19 @@ fn stall_join_secs() -> u64 {
     0
 }
 
+/// fault-harness: the line cut at run time, until this moment -- the node's
+/// `P2P_POKER_AT_SET=cut:<s>`, applied when the table is set.
+#[cfg(feature = "fault-harness")]
+static CUT_UNTIL: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// fault-harness: cut this client's line from now until `until`.
+#[cfg(feature = "fault-harness")]
+pub fn cut_line_until(until: Instant) {
+    if let Ok(mut u) = CUT_UNTIL.lock() {
+        *u = Some(until);
+    }
+}
+
 /// **The client's internet goes away, at the socket** (`patches/0035`).
 ///
 /// `P2P_POKER_OFFLINE_AT=<s>` and `P2P_POKER_OFFLINE_FOR=<s>`: from that
@@ -123,19 +136,6 @@ fn stall_join_secs() -> u64 {
 /// from the first, for the same length each time -- four absences in one run
 /// is how `D-047` is measured. Zero, the default, cuts once.
 #[cfg(feature = "fault-harness")]
-/// fault-harness: the line cut at run time, until this moment -- the node's
-/// `P2P_POKER_AT_SET=cut:<s>`, applied when the table is set.
-#[cfg(feature = "fault-harness")]
-static CUT_UNTIL: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
-
-/// fault-harness: cut this client's line from now until `until`.
-#[cfg(feature = "fault-harness")]
-pub fn cut_line_until(until: Instant) {
-    if let Ok(mut u) = CUT_UNTIL.lock() {
-        *u = Some(until);
-    }
-}
-
 fn offline_window() -> Option<(Duration, Duration, Duration)> {
     use std::sync::OnceLock;
     static WINDOW: OnceLock<Option<(Duration, Duration, Duration)>> = OnceLock::new();
