@@ -988,6 +988,12 @@ struct TableRun {
     /// table's group while it held no hand -- the table has dealt, whatever this
     /// client's roster says.
     dealt_heard: bool,
+    /// `S1-GK`: seats of this set table whose player left by its own signed
+    /// word, with when the word came and whether the seat's client has been seen
+    /// out of the table's group since. Out of the group, the seat is voted about
+    /// at once; back in it, or never out of it within `LEFT_WORD_GROUP_GRACE`,
+    /// the seat is forgotten here and keeps its clock.
+    left_by_word: std::collections::BTreeMap<u8, (tokio::time::Instant, bool)>,
     /// Fault-harness: the longest silence in the table's group of each seat now
     /// silent, said when the seat is heard again -- how long a live member goes
     /// unheard, measured rather than assumed.
@@ -1158,6 +1164,7 @@ impl TableRun {
             continuing: None,
             roster_keys_seen: std::collections::HashMap::new(),
             dealt_heard: false,
+            left_by_word: std::collections::BTreeMap::new(),
             silence_peak: std::collections::BTreeMap::new(),
         }
     }
@@ -3105,6 +3112,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.roster_keys_seen.clear();
             $t.silence_peak.clear();
             $t.dealt_heard = false;
+            $t.left_by_word.clear();
         }};
     }
     // `S1-FY`: the owner's rule, before the table starts too -- a table's window
@@ -6703,6 +6711,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 before_the_start = Some((seat, key, said_ms));
                             }
                             Ok((seat, _, _)) if Some(seat) != f.my_seat() => {
+                                // `S1-GK`: its turns and stages are not waited out.
+                                t.left_by_word.insert(seat, (tokio::time::Instant::now(), false));
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
                                         "seat {seat} left the table: its own signed word (S1-FQ)"
@@ -8822,6 +8832,33 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     publish_hand(replayed, &mut swarm, &mut t.said, &t.tox_sink);
                     // `S1-CW`: a held certificate replayed here can end the hand too.
                     hand_may_have_ended!(t, h);
+                    // `S1-GK`: the seats whose player left by its own word and whose
+                    // client is out of the table's group -- voted about at once. A seat
+                    // back in the group after that is forgotten here, and so is a word
+                    // whose client never left the group within `LEFT_WORD_GROUP_GRACE`:
+                    // a later silence of that seat is its line's, and keeps its clock.
+                    let gone_by_word: Vec<u8> = match t.table.as_ref() {
+                        Some(f) => {
+                            let sink = &t.tox_sink;
+                            let mut gone = Vec::new();
+                            t.left_by_word.retain(|seat, (said, out_seen)| {
+                                let in_group = f.roster().seats().iter().find(|e| e.seat == *seat).is_some_and(|e| {
+                                    sink.in_group(&e.app_public_key) || e.tox_key.is_some_and(|k| sink.in_group_line(&k))
+                                });
+                                match (in_group, *out_seen) {
+                                    (false, _) => {
+                                        *out_seen = true;
+                                        gone.push(*seat);
+                                        true
+                                    }
+                                    (true, true) => false,
+                                    (true, false) => said.elapsed() < LEFT_WORD_GROUP_GRACE,
+                                }
+                            });
+                            gone
+                        }
+                        None => Vec::new(),
+                    };
                     let Some(h) = t.hand.as_mut() else { continue };
 
                     // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
@@ -8948,6 +8985,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // the flood cause.
                     let flooders: Vec<u8> = t.flooders.keys().copied().collect();
                     h.note_flooders(&flooders);
+                    h.note_gone_by_their_word(&gone_by_word);
                     // `S1-FM`: the table's first hand gives a seat a minute more to
                     // join the table's group before anybody votes it out.
                     let held = h.first_hand_opening_held(now, 0);
@@ -11047,6 +11085,12 @@ const HEARING_FRESH: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// `D-060`: one hearing word a second from one carrier, at most.
 const HEARING_TAKEN_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `S1-GK`: how long after a seat's signed leave its client may still be in the
+/// table's group for the word to count. A client that says it leaves leaves the
+/// group with its next breath (`churn182836-10`: two seconds after the word); one
+/// still there is not leaving, and its later silence is its line's.
+const LEFT_WORD_GROUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `D-060`: how long a settled seat's trouble hearing the table, or the table's
 /// hearing it, lasts before the founder gives the seat back.

@@ -1684,6 +1684,11 @@ pub struct Hand {
     /// group, as the node says them. Its votes about them carry
     /// `CAUSE_FLOOD`. It only grows within a hand.
     flooders: BTreeSet<SeatIdx>,
+    /// `S1-GK`: seats whose player left the table by its own signed word and
+    /// whose client has left the table's group -- set by the node each tick
+    /// ([`Hand::note_gone_by_their_word`]). Voted about at once: nobody waits
+    /// out the clock of a player who said it is gone.
+    gone_by_word: BTreeSet<SeatIdx>,
     /// `D-051`: the seats this client has voted about at the stage now open,
     /// whatever the cause -- one vote about one seat at one stage, so a
     /// cause is fixed with the first.
@@ -2209,6 +2214,7 @@ impl Hand {
                 proof: None,
                 words: BTreeMap::new(),
                 flooders: BTreeSet::new(),
+                gone_by_word: BTreeSet::new(),
                 voted_about: BTreeSet::new(),
                 flood_named: BTreeSet::new(),
                 settled_pots: Vec::new(),
@@ -8888,6 +8894,11 @@ impl Hand {
     /// this one; at a turn, the budget -- the owner's choice, a player's time to
     /// decide is never cut.
     fn vote_after_ms(&self, seat: SeatIdx, owed: EventType) -> u64 {
+        // `S1-GK`: a seat whose player said it left, and whose client left the
+        // table's group, has nothing more to say at any stage or turn.
+        if self.gone_by_word.contains(&seat) {
+            return 0;
+        }
         let budget = u64::from(self.next_deadline_for(owed));
         if !self.crypto_stage() {
             return budget;
@@ -9917,6 +9928,14 @@ impl Hand {
     /// `D-051`: the seats this client cut off for flooding the table's carrier
     /// group. Its votes about them carry the flood cause from the next vote
     /// on; a seat once said stays said for the hand.
+    /// `S1-GK`: the seats whose player left the table by its own signed word
+    /// and whose client is out of the table's group, as the node reads them
+    /// now -- the whole set each time, so a seat back in the group is waited
+    /// for again.
+    pub fn note_gone_by_their_word(&mut self, seats: &[SeatIdx]) {
+        self.gone_by_word = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
+    }
+
     pub fn note_flooders(&mut self, seats: &[SeatIdx]) {
         for seat in seats {
             if *seat != self.open.my_seat {
@@ -15744,6 +15763,63 @@ mod tests {
             assert_eq!(n.required, vec![0, 1, 2], "{:?}", n.required);
             assert_eq!(n.genesis, nexts[0].genesis, "one GENESIS(k+1)");
         }
+    }
+
+    /// `S1-GK`: seats whose players left by their own signed word, out of the
+    /// table's group, are voted about at once -- not at the stage's deadline --
+    /// and certified out together as any quiet seats; a seat not so noted, or
+    /// noted and back in the group, keeps its clock.
+    #[test]
+    fn seats_gone_by_their_own_word_are_voted_about_at_once() {
+        let (mut hands, keys) = three_present_two_quiet();
+        let early = NOW + 1_000;
+        for i in 0..3 {
+            let out = bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], early, 0).unwrap());
+            assert!(out.is_empty(), "seat {i}: inside the deadline nobody is voted about");
+        }
+        for h in hands.iter_mut() {
+            h.note_gone_by_their_word(&[3, 4]);
+        }
+        // Mid-delivery bits do not hold a vote about a seat that said it left.
+        let mut votes: Vec<Vec<Vec<u8>>> = Vec::new();
+        for i in 0..3 {
+            let out = bytes_of_sends(hands[i].vote_on_timeouts(&keys[i], early, 0b11000).unwrap());
+            assert_eq!(out.len(), 2, "seat {i} votes about both at once");
+            votes.push(out);
+        }
+        let mut copies: Vec<Vec<u8>> = vec![Vec::new(); 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                if i == j {
+                    continue;
+                }
+                for v in &votes[j] {
+                    for b in bytes_of_sends(hands[i].on_event(v, &keys[i], early + 100).unwrap()) {
+                        copies[i] = b;
+                    }
+                }
+            }
+            assert!(!copies[i].is_empty(), "seat {i} seals a certificate about the pair");
+        }
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    hands[i].on_event(&copies[j], &keys[i], early + 200).expect("a peer's copy holds");
+                }
+            }
+            assert!(!hands[i].took_part(3) && !hands[i].took_part(4), "seat {i}: both leave the roster");
+        }
+        let nexts: Vec<Opening> = hands.iter().map(|h| h.next_hand().expect("a successor")).collect();
+        for n in &nexts {
+            assert_eq!(n.required, vec![0, 1, 2]);
+            assert_eq!(n.genesis, nexts[0].genesis, "one GENESIS(k+1)");
+        }
+
+        // Noted, then back in the group: the clock again.
+        let (mut again, keys) = three_present_two_quiet();
+        again[0].note_gone_by_their_word(&[3, 4]);
+        again[0].note_gone_by_their_word(&[]);
+        assert!(bytes_of_sends(again[0].vote_on_timeouts(&keys[0], early, 0).unwrap()).is_empty());
     }
 
     /// `D-051`: seats every voter's client cut off for flooding the table's

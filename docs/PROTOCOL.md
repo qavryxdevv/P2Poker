@@ -3378,8 +3378,17 @@ Codes `0x0600`–`0x06FF`. Full semantics in §8.
 
 *Direction:* any seat in the required voter set → all.
 *Legal:* only when the local monotonic timer for the subject stage has expired
-(§8.2) **and** this client has not accepted a valid event for that stage **from
-`subject_seat`**.
+(§8.2) -- at once for a seat gone by its own word, below -- **and** this client has
+not accepted a valid event for that stage **from `subject_seat`**.
+
+**`S1-GK`: at once, for a seat gone by its own word.** Once a client has accepted a
+seat's own signed `TABLE_LEAVE` (§7.10) at a set table, and that seat's client is
+out of the table's group, the client's timer for that seat has expired at every
+cryptographic step and every turn: nobody waits out the clock of a player who said
+it is gone. A seat back in the group has its clock again. A receiver still checks
+nothing about when a vote was cast, and a certificate still needs a vote from every
+seat of `V(S)`: a voter that did not hear the word votes at the deadline, and the
+seat is out when the last voter says so.
 
 **D-059: a shorter timer, at a cryptographic step, for a seat that has made the
 table wait.** Each client counts, on its own clock and once each stall is over,
