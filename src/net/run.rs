@@ -988,6 +988,9 @@ struct TableRun {
     /// table's group while it held no hand -- the table has dealt, whatever this
     /// client's roster says.
     dealt_heard: bool,
+    /// `S1-GM`: this table's founder left it by its own signed word -- the
+    /// founder's absence stands whatever is read of its line after.
+    founder_left_by_word: bool,
     /// `S1-GK`: seats of this set table whose player left by its own signed
     /// word, with when the word came and whether the seat's client has been seen
     /// out of the table's group since. Out of the group, the seat is voted about
@@ -1164,6 +1167,7 @@ impl TableRun {
             continuing: None,
             roster_keys_seen: std::collections::HashMap::new(),
             dealt_heard: false,
+            founder_left_by_word: false,
             left_by_word: std::collections::BTreeMap::new(),
             silence_peak: std::collections::BTreeMap::new(),
         }
@@ -2782,6 +2786,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             } else if founder_said {
                 // `D-061`: a window's joiner goes on without the founder, at once.
                 $t.founder_gone = tokio::time::Instant::now().checked_sub(FOUNDER_GONE_GRACE);
+                $t.founder_left_by_word = true;
                 let _ = events
                     .send(NodeEvent::Warning(
                         "the founder left the table before it started, by its own word: its seats go on without it (D-061)".into(),
@@ -3112,6 +3117,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.roster_keys_seen.clear();
             $t.silence_peak.clear();
             $t.dealt_heard = false;
+            $t.founder_left_by_word = false;
             $t.left_by_word.clear();
         }};
     }
@@ -3131,6 +3137,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             let continues_heard = std::mem::take(&mut $t.continues_heard);
             let keys_seen = std::mem::take(&mut $t.roster_keys_seen);
             let dealt_heard = $t.dealt_heard;
+            let founder_left_by_word = $t.founder_left_by_word;
             $t.tox_sink.clear();
             $t.tox_group_said = false;
             $t.table_announces = 0;
@@ -3147,6 +3154,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     $t.continues_heard = continues_heard;
                     $t.roster_keys_seen = keys_seen;
                     $t.dealt_heard = dealt_heard;
+                    $t.founder_left_by_word = founder_left_by_word;
                     $t.rejoin_key = Some(key);
                     $t.rejoin_at = Some(tokio::time::Instant::now() + REASK_FIRST);
                     let _ = events
@@ -3354,6 +3362,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             let continues_heard = std::mem::take(&mut $t.continues_heard);
             let keys_seen = std::mem::take(&mut $t.roster_keys_seen);
             let dealt_heard = $t.dealt_heard;
+            let founder_left_by_word = $t.founder_left_by_word;
             $t.tox_sink.clear();
             $t.tox_group_said = false;
             $t.table_announces = 0;
@@ -3370,6 +3379,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     $t.continues_heard = continues_heard;
                     $t.roster_keys_seen = keys_seen;
                     $t.dealt_heard = dealt_heard;
+                    $t.founder_left_by_word = founder_left_by_word;
                     $t.rejoin_key = Some(key);
                     $t.rejoin_at = Some(tokio::time::Instant::now() + REASK_AGAIN);
                     let _ = events.send(NodeEvent::Warning(format!("{why}; asking again in {} s (S1-FY)", REASK_AGAIN.as_secs()))).await;
@@ -6791,7 +6801,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 if t.hand.is_none() {
                     // `S1-GI`: a hand's frame over the table's group -- the table has
                     // dealt, whatever this client's roster says.
-                    if matches!(crate::net::chained::peek(&item.bytes, TABLE_FRAME_PEEK), Ok((_, hand_id, _)) if hand_id > 0) {
+                    if is_a_hand_frame(&item.bytes) {
                         t.dealt_heard = true;
                     }
                     // `S1-CR`: the running table's hand traffic, kept for the
@@ -8046,12 +8056,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             Some((key, JoinerDoes::WaitForFounder(why), deaf)) => {
                                 // `D-061`: the founder's absence, timed -- never through
                                 // this client's own deafness.
+                                // `S1-GM`: the founder's own signed word that it left is
+                                // a fact, and no reading of its line after it undoes it:
+                                // a client that leaves its table leaves the group a
+                                // moment later, and the one-shot exit gone, the next
+                                // reading had said *the founder can be heard again* and
+                                // cancelled the table's going on (`churn185200-10`).
                                 match (&why, deaf) {
                                     (Some(_), false) => {
                                         t.founder_gone.get_or_insert_with(tokio::time::Instant::now);
                                     }
-                                    (None, _) => t.founder_gone = None,
-                                    (Some(_), true) => {}
+                                    (None, _) if !t.founder_left_by_word => t.founder_gone = None,
+                                    (None, _) | (Some(_), true) => {}
                                 }
                                 if why != t.founder_away_said {
                                     t.founder_away_said = why.clone();
@@ -10733,6 +10749,18 @@ fn hears_nobody(f: &Formation, tox: &super::toxsink::TableSink) -> bool {
 /// (`D-060`); a seat that passes `QUIET_LIMIT_S` does so at most twelve seconds
 /// after the freshest one fell silent, which by then has been silent eight.
 const DEAF_QUIET_S: u64 = 8;
+
+/// `S1-GI`, `S1-GM`: whether bytes over the table's group are a frame of a dealt
+/// hand -- chained, of a hand. The formation's chained messages carry hand 0 and
+/// every unchained word -- a seat's hearing, its leave, a line of chat -- carries
+/// `UNCHAINED_HAND_ID`; reading those as hands made every seat that heard another
+/// seat's word believe its table had dealt (`churn185200-10`).
+fn is_a_hand_frame(bytes: &[u8]) -> bool {
+    matches!(
+        crate::net::chained::peek(bytes, TABLE_FRAME_PEEK),
+        Ok((_, hand_id, _)) if hand_id > 0 && hand_id != crate::protocol::messages::UNCHAINED_HAND_ID
+    )
+}
 
 /// `S1-GL`: how many seats of the roster left by their player's own signed word
 /// (`S1-GK`) and are out of the table's group now.
@@ -16274,6 +16302,25 @@ mod a_joiner_before_the_first_hand {
         assert!(still_forming(false, true, Some(ago(5)), None));
         assert!(!still_forming(true, true, Some(ago(5)), Some(ago(1))));
         assert!(!still_forming(true, false, Some(ago(20)), Some(ago(12))));
+    }
+
+    /// `S1-GM`: only a chained frame of a hand is a hand dealt -- never a seat's
+    /// word, which is unchained, nor the formation's own chained messages.
+    #[test]
+    fn a_seats_word_is_no_frame_of_a_dealt_hand() {
+        use crate::protocol::messages::EventType;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let seal = |kind: EventType, hand_id: u64| -> Vec<u8> {
+            let slot = crate::net::chained::Slot { table_id: [1; 32], hand_id, sequence: 0, previous_event_hash: [2; 32] };
+            crate::net::chained::seal(kind, &slot, &0u8, &key, 1_000, 30_000, 4096).unwrap()
+        };
+        assert!(is_a_hand_frame(&seal(EventType::HandInit, 1)));
+        assert!(is_a_hand_frame(&seal(EventType::TimeoutVote, 3)));
+        let hearing = super::super::tabletalk::hearing_word(&key, &[1; 32], 4, &[2], 1_000).unwrap();
+        assert!(!is_a_hand_frame(&hearing), "a seat's hearing word is unchained");
+        let leave = super::super::tabletalk::leave_word(&key, &[1; 32], 1_000).unwrap();
+        assert!(!is_a_hand_frame(&leave), "and so is its leave");
+        assert!(!is_a_hand_frame(b"not a frame"));
     }
 
     /// `S1-GL`: the first hand's group gate counts a seat gone by its own word as
