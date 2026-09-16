@@ -2388,8 +2388,14 @@ who is at the table — see `TABLE_READY`.
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) request_hash` | `bytes[32]` | |
-| `n(1) reason` | `u16` | enumerated: `1` table full, `2` seat taken, `3` bad password, `4` buy-in out of range, `5` advert expired, `6` banned, `7` capability mismatch, `8` already seated |
-| `n(2) retry_after_ms` | `u32` | ≤ 3 600 000; advisory |
+| `n(1) reason` | `u16` | enumerated: `1` table full, `2` seat taken, `3` bad password, `4` buy-in out of range, `5` advert expired, `6` banned, `7` capability mismatch, `8` already seated, `9` out for good (`D-047`), `10` too soon (`S1-GR`) |
+| `n(2) retry_after_ms` | `u32` | ≤ 3 600 000; advisory -- for `10`, when the founder seats the key again |
+
+**`10` too soon** (`S1-GR`, the owner's word): a key whose seat ended at this table
+-- its player's leave, or the seat given back -- twice or more in the last 10
+minutes, and that holds no seat now, is seated again only 30 s after its latest end,
+the wait doubling with each further end up to 5 minutes. Every other key is seated at
+once. Before the table is set only.
 
 *Receiver must validate:* signature and `request_hash`. The reason code is
 advisory: a rejection is never proof of anything, since the founder may lie. The
@@ -6816,7 +6822,11 @@ the seat is an absent one.
 
 **Before the table is set** (`S1-GA`) the word is said too, over the table's group
 **and** its topic -- a seat still joining the group is heard by the founder on the
-topic alone -- and received on either. The founder gives the seat back at once
+topic alone -- and received on either; and it is sent to the founder itself as a
+request on the join RPC (§4.3's channel, `S1-GP`), which the founder answers with an
+empty frame and judges as the topic's copy -- a player that leaves before its client
+is in the group, at a founder the topic's mesh does not reach, was otherwise heard by
+nobody and held its seat as a ghost. The founder gives the seat back at once
 (`PLAYER_LIST` said again without it); a joiner only notes it and waits for that
 list. A word said more than 10 s before the seat's present sitting, as the founder
 learned it, is an old word carried again and changes nothing. The founder's own
@@ -6852,9 +6862,11 @@ table forms -- and a receiver takes one a second from a carrier at most.
 **What the founder does with it.** A word stands for 15 s, and only while its
 serial is the founder's own. A seat still inside `GROUP_JOIN_GRACE` (40 s) of
 sitting down is neither judged nor counted against another. A settled seat is in
-trouble when it cannot hear a settled seat (its own word, which costs a liar only
-its own seat), or when two settled seats at least cannot hear it (so no single seat
-can have another given back). A trouble that lasts `MESH_GRACE` (20 s) gives the
+trouble when it cannot hear a settled seat whose own word stands (its own word,
+which costs a liar only its own seat), or when two settled seats at least cannot
+hear it (so no single seat can have another given back) -- or, when no word of its
+own stands, when any one settled seat cannot hear it (`S1-GQ`): not hearing a seat
+that says nothing is that seat's trouble and never its hearer's. A trouble that lasts `MESH_GRACE` (20 s) gives the
 seat back: of several, the one with the most trouble, and between equals the later
 seated. Once every seat hears every seat, a seat that has not ratified for
 `READY_GRACE` (15 s) holds the table up and is given back too. A seat whose word

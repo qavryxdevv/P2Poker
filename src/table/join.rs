@@ -129,6 +129,10 @@ pub enum RejectReason {
     /// `D-047`: the seat is out of this table for good, after its fourth
     /// absence; no request from that key sits here again.
     OutForGood = 9,
+    /// `S1-GR`: this key has left this table, or been given back by it, again and
+    /// again in the last minutes; the founder seats it again after
+    /// `retry_after_ms`, and seats every other key at once.
+    TooSoon = 10,
 }
 
 impl RejectReason {
@@ -160,6 +164,7 @@ pub fn refusal_words(code: u16) -> &'static str {
         7 => "capabilities do not match",
         8 => "already seated",
         9 => "this seat was removed after its fourth absence; the game at this table is over for good (D-047)",
+        10 => "this client sat down at this table and left it -- or lost the seat -- too often in a short time; the founder seats it again a little later",
         _ => "no reason this client understands",
     }
 }

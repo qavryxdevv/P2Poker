@@ -3476,12 +3476,12 @@ mod tests {
     /// player nothing at all.
     #[test]
     fn every_reason_code_has_words() {
-        // `D-047`: code 9 is the seat out for good.
-        for code in 1..=9u16 {
+        // `D-047`: code 9 is the seat out for good; `S1-GR`: 10, too soon.
+        for code in 1..=10u16 {
             assert_ne!(refusal(code), "no reason this client understands");
         }
         assert_eq!(refusal(0), "no reason this client understands");
-        assert_eq!(refusal(10), "no reason this client understands");
+        assert_eq!(refusal(11), "no reason this client understands");
     }
 
     #[test]

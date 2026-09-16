@@ -802,6 +802,14 @@ impl Formation {
         Ok(joinwire::publish_join_reject(request_hash, RejectReason::OutForGood, 0, &f.key, now_ms)?)
     }
 
+    /// `S1-GR`: refuse a request from a key that sat down here and left, or was
+    /// given back, too often lately -- with when to ask again.
+    pub fn refuse_too_soon(&self, bytes: &[u8], retry_after_ms: u32, now_ms: u64) -> Result<Vec<u8>, Failed> {
+        let f = self.founder.as_ref().ok_or(Failed::NotTheFounder)?;
+        let (_, _, request_hash) = joinwire::receive_join_request(bytes)?;
+        Ok(joinwire::publish_join_reject(request_hash, RejectReason::TooSoon, retry_after_ms, &f.key, now_ms)?)
+    }
+
     pub fn on_join_request(
         &mut self,
         bytes: &[u8],

@@ -346,6 +346,18 @@ struct LeaveBody {
 /// to its seats -- signed by the seat's key, for this table. The only word from
 /// which another seat may say that a player left: the carrier's own report of a
 /// member leaving on purpose is also made of a client that merely rejoins.
+/// `S1-GP`: the table a leave word names, read without believing anything else
+/// of it -- to route the word to its table's slot; `receive_leave` judges it.
+pub fn leave_table_of(bytes: &[u8]) -> Option<[u8; 32]> {
+    let signed: SignedEvent = from_canonical(bytes, LOBBY_MSG_MAX).ok()?;
+    let envelope: EventBody = from_canonical(&signed.body, LOBBY_MSG_MAX).ok()?;
+    if EventType::try_from(envelope.event_type).ok()? != EventType::TableLeave {
+        return None;
+    }
+    let body: LeaveBody = from_canonical(&envelope.payload, LOBBY_MSG_MAX).ok()?;
+    Some(body.table_id)
+}
+
 pub fn leave_word(key: &SigningKey, table_id: &[u8; 32], now_ms: u64) -> Result<Vec<u8>, &'static str> {
     let body = LeaveBody { table_id: *table_id, reason: LEAVE_BY_THE_PLAYER };
     let body_bytes = to_canonical(&body).map_err(|_| "the body does not encode")?;
@@ -684,6 +696,16 @@ mod tests {
             receive(&word, &TABLE, &CARRIER, seat_of, NOW, &mut Talk::default()),
             Err(NotHeard::Malformed(_))
         ));
+    }
+
+    /// `S1-GP`: a leave word names its table for routing; nothing else does.
+    #[test]
+    fn a_leave_word_names_its_table_and_nothing_else_does() {
+        let word = leave_word(&key(2), &TABLE, NOW).unwrap();
+        assert_eq!(leave_table_of(&word), Some(TABLE));
+        let hearing = hearing_word(&key(2), &TABLE, 3, &[], NOW).unwrap();
+        assert_eq!(leave_table_of(&hearing), None);
+        assert_eq!(leave_table_of(b"nothing"), None);
     }
 
     /// `D-061`: a seat's word that its forming table goes on at a table it founded

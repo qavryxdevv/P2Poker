@@ -991,6 +991,10 @@ struct TableRun {
     /// `S1-GM`: this table's founder left it by its own signed word -- the
     /// founder's absence stands whatever is read of its line after.
     founder_left_by_word: bool,
+    /// `S1-GR`: at a table this client founded, when each key's seat ended here
+    /// lately -- its player's leave, or the seat given back -- so a key that keeps
+    /// sitting down and leaving is seated again later each time, and nobody else is.
+    seat_ends: std::collections::HashMap<[u8; 32], Vec<tokio::time::Instant>>,
     /// `S1-GK`: seats of this set table whose player left by its own signed
     /// word, with when the word came and whether the seat's client has been seen
     /// out of the table's group since. Out of the group, the seat is voted about
@@ -1024,6 +1028,13 @@ struct JoinAsked {
     seat: Option<u8>,
     password: Option<Vec<u8>>,
 }
+
+/// `S1-GR`: how far back a key's ends of its seat at a table count.
+const FLAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+/// `S1-GR`: the wait after the second end of a key's seat in `FLAP_WINDOW`.
+const FLAP_FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// `S1-GR`: the longest wait, however often a key has sat down and left.
+const FLAP_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// `S1-FY`: how soon a seat given back before the start is asked for again,
 /// and how long after an asking that did not go through.
@@ -1168,6 +1179,7 @@ impl TableRun {
             roster_keys_seen: std::collections::HashMap::new(),
             dealt_heard: false,
             founder_left_by_word: false,
+            seat_ends: std::collections::HashMap::new(),
             left_by_word: std::collections::BTreeMap::new(),
             silence_peak: std::collections::BTreeMap::new(),
         }
@@ -1344,6 +1356,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // `S1-FG`: by the slot's number, which a closed slot does not shift.
     let mut join_pending: std::collections::HashMap<libp2p::request_response::OutboundRequestId, u8> =
         std::collections::HashMap::new();
+    // `S1-GP`: the leave words sent to founders over the join's channel, whose
+    // empty answers -- or failures -- concern no table.
+    let mut leaves_said: std::collections::HashSet<libp2p::request_response::OutboundRequestId> =
+        std::collections::HashSet::new();
     let first = &mut tables[0];
     // Arm the boundary: fire now for phase 1, deal after the pause.
     macro_rules! arm_boundary {
@@ -2695,6 +2711,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(bytes) = super::tabletalk::leave_word(&app_key, &f.table_id(), super::node::now_unix_ms()) {
                     let _ = $t.tox_sink.try_broadcast(&bytes);
                     if f.session().is_none() {
+                        // `S1-GP`: and to the founder itself, over the join's own
+                        // channel. A player that leaves before its client is in the
+                        // group is heard there by nobody, and the topic's mesh to a
+                        // relayed founder may carry nothing: the founder held such a
+                        // seat until a minute and a half of ping silence -- a ghost
+                        // the other seats could not hear, which gave the healthy
+                        // ones back (the owner's tables, 2026-09-16).
+                        if !f.is_founder() {
+                            if let Ok(founder) = PeerId::from_bytes(f.founder_peer_id()) {
+                                let asked = swarm.behaviour_mut().join.send_request(&founder, bytes.clone());
+                                leaves_said.insert(asked);
+                            }
+                        }
                         if let Some(topic) = $t.table_topic.as_ref() {
                             let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes);
                         }
@@ -2712,9 +2741,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             let peer: Vec<u8> = $peer;
             let tox_key: Option<[u8; 32]> = $tox_key;
             let why: String = $why;
+            // `S1-GR`: whose seat ends here, for the key's count.
+            let leaving_key = $t
+                .table
+                .as_ref()
+                .and_then(|f| f.roster().seats().iter().find(|e| e.peer_id == peer).map(|e| e.app_public_key));
             if let Some(f) = $t.table.as_mut().filter(|f| f.is_founder()) {
                 match f.release_seat_before_the_first_hand(&peer, $now) {
                     Ok(sends) if !sends.is_empty() => {
+                        if let Some(k) = leaving_key {
+                            let now_i = tokio::time::Instant::now();
+                            let ends = $t.seat_ends.entry(k).or_default();
+                            ends.retain(|at| at.elapsed() < FLAP_WINDOW);
+                            ends.push(now_i);
+                        }
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "seat {seat} {why} and the seat is free again"
@@ -3124,6 +3164,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.silence_peak.clear();
             $t.dealt_heard = false;
             $t.founder_left_by_word = false;
+            $t.seat_ends.clear();
             $t.left_by_word.clear();
         }};
     }
@@ -3431,6 +3472,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // table its join request names, by the request its join answer
                 // answers -- and the active table for everything else.
                 let Some(which) = table_for_event(&tables, &event, active, &join_pending) else {
+                    // `S1-GP`: the founder's answer to a leave word is nobody's table's.
+                    let leave_answered = match &event {
+                        SwarmEvent::Behaviour(PokerBehaviourEvent::Join(
+                            request_response::Event::Message {
+                                message: request_response::Message::Response { request_id, .. },
+                                ..
+                            }
+                            | request_response::Event::OutboundFailure { request_id, .. },
+                        )) => leaves_said.remove(request_id),
+                        _ => false,
+                    };
+                    if leave_answered {
+                        continue;
+                    }
                     // `S1-FG`: an answer to a join this client no longer waits for --
                     // given up, its slot closed. It went to the active table before,
                     // and the table being played read it as its own join gone wrong.
@@ -3897,6 +3952,32 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // one seat — rests on using this and not the
                                 // value in the payload.
                                 let authenticated = peer.to_bytes();
+                                // `S1-GP`: a seat's own word that its player left, sent to
+                                // this founder directly -- judged as over the topic, and
+                                // answered with nothing but an empty frame.
+                                if super::tabletalk::leave_table_of(&request).is_some() {
+                                    let carrier: [u8; 32] = *blake3::hash(&authenticated).as_bytes();
+                                    let heard = t.table.as_ref().filter(|f| f.is_founder() && f.session().is_none()).map(|f| {
+                                        super::tabletalk::receive_leave(
+                                            &request,
+                                            &f.table_id(),
+                                            &carrier,
+                                            |k| f.roster().seat_of(k),
+                                            now,
+                                            &mut t.chat_limits,
+                                        )
+                                    });
+                                    let _ = swarm.behaviour_mut().join.send_response(channel, Vec::new());
+                                    if let Some(Ok((seat, key, said_ms))) = heard {
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "seat {seat}'s word that its player left came to this founder directly (S1-GP)"
+                                            )))
+                                            .await;
+                                        a_seat_left_before_the_start!(t, seat, key, said_ms);
+                                    }
+                                    continue;
+                                }
                                 let Some(f) = t.table.as_mut() else {
                                     // No table here to join. Saying nothing is
                                     // right: an answer would confirm that this
@@ -3927,6 +4008,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .and_then(|e| e.tox_key);
                                 if let Some(k) = returning {
                                     t.tox_sink.tell(super::toxsink::Seat::Back(k));
+                                }
+                                // `S1-GR`: a key that kept sitting down and leaving here --
+                                // not seated now -- waits a little before it sits again.
+                                if let Ok((_, sender, _)) = super::joinwire::receive_join_request(&request) {
+                                    let seated = f.roster().seats().iter().any(|e| e.app_public_key == sender);
+                                    let wait = t.seat_ends.get(&sender).and_then(|ends| flap_wait(ends, tokio::time::Instant::now()));
+                                    if let Some(wait) = wait.filter(|_| !seated && f.session().is_none()) {
+                                        let ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX);
+                                        if let Ok(bytes) = f.refuse_too_soon(&request, ms, now) {
+                                            let _ = swarm.behaviour_mut().join.send_response(channel, bytes);
+                                            let _ = events
+                                                .send(NodeEvent::Warning(format!(
+                                                    "a player that sat down here and left again and again asks to join: seated again in {} s, not now (S1-GR)",
+                                                    wait.as_secs().max(1)
+                                                )))
+                                                .await;
+                                        }
+                                        continue;
+                                    }
                                 }
                                 // `D-047`: a seat out of this table for good asks again --
                                 // refused with the reason, whatever else the request says.
@@ -4132,7 +4232,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             ))
                                             .await;
                                     }
-                                    Err(Failed::Refused { reason, .. }) => {
+                                    Err(Failed::Refused { reason, retry_after_ms }) => {
                                         t.table = None;
                                         // The Tox group goes with the table. Dropping the handle
                                         // tells the driver to leave and joins its thread, which
@@ -4152,11 +4252,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 && reason != crate::table::join::RejectReason::OutForGood.code()
                                         }) {
                                             Some(key) => {
-                                                t.rejoin_at = Some(tokio::time::Instant::now() + REASK_AGAIN);
+                                                // `S1-GR`: a key the founder seats again later is
+                                                // asked for again when it said.
+                                                let again = if reason == crate::table::join::RejectReason::TooSoon.code() {
+                                                    std::time::Duration::from_millis(u64::from(retry_after_ms).max(1_000))
+                                                } else {
+                                                    REASK_AGAIN
+                                                };
+                                                t.rejoin_at = Some(tokio::time::Instant::now() + again);
                                                 let why = format!(
                                                     "the founder says no: {}; asking again in {} s",
                                                     crate::table::join::refusal_words(reason),
-                                                    REASK_AGAIN.as_secs()
+                                                    again.as_secs()
                                                 );
                                                 let _ = events.send(NodeEvent::Warning(format!("{why} (S1-FY)"))).await;
                                                 let _ = events.send(NodeEvent::SeatGivenBack { key, why }).await;
@@ -7840,8 +7947,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .map(|(x, sat)| {
                                     // `S1-GE`: not hearing the founder is the founder's trouble,
                                     // read by `D-061`, and never a seat's own.
-                                    let cannot = fresh(*x)
-                                        .map_or(0, |u| u.iter().filter(|s| seats.contains(s) && Some(**s) != me).count());
+                                    // `S1-GQ`: and not hearing a seat that says nothing either
+                                    // -- a player gone without a word the founder heard, a
+                                    // client that died -- is that seat's trouble, not the
+                                    // hearer's: the owner's tables gave a healthy seat back
+                                    // twice for a ghost it could not hear.
+                                    let cannot = fresh(*x).map_or(0, |u| {
+                                        u.iter().filter(|s| seats.contains(s) && Some(**s) != me && fresh(**s).is_some()).count()
+                                    });
                                     let by = seats
                                         .iter()
                                         .filter(|y| *y != x)
@@ -7860,7 +7973,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let now_i = tokio::time::Instant::now();
                             let mut due: Vec<(u8, usize, usize, u64, bool)> = Vec::new();
                             for (x, cannot, by, stalling, sat, speaking) in &marks {
-                                if *cannot >= 1 || *by >= 2 {
+                                if in_hearing_trouble(*cannot, *by, *speaking) {
                                     if t.mesh_trouble.entry(*x).or_insert(now_i).elapsed() >= MESH_GRACE {
                                         due.push((*x, *cannot, *by, *sat, *speaking));
                                     }
@@ -10675,10 +10788,13 @@ fn table_for_event(
             ..
         })) => super::joinwire::receive_join_request(request)
             .ok()
-            .and_then(|(req, _, _)| {
+            .map(|(req, _, _)| req.table_id)
+            // `S1-GP`: a seat's leave word, sent to its founder directly.
+            .or_else(|| super::tabletalk::leave_table_of(request))
+            .and_then(|table_id| {
                 tables
                     .iter()
-                    .position(|t| t.table.as_ref().is_some_and(|f| f.table_id() == req.table_id))
+                    .position(|t| t.table.as_ref().is_some_and(|f| f.table_id() == table_id))
             }),
         // `S1-FG`: a join's answer, or its failure, goes to the slot that asked
         // and to no other. An answer nobody waits for any more is for no table:
@@ -10775,6 +10891,33 @@ fn is_a_hand_frame(bytes: &[u8]) -> bool {
         crate::net::chained::peek(bytes, TABLE_FRAME_PEEK),
         Ok((_, hand_id, _)) if hand_id > 0 && hand_id != crate::protocol::messages::UNCHAINED_HAND_ID
     )
+}
+
+/// `D-060`, `S1-GQ`: whether a settled seat is in trouble with the table's
+/// hearing: it cannot hear a seat that speaks (its own word, which costs a liar
+/// only its own seat), or two seats cannot hear it -- or, when it says nothing
+/// itself, any one seat cannot.
+fn in_hearing_trouble(cannot_speaking: usize, unheard_by: usize, speaking: bool) -> bool {
+    cannot_speaking >= 1 || unheard_by >= 2 || (!speaking && unheard_by >= 1)
+}
+
+/// `S1-GR`, the owner's word (2026-09-16): *only the peer that keeps sitting down
+/// and leaving waits longer before it sits down again, not everybody*. How long a
+/// key whose seat ended at this table at `ends` -- its player's leave, or the seat
+/// given back -- still waits before it is seated again, if at all: nothing for the
+/// first end in `FLAP_WINDOW`, then `FLAP_FIRST_WAIT` after the latest, doubling
+/// with each further end up to `FLAP_WAIT_MAX`. The owner's own quick joins and
+/// leaves had kept a table in a loop of seats taken and given back.
+fn flap_wait(ends: &[tokio::time::Instant], now: tokio::time::Instant) -> Option<std::time::Duration> {
+    let recent: Vec<tokio::time::Instant> =
+        ends.iter().copied().filter(|at| now.saturating_duration_since(*at) < FLAP_WINDOW).collect();
+    if recent.len() < 2 {
+        return None;
+    }
+    let doublings = u32::try_from(recent.len() - 2).unwrap_or(u32::MAX).min(8);
+    let wait = FLAP_FIRST_WAIT.saturating_mul(1u32 << doublings).min(FLAP_WAIT_MAX);
+    let latest = recent.iter().copied().max()?;
+    wait.checked_sub(now.saturating_duration_since(latest)).filter(|left| !left.is_zero())
 }
 
 /// `S1-GL`: how many seats of the roster left by their player's own signed word
@@ -16325,6 +16468,34 @@ mod a_joiner_before_the_first_hand {
         assert!(still_forming(false, true, Some(ago(5)), None));
         assert!(!still_forming(true, true, Some(ago(5)), Some(ago(1))));
         assert!(!still_forming(true, false, Some(ago(20)), Some(ago(12))));
+    }
+
+    /// `S1-GQ`: a seat that cannot hear a silent seat is not in trouble for it;
+    /// the silent seat is, on one seat's word.
+    #[test]
+    fn a_seat_that_says_nothing_is_in_trouble_on_one_word() {
+        assert!(in_hearing_trouble(1, 0, true), "cannot hear a speaking seat: its own trouble");
+        assert!(!in_hearing_trouble(0, 1, true), "one word against a speaking seat is not enough");
+        assert!(in_hearing_trouble(0, 2, true));
+        assert!(in_hearing_trouble(0, 1, false), "one word against a silent seat is");
+        assert!(!in_hearing_trouble(0, 0, false), "silence alone is the founder's other readings'");
+    }
+
+    /// `S1-GR`: a key seated again at once after one end of its seat, and later and
+    /// later after each further end in the window -- and ends long past count for
+    /// nothing.
+    #[test]
+    fn only_a_key_that_keeps_sitting_down_and_leaving_waits() {
+        let now = tokio::time::Instant::now() + std::time::Duration::from_secs(3_600);
+        let ago = |s: u64| now.checked_sub(std::time::Duration::from_secs(s)).unwrap();
+        assert_eq!(flap_wait(&[], now), None);
+        assert_eq!(flap_wait(&[ago(5)], now), None, "one leave is a player's right");
+        assert_eq!(flap_wait(&[ago(40), ago(10)], now), Some(FLAP_FIRST_WAIT - std::time::Duration::from_secs(10)));
+        assert_eq!(flap_wait(&[ago(100), ago(40), ago(10)], now), Some(FLAP_FIRST_WAIT * 2 - std::time::Duration::from_secs(10)));
+        assert_eq!(flap_wait(&[ago(90), ago(80), ago(70), ago(60), ago(50), ago(40), ago(30), ago(20), ago(10)], now), Some(FLAP_WAIT_MAX - std::time::Duration::from_secs(10)));
+        assert_eq!(flap_wait(&[ago(100), ago(40)], now), None, "the wait after the latest end is over");
+        let window = FLAP_WINDOW.as_secs();
+        assert_eq!(flap_wait(&[ago(window + 20), ago(window + 10), ago(10)], now), None, "ends outside the window count for nothing");
     }
 
     /// `S1-GM`: only a chained frame of a hand is a hand dealt -- never a seat's
