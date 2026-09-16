@@ -887,6 +887,18 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     // Checked **after** the fold, not before: the store is what
                     // the fold fills, and the first version asked it a question
                     // one event too early and never joined anything.
+                    // `S1-GJ`: a table lost before it was ever set -- a join the
+                    // founder did not answer, on a bed whose clients are kept as
+                    // windows' (`P2P_POKER_STAYS`) -- is no seat. The window's player
+                    // closes it and joins again; this driver does the same, or it
+                    // held the lost table for the rest of the run and never asked
+                    // again (`churn191309-10`: one of ten, the table never set).
+                    if join.is_some()
+                        && state.lost.is_some()
+                        && state.seated.as_ref().is_some_and(|s| s.session.is_none())
+                    {
+                        state.close_lost_tables();
+                    }
                     if let (Some(want), None) = (&join, state.seated.as_ref()) {
                         // Only the two edges reach the store, and `S1-GJ`'s
                         // retry. Every other event — a peer count, a ping, a

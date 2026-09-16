@@ -8841,8 +8841,15 @@ impl Hand {
     /// seat the opening waits on; `and_then_ms` extends the same window for
     /// the local abort, which gives a certificate its chance first.
     pub fn first_hand_opening_held(&self, now_ms: u64, and_then_ms: u64) -> bool {
+        // `S1-GN`: the allowance is for a seat still joining the group, never for
+        // one whose player said it left: an opening that waits on such seats alone
+        // is not held (`churn191947-10`: a player gone a second after the set held
+        // the table's first hand for two minutes).
+        let waiting = self.waiting_for();
+        let only_the_gone = !waiting.is_empty() && waiting.iter().all(|s| self.gone_by_word.contains(s));
         self.open.hand_id == 1
             && matches!(self.phase, Phase::Init(_))
+            && !only_the_gone
             && now_ms.saturating_sub(self.stage_at_ms)
                 < u64::from(self.open.crypto_step_timeout_ms)
                     .saturating_add(FIRST_HAND_JOIN_ALLOWANCE_MS)
@@ -14850,7 +14857,16 @@ mod tests {
     fn the_first_hands_opening_waits_a_minute_longer_for_its_seats() {
         let o = opening3(0);
         let budget = u64::from(o.crypto_step_timeout_ms);
-        let (h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
+        let (mut h, _) = Hand::open(o, &key(10), NOW, 30_000).unwrap();
+        // `S1-GN`: not for seats gone by their own word -- unless another seat is
+        // still waited for too.
+        let waiting = h.waiting_for();
+        assert_eq!(waiting.len(), 2, "the opening waits on both other seats");
+        h.note_gone_by_their_word(&waiting[..1]);
+        assert!(h.first_hand_opening_held(NOW + 1, 0), "one seat still joining holds it");
+        h.note_gone_by_their_word(&waiting);
+        assert!(!h.first_hand_opening_held(NOW + 1, 0), "the gone alone do not");
+        h.note_gone_by_their_word(&[]);
         assert!(h.first_hand_opening_held(NOW + budget + 1, 0), "past the budget, still held");
         assert!(h.first_hand_opening_held(NOW + budget + FIRST_HAND_JOIN_ALLOWANCE_MS - 1, 0));
         assert!(!h.first_hand_opening_held(NOW + budget + FIRST_HAND_JOIN_ALLOWANCE_MS, 0), "and then not");

@@ -8861,8 +8861,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             let sink = &t.tox_sink;
                             let mut gone = Vec::new();
                             t.left_by_word.retain(|seat, (said, out_seen)| {
+                                // Present: in the group, and heard there within
+                                // `DEAF_QUIET_S` -- a client that said it left and went
+                                // quiet is gone before the library times it out of the
+                                // group, 58 s on (`churn191947-10`).
                                 let in_group = f.roster().seats().iter().find(|e| e.seat == *seat).is_some_and(|e| {
-                                    sink.in_group(&e.app_public_key) || e.tox_key.is_some_and(|k| sink.in_group_line(&k))
+                                    let held = sink.in_group(&e.app_public_key) || e.tox_key.is_some_and(|k| sink.in_group_line(&k));
+                                    let quiet = [sink.quiet_secs(&e.app_public_key), e.tox_key.and_then(|k| sink.quiet_line(&k))]
+                                        .into_iter()
+                                        .flatten()
+                                        .min();
+                                    held && quiet.is_none_or(|q| q < DEAF_QUIET_S)
                                 });
                                 match (in_group, *out_seen) {
                                     (false, _) => {
@@ -11142,11 +11151,13 @@ const HEARING_FRESH: std::time::Duration = std::time::Duration::from_secs(15);
 /// `D-060`: one hearing word a second from one carrier, at most.
 const HEARING_TAKEN_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// `S1-GK`: how long after a seat's signed leave its client may still be in the
-/// table's group for the word to count. A client that says it leaves leaves the
-/// group with its next breath (`churn182836-10`: two seconds after the word); one
-/// still there is not leaving, and its later silence is its line's.
-const LEFT_WORD_GROUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// `S1-GK`: how long after a seat's signed leave its client may still be heard in
+/// the table's group for the word to count. A client that says it leaves leaves
+/// the group with its next breath (`churn182836-10`: two seconds after the word),
+/// or at least falls silent there -- read at a five-second sweep, so silent for
+/// `DEAF_QUIET_S` within fifteen seconds; one still speaking at thirty is not
+/// leaving, and its later silence is its line's.
+const LEFT_WORD_GROUP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `D-060`: how long a settled seat's trouble hearing the table, or the table's
 /// hearing it, lasts before the founder gives the seat back.
