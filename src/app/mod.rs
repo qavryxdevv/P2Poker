@@ -1915,8 +1915,13 @@ impl AppState {
                 t.name = name;
                 t.seats = seats;
                 t.needed = needed;
-                t.small_blind = small_blind;
-                t.big_blind = big_blind;
+                // `S1-FW`: the advert's blinds are the first level's. Said again
+                // with every roster now, they must not put a table whose hands
+                // have raised the level back to it.
+                if t.blinds_seen.0 == 0 {
+                    t.small_blind = small_blind;
+                    t.big_blind = big_blind;
+                }
                 t.action_ms = action_ms;
             }
             NodeEvent::TableReal { key, session } => {
@@ -4004,6 +4009,72 @@ mod tests {
         t.apply(NodeEvent::TableState { hand_id: 1, street: 1, pot: 20_100, to_act: Some(0), stacks: vec![9_950, 9_900, 0], bets: vec![50, 100, 10_000], folded: vec![false, false, false] });
         t.apply(NodeEvent::SeatLeft { seat: 0, quit: true, removed: false });
         assert!(!t.opponent_left && !t.opponent_out, "MIR is all in and in the game");
+    }
+
+    /// `S1-FW`, the owner (2026-09-16): after a reconnect the clock did not count
+    /// down. A seat back through *already seated* was never told the table's
+    /// parameters, and a window with no decision time draws every clock full and
+    /// still. The node says them with every roster now: the hero's clock runs
+    /// down from the table's thirty seconds, and the parameters said again leave
+    /// the blinds a hand has raised where they are.
+    #[test]
+    fn a_seat_back_counts_its_clock_down_and_keeps_the_blinds_its_hands_raised() {
+        let key = [7u8; 32];
+        let params = || NodeEvent::TableParams {
+            key,
+            name: "New table".into(),
+            seats: 2,
+            needed: 2,
+            small_blind: 50,
+            big_blind: 100,
+            action_ms: 30_000,
+        };
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key, seat: 0 });
+        let hero_clock = |s: &AppState| s.table_view().seats.iter().find(|x| x.seat == 0).and_then(|x| x.clock);
+        s.apply(params());
+        s.apply(NodeEvent::Roster { key, seats: vec![(0, "me".into(), 10_000), (1, "MIR".into(), 10_000)] });
+        s.apply(NodeEvent::TableReal { key, session: [9u8; 32] });
+        s.apply(NodeEvent::HandBegan { hand_id: 12, button: 0, dealt_in: vec![0, 1], small_blind: 100, big_blind: 200 });
+        s.apply(NodeEvent::YourTurn {
+            hand_id: 12,
+            street: 0,
+            to_call: 100,
+            pot: 300,
+            can_check: false,
+            can_call: true,
+            can_bet: false,
+            can_raise: true,
+            min_raise_to: 400,
+            max_raise_to: 9_800,
+            elapsed_ms: 10_000,
+        });
+        let left = hero_clock(&s).expect("the hero's clock runs");
+        assert!((0.6..0.7).contains(&left), "a third of thirty seconds gone: {left}");
+        s.apply(params());
+        let seat = s.seated.as_ref().expect("seated");
+        assert_eq!((seat.small_blind, seat.big_blind), (100, 200), "the level the hands raised stands");
+        assert_eq!(seat.action_ms, 30_000);
+
+        // Without the table's word the clock stands full: what the seat back saw.
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key, seat: 0 });
+        s.apply(NodeEvent::Roster { key, seats: vec![(0, "me".into(), 10_000), (1, "MIR".into(), 10_000)] });
+        s.apply(NodeEvent::HandBegan { hand_id: 12, button: 0, dealt_in: vec![0, 1], small_blind: 100, big_blind: 200 });
+        s.apply(NodeEvent::YourTurn {
+            hand_id: 12,
+            street: 0,
+            to_call: 100,
+            pot: 300,
+            can_check: false,
+            can_call: true,
+            can_bet: false,
+            can_raise: true,
+            min_raise_to: 400,
+            max_raise_to: 9_800,
+            elapsed_ms: 10_000,
+        });
+        assert_eq!(hero_clock(&s), Some(1.0), "no decision time, no countdown");
     }
 
     /// `S1-FU`, the owner's game (2026-09-15): a client back at a hand it took up

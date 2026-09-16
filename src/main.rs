@@ -1370,6 +1370,14 @@ fn preview_table(args: &[String]) {
     if has("--preview-showcase") {
         view.preview = false;
     }
+    // `S1-FW`: the hero raised, was re-raised and decides again -- its word from
+    // earlier in the street above the box, its clock under its name.
+    if has("--preview-reraised") {
+        for s in view.seats.iter_mut().filter(|s| s.seat == 0) {
+            s.act = Some(SeatAct::Raise);
+            s.clock = Some(0.55);
+        }
+    }
     if has("--preview-sitout") {
         view.hero_sitting_out = true;
         for s in view.seats.iter_mut().filter(|s| s.seat == 2) {

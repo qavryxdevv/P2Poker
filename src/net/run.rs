@@ -3476,7 +3476,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                 seat,
                                             }).await;
                                         }
-                                        report_params(&events, f).await;
                                         report_roster(&events, f).await;
                                 seat_on_tox(f, &t.tox_sink);
                                     }
@@ -5234,7 +5233,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         t.table_topic = Some(topic);
                                         t.table = Some(f);
                                         let _ = events.send(NodeEvent::Hosting { key }).await;
-                                        report_params(&events, t.table.as_ref().unwrap()).await;
                                         report_roster(&events, t.table.as_ref().unwrap()).await;
                         if let Some(f) = t.table.as_ref() { seat_on_tox(f, &t.tox_sink); }
                                         // Published first, shown second: a table
@@ -5586,7 +5584,6 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         )))
                                         .await;
                                     let _ = events.send(NodeEvent::Hosting { key }).await;
-                                    report_params(&events, t.table.as_ref().unwrap()).await;
                                     report_roster(&events, t.table.as_ref().unwrap()).await;
                                     if let Some(f) = t.table.as_ref() {
                                         seat_on_tox(f, &t.tox_sink);
@@ -9747,6 +9744,11 @@ fn seats_on_tox(f: &Formation, tox: &super::toxsink::TableSink) {
 }
 
 async fn report_roster(events: &Events, f: &Formation) {
+    // `S1-FW`: and the table's parameters, the same way. A seat back from a
+    // restart through *already seated* was never told them -- they went out
+    // only with a fresh acceptance, a hosting and a founder's return -- so its
+    // window held no decision time and drew every clock full and still.
+    report_params(events, f).await;
     // `S1-DG`: the seat, whenever the roster is said and the formation knows
     // it. A seat that came back through *already seated* learned its number
     // from the founder's list and told the window nothing -- `Seated` went
@@ -14950,5 +14952,18 @@ mod back_at_the_table {
             let cards = b.find("say_the_cards!($t, $h)").unwrap_or_else(|| panic!("{road} says the cards"));
             assert!(began < report && report < cards, "{road}: the start, the report, the cards");
         }
+    }
+
+    /// `S1-FW`: the table's parameters -- the decision time among them -- are
+    /// said wherever the roster is, so a seat back through *already seated*
+    /// hears them too, and not beside it road by road.
+    #[test]
+    fn the_tables_parameters_are_said_with_every_roster() {
+        let src = include_str!("run.rs");
+        let code = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("the tests")];
+        let from = code.find("async fn report_roster(").expect("report_roster");
+        let to = from + code[from..].find("\n}\n").expect("its end");
+        assert!(code[from..to].contains("report_params(events, f).await"), "report_roster says the parameters");
+        assert_eq!(code.matches("report_params(").count(), 2, "and it is the one caller: its definition and that call");
     }
 }

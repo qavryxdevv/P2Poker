@@ -1190,7 +1190,20 @@ fn seat_box(
     let name = style::elided(p, if seat.name.is_empty() { "---" } else { &seat.name }, name_size, Weight::DemiBold, info.width() - 2.0);
     style::text(p, info.left_top(), Align2::LEFT_TOP, &name, name_size, Weight::DemiBold, style::faded(style::NAME, opacity.max(0.6)));
     style::text(p, info.right_bottom(), Align2::RIGHT_BOTTOM, &stack_text, name_size, Weight::Bold, style::faded(style::COLOR_ACCENT, opacity.max(0.6)));
-    if seat.rating > 0 {
+    // `S1-FW`: the hero's clock, under its name -- the place the owner chose
+    // for it, clear of the chips and the badge in the strip above the box, where
+    // it had been drawn only while the hero carried no badge: after a re-raise
+    // the hero's own word from earlier in the street stood there, and its turn
+    // had no clock at all. It takes the stars' place for the turn.
+    let hero_clock = hero && at_turn && !sits_out;
+    if hero_clock {
+        let top = info.top() + name_size * 1.15;
+        let middle = (top + info.bottom()) / 2.0;
+        let right = (info.right() - stack_w - 8.0 * s).max(info.left() + 24.0 * s);
+        let bar = Rect::from_min_max(pos2(info.left() + 1.0 * s, middle - 3.5 * s), pos2(right, middle + 3.5 * s));
+        style::timeout_bar(p, bar, seat.clock.unwrap_or(0.0), style::TIMEOUT_SELF);
+    }
+    if seat.rating > 0 && !hero_clock {
         let left_room = info.width() - stack_w - 6.0;
         let mut star_size = (11.0 * s).max(8.0);
         while star_size > 7.0 && style::text_width(p, "★★★★★", star_size, Weight::Regular) > left_room {
@@ -1204,12 +1217,17 @@ fn seat_box(
         style::text(p, pos2(rect.right() - 4.0 * s, rect.top() + 3.0 * s), Align2::RIGHT_TOP, "muted", (10.0 * s).max(8.0), Weight::Medium, style::PANEL_MUTED);
     }
 
-    // The badge and the clock: over the cards for an opponent, in the strip
-    // above the box for the hero. `D-052`: a winner's seat says its own word in
-    // the pill above its box instead, and the action it last took is stale the
-    // moment the hand is settled, so that is not drawn over it.
+    // The badge and the clock: over the cards for an opponent, the badge in the
+    // strip above the box for the hero (its clock is under its name, above).
+    // `D-052`: a winner's seat says its own word in the pill above its box
+    // instead, and the action it last took is stale the moment the hand is
+    // settled, so that is not drawn over it. `S1-FW`: an opponent deciding has
+    // its clock where its badge was -- the word it carries is from earlier in
+    // the street, the one it is deciding past, and it hid the clock after every
+    // re-raise.
     let changed_at = badge_changed(state, seat.seat, seat.act, now);
     let pop = pop_scale(now - changed_at);
+    let deciding = at_turn && !hero;
     if sits_out {
         let at = if hero {
             pos2(rect.right() - 36.0 * s, rect.top() - 6.0 * s - 9.0 * s)
@@ -1217,6 +1235,9 @@ fn seat_box(
             cards_area.center()
         };
         style::sit_out_badge(p, at, s);
+    } else if deciding {
+        let bar = Rect::from_center_size(cards_area.center(), vec2(44.0, 9.0) * s);
+        style::timeout_bar(p, bar, seat.clock.unwrap_or(0.0), style::TIMEOUT);
     } else if let Some(act) = seat.act.filter(|_| !winner) {
         let at = if hero {
             let size = 12.0 * s;
@@ -1226,14 +1247,6 @@ fn seat_box(
             cards_area.center()
         };
         style::action_badge(p, at, act, s, pop);
-    } else if at_turn {
-        let left = seat.clock.unwrap_or(0.0);
-        let bar = if hero {
-            Rect::from_center_size(pos2(rect.center().x, rect.top() - 6.0 * s - 9.0 * s), vec2(56.0, 7.0) * s)
-        } else {
-            Rect::from_center_size(cards_area.center(), vec2(44.0, 9.0) * s)
-        };
-        style::timeout_bar(p, bar, left, if hero { style::TIMEOUT_SELF } else { style::TIMEOUT });
     }
 
     // The chips in front of the seat, above its box.
@@ -1241,11 +1254,16 @@ fn seat_box(
         let h = seats::BET_LABEL_H * s;
         let w = style::bet_chip_width(p, seat.bet, h);
         let label = if hero {
-            let badge_room = seat
-                .act
-                .filter(|_| !winner)
-                .map(|a| style::text_width(p, a.word(), 12.0 * s, Weight::Bold) + 16.0 * s + 8.0 * s)
-                .unwrap_or(if at_turn { rect.width() / 2.0 + 28.0 * s + 8.0 * s } else { 0.0 });
+            // `S1-FW`: room for the word in the strip, and none for a clock,
+            // which is under the name now.
+            let badge_room = if sits_out {
+                72.0 * s + 8.0 * s
+            } else {
+                seat.act
+                    .filter(|_| !winner)
+                    .map(|a| style::text_width(p, a.word(), 12.0 * s, Weight::Bold) + 16.0 * s + 8.0 * s)
+                    .unwrap_or(0.0)
+            };
             Rect::from_min_size(pos2(rect.right() - badge_room - w, rect.top() - seats::BET_LABEL_GAP * s - h), vec2(w, h))
         } else {
             l.bet_label(seat.seat, w).unwrap_or(rect)
