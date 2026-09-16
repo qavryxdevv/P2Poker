@@ -1,0 +1,43 @@
+# 0038 - a sync that names a member removed for good skips that member and goes on.
+#
+# S1-FZ (2026-09-16), found in runs/run153101-3 measuring S1-FY: three seats at a table
+# for four, one joiner's line cut at 25 s. The founder gave the silent seat back at
+# 54.4 s -- the roster said again without it, and D-045's unseating dropped its group
+# key for good (patch 0034). At 58.4 s the founder logged "a key the table's word
+# removed for good is not added again" and then "unpack_gc_sync_announce -- got
+# impossible return value -3", and its process was gone: no panic, no exit line.
+#
+# A sync response from another member still named the removed member. peer_add refuses
+# a key removed for good with -3 (patch 0034), and unpack_gc_sync_announce knew -1, -2
+# and a peer number only: anything else is LOGGER_FATAL, which aborts. So since D-045
+# any client whose sync partner still listed a member the table's word had removed for
+# good -- a seat given back before the first hand, a seat out for good after its fourth
+# absence (D-047) or for flooding (D-051) -- could die on the next sync.
+#
+# The change: -3 is skipped like -2, a member already known, and the rest of the sync
+# goes on. The other callers of peer_add already read any negative value as no peer.
+# Local; the wire is untouched.
+#
+# Vendored tree patched in place. Re-apply on a toxcore bump with
+#   git apply patches/0038-*.patch
+# and check tools/build-tox.ps1's marker for 0038 in group_chats.c.
+diff --git a/vendor/c-toxcore/toxcore/group_chats.c b/vendor/c-toxcore/toxcore/group_chats.c
+index 2d02a24..8b629ed 100644
+--- a/vendor/c-toxcore/toxcore/group_chats.c
++++ b/vendor/c-toxcore/toxcore/group_chats.c
+@@ -1717,6 +1717,15 @@ static bool unpack_gc_sync_announce(GC_Chat *_Nonnull chat, const uint8_t *_Nonn
+         return true;
+     }
+ 
++    /* p2p-poker (patch 0038): a sync that names a member removed for good
++     * skips that member and goes on. peer_add refuses such a key (patch 0034),
++     * and this function read the refusal as an impossible value: LOGGER_FATAL
++     * aborted the whole client. */
++    if (new_peer_number == -3) {
++        LOGGER_DEBUG(chat->log, "p2p-poker: a sync named a member removed for good; skipped");
++        return true;
++    }
++
+     if (new_peer_number > 0) {
+         GC_Connection *new_gconn = get_gc_connection(chat, new_peer_number);
+ 

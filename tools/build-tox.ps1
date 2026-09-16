@@ -262,6 +262,9 @@ $patched = @(
     @{ File   = 'toxcore/group_chats.c'
        Marker = 'p2p-poker (patch 0037): the library''s own ways back, off, for the bed.'
        Why    = '0037: S1-FE''s instrument. P2P_POKER_NO_LIBRARY_RECONNECT=1 turns off the timed-out list and the saved-peers reseed, so a run measures the invitation road alone; on a relayed line those roads finish their handshake or not by chance. Entirely inside #ifdef P2P_POKER_FAULT_HARNESS' }
+    @{ File   = 'toxcore/group_chats.c'
+       Marker = 'p2p-poker (patch 0038): a sync that names a member removed for good'
+       Why    = '0038: S1-FZ. A sync response naming a member the table''s word removed for good hit patch 0034''s refusal, which unpack_gc_sync_announce read as an impossible value, and LOGGER_FATAL aborted the whole client -- a founder died 4 s after giving a silent seat back (run153101-3). The member is skipped; the wire is untouched.' }
 )
 
 Step 'checking the patches are in the vendored source'

@@ -1717,6 +1717,15 @@ static bool unpack_gc_sync_announce(GC_Chat *_Nonnull chat, const uint8_t *_Nonn
         return true;
     }
 
+    /* p2p-poker (patch 0038): a sync that names a member removed for good
+     * skips that member and goes on. peer_add refuses such a key (patch 0034),
+     * and this function read the refusal as an impossible value: LOGGER_FATAL
+     * aborted the whole client. */
+    if (new_peer_number == -3) {
+        LOGGER_DEBUG(chat->log, "p2p-poker: a sync named a member removed for good; skipped");
+        return true;
+    }
+
     if (new_peer_number > 0) {
         GC_Connection *new_gconn = get_gc_connection(chat, new_peer_number);
 
