@@ -3984,6 +3984,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             if !t.ever_dealt
                                                 && !t.resuming && hand_one_may_open(
                                                     &t.tox_sink,
+                                                    gone_by_their_word(&t.left_by_word, f, &t.tox_sink),
                                                     &mut t.hand_one_held_since,
                                                     &mut t.hand_one_progress,
                                                     &mut t.hand_one_forced_said,
@@ -4551,6 +4552,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     if !t.ever_dealt
                                         && !t.resuming && hand_one_may_open(
                                             &t.tox_sink,
+                                            gone_by_their_word(&t.left_by_word, f, &t.tox_sink),
                                             &mut t.hand_one_held_since,
                                             &mut t.hand_one_progress,
                                             &mut t.hand_one_forced_said,
@@ -7103,6 +7105,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(f) = t.table.as_ref() {
                             if !t.resuming && hand_one_may_open(
                                 &t.tox_sink,
+                                gone_by_their_word(&t.left_by_word, f, &t.tox_sink),
                                 &mut t.hand_one_held_since,
                                 &mut t.hand_one_progress,
                                 &mut t.hand_one_forced_said,
@@ -10730,6 +10733,31 @@ fn hears_nobody(f: &Formation, tox: &super::toxsink::TableSink) -> bool {
 /// (`D-060`); a seat that passes `QUIET_LIMIT_S` does so at most twelve seconds
 /// after the freshest one fell silent, which by then has been silent eight.
 const DEAF_QUIET_S: u64 = 8;
+
+/// `S1-GL`: how many seats of the roster left by their player's own signed word
+/// (`S1-GK`) and are out of the table's group now.
+fn gone_by_their_word(
+    left: &std::collections::BTreeMap<u8, (tokio::time::Instant, bool)>,
+    f: &Formation,
+    tox: &super::toxsink::TableSink,
+) -> u64 {
+    let gone = left
+        .keys()
+        .filter(|seat| {
+            f.roster().seats().iter().find(|e| e.seat == **seat).is_some_and(|e| {
+                !(tox.in_group(&e.app_public_key) || e.tox_key.is_some_and(|k| tox.in_group_line(&k)))
+            })
+        })
+        .count();
+    u64::try_from(gone).unwrap_or(u64::MAX)
+}
+
+/// `S1-GL`: whether the table's group, as `(seen, want)`, holds every other seat
+/// but `gone` -- seats whose player left by its own word. Never for a group that
+/// wants nobody or saw nobody.
+fn group_holds_all_but_the_gone((seen, want): (u64, u64), gone: u64) -> bool {
+    gone > 0 && want > 0 && seen > 0 && seen.saturating_add(gone) >= want
+}
 
 /// `S1-GG`, `S1-GI`: whether this client knows the table it would go on from
 /// still forms: nothing of a hand dealt there reached it (`dealt`), and either its
@@ -14448,6 +14476,7 @@ const GROUP_WAIT_MAX_MS: u64 = 300_000;
 /// is something to wait for rather than when the process did.
 async fn hand_one_may_open(
     tox: &super::toxsink::TableSink,
+    gone: u64,
     held_since: &mut Option<std::time::Instant>,
     progress: &mut Option<(u64, std::time::Instant)>,
     said: &mut bool,
@@ -14470,6 +14499,14 @@ async fn hand_one_may_open(
         return false;
     }
     if tox.group_is_complete() {
+        return true;
+    }
+    // `S1-GL`: nor for a seat whose player left by its own signed word and whose
+    // client is out of the group. Two players left a table of ten the moment it
+    // was set (`churn182836-10`); the far seat's group then held seven of nine,
+    // and it waited two minutes for *no new seat* before dealing, holding the
+    // whole table's first hand to 203.7 s.
+    if group_holds_all_but_the_gone(tox.group_seen(), gone) {
         return true;
     }
     let now = std::time::Instant::now();
@@ -16237,6 +16274,18 @@ mod a_joiner_before_the_first_hand {
         assert!(still_forming(false, true, Some(ago(5)), None));
         assert!(!still_forming(true, true, Some(ago(5)), Some(ago(1))));
         assert!(!still_forming(true, false, Some(ago(20)), Some(ago(12))));
+    }
+
+    /// `S1-GL`: the first hand's group gate counts a seat gone by its own word as
+    /// held -- and nothing else.
+    #[test]
+    fn the_first_hand_does_not_wait_for_a_seat_gone_by_its_word() {
+        assert!(group_holds_all_but_the_gone((7, 9), 2), "seven of nine, and the two that left");
+        assert!(group_holds_all_but_the_gone((9, 9), 1));
+        assert!(!group_holds_all_but_the_gone((7, 9), 1), "a third seat missing is still waited for");
+        assert!(!group_holds_all_but_the_gone((7, 9), 0));
+        assert!(!group_holds_all_but_the_gone((0, 2), 2), "a group that saw nobody deals to nobody");
+        assert!(!group_holds_all_but_the_gone((0, 0), 1));
     }
 
     /// `S1-FY`, the owner's rule (2026-09-16): a window's client never leaves a
