@@ -243,12 +243,21 @@ pub struct Formation {
     /// back). The node reads it and leaves the table: there is nothing to
     /// sit at, and the player joins again from the lobby.
     released: bool,
+    /// `S1-GB`: the newest serial of a `PLAYER_LIST` that named this client. Only
+    /// a list newer than that one gives a seat back: an acceptance carries no
+    /// serial, and the lists of the seconds before this client sat down, carried
+    /// late, are newer than nothing and name it nowhere.
+    named_serial: Option<u64>,
     /// `D-044`: a roster of at least `min_players_to_start` was adopted here
     /// once -- the table was set to start. From then on a roster the founder
     /// says again may be smaller, down to two seats (the owner's floor:
     /// heads-up), and is ratified like any other: a seat given back before
     /// the first hand does not un-set the table.
     started: bool,
+    /// `D-060`: this client's own ratification waits for its node's word that it
+    /// hears every seat of the roster (`ratify_now`); `false`, a roster is
+    /// ratified the moment it is adopted, as before.
+    hold_ready: bool,
 }
 
 /// What this client may need to say again.
@@ -319,7 +328,9 @@ impl Formation {
             recorded_ready: None,
             recorded_refused: false,
             released: false,
+            named_serial: None,
             started: false,
+            hold_ready: false,
         })
     }
 
@@ -375,7 +386,9 @@ impl Formation {
             recorded_ready,
             recorded_refused: false,
             released: false,
+            named_serial: None,
             started: false,
+            hold_ready: false,
         };
         f.said.list = Some(list_bytes.to_vec());
         let out = f.adopt(&list, now_ms)?;
@@ -478,7 +491,9 @@ impl Formation {
                 recorded_ready: None,
                 recorded_refused: false,
                 released: false,
+                named_serial: None,
                 started: false,
+                hold_ready: false,
             },
             bytes,
         ))
@@ -611,6 +626,12 @@ impl Formation {
     /// question is compared against (`D-044`).
     pub fn advert_time(&self) -> u64 {
         self.under.ad.timestamp_unix_ms
+    }
+
+    /// `D-061`: the password of a table this client founded, for its
+    /// continuation.
+    pub fn password(&self) -> Option<&[u8]> {
+        self.founder.as_ref().and_then(|f| f.password.as_deref())
     }
 
     /// Whether this client founded the table, and therefore answers joins and
@@ -1191,15 +1212,22 @@ impl Formation {
         }
         let held = if self.serial == 0 { None } else { Some(self.serial) };
         let roster = admit_list(&list, &sender, held, &self.under).map_err(Failed::List)?;
-        // `S1-DV`: named by the roster held until now, and not by this one.
-        // A first list that does not name a joiner still joining says
-        // nothing, as before; one that drops a seat this client held does.
+        // `S1-DV`: a list that no longer names this client, which an earlier one
+        // did. `S1-GB`: earlier by serial -- a list of the seconds before this
+        // client sat down, carried late behind its acceptance, is newer than the
+        // nothing an acceptance holds and names it nowhere, and two joiners on the
+        // bed read such lists as their seats given back and dropped their table
+        // (`churn163737-10`: seated at 54.4 s, *given back* at 55.5 s, and the
+        // founder had given nobody back).
         let me = self.app.verifying_key().to_bytes();
-        let named_before = self.my_seat.is_some_and(|s| self.roster.seat_of(&me) == Some(s));
-        self.roster = roster;
-        if named_before && self.roster.seat_of(&me).is_none() {
+        let names_me = roster.seat_of(&me).is_some();
+        if !names_me && self.named_serial.is_some_and(|n| list.list_serial > n) {
             self.released = true;
         }
+        if names_me {
+            self.named_serial = Some(self.named_serial.map_or(list.list_serial, |n| n.max(list.list_serial)));
+        }
+        self.roster = roster;
         self.adopt(&list, now_ms)
     }
 
@@ -1237,7 +1265,53 @@ impl Formation {
             self.replay_early();
             return Ok(vec![]);
         }
+        // `D-060`: not before this client hears every seat -- its node says when.
+        if self.hold_ready && self.session.is_none() {
+            self.replay_early();
+            return Ok(vec![]);
+        }
+        self.ratify(seat, now_ms)
+    }
 
+    /// `D-060`: hold this client's own ratification until its node says it hears
+    /// every seat of the roster, or let it go the moment a roster is adopted.
+    pub fn hold_ratification(&mut self, hold: bool) {
+        self.hold_ready = hold;
+    }
+
+    /// `D-060`: the node's word that this client hears every seat of the roster
+    /// it holds -- the ratification is made now, if the roster is one this client
+    /// is seated in, is not short, and has not been ratified here already.
+    pub fn ratify_now(&mut self, now_ms: u64) -> Result<Vec<Send>, Failed> {
+        let me = self.app.verifying_key().to_bytes();
+        let Some(seat) = self.my_seat.filter(|s| self.roster.seat_of(&me) == Some(*s)) else {
+            return Ok(vec![]);
+        };
+        if self.sent_ready || self.serial == 0 || self.roster.len() < self.floor() {
+            return Ok(vec![]);
+        }
+        self.ratify(seat, now_ms)
+    }
+
+    /// `D-060`: whether this client has ratified the roster it holds.
+    pub fn ready_sent(&self) -> bool {
+        self.sent_ready
+    }
+
+    /// `D-060`: whether the roster this client holds is large enough to be
+    /// ratified -- the advert's minimum, or two once the table was set to start.
+    pub fn may_start(&self) -> bool {
+        self.roster.len() >= self.floor()
+    }
+
+    /// `D-060`: the seats whose ratification of the roster this client holds has
+    /// been taken here.
+    pub fn ratified_seats(&self) -> Vec<u8> {
+        self.ratified.keys().copied().collect()
+    }
+
+    /// This client's ratification of the roster it holds, from seat `seat`.
+    fn ratify(&mut self, seat: u8, now_ms: u64) -> Result<Vec<Send>, Failed> {
         // `S1-CR`: a seat that restarted says the ratification it recorded,
         // verbatim, when the roster the founder said again is the one it
         // ratified -- the same serial, the same seats. A new ratification
@@ -1254,6 +1328,15 @@ impl Formation {
                 }
                 _ => self.recorded_refused = true,
             }
+        }
+        // `D-060`: this seat's own ratification of this roster, carried back by
+        // another seat, is said again as it is -- never a second one.
+        if let Some(bytes) = self.ratified_bytes.get(&seat).cloned() {
+            self.sent_ready = true;
+            self.said.ready = Some(bytes.clone());
+            self.settle();
+            self.replay_early();
+            return Ok(vec![Send::Broadcast(bytes)]);
         }
 
         let ready = TableReady {
@@ -1362,6 +1445,16 @@ impl Formation {
             None => {
                 self.ratified.insert(ready.my_seat, event_hash);
                 self.ratified_bytes.insert(ready.my_seat, bytes.to_vec());
+                // `D-060`: this client's own ratification, made before -- by a
+                // life of this client that is gone -- and carried back by another
+                // seat. It is this seat's word already: a new one would be a new
+                // event hash, and so a session nobody else computes
+                // (`churn161800-10`: three seats back at a set table, each at a
+                // session of its own).
+                if sender == self.app.verifying_key().to_bytes() && !self.sent_ready {
+                    self.sent_ready = true;
+                    self.said.ready = Some(bytes.to_vec());
+                }
             }
         }
         self.settle();
@@ -2372,6 +2465,51 @@ mod tests {
         );
     }
 
+    /// `S1-GB`: a list the founder said before a joiner sat down, carried to it
+    /// late behind its acceptance, is newer than the nothing an acceptance holds
+    /// and does not name it -- and gives nothing back.
+    #[test]
+    fn a_list_said_before_a_joiner_sat_down_is_no_seat_given_back() {
+        let (mut t, _, a, hash) = found(6, 3);
+        let table_id = t.founder.table_id();
+        let mut lists = Vec::new();
+        let mut answers = Vec::new();
+        for (n, seed) in [(2u8, 2u8), (3, 3)] {
+            let (j, request) = Formation::join(
+                key(seed),
+                a.clone(),
+                hash,
+                table_id,
+                peer(n),
+                format!("player {n}"),
+                1_000,
+                None,
+                None,
+                [seed; 32],
+                NOW,
+                None,
+            )
+            .unwrap();
+            for s in t.founder.on_join_request(&request, &peer(n), false, NOW).expect("seated") {
+                match s {
+                    Send::Reply(bytes) => answers.push(bytes),
+                    Send::Broadcast(bytes) if joinwire::receive_player_list(&bytes).is_ok() => lists.push(bytes),
+                    Send::Broadcast(_) => {}
+                }
+            }
+            t.joiners.push(j);
+        }
+        // The second joiner hears its acceptance, then the list said before it
+        // sat down, carried late, then its own.
+        let mut second = t.joiners.pop().expect("the second joiner");
+        second.on_join_answer(&answers[1], NOW).expect("the acceptance holds");
+        second.on_player_list(&lists[0], NOW + 1).expect("an older list is newer than nothing here");
+        assert!(!second.released_before_the_first_hand(), "a list from before its sitting gives nothing back");
+        second.on_player_list(&lists[1], NOW + 2).expect("its own list");
+        assert!(!second.released_before_the_first_hand());
+        assert!(second.roster().seat_of(&key(3).verifying_key().to_bytes()).is_some());
+    }
+
     /// `S1-DV`: a joiner whose seat the founder gave back learns it from the
     /// roster said again -- named by the one it held, not by the next -- and
     /// the node takes it to the lobby. A first list that does not name a
@@ -2500,6 +2638,128 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `D-060`: a seat held from ratifying says nothing when the roster comes, and
+    /// ratifies when its node says it hears every seat -- once; and the table is
+    /// set only when the last held seat has.
+    #[test]
+    fn a_held_seat_ratifies_when_told_and_the_table_waits_for_the_last() {
+        let (mut t, _, a, hash) = found(3, 3);
+        t.founder.hold_ratification(true);
+        let table_id = t.founder.table_id();
+        for (n, seed) in [(2u8, 2u8), (3, 3)] {
+            let (mut j, request) = Formation::join(
+                key(seed),
+                a.clone(),
+                hash,
+                table_id,
+                peer(n),
+                format!("player {n}"),
+                1_000,
+                None,
+                None,
+                [seed; 32],
+                NOW,
+                None,
+            )
+            .unwrap();
+            j.hold_ratification(true);
+            let out = t.founder.on_join_request(&request, &peer(n), false, NOW).expect("seated");
+            deliver(&mut t, &mut j, out, table_id, NOW);
+            t.joiners.push(j);
+        }
+        assert_eq!(t.founder.roster().len(), 3);
+        assert!(t.founder.may_start());
+        assert!(!t.founder.ready_sent() && t.joiners.iter().all(|j| !j.ready_sent()), "nobody ratified while held");
+
+        fn spread(t: &mut Table, sends: Vec<Send>, table_id: Hash) {
+            for s in sends {
+                let Send::Broadcast(bytes) = s else { continue };
+                let (r, sender, _) = joinwire::receive_table_ready(&bytes, &table_id, &t.founder.genesis()).unwrap();
+                let mut everyone: Vec<&mut Formation> = vec![&mut t.founder];
+                everyone.extend(t.joiners.iter_mut());
+                for who in everyone {
+                    if who.roster().seat_of(&sender) == Some(r.my_seat) && who.my_seat() != Some(r.my_seat) {
+                        who.on_table_ready(&bytes).expect("a ratification holds");
+                    }
+                }
+            }
+        }
+        let sends = t.founder.ratify_now(NOW + 1).unwrap();
+        assert!(!sends.is_empty() && t.founder.ready_sent());
+        assert!(t.founder.ratify_now(NOW + 2).unwrap().is_empty(), "once");
+        spread(&mut t, sends, table_id);
+        let sends = t.joiners[0].ratify_now(NOW + 3).unwrap();
+        spread(&mut t, sends, table_id);
+        assert!(t.founder.session().is_none(), "one seat has not said it is ready");
+        assert_eq!(t.founder.ratified_seats().len(), 2);
+        let sends = t.joiners[1].ratify_now(NOW + 4).unwrap();
+        spread(&mut t, sends, table_id);
+        let session = t.founder.session().expect("set once every seat said it is ready");
+        assert!(t.joiners.iter().all(|j| j.session() == Some(session)), "and every seat agrees");
+    }
+
+    /// `D-060`: a seat back at a table whose roster it had ratified, with nothing
+    /// of its own kept, takes its own ratification from another seat's copy and
+    /// computes the table's session -- it never ratifies a second time.
+    #[test]
+    fn a_seat_back_takes_its_own_ratification_and_the_tables_session() {
+        let (mut t, _, a, hash) = found(3, 3);
+        let table_id = t.founder.table_id();
+        for (n, seed) in [(2u8, 2u8), (3, 3)] {
+            let (mut j, request) = Formation::join(
+                key(seed),
+                a.clone(),
+                hash,
+                table_id,
+                peer(n),
+                format!("player {n}"),
+                1_000,
+                None,
+                None,
+                [seed; 32],
+                NOW,
+                None,
+            )
+            .unwrap();
+            let out = t.founder.on_join_request(&request, &peer(n), false, NOW).expect("seated");
+            deliver(&mut t, &mut j, out, table_id, NOW);
+            t.joiners.push(j);
+        }
+        let session = t.founder.session().expect("set");
+
+        // The second joiner's client comes back with nothing of its own.
+        let (mut back, _) = Formation::join(
+            key(3),
+            a.clone(),
+            hash,
+            table_id,
+            peer(3),
+            "player 3".into(),
+            1_000,
+            None,
+            None,
+            [33u8; 32],
+            NOW + 10,
+            None,
+        )
+        .unwrap();
+        back.hold_ratification(true);
+        let said = t.founder.say_again(NOW + 10);
+        for bytes in &said {
+            if joinwire::receive_player_list(bytes).is_ok() {
+                back.on_player_list(bytes, NOW + 10).expect("the list holds");
+            }
+        }
+        for bytes in &said {
+            if joinwire::receive_player_list(bytes).is_err() {
+                back.on_table_ready(bytes).expect("a ratification holds");
+            }
+        }
+        assert!(back.ready_sent(), "its own ratification, carried back, is its word");
+        assert_eq!(back.session(), Some(session), "the table's session, and no other");
+        assert!(back.ratify_now(NOW + 11).unwrap().is_empty(), "never a second ratification");
     }
 
     /// `D-044`, the owner's ruling: a table set to start goes on with the seats

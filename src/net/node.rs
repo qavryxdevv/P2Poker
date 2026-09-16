@@ -389,6 +389,10 @@ pub enum NodeEvent {
     /// for a seat again, as a seat certified out of a game asks to sit in. `why`
     /// says where that asking stands.
     SeatGivenBack { key: [u8; 32], why: String },
+    /// `D-061`: before the table starts, its founder is gone and the table goes
+    /// on at a table one of its seats founded -- this client's own, or another
+    /// seat's, where it asks for a seat. `why` says which.
+    TableGoesOn { key: [u8; 32], why: String },
     /// `S1-FY`: before the table starts, the founder gave a seat back: why.
     SeatReleased { seat: u8, why: String },
     /// Something in the transport went wrong and the node carried on.
@@ -676,6 +680,7 @@ impl NodeEvent {
             | Self::TableLost { .. }
             | Self::FounderAway { .. }
             | Self::SeatGivenBack { .. }
+            | Self::TableGoesOn { .. }
             | Self::SeatReleased { .. }
             | Self::OutForGood { .. }
             | Self::SeatFlooded { .. }

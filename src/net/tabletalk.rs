@@ -361,9 +361,10 @@ pub fn leave_word(key: &SigningKey, table_id: &[u8; 32], now_ms: u64) -> Result<
 }
 
 /// `S1-FQ`: take a seat's word that its player left off the wire, for the table
-/// `table_id` -- the seat it holds, or why not. Charged to the carrier first,
-/// as a line is (`D-054`); then the type, the clock, the seat, the signature,
-/// the table and the reason.
+/// `table_id` -- the seat it holds, the key that said it and when (`S1-GA`: a
+/// word older than the seat's present sitting is not about it), or why not.
+/// Charged to the carrier first, as a line is (`D-054`); then the type, the
+/// clock, the seat, the signature, the table and the reason.
 pub fn receive_leave(
     bytes: &[u8],
     table_id: &[u8; 32],
@@ -371,7 +372,7 @@ pub fn receive_leave(
     seat_of: impl Fn(&[u8; 32]) -> Option<u8>,
     now_ms: u64,
     limits: &mut Talk,
-) -> Result<u8, NotHeard> {
+) -> Result<(u8, [u8; 32], u64), NotHeard> {
     if bytes.len() > LOBBY_MSG_MAX {
         return Err(NotHeard::TooLong("the message is over the cap"));
     }
@@ -401,7 +402,7 @@ pub fn receive_leave(
     if body.reason != LEAVE_BY_THE_PLAYER {
         return Err(NotHeard::Malformed("a leave reason this client does not know"));
     }
-    Ok(seat)
+    Ok((seat, who, envelope.emitted_at_unix_ms))
 }
 
 fn plain(s: &str) -> Result<(), crate::net::plaintext::NotPlain> {
@@ -414,6 +415,213 @@ fn verify(who: &[u8; 32], signed: &SignedEvent) -> Result<(), ()> {
     let sig = Signature::from_bytes(&signed.signature);
     key.verify_strict(&to_be_signed(&signed.body), &sig)
         .map_err(|_| ())
+}
+
+/// `D-060`, `PROTOCOL.md` §7.11: the seats a seat cannot hear, before its table
+/// is set -- in the table's group, from the roster of `list_serial`.
+#[derive(Debug, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+struct HearingBody {
+    /// The table, so the word cannot be carried to another.
+    #[cbor(n(0), with = "minicbor::bytes")]
+    table_id: [u8; 32],
+    /// The roster the word is about: a word about another roster says nothing
+    /// of this one.
+    #[n(1)]
+    list_serial: u64,
+    /// The seats this seat cannot hear, ascending; empty when it hears them all.
+    #[cbor(n(2), with = "minicbor::bytes")]
+    unheard: Vec<u8>,
+}
+
+/// A seat's word on whom it hears, once it has been checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hearing {
+    pub seat: u8,
+    pub list_serial: u64,
+    pub unheard: Vec<u8>,
+    pub said_ms: u64,
+}
+
+/// `D-060`: this client's seat cannot hear the seats `unheard` of the roster
+/// `list_serial` -- said to the table before it is set, signed by the seat's key.
+pub fn hearing_word(
+    key: &SigningKey,
+    table_id: &[u8; 32],
+    list_serial: u64,
+    unheard: &[u8],
+    now_ms: u64,
+) -> Result<Vec<u8>, &'static str> {
+    let mut unheard = unheard.to_vec();
+    unheard.sort_unstable();
+    unheard.dedup();
+    let body = HearingBody { table_id: *table_id, list_serial, unheard };
+    let body_bytes = to_canonical(&body).map_err(|_| "the body does not encode")?;
+    let envelope = EventBody::unchained(EventType::TableHearing, key.verifying_key().to_bytes(), body_bytes, now_ms)
+        .ok_or("a table hearing is an unchained event")?;
+    let envelope_bytes = to_canonical(&envelope).map_err(|_| "the envelope does not encode")?;
+    let signature = {
+        use ed25519_dalek::Signer;
+        key.sign(&to_be_signed(&envelope_bytes))
+    };
+    to_canonical(&SignedEvent { body: envelope_bytes, signature: signature.to_bytes() })
+        .map_err(|_| "the signed event does not encode")
+}
+
+/// `D-060`: take a seat's word on whom it cannot hear off the wire, for the
+/// table `table_id` -- the type, the clock, the seat, the signature, the table,
+/// and the list itself: seat numbers of a table, ascending, none twice, never
+/// the speaker's own. Not charged to the chat's budget: every seat says one
+/// every few seconds while the table forms, which is more than a minute's chat
+/// allows, and the node takes one a second from a carrier at most.
+pub fn receive_hearing(
+    bytes: &[u8],
+    table_id: &[u8; 32],
+    seat_of: impl Fn(&[u8; 32]) -> Option<u8>,
+    now_ms: u64,
+) -> Result<Hearing, NotHeard> {
+    if bytes.len() > LOBBY_MSG_MAX {
+        return Err(NotHeard::TooLong("the message is over the cap"));
+    }
+    let signed: SignedEvent =
+        from_canonical(bytes, LOBBY_MSG_MAX).map_err(|_| NotHeard::Malformed("not a signed event"))?;
+    let envelope: EventBody = from_canonical(&signed.body, LOBBY_MSG_MAX)
+        .map_err(|_| NotHeard::Malformed("not an envelope"))?;
+    let kind = EventType::try_from(envelope.event_type)
+        .map_err(|_| NotHeard::Malformed("an event type this client does not know"))?;
+    if kind != EventType::TableHearing {
+        return Err(NotHeard::Malformed("not a table hearing"));
+    }
+    if envelope.emitted_at_unix_ms.abs_diff(now_ms) > CLOCK_SLACK_MS {
+        return Err(NotHeard::Stale);
+    }
+    let who = envelope.sender_public_key;
+    let seat = seat_of(&who).ok_or(NotHeard::NotASeat)?;
+    verify(&who, &signed).map_err(|_| NotHeard::Forged)?;
+    let body: HearingBody = from_canonical(&envelope.payload, LOBBY_CHAT_MAX)
+        .map_err(|_| NotHeard::Malformed("not a table hearing"))?;
+    if &body.table_id != table_id {
+        return Err(NotHeard::AnotherTable);
+    }
+    let max = crate::protocol::constants::MAX_SEATS;
+    if body.unheard.len() >= usize::from(max)
+        || body.unheard.windows(2).any(|w| w[0] >= w[1])
+        || body.unheard.iter().any(|s| *s >= max || *s == seat)
+    {
+        return Err(NotHeard::Malformed("a list of seats no table has"));
+    }
+    Ok(Hearing { seat, list_serial: body.list_serial, unheard: body.unheard, said_ms: envelope.emitted_at_unix_ms })
+}
+
+/// `D-061`, `PROTOCOL.md` §7.12: a forming table goes on without its founder, at
+/// the table a seat of its roster founded for it.
+#[derive(Debug, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+struct ContinuesBody {
+    /// The table that goes on, so the word cannot be carried to another.
+    #[cbor(n(0), with = "minicbor::bytes")]
+    table_id: [u8; 32],
+    /// The roster of that table the speaker held.
+    #[n(1)]
+    list_serial: u64,
+    /// The signed `LOBBY_TABLE_AD` of the table it goes on at, verbatim.
+    #[cbor(n(2), with = "minicbor::bytes")]
+    advert: Vec<u8>,
+}
+
+/// A seat's word that its forming table goes on at a table it founded, once
+/// checked: the seat, its key, the roster serial it held, the advert of the new
+/// table with that table's key, and when it was said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Continues {
+    pub seat: u8,
+    pub who: [u8; 32],
+    pub list_serial: u64,
+    pub advert: Vec<u8>,
+    pub table_key: [u8; 32],
+    pub said_ms: u64,
+}
+
+/// `D-061`: this client's seat founded `advert`'s table for the forming table
+/// `table_id` to go on at -- said to that table's seats, signed by the seat's key.
+pub fn continues_word(
+    key: &SigningKey,
+    table_id: &[u8; 32],
+    list_serial: u64,
+    advert: &[u8],
+    now_ms: u64,
+) -> Result<Vec<u8>, &'static str> {
+    let body = ContinuesBody { table_id: *table_id, list_serial, advert: advert.to_vec() };
+    let body_bytes = to_canonical(&body).map_err(|_| "the body does not encode")?;
+    let envelope = EventBody::unchained(EventType::TableContinues, key.verifying_key().to_bytes(), body_bytes, now_ms)
+        .ok_or("a table continuation is an unchained event")?;
+    let envelope_bytes = to_canonical(&envelope).map_err(|_| "the envelope does not encode")?;
+    let signature = {
+        use ed25519_dalek::Signer;
+        key.sign(&to_be_signed(&envelope_bytes))
+    };
+    to_canonical(&SignedEvent { body: envelope_bytes, signature: signature.to_bytes() })
+        .map_err(|_| "the signed event does not encode")
+}
+
+/// `D-061`: take a seat's word that its forming table goes on at a table it
+/// founded -- the type, the clock, the seat, the signature, the table; then the
+/// advert: a real signed advert, of a table that is not this one, whose founder is
+/// the speaker itself, playing `game` -- the advert of the table that goes on:
+/// its rules, its name and its gate (`S1-GH`). A seat can offer only a table of
+/// its own, and only the same game.
+pub fn receive_continues(
+    bytes: &[u8],
+    table_id: &[u8; 32],
+    game: &crate::net::lobby::TableAd,
+    seat_of: impl Fn(&[u8; 32]) -> Option<u8>,
+    now_ms: u64,
+) -> Result<Continues, NotHeard> {
+    if bytes.len() > LOBBY_MSG_MAX {
+        return Err(NotHeard::TooLong("the message is over the cap"));
+    }
+    let signed: SignedEvent =
+        from_canonical(bytes, LOBBY_MSG_MAX).map_err(|_| NotHeard::Malformed("not a signed event"))?;
+    let envelope: EventBody = from_canonical(&signed.body, LOBBY_MSG_MAX)
+        .map_err(|_| NotHeard::Malformed("not an envelope"))?;
+    let kind = EventType::try_from(envelope.event_type)
+        .map_err(|_| NotHeard::Malformed("an event type this client does not know"))?;
+    if kind != EventType::TableContinues {
+        return Err(NotHeard::Malformed("not a table continuation"));
+    }
+    if envelope.emitted_at_unix_ms.abs_diff(now_ms) > CLOCK_SLACK_MS {
+        return Err(NotHeard::Stale);
+    }
+    let who = envelope.sender_public_key;
+    let seat = seat_of(&who).ok_or(NotHeard::NotASeat)?;
+    verify(&who, &signed).map_err(|_| NotHeard::Forged)?;
+    let body: ContinuesBody = from_canonical(&envelope.payload, LOBBY_MSG_MAX)
+        .map_err(|_| NotHeard::Malformed("not a table continuation"))?;
+    if &body.table_id != table_id {
+        return Err(NotHeard::AnotherTable);
+    }
+    let (ad, _) = super::advert::verify_echoed(&body.advert)
+        .map_err(|_| NotHeard::Malformed("the advert of the table it goes on at does not hold"))?;
+    let table_key: [u8; 32] = from_canonical::<SignedEvent>(&body.advert, LOBBY_MSG_MAX)
+        .ok()
+        .and_then(|s| from_canonical::<EventBody>(&s.body, LOBBY_MSG_MAX).ok())
+        .map(|e| e.sender_public_key)
+        .ok_or(NotHeard::Malformed("the advert of the table it goes on at does not hold"))?;
+    if &table_key == table_id {
+        return Err(NotHeard::Malformed("a table does not go on at itself"));
+    }
+    if ad.founder_app_key != who {
+        return Err(NotHeard::Malformed("a seat offers only a table it founded"));
+    }
+    // `S1-GH`: the founder's authority a continuation gives its seat is over who
+    // sits down, never over what the table plays.
+    if super::advert::table_params_hash(&ad) != super::advert::table_params_hash(game)
+        || ad.table_name != game.table_name
+        || ad.password_required != game.password_required
+    {
+        return Err(NotHeard::Malformed("a continuation plays the table's own game"));
+    }
+    Ok(Continues { seat, who, list_serial: body.list_serial, advert: body.advert, table_key, said_ms: envelope.emitted_at_unix_ms })
 }
 
 #[cfg(test)]
@@ -450,7 +658,7 @@ mod tests {
     fn a_leave_word_is_heard_only_from_its_seat_for_its_table() {
         let mut talk = Talk::default();
         let word = leave_word(&key(2), &TABLE, NOW).unwrap();
-        assert_eq!(receive_leave(&word, &TABLE, &CARRIER, seat_of, NOW, &mut talk), Ok(2));
+        assert_eq!(receive_leave(&word, &TABLE, &CARRIER, seat_of, NOW, &mut talk), Ok((2, key(2).verifying_key().to_bytes(), NOW)));
         let stranger = leave_word(&key(9), &TABLE, NOW).unwrap();
         assert_eq!(receive_leave(&stranger, &TABLE, &CARRIER, seat_of, NOW, &mut talk), Err(NotHeard::NotASeat));
         let elsewhere = leave_word(&key(5), &[8u8; 32], NOW).unwrap();
@@ -476,6 +684,120 @@ mod tests {
             receive(&word, &TABLE, &CARRIER, seat_of, NOW, &mut Talk::default()),
             Err(NotHeard::Malformed(_))
         ));
+    }
+
+    /// `D-061`: a seat's word that its forming table goes on at a table it founded
+    /// is heard from its own seat, for this table, with a real advert of another
+    /// table whose founder is the speaker -- a seat offers only a table of its own.
+    #[test]
+    fn a_continuation_is_heard_only_with_a_table_its_speaker_founded() {
+        use crate::net::lobby::TableAd;
+        let new_table = key(40);
+        // The table that goes on, founded by seat 0's player; its continuation,
+        // the same game under seat 2's key.
+        let game = TableAd::sng(6, "goes on".into(), key(0).verifying_key().to_bytes(), vec![9], NOW - 60_000);
+        let own = TableAd::sng(6, "goes on".into(), key(2).verifying_key().to_bytes(), vec![1, 2, 3], NOW);
+        let advert = crate::net::advert::publish(&own, &new_table).unwrap();
+        let word = continues_word(&key(2), &TABLE, 9, &advert, NOW).unwrap();
+        let heard = receive_continues(&word, &TABLE, &game, seat_of, NOW).unwrap();
+        assert_eq!(
+            (heard.seat, heard.who, heard.list_serial, heard.table_key, heard.said_ms),
+            (2, key(2).verifying_key().to_bytes(), 9, new_table.verifying_key().to_bytes(), NOW)
+        );
+        assert_eq!(heard.advert, advert, "the advert, verbatim, for the lobby to take");
+
+        // A table somebody else founded is not this seat's to offer.
+        let theirs = TableAd::sng(6, "not mine".into(), key(5).verifying_key().to_bytes(), vec![1], NOW);
+        let their_advert = crate::net::advert::publish(&theirs, &key(41)).unwrap();
+        let claim = continues_word(&key(2), &TABLE, 9, &their_advert, NOW).unwrap();
+        assert!(matches!(receive_continues(&claim, &TABLE, &game, seat_of, NOW), Err(NotHeard::Malformed(_))));
+
+        // `S1-GH`: nor another game -- other rules, another name, another gate --
+        // under the speaker's own key.
+        let bigger = TableAd::sng(9, "goes on".into(), key(2).verifying_key().to_bytes(), vec![1, 2, 3], NOW);
+        let mut renamed = own.clone();
+        renamed.table_name = "somewhere else".into();
+        let mut gated = own.clone();
+        gated.password_required = true;
+        let mut longer = own.clone();
+        longer.join_deadline_ms += 1_000;
+        for (i, other) in [bigger, renamed, gated, longer].iter().enumerate() {
+            let other_advert = crate::net::advert::publish(other, &key(60 + i as u8)).unwrap();
+            let other_word = continues_word(&key(2), &TABLE, 9, &other_advert, NOW).unwrap();
+            assert_eq!(
+                receive_continues(&other_word, &TABLE, &game, seat_of, NOW).map(|c| c.seat),
+                Err(NotHeard::Malformed("a continuation plays the table's own game")),
+                "case {i}"
+            );
+        }
+
+        // A table does not go on at itself.
+        let table_key = key(50);
+        let table_id = table_key.verifying_key().to_bytes();
+        let same = crate::net::advert::publish(&own, &table_key).unwrap();
+        let circle = continues_word(&key(2), &table_id, 9, &same, NOW).unwrap();
+        assert!(matches!(receive_continues(&circle, &table_id, &game, seat_of, NOW), Err(NotHeard::Malformed(_))));
+
+        // Nor from a stranger, for another table, late, or with a byte changed.
+        let stranger_ad = TableAd::sng(6, "mine".into(), key(9).verifying_key().to_bytes(), vec![1], NOW);
+        let stranger_advert = crate::net::advert::publish(&stranger_ad, &key(42)).unwrap();
+        let stranger = continues_word(&key(9), &TABLE, 9, &stranger_advert, NOW).unwrap();
+        assert_eq!(receive_continues(&stranger, &TABLE, &game, seat_of, NOW), Err(NotHeard::NotASeat));
+        let elsewhere = continues_word(&key(2), &[8u8; 32], 9, &advert, NOW).unwrap();
+        assert_eq!(receive_continues(&elsewhere, &TABLE, &game, seat_of, NOW), Err(NotHeard::AnotherTable));
+        assert_eq!(receive_continues(&word, &TABLE, &game, seat_of, NOW + CLOCK_SLACK_MS + 1), Err(NotHeard::Stale));
+        let mut broken = word.clone();
+        let at = broken.len() / 3;
+        broken[at] ^= 0xff;
+        assert!(receive_continues(&broken, &TABLE, &game, seat_of, NOW).is_err());
+        let hearing = hearing_word(&key(2), &TABLE, 9, &[], NOW).unwrap();
+        assert!(matches!(receive_continues(&hearing, &TABLE, &game, seat_of, NOW), Err(NotHeard::Malformed(_))));
+    }
+
+    /// `D-060`: a seat's word on whom it cannot hear is heard from its own seat,
+    /// for its table and roster, on time -- and its list is a list of other seats
+    /// of a table, or nothing is heard.
+    #[test]
+    fn a_hearing_word_is_heard_from_its_seat_with_a_list_of_other_seats() {
+        let word = hearing_word(&key(2), &TABLE, 7, &[5, 0, 5], NOW).unwrap();
+        assert_eq!(
+            receive_hearing(&word, &TABLE, seat_of, NOW),
+            Ok(Hearing { seat: 2, list_serial: 7, unheard: vec![0, 5], said_ms: NOW }),
+            "sorted, and each seat once"
+        );
+        let all = hearing_word(&key(5), &TABLE, 7, &[], NOW).unwrap();
+        assert_eq!(receive_hearing(&all, &TABLE, seat_of, NOW).map(|h| h.unheard), Ok(vec![]));
+        let stranger = hearing_word(&key(9), &TABLE, 7, &[2], NOW).unwrap();
+        assert_eq!(receive_hearing(&stranger, &TABLE, seat_of, NOW), Err(NotHeard::NotASeat));
+        let elsewhere = hearing_word(&key(5), &[8u8; 32], 7, &[2], NOW).unwrap();
+        assert_eq!(
+            receive_hearing(&elsewhere, &TABLE, seat_of, NOW),
+            Err(NotHeard::AnotherTable)
+        );
+        let itself = hearing_word(&key(5), &TABLE, 7, &[5], NOW).unwrap();
+        assert!(matches!(
+            receive_hearing(&itself, &TABLE, seat_of, NOW),
+            Err(NotHeard::Malformed(_))
+        ));
+        let no_such_seat = hearing_word(&key(5), &TABLE, 7, &[12], NOW).unwrap();
+        assert!(matches!(
+            receive_hearing(&no_such_seat, &TABLE, seat_of, NOW),
+            Err(NotHeard::Malformed(_))
+        ));
+        let old = hearing_word(&key(5), &TABLE, 7, &[2], NOW).unwrap();
+        assert_eq!(
+            receive_hearing(&old, &TABLE, seat_of, NOW + CLOCK_SLACK_MS + 1),
+            Err(NotHeard::Stale)
+        );
+        let leave = leave_word(&key(5), &TABLE, NOW).unwrap();
+        assert!(matches!(
+            receive_hearing(&leave, &TABLE, seat_of, NOW),
+            Err(NotHeard::Malformed(_))
+        ));
+        let mut broken = hearing_word(&key(5), &TABLE, 7, &[2], NOW).unwrap();
+        let at = broken.len() / 2;
+        broken[at] ^= 0xff;
+        assert!(receive_hearing(&broken, &TABLE, seat_of, NOW).is_err());
     }
 
     #[test]

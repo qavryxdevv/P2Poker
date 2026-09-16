@@ -123,6 +123,19 @@ fn stall_join_secs() -> u64 {
 /// from the first, for the same length each time -- four absences in one run
 /// is how `D-047` is measured. Zero, the default, cuts once.
 #[cfg(feature = "fault-harness")]
+/// fault-harness: the line cut at run time, until this moment -- the node's
+/// `P2P_POKER_AT_SET=cut:<s>`, applied when the table is set.
+#[cfg(feature = "fault-harness")]
+static CUT_UNTIL: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// fault-harness: cut this client's line from now until `until`.
+#[cfg(feature = "fault-harness")]
+pub fn cut_line_until(until: Instant) {
+    if let Ok(mut u) = CUT_UNTIL.lock() {
+        *u = Some(until);
+    }
+}
+
 fn offline_window() -> Option<(Duration, Duration, Duration)> {
     use std::sync::OnceLock;
     static WINDOW: OnceLock<Option<(Duration, Duration, Duration)>> = OnceLock::new();
@@ -2164,13 +2177,15 @@ fn run(mut tox: Tox, control: sync_mpsc::Receiver<Ctl>, nodes: Vec<crate::tox::n
 
         // `patches/0035`: the harness's outage, applied on its edges.
         #[cfg(feature = "fault-harness")]
-        if let Some((at, dur, every)) = offline_window() {
+        {
             let now = started.elapsed();
-            let cut = match now.checked_sub(at) {
+            let scheduled = offline_window().map(|(at, dur, every)| match now.checked_sub(at) {
                 None => false,
                 Some(since) if every.is_zero() => since < dur,
                 Some(since) => since.as_secs() % every.as_secs() < dur.as_secs(),
-            };
+            });
+            let asked = CUT_UNTIL.lock().ok().and_then(|u| *u).is_some_and(|u| Instant::now() < u);
+            let cut = scheduled.unwrap_or(false) || asked;
             if cut != line_cut {
                 tox.cut_line(cut);
                 line_cut = cut;

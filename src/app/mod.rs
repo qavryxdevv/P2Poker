@@ -663,6 +663,9 @@ pub struct Rejoin {
     /// `S1-FY`: before the table started, the founder gave this client's seat
     /// back; where asking for a seat again stands.
     pub given_back: Option<String>,
+    /// `D-061`: and the table goes on without its founder, at a table one of its
+    /// seats founded.
+    pub goes_on: bool,
 }
 
 impl Rejoin {
@@ -679,6 +682,7 @@ impl Rejoin {
             back_at: None,
             restarted: false,
             given_back: None,
+            goes_on: false,
         }
     }
 }
@@ -2102,6 +2106,25 @@ impl AppState {
                     self.note(why);
                 }
             }
+            // `D-061`: before the start, the table goes on without its founder.
+            NodeEvent::TableGoesOn { key, why } => {
+                if self.seated.as_ref().is_some_and(|s| s.key == key) {
+                    let r = self.rejoin.get_or_insert_with(Rejoin::begin);
+                    r.given_back = Some(why.clone());
+                    r.goes_on = true;
+                    r.back_at = None;
+                    self.founder_away = None;
+                    self.lost = None;
+                    if let Some(s) = self.seated.as_mut() {
+                        s.seat = None;
+                    }
+                    self.log_table(
+                        crate::gui::table::LogKind::Normal,
+                        "the table's founder is gone: the table goes on without it".to_string(),
+                    );
+                    self.note(why);
+                }
+            }
             // `S1-FY`: before the start, the founder gave a seat back.
             NodeEvent::SeatReleased { seat, why } => {
                 let name = self.seat_name(seat);
@@ -2711,6 +2734,18 @@ impl AppState {
         let r = self.rejoin.as_ref()?;
         let back = r.back_at.is_some();
         // `S1-FY`: the seat given back before the table started, asked for again.
+        if let Some(why) = r.given_back.as_ref().filter(|_| r.goes_on) {
+            return Some(crate::gui::table::RejoinView {
+                for_s: r.since.elapsed().as_secs(),
+                steps: vec![
+                    (Done, "The table's founder is gone".to_string()),
+                    (Now, "The table goes on at a table one of its seats founded".to_string()),
+                    (Later, "Seated at that table".to_string()),
+                ],
+                detail: Some(sentence(why)),
+                back: false,
+            });
+        }
         if let Some(why) = r.given_back.as_ref() {
             let state = |done: bool, now: bool| if done { Done } else if now { Now } else { Later };
             return Some(crate::gui::table::RejoinView {
@@ -3911,6 +3946,28 @@ mod tests {
         s.apply(NodeEvent::Swept { now_ms: 1 });
         assert!(s.rejoin.is_none(), "and then nothing");
         assert_eq!(s.seated.as_ref().and_then(|x| x.seat), Some(3));
+    }
+
+    /// `D-061`: a table that goes on without its founder is said as its own way,
+    /// and the window moves to the table it goes on at.
+    #[test]
+    fn a_table_that_goes_on_without_its_founder_says_so_and_moves() {
+        use crate::gui::table::StepState::{Done, Later, Now};
+        let (old, new) = ([7u8; 32], [8u8; 32]);
+        let mut s = AppState::new();
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some(old) });
+        s.apply(NodeEvent::Seated { key: old, seat: 2 });
+        s.apply(NodeEvent::FounderAway { key: old, why: Some("the founder has been silent in the table's group for 20 s".into()) });
+        s.apply(NodeEvent::TableGoesOn { key: old, why: "the founder is gone: the table goes on at the table seat 1 founded for it (D-061)".into() });
+        let r = s.table_view_of(0).rejoin.expect("the way on");
+        assert_eq!(r.steps.iter().map(|(st, _)| *st).collect::<Vec<_>>(), vec![Done, Now, Later]);
+        assert_eq!(r.steps[0].1, "The table's founder is gone");
+        assert!(s.table_view_of(0).waits.is_empty(), "no more waiting for the founder");
+        assert_eq!(s.slots().len(), 1, "the window stays");
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some(new) });
+        s.apply(NodeEvent::Seated { key: new, seat: 4 });
+        assert!(s.seated.as_ref().is_some_and(|x| x.key == new && x.seat == Some(4)), "the window moved to the table it goes on at");
+        assert_eq!(s.slots().len(), 1);
     }
 
     /// `S1-FY`: before the table starts, the window says what it waits for -- its

@@ -369,7 +369,9 @@ per message code.
 | `LOBBY_TABLE_AD`, `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE` | lobby broadcast |
 | `LOBBY_CHAT` | lobby chat broadcast |
 | `TABLE_CHAT` | table mesh: the table's group, or its topic where there is no group (§7.8) |
-| `TABLE_LEAVE` | table mesh: the table's group only (§7.10) |
+| `TABLE_LEAVE` | table mesh: the table's group; before the table is set, its topic too (§7.10) |
+| `TABLE_HEARING` | table mesh: the table's group and its topic, before the table is set (§7.11) |
+| `TABLE_CONTINUES` | table mesh: the topic of the table that goes on, before it is set (§7.12) |
 | `LOBBY_SNAPSHOT_REQUEST`, `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC |
 | `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT` | join RPC |
 | everything else (`PLAYER_LIST`, `TABLE_READY`, and all of groups 3–8) | table mesh |
@@ -535,7 +537,7 @@ anything else in those four fields.
 Unchained message types, exhaustively: `HELLO`, `CAPABILITIES`, `JOIN_REQUEST`,
 `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST`, `LOBBY_TABLE_AD`,
 `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE`, `LOBBY_SNAPSHOT_REQUEST`,
-`LOBBY_SNAPSHOT_RESPONSE`, `LOBBY_CHAT`, `TABLE_CHAT`, `TABLE_LEAVE`, **`DISPUTE`**. Everything
+`LOBBY_SNAPSHOT_RESPONSE`, `LOBBY_CHAT`, `TABLE_CHAT`, `TABLE_LEAVE`, `TABLE_HEARING`, `TABLE_CONTINUES`, **`DISPUTE`**. Everything
 else is chained.
 
 `DISPUTE` is on this list and it is the only table-mesh message that is, which is
@@ -2465,7 +2467,11 @@ seated participant emits exactly one, to every other.
 *Legal:* once `PLAYER_LIST` names a roster of at least `min_players_to_start` -- or, after
 one that size was named, a roster the founder says again of at least two seats (D-044: a
 seat given back before the first hand does not un-set the table; the floor is heads-up) --
-and this client has an established connection to every other listed seat.
+and this client **hears every other listed seat** on the table mesh (D-060): each is in this
+client's copy of the table's group and has been heard there within `QUIET_LIMIT_S` (20 s). A
+receiver cannot check that and does not try; it is the sender's rule, and the one that makes a
+table start only full of seats that can play with each other. Until then the seat says whom it
+cannot hear (§7.11).
 *Envelope:* `hand_id = 0`, `sequence = 0`, `previous_event_hash = GENESIS(0)`.
 
 | Field | Type | Limit / rule |
@@ -4831,7 +4837,9 @@ means it does not and never can be.
 | `0x0105` | `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC | 0 | — | any peer |
 | `0x0106` | `LOBBY_CHAT` | lobby chat broadcast | 0 | — | any peer |
 | `0x0107` | `TABLE_CHAT` | table mesh (the table's group; its topic where there is no group) | 0 | — | a seated application key (§7.8) |
-| `0x0108` | `TABLE_LEAVE` | table mesh (the table's group) | 0 | — | a seated application key, of its own seat (§7.10) |
+| `0x0108` | `TABLE_LEAVE` | table mesh (the table's group; before the set, its topic too) | 0 | — | a seated application key, of its own seat (§7.10) |
+| `0x0109` | `TABLE_HEARING` | table mesh (the table's group and its topic, before the set) | 0 | — | a seated application key, of its own seat (§7.11) |
+| `0x010A` | `TABLE_CONTINUES` | table mesh (the topic of the table that goes on, before the set) | 0 | — | a seated application key, the founder of the advert it carries (§7.12) |
 | `0x0201` | `JOIN_REQUEST` | join RPC | 0 | — | joiner |
 | `0x0202` | `JOIN_ACCEPT` | join RPC | 0 | — | table key |
 | `0x0203` | `JOIN_REJECT` | join RPC | 0 | — | table key |
@@ -6793,6 +6801,95 @@ charged before anything is read. A receiver marks the seat gone from the table
 for good; where it was the only other seat still in the game, the game is over
 at that receiver. It changes no roster and moves no chip: to every rule of §8
 the seat is an absent one.
+
+**Before the table is set** (`S1-GA`) the word is said too, over the table's group
+**and** its topic -- a seat still joining the group is heard by the founder on the
+topic alone -- and received on either. The founder gives the seat back at once
+(`PLAYER_LIST` said again without it); a joiner only notes it and waits for that
+list. A word said more than 10 s before the seat's present sitting, as the founder
+learned it, is an old word carried again and changes nothing. The founder's own
+word before the set is §7.12's: its seats go on without it.
+
+### 7.11 `0x0109 TABLE_HEARING`
+
+`D-060`. Before the table is set, a seat's own word on which other seats of the
+roster it cannot hear -- the founder's evidence for giving back a seat the table
+cannot play with, since the founder alone cannot see whether two joiners hear each
+other.
+
+*Channel:* the table's group and its topic, before the table is set; after it,
+neither sends nor reads one.
+*Signed by:* the seat's application key, which must hold a seat in the receiver's
+roster for the table the word names.
+*Sent:* while the table forms, whenever the seats this seat cannot hear change or
+the roster serial does, and every 6 s otherwise. A seat cannot hear a seat that is
+not in its copy of the table's group, or has not been heard there within
+`QUIET_LIMIT_S`.
+*Envelope:* unchained (`chain_scope = 0`).
+
+| Field | Type | Limit / rule |
+|---|---|---|
+| `n(0) table_id` | `bytes(32)` | the table |
+| `n(1) list_serial` | `u64` | the `PLAYER_LIST` serial the word is about |
+| `n(2) unheard` | `bytes` | seat numbers, ascending, none twice, each below `MAX_SEATS`, never the sender's own; empty when it hears every seat |
+
+The emitter's clock must be within `CLOCK_SLACK_MS` of the receiver's. It is not
+charged to §7.8's chat budget -- every seat says one every few seconds while the
+table forms -- and a receiver takes one a second from a carrier at most.
+
+**What the founder does with it.** A word stands for 15 s, and only while its
+serial is the founder's own. A seat still inside `GROUP_JOIN_GRACE` (40 s) of
+sitting down is neither judged nor counted against another. A settled seat is in
+trouble when it cannot hear a settled seat (its own word, which costs a liar only
+its own seat), or when two settled seats at least cannot hear it (so no single seat
+can have another given back). A trouble that lasts `MESH_GRACE` (20 s) gives the
+seat back: of several, the one with the most trouble, and between equals the later
+seated. Once every seat hears every seat, a seat that has not ratified for
+`READY_GRACE` (15 s) holds the table up and is given back too. A seat whose word
+names an older serial is sent the roster again, at most every 10 s. And a seat
+whose word stands is alive and speaking: the founder gives it back for its goodbye
+alone, never for the founder's own reading of its silence -- that reading is the
+founder's line as often as the seat's, and the seat's hearing is judged above.
+
+### 7.12 `0x010A TABLE_CONTINUES`
+
+`D-061`. A forming table whose founder is gone goes on at a new table founded by one
+of its seats. The founder's authority before `TABLE_READY` is the table key's, and
+nobody else holds that key; so the table is not handed over, it is **founded again**
+-- same name, same parameters -- by a seat of its roster, with a key of its own, and
+this word takes the other seats there.
+
+*Channel:* the topic of the table that goes on, before it is set.
+*Signed by:* the application key of a seat in the receiver's roster for that table.
+*Sent:* by the seat that founded the new table, every 5 s for a minute after.
+*Envelope:* unchained (`chain_scope = 0`).
+
+| Field | Type | Limit / rule |
+|---|---|---|
+| `n(0) table_id` | `bytes(32)` | the table that goes on |
+| `n(1) list_serial` | `u64` | the roster of that table the speaker held |
+| `n(2) advert` | `bytes` | the `LOBBY_TABLE_AD` of the new table, verbatim: its signature must hold, its table key must not be `table_id`, its `founder_app_key` must be the speaker's, and it must play the receiver's table's own game -- the same `table_params_hash` (§3.1), `table_name` and `password_required` as the advert that table was joined under |
+
+**When a seat goes on, and at whose table.** Before the set, a seat goes on when the
+founder said it left (§7.10), or when it has not heard the founder for
+`QUIET_LIMIT_S` and `FOUNDER_GONE_GRACE` (20 s) more and hears other seats; either way
+only while another seat, neither itself nor the founder, has said `TABLE_HEARING`
+(§7.11) since the founder went or within `HEARING_FRESH` (15 s) before. A set table's
+seats never say that word, so a client that holds a table's roster without its
+session -- a player back at a table that has dealt -- never goes on; and a seat of a
+set table takes no `TABLE_CONTINUES` at all. The seat it goes on at is the lowest seat
+number of the roster, the founder's excepted, not passed over -- itself included. If that is itself, it founds the new table and says this
+word. Otherwise it goes on at the table of the lowest seat whose word it has, once
+that seat is its choice or lower; a choice that says nothing within `CONTINUES_WAIT`
+(20 s) is passed over for the next -- within 8 s when the seat does not hear it, since it
+may still be founding, heard by others, and two seats must not both found one.
+
+**What it cannot do.** A seat offers only a table it founded itself, and only the
+same game -- a continuation with other rules, another name or another gate is not
+heard; it moves only seats that read the founder as gone themselves, so a seat
+cannot take players away from a founder they hear; and it holds, at the new table, a
+founder's authority and nothing more -- which is none over the cards, the chips or
+any hand.
 
 ---
 
