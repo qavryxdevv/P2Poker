@@ -146,6 +146,24 @@ impl RejectReason {
     }
 }
 
+/// A refusal's code in words, for a player. Every code §4.3 allocates has
+/// words, the two this client never sends included: another implementation
+/// may send them, and "reason 6" tells a player nothing at all.
+pub fn refusal_words(code: u16) -> &'static str {
+    match code {
+        1 => "the table is full",
+        2 => "that seat is taken",
+        3 => "wrong password",
+        4 => "the buy-in is out of range",
+        5 => "the advertisement has expired",
+        6 => "banned",
+        7 => "capabilities do not match",
+        8 => "already seated",
+        9 => "this seat was removed after its fourth absence; the game at this table is over for good (D-047)",
+        _ => "no reason this client understands",
+    }
+}
+
 /// What the joiner retains from the moment it asks.
 ///
 /// `U11`: *"the advertisement it joined under"* is never pinned to a stored

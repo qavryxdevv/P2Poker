@@ -179,19 +179,17 @@ fn log_line(line: &str) {
     }
 }
 
-fn refusal(code: u16) -> &'static str {
-    match code {
-        1 => "the table is full",
-        2 => "that seat is taken",
-        3 => "wrong password",
-        4 => "the buy-in is out of range",
-        5 => "the advertisement has expired",
-        6 => "banned",
-        7 => "capabilities do not match",
-        8 => "already seated",
-        9 => "this seat was removed after its fourth absence; the game at this table is over for good (D-047)",
-        _ => "no reason this client understands",
+/// `S1-FY`: a reason as a panel says it -- its first letter a capital.
+fn sentence(why: &str) -> String {
+    let mut chars = why.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
+}
+
+fn refusal(code: u16) -> &'static str {
+    crate::table::join::refusal_words(code)
 }
 
 /// Eight characters of a key, which is what a person can compare at a glance.
@@ -352,6 +350,8 @@ pub struct TableApp {
     pub unsafe_note: Option<(String, u64)>,
     pub rejoin: Option<Rejoin>,
     pub waits: std::collections::BTreeMap<u8, SeatWait>,
+    pub lost: Option<String>,
+    pub founder_away: Option<(String, std::time::Instant)>,
 }
 
 /// Everything the client knows, in the form the panes read it.
@@ -506,6 +506,12 @@ pub struct AppState {
     /// `D-058`: the other seats this table waits on, or waited on and is taking
     /// back, by seat.
     pub waits: std::collections::BTreeMap<u8, SeatWait>,
+    /// `S1-FY`: this client is no longer at the table and the player did not
+    /// ask to leave it: why. The window stays and says so; its player closes it.
+    pub lost: Option<String>,
+    /// `S1-FY`: before the table starts, why its founder cannot be heard, and
+    /// since when -- the joiner waits for it.
+    pub founder_away: Option<(String, std::time::Instant)>,
     /// The sounds owed since the window last played them, in order.
     pub sound_cues: Vec<crate::sound::Cue>,
     /// How many games this client has sat down to since it started: PokerTH's
@@ -654,6 +660,9 @@ pub struct Rejoin {
     pub back_at: Option<std::time::Instant>,
     /// `S1-FR`: this client came back after a restart, from its session record.
     pub restarted: bool,
+    /// `S1-FY`: before the table started, the founder gave this client's seat
+    /// back; where asking for a seat again stands.
+    pub given_back: Option<String>,
 }
 
 impl Rejoin {
@@ -669,6 +678,7 @@ impl Rejoin {
             asked: None,
             back_at: None,
             restarted: false,
+            given_back: None,
         }
     }
 }
@@ -842,7 +852,7 @@ impl AppState {
             NodeEvent::YourTurn { .. } => {
                 self.turn_at.insert(self.current_slot);
             }
-            NodeEvent::NotYourTurn { .. } | NodeEvent::HandEnded { .. } | NodeEvent::LeftTable { .. } => {
+            NodeEvent::NotYourTurn { .. } | NodeEvent::HandEnded { .. } | NodeEvent::LeftTable { .. } | NodeEvent::TableLost { .. } => {
                 self.turn_at.remove(&self.current_slot);
             }
             _ => {}
@@ -903,6 +913,8 @@ impl AppState {
         std::mem::swap(&mut self.unsafe_note, &mut other.unsafe_note);
         std::mem::swap(&mut self.rejoin, &mut other.rejoin);
         std::mem::swap(&mut self.waits, &mut other.waits);
+        std::mem::swap(&mut self.lost, &mut other.lost);
+        std::mem::swap(&mut self.founder_away, &mut other.founder_away);
     }
 
     /// `D-043`: turn to another of this client's tables: its state becomes
@@ -1881,6 +1893,15 @@ impl AppState {
                 if restarted && self.rejoin.is_none() {
                     self.rejoin = Some(Rejoin { restarted: true, ..Rejoin::begin() });
                 }
+                // `S1-FY`: a seat given back before the start, taken again.
+                self.lost = None;
+                let given_back = self.rejoin.as_ref().is_some_and(|r| r.given_back.is_some() && r.back_at.is_none());
+                if given_back {
+                    if let Some(r) = self.rejoin.as_mut() {
+                        r.back_at = Some(std::time::Instant::now());
+                    }
+                    self.log_table(crate::gui::table::LogKind::Normal, "seated at the table again".to_string());
+                }
             }
             NodeEvent::Roster { key, seats } => {
                 let n = seats.len();
@@ -1950,6 +1971,22 @@ impl AppState {
                 }
             }
             NodeEvent::JoinRefused { reason } => {
+                // `S1-FY`: with the table's window open and no join of this slot
+                // under way, the window stays and says why; only its player closes
+                // it. The hand it held cannot be played from here any more.
+                let window = self.seated.as_ref().map(|s| s.key);
+                let join = self.joining_of_this_slot().map(|j| j.key);
+                if window.is_some() && (join.is_none() || join == window) {
+                    let why = format!("the founder says no: {}", refusal(reason));
+                    if let Some(j) = self.joining_of_this_slot() {
+                        j.failed = Some(why.clone());
+                    }
+                    self.hand = None;
+                    self.waiting_for.clear();
+                    self.lost = Some(why.clone());
+                    self.note(why);
+                    return;
+                }
                 // The founder's claim, said as a claim. A rejection is never
                 // proof of anything: §4.3 puts it plainly, and the founder may
                 // simply not want this player.
@@ -2010,6 +2047,66 @@ impl AppState {
                 }
                 self.note(why);
             }
+            // `S1-FY`, the owner's rule (2026-09-16): a table's window closes at its
+            // player's word alone. A table lost without the player asking keeps
+            // its window, which says why; a join still in the lobby is told it
+            // failed, as before.
+            NodeEvent::TableLost { why } => {
+                if let Some(j) = self.joining_of_this_slot() {
+                    j.failed = Some(why.clone());
+                }
+                if self.seated.is_some() {
+                    self.lost = Some(why.clone());
+                    self.rejoin = None;
+                    self.founder_away = None;
+                    self.hand = None;
+                    self.waiting_for.clear();
+                }
+                self.note(why);
+            }
+            // `S1-FY`: before the start, the wait for the founder.
+            NodeEvent::FounderAway { key, why } => {
+                if self.seated.as_ref().is_some_and(|s| s.key == key) {
+                    match why {
+                        Some(why) => {
+                            let since = self.founder_away.as_ref().map_or_else(std::time::Instant::now, |(_, at)| *at);
+                            self.founder_away = Some((why.clone(), since));
+                            self.log_table(crate::gui::table::LogKind::Normal, format!("waiting for the founder: {why}"));
+                        }
+                        None => {
+                            if self.founder_away.take().is_some() {
+                                self.log_table(crate::gui::table::LogKind::Normal, "the founder can be heard again".to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            // `S1-FY`: before the start, this client's seat given back and asked for again.
+            NodeEvent::SeatGivenBack { key, why } => {
+                if self.seated.as_ref().is_some_and(|s| s.key == key) {
+                    let first = self.rejoin.as_ref().is_none_or(|r| r.given_back.is_none());
+                    let r = self.rejoin.get_or_insert_with(Rejoin::begin);
+                    r.given_back = Some(why.clone());
+                    r.back_at = None;
+                    self.founder_away = None;
+                    self.lost = None;
+                    if let Some(s) = self.seated.as_mut() {
+                        s.seat = None;
+                    }
+                    if first {
+                        self.log_table(
+                            crate::gui::table::LogKind::Normal,
+                            "your seat was given back before the table started: asking for a seat again".to_string(),
+                        );
+                    }
+                    self.note(why);
+                }
+            }
+            // `S1-FY`: before the start, the founder gave a seat back.
+            NodeEvent::SeatReleased { seat, why } => {
+                let name = self.seat_name(seat);
+                self.log_table(crate::gui::table::LogKind::Normal, format!("{name} {why}: its seat is free again"));
+            }
         }
     }
 
@@ -2066,6 +2163,26 @@ impl AppState {
         self.emitted = self.emitted.saturating_add(1);
     }
 
+    /// `S1-FY`: a client with no player -- the headless one -- closes a lost
+    /// table's window at once, as a player would, and so asks for its table
+    /// again as it always did.
+    pub fn close_lost_tables(&mut self) {
+        if self.lost.is_some() {
+            self.forget_the_table();
+            self.seated = None;
+        }
+        let lost: Vec<u8> = self
+            .background
+            .iter()
+            .filter(|(_, t)| t.lost.is_some())
+            .map(|(slot, _)| *slot)
+            .collect();
+        for slot in lost {
+            self.background.remove(&slot);
+            self.slot_keys.remove(&slot);
+        }
+    }
+
     /// `S1-CS`: nothing of a hand outlives the table it was played at. The
     /// window reopened used to show the last game's cards at the next
     /// table, because the hand was never cleared.
@@ -2102,6 +2219,8 @@ impl AppState {
         self.unsafe_note = None;
         self.rejoin = None;
         self.waits.clear();
+        self.lost = None;
+        self.founder_away = None;
     }
 
     /// `S1-FL`: a seat's place, by the node's word at the boundary (the owner,
@@ -2366,8 +2485,59 @@ impl AppState {
         let Some(seated) = self.seated.as_ref() else {
             return Vec::new();
         };
+        // `S1-FY`: before the table starts, the wait for its founder, or for a
+        // seat gone off the line -- said as a game says a seat it waits on.
+        if seated.session.is_none() {
+            if self.rejoin.is_some() || self.lost.is_some() {
+                return Vec::new();
+            }
+            if let Some((why, since)) = self.founder_away.as_ref() {
+                return vec![WaitView {
+                    title: "Waiting for the table's founder".to_string(),
+                    panel: RejoinView {
+                        for_s: since.elapsed().as_secs(),
+                        steps: vec![
+                            (Now, sentence(why)),
+                            (Later, "The founder is heard again".to_string()),
+                            (Later, "The table starts when every seat is in".to_string()),
+                        ],
+                        detail: Some(
+                            "The table cannot start without its founder, and nothing here closes by itself: wait for it, or leave the table"
+                                .to_string(),
+                        ),
+                        back: false,
+                    },
+                }];
+            }
+            let mut off = Vec::new();
+            for (n, name, _) in &seated.roster {
+                if Some(*n) == seated.seat {
+                    continue;
+                }
+                // Heard once and not now: a seat still joining the group has
+                // never been heard, and that is the table forming.
+                if let Some((_, false, Some(quiet), _)) = self.links.get(n) {
+                    off.push(WaitView {
+                        title: format!("Waiting for {name}"),
+                        panel: RejoinView {
+                            for_s: *quiet,
+                            steps: vec![
+                                (Done, format!("{name} is off the line")),
+                                (Now, format!("Its seat is given back after {} s of silence", crate::net::run::QUIET_LIMIT_S)),
+                                (Later, "The table waits for a player to take the seat".to_string()),
+                            ],
+                            detail: Some(format!(
+                                "{name} has not been heard for {quiet} s. Back in time it keeps its seat; if not, the founder gives the seat back, and its client asks for one again"
+                            )),
+                            back: false,
+                        },
+                    });
+                }
+            }
+            return off;
+        }
         // `S1-EI`'s rule: a set table whose group has held a seat once.
-        if seated.session.is_none() || !self.ever_on_line {
+        if !self.ever_on_line {
             return Vec::new();
         }
         // This client's own way back is the only panel while it is under way.
@@ -2540,6 +2710,20 @@ impl AppState {
         use crate::gui::table::StepState::{Done, Later, Now};
         let r = self.rejoin.as_ref()?;
         let back = r.back_at.is_some();
+        // `S1-FY`: the seat given back before the table started, asked for again.
+        if let Some(why) = r.given_back.as_ref() {
+            let state = |done: bool, now: bool| if done { Done } else if now { Now } else { Later };
+            return Some(crate::gui::table::RejoinView {
+                for_s: r.since.elapsed().as_secs(),
+                steps: vec![
+                    (Done, "Seat given back before the table started".to_string()),
+                    (state(back, true), "Asking for a seat again".to_string()),
+                    (state(back, false), "Seated at the table again".to_string()),
+                ],
+                detail: Some(if back { "Seated again".to_string() } else { sentence(why) }),
+                back,
+            });
+        }
         // `D-057`, the owner's word: *Back in the game* is not said over a hand
         // this client holds its cards in.
         if back && self.holds_cards() {
@@ -3230,7 +3414,9 @@ mod tests {
         assert!(s.at_a_real_table());
     }
 
-    /// A refusal clears the seat and reaches the log as a **claim**.
+    /// A refusal reaches the log as a **claim**. `S1-FY`, the owner's rule: with
+    /// the table's window open it closes nothing -- the window stays and says why,
+    /// and only its player closes it.
     #[test]
     fn a_refusal_is_reported_as_a_claim() {
         let mut s = AppState::new();
@@ -3239,10 +3425,15 @@ mod tests {
             seat: 3,
         });
         s.apply(NodeEvent::JoinRefused { reason: 3 });
-        assert!(s.seated.is_none());
+        assert!(s.seated.is_some(), "the window stays");
+        assert!(s.lost.as_deref().is_some_and(|w| w.contains("wrong password")), "{:?}", s.lost);
+        assert!(s.table_view().lost.is_some(), "and says why");
         let line = s.log.back().unwrap();
         assert!(line.contains("says no"), "{line}");
         assert!(line.contains("wrong password"), "{line}");
+        // The player closes it: the leave the window asks for.
+        s.apply(NodeEvent::LeftTable { why: "left the table".into() });
+        assert!(s.seated.is_none() && s.lost.is_none());
     }
 
     /// Every reason code §4.3 allocates has words, including the two this client
@@ -3636,6 +3827,135 @@ mod tests {
         assert!(s.joining.as_ref().unwrap().failed.as_deref().unwrap().contains("no answer"));
         s.joining = None;
         assert!(s.view().joining.is_none());
+    }
+
+    /// `S1-FY`, the owner's rule (2026-09-16): nothing closes a table's window but
+    /// its player. A table lost without the player asking keeps its window, which
+    /// says why, until the leave the player asks for; a join still in the lobby,
+    /// with no window yet, is told it failed, as before.
+    #[test]
+    fn a_table_lost_keeps_its_window_until_its_player_closes_it() {
+        let (a, b) = ([7u8; 32], [8u8; 32]);
+        let mut s = AppState::new();
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some(a) });
+        s.apply(NodeEvent::Seated { key: a, seat: 1 });
+        s.apply(NodeEvent::Roster { key: a, seats: vec![(0, "Founder".into(), 1_000), (1, "me".into(), 1_000)] });
+        s.apply(NodeEvent::FounderAway { key: a, why: Some("the founder timed out of the table's group".into()) });
+        s.apply(NodeEvent::TableLost { why: "the founder gave this seat away".into() });
+        assert_eq!(s.slots().len(), 1, "the window stays");
+        let v = s.table_view_of(0);
+        assert_eq!(v.lost.as_deref(), Some("the founder gave this seat away"));
+        assert!(v.waits.is_empty() && v.rejoin.is_none(), "the window's word is the one about the table lost");
+
+        s.apply(NodeEvent::LeftTable { why: "left the table".into() });
+        assert!(s.slots().is_empty(), "closed at its player's word");
+        assert!(s.lost.is_none() && s.founder_away.is_none());
+
+        // A join with no window yet: it failed, and no window opens for it.
+        s.begin_join(b, "Elsewhere".into(), 1_000, None);
+        s.apply(NodeEvent::AtTable { slot: 1, key: Some(b) });
+        s.apply(NodeEvent::TableLost { why: "the acceptance did not hold".into() });
+        assert_eq!(s.joining.as_ref().and_then(|j| j.failed.as_deref()), Some("the acceptance did not hold"));
+        assert!(s.slots().is_empty());
+    }
+
+    /// `S1-FY`: the headless client has no player to close a lost table, so it
+    /// closes it at once -- that table's, and no other.
+    #[test]
+    fn a_client_with_no_player_closes_a_lost_table_at_once() {
+        let (a, b) = ([7u8; 32], [8u8; 32]);
+        let mut s = AppState::new();
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some(a) });
+        s.apply(NodeEvent::Seated { key: a, seat: 1 });
+        s.apply(NodeEvent::AtTable { slot: 1, key: Some(b) });
+        s.apply(NodeEvent::Seated { key: b, seat: 2 });
+        s.apply(NodeEvent::TableLost { why: "the founder gave this seat away".into() });
+        assert_eq!(s.slots().len(), 2);
+        s.close_lost_tables();
+        assert_eq!(s.slots().len(), 1);
+        assert!(s.seated.as_ref().is_some_and(|x| x.key == a), "the table being played is untouched");
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some(a) });
+        s.apply(NodeEvent::TableLost { why: "the founder gave this seat away".into() });
+        s.close_lost_tables();
+        assert!(s.slots().is_empty());
+    }
+
+    /// `S1-FY`: before the table starts, a seat the founder gave back is asked for
+    /// again in its own window -- said once, shown as the way back, and taken down
+    /// a moment after the seat is taken again.
+    #[test]
+    fn before_the_start_a_seat_given_back_is_asked_for_again_in_its_window() {
+        use crate::gui::table::StepState::{Done, Later, Now};
+        let key = [7u8; 32];
+        let mut s = AppState::new();
+        s.apply(NodeEvent::AtTable { slot: 0, key: Some(key) });
+        s.apply(NodeEvent::Seated { key, seat: 2 });
+        s.apply(NodeEvent::Roster { key, seats: vec![(0, "Founder".into(), 1_000), (2, "me".into(), 1_000)] });
+        let why = "the founder gave this seat away before the first hand; asking for a seat again";
+        s.apply(NodeEvent::SeatGivenBack { key, why: why.into() });
+        s.apply(NodeEvent::SeatGivenBack { key: [9u8; 32], why: "another table's word".into() });
+        s.apply(NodeEvent::SeatGivenBack { key, why: why.into() });
+        assert!(s.seated.as_ref().is_some_and(|x| x.key == key && x.seat.is_none()), "the window stays; its seat is asked for");
+        let r = s.table_view_of(0).rejoin.expect("the way back");
+        assert_eq!(r.steps.iter().map(|(st, _)| *st).collect::<Vec<_>>(), vec![Done, Now, Later]);
+        assert_eq!(r.detail.as_deref(), Some("The founder gave this seat away before the first hand; asking for a seat again"));
+        assert!(!r.back);
+        assert_eq!(s.table_log.iter().filter(|l| l.text.contains("asking for a seat again")).count(), 1, "said once");
+        assert!(s.table_view_of(0).waits.is_empty(), "the way back is the one panel");
+
+        s.apply(NodeEvent::Seated { key, seat: 3 });
+        let r = s.table_view_of(0).rejoin.expect("seated again, said for a moment");
+        assert!(r.back && r.steps.iter().all(|(st, _)| *st == Done), "{r:?}");
+        assert!(s.table_log.iter().any(|l| l.text == "seated at the table again"));
+        s.rejoin.as_mut().unwrap().back_at = Some(std::time::Instant::now() - REJOIN_BACK_SHOWN);
+        s.apply(NodeEvent::Swept { now_ms: 1 });
+        assert!(s.rejoin.is_none(), "and then nothing");
+        assert_eq!(s.seated.as_ref().and_then(|x| x.seat), Some(3));
+    }
+
+    /// `S1-FY`: before the table starts, the window says what it waits for -- its
+    /// founder, or a seat heard once and off the line now -- and a seat the founder
+    /// gave back is said at the table. A seat never heard is the table forming,
+    /// and nothing waits for it.
+    #[test]
+    fn before_the_start_the_window_says_what_it_waits_for() {
+        use crate::gui::table::StepState::Now;
+        let key = [7u8; 32];
+        let mut s = AppState::new();
+        s.apply(NodeEvent::Seated { key, seat: 1 });
+        s.apply(NodeEvent::Roster {
+            key,
+            seats: vec![(0, "Founder".into(), 1_000), (1, "me".into(), 1_000), (2, "Carol".into(), 1_000), (3, "Dave".into(), 1_000)],
+        });
+        assert!(s.table_view().waits.is_empty(), "a table forming waits for nobody");
+
+        s.apply(NodeEvent::FounderAway { key, why: Some("the founder has been silent in the table's group for 20 s".into()) });
+        let v = s.table_view().waits;
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].title, "Waiting for the table's founder");
+        assert_eq!(v[0].panel.steps[0], (Now, "The founder has been silent in the table's group for 20 s".to_string()));
+        s.apply(NodeEvent::FounderAway { key: [9u8; 32], why: None });
+        assert_eq!(s.table_view().waits.len(), 1, "another table's founder is not this one's");
+        s.apply(NodeEvent::FounderAway { key, why: None });
+        assert!(s.table_view().waits.is_empty());
+        assert!(s.table_log.iter().any(|l| l.text == "the founder can be heard again"), "{:?}", s.table_log);
+
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: false, quiet_s: Some(25), away: false });
+        s.apply(NodeEvent::SeatLink { seat: 3, rtt_ms: None, group: false, quiet_s: None, away: false });
+        let v = s.table_view().waits;
+        assert_eq!(v.iter().map(|w| w.title.as_str()).collect::<Vec<_>>(), vec!["Waiting for Carol"]);
+        assert_eq!(v[0].panel.for_s, 25);
+        s.apply(NodeEvent::SeatLink { seat: 2, rtt_ms: None, group: true, quiet_s: Some(0), away: false });
+        assert!(s.table_view().waits.is_empty(), "back on the line");
+
+        s.apply(NodeEvent::SeatReleased { seat: 3, why: "never joined the table's group and its line is down, 40 s after sitting down".into() });
+        assert!(
+            s.table_log
+                .iter()
+                .any(|l| l.text == "Dave never joined the table's group and its line is down, 40 s after sitting down: its seat is free again"),
+            "{:?}",
+            s.table_log
+        );
     }
 
     /// `S1-DE`: the question about an unfinished game is answered once.

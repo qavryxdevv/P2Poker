@@ -282,6 +282,9 @@ pub struct TableView {
     pub out_for_good: Option<String>,
     /// `D-051`: and the word was that this client flooded the table's group.
     pub out_flooded: bool,
+    /// `S1-FY`: this client is no longer at the table and its player did not
+    /// ask to leave it: why. The window stays and says so; the player closes it.
+    pub lost: Option<String>,
     /// `D-051`: why this table is not safe, with the serial the window is
     /// closed by -- the question comes back when the node says it again.
     pub unsafe_note: Option<(String, u64)>,
@@ -1739,6 +1742,29 @@ fn windows(ui: &egui::Ui, view: &TableView, state: &mut TableUi, settings: &Sett
             });
     }
 
+    // `S1-FY`, the owner's rule: a table's window closes at its player's word
+    // alone. This client is no longer at the table, and nobody asked it to leave:
+    // said here, and the window closes when the player closes it.
+    if let Some(why) = view.lost.as_ref().filter(|_| view.out_for_good.is_none()) {
+        egui::Window::new("Not at this table")
+            .id(egui::Id::new("table-lost"))
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .frame(window_frame(&ctx))
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(&ctx, |ui| {
+                ui.set_min_width(400.0);
+                ui.visuals_mut().override_text_color = Some(style::PANEL_TEXT);
+                window_heading(ui, "Not at this table any more", false);
+                ui.label("This client is no longer at the table, and nothing here was closed for you: the window stays until you close it.");
+                ui.label(RichText::new(why.as_str()).color(style::PANEL_MUTED).small());
+                if ui.add(egui::Button::new(RichText::new("Close the table").color(style::WHITE)).fill(Color32::from_rgb(0x8A, 0x2C, 0x2C))).clicked() {
+                    action = Some(TableAction::CloseOut);
+                }
+            });
+    }
+
     // `D-051`, the owner: where the table cannot put out what floods it, the
     // honest players are told it is not safe and that leaving is recommended.
     // Stay closes the question until the node says it again.
@@ -2103,6 +2129,7 @@ impl TableView {
             opponent_left: false,
             out_for_good: None,
             out_flooded: false,
+            lost: None,
             unsafe_note: None,
             line: None,
             absent: Vec::new(),

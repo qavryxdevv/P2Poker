@@ -197,6 +197,7 @@ impl AppState {
             opponent_left: self.opponent_left,
             out_for_good: self.out_for_good.clone(),
             out_flooded: self.out_flooded,
+            lost: self.lost.clone(),
             unsafe_note: self.unsafe_note.clone(),
             // `S1-EL`: and the group's softer *the line may be down* yields to the
             // question when that stands, which says the same with the choice.

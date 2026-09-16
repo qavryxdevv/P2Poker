@@ -929,7 +929,36 @@ struct TableRun {
     /// left `TOURNAMENT_LEAVE_GRACE` after -- long enough for the resend loop
     /// to give a slow seat the terminal message again, and no longer.
     table_over_at: Option<std::time::Instant>,
+    /// `S1-FY`: what the player joined this table with, kept to ask for the
+    /// seat again when the founder gives it back before the table starts.
+    join_asked: Option<JoinAsked>,
+    /// `S1-FY`: the table whose seat was given back and is being asked for
+    /// again -- the slot still holds it for the window -- and when to ask next.
+    rejoin_key: Option<[u8; 32]>,
+    rejoin_at: Option<tokio::time::Instant>,
+    /// `S1-FY`: the reading about the founder last told the window, before
+    /// the table starts.
+    founder_away_said: Option<String>,
+    /// `S1-FY`: the table this slot lost without its player asking, while the
+    /// table's window still says so. The slot stays the window's until its
+    /// player closes it: a slot closed under an open window sent that window's
+    /// leave to the table being played.
+    lost_key: Option<[u8; 32]>,
 }
+
+/// `S1-FY`: a join as the player asked for it.
+#[derive(Clone)]
+struct JoinAsked {
+    key: [u8; 32],
+    buyin: u64,
+    seat: Option<u8>,
+    password: Option<Vec<u8>>,
+}
+
+/// `S1-FY`: how soon a seat given back before the start is asked for again,
+/// and how long after an asking that did not go through.
+const REASK_FIRST: std::time::Duration = std::time::Duration::from_secs(2);
+const REASK_AGAIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl TableRun {
     fn new(
@@ -1049,6 +1078,11 @@ impl TableRun {
             table_closed: false,
             tournament_started: false,
             table_over_at: None,
+            join_asked: None,
+            rejoin_key: None,
+            rejoin_at: None,
+            founder_away_said: None,
+            lost_key: None,
         }
     }
 }
@@ -1215,6 +1249,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // The next slot's number, and the last `AtTable` the window was told.
     let mut next_slot: u8 = 1;
     let mut marked: Option<(u8, Option<[u8; 32]>)> = None;
+    // `S1-FY`: the window turned to a slot this node no longer holds. Its
+    // commands go nowhere -- never to the active table -- and its leave closes
+    // that window.
+    let mut focus_gone: Option<u8> = None;
     // The join requests in flight, by the table each was sent for.
     // `S1-FG`: by the slot's number, which a closed slot does not shift.
     let mut join_pending: std::collections::HashMap<libp2p::request_response::OutboundRequestId, u8> =
@@ -2486,17 +2524,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
     macro_rules! leave_table_now {
+        // The player's own leave -- the window's command, or the harness pressing
+        // it -- and the one leave that closes the table's window (`S1-FY`).
         ($t:ident) => {
-            leave_table_now!($t, "left the table".to_string())
+            leave_table_now!($t, "left the table".to_string(), true, true)
         };
-        // `S1-DV`: with the reason the window shows -- a joiner taken back to
-        // the lobby is told why.
+        // `S1-DV`: with the reason the window shows. `S1-FY`: a leave the player
+        // did not ask for is said as the table lost, and the window stays.
         ($t:ident, $why:expr) => {
-            leave_table_now!($t, $why, true)
+            leave_table_now!($t, $why, true, false)
         };
         // `S1-FG`: and whether the session record may go at all -- not for a
-        // rejoin put off for now.
-        ($t:ident, $why:expr, $forget:expr) => {{
+        // rejoin put off for now; `S1-FY`: and whether the player asked.
+        ($t:ident, $why:expr, $forget:expr, $asked:expr) => {{
             // `S1-FG`: the record this leave may forget is this table's. The
             // profile holds one, and another table this client sits at may
             // have written it since: a join given up used to forget the record
@@ -2507,6 +2547,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 .map(|f| f.table_id())
                 .or($t.joined_key)
                 .or($t.resume.as_ref().map(|r| r.table_key));
+            // `S1-FY`: the table has a window -- this client held a seat there.
+            let window = $t.table.as_ref().filter(|f| holds_a_window(f)).map(|f| f.table_id());
             // The Tox group goes with the table: dropping the handle tells
             // the driver to leave and joins its thread, which flushes what it
             // still holds -- the last message of a hand sits in that queue.
@@ -2527,7 +2569,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
             $t.resume = None;
             $t.resuming = false;
-            let _ = events.send(NodeEvent::LeftTable { why: $why }).await;
+            let why: String = $why;
+            if $asked {
+                let _ = events.send(NodeEvent::LeftTable { why }).await;
+            } else {
+                $t.lost_key = window;
+                let _ = events.send(NodeEvent::TableLost { why }).await;
+            }
         }};
     }
     // `D-045`, the owner's rule: a seat the table certified out of the hand
@@ -2847,8 +2895,107 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.joined_key = None;
             $t.joined_ad = None;
             $t.joined_advert_hash = None;
+            $t.join_asked = None;
+            $t.rejoin_key = None;
+            $t.rejoin_at = None;
+            $t.founder_away_said = None;
+            $t.lost_key = None;
         }};
     }
+    // `S1-FY`: the owner's rule, before the table starts too -- a table's window
+    // closes at its player's word alone. The founder gave this client's seat back
+    // before the start (it was silent or off the line there); the road back is to
+    // ask for a seat again, as a seat certified out of a game asks to sit in. The
+    // join is dropped -- the group, the topic, the formation -- and asked again a
+    // moment later from what the player joined with; the slot and its window stay.
+    macro_rules! seat_given_back {
+        ($t:ident, $key:expr, $why:expr) => {{
+            let key: [u8; 32] = $key;
+            let why: String = $why;
+            let asked = $t.join_asked.take();
+            $t.tox_sink.clear();
+            $t.tox_group_said = false;
+            $t.table_announces = 0;
+            if let Some(topic) = $t.table_topic.take() {
+                let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
+            }
+            $t.table = None;
+            leave_the_table!($t);
+            dht_effort(&mut swarm, false);
+            match asked {
+                Some(a) => {
+                    $t.join_asked = Some(a);
+                    $t.rejoin_key = Some(key);
+                    $t.rejoin_at = Some(tokio::time::Instant::now() + REASK_FIRST);
+                    let _ = events
+                        .send(NodeEvent::Warning(format!("{why}: this client asks for a seat again (S1-FY)")))
+                        .await;
+                    let _ = events
+                        .send(NodeEvent::SeatGivenBack { key, why: format!("{why}; asking for a seat again") })
+                        .await;
+                }
+                None => {
+                    $t.lost_key = Some(key);
+                    let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                    let _ = events.send(NodeEvent::TableLost { why }).await;
+                }
+            }
+        }};
+    }
+    // `S1-FY`: a join that did not go through. A seat being asked for again keeps
+    // asking; any other join is lost -- said to the window, which stays open for
+    // its player to close (the lobby's join says it failed).
+    macro_rules! join_failed {
+        ($t:ident, $why:expr) => {{
+            let why: String = $why;
+            let again = $t.rejoin_key.zip($t.join_asked.clone());
+            let window = $t.table.as_ref().filter(|f| holds_a_window(f)).map(|f| f.table_id());
+            $t.tox_sink.clear();
+            $t.tox_group_said = false;
+            $t.table_announces = 0;
+            if let Some(topic) = $t.table_topic.take() {
+                let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
+            }
+            $t.table = None;
+            leave_the_table!($t);
+            dht_effort(&mut swarm, false);
+            match again {
+                Some((key, asked)) => {
+                    $t.join_asked = Some(asked);
+                    $t.rejoin_key = Some(key);
+                    $t.rejoin_at = Some(tokio::time::Instant::now() + REASK_AGAIN);
+                    let _ = events.send(NodeEvent::Warning(format!("{why}; asking again in {} s (S1-FY)", REASK_AGAIN.as_secs()))).await;
+                    let _ = events
+                        .send(NodeEvent::SeatGivenBack { key, why: format!("{why}; asking again in {} s", REASK_AGAIN.as_secs()) })
+                        .await;
+                }
+                None => {
+                    $t.lost_key = window;
+                    let _ = events.send(NodeEvent::TableLost { why }).await;
+                }
+            }
+        }};
+    }
+    // `S1-FY`: a join not even asked. A seat being asked for again is asked for
+    // again later; any other goes back to the lobby's join, as before.
+    macro_rules! join_not_started {
+        ($t:ident, $key:expr, $why:expr, $here:expr) => {{
+            let key: [u8; 32] = $key;
+            let why: String = $why;
+            let _ = events.send(NodeEvent::Warning(why.clone())).await;
+            if $t.rejoin_key == Some(key) && $t.table.is_none() {
+                $t.rejoin_at = Some(tokio::time::Instant::now() + REASK_AGAIN);
+                let _ = events
+                    .send(NodeEvent::SeatGivenBack { key, why: format!("{why}; asking again in {} s", REASK_AGAIN.as_secs()) })
+                    .await;
+            } else {
+                let _ = events.send(NodeEvent::JoinNotStarted { key, why, already_here: $here }).await;
+            }
+        }};
+    }
+    // `S1-FY`: commands this node gives itself -- a seat given back, asked for
+    // again -- taken before the window's, down the same road.
+    let mut own_commands: std::collections::VecDeque<NodeCommand> = std::collections::VecDeque::new();
 
     loop {
         // `D-043`: the earliest own clock and the earliest deal among the
@@ -3478,6 +3625,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         report_roster(&events, f).await;
                                 seat_on_tox(f, &t.tox_sink);
+                                        // `S1-FY`: seated again -- nothing more to ask.
+                                        t.rejoin_key = None;
+                                        t.rejoin_at = None;
                                     }
                                     // **`AlreadySeated` is not a refusal like the
                                     // others, and treating it like one is what
@@ -3572,9 +3722,35 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         if let Some(t) = t.table_topic.take() {
                                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                                         }
-                                        let _ = events
-                                            .send(NodeEvent::JoinRefused { reason })
-                                            .await;
+                                        // `S1-FY`: a seat asked for again after the founder gave
+                                        // it back is asked for again later -- a seat may free up --
+                                        // unless the table put it out for good (`D-047`).
+                                        match t.rejoin_key.filter(|_| {
+                                            t.join_asked.is_some()
+                                                && reason != crate::table::join::RejectReason::OutForGood.code()
+                                        }) {
+                                            Some(key) => {
+                                                t.rejoin_at = Some(tokio::time::Instant::now() + REASK_AGAIN);
+                                                let why = format!(
+                                                    "the founder says no: {}; asking again in {} s",
+                                                    crate::table::join::refusal_words(reason),
+                                                    REASK_AGAIN.as_secs()
+                                                );
+                                                let _ = events.send(NodeEvent::Warning(format!("{why} (S1-FY)"))).await;
+                                                let _ = events.send(NodeEvent::SeatGivenBack { key, why }).await;
+                                            }
+                                            None => {
+                                                // The seat given back, refused for good: the
+                                                // window stays, and says so.
+                                                if let Some(key) = t.rejoin_key.take() {
+                                                    t.rejoin_at = None;
+                                                    t.lost_key = Some(key);
+                                                }
+                                                let _ = events
+                                                    .send(NodeEvent::JoinRefused { reason })
+                                                    .await;
+                                            }
+                                        }
                                         // `S1-CR`: the founder answered, and not with *already
                                         // seated*: the session this record names is gone.
                                         if t.resuming
@@ -3591,12 +3767,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                     Err(e) => {
-                                        t.table = None;
-                        leave_the_table!(t);
-                        dht_effort(&mut swarm, false);
-                        let _ = events.send(NodeEvent::LeftTable {
-                                            why: format!("the acceptance did not hold: {e:?}"),
-                                        }).await;
+                                        join_failed!(t, format!("the acceptance did not hold: {e:?}"));
                                     }
                                 }
                             }
@@ -3610,22 +3781,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // have done nothing. `S1-FG`: at the slot that asked --
                         // `table_for_event` sends it nowhere else.
                         join_pending.remove(&request_id);
-                        t.table = None;
-                        // The Tox group goes with the table. Dropping the handle
-                        // tells the driver to leave and joins its thread, which
-                        // flushes what it still holds - the last message of a hand
-                        // is exactly what sits in that queue.
-                        t.tox_sink.clear();
-                            t.tox_group_said = false;
-                            t.table_announces = 0;
-                        if let Some(t) = t.table_topic.take() {
-                            let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
-                        }
-                        leave_the_table!(t);
-                        dht_effort(&mut swarm, false);
-                        let _ = events.send(NodeEvent::LeftTable {
-                            why: format!("the founder did not answer: {error}"),
-                        }).await;
+                        // The Tox group goes with the table (`join_failed!`): dropping
+                        // the handle tells the driver to leave and joins its thread,
+                        // which flushes what it still holds.
+                        join_failed!(t, format!("the founder did not answer: {error}"));
                     }
                     SwarmEvent::Behaviour(PokerBehaviourEvent::Gossipsub(
                         gossipsub::Event::Message {
@@ -4909,7 +5068,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            Some(command) = commands.recv() => {
+            Some(command) = next_command(&mut commands, &mut own_commands) => {
                 // `D-043`: a table founded or joined while this client sits at
                 // another opens a new slot, up to `MAX_TABLES`; everything else
                 // goes to the active table.
@@ -4925,11 +5084,25 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     NodeCommand::JoinTable { key, .. } => Some(*key),
                     _ => None,
                 };
-                let held: Vec<Option<[u8; 32]>> =
-                    tables.iter().map(|x| x.table.as_ref().map(|f| f.table_id())).collect();
+                // `S1-FY`: a slot asking for its seat again still holds that table.
+                let held: Vec<Option<[u8; 32]>> = tables.iter().map(slot_holds).collect();
                 // `S1-FG`: a join given up goes to the slot holding that table and to
                 // no other; one no slot holds any more has ended already, and there
                 // is nothing to give up.
+                if let Some(gone) = focus_gone.filter(|_| for_the_window(&command)) {
+                    if matches!(command, NodeCommand::LeaveTable) {
+                        marked = Some((gone, None));
+                        let _ = events.send(NodeEvent::AtTable { slot: gone, key: None }).await;
+                        let _ = events.send(NodeEvent::LeftTable { why: "left the table".into() }).await;
+                    } else {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "a command for table slot {gone}, which this client no longer holds: ignored (S1-FY)"
+                            )))
+                            .await;
+                    }
+                    continue;
+                }
                 let (which, open) = match &command {
                     NodeCommand::CancelJoin { key, .. } => match slot_for_cancel(key, &held) {
                         Some(i) => (i, false),
@@ -5057,7 +5230,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // `S1-FG`: never over a table this slot holds. At the most
                         // tables one client plays at, the command lands on the active
                         // slot, and founding there replaced the table being played.
-                        if t.table.is_some() {
+                        // `S1-FY`: nor over a seat this slot asks for again.
+                        if t.table.is_some() || t.rejoin_key.is_some() {
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
                                     "this client sits at {MAX_TABLES} tables, the most it plays at once: leave one before founding another"
@@ -5065,6 +5239,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .await;
                             continue;
                         }
+                        t.lost_key = None;
                         // A fresh key per table, and that freshness is the only
                         // thing making two tables with the same players and the
                         // same rules different games (§4.3's `session_id`).
@@ -5321,16 +5496,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 format!("this client sits at {MAX_TABLES} tables, the most it plays at once: leave one before joining another")
                             };
-                            let _ = events.send(NodeEvent::Warning(why.clone())).await;
-                            let _ = events.send(NodeEvent::JoinNotStarted { key, why, already_here: here }).await;
+                            join_not_started!(t, key, why, here);
+                            continue;
+                        }
+                        // `S1-FY`: nor over a seat this slot asks for again at another table.
+                        if t.rejoin_key.is_some_and(|k| k != key) {
+                            let why = format!("this client sits at {MAX_TABLES} tables, the most it plays at once: leave one before joining another");
+                            join_not_started!(t, key, why, false);
                             continue;
                         }
                         let Some(held) = state.lobby.get(&key).cloned() else {
                             let why = "that table is no longer advertised".to_string();
-                            let _ = events.send(NodeEvent::Warning(why.clone())).await;
-                            let _ = events.send(NodeEvent::JoinNotStarted { key, why, already_here: false }).await;
+                            join_not_started!(t, key, why, false);
                             continue;
                         };
+                        t.lost_key = None;
                         // `S1-DE`: a seat that sits down elsewhere is not resuming
                         // any more -- the recorded ratification is the old table's,
                         // and a resuming client adopts hands rather than deriving
@@ -5341,6 +5521,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         t.joined_key = Some(key);
                         t.joined_ad = Some(held.ad.clone());
                         t.joined_advert_hash = Some(held.advert_hash);
+                        t.join_asked = Some(JoinAsked { key, buyin, seat, password: password.clone() });
                         // The founder's PeerId comes from the advert, which was
                         // signed by the table key. Dialling anything else would
                         // be taking routing advice from whoever spoke last.
@@ -5348,8 +5529,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             Ok(p) => p,
                             Err(_) => {
                                 let why = "that table advertises a peer id this client cannot read".to_string();
-                                let _ = events.send(NodeEvent::Warning(why.clone())).await;
-                                let _ = events.send(NodeEvent::JoinNotStarted { key, why, already_here: false }).await;
+                                join_not_started!(t, key, why, false);
                                 continue;
                             }
                         };
@@ -5357,8 +5537,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             Ok(n) => n,
                             Err(e) => {
                                 let why = format!("no randomness for a join nonce: {e}");
-                                let _ = events.send(NodeEvent::Warning(why.clone())).await;
-                                let _ = events.send(NodeEvent::JoinNotStarted { key, why, already_here: false }).await;
+                                join_not_started!(t, key, why, false);
                                 continue;
                             }
                         };
@@ -5483,11 +5662,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 join_pending.insert(asked, t.slot);
                             }
                             Err(e) => {
-                        leave_the_table!(t);
-                        dht_effort(&mut swarm, false);
-                        let _ = events.send(NodeEvent::LeftTable {
-                                    why: format!("cannot ask to join: {e:?}"),
-                                }).await;
+                                join_failed!(t, format!("cannot ask to join: {e:?}"));
                             }
                         }
                     }
@@ -5661,8 +5836,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     NodeCommand::Focus(slot) => {
                         // `D-043`: the window turned to another of its tables.
-                        if let Some(i) = tables.iter().position(|x| x.slot == slot) {
-                            active = i;
+                        match tables.iter().position(|x| x.slot == slot) {
+                            Some(i) => {
+                                active = i;
+                                focus_gone = None;
+                            }
+                            None => focus_gone = Some(slot),
                         }
                     }
                     NodeCommand::SetNickname(name) => {
@@ -5752,7 +5931,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // and the slot closed; the record goes only when it names this
                         // table and the join was not a rejoin put off.
                         close_slot = true;
-                        leave_table_now!(t, "the join was given up".to_string(), forget);
+                        leave_table_now!(t, "the join was given up".to_string(), forget, true);
                     }
                 }
                 // `D-043`: a slot left while another table is open is closed.
@@ -5771,8 +5950,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // once the window has turned elsewhere.
                 if tables.len() > 1 {
                     let keep = tables[active].slot;
+                    // `S1-FY`: nor a slot asking for its seat again, or one whose
+                    // lost table's window is still open.
                     tables.retain(|x| {
-                        x.table.is_some()
+                        slot_holds(x).is_some()
                             || x.slot == keep
                             || x.opened_at.elapsed() < std::time::Duration::from_secs(60)
                     });
@@ -6649,6 +6830,21 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let t = &mut tables[which];
                     mark_table(&events, &mut marked, t).await;
                     let now = super::node::now_unix_ms();
+                    // `S1-FY`: a seat given back before the start, asked for again.
+                    if t.table.is_none() && t.rejoin_at.is_some_and(|at| at <= tokio::time::Instant::now()) {
+                        t.rejoin_at = None;
+                        if let Some(a) = t.join_asked.clone() {
+                            let _ = events
+                                .send(NodeEvent::Warning("asking for a seat at the table again (S1-FY)".into()))
+                                .await;
+                            own_commands.push_back(NodeCommand::JoinTable {
+                                key: a.key,
+                                buyin: a.buyin,
+                                seat: a.seat,
+                                password: a.password,
+                            });
+                        }
+                    }
                     // `D-051`: the seats, said again, so the carrier's list is never
                     // older than this tick; and whether the table is safe.
                     if let Some(f) = t.table.as_ref() {
@@ -6758,6 +6954,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         if let Some(f) = t.table.as_mut().filter(|f| f.is_founder()) {
+                            // `S1-FY`, the owner's word (2026-09-16): healthy seats are
+                            // never let go for another client's bad line -- and a
+                            // founder that hears no seat at a table of three or more is
+                            // most likely that client itself. While it is deaf it gives
+                            // back only a seat that said goodbye to the group.
+                            let deaf = t.ever_on_line && hears_nobody(f, &t.tox_sink);
                             let silent: Vec<(u8, Vec<u8>, Option<[u8; 32]>, String)> = f
                                 .roster()
                                 .seats()
@@ -6796,12 +6998,14 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         .seat_since
                                         .get(&e.seat)
                                         .is_some_and(|since| since.elapsed() >= GROUP_JOIN_GRACE);
-                                    let why = if let Some(quit) = exit {
+                                    let why = if let Some(quit) = exit.filter(|quit| *quit || !deaf) {
                                         Some(if quit {
                                             "left the table before the first hand".to_string()
                                         } else {
                                             "timed out of the table's group before the first hand".to_string()
                                         })
+                                    } else if deaf {
+                                        None
                                     } else if quiet {
                                         Some(format!("has been silent in the table's group for {QUIET_LIMIT_S} s"))
                                     } else if never_in {
@@ -6829,6 +7033,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             .send(NodeEvent::Warning(format!(
                                                 "seat {seat} {why} and the seat is free again"
                                             )))
+                                            .await;
+                                        // `S1-FY`: said at the table, as a certificate is.
+                                        let _ = events
+                                            .send(NodeEvent::SeatReleased { seat, why: why.clone() })
                                             .await;
                                         // **D-019: out of the roster is out of the
                                         // group.** `Seat::Left` was constructed
@@ -6927,7 +7135,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // table is the hand's to handle, like any seat: certified out,
                         // or at heads-up its opponent's question. Only the founder's own
                         // roster without this seat still sends it back.
-                        let gone: Option<String> = t.table.as_ref().filter(|f| !f.is_founder() && !t.resuming).and_then(|f| {
+                        let reading: Option<([u8; 32], JoinerDoes)> = t.table.as_ref().filter(|f| !f.is_founder() && !t.resuming).map(|f| {
                             let founder_peer = PeerId::from_bytes(f.founder_peer_id()).ok();
                             let founder_line = f
                                 .roster()
@@ -6981,19 +7189,50 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 && answers
                                     .get(f.founder_peer_id())
                                     .is_some_and(|(named, at)| !named.contains(&f.table_id()) && *at > f.advert_time());
-                            joiner_leaves_because(
-                                f.released_before_the_first_hand(),
-                                f.session().is_some(),
-                                exit,
-                                withdrawn,
-                                quiet,
-                                never_in,
-                                by_ping,
+                            let released = f.released_before_the_first_hand();
+                            let set = f.session().is_some();
+                            // `S1-FY`: a client that hears no seat at a table of three or
+                            // more reads its own line, not its founder: only a goodbye
+                            // and the founder's own word in the lobby still count (the
+                            // bed's cut joiner said *the founder has been silent* of
+                            // itself, `run153101-3`).
+                            let deaf = t.ever_on_line && hears_nobody(f, &t.tox_sink);
+                            let (exit, quiet, never_in, by_ping) =
+                                if deaf { (exit.filter(|quit| *quit), false, false, false) } else { (exit, quiet, never_in, by_ping) };
+                            (
+                                f.table_id(),
+                                joiner_does(
+                                    released,
+                                    set,
+                                    joiner_leaves_because(released, set, exit, withdrawn, quiet, never_in, by_ping),
+                                    founder_away_because(set, deaf, exit, withdrawn, quiet, never_in, by_ping),
+                                    autoplay.is_some() && !stays_at_the_table(),
+                                ),
                             )
                         });
-                        if let Some(why) = gone {
-                            let _ = events.send(NodeEvent::Warning(why.clone())).await;
-                            leave_table_now!(t, why);
+                        match reading {
+                            None | Some((_, JoinerDoes::Stay)) => {}
+                            Some((_, JoinerDoes::Leave(why))) => {
+                                let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                                leave_table_now!(t, why);
+                            }
+                            Some((key, JoinerDoes::AskAgain(why))) => {
+                                seat_given_back!(t, key, why);
+                            }
+                            Some((key, JoinerDoes::WaitForFounder(why))) => {
+                                if why != t.founder_away_said {
+                                    t.founder_away_said = why.clone();
+                                    let _ = events
+                                        .send(NodeEvent::Warning(match &why {
+                                            Some(w) => format!(
+                                                "{w}; the table cannot start without its founder: this client waits for it, and its player may leave (S1-FY)"
+                                            ),
+                                            None => "the founder can be heard again (S1-FY)".to_string(),
+                                        }))
+                                        .await;
+                                    let _ = events.send(NodeEvent::FounderAway { key, why }).await;
+                                }
+                            }
                         }
                     }
 
@@ -9567,11 +9806,44 @@ fn table_for_event(
 /// `D-043`: tell the window which table what follows is about, when that
 /// changes -- the slot's number and the table's key once it has one.
 async fn mark_table(events: &Events, marked: &mut Option<(u8, Option<[u8; 32]>)>, t: &TableRun) {
-    let key = t.table.as_ref().map(|f| f.table_id());
+    let key = slot_holds(t);
     if *marked != Some((t.slot, key)) {
         *marked = Some((t.slot, key));
         let _ = events.send(NodeEvent::AtTable { slot: t.slot, key }).await;
     }
+}
+
+/// `S1-FY`: the table a slot holds for its window -- the one it plays or
+/// joins, the one whose seat it asks for again, or the one it lost while the
+/// window still says so.
+fn slot_holds(t: &TableRun) -> Option<[u8; 32]> {
+    t.table.as_ref().map(|f| f.table_id()).or(t.rejoin_key).or(t.lost_key)
+}
+
+/// `S1-FY`: whether this client's window shows the table: it holds a seat there,
+/// held one before the start, or the table is set.
+fn holds_a_window(f: &Formation) -> bool {
+    f.my_seat().is_some() || f.released_before_the_first_hand() || f.session().is_some()
+}
+
+/// `S1-FY`: this client hears no other seat of a table of three or more -- the
+/// group's own reading, taken now: every other seat is out of this client's copy
+/// of the group, or silent there for `QUIET_LIMIT_S`. At a table of two this
+/// client's own line and its one other seat's cannot be told apart, and this
+/// says nothing. Read only once a seat has been on the line here: before that a
+/// silence is a group still forming.
+fn hears_nobody(f: &Formation, tox: &super::toxsink::TableSink) -> bool {
+    let me = f.my_seat();
+    let others: Vec<&crate::table::formation::SeatEntry> = f.roster().seats().iter().filter(|e| Some(e.seat) != me).collect();
+    others.len() >= 2
+        && others.iter().all(|e| {
+            let held = tox.in_group(&e.app_public_key) || e.tox_key.is_some_and(|k| tox.in_group_line(&k));
+            let quiet = [tox.quiet_secs(&e.app_public_key), e.tox_key.and_then(|k| tox.quiet_line(&k))]
+                .into_iter()
+                .flatten()
+                .min();
+            !(held && quiet.is_none_or(|q| q < QUIET_LIMIT_S))
+        })
 }
 
 /// `D-043`: the earliest of one timer across the tables, with its table.
@@ -13008,6 +13280,113 @@ fn joiner_leaves_because(
     }
 }
 
+/// `S1-FY`: what a joiner does about the table's word -- the owner's rule
+/// (2026-09-16): a table's window closes at its player's word alone, and a
+/// player who leaves or loses the line before the start is handled as a
+/// certificate handles one in a game, with the window told each step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JoinerDoes {
+    Stay,
+    /// Leave the table: a client with no player (`--autoplay`), as before; or
+    /// the founder's roster without this seat after the table was set, which is
+    /// the table's word for good -- said as the table lost, the window kept.
+    Leave(String),
+    /// The founder gave this seat back before the start: ask for a seat again.
+    AskAgain(String),
+    /// Wait for the founder, and say why; `None` when it is heard again.
+    WaitForFounder(Option<String>),
+}
+
+fn joiner_does(
+    released: bool,
+    set: bool,
+    gone: Option<String>,
+    founder: Option<String>,
+    leaves_by_itself: bool,
+) -> JoinerDoes {
+    if leaves_by_itself {
+        return gone.map_or(JoinerDoes::Stay, JoinerDoes::Leave);
+    }
+    match (released, set, gone) {
+        (true, false, Some(why)) => JoinerDoes::AskAgain(why),
+        (true, true, Some(why)) => JoinerDoes::Leave(why),
+        _ => JoinerDoes::WaitForFounder(founder),
+    }
+}
+
+/// `S1-FY`: the joiner's reading of its founder before the start, in words a
+/// wait can be said in -- `joiner_leaves_because` says the same readings as a
+/// leave. Nothing after the set: a founder there is the hand's to handle.
+/// `deaf`: no seat can be heard from here, which is this client's line first.
+fn founder_away_because(
+    set: bool,
+    deaf: bool,
+    exit: Option<bool>,
+    withdrawn: bool,
+    quiet: bool,
+    never_in: bool,
+    by_ping: bool,
+) -> Option<String> {
+    if set {
+        return None;
+    }
+    if deaf && exit != Some(true) && !withdrawn {
+        return Some("no seat at the table can be heard from here -- this client's own line may be down".to_string());
+    }
+    if let Some(quit) = exit {
+        Some(if quit {
+            "the founder left the table's group -- a client that rejoins the group says so too".to_string()
+        } else {
+            "the founder timed out of the table's group".to_string()
+        })
+    } else if withdrawn {
+        Some("the founder's answer in the lobby no longer offers this table".to_string())
+    } else if quiet {
+        Some(format!("the founder has been silent in the table's group for {QUIET_LIMIT_S} s"))
+    } else if never_in {
+        Some("the founder is not in the table's group and its line is down".to_string())
+    } else if by_ping {
+        Some(format!("the founder has answered nothing for {} s", SEAT_SILENCE_MS / 1000))
+    } else {
+        None
+    }
+}
+
+/// `S1-FY`: a command about the table a window shows, which goes to the slot
+/// that window turned to and to no other.
+fn for_the_window(command: &NodeCommand) -> bool {
+    matches!(
+        command,
+        NodeCommand::Act(_)
+            | NodeCommand::SitBack
+            | NodeCommand::ShowCards
+            | NodeCommand::SayAtTable(_)
+            | NodeCommand::LeaveTable
+    )
+}
+
+/// `S1-FY`: the next command -- one this node gave itself first, then the window's.
+async fn next_command(
+    commands: &mut mpsc::Receiver<NodeCommand>,
+    own: &mut std::collections::VecDeque<NodeCommand>,
+) -> Option<NodeCommand> {
+    if let Some(command) = own.pop_front() {
+        return Some(command);
+    }
+    commands.recv().await
+}
+
+/// fault-harness: `P2P_POKER_STAYS=1` makes an `--autoplay` client treat its
+/// table as a window's client does: it never leaves it by itself (`S1-FY`).
+/// Never true in a build without the feature.
+pub fn stays_at_the_table() -> bool {
+    if !cfg!(feature = "fault-harness") {
+        return false;
+    }
+    static STAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STAYS.get_or_init(|| std::env::var("P2P_POKER_STAYS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// How long hand 1 waits after the group **stops filling**.
 ///
 /// **A fixed deadline is wrong for one of the two cases, which is why this one
@@ -14811,6 +15190,100 @@ mod a_joiner_before_the_first_hand {
         assert!(joiner_leaves_because(false, false, None, false, true, false, true).is_some_and(|w| w.contains("silent")));
         assert!(joiner_leaves_because(false, false, None, false, false, false, true).is_some_and(|w| w.contains("answered nothing for 90 s")));
         assert_eq!(joiner_leaves_because(false, false, None, false, false, false, false), None);
+    }
+
+    /// `S1-FY`, the owner's rule (2026-09-16): a window's client never leaves a
+    /// table by itself. Before the start it waits for a founder it cannot hear,
+    /// and asks for a seat the founder gave back again; the founder's roster
+    /// without this seat after the set is the table lost, said with the window
+    /// kept. A client with no player (`--autoplay`) leaves as `D-044` built it.
+    #[test]
+    fn a_windows_client_waits_or_asks_again_and_never_leaves_by_itself() {
+        let gone = |released, set, exit, withdrawn, quiet, never_in, by_ping| {
+            joiner_leaves_because(released, set, exit, withdrawn, quiet, never_in, by_ping)
+        };
+        let away = |set, exit, withdrawn, quiet, never_in, by_ping| {
+            founder_away_because(set, false, exit, withdrawn, quiet, never_in, by_ping)
+        };
+        // The founder silent before the start: the window waits, and says why.
+        let silent = joiner_does(false, false, gone(false, false, None, false, true, false, false), away(false, None, false, true, false, false), false);
+        assert_eq!(silent, JoinerDoes::WaitForFounder(Some(format!("the founder has been silent in the table's group for {QUIET_LIMIT_S} s"))));
+        // Every reading of the founder is a wait, none a leave.
+        for (exit, withdrawn, quiet, never_in, by_ping) in [
+            (Some(true), false, false, false, false),
+            (Some(false), false, false, false, false),
+            (None, true, false, false, false),
+            (None, false, false, true, false),
+            (None, false, false, false, true),
+        ] {
+            let does = joiner_does(
+                false,
+                false,
+                gone(false, false, exit, withdrawn, quiet, never_in, by_ping),
+                away(false, exit, withdrawn, quiet, never_in, by_ping),
+                false,
+            );
+            assert!(matches!(does, JoinerDoes::WaitForFounder(Some(_))), "{does:?}");
+        }
+        // Heard again: the wait is over.
+        assert_eq!(joiner_does(false, false, None, away(false, None, false, false, false, false), false), JoinerDoes::WaitForFounder(None));
+        // The seat given back before the start: asked for again.
+        assert!(matches!(
+            joiner_does(true, false, gone(true, false, None, false, false, false, false), None, false),
+            JoinerDoes::AskAgain(w) if w.contains("gave this seat away")
+        ));
+        // After the set: the founder's roster without this seat is the table lost.
+        assert!(matches!(
+            joiner_does(true, true, gone(true, true, None, false, false, false, false), None, false),
+            JoinerDoes::Leave(w) if w.contains("gave this seat away")
+        ));
+        // After the set nothing about the founder is read.
+        assert_eq!(away(true, Some(true), true, true, true, true), None);
+        assert_eq!(joiner_does(false, true, gone(false, true, Some(true), true, true, true, true), None, false), JoinerDoes::WaitForFounder(None));
+        // `--autoplay`: as before.
+        assert!(matches!(
+            joiner_does(false, false, gone(false, false, None, false, true, false, false), away(false, None, false, true, false, false), true),
+            JoinerDoes::Leave(w) if w.contains("the table is gone")
+        ));
+        assert_eq!(joiner_does(false, false, None, None, true), JoinerDoes::Stay);
+        // Deaf: this client's line is said, not the founder's silence; a goodbye
+        // and the founder's own word in the lobby are still the founder's.
+        assert_eq!(
+            founder_away_because(false, true, None, false, false, false, false).as_deref(),
+            Some("no seat at the table can be heard from here -- this client's own line may be down")
+        );
+        assert!(founder_away_because(false, true, Some(true), false, false, false, false).is_some_and(|w| w.contains("left the table's group")));
+        assert!(founder_away_because(false, true, None, true, false, false, false).is_some_and(|w| w.contains("lobby")));
+        assert_eq!(founder_away_because(true, true, None, false, false, false, false), None, "nothing after the set");
+    }
+
+    /// `S1-FY`: the commands about the table a window shows. A window turned to a
+    /// slot the node no longer holds sends them nowhere -- a leave used to reach
+    /// the active slot, the table being played.
+    #[test]
+    fn a_windows_commands_are_told_from_the_rest() {
+        use crate::poker::actions::Action;
+        for c in [
+            NodeCommand::Act(Action::Fold),
+            NodeCommand::SitBack,
+            NodeCommand::ShowCards,
+            NodeCommand::SayAtTable("hi".into()),
+            NodeCommand::LeaveTable,
+        ] {
+            assert!(for_the_window(&c), "{c:?}");
+        }
+        for c in [
+            NodeCommand::Focus(1),
+            NodeCommand::SetAutoMuck(true),
+            NodeCommand::SayInLobby("hi".into()),
+            NodeCommand::SetNickname("me".into()),
+            NodeCommand::CancelJoin { key: [1u8; 32], forget: true },
+            NodeCommand::JoinTable { key: [1u8; 32], buyin: 1_000, seat: None, password: None },
+            NodeCommand::ResumeSession,
+            NodeCommand::ForgetSession,
+        ] {
+            assert!(!for_the_window(&c), "{c:?}");
+        }
     }
 }
 

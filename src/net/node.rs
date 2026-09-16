@@ -373,8 +373,24 @@ pub enum NodeEvent {
     /// The founder refused. **Advisory** — a founder may lie, so the reason is
     /// carried as the claim it is.
     JoinRefused { reason: u16 },
-    /// Formation was abandoned, either by this client or by a rule.
+    /// The player left the table, or gave up the join -- the window's own
+    /// command, and the one road that closes a table's window (`S1-FY`).
     LeftTable { why: String },
+    /// `S1-FY`: this client is no longer at the table, and the player did not
+    /// ask to leave it -- a join that did not go through, or a rule. The window
+    /// stays open and says why; only its player closes it.
+    TableLost { why: String },
+    /// `S1-FY`: before the table starts, its founder cannot be heard -- why --
+    /// and `None` once it can again. The joiner waits for it rather than
+    /// leaving: a table's window closes at its player's word alone.
+    FounderAway { key: [u8; 32], why: Option<String> },
+    /// `S1-FY`: before the table starts, the founder gave this client's seat
+    /// back -- the seat was silent or off the line there -- and this client asks
+    /// for a seat again, as a seat certified out of a game asks to sit in. `why`
+    /// says where that asking stands.
+    SeatGivenBack { key: [u8; 32], why: String },
+    /// `S1-FY`: before the table starts, the founder gave a seat back: why.
+    SeatReleased { seat: u8, why: String },
     /// Something in the transport went wrong and the node carried on.
     ///
     /// Separate from [`TableRefused`](NodeEvent::TableRefused), which is a
@@ -656,6 +672,11 @@ impl NodeEvent {
             | Self::HandEnded { .. }
             | Self::JoinRefused { .. }
             | Self::LeftTable { .. }
+            // `S1-FY`: the table kept, and why.
+            | Self::TableLost { .. }
+            | Self::FounderAway { .. }
+            | Self::SeatGivenBack { .. }
+            | Self::SeatReleased { .. }
             | Self::OutForGood { .. }
             | Self::SeatFlooded { .. }
             | Self::TableUnsafe { .. }

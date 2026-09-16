@@ -324,6 +324,12 @@ param(
     # A return that would start after the run is over is not started: the seat
     # stays away.
     [string]$DropNodes = '1',
+    # `-StayNodes` (S1-FY): which nodes treat their table as a window's client
+    # does -- they never leave it by themselves: before the start they wait for
+    # a founder they cannot hear and ask again for a seat the founder gave back.
+    # Node numbers, comma-separated, or `all`. Needs a binary built with
+    # `--features fault-harness`.
+    [string]$StayNodes = '',
     # A seat slower than this to enter the Tox group keeps the logs, however
     # well the rest of the run went. Sixty seconds is far outside the ordinary
     # spread, which has been 10-25 s in every run measured.
@@ -331,6 +337,8 @@ param(
 )
 # Comma or space: `-DropNodes 1,2` can reach a [string] parameter as "1 2".
 $droppers = @("$DropNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+# Not `$stayNodes`: a local of that name IS the parameter.
+$stayList = @("$StayNodes" -split '[,\s]+' | Where-Object { $_ -ne '' })
 # Not `$hostSeats`: PowerShell variable names are case-insensitive and that
 # would BE the parameter.
 $founderSeats = if ($HostSeats -gt 0) { $HostSeats } else { $Seats }
@@ -504,8 +512,10 @@ for ($i = 0; $i -lt $nodeCount; $i++) {
     # The founder alone, and handed to the job like the stack: the job sees
     # nothing of this scope (the first run printed the banner and kicked nobody).
     $kickForNode = if ($KickWithoutWordAt -gt 0 -and $i -eq 0) { $KickWithoutWordAt } else { 0 }
-    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, [bool]$StrangerFlood, $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth -ScriptBlock {
-        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth)
+    $staysForNode = ($stayList -contains 'all') -or ($stayList -contains "$i")
+    $jobs += Start-Job -Name "n$i" -ArgumentList $Exe, $nodeArgs, $log, $diverge, $downAt, $LinkDownFor, $stall, $mute, $MuteAt, [bool]$MuteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stackForNode, $kickForNode, $offAt, $OfflineFor, $OfflineEvery, $afkForNode, $backForNode, $HoldMuck, $floodForNode, $FloodRate, $FloodKind, $strangerForNode, [bool]$StrangerFlood, $StrangerName, $chatSpamForNode, $ChatSpamRate, $LobbyDepth, [bool]$staysForNode -ScriptBlock {
+        param($exe, $nodeArgs, $log, $diverge, $downAt, $downFor, $stall, $mute, $muteAt, $muteOnTurn, $stopOnTurn, $stopAtOpen, $stopAtHand, $leaveAt, $stack, $kickAt, $offAt, $offFor, $offEvery, $afkAt, $backAt, $holdMuck, $floodAt, $floodRate, $floodKind, $strangerAt, $strangerFlood, $strangerName, $chatSpamAt, $chatSpamRate, $lobbyDepth, $stays)
+        if ($stays) { $env:P2P_POKER_STAYS = '1' }
         if ($holdMuck) { $env:P2P_POKER_HOLD_MUCK = "$holdMuck" }
         $env:P2P_POKER_FLOOD_RATE = "$floodRate"
         if ($floodAt -gt 0) {
@@ -621,6 +631,9 @@ if ($StrangerAt -gt 0) {
 if ($AfkAt -gt 0) {
     Write-Host "==> n$AfkNode stops playing at $AfkAt s and sits out when its clock runs out$(if ($BackAt -gt 0) { "; back at $BackAt s" })"
     Write-Host "    (needs a binary built with --features fault-harness; D-049)"
+}
+if ($stayList.Count -gt 0) {
+    Write-Host "==> $(if ($stayList -contains 'all') { 'every node' } else { 'n' + ($stayList -join ', n') }) never leave(s) a table by itself, as a window's client (S1-FY; needs --features fault-harness)"
 }
 if ($OfflineAt -gt 0) {
     Write-Host "==> n$OfflineNode's INTERNET goes away at $OfflineAt s for $OfflineFor s, at the socket; the process lives on$(if ($OfflineEvery -gt 0) { " -- and again every $OfflineEvery s" })"

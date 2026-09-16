@@ -773,12 +773,14 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                         NodeEvent::PeerConnected(p) => Some(p.to_bytes()),
                         _ => None,
                     };
-                    // Every way a join this driver sent can end. `LeftTable`
-                    // carries the founder that did not answer, `JoinRefused` a
-                    // seat refused outright, and a seat is the success.
+                    // Every way a join this driver sent can end. `TableLost`
+                    // carries the founder that did not answer (`S1-FY`: every
+                    // leave nobody asked for), `JoinRefused` a seat refused
+                    // outright, and a seat is the success.
                     if matches!(
                         event,
                         NodeEvent::LeftTable { .. }
+                            | NodeEvent::TableLost { .. }
                             | NodeEvent::JoinRefused { .. }
                             | NodeEvent::Seated { .. }
                     ) {
@@ -825,7 +827,15 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                         }
                     }
                     let before = state.emitted;
+                    let lost = matches!(event, NodeEvent::TableLost { .. });
                     state.apply(event);
+                    // `S1-FY`: a window keeps a table lost without its player
+                    // asking, until the player closes it. This client has no
+                    // player, so it closes the table at once and asks for it again
+                    // as before -- unless the bed made it a window's client.
+                    if lost && !p2p_poker::net::run::stays_at_the_table() {
+                        state.close_lost_tables();
+                    }
                     // `S1-CX`: the opponent question's clock runs on every event
                     // here, as it runs on every frame in the window. The sweep
                     // alone is thirty seconds apart, and an opponent back inside
