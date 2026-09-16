@@ -459,19 +459,10 @@ pub fn board_glow(p: &Painter, rect: Rect) {
     glow(p, rect.shrink(8.0), r, 40.0, Color32::from_rgba_unmultiplied(255, 237, 184, 22));
 }
 
-/// Which puck.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Puck {
-    Dealer,
-    SmallBlind,
-    BigBlind,
-}
-
-/// A casino puck: `dealerPuck.svg` drawn -- the dark chip, eight gold edge
-/// stripes, the gold-ringed centre, the gloss -- with its letters. Gold for
-/// all three, the owner's word (Green Casino's own SB and BB pucks are blue
-/// and red).
-pub fn puck(p: &Painter, rect: Rect, which: Puck) {
+/// The dealer's puck: `dealerPuck.svg` drawn -- the dark chip, eight gold edge
+/// stripes, the gold-ringed centre, the gloss -- with its letter. The blinds'
+/// pucks are not drawn, the owner's word (2026-09-16): the dealer's is enough.
+pub fn dealer_puck(p: &Painter, rect: Rect) {
     let c = rect.center();
     let u = rect.width() / 32.0;
     let gold = rgb(0xC8A850);
@@ -489,12 +480,7 @@ pub fn puck(p: &Painter, rect: Rect, which: Puck) {
     }
     p.circle_filled(c, 9.0 * u, rgb(0x1A1A1A));
     p.circle_stroke(c, 9.0 * u, Stroke::new(1.5 * u, gold));
-    let (label, size) = match which {
-        Puck::Dealer => ("D", 11.0 * u),
-        Puck::SmallBlind => ("SB", 7.6 * u),
-        Puck::BigBlind => ("BB", 7.6 * u),
-    };
-    text(p, pos2(c.x, c.y + 0.3 * u), Align2::CENTER_CENTER, label, size, Weight::Bold, GOLD);
+    text(p, pos2(c.x, c.y + 0.3 * u), Align2::CENTER_CENTER, "D", 11.0 * u, Weight::Bold, GOLD);
     // The gloss: light from the upper left.
     let mut mesh = Mesh::default();
     let centre = pos2(rect.left() + rect.width() * 0.37, rect.top() + rect.height() * 0.30);

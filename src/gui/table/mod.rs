@@ -42,7 +42,7 @@ use eframe::egui::{self, pos2, vec2, Align2, Color32, Rect, RichText, Stroke, St
 use crate::poker::state::{Card, Chips, SeatIdx};
 use crate::storage::settings::Settings;
 use seats::Seats;
-use style::{Icon, Puck, Weight};
+use style::{Icon, Weight};
 
 /// A card this client has been cleared to draw face-up.
 ///
@@ -722,29 +722,6 @@ pub fn phase(street: &str) -> String {
     }
 }
 
-/// The small and the big blind this hand, by the order of play from the
-/// button among the seats dealt in: heads-up the button posts the small one.
-pub fn blind_seats(view: &TableView) -> (Option<SeatIdx>, Option<SeatIdx>) {
-    let mut dealt: Vec<SeatIdx> = view
-        .seats
-        .iter()
-        .filter(|s| !s.sitting_out && !s.left)
-        .map(|s| s.seat)
-        .collect();
-    dealt.sort_unstable();
-    if dealt.len() < 2 || view.hand == 0 {
-        return (None, None);
-    }
-    if dealt.len() == 2 {
-        let other = dealt.iter().copied().find(|s| *s != view.button);
-        return (Some(view.button), other);
-    }
-    let after = |seat: SeatIdx| dealt.iter().copied().find(|s| *s > seat).or_else(|| dealt.first().copied());
-    let sb = after(view.button);
-    let bb = sb.and_then(after);
-    (sb, bb)
-}
-
 /// Green Casino's `table.png`, decoded once and kept as a texture.
 fn table_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     const PNG: &[u8] = include_bytes!("../../../assets/pokerth/greencasino/table.png");
@@ -785,7 +762,6 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi, settings: 
     state.motion.observe(view, now);
     board(&p, &l, view, &state.motion, now);
 
-    let (sb, bb) = blind_seats(view);
     for b in &l.others {
         if let Some(seat) = view.seats.iter().find(|s| s.seat == b.seat) {
             if let Some(a) = seat_box(ui, &p, &l, b.rect, seat, view, state, now, false) {
@@ -798,7 +774,7 @@ pub fn draw(ui: &mut egui::Ui, view: &TableView, state: &mut TableUi, settings: 
             action = a;
         }
     }
-    pucks(&p, &l, view, sb, bb);
+    dealer_puck(&p, &l, view);
     flights(&p, &l, &state.motion, now);
     shown_hands(&p, &l, view);
     // `S1-FR`: the way back is the word while it is shown; the felt's note
@@ -1327,29 +1303,14 @@ fn pop_scale(age: f64) -> f32 {
     }
 }
 
-/// The dealer and blind pucks beside their boxes.
-fn pucks(p: &egui::Painter, l: &Seats, view: &TableView, sb: Option<SeatIdx>, bb: Option<SeatIdx>) {
+/// The dealer's puck beside its box. The blinds' pucks are not drawn, the
+/// owner's word (2026-09-16): the dealer's is enough.
+fn dealer_puck(p: &egui::Painter, l: &Seats, view: &TableView) {
     if view.hand == 0 && !view.preview {
         return;
     }
-    let mut drawn: Vec<SeatIdx> = Vec::new();
-    for (seat, which) in [(Some(view.button), Puck::Dealer), (sb, Puck::SmallBlind), (bb, Puck::BigBlind)] {
-        let Some(seat) = seat else {
-            continue;
-        };
-        let Some(mut rect) = l.puck(seat) else {
-            continue;
-        };
-        // Heads-up the button posts the small blind too: the two pucks side
-        // by side, as PokerTH shows the button and the blind together.
-        let already = drawn.iter().filter(|d| **d == seat).count() as f32;
-        if already > 0.0 {
-            let step = rect.width() + 2.0;
-            let dir = if rect.center().x < l.zone.center().x { -1.0 } else { 1.0 };
-            rect = rect.translate(vec2(dir * step * already, 0.0));
-        }
-        style::puck(p, rect, which);
-        drawn.push(seat);
+    if let Some(rect) = l.puck(view.button) {
+        style::dealer_puck(p, rect);
     }
 }
 
@@ -2305,20 +2266,6 @@ mod tests {
         assert_eq!(phase("pre-flop"), "Preflop");
         assert_eq!(phase("river"), "River");
         assert_eq!(phase("hand over"), "Hand over");
-    }
-
-    /// The blinds follow the button: heads-up the button posts the small one,
-    /// otherwise the next two seats dealt in.
-    #[test]
-    fn the_blinds_are_the_seats_after_the_button() {
-        let seat = |n: u8| SeatView { seat: n, ..Default::default() };
-        let mut v = TableView { hand: 1, button: 1, seats: vec![seat(0), seat(1)], ..Default::default() };
-        assert_eq!(blind_seats(&v), (Some(1), Some(0)));
-        v.seats = vec![seat(0), seat(1), seat(2), seat(3)];
-        v.button = 3;
-        assert_eq!(blind_seats(&v), (Some(0), Some(1)));
-        v.seats[0].sitting_out = true;
-        assert_eq!(blind_seats(&v), (Some(1), Some(2)), "a seat not dealt in posts nothing");
     }
 
     /// PokerTH's badge pop settles at its own size.

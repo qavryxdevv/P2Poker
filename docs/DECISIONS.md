@@ -4268,6 +4268,8 @@ node (`--preview-seats N`, `--preview-panels`, `--preview-over`, `--preview-note
 
 **Amended 2026-09-16 (`S1-FW`, the owner's word).** The hero's decision clock is under its name, left of its stack, and no longer in the strip above its box; a seat's clock is drawn at every turn of its own, and an opponent deciding has it where its last word was. `--preview-reraised` draws the hero raised, re-raised and deciding again.
 
+**Amended 2026-09-16 again, the owner's word** (*"deaktivuj v GUI zobrazování SB a BB buttonů, stačí mi dealer button"*). The blinds' pucks are not drawn: beside the boxes stands the dealer's puck alone. `gui::table::blind_seats`, its test and `style::Puck` went with them; `style::dealer_puck` draws the one left.
+
 ## D-049 — a seat whose clock runs out sits out until the player is back
 
 **Built 2026-09-13 at the project owner's instruction** (*"Hráč, který se nerozhodne v časovém limitu, získá status
