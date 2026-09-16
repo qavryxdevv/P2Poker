@@ -258,6 +258,11 @@ pub struct Formation {
     /// hears every seat of the roster (`ratify_now`); `false`, a roster is
     /// ratified the moment it is adopted, as before.
     hold_ready: bool,
+    /// `S1-GI`: this client's seat came from its founder's own `JOIN_ACCEPT`,
+    /// which a founder gives a stranger only before its table deals -- not from
+    /// a roster said to a seat already on it, which a founder says at a table in
+    /// play too.
+    admitted: bool,
 }
 
 /// What this client may need to say again.
@@ -331,6 +336,7 @@ impl Formation {
             named_serial: None,
             started: false,
             hold_ready: false,
+            admitted: false,
         })
     }
 
@@ -389,6 +395,7 @@ impl Formation {
             named_serial: None,
             started: false,
             hold_ready: false,
+            admitted: false,
         };
         f.said.list = Some(list_bytes.to_vec());
         let out = f.adopt(&list, now_ms)?;
@@ -494,6 +501,7 @@ impl Formation {
                 named_serial: None,
                 started: false,
                 hold_ready: false,
+                admitted: false,
             },
             bytes,
         ))
@@ -1136,6 +1144,7 @@ impl Formation {
 
         self.pending = None;
         self.my_seat = Some(accept.seat);
+        self.admitted = true;
 
         // **A `JOIN_ACCEPT` is a bootstrap, not an update.**
         //
@@ -1291,6 +1300,13 @@ impl Formation {
             return Ok(vec![]);
         }
         self.ratify(seat, now_ms)
+    }
+
+    /// `S1-GI`: whether this client's seat came from its founder's own
+    /// acceptance -- given only before the table deals -- rather than from a
+    /// roster said to a seat already on it.
+    pub fn seated_by_acceptance(&self) -> bool {
+        self.admitted
     }
 
     /// `D-060`: whether this client has ratified the roster it holds.
@@ -2508,6 +2524,46 @@ mod tests {
         second.on_player_list(&lists[1], NOW + 2).expect("its own list");
         assert!(!second.released_before_the_first_hand());
         assert!(second.roster().seat_of(&key(3).verifying_key().to_bytes()).is_some());
+        assert!(second.seated_by_acceptance(), "S1-GI: its founder admitted it");
+    }
+
+    /// `S1-GI`: a seat learnt from a roster said to a seat already on it is not
+    /// one its founder admitted -- a founder says that roster at a table in play
+    /// too -- and a seat its founder accepted is.
+    #[test]
+    fn a_seat_known_from_a_roster_is_not_one_its_founder_admitted() {
+        let (mut t, _, a, hash) = found(6, 3);
+        let table_id = t.founder.table_id();
+        let ask = |at: u64| {
+            Formation::join(key(2), a.clone(), hash, table_id, peer(2), "player 2".into(), 1_000, None, None, [2; 32], at, None)
+                .unwrap()
+        };
+        let (mut first, request) = ask(NOW);
+        let sends = t.founder.on_join_request(&request, &peer(2), false, NOW).expect("seated");
+        let accept = sends.iter().find_map(|s| match s {
+            Send::Reply(bytes) => Some(bytes.clone()),
+            _ => None,
+        });
+        first.on_join_answer(&accept.expect("an answer"), NOW).expect("the acceptance holds");
+        assert!(first.seated_by_acceptance());
+
+        // The same player asks again from a fresh client: already seated, and
+        // the roster, from which it knows its seat.
+        let (mut again, request) = ask(NOW + 10);
+        let sends = t.founder.on_join_request(&request, &peer(2), false, NOW + 10).expect("answered");
+        let mut list = None;
+        for s in sends {
+            match s {
+                Send::Reply(bytes) => {
+                    assert!(matches!(again.on_join_answer(&bytes, NOW + 10), Err(Failed::Refused { .. })), "already seated");
+                }
+                Send::Broadcast(bytes) if joinwire::receive_player_list(&bytes).is_ok() => list = Some(bytes),
+                Send::Broadcast(_) => {}
+            }
+        }
+        again.on_player_list(&list.expect("the roster again"), NOW + 11).expect("the roster names it");
+        assert_eq!(again.my_seat(), first.my_seat());
+        assert!(!again.seated_by_acceptance(), "a roster is no admission");
     }
 
     /// `S1-DV`: a joiner whose seat the founder gave back learns it from the

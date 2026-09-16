@@ -6873,13 +6873,18 @@ this word takes the other seats there.
 **When a seat goes on, and at whose table.** Before the set, a seat goes on when the
 founder said it left (§7.10), or when it has not heard the founder for
 `QUIET_LIMIT_S` and `FOUNDER_GONE_GRACE` (20 s) more and hears other seats; either way
-only while another seat, neither itself nor the founder, has said `TABLE_HEARING`
-(§7.11) since the founder went or within `HEARING_FRESH` (15 s) before. A set table's
-seats never say that word, so a client that holds a table's roster without its
-session -- a player back at a table that has dealt -- never goes on; and a seat of a
-set table takes no `TABLE_CONTINUES` at all. The seat it goes on at is the lowest seat
-number of the roster, the founder's excepted, not passed over -- itself included. If that is itself, it founds the new table and says this
-word. Otherwise it goes on at the table of the lowest seat whose word it has, once
+only while it knows the table still forms: no frame of a hand of that table has
+reached it, and either its founder admitted it with `JOIN_ACCEPT` -- which a founder
+gives a stranger only before its table deals -- or another seat, neither itself nor
+the founder, has said `TABLE_HEARING` (§7.11) since the founder went or within
+`HEARING_FRESH` (15 s) before. A set table's seats never say that word, and a seat
+already on a roster is answered with the roster, not admitted; so a client that holds
+a table's roster without its session -- a player back at a table that has dealt --
+never goes on, while a seat its founder admitted goes on even alone, and the table
+fills again at its continuation. A seat of a set table takes no `TABLE_CONTINUES` at
+all. The seat it goes on at is the lowest seat number of the roster, the founder's
+excepted, not passed over -- itself included. If that is itself, it founds the new
+table and says this word. Otherwise it goes on at the table of the lowest seat whose word it has, once
 that seat is its choice or lower; a choice that says nothing within `CONTINUES_WAIT`
 (20 s) is passed over for the next -- within 8 s when the seat does not hear it, since it
 may still be founding, heard by others, and two seats must not both found one.

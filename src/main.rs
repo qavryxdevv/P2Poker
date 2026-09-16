@@ -101,6 +101,28 @@ enum Ask {
     /// The founder became dialable while an advert was held and this client
     /// had no seat.
     FounderUp,
+    /// `S1-GJ`: the last ask went unanswered long enough ago (`JOIN_RETRY_EVERY`).
+    Retry,
+}
+
+/// `S1-GJ`: how long after an ask that ended without a seat the driver asks
+/// again, while the table is listed and nothing is in flight.
+///
+/// Neither edge is a schedule, and on the bed both went quiet with a table
+/// listed and a seat free: two joiners' first asks found no address for the
+/// founder (*the founder did not answer: Failed to dial the requested peer*),
+/// the advert limiter admitted no newer copy, and the founder's connection
+/// came up while an earlier one stood -- so they asked three times and twice
+/// in the first 35 s and never again, and a table of ten sat at eight for
+/// five minutes (`churn182158-10`). A player at a window asks again with a
+/// click; this driver has no player.
+const JOIN_RETRY_EVERY: Duration = Duration::from_secs(20);
+
+/// `S1-GJ`: whether the driver asks again: an ask was made, none is in flight
+/// (`JOIN_ASK_LINGERS`, as the founder edge reads it), and the last was at
+/// least `JOIN_RETRY_EVERY` ago.
+fn retry_due(since_join_ask: Option<Duration>, since_any_ask: Option<Duration>) -> bool {
+    since_join_ask.map_or(true, |d| d >= JOIN_ASK_LINGERS) && since_any_ask.is_some_and(|d| d >= JOIN_RETRY_EVERY)
 }
 
 /// **The second edge a join needs, which nothing watched.**
@@ -671,6 +693,8 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
         // spent on nothing — and it is an instant rather than a flag because
         // the arms that answer with a warning alone would never clear one.
         let mut join_asked: Option<std::time::Instant> = None;
+        // `S1-GJ`: when this driver last asked for a seat, by any edge.
+        let mut last_any_ask: Option<std::time::Instant> = None;
         let deadline = async {
             match bounded {
                 Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
@@ -864,10 +888,14 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     // the fold fills, and the first version asked it a question
                     // one event too early and never joined anything.
                     if let (Some(want), None) = (&join, state.seated.as_ref()) {
-                        // Only the two edges reach the store. Every other
-                        // event — a peer count, a ping, a line of chat — leaves
-                        // this alone, exactly as before.
-                        if seen || connected.is_some() {
+                        // Only the two edges reach the store, and `S1-GJ`'s
+                        // retry. Every other event — a peer count, a ping, a
+                        // line of chat — leaves this alone, exactly as before.
+                        let retry = retry_due(
+                            join_asked.map(|t| t.elapsed()),
+                            last_any_ask.map(|t| t.elapsed()),
+                        );
+                        if seen || connected.is_some() || retry {
                             let found = state
                                 .lobby
                                 .tables()
@@ -889,7 +917,8 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                                     join_asked.map(|t| t.elapsed()),
                                     last_ask.map(|t| t.elapsed()),
                                     connect_asks,
-                                );
+                                )
+                                .or(retry.then_some(Ask::Retry));
                                 match edge {
                                     Some(Ask::Advert) => println!("asking to join {want}"),
                                     Some(Ask::FounderUp) => {
@@ -900,6 +929,9 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                                             "asking to join {want} (the founder is on the line)"
                                         );
                                     }
+                                    Some(Ask::Retry) => println!(
+                                        "asking to join {want} again: the last ask went unanswered (S1-GJ)"
+                                    ),
                                     None => {}
                                 }
                                 // **The floor is the founder edge's own.**
@@ -916,6 +948,7 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                                     last_ask = Some(std::time::Instant::now());
                                 }
                                 if edge.is_some() {
+                                    last_any_ask = Some(std::time::Instant::now());
                                     join_asked = Some(std::time::Instant::now());
                                     let _ = commands
                                         .send(NodeCommand::JoinTable {
@@ -2272,5 +2305,16 @@ mod tests {
 
         // Nothing at all: every other event leaves the driver alone.
         assert_eq!(ask_for(false, false, None, None, 0), None);
+    }
+
+    /// `S1-GJ`: an ask that went unanswered is asked again, once nothing is in
+    /// flight and `JOIN_RETRY_EVERY` has passed -- and never before a first ask.
+    #[test]
+    fn an_unanswered_join_is_asked_again() {
+        assert!(!retry_due(None, None), "no ask yet: the advert edge asks first");
+        assert!(retry_due(None, Some(JOIN_RETRY_EVERY)));
+        assert!(!retry_due(None, Some(JOIN_RETRY_EVERY - Duration::from_millis(1))));
+        assert!(!retry_due(Some(JOIN_ASK_LINGERS - Duration::from_millis(1)), Some(JOIN_RETRY_EVERY)), "one is in flight");
+        assert!(retry_due(Some(JOIN_ASK_LINGERS), Some(JOIN_ASK_LINGERS.max(JOIN_RETRY_EVERY))));
     }
 }

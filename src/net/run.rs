@@ -984,6 +984,10 @@ struct TableRun {
     /// its seat -- a seat that founded the continuation has left the roster by the
     /// time its word is heard.
     roster_keys_seen: std::collections::HashMap<[u8; 32], u8>,
+    /// `S1-GI`: a frame of a hand of this table reached this client over the
+    /// table's group while it held no hand -- the table has dealt, whatever this
+    /// client's roster says.
+    dealt_heard: bool,
     /// Fault-harness: the longest silence in the table's group of each seat now
     /// silent, said when the seat is heard again -- how long a live member goes
     /// unheard, measured rather than assumed.
@@ -1153,6 +1157,7 @@ impl TableRun {
             successors_passed: std::collections::BTreeSet::new(),
             continuing: None,
             roster_keys_seen: std::collections::HashMap::new(),
+            dealt_heard: false,
             silence_peak: std::collections::BTreeMap::new(),
         }
     }
@@ -3099,6 +3104,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
             $t.roster_keys_seen.clear();
             $t.silence_peak.clear();
+            $t.dealt_heard = false;
         }};
     }
     // `S1-FY`: the owner's rule, before the table starts too -- a table's window
@@ -3116,6 +3122,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             let founder_gone = $t.founder_gone;
             let continues_heard = std::mem::take(&mut $t.continues_heard);
             let keys_seen = std::mem::take(&mut $t.roster_keys_seen);
+            let dealt_heard = $t.dealt_heard;
             $t.tox_sink.clear();
             $t.tox_group_said = false;
             $t.table_announces = 0;
@@ -3131,6 +3138,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     $t.founder_gone = founder_gone;
                     $t.continues_heard = continues_heard;
                     $t.roster_keys_seen = keys_seen;
+                    $t.dealt_heard = dealt_heard;
                     $t.rejoin_key = Some(key);
                     $t.rejoin_at = Some(tokio::time::Instant::now() + REASK_FIRST);
                     let _ = events
@@ -3281,10 +3289,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // and would found a continuation of a game in play: the bed's
                     // far seat did, 20 s after it came back to its own table
                     // (`churn172308-6`).
-                    let forming = match ($t.founder_gone, forming_heard(&$t.hearing, me, founder)) {
-                        (Some(gone), Some(last)) => last + HEARING_FRESH >= gone,
-                        _ => false,
-                    };
+                    // `S1-GI`: or its founder admitted this seat -- a founder admits a
+                    // stranger only before its table deals -- so a lone seat goes on
+                    // too; and never once a frame of a hand dealt there has reached it.
+                    let forming = still_forming(
+                        $t.dealt_heard || $t.ever_dealt || $t.hand.is_some(),
+                        f.seated_by_acceptance(),
+                        $t.founder_gone,
+                        forming_heard(&$t.hearing, me, founder),
+                    );
                     (f.table_id(), f.serial(), me, successor, heard, f.advert().clone(), forming)
                 });
             if let Some((old, serial, me, Some(successor), heard, ad, true)) = plan {
@@ -3332,6 +3345,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             let founder_gone = $t.founder_gone;
             let continues_heard = std::mem::take(&mut $t.continues_heard);
             let keys_seen = std::mem::take(&mut $t.roster_keys_seen);
+            let dealt_heard = $t.dealt_heard;
             $t.tox_sink.clear();
             $t.tox_group_said = false;
             $t.table_announces = 0;
@@ -3347,6 +3361,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     $t.founder_gone = founder_gone;
                     $t.continues_heard = continues_heard;
                     $t.roster_keys_seen = keys_seen;
+                    $t.dealt_heard = dealt_heard;
                     $t.rejoin_key = Some(key);
                     $t.rejoin_at = Some(tokio::time::Instant::now() + REASK_AGAIN);
                     let _ = events.send(NodeEvent::Warning(format!("{why}; asking again in {} s (S1-FY)", REASK_AGAIN.as_secs()))).await;
@@ -6762,6 +6777,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // party's missing copy. A seat that never enters the group at
                 // all is `S1-AA` shape (i) and is untouched by this.
                 if t.hand.is_none() {
+                    // `S1-GI`: a hand's frame over the table's group -- the table has
+                    // dealt, whatever this client's roster says.
+                    if matches!(crate::net::chained::peek(&item.bytes, TABLE_FRAME_PEEK), Ok((_, hand_id, _)) if hand_id > 0) {
+                        t.dealt_heard = true;
+                    }
                     // `S1-CR`: the running table's hand traffic, kept for the
                     // adoption at the stall tick. The formation handler below
                     // refuses it quietly either way.
@@ -10672,6 +10692,25 @@ fn hears_nobody(f: &Formation, tox: &super::toxsink::TableSink) -> bool {
 /// (`D-060`); a seat that passes `QUIET_LIMIT_S` does so at most twelve seconds
 /// after the freshest one fell silent, which by then has been silent eight.
 const DEAF_QUIET_S: u64 = 8;
+
+/// `S1-GG`, `S1-GI`: whether this client knows the table it would go on from
+/// still forms: nothing of a hand dealt there reached it (`dealt`), and either its
+/// founder admitted it -- which a founder does only before its table deals -- or
+/// another seat said `TABLE_HEARING`, which a set table's seats never say, since
+/// the founder went or within `HEARING_FRESH` before.
+fn still_forming(
+    dealt: bool,
+    admitted: bool,
+    founder_gone: Option<tokio::time::Instant>,
+    last_forming_word: Option<tokio::time::Instant>,
+) -> bool {
+    !dealt
+        && (admitted
+            || match (founder_gone, last_forming_word) {
+                (Some(gone), Some(last)) => last + HEARING_FRESH >= gone,
+                _ => false,
+            })
+}
 
 /// `S1-GG`: when a seat of this table other than this client and its founder
 /// last said whom it hears -- the word only a table that still forms says.
@@ -16143,12 +16182,17 @@ mod a_joiner_before_the_first_hand {
         hearing.insert(4u8, (4u64, Vec::new(), ago(12)));
         let last = forming_heard(&hearing, Some(2), Some(0)).unwrap();
         assert_eq!(last, ago(12));
-        // The rule the macro applies: heard since the founder went, or within
-        // `HEARING_FRESH` before it.
-        let forming = |gone: tokio::time::Instant, last: tokio::time::Instant| last + HEARING_FRESH >= gone;
-        assert!(forming(ago(20), ago(12)));
-        assert!(forming(ago(25), ago(12)));
-        assert!(!forming(ago(5), ago(40)), "words that stopped long before the founder went are a set table's");
+        // Heard since the founder went, or within `HEARING_FRESH` before it.
+        assert!(still_forming(false, false, Some(ago(20)), Some(ago(12))));
+        assert!(still_forming(false, false, Some(ago(25)), Some(ago(12))));
+        assert!(!still_forming(false, false, Some(ago(5)), Some(ago(40))), "words that stopped long before the founder went are a set table's");
+        assert!(!still_forming(false, false, Some(ago(5)), None), "a seat back at a table that dealt hears no such word");
+        // `S1-GI`: a seat its founder admitted knows the table forms, alone too
+        // (`churn181420-10`: the founder left with one seat sat down) -- unless a
+        // frame of a hand dealt there reached it.
+        assert!(still_forming(false, true, Some(ago(5)), None));
+        assert!(!still_forming(true, true, Some(ago(5)), Some(ago(1))));
+        assert!(!still_forming(true, false, Some(ago(20)), Some(ago(12))));
     }
 
     /// `S1-FY`, the owner's rule (2026-09-16): a window's client never leaves a
