@@ -1891,13 +1891,23 @@ the v4 arm always did.
 
 ### 6.1 Topics
 
-Two topics, named by the constants `LOBBY_TOPIC` and `LOBBY_CHAT_TOPIC`; the
-strings themselves are two-sided and live in `PROTOCOL.md` §13.
+Three topics, named by the constants `LOBBY_TOPIC`, `LOBBY_CHAT_TOPIC` and
+`SEARCH_QUEUE_TOPIC`; the strings themselves are two-sided and live in
+`PROTOCOL.md` §1.1.
 
 | Topic (`IdentTopic`) | Carries | Publisher | Cadence |
 |---|---|---|---|
 | `LOBBY_TOPIC` | `LOBBY_TABLE_AD`, `LOBBY_TABLE_REMOVE`, player presence heartbeat | table founder / each client | ad every `AD_REBROADCAST_MS`, presence every `PRESENCE_HEARTBEAT_MS` (§10) |
 | `LOBBY_CHAT_TOPIC` | lobby chat (`SPEC_CS.md` §22 requires chat) | any client | user-driven, rate-limited |
+| `SEARCH_QUEUE_TOPIC`, and a slice of it beside every lobby slice | `SEARCH_PRESENCE`: a client's word that it searches for a game, and stopped (`PROTOCOL.md` §7.13, `D-064`) | each searching client, about itself | every `SEARCH_PRESENCE_EVERY_MS` while it searches, once more when it stops |
+
+The queue is a topic beside the lobby and not a field of the lobby's messages so
+that a client's search can be seen by everybody without a table existing, and so
+that the count of searchers costs an idle client one small signed message per
+searcher per half minute and nothing else. It is sliced with the lobby: a client
+that listens to four slices of a sliced lobby listens to the same four slices of
+the queue, and a searcher says its presence on the whole queue and on the slice its
+own application key names at every depth, as a founder says an advert.
 
 Chat is a **separate topic** so that chat volume can never crowd out table
 discovery, so it can be muted without losing the lobby, and so its scoring and rate
@@ -2022,6 +2032,7 @@ document carries.
 | `LOBBY_TABLE_AD` | `TABLE_AD_MAX` | the **payload** only. The fields of `SPEC_CS.md` §4 plus a custom-parameter block total under 500 B at worst case, so the constant carries over 2× headroom |
 | a **complete signed** `LOBBY_TABLE_AD` | `TABLE_AD_SIGNED_MAX` | payload + envelope + the 64-byte signature. This is the cap applied wherever a whole signed advert is **forwarded or embedded** rather than freshly parsed: the snapshot elements of §7.3, and `JOIN_ACCEPT`'s `advert_event` (`PROTOCOL.md` §4.3). The two caps bound different objects, and conflating them is what produced the 2 560 / 1 024 conflict `PHASE0_REVIEW.md` C-1 found — which is also why neither number is written twice any more |
 | `LOBBY_TABLE_REMOVE`, presence heartbeat | — | small fixed-shape bodies; no separate constant, bounded by `LOBBY_MSG_MAX` |
+| `SEARCH_PRESENCE` | `SEARCH_PRESENCE_MAX` | the whole signed event: three small integers in the body, the envelope and the signature (`PROTOCOL.md` §7.13) |
 | lobby chat message | `LOBBY_CHAT_MAX` | payload cap. The message type is `PROTOCOL.md` §4/§7's `0x0106 LOBBY_CHAT`; its `display_name` and `text` are display-only strings bounded by `PROTOCOL.md` §9.4's string rules |
 | any lobby message | `LOBBY_MSG_MAX` | hard ceiling; anything larger is a protocol error regardless of type |
 
@@ -2038,6 +2049,7 @@ Per remote `PeerId`, token buckets refilled continuously:
 | table ads (any table) | 1 per 10 s | 4 |
 | distinct `table_id`s advertised by one identity | 4 concurrently | — |
 | presence heartbeats | 1 per 20 s | 2 |
+| search presence (`SEARCH_PRESENCE`) | 4 per minute, per author key and per forwarding peer, on a map of its own | — |
 | chat messages | 1 per 2 s | 5 |
 | total lobby bytes from one peer | 8 KiB/s | 64 KiB |
 

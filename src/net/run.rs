@@ -71,6 +71,7 @@ use crate::table::hand::Holding;
 use super::swarm::{CONNECTION_CEILING, MAX_CONNECTIONS, MIN_CONNECTIONS};
 use super::swarm::{self, NodeConfig, PokerBehaviourEvent, RelayRole, Topics};
 use super::joinwire::DISPLAY_NAME_MAX;
+use super::matchmaker::{Candidate, NetReading, SlotReading, Step};
 use crate::protocol::constants::SNAPSHOT_MAX_ADS;
 use crate::protocol::constants::{
     RETURN_GRACE_MS,
@@ -929,6 +930,11 @@ struct TableRun {
     /// left `TOURNAMENT_LEAVE_GRACE` after -- long enough for the resend loop
     /// to give a slow seat the terminal message again, and no longer.
     table_over_at: Option<std::time::Instant>,
+    /// `D-064`, `S1-HJ`: this client's game at the table is done -- the
+    /// tournament over, or its own seat finished -- as the window was told,
+    /// which is seconds before `table_over_at` at the boundary. No game
+    /// against the search's limit from then on.
+    done_here: bool,
     /// `S1-FY`: what the player joined this table with, kept to ask for the
     /// seat again when the founder gives it back before the table starts.
     join_asked: Option<JoinAsked>,
@@ -1011,6 +1017,12 @@ struct TableRun {
     /// `D-062`: tables that refused this client lately, not gone on at until
     /// `AVOID_FOR` has passed; the slot's own.
     avoided: std::collections::HashMap<[u8; 32], tokio::time::Instant>,
+    /// `D-064`: this slot was opened by the automatic search and holds, or asks
+    /// for, one of its reservations. The slot's own, like its number: a leave
+    /// does not clear it, or a seat given back and asked for again (`S1-FY`)
+    /// would be a seat the search had lost sight of. It goes when the table
+    /// starts under the search -- a game, the window's from then on.
+    search: bool,
     /// `D-062`: when this seat last read the lobby for where its game goes on.
     reconvened_at: Option<tokio::time::Instant>,
     /// `D-062`: since when no table of this seat's game has been offered while it
@@ -1224,6 +1236,7 @@ impl TableRun {
             table_closed: false,
             tournament_started: false,
             table_over_at: None,
+            done_here: false,
             join_asked: None,
             rejoin_key: None,
             rejoin_at: None,
@@ -1249,6 +1262,7 @@ impl TableRun {
             silence_peak: std::collections::BTreeMap::new(),
             origin: None,
             avoided: std::collections::HashMap::new(),
+            search: false,
             reconvened_at: None,
             unoffered_since: None,
             tox_down_at: None,
@@ -1306,6 +1320,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         };
     }
     for name in listening.topics() {
+        subscribe_scored(&mut swarm, &gossipsub::IdentTopic::new(name))?;
+    }
+    // `D-064`: and the queue beside the lobby, on the same slices, so the count
+    // of searchers is known before a search starts.
+    for name in listening.queue_topics() {
         subscribe_scored(&mut swarm, &gossipsub::IdentTopic::new(name))?;
     }
     subscribe_scored(&mut swarm, &topics.lobby_chat)?;
@@ -3135,6 +3154,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.table_closed = false;
             $t.tournament_started = false;
             $t.table_over_at = None;
+            $t.done_here = false;
             $t.ever_dealt = false;
             $t.hand = None;
             $t.late_cert_said = None;
@@ -3337,6 +3357,127 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // `S1-FY`: commands this node gives itself -- a seat given back, asked for
     // again -- taken before the window's, down the same road.
     let mut own_commands: std::collections::VecDeque<NodeCommand> = std::collections::VecDeque::new();
+    // `D-064`: the automatic search, its tick, the queue's heartbeat, the reason
+    // each seat it gives back is given back for, and the queue's last said size.
+    let mut mm = super::matchmaker::Matchmaker::new();
+    let mut search_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    search_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut queue_timer = tokio::time::interval(std::time::Duration::from_millis(
+        crate::protocol::constants::SEARCH_PRESENCE_EVERY_MS,
+    ));
+    queue_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut search_leave_whys: std::collections::HashMap<[u8; 32], String> = std::collections::HashMap::new();
+    let mut queue_said: usize = 0;
+    // `D-064`: the seats the search asked for, by table: the founder to reach,
+    // when it was last asked, how many times. A join to a founder this client
+    // has no address for yet fails at once (*Failed to dial the requested
+    // peer*), so it is asked again when that founder connects, and every
+    // `SEARCH_ASK_AGAIN` while the seat is pending, `SEARCH_ASKS_MAX` times --
+    // the headless driver's founder edge (`Ask::FounderUp`), for the search.
+    let mut search_asks: std::collections::HashMap<[u8; 32], (libp2p::PeerId, std::time::Instant, u32)> =
+        std::collections::HashMap::new();
+    const SEARCH_ASK_AGAIN: std::time::Duration = std::time::Duration::from_secs(15);
+    const SEARCH_ASKS_MAX: u32 = 4;
+    // `D-064`: this client's word on the queue topic -- on the whole queue and on
+    // the slice its own key names at every depth, as an advert is said (`S1-EX`).
+    macro_rules! say_search_presence {
+        ($format:expr) => {{
+            let format: Option<super::matchmaker::Format> = $format;
+            let tables_wanted = mm.request().map_or(1, |r| r.tables);
+            let since = mm.since_unix_ms().unwrap_or_else(super::node::now_unix_ms);
+            if let Ok(bytes) = super::matchmaker::presence(&app_key, format, tables_wanted, since, super::node::now_unix_ms()) {
+                for name in super::shard::queue_topics_for(&my_app_key) {
+                    let _ = swarm.behaviour_mut().gossipsub.publish(gossipsub::IdentTopic::new(name), bytes.clone());
+                }
+            }
+        }};
+    }
+    // `D-064`: what the search asks of the node, done the way a player's own
+    // button would do it: a join or a founding as a command the node gives
+    // itself, a leave as the join given up, the rest said.
+    // `D-064`: ask again for a seat the search still waits on, at most
+    // `SEARCH_ASKS_MAX` times, `SEARCH_ASK_AGAIN` apart.
+    macro_rules! ask_search_seat_again {
+        ($key:expr) => {{
+            let key: [u8; 32] = $key;
+            let due = search_asks
+                .get(&key)
+                .is_some_and(|(_, last, asks)| *asks < SEARCH_ASKS_MAX && last.elapsed() >= SEARCH_ASK_AGAIN);
+            if due && mm.pending(&key) {
+                if let Some(buyin) = state.lobby.get(&key).map(|h| {
+                    if h.ad.mode == super::lobby::Mode::TournamentSngPlayMoney.code() { h.ad.start_stack } else { h.ad.max_buyin }
+                }) {
+                    if let Some((_, last, asks)) = search_asks.get_mut(&key) {
+                        *last = std::time::Instant::now();
+                        *asks += 1;
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "search: asking again for a seat at {} (ask {asks})",
+                                super::matchmaker::short(&key)
+                            )))
+                            .await;
+                    }
+                    own_commands.push_back(NodeCommand::SearchStep(Box::new(NodeCommand::JoinTable {
+                        key,
+                        buyin,
+                        seat: None,
+                        password: None,
+                    })));
+                }
+            }
+        }};
+    }
+    macro_rules! do_search_steps {
+        ($steps:expr) => {{
+            let steps: Vec<Step> = $steps;
+            for step in steps {
+                match step {
+                    Step::Join { key, buyin } => {
+                        if let Some(p) = state.lobby.get(&key).and_then(|h| PeerId::from_bytes(&h.ad.founder_peer_id).ok()) {
+                            search_asks.insert(key, (p, std::time::Instant::now(), 1));
+                        }
+                        own_commands.push_back(NodeCommand::SearchStep(Box::new(NodeCommand::JoinTable {
+                            key,
+                            buyin,
+                            seat: None,
+                            password: None,
+                        })));
+                    }
+                    Step::Found { seats, name } => own_commands.push_back(NodeCommand::SearchStep(Box::new(
+                        NodeCommand::CreateTable {
+                            kind: TableKind::SitAndGo,
+                            name,
+                            seats,
+                            min_players: 2,
+                            buyin: crate::protocol::constants::RATED_START_STACK,
+                            password: None,
+                        },
+                    ))),
+                    Step::Leave { key, why } => {
+                        search_leave_whys.insert(key, why);
+                        own_commands.push_back(NodeCommand::SearchStep(Box::new(NodeCommand::CancelJoin { key, forget: true })));
+                    }
+                    Step::Presence(format) => say_search_presence!(format),
+                    Step::Report(report) => {
+                        let _ = events.send(NodeEvent::Search(report)).await;
+                    }
+                    Step::Ended { id, why, started } => {
+                        for x in tables.iter_mut() {
+                            if started.contains(&x.slot) {
+                                x.search = false;
+                            }
+                        }
+                        search_leave_whys.retain(|k, _| mm.is_reserved(k));
+                        search_asks.clear();
+                        let _ = events.send(NodeEvent::SearchEnded { id, why, started }).await;
+                    }
+                    Step::Log(line) => {
+                        let _ = events.send(NodeEvent::Warning(line)).await;
+                    }
+                }
+            }
+        }};
+    }
     // `D-062`: this seat goes on at another table of its game -- a continuation
     // another seat founded, by that seat's word (`D-061`) or offered in the lobby
     // -- and asks for a seat there from what the player joined with; the window's
@@ -3719,6 +3860,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                         lobby_dials.remove(&connection_id);
                         state_peers += 1;
+                        // `D-064`: a founder the search could not reach is here now.
+                        let again: Vec<[u8; 32]> =
+                            search_asks.iter().filter(|(_, (p, _, _))| *p == peer_id).map(|(k, _)| *k).collect();
+                        for k in again {
+                            ask_search_seat_again!(k);
+                        }
                         // A connection that has just been made is evidence the
                         // peer is there, and it is the only evidence available
                         // until the first ping fifteen seconds later. Without
@@ -5697,6 +5844,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             &topics,
                             &mut state,
                             &events,
+                            &my_app_key,
                         )
                         .await;
 
@@ -5903,6 +6051,40 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             Some(command) = next_command(&mut commands, &mut own_commands) => {
+                // `D-064`: the lobby's commands to the search are the loop's, not a
+                // slot's; a step of the search is one of the slot commands below, in
+                // a slot of the search's own.
+                let command = match command {
+                    NodeCommand::Lobby(super::matchmaker::LobbyCommand::PlayerStartSearch(req)) => {
+                        let steps = mm.start(req, std::time::Instant::now(), super::node::now_unix_ms());
+                        do_search_steps!(steps);
+                        queue_timer.reset();
+                        continue;
+                    }
+                    NodeCommand::Lobby(super::matchmaker::LobbyCommand::PlayerCancelSearch) => {
+                        let steps = mm.cancel(std::time::Instant::now(), "the player pressed cancel");
+                        do_search_steps!(steps);
+                        continue;
+                    }
+                    other => other,
+                };
+                let (command, for_search) = match command {
+                    NodeCommand::SearchStep(inner) => (*inner, true),
+                    other => (other, false),
+                };
+                // `D-064`: a step the search no longer wants -- a join queued before
+                // the cancel, a founding after a game started -- does nothing.
+                if for_search {
+                    let wanted = match &command {
+                        NodeCommand::JoinTable { key, .. } => mm.is_reserved(key),
+                        NodeCommand::CreateTable { name, .. } => mm.founding() == Some(name.as_str()),
+                        NodeCommand::CancelJoin { .. } => true,
+                        _ => false,
+                    };
+                    if !wanted {
+                        continue;
+                    }
+                }
                 // `D-043`: a table founded or joined while this client sits at
                 // another opens a new slot, up to `MAX_TABLES`; everything else
                 // goes to the active table.
@@ -5956,6 +6138,32 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .position(|x| x.table.is_none() && x.origin.as_ref().is_some_and(|o| origin_rank(o, &k, &ad).is_some()))
                     });
                 let (which, open) = match &command {
+                    // `D-064`: a seat the search asks for gets a slot of its own --
+                    // never the window's, never a table's -- and the search holds at
+                    // most `DQE_MAX` of them; a seat it gives back goes to the slot
+                    // holding that table, below, like any join given up.
+                    NodeCommand::JoinTable { .. } | NodeCommand::CreateTable { .. } if for_search => {
+                        // Seats held: a slot holding its table, a seat given back and asked
+                        // for again, a table lost -- never a key merely asked for (`S1-HI`).
+                        let held_by_search = tables.iter().filter(|x| x.search && slot_holds(x).is_some()).count();
+                        if held_by_search >= usize::from(super::matchmaker::DQE_MAX) {
+                            let _ = events
+                                .send(NodeEvent::Warning(format!(
+                                    "search: {held_by_search} seat(s) held already, the most the search holds; not asking for another"
+                                )))
+                                .await;
+                            continue;
+                        }
+                        // A search slot whose join failed, or was refused, holds nothing:
+                        // asked again in it, not beside it.
+                        match tables
+                            .iter()
+                            .position(|x| x.search && x.table.is_none() && x.rejoin_key.is_none() && x.lost_key.is_none())
+                        {
+                            Some(empty) => (empty, false),
+                            None => (tables.len(), true),
+                        }
+                    }
                     NodeCommand::CreateTable { .. } if continuing_slot.is_some() => (continuing_slot.unwrap_or(active), false),
                     NodeCommand::JoinTable { .. } if own_game_slot.is_some() => (own_game_slot.unwrap_or(active), false),
                     NodeCommand::CancelJoin { key, .. } => match slot_for_cancel(key, &held) {
@@ -5968,12 +6176,24 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let sink = tables[0].tox_sink.share();
                     tables.push(TableRun::new(next_slot, &profile_dir, None, sink));
                     next_slot = next_slot.saturating_add(1);
-                    let _ = events
-                        .send(NodeEvent::Warning(format!(
-                            "another table: {} of {MAX_TABLES} slots open",
-                            tables.len()
-                        )))
-                        .await;
+                    if for_search {
+                        if let Some(x) = tables.last_mut() {
+                            x.search = true;
+                        }
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "search: slot {} opened for a seat (D-064)",
+                                next_slot.saturating_sub(1)
+                            )))
+                            .await;
+                    } else {
+                        let _ = events
+                            .send(NodeEvent::Warning(format!(
+                                "another table: {} of {MAX_TABLES} slots open",
+                                tables.len()
+                            )))
+                            .await;
+                    }
                 }
                 let mut close_slot = false;
                 let t = &mut tables[which];
@@ -6142,6 +6362,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 ),
                                 password,
                             )
+                        };
+                        // `D-064`: a Sit & Go the search founds starts at two -- its
+                        // founder's own rule says when (`matchmaker::capacity_now`), and
+                        // the advert says so from the first, so every joiner agrees
+                        // (`§7.2` rule 7). `TableAd::sng` seals a table that starts full,
+                        // which is what a player's own Sit & Go is.
+                        let ad = if for_search && tournament {
+                            let mut ad = ad;
+                            ad.min_players_to_start = 2;
+                            ad
+                        } else {
+                            ad
                         };
                         // **fault-harness only.** `P2P_POKER_START_STACK=<chips>`
                         // starts every seat of this founder's Sit & Go with that
@@ -6828,7 +7060,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         close_slot = true;
                         leave_table_now!(t);
                     }
-                    NodeCommand::CancelJoin { forget, .. } => {
+                    // `D-064`: taken by the loop before any slot, and a step wrapped
+                    // twice is nobody's: nothing lands here.
+                    NodeCommand::Lobby(_) | NodeCommand::SearchStep(_) => {}
+                    NodeCommand::CancelJoin { key, forget } => {
                         // `S1-FG`: the join to this slot's table given up in the lobby.
                         // Left as at a leave -- its group, its topic, its formation --
                         // and the slot closed; the record goes only when it names this
@@ -6836,7 +7071,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         close_slot = true;
                         // `S1-GA`: a seat held at a forming table is free at once.
                         say_the_leave!(t);
-                        leave_table_now!(t, "the join was given up".to_string(), forget, true);
+                        // `D-064`: a seat the search gives back says why.
+                        let why = search_leave_whys
+                            .remove(&key)
+                            .unwrap_or_else(|| "the join was given up".to_string());
+                        leave_table_now!(t, why, forget, true);
                     }
                 }
                 // `D-043`: a slot left while another table is open is closed.
@@ -8087,7 +8326,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         f.roster().seats().iter().filter(|e| Some(e.seat) != f.my_seat()).all(|e| ratified.contains(&e.seat))
                                     }
                                 });
-                                if unheard.is_empty() && founder_last && t.table.as_ref().is_some_and(|f| !f.ready_sent() && f.may_start()) {
+                                // `D-064`: a seat the search holds ratifies only while the search
+                                // arms it -- its ratification is its consent to start now, and
+                                // it consents to as many tables at once as games it wants -- and
+                                // a table the search founded starts at its founder's capacity.
+                                let search_allows = !t.search
+                                    || t.table.as_ref().is_some_and(|f| {
+                                        if f.is_founder() {
+                                            mm.founder_gate(&f.table_id(), std::time::Instant::now())
+                                                .is_some_and(|g| g.armed && f.roster().len() >= usize::from(g.floor))
+                                        } else {
+                                            mm.may_ratify(&f.table_id())
+                                        }
+                                    });
+                                if unheard.is_empty() && founder_last && search_allows && t.table.as_ref().is_some_and(|f| !f.ready_sent() && f.may_start()) {
                                     match t.table.as_mut().map(|f| f.ratify_now(now)) {
                                         Some(Ok(sends)) if !sends.is_empty() => {
                                             for send in sends {
@@ -8260,7 +8512,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     .map(|(_, u, _)| u.clone())
                             };
                             let ratified = f.ratified_seats();
-                            let everybody_hears = seats.len() == f.roster().len()
+                            // `D-064`: a search founder holds nobody to `READY_GRACE` before it
+                            // wants to start itself: a seat the search holds ratifies only when
+                            // armed, and giving it back for that would empty every search
+                            // table of every searcher.
+                            let founder_wants = !t.search
+                                || mm
+                                    .founder_gate(&f.table_id(), std::time::Instant::now())
+                                    .is_some_and(|g| g.armed && f.roster().len() >= usize::from(g.floor));
+                            let everybody_hears = founder_wants
+                                && seats.len() == f.roster().len()
                                 && seats.iter().all(|s| fresh(*s).is_some_and(|u| u.is_empty()))
                                 && f.may_start();
                             let marks: Vec<(u8, usize, usize, bool, u64, bool)> = settled
@@ -8359,6 +8620,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // seconds before, and three players sat at three tables
                         // (2026-09-16 20:37 UTC).
                         let reconvene_due = (autoplay.is_none() || stays_at_the_table())
+                            && !t.search
                             && t.reconvened_at.is_none_or(|at| at.elapsed() >= RECONVENE_EVERY);
                         if reconvene_due {
                             t.reconvened_at = Some(tokio::time::Instant::now());
@@ -8624,8 +8886,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         // `D-061`: and a window's joiner goes on without a founder gone
-                        // long enough.
-                        if autoplay.is_none() || stays_at_the_table() {
+                        // long enough. `D-064`: never a seat the search holds -- the search
+                        // gives it back and takes another.
+                        if (autoplay.is_none() || stays_at_the_table()) && !t.search {
                             go_on_without_the_founder!(t);
                         }
                     }
@@ -10003,10 +10266,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // the first hand it played was told its place as the final hand
                 // ended (the owner, 2026-09-15). The derivation still says the
                 // places this could not.
+                let my_seat_here = t.table.as_ref().and_then(|f| f.my_seat());
                 if let Some(h) = t.hand.as_ref() {
                     if t.finish_said_for != Some(h.hand_id()) {
                         if let Some((over, finishes)) = h.finishes_final_at_the_end() {
                             t.finish_said_for = Some(h.hand_id());
+                            // `D-064`: done here the moment it is said (`S1-HJ`).
+                            if over || finishes.iter().any(|f| Some(f.seat) == my_seat_here) {
+                                t.done_here = true;
+                            }
                             for f in finishes {
                                 let _ = events
                                     .send(NodeEvent::Finished {
@@ -10506,10 +10774,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // per hand. The window used to work it out from its own copies
                 // of the stacks, which a client back from a restart did not
                 // hold, and only for a hand it was dealt into.
+                let my_seat_here = t.table.as_ref().and_then(|f| f.my_seat());
                 if let Some(h) = t.hand.as_ref() {
                     if t.finish_said_for != Some(h.hand_id()) {
                         t.finish_said_for = Some(h.hand_id());
                         let (over, finishes) = h.finishes_at_boundary();
+                        // `D-064`: done here the moment it is said (`S1-HJ`).
+                        if over || finishes.iter().any(|f| Some(f.seat) == my_seat_here) {
+                            t.done_here = true;
+                        }
                         for f in finishes {
                             let _ = events
                                 .send(NodeEvent::Finished {
@@ -10709,9 +10982,112 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // `D-064`: the queue's heartbeat, while this client searches.
+            _ = queue_timer.tick(), if mm.searching() => {
+                say_search_presence!(mm.request().map(|r| r.format));
+            }
+
+            // `D-064`: the search's tick -- what the lobby offers, what the slots
+            // hold, what the network is like, and what the search does about it.
+            _ = search_tick.tick(), if mm.searching() => {
+                let now_i = std::time::Instant::now();
+                let now_ms = super::node::now_unix_ms();
+                let candidates: Vec<Candidate> = state
+                    .lobby
+                    .tables()
+                    .map(|l| {
+                        let ad = &l.held.ad;
+                        let tournament = ad.mode == super::lobby::Mode::TournamentSngPlayMoney.code();
+                        Candidate {
+                            key: *l.key,
+                            name: ad.table_name.clone(),
+                            seats: ad.max_players,
+                            players: ad.players,
+                            min_players: ad.min_players_to_start,
+                            founder: ad.founder_app_key,
+                            buyin: if tournament { ad.start_stack } else { ad.max_buyin },
+                            first_seen_ms: l.held.first_seen_ms,
+                            fresh: now_ms.saturating_sub(l.held.received_at_ms) < super::matchmaker::OFFER_FRESH_MS,
+                            joinable: !l.held.unjoinable,
+                            tournament,
+                            password: ad.password_required,
+                            relayed: PeerId::from_bytes(&ad.founder_peer_id).is_ok_and(|p| relayed_peers.contains(&p)),
+                        }
+                    })
+                    .collect();
+                let slots: Vec<SlotReading> = tables
+                    .iter()
+                    .map(|x| SlotReading {
+                        slot: x.slot,
+                        // `S1-HI`: the table the slot holds -- never the key it asked for
+                        // and was refused, which `joined_key` keeps until the slot is left.
+                        key: slot_holds(x),
+                        name: x
+                            .table
+                            .as_ref()
+                            .map(|f| f.advert().table_name.clone())
+                            .or_else(|| x.joined_ad.as_ref().map(|a| a.table_name.clone()))
+                            .unwrap_or_default(),
+                        search: x.search,
+                        founder: x.table.as_ref().is_some_and(|f| f.is_founder()),
+                        players: x.table.as_ref().map_or(0, |f| u8::try_from(f.roster().len()).unwrap_or(u8::MAX)),
+                        seats: x.table.as_ref().map_or(0, |f| f.advert().max_players),
+                        set: x.table.as_ref().is_some_and(|f| f.session().is_some()),
+                        over: x.done_here || x.table_over_at.is_some(),
+                        lost: x.table.is_none() && x.lost_key.is_some(),
+                        asking_again: x.table.is_none() && x.rejoin_key.is_some(),
+                        founder_gone_s: x
+                            .founder_gone
+                            .filter(|_| x.table.as_ref().is_some_and(|f| f.session().is_none()))
+                            .map(|at| at.elapsed().as_secs()),
+                    })
+                    .collect();
+                // AutoNAT's verdict is read only once it could have been given: a
+                // client ninety seconds old with no relay is behind a NAT on the
+                // evidence, one nine seconds old is merely young.
+                let verdict_due = PROCESS_STARTED.get().is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(90))
+                    || state.is_public()
+                    || have_reservation;
+                let net = NetReading {
+                    poker_peers: poker_peers.iter().filter(|p| swarm.is_connected(p)).count(),
+                    relayed: have_reservation && !state.is_public(),
+                    line_down: swarm.connected_peers().count() == 0
+                        || tables
+                            .iter()
+                            .any(|x| x.ever_on_line && x.tox_sink.is_on_tox() && x.tox_sink.tox_connection() == 0),
+                    public: verdict_due.then_some(state.is_public()),
+                    relay: have_reservation,
+                };
+                let steps = mm.tick(now_i, now_ms, &candidates, &slots, &net, &state.queue, &my_app_key);
+                do_search_steps!(steps);
+                // `D-064`: seats still asked for, whose founder is on the line now.
+                search_asks.retain(|k, _| mm.is_reserved(k));
+                let again: Vec<[u8; 32]> = search_asks
+                    .iter()
+                    .filter(|(_, (p, _, _))| swarm.is_connected(p))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in again {
+                    ask_search_seat_again!(k);
+                }
+                // `D-062`'s roads are a played table's: a seat the search holds goes
+                // on nowhere -- it is given back and another is taken.
+                for x in tables.iter_mut().filter(|x| x.search) {
+                    x.origin = None;
+                }
+            }
+
             _ = housekeeping.tick() => {
                 let now = super::node::now_unix_ms();
                 state.tick(now);
+                // `D-064`: the queue's size, said when it changes -- searchers gone
+                // quiet are expired in `tick`.
+                if state.queue.len() != queue_said {
+                    queue_said = state.queue.len();
+                    let _ = events
+                        .send(NodeEvent::QueueSeen { searching: state.queue.count(None, &my_app_key) })
+                        .await;
+                }
                 // `S1-EX`: and weigh what the lobby is costing, which is what
                 // decides how much of it this client listens to. Does nothing
                 // until half a minute of traffic has been counted, and nothing
@@ -12039,6 +12415,7 @@ async fn handle_gossip(
     topics: &Topics,
     state: &mut NodeState,
     events: &Events,
+    me: &[u8; 32],
 ) -> gossipsub::MessageAcceptance {
     // Size first: free, the cap is the protocol's, and a message over it cannot
     // be a conforming one. `Reject`, because the sender chose the size.
@@ -12056,6 +12433,30 @@ async fn handle_gossip(
     // small enough stays for ever, and a narrower one below that. The slice is
     // named by the table's own key, so a listener computes the same name the
     // founder published to and there is nothing to agree about.
+    // `D-064`: a client's word that it searches for a game, on the queue topic
+    // of a slice this client listens to -- the lobby's slices, mirrored. Judged
+    // as the lobby's presence is: the neighbour's budget, the shape, the clock,
+    // the signature, the author's budget; and it decides nothing about any game.
+    let queue = state
+        .listening
+        .queue_topics()
+        .iter()
+        .any(|name| gossipsub::IdentTopic::new(name.clone()).hash() == message.topic);
+    if queue {
+        let now = super::node::now_unix_ms();
+        return match super::matchmaker::receive_presence(&message.data, peer_bytes(&from), now, &mut state.limits) {
+            Ok(heard) => {
+                if state.queue.note(heard, now) {
+                    let _ = events
+                        .send(NodeEvent::QueueSeen { searching: state.queue.count(None, me) })
+                        .await;
+                }
+                gossipsub::MessageAcceptance::Accept
+            }
+            Err(super::matchmaker::NotHeard::TooMuch) => gossipsub::MessageAcceptance::Ignore,
+            Err(_) => gossipsub::MessageAcceptance::Reject,
+        };
+    }
     let ours = state
         .listening
         .topics()
@@ -13194,6 +13595,20 @@ async fn weigh_lobby(
     }
     for name in before {
         if !after.holds(&name) {
+            let _ = swarm
+                .behaviour_mut()
+                .gossipsub
+                .unsubscribe(&gossipsub::IdentTopic::new(name));
+        }
+    }
+    // `D-064`: the queue's topics follow the lobby's slices, subscribed before
+    // unsubscribed the same way.
+    let before_queue: Vec<String> = now.queue_topics();
+    for name in after.queue_topics() {
+        let _ = subscribe_scored(swarm, &gossipsub::IdentTopic::new(name));
+    }
+    for name in before_queue {
+        if !after.holds_queue(&name) {
             let _ = swarm
                 .behaviour_mut()
                 .gossipsub
@@ -17294,6 +17709,9 @@ mod back_at_the_table {
             "origin",
             "avoided",
             "tox_down_at",
+            // `D-064`: the search's slot stays the search's across a seat given
+            // back and asked for again.
+            "search",
         ];
         let src = include_str!("run.rs");
         let start = src.find("\nstruct TableRun {\n").expect("the struct");

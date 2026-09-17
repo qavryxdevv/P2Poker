@@ -75,6 +75,23 @@ pub fn topics_for(table_key: &[u8; 32]) -> Vec<String> {
     DEPTHS.iter().map(|d| topic_of(&slice_of(table_key, *d))).collect()
 }
 
+/// `D-064`: the queue topic of a slice -- the whole queue at depth zero, the
+/// slice's own below it, named exactly as the lobby's is.
+pub fn queue_topic_of(slice: &str) -> String {
+    if slice.is_empty() {
+        crate::protocol::constants::SEARCH_QUEUE_TOPIC.to_owned()
+    } else {
+        format!("{}/{slice}", crate::protocol::constants::SEARCH_QUEUE_TOPIC)
+    }
+}
+
+/// `D-064`: every queue topic a searcher says its presence on: one per depth,
+/// the slice named by its own application key, so a listener at any depth
+/// hears it on the slice it holds.
+pub fn queue_topics_for(app_key: &[u8; 32]) -> Vec<String> {
+    DEPTHS.iter().map(|d| queue_topic_of(&slice_of(app_key, *d))).collect()
+}
+
 /// What this client currently listens to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listening {
@@ -102,6 +119,16 @@ impl Listening {
     /// Whether a topic name is one of this client's lobby topics.
     pub fn holds(&self, topic: &str) -> bool {
         self.topics().iter().any(|t| t == topic)
+    }
+
+    /// `D-064`: the queue topics beside the lobby's: the same slices.
+    pub fn queue_topics(&self) -> Vec<String> {
+        self.slices.iter().map(|s| queue_topic_of(s)).collect()
+    }
+
+    /// Whether a topic name is one of this client's queue topics.
+    pub fn holds_queue(&self, topic: &str) -> bool {
+        self.queue_topics().iter().any(|t| t == topic)
     }
 }
 

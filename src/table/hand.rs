@@ -689,6 +689,7 @@ pub fn frame_ceiling(kind: EventType) -> usize {
         | EventType::TableLeave
         | EventType::TableHearing
         | EventType::TableContinues
+        | EventType::SearchPresence
         | EventType::JoinRequest
         | EventType::JoinAccept
         | EventType::JoinReject

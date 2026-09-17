@@ -116,6 +116,12 @@ pub enum NodeCommand {
     ResumeSession,
     /// `S1-CR`: the unfinished session on record is not wanted; forget it.
     ForgetSession,
+    /// `D-064`: the automatic search for a game, as the lobby commands it.
+    Lobby(crate::net::matchmaker::LobbyCommand),
+    /// `D-064`: a step of the search, which the node gives itself: a join, a
+    /// founding or a leave for a seat the search holds. The node's own; the
+    /// window never sends one.
+    SearchStep(Box<NodeCommand>),
 }
 
 /// `D-052`: one pot of a settled hand, as the window is told it.
@@ -578,6 +584,13 @@ pub enum NodeEvent {
     /// count; from its next cryptographic step on, the table waits
     /// `hand::patience_ms(step_ms, waits)` for it.
     SeatWaited { seat: u8, waits: u8, step_ms: u64 },
+    /// `D-064`: where the automatic search stands, once a second while it runs.
+    Search(crate::net::matchmaker::SearchReport),
+    /// `D-064`: the search ended -- why, and the slots whose tables are games
+    /// now, which the window shows from here on.
+    SearchEnded { id: u32, why: String, started: Vec<u8> },
+    /// `D-064`: how many other clients search for a game, when that changes.
+    QueueSeen { searching: u32 },
 }
 
 impl NodeEvent {
@@ -628,6 +641,9 @@ impl NodeEvent {
                 // has already cost this project a run where housekeeping did
                 // not fire for three minutes.
                 | NodeEvent::Carrier { .. }
+                // `D-064`: a reading a second, and a count; the next says the same.
+                | NodeEvent::Search(_)
+                | NodeEvent::QueueSeen { .. }
         )
     }
 }
@@ -718,7 +734,11 @@ impl NodeEvent {
             // `D-059`: a seat made the table wait.
             | Self::SeatWaited { .. }
             // `S1-FQ`: a player left the table, by its own word.
-            | Self::SeatLeftTable { .. } => true,
+            | Self::SeatLeftTable { .. }
+            // `D-064`: the search's window, and the lobby's count of searchers.
+            | Self::Search(_)
+            | Self::SearchEnded { .. }
+            | Self::QueueSeen { .. } => true,
 
             // Log only. Chatty, repetitive, and worth a second's delay.
             //
@@ -791,7 +811,8 @@ pub struct NodeState {
     /// Whether AutoNAT has confirmed this node is reachable, which is what D-002
     /// gates relay volunteering on.
     public: bool,
-
+    /// `D-064`: the clients searching for a game, as the queue topic says.
+    pub queue: crate::net::matchmaker::Queue,
 }
 
 impl Default for NodeState {
@@ -808,6 +829,7 @@ impl NodeState {
             listening: crate::net::shard::Listening::default(),
             heard: (0, std::time::Instant::now()),
             public: false,
+            queue: crate::net::matchmaker::Queue::new(),
         }
     }
 
@@ -824,6 +846,8 @@ impl NodeState {
     /// Returns how many tables were dropped.
     pub fn tick(&mut self, now_ms: u64) -> usize {
         self.limits.sweep(now_ms);
+        // `D-064`: a searcher not heard for its TTL is out of the queue.
+        self.queue.expire(now_ms);
         self.lobby.expire(now_ms)
     }
 }

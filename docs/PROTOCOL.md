@@ -204,13 +204,15 @@ There are two version numbers and they do different jobs.
 | `PROTOCOL_MAJOR` | compile-time constant, `1` | libp2p protocol name strings, GossipSub topic string | wire-format epoch. Two peers with different majors cannot negotiate anything; they never meet, because the protocol strings differ. |
 | `protocol_version` | `u16`, currently `1` | every signed envelope, every table advertisement | the exact rule set and encoding in force for this session. Must equal the value pinned by the table advertisement for every event of that table. |
 
-For `PROTOCOL_MAJOR = 1` there are **seven** strings, exactly:
+For `PROTOCOL_MAJOR = 1` there are **eight** strings, exactly:
 
 ```
 identify protocol             /p2p-poker/1
 GossipSub lobby topic         /p2p-poker/lobby/1        (IdentTopic, not Sha256Topic)
 GossipSub lobby slice topic   /p2p-poker/lobby/1/<slice> (S1-EX; see below)
 GossipSub lobby chat topic    /p2p-poker/lobby-chat/1   (IdentTopic; see §7.7)
+GossipSub search-queue topic  /p2p-poker/search-queue/1 (IdentTopic, and /<slice>
+                                                         beside each lobby slice; §7.13)
 lobby snapshot RPC            /p2p-poker/lobby-snapshot/1
 join RPC                      /p2p-poker/join/1
 table event stream            /p2p-poker/table/1
@@ -355,6 +357,7 @@ identifier, and the framing, which is ours and survives a change of crate.
 |---|---|---|
 | **Lobby broadcast** | `/p2p-poker/lobby/1` | one `SignedEvent` per broadcast message, no extra framing |
 | **Lobby chat broadcast** | `/p2p-poker/lobby-chat/1` (§7.7) | one `SignedEvent` per broadcast message |
+| **Search queue broadcast** | `/p2p-poker/search-queue/1` and its slices (§7.13) | one `SignedEvent` per broadcast message |
 | **Lobby RPC** | `/p2p-poker/lobby-snapshot/1` | the RPC codec's own framing; `SNAPSHOT_REQ_MAX` / `SNAPSHOT_RESP_MAX` per §13 |
 | **Join RPC** | `/p2p-poker/join/1` | the RPC codec's own framing; `JOIN_REQ_MAX` / `JOIN_RESP_MAX` per §13; 20 s timeout |
 | **Table mesh** | `/p2p-poker/table/1` | `u32` big-endian length prefix, then exactly that many bytes of `SignedEvent`. Nothing else. |
@@ -372,6 +375,7 @@ per message code.
 | `TABLE_LEAVE` | table mesh: the table's group; before the table is set, its topic too (§7.10) |
 | `TABLE_HEARING` | table mesh: the table's group and its topic, before the table is set (§7.11) |
 | `TABLE_CONTINUES` | table mesh: the topic of the table that goes on, before it is set (§7.12) |
+| `SEARCH_PRESENCE` | search queue broadcast (§7.13) |
 | `LOBBY_SNAPSHOT_REQUEST`, `LOBBY_SNAPSHOT_RESPONSE` | lobby RPC |
 | `JOIN_REQUEST`, `JOIN_ACCEPT`, `JOIN_REJECT` | join RPC |
 | everything else (`PLAYER_LIST`, `TABLE_READY`, and all of groups 3–8) | table mesh |
@@ -537,8 +541,8 @@ anything else in those four fields.
 Unchained message types, exhaustively: `HELLO`, `CAPABILITIES`, `JOIN_REQUEST`,
 `JOIN_ACCEPT`, `JOIN_REJECT`, `PLAYER_LIST`, `LOBBY_TABLE_AD`,
 `LOBBY_TABLE_REMOVE`, `LOBBY_PLAYER_PRESENCE`, `LOBBY_SNAPSHOT_REQUEST`,
-`LOBBY_SNAPSHOT_RESPONSE`, `LOBBY_CHAT`, `TABLE_CHAT`, `TABLE_LEAVE`, `TABLE_HEARING`, `TABLE_CONTINUES`, **`DISPUTE`**. Everything
-else is chained.
+`LOBBY_SNAPSHOT_RESPONSE`, `LOBBY_CHAT`, `TABLE_CHAT`, `TABLE_LEAVE`, `TABLE_HEARING`, `TABLE_CONTINUES`,
+`SEARCH_PRESENCE`, **`DISPUTE`**. Everything else is chained.
 
 `DISPUTE` is on this list and it is the only table-mesh message that is, which is
 worth one sentence because an earlier draft had it chained. `chain_scope = 1`
@@ -4863,6 +4867,7 @@ means it does not and never can be.
 | `0x0108` | `TABLE_LEAVE` | table mesh (the table's group; before the set, its topic too) | 0 | — | a seated application key, of its own seat (§7.10) |
 | `0x0109` | `TABLE_HEARING` | table mesh (the table's group and its topic, before the set) | 0 | — | a seated application key, of its own seat (§7.11) |
 | `0x010A` | `TABLE_CONTINUES` | table mesh (the topic of the table that goes on, before the set) | 0 | — | a seated application key, the founder of the advert it carries (§7.12) |
+| `0x010B` | `SEARCH_PRESENCE` | search queue broadcast (§7.13) | 0 | — | any peer, about itself |
 | `0x0201` | `JOIN_REQUEST` | join RPC | 0 | — | joiner |
 | `0x0202` | `JOIN_ACCEPT` | join RPC | 0 | — | table key |
 | `0x0203` | `JOIN_REJECT` | join RPC | 0 | — | table key |
@@ -4897,9 +4902,10 @@ means it does not and never can be.
 | `0x0804` | `PLAYER_SIT_IN` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; the one type a seat outside `P(k)` may emit |
 | `0x0805` | `PLAYER_LEAVE` | table mesh | 1 | single, boundary window of chain `k` — §4.10 | the seat, same `sequence` rule; counts into no `P` (§3.2) |
 
-42 message types. Lobby chat is on `/p2p-poker/lobby-chat/1` and not on the lobby
-topic, so §1.4's "a message on the wrong channel is dropped" rule covers it like
-any other.
+43 message types. Lobby chat is on `/p2p-poker/lobby-chat/1` and not on the lobby
+topic, and the search queue's presence is on `/p2p-poker/search-queue/1` (§7.13),
+so §1.4's "a message on the wrong channel is dropped" rule covers them like any
+other.
 
 **Two of the 41 rows have no emitter in version 1, and the count stays 41
 (D-015).** `0x0601` and `0x0602` keep their rows, their codes, their
@@ -6971,6 +6977,53 @@ any hand. Through the lobby it can say more players sit at its table than do: se
 that go there find its real roster and read the lobby again, and a table that
 refuses them is avoided for five minutes.
 
+### 7.13 `0x010B SEARCH_PRESENCE`
+
+`D-064`. A client that searches for a game by itself says so, so that every client
+can count who is looking and a searching client can say how many others are, and
+how long they have waited. It is the queue's mirror of `LOBBY_PLAYER_PRESENCE`
+(§7.4): the same kind of message, on a topic of its own, judged the same way.
+
+*Channel:* the search-queue topic `/p2p-poker/search-queue/1`, an `IdentTopic`
+with the lobby topic's settings -- and, wherever the lobby is sliced (`S1-EX`), the
+slice topic `/p2p-poker/search-queue/1/<slice>`, the slice named by the speaker's
+own application key at every depth, exactly as a founder names an advert's slice by
+its table key. A client listens to the queue's slices that match the lobby's slices
+it holds, so a sliced lobby and a sliced queue are one decision.
+*Signed by:* the speaker's application key.
+*Sent:* every `SEARCH_PRESENCE_EVERY_MS` while the client searches, and once more,
+with `state = 0`, when it stops -- so the count falls at the cancel and not three
+heartbeats later.
+*Envelope:* unchained (`chain_scope = 0`).
+*Body:* `n(0) state: u8` -- `0` stopped searching, `1` heads-up, `2` six seats,
+`3` nine seats, `4` any tournament table; `n(1) tables: u8` -- how many games at
+once, `1..=4`; `n(2) since_unix_ms: u64` -- when the search began, on the speaker's
+clock, so a listener can say how long the queue has waited (a value ahead of the
+listener's clock reads as *now*).
+
+A receiver takes the message in the order §7.4's is taken: the forwarding
+neighbour's budget first, then the shape, then the clock (`CLOCK_SLACK_MS`), then
+the signature, then the author's own budget (`MAX_PRESENCE_PER_PEER_PER_MIN`, on a
+map of its own, so a client's lobby heartbeat and its search heartbeat never spend
+each other's allowance). A `state` or a `tables` outside its bounds is malformed
+and `Reject`ed. A presence is held until `SEARCH_PRESENCE_TTL_MS` after it was
+heard -- three heartbeats, the advert's own ratio -- or until the speaker says it
+stopped; at most `MAX_TRACKED_SEARCHERS` speakers are held, the longest unheard
+making way.
+
+**What it decides, and what it never decides.** It moves a number in a window,
+it says what an *any* search founds (the format most searchers want), and it
+orders the founding: a client founds its own table only after a delay that grows
+with the number of searchers of its format whose key is lower, so the lowest key
+founds first and the others find its table inside a lobby round. That is the
+whole of its authority. It is never an input to any game decision, a table's
+roster, a seat, a card or a chip; a forged presence moves the count by one and
+delays one founding by fifteen seconds. Every seat the search takes is a
+`JOIN_REQUEST` (§4.3) judged by its founder as any other, every table it founds is
+advertised as any other (§7.2, with `min_players_to_start = 2` and a name that
+begins `Auto Sit & Go`, so a search reads the founder's rule for starting short of
+full), and every seat it gives back is a `TABLE_LEAVE` (§7.10).
+
 ---
 
 ## 8. Deadlines and timeouts
@@ -7879,6 +7932,7 @@ reading the body.
 | `LOBBY_TABLE_AD` (`TABLE_AD_MAX`) | 1 024 | ~350; the 29 fields of §7.2 total under 500 B at worst case |
 | `LOBBY_TABLE_REMOVE` | 128 | ~50 |
 | `LOBBY_PLAYER_PRESENCE` | 512 | ~150 |
+| `SEARCH_PRESENCE` (`SEARCH_PRESENCE_MAX`) | 512 | ~150 |
 | `LOBBY_SNAPSHOT_REQUEST` | 128 | ~45 |
 | `LOBBY_SNAPSHOT_RESPONSE` | 262 144 | ≤ 128 × ~500; the hard ceiling is ≤ 128 × 1 536 = 196 608 |
 | `LOBBY_CHAT` | 2 048 | ~120 |
@@ -8528,6 +8582,9 @@ MAX_AD_LIFETIME_MS              = 300 000       (bound on expires_at vs local ti
 MAX_CLOCK_SKEW_MS               = 120 000
 PRESENCE_TTL_MS                 = 120 000
 PRESENCE_HEARTBEAT_MS           = 40 000
+SEARCH_PRESENCE_EVERY_MS        = 30 000        (D-064, §7.13: the queue's heartbeat)
+SEARCH_PRESENCE_TTL_MS          = 90 000        (three heartbeats, the advert's ratio)
+SEARCH_PRESENCE_MAX             = 512           (the whole signed event)
   (REANNOUNCE_INTERVAL_MS, 600 000, stood here until 2026-09-15: Mainline's
   ten-minute re-announce, read by nothing since 56b0b50. A provider record is
   republished by the Kademlia library on its own interval; NETWORK_STACK.md
@@ -8539,7 +8596,9 @@ MAX_TRACKED_TABLES              = 512           (local)
 MAX_TRACKED_PRESENCE            = 8 192         (local)
 MAX_ADS_PER_TABLE_KEY_PER_MIN   = 4             (local)
 MAX_ADS_PER_PEER_PER_MIN        = 90            (local)
-MAX_PRESENCE_PER_PEER_PER_MIN   = 4             (local)
+MAX_PRESENCE_PER_PEER_PER_MIN   = 4             (local; and the same figure for
+  SEARCH_PRESENCE on a map of its own, §7.13)
+MAX_TRACKED_SEARCHERS           = 2 048         (local, D-064)
 
 HANDSHAKE_DEADLINE_MS           = 15 000
 MAX_CONSECUTIVE_AUTO_ACTIONS    = 3

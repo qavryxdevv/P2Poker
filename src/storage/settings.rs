@@ -79,6 +79,83 @@ pub struct Settings {
     /// reads as on.
     #[n(5)]
     pub auto_muck: Option<bool>,
+    /// `D-064`: what the automatic search was last asked for, and how long
+    /// past searches took. `None` in a file written before the search existed.
+    #[n(6)]
+    pub search: Option<SearchSettings>,
+}
+
+/// `D-064`: the most past searches remembered.
+pub const SEARCH_HISTORY_MAX: usize = 20;
+
+/// `D-064`: the automatic search's last request and its history -- the
+/// window's word on what to expect before a search has measured anything.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
+pub struct SearchSettings {
+    /// `net::matchmaker::Format::code`.
+    #[n(0)]
+    pub format: u8,
+    /// How many games at once, `1..=MAX_GAMES`.
+    #[n(1)]
+    pub tables: u8,
+    /// Search again when the game ends.
+    #[n(2)]
+    pub again: bool,
+    /// The searches that found a game: the format's code and the seconds each
+    /// took, oldest first, at most `SEARCH_HISTORY_MAX`.
+    #[n(3)]
+    pub history: Vec<(u8, u32)>,
+}
+
+impl Default for SearchSettings {
+    /// Any format, one game, once: the choice that finds a game soonest.
+    fn default() -> Self {
+        SearchSettings {
+            format: crate::net::matchmaker::Format::Any.code(),
+            tables: 1,
+            again: false,
+            history: Vec::new(),
+        }
+    }
+}
+
+impl SearchSettings {
+    /// What a search of `format` took before, typically: the median of the
+    /// remembered searches of that format -- of every format for *any*.
+    pub fn typical_s(&self, format: u8) -> Option<u32> {
+        let any = crate::net::matchmaker::Format::Any.code();
+        let mut took: Vec<u32> = self
+            .history
+            .iter()
+            .filter(|(f, _)| format == any || *f == format)
+            .map(|(_, s)| *s)
+            .collect();
+        if took.is_empty() {
+            return None;
+        }
+        took.sort_unstable();
+        Some(took[took.len() / 2])
+    }
+
+    /// Remember a search that found a game.
+    pub fn remember(&mut self, format: u8, took_s: u32) {
+        self.history.push((format, took_s));
+        while self.history.len() > SEARCH_HISTORY_MAX {
+            self.history.remove(0);
+        }
+    }
+
+    /// Inside every bound: a hand-edited file arrives here too.
+    fn repair(&mut self) {
+        self.tables = self.tables.clamp(1, crate::net::matchmaker::MAX_GAMES);
+        if crate::net::matchmaker::Format::parse(self.format).is_none() {
+            self.format = crate::net::matchmaker::Format::Any.code();
+        }
+        while self.history.len() > SEARCH_HISTORY_MAX {
+            self.history.remove(0);
+        }
+    }
 }
 
 /// PokerTH's sound settings (`SoundSettings.qml`, `configfile.cpp`'s defaults):
@@ -148,7 +225,13 @@ impl Settings {
             show_odds: None,
             show_chat: None,
             auto_muck: None,
+            search: None,
         }
+    }
+
+    /// `D-064`: the search's settings in force: the player's, or the defaults.
+    pub fn search(&self) -> SearchSettings {
+        self.search.clone().unwrap_or_default()
     }
 
     /// The sound switches in force: the player's, or PokerTH's defaults.
@@ -199,6 +282,9 @@ impl Settings {
         self.text_percent = self.text_percent.clamp(SCALE_MIN, SCALE_MAX);
         if let Some(s) = self.sound.as_mut() {
             s.volume = s.volume.clamp(1, 10);
+        }
+        if let Some(s) = self.search.as_mut() {
+            s.repair();
         }
     }
 }
@@ -270,9 +356,35 @@ mod tests {
             show_odds: None,
             show_chat: None,
             auto_muck: None,
+            search: None,
         };
         save(&dir, &s, &k).unwrap();
         assert_eq!(load(&dir, &k), s);
+    }
+
+    /// `D-064`: the search's settings and history round-trip, and a file's
+    /// numbers outside their bounds are pulled inside them.
+    #[test]
+    fn the_search_settings_round_trip_and_repair() {
+        let dir = scratch("search");
+        let k = key();
+        let mut search = SearchSettings { format: 2, tables: 9, again: true, history: Vec::new() };
+        for i in 0..(SEARCH_HISTORY_MAX as u32 + 5) {
+            search.remember(2, 100 + i);
+        }
+        search.remember(1, 30);
+        let s = Settings { search: Some(search), ..Settings::defaults(&k) };
+        save(&dir, &s, &k).unwrap();
+        let back = load(&dir, &k).search();
+        assert_eq!(back.tables, crate::net::matchmaker::MAX_GAMES, "clamped on save");
+        assert_eq!(back.history.len(), SEARCH_HISTORY_MAX);
+        assert_eq!(back.typical_s(1), Some(30));
+        assert!(back.typical_s(2).is_some_and(|t| t > 100));
+        assert!(back.typical_s(3).is_none());
+        assert!(back.typical_s(4).is_some(), "any format reads every search");
+        let mut odd = SearchSettings { format: 9, tables: 0, again: false, history: Vec::new() };
+        odd.repair();
+        assert_eq!((odd.format, odd.tables), (4, 1));
     }
 
     /// A file written before the odds switch existed still reads, and reads as
@@ -345,6 +457,7 @@ mod tests {
             show_odds: None,
             show_chat: None,
             auto_muck: None,
+            search: None,
         };
         s.repair(&k);
         assert!(s.nickname.len() <= NAME_MAX);
@@ -356,6 +469,7 @@ mod tests {
             show_odds: None,
             show_chat: None,
             auto_muck: None,
+            search: None,
         };
         s.repair(&k);
         assert!(!s.nickname.chars().any(|c| c.is_control()));
@@ -369,6 +483,7 @@ mod tests {
             show_odds: None,
             show_chat: None,
             auto_muck: None,
+            search: None,
         };
         s.repair(&k);
         assert_eq!(s.nickname, Settings::defaults(&k).nickname);
@@ -388,6 +503,7 @@ mod tests {
                 show_odds: None,
                 show_chat: None,
                 auto_muck: None,
+                search: None,
             };
             s.repair(&k);
             assert!(s.nickname.len() <= NAME_MAX, "{n}");
@@ -411,6 +527,7 @@ mod tests {
             show_odds: None,
             show_chat: None,
             auto_muck: None,
+            search: None,
         };
         // Written past `save`'s own repair, the way a person editing the file
         // would.
@@ -425,6 +542,7 @@ mod tests {
             show_odds: None,
             show_chat: None,
             auto_muck: None,
+            search: None,
         };
         std::fs::write(settings_path(&dir), minicbor::to_vec(&tiny).unwrap()).unwrap();
         assert_eq!(load(&dir, &k).text_percent, SCALE_MIN);
@@ -440,6 +558,7 @@ mod tests {
             show_odds: None,
             show_chat: None,
             auto_muck: None,
+            search: None,
         };
         assert_eq!(s.zoom(), 1.0);
     }
@@ -459,6 +578,7 @@ mod tests {
                 show_odds: None,
                 show_chat: None,
                 auto_muck: None,
+                search: None,
             },
             &k,
         )
@@ -472,6 +592,7 @@ mod tests {
                 show_odds: None,
                 show_chat: None,
                 auto_muck: None,
+                search: None,
             },
             &k,
         )

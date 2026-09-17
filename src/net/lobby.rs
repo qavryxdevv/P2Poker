@@ -917,6 +917,10 @@ pub struct RateLimiter {
     per_author_talk: BTreeMap<[u8; 32], Window>,
     /// `D-054`: and what one author may announce about itself.
     per_author_presence: BTreeMap<[u8; 32], Window>,
+    /// `D-064`: and what one author may say on the queue topic -- its own
+    /// map, so a client's lobby heartbeat and its search heartbeat, four a
+    /// minute between them, never spend each other's allowance.
+    per_author_queue: BTreeMap<[u8; 32], Window>,
 }
 
 /// `D-055`: how many rows a **full** window gives up in a minute.
@@ -1058,6 +1062,16 @@ impl RateLimiter {
             .admit(now_ms, MAX_PRESENCE_PER_PEER_PER_MIN)
     }
 
+    /// `D-064`: whether this **author key** may say it searches again: the
+    /// lobby presence's own allowance, on the queue's own map.
+    pub fn admit_author_queue(&mut self, author: [u8; 32], now_ms: u64) -> bool {
+        prune(&mut self.per_author_queue, now_ms);
+        self.per_author_queue
+            .entry(author)
+            .or_default()
+            .admit(now_ms, MAX_PRESENCE_PER_PEER_PER_MIN)
+    }
+
     /// Whether this **table key** may advertise again.
     ///
     /// **Charged only after the signature verifies**, and the first version got
@@ -1088,6 +1102,7 @@ impl RateLimiter {
         // ever relayed a chat message.
         self.per_peer_talk.retain(|_, w| !stale(w));
         self.per_table.retain(|_, w| !stale(w));
+        self.per_author_queue.retain(|_, w| !stale(w));
     }
 
     /// Windows held, as `(peers, tables)`.

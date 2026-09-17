@@ -69,6 +69,9 @@ pub enum EventType {
     /// `D-061`: a forming table goes on without its founder, at a seat's own
     /// new table (§7.12).
     TableContinues = 0x010A,
+    /// `D-064`: a client's word on the queue topic that it searches for a
+    /// game, or stopped (§7.13).
+    SearchPresence = 0x010B,
 
     JoinRequest = 0x0201,
     JoinAccept = 0x0202,
@@ -137,7 +140,7 @@ impl EventType {
     pub const RESERVED: core::ops::RangeInclusive<u16> = 0xF000..=0xFFFF;
 
     /// Every type, in wire-code order.
-    pub const ALL: [EventType; 45] = [
+    pub const ALL: [EventType; 46] = [
         EventType::Hello,
         EventType::Capabilities,
         EventType::LobbyTableAd,
@@ -150,6 +153,7 @@ impl EventType {
         EventType::TableLeave,
         EventType::TableHearing,
         EventType::TableContinues,
+        EventType::SearchPresence,
         EventType::JoinRequest,
         EventType::JoinAccept,
         EventType::JoinReject,
@@ -200,7 +204,7 @@ impl EventType {
         match self {
             Hello | Capabilities | LobbyTableAd | LobbyTableRemove | LobbyPlayerPresence
             | LobbySnapshotRequest | LobbySnapshotResponse | LobbyChat | TableChat | TableLeave | TableHearing
-            | TableContinues | JoinRequest | JoinAccept | JoinReject | PlayerList | Dispute => 0,
+            | TableContinues | SearchPresence | JoinRequest | JoinAccept | JoinReject | PlayerList | Dispute => 0,
             _ => 1,
         }
     }
@@ -208,7 +212,7 @@ impl EventType {
     pub const fn channel(self) -> Channel {
         use EventType::*;
         match self {
-            LobbyTableAd | LobbyTableRemove | LobbyPlayerPresence => Channel::LobbyBroadcast,
+            LobbyTableAd | LobbyTableRemove | LobbyPlayerPresence | SearchPresence => Channel::LobbyBroadcast,
             LobbySnapshotRequest | LobbySnapshotResponse => Channel::LobbyRpc,
             LobbyChat => Channel::LobbyChat,
             JoinRequest | JoinAccept | JoinReject => Channel::JoinRpc,
@@ -222,7 +226,7 @@ impl EventType {
             // Unchained: no stage at all.
             Hello | Capabilities | LobbyTableAd | LobbyTableRemove | LobbyPlayerPresence
             | LobbySnapshotRequest | LobbySnapshotResponse | LobbyChat | TableChat | TableLeave | TableHearing
-            | TableContinues | JoinRequest | JoinAccept | JoinReject | PlayerList => StageKind::Unchained,
+            | TableContinues | SearchPresence | JoinRequest | JoinAccept | JoinReject | PlayerList => StageKind::Unchained,
 
             // Chained, but legal outside its stage.
             Dispute => StageKind::OutOfStage,
@@ -276,6 +280,7 @@ impl EventType {
             TableLeave => "TABLE_LEAVE",
             TableHearing => "TABLE_HEARING",
             TableContinues => "TABLE_CONTINUES",
+            SearchPresence => "SEARCH_PRESENCE",
             JoinRequest => "JOIN_REQUEST",
             JoinAccept => "JOIN_ACCEPT",
             JoinReject => "JOIN_REJECT",
@@ -708,15 +713,15 @@ mod tests {
 
     #[test]
     fn the_catalogue_has_exactly_thirty_nine_types() {
-        assert_eq!(EventType::ALL.len(), 45, "PROTOCOL.md section 4.11 lists 45");
+        assert_eq!(EventType::ALL.len(), 46, "PROTOCOL.md section 4.11 lists 46");
     }
 
     #[test]
     fn every_code_is_distinct_and_every_name_is_distinct() {
         let codes: BTreeSet<u16> = EventType::ALL.iter().map(|t| t.code()).collect();
-        assert_eq!(codes.len(), 45, "two types share a wire code");
+        assert_eq!(codes.len(), 46, "two types share a wire code");
         let names: BTreeSet<&str> = EventType::ALL.iter().map(|t| t.name()).collect();
-        assert_eq!(names.len(), 45, "two types share a name");
+        assert_eq!(names.len(), 46, "two types share a name");
     }
 
     #[test]
@@ -731,7 +736,7 @@ mod tests {
     /// condition and must be a rejection rather than a forgotten match arm.
     #[test]
     fn an_uncatalogued_code_is_rejected() {
-        for code in [0x0000u16, 0x0003, 0x010B, 0x0206, 0x0308, 0x0506, 0x0704, 0x0806, 0x1234] {
+        for code in [0x0000u16, 0x0003, 0x010C, 0x0206, 0x0308, 0x0506, 0x0704, 0x0806, 0x1234] {
             assert_eq!(
                 EventType::try_from(code),
                 Err(UnknownEventType::Unknown(code)),
@@ -765,7 +770,8 @@ mod tests {
             .into_iter()
             .filter(|t| t.chain_scope() == 0)
             .collect();
-        assert_eq!(unchained.len(), 17, "got {unchained:?}");
+        // `D-064`: and `SEARCH_PRESENCE`, the queue's word, is the eighteenth.
+        assert_eq!(unchained.len(), 18, "got {unchained:?}");
 
         for t in unchained {
             assert!(!t.is_chained(), "{t}");

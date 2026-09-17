@@ -39,6 +39,7 @@ use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, TextStyl
 
 use super::lobby::{empty_explanation, visible, Filter, LobbyView, TableState, PASSWORD_WARNING};
 use crate::net::lobby::TableKind;
+use crate::net::matchmaker::{Format, SearchRequest};
 use crate::protocol::constants::{
     RATED_BLIND_EVERY_N_HANDS, RATED_SEATS, RATED_SMALL_BLIND, RATED_START_STACK,
 };
@@ -84,6 +85,10 @@ pub enum LobbyAction {
     RetryJoin,
     /// `S1-CS`: give the join in progress up.
     CancelJoin,
+    /// `D-064`: find a game automatically, as the dialog asked.
+    StartSearch(SearchRequest),
+    /// `D-064`: the search's one button: give it up, now.
+    CancelSearch,
 }
 
 /// What the create dialog collects.
@@ -138,6 +143,28 @@ pub struct SitDown {
     pub wants_password: bool,
 }
 
+/// `D-064`: what the search dialog collects, opened on what the player chose
+/// last time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchForm {
+    pub format: Format,
+    pub tables: u8,
+    pub again: bool,
+    /// What past searches took, for the dialog's word on what to expect.
+    pub history: crate::storage::settings::SearchSettings,
+}
+
+impl SearchForm {
+    pub fn from_settings(s: &crate::storage::settings::SearchSettings) -> Self {
+        SearchForm {
+            format: Format::parse(s.format).unwrap_or(Format::Any),
+            tables: s.tables.clamp(1, crate::net::matchmaker::MAX_GAMES),
+            again: s.again,
+            history: s.clone(),
+        }
+    }
+}
+
 /// Which dialog is open, if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dialog {
@@ -145,6 +172,8 @@ pub enum Dialog {
     Sit(SitDown),
     /// The player's own name and how big the text is.
     Settings(Settings),
+    /// `D-064`: the automatic search's format and games at once.
+    Search(SearchForm),
 }
 
 /// The parts of the pane the user types into.
@@ -307,6 +336,12 @@ pub fn lobby(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> LobbyA
     // `S1-FG`: the table asked for is one this client is at already.
     if let Some(a) = view.already_at.as_ref() {
         if let Some(what) = already_at_window(ui.ctx(), a) {
+            asked = Some(what);
+        }
+    }
+    // `D-064`: the search's window, over everything, while a search is on.
+    if let Some(s) = view.search.as_ref() {
+        if let Some(what) = search_modal(ui.ctx(), s) {
             asked = Some(what);
         }
     }
@@ -555,6 +590,156 @@ pub fn joining_window(ctx: &egui::Context, j: &super::lobby::JoiningView) -> Opt
     action
 }
 
+/// `D-064`: the search's window -- a modal over the lobby, with the clock, the
+/// estimate, the queue, the seats held, the games running, the network's one
+/// warning, and the one button, which cancels on the click.
+///
+/// Repainted four times a second while it is up: the spinner turns, the clock
+/// counts, and the node's word arrives once a second on its own.
+pub fn search_modal(ctx: &egui::Context, s: &super::lobby::SearchView) -> Option<LobbyAction> {
+    use super::lobby::clock;
+    let mut action = None;
+    egui::Modal::new(egui::Id::new("search-modal"))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .stroke(Stroke::new(1.0, theme::LINE))
+                .corner_radius(12.0)
+                .inner_margin(22.0),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(26.0).color(theme::ACCENT));
+                ui.add_space(6.0);
+                ui.label(RichText::new("Searching for a game").color(theme::TEXT).size(21.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(clock(s.elapsed_s))
+                            .color(theme::ACCENT)
+                            .size(24.0)
+                            .strong()
+                            .monospace(),
+                    );
+                });
+            });
+            ui.label(
+                RichText::new(format!(
+                    "{} \u{00b7} {} game{} at once",
+                    s.format,
+                    s.games,
+                    if s.games == 1 { "" } else { "s" }
+                ))
+                .color(theme::TEXT_DIM)
+                .size(14.0),
+            );
+            ui.add_space(8.0);
+            // The bar animates only while it has nothing to show: egui draws the
+            // animation inside the bar, where it sat over the words.
+            let (fraction, text) = search_progress(s);
+            ui.add(egui::ProgressBar::new(fraction).animate(fraction <= 0.0).fill(theme::OK));
+            ui.label(RichText::new(text).color(theme::TEXT_DIM).size(14.0));
+            ui.add_space(10.0);
+
+            let r = s.report.as_ref();
+            let eta = r
+                .and_then(|r| r.eta_s)
+                .map(|e| format!("about {}", clock(e)))
+                .or_else(|| s.typical_s.map(|t| format!("usually about {}", clock(u64::from(t)))))
+                .unwrap_or_else(|| "measuring\u{2026}".to_string());
+            stat_row(ui, "Estimated wait", &eta, theme::TEXT);
+            let queue = match r {
+                Some(r) => match r.queue_wait_s {
+                    Some(w) => format!("{} (waiting {} on average)", r.queue, clock(w)),
+                    None => r.queue.to_string(),
+                },
+                None => "\u{2026}".to_string(),
+            };
+            stat_row(ui, "Players searching", &queue, theme::TEXT);
+            let reserved = r.map_or("\u{2026}".to_string(), |r| {
+                format!(
+                    "{} table{} (looking at up to {})",
+                    r.reservations.len(),
+                    if r.reservations.len() == 1 { "" } else { "s" },
+                    r.looking_at
+                )
+            });
+            stat_row(ui, "Reserved at", &reserved, theme::OK);
+            if let Some(r) = r {
+                for x in &r.reservations {
+                    ui.label(
+                        RichText::new(format!(
+                            "    {} \u{2014} {}/{} seated, starts at {}{}{}",
+                            x.name,
+                            x.players,
+                            x.seats,
+                            x.capacity,
+                            if x.mine { " \u{00b7} yours" } else { "" },
+                            if x.armed { " \u{00b7} ready" } else { "" }
+                        ))
+                        .color(theme::TEXT_DIM)
+                        .size(14.0),
+                    );
+                }
+            }
+            let games = r.map_or("\u{2026}".to_string(), |r| format!("{} / {}", r.running, r.limit));
+            stat_row(ui, "Games running", &games, theme::STACK);
+            if let Some(r) = r {
+                ui.add_space(4.0);
+                ui.label(RichText::new(&r.phase).color(theme::TEXT_DIM).size(14.0));
+                if let Some(w) = r.warning.as_ref() {
+                    ui.label(RichText::new(w).color(theme::WARN).strong());
+                }
+            }
+            ui.add_space(16.0);
+            ui.vertical_centered(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("CANCEL SEARCH").color(theme::TEXT).size(18.0).strong())
+                            .fill(theme::DANGER)
+                            .min_size(egui::vec2(320.0, 50.0)),
+                    )
+                    .clicked()
+                {
+                    action = Some(LobbyAction::CancelSearch);
+                }
+            });
+            crate::gui::table::paint_again(ctx, std::time::Duration::from_millis(250));
+        });
+    action
+}
+
+/// `D-064`: how far the search is, as a bar: the fullest seat held against the
+/// seats its table needs to start; nothing yet while no seat is held.
+fn search_progress(s: &super::lobby::SearchView) -> (f32, String) {
+    let Some(r) = s.report.as_ref() else {
+        return (0.0, "starting".to_string());
+    };
+    let best = r
+        .reservations
+        .iter()
+        .filter(|x| x.capacity > 0)
+        .max_by_key(|x| (u32::from(x.players) * 1_000 / u32::from(x.capacity), x.players));
+    match best {
+        Some(x) => (
+            (f32::from(x.players) / f32::from(x.capacity)).clamp(0.0, 1.0),
+            format!("{} of {} seats at the closest table", x.players.min(x.capacity), x.capacity),
+        ),
+        None => (0.0, "looking for tables".to_string()),
+    }
+}
+
+/// One line of the search's window: a dim label, then the value.
+fn stat_row(ui: &mut egui::Ui, label: &str, value: &str, colour: Color32) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            egui::vec2(150.0, 24.0),
+            egui::Label::new(RichText::new(label).color(theme::TEXT_DIM)),
+        );
+        ui.label(RichText::new(value).color(colour).strong());
+    });
+}
+
 /// The create and sit-down dialogs, which are the only two places this client
 /// asks a player for anything.
 fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
@@ -566,6 +751,7 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
         Dialog::Create(_) => "Create a table",
         Dialog::Sit(_) => "Sit down",
         Dialog::Settings(_) => "Settings",
+        Dialog::Search(_) => "Find a game",
     };
 
     egui::Window::new(RichText::new(title).size(19.0).strong())
@@ -692,6 +878,69 @@ fn dialog(ui: &mut egui::Ui, state: &mut LobbyUi) -> Option<LobbyAction> {
                             .clicked()
                         {
                             action = Some(LobbyAction::Create(f.clone()));
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::Search(f) => {
+                    ui.label(
+                        RichText::new(
+                            "The client looks for a Sit & Go for you: it reserves seats at the \
+                             tables closest to starting, founds one of its own when nothing is \
+                             on offer, lets that one start with the players who came, and gives \
+                             every other seat back the moment a game starts.",
+                        )
+                        .color(theme::TEXT_DIM)
+                        .size(14.0),
+                    );
+                    ui.add_space(8.0);
+                    field_row(ui, "Format", |ui| {
+                        for format in Format::ALL {
+                            ui.selectable_value(&mut f.format, format, format.label());
+                        }
+                    });
+                    field_row(ui, "Games at once", |ui| {
+                        ui.add(egui::Slider::new(&mut f.tables, 1..=crate::net::matchmaker::MAX_GAMES));
+                    });
+                    ui.checkbox(&mut f.again, "Search again when the game ends");
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(match f.history.typical_s(f.format.code()) {
+                            Some(t) => format!(
+                                "Searches for {} took about {} before.",
+                                f.format.label(),
+                                super::lobby::clock(u64::from(t))
+                            ),
+                            None => "How long it takes depends on who else is looking; the window \
+                                     shows an estimate as the search learns."
+                                .to_string(),
+                        })
+                        .color(theme::TEXT_DIM)
+                        .size(14.0),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Start search")
+                                        .color(Color32::from_rgb(4, 16, 26))
+                                        .strong(),
+                                )
+                                .fill(theme::OK)
+                                .min_size(egui::vec2(140.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            action = Some(LobbyAction::StartSearch(SearchRequest {
+                                id: 0,
+                                format: f.format,
+                                tables: f.tables,
+                                again: f.again,
+                            }));
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -901,6 +1150,8 @@ fn header(ui: &mut egui::Ui, view: &LobbyView) -> bool {
             // Beside it, not instead of it: "462 peers" is true about the
             // network and says nothing about who is here to play.
             (view.status.lobby_peers, "in lobby", theme::OK),
+            // `D-064`: who is looking for a game right now.
+            (usize::try_from(view.searching).unwrap_or(usize::MAX), "searching", theme::WARN),
         ] {
             pill(ui, &format!("{n} {what}"), colour);
         }
@@ -1003,6 +1254,22 @@ fn tables_column(ui: &mut egui::Ui, view: &LobbyView, state: &mut LobbyUi) -> Lo
                     .clicked()
                 {
                     state.dialog = Some(Dialog::Create(NewTable::default()));
+                }
+                // `D-064`: the one button that finds a game by itself.
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Find a game")
+                                .color(Color32::from_rgb(4, 16, 26))
+                                .strong(),
+                        )
+                        .fill(theme::OK)
+                        .min_size(egui::vec2(140.0, 34.0)),
+                    )
+                    .on_hover_text("Search for a Sit & Go automatically: the client reserves seats at the tables closest to starting and founds one when nothing is on offer.")
+                    .clicked()
+                {
+                    state.dialog = Some(Dialog::Search(SearchForm::from_settings(&state.settings.search())));
                 }
 
                 let can_join = view.can_join();

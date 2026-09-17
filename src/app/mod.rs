@@ -294,6 +294,22 @@ pub struct SlotView {
     pub active: bool,
 }
 
+/// `D-064`: the automatic search, as the window follows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchState {
+    pub request: crate::net::matchmaker::SearchRequest,
+    pub since: std::time::Instant,
+    pub report: Option<crate::net::matchmaker::SearchReport>,
+    /// The slots holding the search's reservations: no window of theirs is
+    /// drawn until one of them is a game (the owner: the system may close only
+    /// windows it opened itself -- so it opens none until there is a game).
+    pub reserved: std::collections::BTreeSet<u8>,
+    /// The player pressed cancel; the node's word that the search ended is on
+    /// its way. The modal is gone from the click; the reservations' slots stay
+    /// hidden until they are left.
+    pub cancelling: bool,
+}
+
 /// `S1-FG`: where this client is at a table the lobby offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Here {
@@ -520,6 +536,28 @@ pub struct AppState {
     /// What this player keeps about other players, by key: the stars under a
     /// name and the note behind them. Loaded by the window from the profile.
     pub notes: crate::storage::notes::Notes,
+    /// `D-064`: the automatic search under way.
+    pub search: Option<SearchState>,
+    /// `D-064`: the searches' numbers, so a report of an earlier one is nobody's.
+    pub search_ids: u32,
+    /// `D-064`: the request to make again when a game the search started ends
+    /// (*again* asked), the slots of those games, and whether it is owed now.
+    pub search_again: Option<crate::net::matchmaker::SearchRequest>,
+    pub search_again_slots: std::collections::BTreeSet<u8>,
+    pub search_again_due: bool,
+    /// `D-064`: the slots of reservations the search ended with, hidden until
+    /// the node has left each -- the node says the search ended before the
+    /// leaves it queued run, and a window that opened for the moment between
+    /// would be a window the system opened for nothing.
+    pub search_hidden: std::collections::BTreeSet<u8>,
+    /// `D-064`: other clients searching, as the queue topic last said.
+    pub searching: u32,
+    /// `D-064`: searches that ended in a game -- the format's code and the
+    /// seconds each took -- not yet written to the profile.
+    pub search_history: Vec<(u8, u32)>,
+    /// `D-064`: what past searches took, from the profile, for the window's
+    /// word before a search has measured anything.
+    pub search_settings: crate::storage::settings::SearchSettings,
 }
 
 impl Seat {
@@ -852,6 +890,20 @@ impl AppState {
             }
             return;
         }
+        // `D-064`: a game the search started is over for this player -- the
+        // tournament ended, or this seat finished, busted or not -- and the
+        // player asked to search again when it ends.
+        if let NodeEvent::Finished { seat, over, .. } = &event {
+            let slot = self.current_slot;
+            let me = if slot == self.active_slot {
+                self.seated.as_ref().and_then(|s| s.seat)
+            } else {
+                self.background.get(&slot).and_then(|t| t.seated.as_ref()).and_then(|s| s.seat)
+            };
+            if (*over || Some(*seat) == me) && self.search_again_slots.remove(&slot) && self.search_again.is_some() {
+                self.search_again_due = true;
+            }
+        }
         match &event {
             NodeEvent::YourTurn { .. } => {
                 self.turn_at.insert(self.current_slot);
@@ -863,6 +915,10 @@ impl AppState {
         }
         let left = matches!(event, NodeEvent::LeftTable { .. });
         let slot = self.current_slot;
+        // `D-064`: a reservation's slot left, or seated again, is hidden no more.
+        if matches!(event, NodeEvent::LeftTable { .. } | NodeEvent::TableLost { .. } | NodeEvent::TableReal { .. }) {
+            self.search_hidden.remove(&slot);
+        }
         if slot == self.active_slot || !self.background.contains_key(&slot) {
             self.apply_here(event);
             return;
@@ -953,7 +1009,11 @@ impl AppState {
     /// one -- the active slot first.
     pub fn slots(&self) -> Vec<SlotView> {
         let mut out = Vec::new();
-        if let Some(s) = self.seated.as_ref() {
+        // `D-064`: a seat the search holds has no window until it is a game.
+        let hidden = |slot: &u8| {
+            self.search.as_ref().is_some_and(|s| s.reserved.contains(slot)) || self.search_hidden.contains(slot)
+        };
+        if let Some(s) = self.seated.as_ref().filter(|_| !hidden(&self.active_slot)) {
             out.push(SlotView {
                 slot: self.active_slot,
                 name: s.name.clone(),
@@ -962,6 +1022,9 @@ impl AppState {
             });
         }
         for (slot, other) in self.background.iter() {
+            if hidden(slot) {
+                continue;
+            }
             if let Some(s) = other.seated.as_ref() {
                 out.push(SlotView {
                     slot: *slot,
@@ -1854,6 +1917,33 @@ impl AppState {
                     self.note(format!("dial failed: {reason}"));
                 }
             }
+            // `D-064`: the search's word, for the search the window holds; a
+            // report of a search given up is nobody's.
+            NodeEvent::Search(report) => {
+                if let Some(s) = self.search.as_mut().filter(|s| s.request.id == report.id) {
+                    s.reserved = report.reservations.iter().filter_map(|r| r.slot).collect();
+                    s.report = Some(report);
+                }
+            }
+            NodeEvent::SearchEnded { id, why, started } => {
+                if let Some(s) = self.search.take_if(|s| s.request.id == id) {
+                    let took = u32::try_from(s.since.elapsed().as_secs()).unwrap_or(u32::MAX);
+                    self.search_hidden.extend(s.reserved.iter().copied().filter(|slot| !started.contains(slot)));
+                    if !started.is_empty() {
+                        let code = s.request.format.code();
+                        self.search_history.push((code, took));
+                        self.search_settings.remember(code, took);
+                        if s.request.again {
+                            self.search_again = Some(s.request);
+                            self.search_again_slots.extend(started.iter().copied());
+                        }
+                    }
+                    self.note(format!("search: ended after {took} s -- {why}"));
+                } else {
+                    self.note(format!("search: ended -- {why}"));
+                }
+            }
+            NodeEvent::QueueSeen { searching } => self.searching = searching,
             NodeEvent::Warning(w) => self.note(w),
 
             NodeEvent::PortMapped { how, external } => {
@@ -3180,6 +3270,74 @@ impl AppState {
         }
     }
 
+    /// `D-064`: start the automatic search: the window's state at once, and
+    /// the command the node takes.
+    pub fn begin_search(&mut self, req: crate::net::matchmaker::SearchRequest) -> NodeCommand {
+        self.search_ids = self.search_ids.wrapping_add(1).max(1);
+        let req = crate::net::matchmaker::SearchRequest { id: self.search_ids, ..req }.checked();
+        self.search = Some(SearchState {
+            request: req,
+            since: std::time::Instant::now(),
+            report: None,
+            reserved: std::collections::BTreeSet::new(),
+            cancelling: false,
+        });
+        self.search_again = None;
+        self.search_again_due = false;
+        self.note(format!(
+            "search: looking for a {} game, {} at once{}",
+            req.format.label(),
+            req.tables,
+            if req.again { ", and again after it" } else { "" }
+        ));
+        NodeCommand::Lobby(crate::net::matchmaker::LobbyCommand::PlayerStartSearch(req))
+    }
+
+    /// `D-064`: the player gave the search up. The modal goes on the click --
+    /// the node's word that the search ended follows, and takes the state
+    /// with it -- and the command is what the node takes.
+    pub fn cancel_search(&mut self) -> Option<NodeCommand> {
+        let s = self.search.as_mut().filter(|s| !s.cancelling)?;
+        s.cancelling = true;
+        self.search_again = None;
+        self.search_again_due = false;
+        self.note("search: cancelled by the player".to_string());
+        Some(NodeCommand::Lobby(crate::net::matchmaker::LobbyCommand::PlayerCancelSearch))
+    }
+
+    /// `D-064`: the search's modal window, while a search is on and not given up.
+    pub fn search_view(&self) -> Option<crate::gui::lobby::SearchView> {
+        let s = self.search.as_ref().filter(|s| !s.cancelling)?;
+        Some(crate::gui::lobby::SearchView {
+            id: s.request.id,
+            format: s.request.format.label(),
+            games: s.request.tables,
+            elapsed_s: s.since.elapsed().as_secs(),
+            report: s.report.clone(),
+            typical_s: self.search_settings.typical_s(s.request.format.code()),
+        })
+    }
+
+    /// `D-064`: the search owed now -- a game it started ended and the player
+    /// asked to search again -- as the command that starts it.
+    pub fn take_search_again(&mut self) -> Option<NodeCommand> {
+        if !self.search_again_due {
+            return None;
+        }
+        self.search_again_due = false;
+        let req = self.search_again.take()?;
+        Some(self.begin_search(req))
+    }
+
+    /// `D-064`: the searches that found a game since this was last taken, for
+    /// the profile.
+    pub fn take_search_history(&mut self) -> Option<Vec<(u8, u32)>> {
+        if self.search_history.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut self.search_history))
+    }
+
     /// `S1-CS`: the decision clock runs for the seat to act, from the moment
     /// this client learned it was that seat's turn; a seat that was already
     /// on the clock keeps its start.
@@ -3294,6 +3452,9 @@ impl AppState {
         // still here.
         // `D-043`: every table this client sits at, the turn marked.
         v.my_tables = self.slots();
+        // `D-064`: the search, and the queue's size.
+        v.search = self.search_view();
+        v.searching = self.searching;
         v.seated = {
             let mut who: Vec<String> = self
                 .players

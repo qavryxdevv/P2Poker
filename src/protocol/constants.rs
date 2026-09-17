@@ -35,6 +35,9 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 pub const IDENTIFY_PROTOCOL: &str = "/p2p-poker/1";
 pub const LOBBY_TOPIC: &str = "/p2p-poker/lobby/1";
 pub const LOBBY_CHAT_TOPIC: &str = "/p2p-poker/lobby-chat/1";
+/// `D-064`: the queue of clients searching for a game, beside the lobby and
+/// sliced like it (`PROTOCOL.md` §7.13).
+pub const SEARCH_QUEUE_TOPIC: &str = "/p2p-poker/search-queue/1";
 pub const SNAPSHOT_PROTOCOL: &str = "/p2p-poker/lobby-snapshot/1";
 pub const JOIN_PROTOCOL: &str = "/p2p-poker/join/1";
 pub const TABLE_PROTOCOL: &str = "/p2p-poker/table/1";
@@ -243,6 +246,14 @@ pub const MAX_AD_LIFETIME_MS: u64 = 300_000;
 pub const MAX_CLOCK_SKEW_MS: u64 = 120_000;
 pub const PRESENCE_TTL_MS: u64 = 120_000;
 pub const PRESENCE_HEARTBEAT_MS: u64 = 40_000;
+/// `D-064`: a searching client says so on the queue topic this often, and a
+/// searcher not heard for three of those is out of the queue -- the lobby
+/// advert's own ratio (`AD_REBROADCAST_MS` to `AD_TTL_MS`).
+pub const SEARCH_PRESENCE_EVERY_MS: u64 = 30_000;
+pub const SEARCH_PRESENCE_TTL_MS: u64 = 90_000;
+/// `D-064`: the most bytes a `SEARCH_PRESENCE` may be; the body is three
+/// small integers and the whole signed event is about 150.
+pub const SEARCH_PRESENCE_MAX: usize = 512;
 
 // **`REANNOUNCE_INTERVAL_MS` is gone as well (2026-09-15).** It was Mainline's
 // ten-minute re-announce, sized against a record that lived about forty-five

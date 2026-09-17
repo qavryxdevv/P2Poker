@@ -63,6 +63,14 @@ The window opens on the lobby. **Create table** advertises one; **Join table**
 sits down at somebody else's. The table itself opens in a window of its own,
 beside the lobby, and the other players appear in it as they sit down.
 
+**Find a game** does the looking for you: choose a format (heads-up, six seats,
+nine seats, or whatever fills first) and how many games you want at once, and
+the client reserves seats at the tables closest to starting, founds one of its
+own when nothing is on offer, lets that one start with the players who came,
+and gives every other seat back the moment a game starts. The window shows the
+clock, the estimate, how many others are searching and where seats are held,
+and one button, which cancels at once.
+
 A new table is a **rated Sit-and-Go** by default: ten seats, 10 000 chips each,
 blinds 50/100 doubling every eleven hands, and it deals when all ten are in.
 Those numbers are not a choice — they are `RATED_SNG_POKERTH_V1`, read out of
@@ -92,6 +100,9 @@ Both print `TABLE FORMED session=…` with the same session identity.
 | `--seats N` | make it a custom table of `N` seats instead (a rated one needs all ten) |
 | `--min N` | how many of them it starts with |
 | `--join NAME` | sit down at the first table called `NAME` |
+| `--search hu` \| `6` \| `9` \| `auto` | find a game automatically, from the start |
+| `--search-tables N` | how many games at once the search aims at, 1 to 4 |
+| `--search-again` | search again when the game the search found ends |
 | `--table` | open on the table rather than the lobby |
 | `--for N` | stop after `N` seconds |
 | `--renderer gl` \| `software` | pin the renderer instead of letting it choose |

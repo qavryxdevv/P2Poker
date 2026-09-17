@@ -387,6 +387,29 @@ pub struct LobbyView {
     pub here: Vec<[u8; 32]>,
     /// `S1-FG`: the word that the table asked for is one this client is at.
     pub already_at: Option<AlreadyAtView>,
+    /// `D-064`: the automatic search under way, for its modal window.
+    pub search: Option<SearchView>,
+    /// `D-064`: other clients searching for a game, as the queue topic says.
+    pub searching: u32,
+}
+
+/// `D-064`: the search under way, as the modal window shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchView {
+    pub id: u32,
+    pub format: &'static str,
+    /// How many games at once the player asked for.
+    pub games: u8,
+    pub elapsed_s: u64,
+    /// The node's last word on the search, once it has said one.
+    pub report: Option<crate::net::matchmaker::SearchReport>,
+    /// What searches of this format took before, from the profile.
+    pub typical_s: Option<u32>,
+}
+
+/// Seconds as `mm:ss`: the search clock's face.
+pub fn clock(secs: u64) -> String {
+    format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
 /// One line of lobby chat.
@@ -414,6 +437,8 @@ impl LobbyView {
             joining: None,
             here: Vec::new(),
             already_at: None,
+            search: None,
+            searching: 0,
         }
     }
 

@@ -27,6 +27,9 @@
 //! p2p-poker --join N --resume     the same two in the window, for a scripted
 //!                                 run of it: sit at the first table called N,
 //!                                 answer *rejoin* without being asked
+//! p2p-poker --search auto         find a game automatically (hu, 6, 9 or auto;
+//!                                 --search-tables N games at once, --search-again
+//!                                 to search again when the game ends)
 //! ```
 //!
 //! `--renderer` is there to be overridden, not to be typed. The client draws
@@ -380,6 +383,23 @@ fn main() {
     // `--resume`: a headless client rejoins the unfinished session on record
     // without being asked (`S1-CR`); the window asks the player.
     let resume = has("--resume");
+    // `D-064`: the automatic search, from the start.
+    let search = value_of("--search").map(|f| {
+        use p2p_poker::net::matchmaker::{Format, SearchRequest};
+        let format = match f.trim().to_ascii_lowercase().as_str() {
+            "hu" | "2" | "2max" => Format::HeadsUp,
+            "6" | "6max" => Format::SixMax,
+            "9" | "9max" => Format::NineMax,
+            _ => Format::Any,
+        };
+        SearchRequest {
+            id: 1,
+            format,
+            tables: value_of("--search-tables").and_then(|v| v.parse::<u8>().ok()).unwrap_or(1),
+            again: has("--search-again"),
+        }
+        .checked()
+    });
 
     // Multicast discovery, on unless refused. `--no-mdns` exists to prove the
     // other path: with it on, two clients on one wire find each other in under
@@ -438,6 +458,7 @@ fn main() {
         then_join,
         also_join,
         also_at,
+        search,
     };
 
     if has("--headless") {
@@ -620,6 +641,7 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
         then_join,
         also_join,
         also_at,
+        search,
         ..
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
@@ -679,6 +701,38 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
         let mut also_done = also_join.is_none();
 
         let mut state = AppState::new();
+        // `D-064`: `--search`: the automatic search, from the start; and the
+        // bed's knobs: `P2P_POKER_CANCEL_SEARCH_AT=<s>` cancels it at that second
+        // of this client's life, `P2P_POKER_SEARCH_AGAIN_AT=<s>` starts it again.
+        if let Some(req) = search {
+            println!("searching for a {} game ({} at once)", req.format.label(), req.tables);
+            let cmd = state.begin_search(req);
+            let _ = commands.send(cmd).await;
+        }
+        let knob = |name: &str| -> Option<u64> {
+            if !cfg!(feature = "fault-harness") {
+                return None;
+            }
+            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        let cancel_search_at = knob("P2P_POKER_CANCEL_SEARCH_AT");
+        let search_again_at = knob("P2P_POKER_SEARCH_AGAIN_AT");
+        let cancel_search = async {
+            match cancel_search_at {
+                Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(cancel_search);
+        let mut cancel_done = cancel_search_at.is_none();
+        let search_again = async {
+            match search_again_at {
+                Some(secs) => tokio::time::sleep(Duration::from_secs(secs)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(search_again);
+        let mut again_done = search_again_at.is_none();
         // `D-032`: the opponent's fourth absence ends the game; said once.
         let mut left_for_returns = false;
         // The last ask, whichever edge made it. A floor under the new
@@ -714,6 +768,21 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => break,
                 _ = &mut deadline => break,
+                _ = &mut cancel_search, if !cancel_done => {
+                    cancel_done = true;
+                    println!("fault-harness: cancelling the search, as P2P_POKER_CANCEL_SEARCH_AT asked");
+                    if let Some(cmd) = state.cancel_search() {
+                        let _ = commands.send(cmd).await;
+                    }
+                }
+                _ = &mut search_again, if !again_done => {
+                    again_done = true;
+                    if let Some(req) = search {
+                        println!("fault-harness: searching again, as P2P_POKER_SEARCH_AGAIN_AT asked");
+                        let cmd = state.begin_search(req);
+                        let _ = commands.send(cmd).await;
+                    }
+                }
                 _ = &mut also, if !also_done => {
                     also_done = true;
                     if let Some(name) = also_join.clone() {
@@ -876,6 +945,11 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                     for line in state.log.iter().skip(state.log.len().saturating_sub(fresh)) {
                         println!("{line}");
                     }
+                    // `D-064`: `--search-again`: a game the search started ended.
+                    if let Some(cmd) = state.take_search_again() {
+                        println!("searching again, as --search-again asked");
+                        let _ = commands.send(cmd).await;
+                    }
 
                     // A table this run was told to sit down at, recognised by
                     // the name in its advertisement. The name is **display data
@@ -1009,6 +1083,18 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
             ),
             _ => println!("NO TABLE"),
         }
+        // `D-064`: the games the search started sit in other slots.
+        for (slot, t) in state.background.iter() {
+            if let Some(s) = t.seated.as_ref().filter(|s| s.session.is_some()) {
+                println!(
+                    "TABLE FORMED session={} seats={} slot={slot}",
+                    s.session
+                        .map(|x| x[..8].iter().map(|b| format!("{b:02x}")).collect::<String>())
+                        .unwrap_or_default(),
+                    s.roster.len()
+                );
+            }
+        }
         println!("done");
     });
 }
@@ -1047,6 +1133,9 @@ struct Run {
     also_at: Option<u64>,
     /// `--resume`: rejoin the unfinished session on record, headless (`S1-CR`).
     resume: bool,
+    /// `D-064`: `--search hu|6|9|auto [--search-tables N] [--search-again]`:
+    /// the automatic search, from the start, for a scripted run of it.
+    search: Option<p2p_poker::net::matchmaker::SearchRequest>,
 }
 
 fn windowed(player: Player, run: Run) -> Started {
@@ -1076,6 +1165,7 @@ fn windowed(player: Player, run: Run) -> Started {
         then_join: _,
         also_join: _,
         also_at: _,
+        search,
     } = run;
     let rt = tokio::runtime::Runtime::new().expect("a tokio runtime");
     // The same headroom as the headless path, for the same reason.
@@ -1213,6 +1303,14 @@ fn windowed(player: Player, run: Run) -> Started {
             state.me = settings.nickname.clone();
             // PokerTH's notes about players: local, by key.
             state.notes = p2p_poker::storage::notes::load(&profile_dir);
+            // `D-064`: what past searches took, for the search window's word.
+            state.search_settings = settings.search();
+            // `D-064`: `--search` in the window: the search from the first frame,
+            // for a scripted run that photographs it.
+            if let Some(req) = search {
+                let cmd = state.begin_search(req);
+                let _ = commands.try_send(cmd);
+            }
             cc.egui_ctx.set_zoom_factor(settings.zoom());
             Ok(Box::new(Client {
                 state,
@@ -2040,6 +2138,23 @@ impl eframe::App for Client {
 
         // `S1-CS`: a join nobody answers is called failed on the clock.
         self.state.tick_join();
+        // `D-064`: a game the search started ended and the player asked to
+        // search again; and what the searches took, written to the profile.
+        if let Some(cmd) = self.state.take_search_again() {
+            self.tell(cmd);
+        }
+        if let Some(history) = self.state.take_search_history() {
+            let mut settings = self.ui.settings.clone();
+            let mut search = settings.search();
+            for (format, took) in history {
+                search.remember(format, took);
+            }
+            settings.search = Some(search);
+            if let Err(e) = p2p_poker::storage::settings::save(&self.profile_dir, &settings, &self.app_key) {
+                self.state.log.push_back(format!("the search history did not save: {e}"));
+            }
+            self.ui.settings = settings;
+        }
         // `S1-CX`: an unreachable heads-up opponent is said once it is worth saying.
         self.state.tick_opponent();
         // PokerTH's turn warning, and every sound owed since the last frame.
@@ -2169,6 +2284,23 @@ impl eframe::App for Client {
                     render::LobbyAction::Say(text) => self.tell(NodeCommand::SayInLobby(text)),
                     render::LobbyAction::Save(settings) => {
                         self.save_settings(&ctx, settings);
+                    }
+                    // `D-064`: the search, and what it was asked for remembered.
+                    render::LobbyAction::StartSearch(req) => {
+                        let cmd = self.state.begin_search(req);
+                        self.tell(cmd);
+                        let mut settings = self.ui.settings.clone();
+                        let mut search = settings.search();
+                        search.format = req.format.code();
+                        search.tables = req.tables;
+                        search.again = req.again;
+                        settings.search = Some(search);
+                        self.save_settings(&ctx, settings);
+                    }
+                    render::LobbyAction::CancelSearch => {
+                        if let Some(cmd) = self.state.cancel_search() {
+                            self.tell(cmd);
+                        }
                     }
                 }
             }
