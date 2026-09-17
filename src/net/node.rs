@@ -591,6 +591,10 @@ pub enum NodeEvent {
     SearchEnded { id: u32, why: String, started: Vec<u8> },
     /// `D-064`: how many other clients search for a game, when that changes.
     QueueSeen { searching: u32 },
+    /// `S1-HL`: this slot is the search's -- said the moment it is opened
+    /// for a seat, before any word about the table in it, so the window
+    /// draws no table window for it until it is a game.
+    SearchSlot { slot: u8 },
 }
 
 impl NodeEvent {
@@ -738,7 +742,8 @@ impl NodeEvent {
             // `D-064`: the search's window, and the lobby's count of searchers.
             | Self::Search(_)
             | Self::SearchEnded { .. }
-            | Self::QueueSeen { .. } => true,
+            | Self::QueueSeen { .. }
+            | Self::SearchSlot { .. } => true,
 
             // Log only. Chatty, repetitive, and worth a second's delay.
             //

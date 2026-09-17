@@ -6996,7 +6996,7 @@ with `state = 0`, when it stops -- so the count falls at the cancel and not thre
 heartbeats later.
 *Envelope:* unchained (`chain_scope = 0`).
 *Body:* `n(0) state: u8` -- `0` stopped searching, `1` heads-up, `2` six seats,
-`3` nine seats, `4` any tournament table; `n(1) tables: u8` -- how many games at
+`3` ten seats (the full ring), `4` any tournament table; `n(1) tables: u8` -- how many games at
 once, `1..=4`; `n(2) since_unix_ms: u64` -- when the search began, on the speaker's
 clock, so a listener can say how long the queue has waited (a value ahead of the
 listener's clock reads as *now*).

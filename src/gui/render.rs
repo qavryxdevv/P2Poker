@@ -649,6 +649,8 @@ pub fn search_modal(ctx: &egui::Context, s: &super::lobby::SearchView) -> Option
                 .unwrap_or_else(|| "measuring\u{2026}".to_string());
             stat_row(ui, "Estimated wait", &eta, theme::TEXT);
             let queue = match r {
+                // `S1-HK`: the queue's silence before it could be heard is not a zero.
+                Some(r) if !r.queue_known => "measuring\u{2026}".to_string(),
                 Some(r) => match r.queue_wait_s {
                     Some(w) => format!("{} (waiting {} on average)", r.queue, clock(w)),
                     None => r.queue.to_string(),

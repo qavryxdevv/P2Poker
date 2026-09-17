@@ -27,7 +27,7 @@
 //! p2p-poker --join N --resume     the same two in the window, for a scripted
 //!                                 run of it: sit at the first table called N,
 //!                                 answer *rejoin* without being asked
-//! p2p-poker --search auto         find a game automatically (hu, 6, 9 or auto;
+//! p2p-poker --search auto         find a game automatically (hu, 6, 10 or auto;
 //!                                 --search-tables N games at once, --search-again
 //!                                 to search again when the game ends)
 //! ```
@@ -389,7 +389,7 @@ fn main() {
         let format = match f.trim().to_ascii_lowercase().as_str() {
             "hu" | "2" | "2max" => Format::HeadsUp,
             "6" | "6max" => Format::SixMax,
-            "9" | "9max" => Format::NineMax,
+            "10" | "10max" | "full" => Format::FullRing,
             _ => Format::Any,
         };
         SearchRequest {
@@ -1321,6 +1321,7 @@ fn windowed(player: Player, run: Run) -> Started {
                 confirm_exit: None,
                 ui: render::LobbyUi::new(settings),
                 table_ui: Default::default(),
+                windows_shown: Default::default(),
                 sound: p2p_poker::sound::Player::new(),
                 profile_dir,
                 app_key,
@@ -1790,6 +1791,9 @@ struct Client {
     ui: p2p_poker::gui::render::LobbyUi,
     /// `S1-EF`: what each table window is typing or sliding, by slot.
     table_ui: std::collections::BTreeMap<u8, p2p_poker::gui::table::TableUi>,
+    /// `S1-HL`: the slots whose table windows were drawn last frame, so an
+    /// opening or a closing is said once in the client log.
+    windows_shown: std::collections::BTreeSet<u8>,
     /// PokerTH's sounds, played as the app owes them.
     sound: p2p_poker::sound::Player,
     events: tokio::sync::mpsc::Receiver<NodeEvent>,
@@ -1815,11 +1819,23 @@ impl Client {
     /// slot gets its window here, so a game without one cannot last a frame;
     /// a slot left stops being drawn and its window closes with it.
     fn table_windows(&mut self, ctx: &eframe::egui::Context) {
-        let slots: Vec<u8> = self.state.slots().into_iter().map(|s| s.slot).collect();
+        let slots: Vec<u8> = self
+            .state
+            .slots()
+            .into_iter()
+            .map(|s| s.slot)
+            .filter(|slot| !(*slot == self.state.active_slot && self.table_closed))
+            .collect();
+        // `S1-HL`: every opening and closing, said once.
+        let now: std::collections::BTreeSet<u8> = slots.iter().copied().collect();
+        for slot in now.difference(&self.windows_shown) {
+            self.state.note_window(*slot, true);
+        }
+        for slot in self.windows_shown.difference(&now) {
+            self.state.note_window(*slot, false);
+        }
+        self.windows_shown = now;
         for slot in slots {
-            if slot == self.state.active_slot && self.table_closed {
-                continue;
-            }
             self.table_window(ctx, slot);
         }
     }

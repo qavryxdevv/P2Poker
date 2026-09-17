@@ -36,7 +36,7 @@
 //! 2. **Dynamic queue expansion.** A search begins reserving at up to
 //!    `DQE_START` tables and may hold one more every `dqe_step` of waiting,
 //!    up to the format's cap. A heads-up seat costs the client one small group;
-//!    a nine-seat one costs it a group whose asking for missing messages grows
+//!    a ten-seat one costs it a group whose asking for missing messages grows
 //!    with the seats (`D-063` point 4: 0.06 a second at three seats, 1.3 at
 //!    ten), so the bigger formats expand more slowly and stop lower.
 //! 3. **Capacity adaptation.** A table this client founded for the search
@@ -97,21 +97,21 @@ pub enum Format {
     HeadsUp,
     /// Six seats.
     SixMax,
-    /// Nine seats.
-    NineMax,
+    /// Ten seats: the full ring.
+    FullRing,
     /// Whatever tournament table fills first, of any size.
     Any,
 }
 
 impl Format {
-    pub const ALL: [Format; 4] = [Format::HeadsUp, Format::SixMax, Format::NineMax, Format::Any];
+    pub const ALL: [Format; 4] = [Format::HeadsUp, Format::SixMax, Format::FullRing, Format::Any];
 
     /// The wire code, and the settings file's: `0` is *not searching*.
     pub const fn code(self) -> u8 {
         match self {
             Format::HeadsUp => 1,
             Format::SixMax => 2,
-            Format::NineMax => 3,
+            Format::FullRing => 3,
             Format::Any => 4,
         }
     }
@@ -120,7 +120,7 @@ impl Format {
         match code {
             1 => Some(Format::HeadsUp),
             2 => Some(Format::SixMax),
-            3 => Some(Format::NineMax),
+            3 => Some(Format::FullRing),
             4 => Some(Format::Any),
             _ => None,
         }
@@ -131,7 +131,7 @@ impl Format {
         match self {
             Format::HeadsUp => Some(2),
             Format::SixMax => Some(6),
-            Format::NineMax => Some(9),
+            Format::FullRing => Some(10),
             Format::Any => None,
         }
     }
@@ -153,7 +153,7 @@ impl Format {
         match self {
             Format::HeadsUp => "Heads-Up (2-max)",
             Format::SixMax => "6-Max",
-            Format::NineMax => "9-Max",
+            Format::FullRing => "Full ring (10-max)",
             Format::Any => "Automatic",
         }
     }
@@ -161,13 +161,13 @@ impl Format {
     /// The most tables a search of this format may hold seats at, and how
     /// long it waits before holding one more. Heads-up and *any* expand at
     /// the owner's pace; the bigger formats more slowly, because every seat
-    /// held is a group this client talks in, and a nine-seat group asks for
+    /// held is a group this client talks in, and a ten-seat group asks for
     /// missing messages ten times as often as a three-seat one.
     pub const fn expansion(self) -> (u8, Duration) {
         match self {
             Format::HeadsUp | Format::Any => (DQE_MAX, Duration::from_secs(30)),
             Format::SixMax => (8, Duration::from_secs(45)),
-            Format::NineMax => (6, Duration::from_secs(60)),
+            Format::FullRing => (6, Duration::from_secs(60)),
         }
     }
 }
@@ -213,9 +213,26 @@ pub enum LobbyCommand {
 pub const DQE_START: u8 = 4;
 /// The most tables any search reserves seats at.
 pub const DQE_MAX: u8 = 10;
+/// `D-064` amended (the owner): an *any* search founds the biggest table
+/// and lets the queue say how fast its founder comes down.
+pub const AUTO_SEATS: u8 = 10;
 /// How long a table this client founded for the search stands unfilled
-/// before its founder needs one seat fewer.
-pub const CAPACITY_STEP: Duration = Duration::from_secs(90);
+/// before its founder needs one seat fewer: `STEP_FAST` when nobody waits in
+/// the queue, `STEP_SLOW` when enough wait to fill it, between the two in
+/// proportion (`capacity_step`).
+pub const STEP_FAST: Duration = Duration::from_secs(30);
+pub const STEP_SLOW: Duration = Duration::from_secs(180);
+/// A queue read within this long of the first poker peer on the line is a
+/// queue not heard yet -- unknown, not empty. The gossip mesh takes about
+/// that long to carry the first presence, and a client that read the silence
+/// as *nobody waits* founded heads-up tables for four players (`S1-HK`).
+pub const QUEUE_WARM_S: u64 = 40;
+/// A search that has heard no queue and had no poker peer for this long
+/// founds anyway: alone in the world, it should still put a table up.
+pub const QUEUE_WAIT_MAX: Duration = Duration::from_secs(60);
+/// An *any* search forgives a table this many seconds of estimate per seat
+/// above two: the bigger table is preferred while it is not much slower.
+pub const SEAT_PREFERENCE_S: u64 = 10;
 /// An advert older than this is a table that may be gone: not reserved at.
 pub const OFFER_FRESH_MS: u64 = 90_000;
 /// How long a reservation stays armed -- its ratification allowed -- before
@@ -477,36 +494,28 @@ impl Queue {
             .count()
     }
 
-    /// The concrete format most searchers want: what an *any* search founds.
-    ///
-    /// A searcher that named a format counts for it; where nobody named one
-    /// -- every searcher, or nobody, is *any* -- the crowd decides: up to
-    /// three others, heads-up, the table that starts the moment one arrives;
-    /// up to seven, six seats; more, nine. Four *any* searchers founding
-    /// six-seat tables waited six minutes for the capacity to come down to
-    /// their two seats each (`search190453-4`).
-    pub fn demand(&self, me: &[u8; 32]) -> Format {
-        let mut want = [(Format::SixMax, 0usize), (Format::HeadsUp, 0), (Format::NineMax, 0)];
-        let mut others = 0usize;
+    /// The seats an *any* search founds: the format most searchers named --
+    /// they take no other -- or, where nobody named one, `AUTO_SEATS`: the
+    /// biggest table, whose founder comes down as fast as the queue says
+    /// (`capacity_step`). Founding heads-up for a queue that read empty made
+    /// heads-up games of four players (`S1-HK`).
+    pub fn demand_seats(&self, me: &[u8; 32]) -> u8 {
+        let mut want = [(Format::SixMax, 0usize), (Format::HeadsUp, 0), (Format::FullRing, 0)];
         for (k, w) in self.entries.iter() {
             if k == me {
                 continue;
             }
-            others += 1;
             for (f, n) in want.iter_mut() {
                 if w.format == *f {
                     *n += 1;
                 }
             }
         }
-        if let Some((f, _)) = want.iter().filter(|(_, n)| *n > 0).max_by_key(|(f, n)| (*n, tie(*f))) {
-            return *f;
-        }
-        match others {
-            0..=3 => Format::HeadsUp,
-            4..=7 => Format::SixMax,
-            _ => Format::NineMax,
-        }
+        want.iter()
+            .filter(|(_, n)| *n > 0)
+            .max_by_key(|(f, n)| (*n, tie(*f)))
+            .and_then(|(f, _)| f.seats())
+            .unwrap_or(AUTO_SEATS)
     }
 
     pub fn len(&self) -> usize {
@@ -581,9 +590,18 @@ pub struct NetReading {
     /// AutoNAT's verdict, if any.
     pub public: Option<bool>,
     pub relay: bool,
+    /// Seconds since the first poker peer came on the line; `None` before one.
+    pub on_line_s: Option<u64>,
 }
 
 impl NetReading {
+    /// `S1-HK`: whether the queue's silence means anything yet: a presence
+    /// was heard, or the line has carried a poker peer for `QUEUE_WARM_S`, or
+    /// the search has waited `QUEUE_WAIT_MAX` for either.
+    pub fn queue_known(&self, heard: bool, elapsed: Duration) -> bool {
+        heard || self.on_line_s.is_some_and(|s| s >= QUEUE_WARM_S) || elapsed >= QUEUE_WAIT_MAX
+    }
+
     /// How long a join is waited for: a relayed client's request and answer
     /// both cross a relay, and a client with almost nobody on the line may be
     /// asking a founder it has not yet dialled.
@@ -680,6 +698,8 @@ pub struct SearchReport {
     pub eta_s: Option<u64>,
     /// Other clients searching for a table this one could share.
     pub queue: u32,
+    /// Whether that count is a reading or the silence before the first one.
+    pub queue_known: bool,
     /// How long they have waited, on average.
     pub queue_wait_s: Option<u64>,
     pub reservations: Vec<ReservationView>,
@@ -696,10 +716,26 @@ pub struct SearchReport {
 // The arithmetic
 // ---------------------------------------------------------------------------
 
+/// How long a search table's founder waits before needing one seat fewer:
+/// `waiting` searchers of a compatible format not seated at the table
+/// against the `missing` seats -- nobody waiting, `STEP_FAST`; enough to fill
+/// it, `STEP_SLOW`; between, in proportion. A queue not heard yet (`None`)
+/// is read as the slow step: the silence is not *nobody*.
+pub fn capacity_step(waiting: Option<u32>, missing: u8) -> Duration {
+    let Some(w) = waiting else {
+        return STEP_SLOW;
+    };
+    if missing == 0 {
+        return STEP_SLOW;
+    }
+    let r = (f64::from(w) / f64::from(missing)).min(1.0);
+    STEP_FAST + Duration::from_secs_f64((STEP_SLOW - STEP_FAST).as_secs_f64() * r)
+}
+
 /// The seats a search table's founder needs to start after standing `age`
-/// unfilled: one fewer every `CAPACITY_STEP`, never under two.
-pub fn capacity_now(seats: u8, age: Duration) -> u8 {
-    let steps = (age.as_secs() / CAPACITY_STEP.as_secs()).min(u64::from(u8::MAX)) as u8;
+/// unfilled: one fewer every `step`, never under two.
+pub fn capacity_now(seats: u8, age: Duration, step: Duration) -> u8 {
+    let steps = (age.as_secs() / step.as_secs().max(1)).min(u64::from(u8::MAX)) as u8;
     seats.saturating_sub(steps).max(2)
 }
 
@@ -714,14 +750,23 @@ pub fn dqe_limit(format: Format, elapsed: Duration) -> u8 {
 /// measured pace, or -- for a search table -- its founder's capacity reaching
 /// the seats it has, whichever comes first. `None` for a table that cannot
 /// start on its own: one seat, which no capacity reaches.
-pub fn eta_s(players: u8, seats: u8, search_table: bool, age: Duration, per_seat_s: u64, relayed: bool) -> Option<u64> {
+#[allow(clippy::too_many_arguments)]
+pub fn eta_s(
+    players: u8,
+    seats: u8,
+    search_table: bool,
+    age: Duration,
+    step: Duration,
+    per_seat_s: u64,
+    relayed: bool,
+) -> Option<u64> {
     if players >= seats && seats >= 2 {
         return Some(if relayed { RELAY_PENALTY_S } else { 0 });
     }
     let missing = u64::from(seats.saturating_sub(players));
     let by_fill = missing * per_seat_s;
     let by_capacity = if search_table && players >= 2 {
-        let need = u64::from(seats.saturating_sub(players)) * CAPACITY_STEP.as_secs();
+        let need = u64::from(seats.saturating_sub(players)) * step.as_secs();
         Some(need.saturating_sub(age.as_secs()))
     } else {
         None
@@ -796,9 +841,17 @@ struct Reservation {
 }
 
 impl Reservation {
-    fn capacity(&self, now: Instant) -> u8 {
+    /// The founder's step at this table: the searchers waiting, less the
+    /// others already seated here (they search on until the game starts),
+    /// against the seats missing.
+    fn step(&self, waiting: Option<u32>) -> Duration {
+        let here = u32::from(self.players.saturating_sub(1));
+        capacity_step(waiting.map(|w| w.saturating_sub(here)), self.seats.saturating_sub(self.players))
+    }
+
+    fn capacity(&self, now: Instant, waiting: Option<u32>) -> u8 {
         if self.search_table {
-            capacity_now(self.seats, now.saturating_duration_since(self.began))
+            capacity_now(self.seats, now.saturating_duration_since(self.began), self.step(waiting))
         } else {
             self.seats
         }
@@ -808,12 +861,12 @@ impl Reservation {
     /// search table at its founder's capacity -- one seat under the estimate
     /// for a table another client founded, whose age this client saw only
     /// from the advert's first sight -- and any other table when full.
-    fn ready(&self, now: Instant) -> bool {
+    fn ready(&self, now: Instant, waiting: Option<u32>) -> bool {
         if self.seated.is_none() || self.set || self.players < 2 {
             return false;
         }
         if self.search_table {
-            let cap = self.capacity(now);
+            let cap = self.capacity(now, waiting);
             let need = if self.mine { cap } else { cap.saturating_sub(1).max(2) };
             self.players >= need
         } else {
@@ -821,24 +874,25 @@ impl Reservation {
         }
     }
 
-    fn eta(&self, now: Instant, per_seat_s: u64) -> Option<u64> {
+    fn eta(&self, now: Instant, per_seat_s: u64, waiting: Option<u32>) -> Option<u64> {
         eta_s(
             self.players,
             self.seats,
             self.search_table,
             now.saturating_duration_since(self.began),
+            self.step(waiting),
             per_seat_s,
             self.relayed,
         )
     }
 
-    fn view(&self, now: Instant) -> ReservationView {
+    fn view(&self, now: Instant, waiting: Option<u32>) -> ReservationView {
         ReservationView {
             slot: self.slot,
             key: self.key,
             name: self.name.clone(),
             players: self.players,
-            capacity: self.capacity(now),
+            capacity: self.capacity(now, waiting),
             seats: self.seats,
             armed: self.armed.is_some(),
             mine: self.mine,
@@ -862,6 +916,9 @@ struct Search {
     arrivals: Arrivals,
     /// The slots whose tables set under this search.
     started: Vec<u8>,
+    /// The searchers of a compatible format the queue holds, as last read;
+    /// `None` while the queue is not heard yet (`S1-HK`).
+    waiting: Option<u32>,
 }
 
 /// The matchmaker: at most one search at a time, and what it has learned
@@ -929,7 +986,7 @@ impl Matchmaker {
         let s = self.search.as_ref()?;
         let r = s.reservations.iter().find(|r| r.mine && r.key == Some(*key))?;
         Some(FounderGate {
-            floor: r.capacity(now),
+            floor: r.capacity(now, s.waiting),
             armed: r.armed.is_some(),
         })
     }
@@ -962,6 +1019,7 @@ impl Matchmaker {
             last_log: None,
             arrivals: Arrivals::default(),
             started: Vec::new(),
+            waiting: None,
         });
         steps.push(Step::Log(format!(
             "search: started ({}, {} game(s) at once{})",
@@ -1192,7 +1250,7 @@ impl Matchmaker {
                 elapsed.as_secs()
             )));
             steps.push(Step::Presence(None));
-            steps.push(Step::Report(report(s, now, now_ms, net, queue, me, running, "a game is starting")));
+            steps.push(Step::Report(report(s, now, now_ms, net, queue, me, running, "a game is starting", true)));
             steps.push(Step::Ended { id: s.req.id, why, started });
             self.search = None;
             return steps;
@@ -1220,6 +1278,11 @@ impl Matchmaker {
         }
         let want = limit - running;
         let per_seat_s = s.arrivals.per_seat_s();
+        // `S1-HK`: the queue is a reading only once it could have been heard;
+        // before that its silence says nothing, and the search waits.
+        let queue_known = net.queue_known(!queue.is_empty(), elapsed);
+        s.waiting = queue_known.then(|| queue.count(Some(s.req.format), me));
+        let waiting = s.waiting;
 
         // 3. Reserve at the tables closest to starting, up to the expansion's limit.
         let looking_at = dqe_limit(s.req.format, elapsed);
@@ -1237,8 +1300,17 @@ impl Matchmaker {
                 .filter(|c| !(founded_here && is_search_table(&c.name, c.min_players) && c.founder > *me))
                 .filter_map(|c| {
                     let age = Duration::from_millis(now_ms.saturating_sub(c.first_seen_ms));
-                    let eta = eta_s(c.players, c.seats, is_search_table(&c.name, c.min_players), age, per_seat_s, c.relayed)?;
-                    Some((eta, c.seats.saturating_sub(c.players), c.key, c))
+                    let here = u32::from(c.players.saturating_sub(1));
+                    let step = capacity_step(waiting.map(|w| w.saturating_sub(here)), c.seats.saturating_sub(c.players));
+                    let eta = eta_s(c.players, c.seats, is_search_table(&c.name, c.min_players), age, step, per_seat_s, c.relayed)?;
+                    // An *any* search prefers the bigger table while it is not
+                    // much slower: the owner wants games, not heads-ups.
+                    let ranked = if s.req.format == Format::Any {
+                        eta.saturating_sub(SEAT_PREFERENCE_S * u64::from(c.seats.saturating_sub(2)))
+                    } else {
+                        eta
+                    };
+                    Some((ranked, c.seats.saturating_sub(c.players), c.key, c))
                 })
                 .collect();
             eligible.sort_by_key(|(eta, missing, key, _)| (*eta, *missing, *key));
@@ -1274,10 +1346,11 @@ impl Matchmaker {
         let may_found = s.founded_at.is_none()
             && s.reservations.is_empty()
             && !net.line_down
+            && queue_known
             && s.found_gone_at.is_none_or(|at| now.saturating_duration_since(at) >= net.found_after(0))
             && elapsed >= net.found_after(queue.rank_below(s.req.format, me));
         if may_found {
-            let seats = s.req.format.seats().unwrap_or_else(|| queue.demand(me).seats().unwrap_or(6));
+            let seats = s.req.format.seats().unwrap_or_else(|| queue.demand_seats(me));
             let name = search_table_name(seats);
             s.reservations.push(Reservation {
                 key: None,
@@ -1309,15 +1382,15 @@ impl Matchmaker {
             .reservations
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.ready(now))
-            .map(|(i, r)| (r.eta(now, per_seat_s).unwrap_or(u64::MAX), r.key.unwrap_or([0xff; 32]), i))
+            .filter(|(_, r)| r.ready(now, waiting))
+            .map(|(i, r)| (r.eta(now, per_seat_s, waiting).unwrap_or(u64::MAX), r.key.unwrap_or([0xff; 32]), i))
             .collect();
         order.sort_unstable();
         let kept: Vec<usize> = s
             .reservations
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.ready(now) && r.armed.is_some_and(|at| now.saturating_duration_since(at) < COMMIT_TTL))
+            .filter(|(_, r)| r.ready(now, waiting) && r.armed.is_some_and(|at| now.saturating_duration_since(at) < COMMIT_TTL))
             .map(|(i, _)| i)
             .collect();
         let mut armed: Vec<usize> = kept.into_iter().take(want).collect();
@@ -1339,7 +1412,7 @@ impl Matchmaker {
                         r.key.map(|k| short(&k)).unwrap_or_default(),
                         r.players,
                         r.seats,
-                        r.capacity(now)
+                        r.capacity(now, waiting)
                     )));
                 }
                 (false, Some(_)) => {
@@ -1367,7 +1440,7 @@ impl Matchmaker {
             } else {
                 "asking for seats"
             };
-            steps.push(Step::Report(report(s, now, now_ms, net, queue, me, running, phase)));
+            steps.push(Step::Report(report(s, now, now_ms, net, queue, me, running, phase, queue_known)));
         }
         if s.last_log.is_none_or(|at| now.saturating_duration_since(at) >= LOG_EVERY) {
             s.last_log = Some(now);
@@ -1379,18 +1452,18 @@ impl Matchmaker {
                         "{} {}/{}{}{}",
                         r.key.map(|k| short(&k)).unwrap_or_else(|| "founding".into()),
                         r.players,
-                        r.capacity(now),
+                        r.capacity(now, waiting),
                         if r.mine { " mine" } else { "" },
                         if r.armed.is_some() { " armed" } else { "" }
                     )
                 })
                 .collect();
-            let eta = s.reservations.iter().filter(|r| !r.set).filter_map(|r| r.eta(now, per_seat_s)).min();
+            let eta = s.reservations.iter().filter(|r| !r.set).filter_map(|r| r.eta(now, per_seat_s, waiting)).min();
             steps.push(Step::Log(format!(
                 "search: {} s, eta {}, queue {}, reserved {} of up to {} [{}], playing {}/{}{}",
                 elapsed.as_secs(),
                 eta.map_or("--".to_string(), |e| format!("~{e} s")),
-                queue.count(Some(s.req.format), me),
+                waiting.map_or("?".to_string(), |w| w.to_string()),
                 s.reservations.len(),
                 looking_at,
                 held.join("; "),
@@ -1413,17 +1486,25 @@ fn report(
     me: &[u8; 32],
     running: usize,
     phase: &str,
+    queue_known: bool,
 ) -> SearchReport {
     let per_seat_s = s.arrivals.per_seat_s();
+    let waiting = s.waiting;
     SearchReport {
         id: s.req.id,
         format: s.req.format,
         elapsed_s: now.saturating_duration_since(s.since).as_secs(),
-        eta_s: s.reservations.iter().filter(|r| r.seated.is_some() && !r.set).filter_map(|r| r.eta(now, per_seat_s)).min(),
+        eta_s: s
+            .reservations
+            .iter()
+            .filter(|r| r.seated.is_some() && !r.set)
+            .filter_map(|r| r.eta(now, per_seat_s, waiting))
+            .min(),
         queue: queue.count(Some(s.req.format), me),
+        queue_known,
         queue_wait_s: queue.mean_wait_s(s.req.format, now_ms, me),
         // A table that set under this search is a game, counted among those.
-        reservations: s.reservations.iter().filter(|r| !r.set).map(|r| r.view(now)).collect(),
+        reservations: s.reservations.iter().filter(|r| !r.set).map(|r| r.view(now, waiting)).collect(),
         looking_at: dqe_limit(s.req.format, now.saturating_duration_since(s.since)),
         running: running.try_into().unwrap_or(u8::MAX),
         limit: s.req.tables,
@@ -1523,13 +1604,30 @@ mod tests {
 
     #[test]
     fn capacity_falls_one_seat_every_step_and_never_under_two() {
-        assert_eq!(capacity_now(6, Duration::ZERO), 6);
-        assert_eq!(capacity_now(6, Duration::from_secs(89)), 6);
-        assert_eq!(capacity_now(6, Duration::from_secs(90)), 5);
-        assert_eq!(capacity_now(6, Duration::from_secs(359)), 3);
-        assert_eq!(capacity_now(6, Duration::from_secs(360)), 2);
-        assert_eq!(capacity_now(6, Duration::from_secs(10_000)), 2);
-        assert_eq!(capacity_now(2, Duration::from_secs(10_000)), 2);
+        let step = Duration::from_secs(90);
+        assert_eq!(capacity_now(6, Duration::ZERO, step), 6);
+        assert_eq!(capacity_now(6, Duration::from_secs(89), step), 6);
+        assert_eq!(capacity_now(6, Duration::from_secs(90), step), 5);
+        assert_eq!(capacity_now(6, Duration::from_secs(359), step), 3);
+        assert_eq!(capacity_now(6, Duration::from_secs(360), step), 2);
+        assert_eq!(capacity_now(6, Duration::from_secs(10_000), step), 2);
+        assert_eq!(capacity_now(2, Duration::from_secs(10_000), step), 2);
+    }
+
+    /// The owner's amendment: the queue says how fast a founder comes down.
+    #[test]
+    fn the_step_is_fast_for_nobody_waiting_and_slow_for_enough() {
+        assert_eq!(capacity_step(None, 6), STEP_SLOW, "a queue not heard is not empty");
+        assert_eq!(capacity_step(Some(0), 6), STEP_FAST);
+        assert_eq!(capacity_step(Some(3), 6), Duration::from_secs(105));
+        assert_eq!(capacity_step(Some(6), 6), STEP_SLOW);
+        assert_eq!(capacity_step(Some(9), 6), STEP_SLOW, "capped");
+        assert_eq!(capacity_step(Some(0), 0), STEP_SLOW, "nothing missing: nothing to come down for");
+        let net = NetReading::default();
+        assert!(!net.queue_known(false, Duration::from_secs(30)), "no peer, nothing heard, half a minute: unknown");
+        assert!(net.queue_known(true, Duration::ZERO), "one presence heard: known");
+        assert!(NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() }.queue_known(false, Duration::ZERO));
+        assert!(net.queue_known(false, QUEUE_WAIT_MAX), "a minute alone: found anyway");
     }
 
     #[test]
@@ -1543,22 +1641,23 @@ mod tests {
         assert_eq!(dqe_limit(Format::SixMax, Duration::from_secs(30)), 4);
         assert_eq!(dqe_limit(Format::SixMax, Duration::from_secs(45)), 5);
         assert_eq!(dqe_limit(Format::SixMax, Duration::from_secs(3_600)), 8);
-        assert_eq!(dqe_limit(Format::NineMax, Duration::from_secs(59)), 4);
-        assert_eq!(dqe_limit(Format::NineMax, Duration::from_secs(60)), 5);
-        assert_eq!(dqe_limit(Format::NineMax, Duration::from_secs(3_600)), 6);
+        assert_eq!(dqe_limit(Format::FullRing, Duration::from_secs(59)), 4);
+        assert_eq!(dqe_limit(Format::FullRing, Duration::from_secs(60)), 5);
+        assert_eq!(dqe_limit(Format::FullRing, Duration::from_secs(3_600)), 6);
     }
 
     #[test]
     fn the_eta_is_the_sooner_of_the_fill_and_the_capacity() {
         // Four seats to fill at 45 s each, or the capacity reaching two seats
         // in four steps minus the age.
-        assert_eq!(eta_s(2, 6, true, Duration::from_secs(300), 45, false), Some(60));
-        assert_eq!(eta_s(2, 6, true, Duration::ZERO, 45, false), Some(180));
+        let step = Duration::from_secs(90);
+        assert_eq!(eta_s(2, 6, true, Duration::from_secs(300), step, 45, false), Some(60));
+        assert_eq!(eta_s(2, 6, true, Duration::ZERO, step, 45, false), Some(180));
         // A table another player founded starts only full.
-        assert_eq!(eta_s(2, 6, false, Duration::from_secs(300), 45, false), Some(180));
+        assert_eq!(eta_s(2, 6, false, Duration::from_secs(300), step, 45, false), Some(180));
         // One seat: no capacity reaches it; the fill alone.
-        assert_eq!(eta_s(1, 2, true, Duration::from_secs(1_000), 45, false), Some(45));
-        assert_eq!(eta_s(6, 6, false, Duration::ZERO, 45, true), Some(RELAY_PENALTY_S));
+        assert_eq!(eta_s(1, 2, true, Duration::from_secs(1_000), step, 45, false), Some(45));
+        assert_eq!(eta_s(6, 6, false, Duration::ZERO, step, 45, true), Some(RELAY_PENALTY_S));
     }
 
     #[test]
@@ -1593,7 +1692,7 @@ mod tests {
         let mut mm = Matchmaker::new();
         let now = Instant::now();
         let me = key(0xaa);
-        let net = NetReading::default();
+        let net = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         let _ = mm.start(req(Format::HeadsUp, 1), now, NOW_MS);
         let early = mm.tick(now + Duration::from_secs(5), NOW_MS, &[], &[], &net, &Queue::new(), &me);
         assert!(founds(&early).is_empty(), "not before found_after");
@@ -1632,27 +1731,23 @@ mod tests {
     fn an_any_search_founds_what_the_queue_wants() {
         let mut q = Queue::new();
         let me = key(0xaa);
-        assert_eq!(q.demand(&me), Format::HeadsUp, "nobody: the table that starts with the first arrival");
+        assert_eq!(q.demand_seats(&me), AUTO_SEATS, "nobody named a format: the biggest table");
         for n in 1..=3u8 {
-            q.note(Heard { who: key(n), format: Some(Format::NineMax), tables: 1, since_unix_ms: NOW_MS }, NOW_MS);
+            q.note(Heard { who: key(n), format: Some(Format::SixMax), tables: 1, since_unix_ms: NOW_MS }, NOW_MS);
         }
         q.note(Heard { who: key(9), format: Some(Format::Any), tables: 1, since_unix_ms: NOW_MS }, NOW_MS);
-        assert_eq!(q.demand(&me), Format::NineMax);
-        // A crowd of *any* searchers decides by its size.
+        assert_eq!(q.demand_seats(&me), 6, "the format the others named");
+        // A crowd of *any* searchers, however big, is the biggest table too.
         let mut crowd = Queue::new();
-        for n in 1..=5u8 {
+        for n in 1..=9u8 {
             crowd.note(Heard { who: key(n), format: Some(Format::Any), tables: 1, since_unix_ms: NOW_MS }, NOW_MS);
         }
-        assert_eq!(crowd.demand(&me), Format::SixMax);
-        for n in 6..=9u8 {
-            crowd.note(Heard { who: key(n), format: Some(Format::Any), tables: 1, since_unix_ms: NOW_MS }, NOW_MS);
-        }
-        assert_eq!(crowd.demand(&me), Format::NineMax);
-        assert_eq!(q.count(Some(Format::NineMax), &me), 4);
+        assert_eq!(crowd.demand_seats(&me), AUTO_SEATS);
+        assert_eq!(q.count(Some(Format::SixMax), &me), 4);
         assert_eq!(q.count(Some(Format::HeadsUp), &me), 1);
         assert_eq!(q.count(None, &me), 4);
-        assert_eq!(q.rank_below(Format::NineMax, &me), 4);
-        assert_eq!(q.rank_below(Format::NineMax, &key(2)), 1);
+        assert_eq!(q.rank_below(Format::SixMax, &me), 4);
+        assert_eq!(q.rank_below(Format::SixMax, &key(2)), 1);
         // A stop takes the searcher out at once; the TTL takes the rest.
         assert!(q.note(Heard { who: key(1), format: None, tables: 1, since_unix_ms: 0 }, NOW_MS));
         assert_eq!(q.count(None, &me), 3);
@@ -1662,7 +1757,7 @@ mod tests {
 
     #[test]
     fn the_founding_order_is_by_key_and_seats_flow_to_the_lower_one() {
-        let net = NetReading::default();
+        let net = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         assert!(net.found_after(0) < net.found_after(1));
         assert_eq!(net.found_after(9), net.found_after(4), "capped");
         // A client that founded joins another search table only below its key.
@@ -1741,18 +1836,56 @@ mod tests {
         let mut mm = Matchmaker::new();
         let now = Instant::now();
         let me = key(0xaa);
-        let net = NetReading::default();
+        // The queue not heard yet: the slow step, so a table seen 100 s old
+        // is at its six seats still, and four of them are not one under.
+        let unknown = NetReading::default();
         let _ = mm.start(req(Format::SixMax, 1), now, NOW_MS);
-        // Seen 100 s old: capacity 5 here, so ready at 4.
         let cands = vec![search_candidate(1, 6, 3, 0x01, 100)];
-        let _ = mm.tick(now, NOW_MS, &cands, &[], &net, &Queue::new(), &me);
+        let _ = mm.tick(now, NOW_MS, &cands, &[], &unknown, &Queue::new(), &me);
         let mut s = slot(1, key(1), 3, 6);
         s.name = search_table_name(6);
-        let _ = mm.tick(now + Duration::from_secs(1), NOW_MS, &cands, &[s.clone()], &net, &Queue::new(), &me);
-        assert!(!mm.may_ratify(&key(1)), "three of a capacity of five");
+        let _ = mm.tick(now + Duration::from_secs(1), NOW_MS, &cands, &[s.clone()], &unknown, &Queue::new(), &me);
+        assert!(!mm.may_ratify(&key(1)), "three of a capacity of six");
         s.players = 4;
-        let _ = mm.tick(now + Duration::from_secs(2), NOW_MS, &cands, &[s], &net, &Queue::new(), &me);
+        let _ = mm.tick(now + Duration::from_secs(2), NOW_MS, &cands, &[s.clone()], &unknown, &Queue::new(), &me);
+        assert!(!mm.may_ratify(&key(1)), "four of a capacity of six, the queue unknown");
+        // The queue heard and nobody waiting: the fast step, a capacity of
+        // three at 100 s, and four seats are ready.
+        let known = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let _ = mm.tick(now + Duration::from_secs(3), NOW_MS, &cands, &[s], &known, &Queue::new(), &me);
         assert!(mm.may_ratify(&key(1)));
+    }
+
+    /// `S1-HK`: an *any* search founds nothing while the queue's silence may
+    /// be the mesh still forming, founds the biggest table once the queue is
+    /// known and nobody named a format, and prefers the bigger table on offer.
+    #[test]
+    fn an_any_search_waits_for_the_queue_founds_ten_and_prefers_the_bigger_table() {
+        let mut mm = Matchmaker::new();
+        let now = Instant::now();
+        let me = key(0xaa);
+        let unknown = NetReading::default();
+        let _ = mm.start(req(Format::Any, 1), now, NOW_MS);
+        let early = mm.tick(now + Duration::from_secs(30), NOW_MS, &[], &[], &unknown, &Queue::new(), &me);
+        assert!(founds(&early).is_empty(), "the queue is not heard yet");
+        let late = mm.tick(now + QUEUE_WAIT_MAX, NOW_MS, &[], &[], &unknown, &Queue::new(), &me);
+        assert_eq!(founds(&late), vec![AUTO_SEATS], "alone for a minute: the biggest table");
+        // A queue heard, with a heads-up searcher below this key: heads-up is
+        // what it can take, and the founding waits its rank.
+        let mut q = Queue::new();
+        q.note(Heard { who: key(0x01), format: Some(Format::HeadsUp), tables: 1, since_unix_ms: NOW_MS }, NOW_MS);
+        let mut hu = Matchmaker::new();
+        let _ = hu.start(req(Format::Any, 1), now, NOW_MS);
+        let steps = hu.tick(now + unknown.found_after(1), NOW_MS, &[], &[], &unknown, &q, &me);
+        assert_eq!(founds(&steps), vec![2]);
+        // On offer: a heads-up table with one seat, and a ten-seat search
+        // table with eight; the bigger one is asked for first.
+        let mut big = Matchmaker::new();
+        let known = NetReading { on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
+        let _ = big.start(req(Format::Any, 1), now, NOW_MS);
+        let cands = vec![candidate(0x05, 2, 1, 0x05), search_candidate(0x06, 10, 8, 0x06, 0)];
+        let steps = big.tick(now, NOW_MS, &cands, &[], &known, &Queue::new(), &me);
+        assert_eq!(joins(&steps)[0], key(0x06));
     }
 
     #[test]
@@ -1941,7 +2074,7 @@ mod tests {
         let mut mm = Matchmaker::new();
         let now = Instant::now();
         let me = key(0xaa);
-        let net = NetReading { poker_peers: 3, ..Default::default() };
+        let net = NetReading { poker_peers: 3, on_line_s: Some(QUEUE_WARM_S), ..Default::default() };
         let _ = mm.start(req(Format::SixMax, 1), now, NOW_MS);
         let cands = vec![search_candidate(1, 6, 4, 0x01, 200)];
         let steps = mm.tick(now, NOW_MS, &cands, &[], &net, &Queue::new(), &me);
@@ -1949,8 +2082,9 @@ mod tests {
         assert_eq!(r.id, 7);
         assert_eq!(r.limit, 1);
         assert_eq!(r.looking_at, 4);
+        assert!(r.queue_known);
         assert_eq!(r.reservations.len(), 1);
-        assert_eq!(r.reservations[0].capacity, 4, "200 s old: two steps down from six");
+        assert_eq!(r.reservations[0].capacity, 2, "200 s old with nobody waiting: the fast step, down to two");
         assert_eq!(r.phase, "asking for seats");
         assert_eq!(r.eta_s, None, "no seat yet");
         let mut s = slot(1, key(1), 4, 6);
@@ -2008,9 +2142,10 @@ mod tests {
     fn a_request_is_clamped_never_refused() {
         assert_eq!(SearchRequest { id: 1, format: Format::Any, tables: 0, again: false }.checked().tables, 1);
         assert_eq!(SearchRequest { id: 1, format: Format::Any, tables: 9, again: false }.checked().tables, MAX_GAMES);
-        assert_eq!(Format::parse(Format::NineMax.code()), Some(Format::NineMax));
+        assert_eq!(Format::parse(Format::FullRing.code()), Some(Format::FullRing));
         assert_eq!(Format::parse(0), None);
         assert!(Format::Any.accepts(10) && !Format::SixMax.accepts(9) && !Format::Any.accepts(1));
+        assert_eq!(Format::FullRing.seats(), Some(10));
         assert!(Format::Any.compatible(Format::HeadsUp) && !Format::HeadsUp.compatible(Format::SixMax));
     }
 }

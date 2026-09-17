@@ -918,6 +918,11 @@ impl AppState {
         // `D-064`: a reservation's slot left, or seated again, is hidden no more.
         if matches!(event, NodeEvent::LeftTable { .. } | NodeEvent::TableLost { .. } | NodeEvent::TableReal { .. }) {
             self.search_hidden.remove(&slot);
+            // `S1-HL`: a reservation's slot is hidden until its table is a game
+            // (`TableReal`), or it is left; the search's report never re-hides it.
+            if let Some(s) = self.search.as_mut() {
+                s.reserved.remove(&slot);
+            }
         }
         if slot == self.active_slot || !self.background.contains_key(&slot) {
             self.apply_here(event);
@@ -1921,8 +1926,16 @@ impl AppState {
             // report of a search given up is nobody's.
             NodeEvent::Search(report) => {
                 if let Some(s) = self.search.as_mut().filter(|s| s.request.id == report.id) {
-                    s.reserved = report.reservations.iter().filter_map(|r| r.slot).collect();
+                    // `S1-HL`: the report adds to the hidden slots and takes none away --
+                    // a slot leaves the set when its table is a game or is left.
+                    s.reserved.extend(report.reservations.iter().filter_map(|r| r.slot));
                     s.report = Some(report);
+                }
+            }
+            // `S1-HL`: a slot opened for the search, hidden from this moment.
+            NodeEvent::SearchSlot { slot } => {
+                if let Some(s) = self.search.as_mut() {
+                    s.reserved.insert(slot);
                 }
             }
             NodeEvent::SearchEnded { id, why, started } => {
@@ -3338,6 +3351,21 @@ impl AppState {
         Some(std::mem::take(&mut self.search_history))
     }
 
+    /// `S1-HL`: whether slot `slot`'s table window is drawn now.
+    #[cfg(test)]
+    fn shows_window_for(&self, slot: u8) -> bool {
+        self.slots().iter().any(|s| s.slot == slot)
+    }
+
+    /// `S1-HL`: the window opened or closed a table window; a line in the
+    /// client log, so a window that flashed is a line and not a memory.
+    pub fn note_window(&mut self, slot: u8, opened: bool) {
+        self.note(format!(
+            "table window for slot {slot} {}",
+            if opened { "opened" } else { "closed" }
+        ));
+    }
+
     /// `S1-CS`: the decision clock runs for the seat to act, from the moment
     /// this client learned it was that seat's turn; a seat that was already
     /// on the clock keeps its start.
@@ -3474,6 +3502,46 @@ impl AppState {
 mod tests {
     use super::*;
     use libp2p::PeerId;
+
+    /// `S1-HL`: a slot the search opens has no window from its opening -- not
+    /// between the seat and the next report, when the table window showed for
+    /// a moment and hid again -- until its table is a game.
+    #[test]
+    fn a_search_slot_shows_no_window_from_its_opening_until_its_table_is_a_game() {
+        use crate::net::matchmaker::{Format, SearchReport, SearchRequest};
+        let mut s = AppState::new();
+        let _ = s.begin_search(SearchRequest { id: 0, format: Format::Any, tables: 1, again: false });
+        let id = s.search.as_ref().expect("a search").request.id;
+        s.apply(NodeEvent::SearchSlot { slot: 1 });
+        s.apply(NodeEvent::AtTable { slot: 1, key: Some([7u8; 32]) });
+        s.apply(NodeEvent::Hosting { key: [7u8; 32] });
+        assert!(!s.shows_window_for(1), "hidden from the opening, before any report");
+        // A report that does not name the slot yet takes nothing away.
+        let report = SearchReport {
+            id,
+            format: Format::Any,
+            elapsed_s: 1,
+            eta_s: None,
+            queue: 0,
+            queue_known: false,
+            queue_wait_s: None,
+            reservations: Vec::new(),
+            looking_at: 4,
+            running: 0,
+            limit: 1,
+            warning: None,
+            phase: "looking for tables".into(),
+        };
+        s.apply(NodeEvent::Search(report));
+        assert!(!s.shows_window_for(1), "a report without the slot re-hides nothing");
+        // The table is a game: the window opens, and stays through the end.
+        s.apply(NodeEvent::AtTable { slot: 1, key: Some([7u8; 32]) });
+        s.apply(NodeEvent::TableReal { key: [7u8; 32], session: [9u8; 32] });
+        assert!(s.shows_window_for(1), "a game has its window");
+        s.apply(NodeEvent::SearchEnded { id, why: "a game started".into(), started: vec![1] });
+        assert!(s.shows_window_for(1));
+        assert!(s.search.is_none());
+    }
 
     fn peer() -> PeerId {
         PeerId::from(libp2p::identity::Keypair::generate_ed25519().public())

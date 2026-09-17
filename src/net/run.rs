@@ -1703,6 +1703,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // whether it was one without asking `identify` about a peer already gone.
     let mut poker_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
+    // `S1-HK`: when the first poker peer came on the line -- the search reads
+    // the queue's silence as a reading only `QUEUE_WARM_S` after it.
+    let mut poker_line_since: Option<std::time::Instant> = None;
     // `S1-EH`: this client's line to the Tox network as last said to the
     // window (0 offline, 1 tcp, 2 udp); one instance, so one reading.
     let mut tox_line_reported: Option<u64> = None;
@@ -5244,6 +5247,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if info.protocol_version == super::swarm::IDENTIFY_PROTOCOL
                             && poker_peers.insert(peer_id)
                         {
+                            poker_line_since.get_or_insert_with(std::time::Instant::now);
                             // Never subject to the cap. The whole point of a
                             // cap is to keep strangers from crowding out the
                             // people this client is here for, and a cap that
@@ -6160,7 +6164,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .iter()
                             .position(|x| x.search && x.table.is_none() && x.rejoin_key.is_none() && x.lost_key.is_none())
                         {
-                            Some(empty) => (empty, false),
+                            Some(empty) => {
+                                let _ = events.send(NodeEvent::SearchSlot { slot: tables[empty].slot }).await;
+                                (empty, false)
+                            }
                             None => (tables.len(), true),
                         }
                     }
@@ -6180,6 +6187,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(x) = tables.last_mut() {
                             x.search = true;
                         }
+                        // `S1-HL`: the window hears it before any word about the seat.
+                        let _ = events.send(NodeEvent::SearchSlot { slot: next_slot.saturating_sub(1) }).await;
                         let _ = events
                             .send(NodeEvent::Warning(format!(
                                 "search: slot {} opened for a seat (D-064)",
@@ -6371,6 +6380,10 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         let ad = if for_search && tournament {
                             let mut ad = ad;
                             ad.min_players_to_start = 2;
+                            // Ten seats with a minimum of two is the rated game's
+                            // numbers and not the rated preset, which asserts §13's
+                            // minimum of ten: `CUSTOM`, as any other size.
+                            ad.preset_id = crate::protocol::constants::PresetId::Custom.as_str().into();
                             ad
                         } else {
                             ad
@@ -11057,6 +11070,7 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             .any(|x| x.ever_on_line && x.tox_sink.is_on_tox() && x.tox_sink.tox_connection() == 0),
                     public: verdict_due.then_some(state.is_public()),
                     relay: have_reservation,
+                    on_line_s: poker_line_since.map(|at| at.elapsed().as_secs()),
                 };
                 let steps = mm.tick(now_i, now_ms, &candidates, &slots, &net, &state.queue, &my_app_key);
                 do_search_steps!(steps);

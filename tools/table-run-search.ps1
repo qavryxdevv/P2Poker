@@ -11,7 +11,7 @@
     that came, giving every other seat back the moment a game starts.
 
     This starts -Nodes searching clients, each with a format (-Formats: one for
-    all, or a comma-separated list per node: hu, 6, 9, auto) and a number of
+    all, or a comma-separated list per node: hu, 6, 10, auto) and a number of
     games at once (-Tables, the same way), arriving over -ArriveOver seconds.
     Drawn from -Seed: which nodes have their line cut once while they search
     (-Cuts), which are killed and started again (-Crashes), and which cancel
@@ -45,7 +45,7 @@ param(
     [int]$Seed = 0,
     # Nodes arrive over this many seconds from the run's start.
     [ValidateRange(0, 600)][int]$ArriveOver = 40,
-    # hu, 6, 9 or auto: one for every node, or one per node, comma-separated.
+    # hu, 6, 10 or auto: one for every node, or one per node, comma-separated.
     [string]$Formats = 'auto',
     # Games at once, 1..4: one for every node, or one per node.
     [string]$Tables = '1',
@@ -111,7 +111,7 @@ $formatList = @("$Formats" -split '[,\s]+' | Where-Object { $_ -ne '' })
 $tableList = @("$Tables" -split '[,\s]+' | Where-Object { $_ -ne '' })
 function Format-Of([int]$n) { if ($formatList.Count -eq 1) { $formatList[0] } else { $formatList[$n % $formatList.Count] } }
 function Tables-Of([int]$n) { if ($tableList.Count -eq 1) { [int]$tableList[0] } else { [int]$tableList[$n % $tableList.Count] } }
-foreach ($f in $formatList) { if ($f -notin @('hu', '6', '9', 'auto')) { throw "-Formats '$f': hu, 6, 9 or auto" } }
+foreach ($f in $formatList) { if ($f -notin @('hu', '6', '10', 'auto')) { throw "-Formats '$f': hu, 6, 10 or auto" } }
 $farList = @("$FarNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
 foreach ($f in $farList) { if ($nodeList -notcontains $f) { throw "-FarNodes ${f}: not a node of $Nodes" } }
 $shuffled = @($nodeList | Sort-Object { $rng.Next() })

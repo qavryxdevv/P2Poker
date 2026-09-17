@@ -64,7 +64,7 @@ sits down at somebody else's. The table itself opens in a window of its own,
 beside the lobby, and the other players appear in it as they sit down.
 
 **Find a game** does the looking for you: choose a format (heads-up, six seats,
-nine seats, or whatever fills first) and how many games you want at once, and
+the full ring of ten, or whatever fills first) and how many games you want at once, and
 the client reserves seats at the tables closest to starting, founds one of its
 own when nothing is on offer, lets that one start with the players who came,
 and gives every other seat back the moment a game starts. The window shows the
@@ -100,7 +100,7 @@ Both print `TABLE FORMED session=…` with the same session identity.
 | `--seats N` | make it a custom table of `N` seats instead (a rated one needs all ten) |
 | `--min N` | how many of them it starts with |
 | `--join NAME` | sit down at the first table called `NAME` |
-| `--search hu` \| `6` \| `9` \| `auto` | find a game automatically, from the start |
+| `--search hu` \| `6` \| `10` \| `auto` | find a game automatically, from the start |
 | `--search-tables N` | how many games at once the search aims at, 1 to 4 |
 | `--search-again` | search again when the game the search found ends |
 | `--table` | open on the table rather than the lobby |
