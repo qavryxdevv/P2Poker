@@ -62,6 +62,17 @@ param(
     # player leaves), `crash` (the client dies) or `cut:<s>` (the line goes away).
     [string]$AtSetNodes = '',
     [ValidatePattern('^(|leave|crash|cut:[0-9]+)$')][string]$AtSetFault = '',
+    # Faults during play, after the table is set -- the owner's third phase:
+    # `node:kind@at[+for]` entries, comma-separated. `3:cut@200+60` cuts n3's line
+    # at 200 s for 60 s; `5:crash@210+40` kills n5 at 210 s and starts it again
+    # 40 s later with its record; `7:leave@215+30` has n7's player leave at 215 s
+    # and ask for a seat again 30 s later. `for` is 30 s when left out. The
+    # founder is n0. A node named here draws no churn role, and its fault may
+    # fall before the set as well: the schedule is the schedule.
+    [string]$PlayFaults = '',
+    # Which joiners run on the far machine (numbers, comma-separated); drawn from
+    # -Seed when left out. -There is then their count.
+    [string]$FarNodes = '',
     [string]$Target = '',
     [string]$KeyPath = '',
     [string]$Exe,
@@ -76,7 +87,7 @@ trap {
 }
 $inv = [System.Globalization.CultureInfo]::InvariantCulture
 $root = Split-Path -Parent $PSScriptRoot
-if ($There -gt $Seats - 1) { throw "-There ${There}: the table has only $($Seats - 1) joiners" }
+if (-not $FarNodes -and $There -gt $Seats - 1) { throw "-There ${There}: the table has only $($Seats - 1) joiners" }
 
 # --- the binary -------------------------------------------------------------
 if (-not $Exe) { $Exe = Join-Path $root 'target\release\p2p-poker.exe' }
@@ -113,9 +124,22 @@ function Draw([int]$lo, [int]$hi) {
 }
 $joiners = 1..($Seats - 1)
 $shuffled = @($joiners | Sort-Object { $rng.Next() })
-$far = @($shuffled | Select-Object -First $There)
+$farList = @("$FarNodes" -split '[,\s]+' | Where-Object { $_ -ne '' } | ForEach-Object { [int]$_ })
+foreach ($f in $farList) { if ($joiners -notcontains $f) { throw "-FarNodes ${f}: not a joiner of a table of $Seats" } }
+$far = if ($farList.Count -gt 0) { $farList } else { @($shuffled | Select-Object -First $There) }
+$There = $far.Count
+$playList = @()
+foreach ($p in @("$PlayFaults" -split '[,\s]+' | Where-Object { $_ -ne '' })) {
+    if ($p -notmatch '^(\d+):(cut|crash|leave)@(\d+)(\+(\d+))?$') { throw "-PlayFaults entry '$p': expected node:kind@at[+for]" }
+    $playList += [pscustomobject]@{
+        Node = [int]$Matches[1]; Kind = $Matches[2]; At = [int]$Matches[3]
+        For = $(if ($Matches[5]) { [int]$Matches[5] } else { 30 })
+    }
+}
+foreach ($p in $playList) { if ($p.Node -ne 0 -and $joiners -notcontains $p.Node) { throw "-PlayFaults n$($p.Node): not a node of a table of $Seats" } }
+$playNodes = @($playList | ForEach-Object Node)
 $roles = @{}
-$order = @($joiners | Sort-Object { $rng.Next() })
+$order = @($joiners | Where-Object { $playNodes -notcontains $_ } | Sort-Object { $rng.Next() })
 $k = 0
 foreach ($r in @(@('outage', $Outages), @('crash', $Crashes), @('leave', $Leaves))) {
     for ($j = 0; $j -lt $r[1] -and $k -lt $order.Count; $j++) { $roles["$($order[$k])"] = $r[0]; $k++ }
@@ -129,12 +153,31 @@ function Add-Life($node, $life, $start, $stop, $end, $leaveAt, $offAt, $offFor, 
         AtSet = $(if ($AtSetFault -and $life -eq 0 -and $atSetList -contains $node) { $AtSetFault } else { '' })
     })
 }
+# A fault during play, as -PlayFaults asked: the node's whole life with its line
+# cut once; or killed and started again with its record; or its player leaving
+# and asking for a seat again.
+function Add-PlayLives($n, $a, $pf) {
+    switch ($pf.Kind) {
+        'cut' { Add-Life $n 0 $a $Seconds 'close' 0 ($pf.At - $a) $pf.For $false }
+        'crash' {
+            Add-Life $n 0 $a $pf.At 'kill' 0 0 0 $false
+            Add-Life $n 1 ($pf.At + $pf.For) $Seconds 'close' 0 0 0 $true
+        }
+        'leave' {
+            Add-Life $n 0 $a ($pf.At + 4) 'kill' ($pf.At - $a) 0 0 $false
+            Add-Life $n 1 ($pf.At + $pf.For) $Seconds 'close' 0 0 0 $false
+        }
+    }
+}
 # The founder: a whole run, its line cut once when asked.
 $fOffAt = 0
 if ($FounderOutFor -gt 0) { $fOffAt = if ($FounderOutAt -gt 0) { $FounderOutAt } else { Draw 30 ([Math]::Max(30, $ChurnUntil - $FounderOutFor - 10)) } }
-Add-Life 0 0 0 $Seconds 'close' $FounderLeaveAt $fOffAt $FounderOutFor $false
+$fPlay = @($playList | Where-Object { $_.Node -eq 0 } | Select-Object -First 1)
+if ($fPlay.Count -gt 0) { Add-PlayLives 0 0 $fPlay[0] } else { Add-Life 0 0 0 $Seconds 'close' $FounderLeaveAt $fOffAt $FounderOutFor $false }
 foreach ($n in $joiners) {
     $a = Draw 3 ([Math]::Max(3, $ArriveOver))
+    $pf = @($playList | Where-Object { $_.Node -eq $n } | Select-Object -First 1)
+    if ($pf.Count -gt 0) { Add-PlayLives $n $a $pf[0]; continue }
     switch ($roles["$n"]) {
         'outage' {
             $t = Draw ($a + 10) ([Math]::Max($a + 10, $ChurnUntil - 70))
@@ -163,7 +206,7 @@ $work = Join-Path $root (Join-Path 'runs' $table)
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 [pscustomobject]@{
     table = $table; seats = $Seats; seconds = $Seconds; seed = $Seed; churn_until = $ChurnUntil
-    far = $far; roles = $roles; lives = $lives
+    far = $far; roles = $roles; lives = $lives; play = $playList
 } | ConvertTo-Json -Depth 5 | Out-File (Join-Path $work 'plan.json') -Encoding utf8
 
 $header = @(
@@ -173,6 +216,7 @@ $header = @(
     "roles  $(($roles.GetEnumerator() | Sort-Object Name | ForEach-Object { "n$($_.Name) $($_.Value)" }) -join ', ')"
     "atset  $(if ($AtSetFault) { "n$($atSetList -join ', n') meet '$AtSetFault' as the table is set" } else { 'no fault at the set' })"
     "founder$(if ($FounderOutFor -gt 0) { " line cut at $fOffAt s for $FounderOutFor s" } else { ' healthy' })$(if ($FounderLeaveAt -gt 0) { ", leaves its table at $FounderLeaveAt s" })"
+    "play   $(if ($playList.Count -gt 0) { ($playList | ForEach-Object { "n$($_.Node) $($_.Kind) at $($_.At) s for $($_.For) s" }) -join ', ' } else { 'no fault during play' })"
     "work   $work"
 )
 $header | ForEach-Object { Write-Host $_ }

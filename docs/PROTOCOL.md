@@ -3531,7 +3531,8 @@ belongs in the key*, and for a certificate that field is the subject.
 | Field | Type | Limit / rule |
 |---|---|---|
 | `n(0) subject_digest` | `bytes[32]` | `h("p2p-poker v1 timeout-cert", [u64_be(subject_sequence), bytes(subject_seats), u16_be(subject_event_type), parent_event_hash, u32_be(deadline_ms), u16_be(kind)])` — `subject_seats` the seats named, ascending, one byte each; for one seat this is `u8(subject_seat)` as before (D-036) — and, only when a seat is named with a cause (D-051), one more part: every named seat's `cause` as `u16_be`, zero for none, in the seats' order. A subject with no cause hashes exactly as before |
-| `n(1) votes` | `Vec<bytes>` | for every seat named, ascending, one complete `SignedEvent` of a `TIMEOUT_VOTE` about it from every seat of `V(S)`, ascending by voter; ≤ `MAX_SEATS² / 4` entries (D-036: `\|V(S)\| > \|S\|` and `\|S\| + \|V(S)\| <= MAX_SEATS`) |
+| `n(1) votes` | `Vec<bytes>` | for every seat named, ascending, one complete `SignedEvent` of a `TIMEOUT_VOTE` about it from every seat of `V(S)`, ascending by voter; ≤ `MAX_SEATS² / 4` entries (D-036: `\|V(S)\| > \|S\|` and `\|S\| + \|V(S)\| <= MAX_SEATS`; D-063: `\|S\| · \|V(S)\|` with `\|S\| + \|V(S)\| <= MAX_SEATS`, the same bound) |
+| `n(2) resignations` | `Vec<bytes>` | `D-063`: for every seat of `S` whose player left the table by its own signed word, that `TABLE_LEAVE` (§7.10) as the complete `SignedEvent`, ascending by seat; empty when none did; ≤ `MAX_SEATS` entries |
 
 *Receiver must validate:* every embedded vote independently passes §4.0 steps
 2–11; all votes are about one stage under one deadline, and the seats they name
@@ -3540,7 +3541,11 @@ from one and the same voter set, no seat of `S` is in it, and that set is exactl
 `V(S)` as §8.3 defines it, with no duplicates — **every seat absent from it is
 absent because it is named by this certificate or by a completed, valid
 certificate earlier in this hand** — a `V` shrunk by bare votes is not a `V`;
-`|V(S)| >= 2` and `|V(S)| > |S|`; a `kind = 1` certificate names one seat;
+every resignation is a `TABLE_LEAVE` for this table that verifies under the key
+of a seat of `S`, one per seat (`D-063`); `|V(S)| >= 1`, and with `Q` the seats of
+`S` carrying no resignation, either `Q` is empty or `|V(S)| >= 2` and
+`|V(S)| > |Q|` — a seat that said it left counts for nothing against the floor,
+its own word being its consent; a `kind = 1` certificate names one seat;
 every vote about one seat names one `cause`, and a defined one (D-051);
 `subject_digest` recomputes; the emitter is itself a member of `V(S)`.
 
@@ -6829,8 +6834,16 @@ is in the group, at a founder the topic's mesh does not reach, was otherwise hea
 nobody and held its seat as a ghost. The founder gives the seat back at once
 (`PLAYER_LIST` said again without it); a joiner only notes it and waits for that
 list. A word said more than 10 s before the seat's present sitting, as the founder
-learned it, is an old word carried again and changes nothing. The founder's own
-word before the set is §7.12's: its seats go on without it.
+learned it, is an old word carried again and changes nothing. **From the set on**
+(`D-063`) the word is carried in the `TIMEOUT_CERT` that names the seat (§4.8),
+which every seat checks as it checks the votes, and against which the seat counts
+for nothing on §8.3's floor: two players leaving a table of three leave the third
+a table of one, not a hand that ends on its budget for ever. The founder's own
+word before the set is §7.12's: its seats go on without it -- and it goes to every
+seat of its roster as a request on the join channel too (`D-062`): a seat not yet in
+the table's group, at a founder the topic's mesh does not reach, learned of it from
+the lobby's asking half a minute later otherwise. A seat takes it that way from the
+founder's own peer only, and answers with an empty frame.
 
 ### 7.11 `0x0109 TABLE_HEARING`
 
@@ -6874,6 +6887,13 @@ names an older serial is sent the roster again, at most every 10 s. And a seat
 whose word stands is alive and speaking: the founder gives it back for its goodbye
 alone, never for the founder's own reading of its silence -- that reading is the
 founder's line as often as the seat's, and the seat's hearing is judged above.
+The founder judges no seat while its own line to the group's carrier is down, or
+was within `QUIET_LIMIT_S`, or while two members or more timed out of its copy of
+the group within a minute -- its own line, before the carrier says so (`S1-GX`).
+**The founder ratifies last** (`S1-HE`): it says `TABLE_READY` for a roster only
+once it holds every other seat's ratification of it, so its word completes the set
+everywhere at once, and it gives no seat back after -- a roster changed under a set
+half made set the table in two halves.
 
 ### 7.12 `0x010A TABLE_CONTINUES`
 
@@ -6913,12 +6933,43 @@ that seat is its choice or lower; a choice that says nothing within `CONTINUES_W
 (20 s) is passed over for the next -- within 8 s when the seat does not hear it, since it
 may still be founding, heard by others, and two seats must not both found one.
 
+**Through the lobby, first (`D-062`).** A word reaches the seats the topic's mesh
+reaches in that minute and carries nothing a seat can weigh, and seats moved by words
+alone sat at three tables. So every seat keeps the table it first sat at -- its
+*origin*: the table's id, its founder's key, every application key its rosters seated
+with its seat, and the advert it was joined under -- across every continuation, until
+its player leaves or joins a table that is none of the origin's. A *table of its
+game* is the origin, offered by its founder, or a table founded by a key of the
+origin's rosters that plays the origin's game (the same `table_params_hash`,
+`table_name` and `password_required`); its rank is 0 for the origin and the
+founder's origin seat otherwise. The best table of the game is the one with most
+players (the advert's `players`), then the origin, then the lowest rank -- among the
+tables heard within 90 s, joinable, not full, and not one that refused this seat
+within 5 minutes. Every 30 s: a seat that reads its founder as gone goes to the best
+table offered before it follows any word or founds anything (a table with a single
+player only from a higher seat, whose own table would rank below it); the founder of
+a forming table goes on, as a seat, to a table with more players than its roster
+holds, and never on a word alone; a seat asking for a table of its game asks for the
+best table instead, and founds the game's continuation from its origin when none is
+offered for 60 s. A seat that hears its founder moves at its founder's word alone.
+The word above serves the first seconds, before the lobby's asking has carried an
+advert.
+
+**Not through a line of its own (`S1-GS`).** A seat reads its founder gone by the
+group only while its own line to the group's carrier is up and has been for `QUIET_LIMIT_S`; and
+not while the founder answers the lobby's question (§7.5) naming the table within
+75 s, which is a founder alive with the group's line in trouble -- unless the founder
+has been out of the group's hearing for 120 s, past which the table cannot form. The
+founder's own signed word (§7.10) stands whatever the line says.
+
 **What it cannot do.** A seat offers only a table it founded itself, and only the
 same game -- a continuation with other rules, another name or another gate is not
 heard; it moves only seats that read the founder as gone themselves, so a seat
 cannot take players away from a founder they hear; and it holds, at the new table, a
 founder's authority and nothing more -- which is none over the cards, the chips or
-any hand.
+any hand. Through the lobby it can say more players sit at its table than do: seats
+that go there find its real roster and read the lobby again, and a table that
+refuses them is avoided for five minutes.
 
 ---
 
@@ -7324,6 +7375,14 @@ D-007 at every table size. Wherever an earlier draft of this document said "at
 > `|S| = 1`, digest and bytes alike. Being voted against is still not exclusion:
 > `S` leaves `V(S)` only inside the certificate that unanimously names every
 > member of it, and a vote removes nobody from anything.
+>
+> **`D-063` -- the seats that resigned (2026-09-17).** The seats of `S` whose
+> player left by its own signed `TABLE_LEAVE` (§7.10), carried in the certificate,
+> count for nothing against that floor: with `Q` the rest of `S`, the certificate
+> is legal when `|V(S)| >= 1` and either `Q` is empty or `|V(S)| >= 2` and
+> `|V(S)| > |Q|`. A seat that said it left is at no fork -- it is at no table --
+> and the seats left need no majority to remove it; a certificate naming it puts
+> it out of the table for good.
 >
 > **Being voted against is not exclusion.** A `TIMEOUT_VOTE` is one peer's
 > unilateral assertion, this section concedes below that a lying voter is

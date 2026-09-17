@@ -119,6 +119,7 @@ fn a_certificate_carrying_max_seats_minus_one_votes_fits_its_cap() {
     let cert = TimeoutCert {
         subject_digest: [0x11; 32],
         votes,
+        resignations: Vec::new(),
     };
     let encoded = canonical(&cert).len();
 
@@ -168,6 +169,7 @@ fn a_joint_certificate_at_its_widest_fits_its_cap() {
     let cert = TimeoutCert {
         subject_digest: [0x11; 32],
         votes,
+        resignations: Vec::new(),
     };
     let encoded = canonical(&cert).len();
     assert!(

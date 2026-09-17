@@ -82,7 +82,8 @@ def main():
     lives = plan["lives"]
     if isinstance(lives, dict):
         lives = [lives]
-    far = set(plan.get("far") or [])
+    far_raw = plan.get("far") or []
+    far = set(far_raw if isinstance(far_raw, list) else [far_raw])
 
     events = []  # (t, node, life, kind, match, text)
     for life in lives:

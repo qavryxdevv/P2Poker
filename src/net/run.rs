@@ -1000,11 +1000,40 @@ struct TableRun {
     /// out of the table's group since. Out of the group, the seat is voted about
     /// at once; back in it, or never out of it within `LEFT_WORD_GROUP_GRACE`,
     /// the seat is forgotten here and keeps its clock.
-    left_by_word: std::collections::BTreeMap<u8, (tokio::time::Instant, bool)>,
+    left_by_word: std::collections::BTreeMap<u8, (tokio::time::Instant, bool, Vec<u8>)>,
     /// Fault-harness: the longest silence in the table's group of each seat now
     /// silent, said when the seat is heard again -- how long a live member goes
     /// unheard, measured rather than assumed.
     silence_peak: std::collections::BTreeMap<u8, u64>,
+    /// `D-062`: the table this slot's seat first sat at, and its rosters' keys --
+    /// the slot's own across a continuation, see `Origin`.
+    origin: Option<Origin>,
+    /// `D-062`: tables that refused this client lately, not gone on at until
+    /// `AVOID_FOR` has passed; the slot's own.
+    avoided: std::collections::HashMap<[u8; 32], tokio::time::Instant>,
+    /// `D-062`: when this seat last read the lobby for where its game goes on.
+    reconvened_at: Option<tokio::time::Instant>,
+    /// `D-062`: since when no table of this seat's game has been offered while it
+    /// asks for one.
+    unoffered_since: Option<tokio::time::Instant>,
+    /// `S1-GS`: when this client's own Tox connection was last seen down -- the
+    /// client's line, no table's.
+    tox_down_at: Option<tokio::time::Instant>,
+    /// `S1-GX`: when members of this table's group timed out of this client's
+    /// copy of it lately -- two or more within `OWN_LINE_WINDOW` is this
+    /// client's own line going, before the library says so.
+    group_timeouts: Vec<tokio::time::Instant>,
+    /// `S1-GZ`: the hand in which this client last answered each seat's
+    /// ratification copy after the set, by application key -- once per hand
+    /// per seat.
+    ratification_answered: std::collections::HashMap<[u8; 32], u64>,
+    /// `S1-GZ`: the hand whose frames this client last said again for each seat
+    /// back from a restart -- once per hand per seat.
+    hand_said_again_for: std::collections::HashMap<[u8; 32], u64>,
+    /// `S1-HB`: how many times in a row the founder has refused this seat's
+    /// asking again as *the advertisement has expired* -- twice, with the
+    /// lobby's newest advert each time, is a table that started without it.
+    expired_refusals: u8,
 }
 
 /// `D-061`: a table's continuation, at the seat that founds it.
@@ -1035,6 +1064,42 @@ const FLAP_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
 const FLAP_FIRST_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// `S1-GR`: the longest wait, however often a key has sat down and left.
 const FLAP_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `D-062`: an advert heard this long ago still counts as offered -- three of the
+/// lobby's askings (`D-040`, every 30 s).
+const OFFER_FRESH_MS: u64 = 90_000;
+/// `D-062`: how often a seat reads the lobby for where its game goes on.
+const RECONVENE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+/// `D-062`: a seat asking for a table of its game that the lobby offers no more
+/// founds the game's continuation itself after this long.
+const LOOK_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// `D-062`: a table that refused this client is not gone on at for this long.
+const AVOID_FOR: std::time::Duration = std::time::Duration::from_secs(300);
+/// `S1-GS`: a founder that answered the lobby's question this recently, naming the
+/// table, is alive: its silence in the group is the group's or this client's line,
+/// not its absence.
+const FOUNDER_ANSWER_FRESH_MS: u64 = 75_000;
+/// `S1-GS`: ...unless it has been out of the group's hearing this long: a founder
+/// with its lobby link up and its line to the group down for good would hold its
+/// seats for ever otherwise.
+const FOUNDER_TOX_DEAD_S: u64 = 120;
+
+/// `D-062`: the table a seat first sat at -- its *origin* -- against which every
+/// table its game goes on at is read: the origin itself, or a table founded by
+/// a key of the origin's rosters, of the same game (`S1-GH`). Kept across a
+/// continuation (`leave_the_table!` does not forget it) and forgotten with the
+/// player's own leave, or a join elsewhere.
+struct Origin {
+    table_id: [u8; 32],
+    founder_key: [u8; 32],
+    /// Every application key a roster of the origin seated, with its seat.
+    seats: std::collections::HashMap<[u8; 32], u8>,
+    /// The game, name and gate every continuation must play.
+    template: TableAd,
+    /// `S1-GY`: the origin's founder left it by its own word: the origin is
+    /// no table of the game any more, whatever its stale advert says.
+    dead: bool,
+}
 
 /// `S1-FY`: how soon a seat given back before the start is asked for again,
 /// and how long after an asking that did not go through.
@@ -1182,6 +1247,15 @@ impl TableRun {
             seat_ends: std::collections::HashMap::new(),
             left_by_word: std::collections::BTreeMap::new(),
             silence_peak: std::collections::BTreeMap::new(),
+            origin: None,
+            avoided: std::collections::HashMap::new(),
+            reconvened_at: None,
+            unoffered_since: None,
+            tox_down_at: None,
+            group_timeouts: Vec::new(),
+            ratification_answered: std::collections::HashMap::new(),
+            hand_said_again_for: std::collections::HashMap::new(),
+            expired_refusals: 0,
         }
     }
 }
@@ -2669,6 +2743,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             }
             $t.table = None;
             leave_the_table!($t);
+            // `D-062`: a table left by the player, or lost for good, is no origin
+            // to go on from.
+            $t.origin = None;
             dht_effort(&mut swarm, false);
             // `S1-CR`: a seat that leaves by its own choice has no session to come back to.
             if $forget
@@ -2723,6 +2800,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 let asked = swarm.behaviour_mut().join.send_request(&founder, bytes.clone());
                                 leaves_said.insert(asked);
                             }
+                        } else {
+                            // `D-062`, the other way: the founder's own word to every seat
+                            // of its roster over the same channel. A seat not yet in the
+                            // group, at a founder its topic's mesh did not reach, learned
+                            // its founder gone from the lobby's asking half a minute
+                            // later, and went on twenty seconds after that (the owner's
+                            // clients, 2026-09-16 20:32 UTC).
+                            for e in f.roster().seats().iter().filter(|e| Some(e.seat) != f.my_seat()) {
+                                if let Ok(peer) = PeerId::from_bytes(&e.peer_id) {
+                                    let asked = swarm.behaviour_mut().join.send_request(&peer, bytes.clone());
+                                    leaves_said.insert(asked);
+                                }
+                            }
                         }
                         if let Some(topic) = $t.table_topic.as_ref() {
                             let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), bytes);
@@ -2746,7 +2836,15 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 .table
                 .as_ref()
                 .and_then(|f| f.roster().seats().iter().find(|e| e.peer_id == peer).map(|e| e.app_public_key));
-            if let Some(f) = $t.table.as_mut().filter(|f| f.is_founder()) {
+            // `S1-HE`: and never once this founder has ratified the roster -- its
+            // ratification is the last and the set follows it; a seat lost after
+            // that is the hand's to certify out.
+            // `S1-GX`: nor through this founder's own line, whichever road led here --
+            // the never-joined road gave a seat back 56 s into the founder's own cut,
+            // where the hearing's judgement would have held (`churn162945-10`).
+            let line_suspect = own_line_suspect($t)
+                || $t.table.as_ref().is_some_and(|f| $t.ever_on_line && hears_nobody(f, &$t.tox_sink));
+            if let Some(f) = $t.table.as_mut().filter(|f| f.is_founder() && !f.ready_sent() && !line_suspect) {
                 match f.release_seat_before_the_first_hand(&peer, $now) {
                     Ok(sends) if !sends.is_empty() => {
                         if let Some(k) = leaving_key {
@@ -2833,6 +2931,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 // `D-061`: a window's joiner goes on without the founder, at once.
                 $t.founder_gone = tokio::time::Instant::now().checked_sub(FOUNDER_GONE_GRACE);
                 $t.founder_left_by_word = true;
+                // `S1-GY`: and its table is no table of the game any more -- not an
+                // origin to go back to, not offered: a continuation's founder went
+                // back to it on its stale advert, and its seats after it
+                // (`churn131041-5`).
+                if let Some(gone_id) = $t.table.as_ref().map(|f| f.table_id()) {
+                    if let Some(o) = $t.origin.as_mut().filter(|o| o.table_id == gone_id) {
+                        o.dead = true;
+                    }
+                    $t.avoided.insert(gone_id, tokio::time::Instant::now());
+                    state.lobby.remove(&gone_id);
+                }
                 let _ = events
                     .send(NodeEvent::Warning(
                         "the founder left the table before it started, by its own word: its seats go on without it (D-061)".into(),
@@ -3166,6 +3275,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             $t.founder_left_by_word = false;
             $t.seat_ends.clear();
             $t.left_by_word.clear();
+            $t.reconvened_at = None;
+            $t.unoffered_since = None;
+            $t.group_timeouts.clear();
+            $t.ratification_answered.clear();
+            $t.hand_said_again_for.clear();
+            $t.expired_refusals = 0;
         }};
     }
     // `S1-FY`: the owner's rule, before the table starts too -- a table's window
@@ -3222,25 +3337,23 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     // `S1-FY`: commands this node gives itself -- a seat given back, asked for
     // again -- taken before the window's, down the same road.
     let mut own_commands: std::collections::VecDeque<NodeCommand> = std::collections::VecDeque::new();
-    // `D-061`: this seat goes on at the continuation another seat founded: the new
-    // table's advert into the lobby, where a join looks for it, and the seat asked
-    // for there, from what the player joined with -- the window's slot and the
-    // window follow.
-    macro_rules! follow_the_continuation {
-        ($t:ident, $old:expr, $c:expr) => {{
+    // `D-062`: this seat goes on at another table of its game -- a continuation
+    // another seat founded, by that seat's word (`D-061`) or offered in the lobby
+    // -- and asks for a seat there from what the player joined with; the window's
+    // slot and the window follow. Going on is leaving the table it was at: said,
+    // so its founder -- if it is there at all -- frees the seat at once (`S1-GA`),
+    // and no seat reports this one unheard there.
+    macro_rules! go_on_at {
+        ($t:ident, $old:expr, $key:expr, $why:expr) => {{
             let old: [u8; 32] = $old;
-            let c: super::tabletalk::Continues = $c;
-            let now = super::node::now_unix_ms();
-            let _ = advert::receive(&c.advert, c.who, now, &mut state.limits, &mut state.lobby);
-            let why = format!(
-                "the founder is gone: the table goes on at the table seat {} founded for it (D-061)",
-                c.seat
-            );
+            let key: [u8; 32] = $key;
+            let why: String = $why;
             let asked = $t.join_asked.take();
-            // Going on is leaving the old table: said, so its founder -- if it is
-            // there at all -- frees the seat at once (`S1-GA`), and no seat reports
-            // this one unheard there.
             say_the_leave!($t);
+            // `S1-GY`: the table left is no table to go back to for a while, and
+            // its advert -- stale by now -- is dropped here.
+            $t.avoided.insert(old, tokio::time::Instant::now());
+            state.lobby.remove(&old);
             $t.tox_sink.clear();
             $t.tox_group_said = false;
             $t.table_announces = 0;
@@ -3252,9 +3365,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             dht_effort(&mut swarm, false);
             match asked {
                 Some(mut a) => {
-                    a.key = c.table_key;
+                    a.key = key;
                     $t.join_asked = Some(a);
-                    $t.rejoin_key = Some(c.table_key);
+                    $t.rejoin_key = Some(key);
                     $t.rejoin_at = Some(tokio::time::Instant::now());
                     let _ = events.send(NodeEvent::Warning(why.clone())).await;
                     let _ = events.send(NodeEvent::TableGoesOn { key: old, why }).await;
@@ -3264,6 +3377,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = events.send(NodeEvent::TableLost { why }).await;
                 }
             }
+        }};
+    }
+    // `D-061`: this seat goes on at the continuation another seat founded, by
+    // that seat's word: the new table's advert into the lobby, where a join looks
+    // for it, and the seat asked for there.
+    macro_rules! follow_the_continuation {
+        ($t:ident, $old:expr, $c:expr) => {{
+            let old: [u8; 32] = $old;
+            let c: super::tabletalk::Continues = $c;
+            let now = super::node::now_unix_ms();
+            let _ = advert::receive(&c.advert, c.who, now, &mut state.limits, &mut state.lobby);
+            let why = format!(
+                "the founder is gone: the table goes on at the table seat {} founded for it (D-061)",
+                c.seat
+            );
+            go_on_at!($t, old, c.table_key, why);
         }};
     }
     // `D-061`: this seat founds the table's continuation -- the same game, under a
@@ -3282,6 +3411,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
             let buyin = asked.as_ref().map_or(ad.start_stack.max(ad.min_buyin), |a| a.buyin);
             let password = asked.as_ref().and_then(|a| a.password.clone());
             say_the_leave!($t);
+            // `S1-GY`: as above -- the table continued is not gone back to.
+            $t.avoided.insert(old, tokio::time::Instant::now());
+            state.lobby.remove(&old);
             let old_topic = $t.table_topic.take();
             $t.tox_sink.clear();
             $t.tox_group_said = false;
@@ -3364,8 +3496,28 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     (f.table_id(), f.serial(), me, successor, heard, f.advert().clone(), forming)
                 });
             if let Some((old, serial, me, Some(successor), heard, ad, true)) = plan {
+                // `D-062`: the lobby first. A table of this seat's game offered now --
+                // founded by a seat of the origin's roster, or the origin itself with
+                // its founder back -- is where the seats meet: the one with most
+                // players, then the lowest seat's; one with a single player is taken
+                // only from a higher seat, since the lower seat's own table would rank
+                // above it. The word and the election below serve the first seconds,
+                // before the lobby's asking has carried any advert.
+                $t.avoided.retain(|_, at| at.elapsed() < AVOID_FOR);
+                let offered = $t
+                    .origin
+                    .as_ref()
+                    .and_then(|o| best_of_origin(&state.lobby, o, super::node::now_unix_ms(), &$t.avoided, Some(old)))
+                    .filter(|(_, players, rank)| {
+                        me.is_none_or(|m| better_table((*players, *rank), (1, m)) == std::cmp::Ordering::Greater)
+                    });
                 let word = $t.continues_heard.iter().find(|(s, _)| **s <= successor).map(|(_, c)| c.clone());
-                if let Some(c) = word {
+                if let Some((key, players, rank)) = offered {
+                    let why = format!(
+                        "the founder is gone: the table goes on at the table the lobby offers for it -- seat {rank}'s, {players} seated (D-062)"
+                    );
+                    go_on_at!($t, old, key, why);
+                } else if let Some(c) = word {
                     follow_the_continuation!($t, old, c);
                 } else if Some(successor) == me {
                     found_the_continuation!($t, old, serial, ad);
@@ -3957,7 +4109,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 // answered with nothing but an empty frame.
                                 if super::tabletalk::leave_table_of(&request).is_some() {
                                     let carrier: [u8; 32] = *blake3::hash(&authenticated).as_bytes();
-                                    let heard = t.table.as_ref().filter(|f| f.is_founder() && f.session().is_none()).map(|f| {
+                                    // `D-062`: and at a joiner, the founder's own word, from
+                                    // the founder's own peer and no other.
+                                    let heard = t
+                                        .table
+                                        .as_ref()
+                                        .filter(|f| f.session().is_none() && (f.is_founder() || f.founder_peer_id() == authenticated.as_slice()))
+                                        .map(|f| {
                                         super::tabletalk::receive_leave(
                                             &request,
                                             &f.table_id(),
@@ -3969,10 +4127,13 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     });
                                     let _ = swarm.behaviour_mut().join.send_response(channel, Vec::new());
                                     if let Some(Ok((seat, key, said_ms))) = heard {
+                                        let founder_here = t.table.as_ref().is_some_and(|f| f.is_founder());
                                         let _ = events
-                                            .send(NodeEvent::Warning(format!(
-                                                "seat {seat}'s word that its player left came to this founder directly (S1-GP)"
-                                            )))
+                                            .send(NodeEvent::Warning(if founder_here {
+                                                format!("seat {seat}'s word that its player left came to this founder directly (S1-GP)")
+                                            } else {
+                                                "the founder's own word that it left came to this seat directly (D-062)".to_string()
+                                            }))
                                             .await;
                                         a_seat_left_before_the_start!(t, seat, key, said_ms);
                                     }
@@ -4234,6 +4395,16 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     Err(Failed::Refused { reason, retry_after_ms }) => {
                                         t.table = None;
+                                        // `D-062`: a table that refused this client is not one
+                                        // its game goes on at, for a while -- a founder that
+                                        // seats it later, or says it sits there, excepted.
+                                        if reason != crate::table::join::RejectReason::TooSoon.code()
+                                            && reason != crate::table::join::RejectReason::AlreadySeated.code()
+                                        {
+                                            if let Some(k) = t.rejoin_key.or(t.joined_key) {
+                                                t.avoided.insert(k, tokio::time::Instant::now());
+                                            }
+                                        }
                                         // The Tox group goes with the table. Dropping the handle
                                         // tells the driver to leave and joins its thread, which
                                         // flushes what it still holds - the last message of a hand
@@ -4244,12 +4415,27 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         if let Some(t) = t.table_topic.take() {
                                             let _ = swarm.behaviour_mut().gossipsub.unsubscribe(&t);
                                         }
+                                        // `S1-HB`: *the advertisement has expired* is also what a
+                                        // founder answers a seat not on its roster once the table
+                                        // has started; the asking again takes the lobby's newest
+                                        // advert each time, so the answer twice in a row is a table
+                                        // that started without this seat (`churn140638-6`: a far seat
+                                        // given back before the set asked every half minute to the
+                                        // end of the run).
+                                        let started_without_me = if reason == crate::table::join::RejectReason::AdvertExpired.code() {
+                                            t.expired_refusals = t.expired_refusals.saturating_add(1);
+                                            t.expired_refusals >= 2
+                                        } else {
+                                            t.expired_refusals = 0;
+                                            false
+                                        };
                                         // `S1-FY`: a seat asked for again after the founder gave
                                         // it back is asked for again later -- a seat may free up --
                                         // unless the table put it out for good (`D-047`).
                                         match t.rejoin_key.filter(|_| {
                                             t.join_asked.is_some()
                                                 && reason != crate::table::join::RejectReason::OutForGood.code()
+                                                && !started_without_me
                                         }) {
                                             Some(key) => {
                                                 // `S1-GR`: a key the founder seats again later is
@@ -4275,9 +4461,18 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                                     t.rejoin_at = None;
                                                     t.lost_key = Some(key);
                                                 }
-                                                let _ = events
-                                                    .send(NodeEvent::JoinRefused { reason })
-                                                    .await;
+                                                if started_without_me {
+                                                    // `S1-HB`: and the game went on without this
+                                                    // seat -- no continuation of it to found.
+                                                    t.origin = None;
+                                                    let why = "the table started without this seat: the founder answers, twice, that its advert is no longer the one this seat joined under (S1-HB)".to_string();
+                                                    let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                                                    let _ = events.send(NodeEvent::TableLost { why }).await;
+                                                } else {
+                                                    let _ = events
+                                                        .send(NodeEvent::JoinRefused { reason })
+                                                        .await;
+                                                }
                                             }
                                         }
                                         // `S1-CR`: the founder answered, and not with *already
@@ -5747,8 +5942,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                 let continuing_slot = matches!(command, NodeCommand::CreateTable { .. })
                     .then(|| tables.iter().position(|x| x.table.is_none() && x.continuing.as_ref().is_some_and(|c| c.advert.is_none())))
                     .flatten();
+                // `D-062`: a join for a table of a slot's own game -- its origin, or a
+                // table the origin's roster founded -- goes to that slot while it holds
+                // no table, and opens no second one: the bed's driver, asking for a
+                // table by name, would have seated one client at a table and its
+                // continuation.
+                let own_game_slot = join_key
+                    .filter(|k| !held.iter().any(|h| *h == Some(*k)))
+                    .and_then(|k| {
+                        let ad = state.lobby.get(&k).map(|h| h.ad.clone())?;
+                        tables
+                            .iter()
+                            .position(|x| x.table.is_none() && x.origin.as_ref().is_some_and(|o| origin_rank(o, &k, &ad).is_some()))
+                    });
                 let (which, open) = match &command {
                     NodeCommand::CreateTable { .. } if continuing_slot.is_some() => (continuing_slot.unwrap_or(active), false),
+                    NodeCommand::JoinTable { .. } if own_game_slot.is_some() => (own_game_slot.unwrap_or(active), false),
                     NodeCommand::CancelJoin { key, .. } => match slot_for_cancel(key, &held) {
                         Some(i) => (i, false),
                         None => continue,
@@ -5876,6 +6085,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // tables one client plays at, the command lands on the active
                         // slot, and founding there replaced the table being played.
                         // `S1-FY`: nor over a seat this slot asks for again.
+                        // `D-062`: a table founded afresh is its own origin; a continuation
+                        // keeps the origin of the table it continues.
+                        if t.continuing.is_none() {
+                            t.origin = None;
+                        }
                         if t.table.is_some() || t.rejoin_key.is_some() {
                             let _ = events
                                 .send(NodeEvent::Warning(format!(
@@ -6168,17 +6382,34 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             join_not_started!(t, key, why, here);
                             continue;
                         }
-                        // `S1-FY`: nor over a seat this slot asks for again at another table.
+                        // `S1-FY`: nor over a seat this slot asks for again at another table
+                        // -- `D-062`: unless that table is of the same game, one the slot's
+                        // origin's roster founded: the player joining the continuation the
+                        // slot looks for, which is the ask retargeted.
                         if t.rejoin_key.is_some_and(|k| k != key) {
-                            let why = format!("this client sits at {MAX_TABLES} tables, the most it plays at once: leave one before joining another");
-                            join_not_started!(t, key, why, false);
-                            continue;
+                            let same_game = t
+                                .origin
+                                .as_ref()
+                                .zip(state.lobby.get(&key))
+                                .is_some_and(|(o, h)| origin_rank(o, &key, &h.ad).is_some());
+                            if same_game {
+                                t.rejoin_key = Some(key);
+                            } else {
+                                let why = format!("this client sits at {MAX_TABLES} tables, the most it plays at once: leave one before joining another");
+                                join_not_started!(t, key, why, false);
+                                continue;
+                            }
                         }
                         let Some(held) = state.lobby.get(&key).cloned() else {
                             let why = "that table is no longer advertised".to_string();
                             join_not_started!(t, key, why, false);
                             continue;
                         };
+                        // `D-062`: a player joining a table that is no continuation of the
+                        // one its slot first sat at starts afresh there.
+                        if t.origin.as_ref().is_some_and(|o| origin_rank(o, &key, &held.ad).is_none()) {
+                            t.origin = None;
+                        }
                         t.lost_key = None;
                         // `S1-DE`: a seat that sits down elsewhere is not resuming
                         // any more -- the recorded ratification is the old table's,
@@ -6723,9 +6954,52 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             Ok((crate::protocol::messages::EventType::TableReady, _, _))
                         )
                     {
+                        // `S1-GZ`: only a copy signed by a seat this client's hand waits
+                        // on (or holds no hand for), and once a minute per seat. A seat
+                        // back from a restart says its own ratification until it has
+                        // dealt, and the hand waits on it until it takes the hand up; the
+                        // answer carries every ratification this client holds, so a copy
+                        // signed by a seat that plays is somebody's answer, and answering
+                        // it was every seat echoing every seat at the five-second cap for
+                        // the whole game -- eleven messages and, once a minute, eighty
+                        // frames of the hand from each of ten seats (`churn131817-10`: the
+                        // three relayed seats timed out of the group under it, hand #3
+                        // stalled three minutes and the table split).
+                        let author = crate::net::chained::sender_of(&item.bytes, TABLE_FRAME_PEEK);
+                        // Third cut: a seat heard at any stage of this hand holds it -- its
+                        // copy is somebody's answer, never a restart -- and between hands a
+                        // newcomer is taught by `S1-DX` on its arrival in the group. A control
+                        // run of ten seats with no fault still answered thirty copies a seat
+                        // under the waited-on gate alone (`churn154849-10`): every crypto
+                        // stage waits on most seats for a moment.
+                        let waited_on = author
+                            .and_then(|a| f.roster().seat_of(&a))
+                            .is_some_and(|s| t.hand.as_ref().is_some_and(|h| h.waiting_for().contains(&s) && !h.heard_from(s)));
+                        // And heard in the group now: a seat back from a restart is
+                        // saying its ratification there, while a seat whose line was cut
+                        // is silent -- its copies come inside other seats' answers, and
+                        // answering those was still every seat re-saying the hand for a
+                        // seat that could not hear it (`churn134826-6`: twenty answers and
+                        // six whole-hand resends per seat in nine minutes).
+                        let talking = author
+                            .and_then(|a| {
+                                let e = f.roster().seats().iter().find(|e| e.app_public_key == a)?;
+                                [t.tox_sink.quiet_secs(&a), e.tox_key.and_then(|k| t.tox_sink.quiet_line(&k))]
+                                    .into_iter()
+                                    .flatten()
+                                    .min()
+                            })
+                            .is_some_and(|q| q < DEAF_QUIET_S);
                         let now = super::node::now_unix_ms();
-                        if now.saturating_sub(t.ratification_echo_ms) >= 5_000 {
+                        let hand_now = t.hand.as_ref().map_or(0, |h| h.hand_id());
+                        let answered = author
+                            .and_then(|a| t.ratification_answered.get(&a).copied())
+                            .is_some_and(|in_hand| in_hand == hand_now);
+                        if waited_on && talking && !answered && now.saturating_sub(t.ratification_echo_ms) >= 5_000 {
                             t.ratification_echo_ms = now;
+                            if let Some(a) = author {
+                                t.ratification_answered.insert(a, hand_now);
+                            }
                             let mut n = 0usize;
                             for bytes in f.say_again(now) {
                                 t.tox_sink.try_broadcast(&bytes);
@@ -6734,11 +7008,19 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             // `D-033`: and the running hand -- every frame accepted
                             // and every frame said -- so a seat back from a restart
                             // can take the hand up where it stood.
-                            // Once a minute at most: a seat back from a restart repeats its
-                            // ratification every thirty seconds until it has dealt, and a
-                            // dealt hand is a hundred kilobytes of frames.
-                            if let Some(h) = t.hand.as_ref().filter(|_| now.saturating_sub(t.hand_said_again_ms) >= 60_000) {
+                            // Once a minute at most, and once per hand per seat back
+                            // (`S1-GZ`): a dealt hand is a hundred kilobytes of frames.
+                            let frames_due = t.hand.as_ref().is_some_and(|h| {
+                                now.saturating_sub(t.hand_said_again_ms) >= 60_000
+                                    && author.is_some_and(|a| t.hand_said_again_for.get(&a) != Some(&h.hand_id()))
+                                    // `S1-HD`: and by one seat.
+                                    && i_say_the_hand_again(h, &seats_unheard(f, &t.tox_sink))
+                            });
+                            if let Some(h) = t.hand.as_ref().filter(|_| frames_due) {
                                 t.hand_said_again_ms = now;
+                                if let Some(a) = author {
+                                    t.hand_said_again_for.insert(a, h.hand_id());
+                                }
                                 let hid = h.hand_id();
                                 let mut frames = 0usize;
                                 for b in h.transcript() {
@@ -6837,7 +7119,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             }
                             Ok((seat, _, _)) if Some(seat) != f.my_seat() => {
                                 // `S1-GK`: its turns and stages are not waited out.
-                                t.left_by_word.insert(seat, (tokio::time::Instant::now(), false));
+                                // `D-063`: with the word itself, for the certificate.
+                                t.left_by_word.insert(seat, (tokio::time::Instant::now(), false, item.bytes.clone()));
                                 let _ = events
                                     .send(NodeEvent::Warning(format!(
                                         "seat {seat} left the table: its own signed word (S1-FQ)"
@@ -7439,6 +7722,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     if !t.tox_sink.is_on_tox() {
                         continue;
                     }
+                    // `S1-GS`: this client's own line by the library's verdict, once a
+                    // seat was on the line here -- for the reading of its founder and
+                    // of its seats (`own_line_suspect`).
+                    if t.ever_on_line && t.tox_sink.tox_connection() == 0 {
+                        t.tox_down_at = Some(tokio::time::Instant::now());
+                    }
                     // `D-051`: the members the carrier cut off, said at once and
                     // remembered: a flooder's seat by seat, a stranger by when.
                     let cuts = t.tox_sink.take_cut_offs();
@@ -7736,6 +8025,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             for e in f.roster().seats() {
                                 t.roster_keys_seen.insert(e.app_public_key, e.seat);
                             }
+                            // `D-062`: the table this seat first sat at, and every key its
+                            // rosters seat -- what its continuations are read against.
+                            if t.origin.is_none() {
+                                t.origin = Some(Origin {
+                                    table_id: f.table_id(),
+                                    founder_key: f.advert().founder_app_key,
+                                    seats: std::collections::HashMap::new(),
+                                    template: f.advert().clone(),
+                                    dead: false,
+                                });
+                            }
+                            if let Some(o) = t.origin.as_mut().filter(|o| o.table_id == f.table_id()) {
+                                for e in f.roster().seats() {
+                                    o.seats.insert(e.app_public_key, e.seat);
+                                }
+                            }
                         }
                         // `D-061`: the seat that founded a table's continuation says so on
                         // the old table's topic, every `CONTINUES_SAY_EVERY` for
@@ -7769,7 +8074,20 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .filter(|f| f.session().is_none() && f.my_seat().is_some() && f.serial() > 0)
                                 .map(|f| (f.serial(), f.table_id(), f.my_seat(), seats_unheard(f, &t.tox_sink)));
                             if let Some((serial, table_id, me, unheard)) = reading {
-                                if unheard.is_empty() && t.table.as_ref().is_some_and(|f| !f.ready_sent() && f.may_start()) {
+                                // `S1-HE`: the founder ratifies LAST -- once it holds every other
+                                // seat's ratification of this roster -- so its word is the set,
+                                // and no roster of its can change under a set half made: a
+                                // founder that had ratified and then gave a seat back split
+                                // its table between the seats set on the old roster and the
+                                // rest on the new (`churn150139-10`: four seats dealt hand #1
+                                // to nine, the founder at *ratified 6/10* to the end).
+                                let founder_last = t.table.as_ref().is_some_and(|f| {
+                                    !f.is_founder() || {
+                                        let ratified = f.ratified_seats();
+                                        f.roster().seats().iter().filter(|e| Some(e.seat) != f.my_seat()).all(|e| ratified.contains(&e.seat))
+                                    }
+                                });
+                                if unheard.is_empty() && founder_last && t.table.as_ref().is_some_and(|f| !f.ready_sent() && f.may_start()) {
                                     match t.table.as_mut().map(|f| f.ratify_now(now)) {
                                         Some(Ok(sends)) if !sends.is_empty() => {
                                             for send in sends {
@@ -7915,7 +8233,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                         // every seat hears every seat, one that has not said it is ready
                         // for `READY_GRACE` holds the table up, and goes too.
                         let judged = t.table.as_ref().filter(|f| {
-                            f.is_founder() && f.session().is_none() && !(t.ever_on_line && hears_nobody(f, &t.tox_sink))
+                            // `S1-GX`: nor through its own line -- a founder whose line was
+                            // cut gave every seat back once its group copy had timed them
+                            // out, 54 s into the cut, which `hears_nobody` (seats in the
+                            // group only) could not see (`churn130206-6`).
+                            f.is_founder() && f.session().is_none() && !(t.ever_on_line && hears_nobody(f, &t.tox_sink)) && !own_line_suspect(t)
                         }).map(|f| {
                             let serial = f.serial();
                             let me = f.my_seat();
@@ -8028,27 +8350,102 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        // `D-061`: a founder whose seats went on without it -- a continuation
-                        // said by a seat of its roster, and most of its other seats out of
-                        // its hearing -- goes on there too, as a seat of that table.
-                        if autoplay.is_none() || stays_at_the_table() {
-                            let follow = t
-                                .table
-                                .as_ref()
-                                .filter(|f| f.is_founder() && f.session().is_none())
-                                .and_then(|f| {
-                                    let others = f.roster().len().saturating_sub(1);
-                                    let unheard = seats_unheard(f, &t.tox_sink).len();
-                                    (others > 0 && unheard * 2 > others).then(|| {
-                                        let me = f.my_seat();
-                                        let buyin = f.roster().seats().iter().find(|e| Some(e.seat) == me).map_or(0, |e| e.buyin);
-                                        (f.table_id(), buyin, f.password().map(|p| p.to_vec()))
-                                    })
+                        // `D-062`: a founder of a forming table goes on where more of its
+                        // game's seats are -- a table of its origin the lobby offers now,
+                        // a continuation founded by a seat of that roster or the origin
+                        // itself, with more players than its own roster holds, the lowest
+                        // seat's among equals -- and never on a word alone: the owner's
+                        // founder followed a stale word to a table withdrawn eighty
+                        // seconds before, and three players sat at three tables
+                        // (2026-09-16 20:37 UTC).
+                        let reconvene_due = (autoplay.is_none() || stays_at_the_table())
+                            && t.reconvened_at.is_none_or(|at| at.elapsed() >= RECONVENE_EVERY);
+                        if reconvene_due {
+                            t.reconvened_at = Some(tokio::time::Instant::now());
+                            t.avoided.retain(|_, at| at.elapsed() < AVOID_FOR);
+                        }
+                        if reconvene_due && t.table.as_ref().is_some_and(|f| f.is_founder() && f.session().is_none()) {
+                            let now_ms = super::node::now_unix_ms();
+                            let follow = t.table.as_ref().zip(t.origin.as_ref()).and_then(|(f, o)| {
+                                let rank = origin_rank(o, &f.table_id(), f.advert())?;
+                                let mine = (u8::try_from(f.roster().len()).unwrap_or(u8::MAX), rank);
+                                let best = best_of_origin(&state.lobby, o, now_ms, &t.avoided, Some(f.table_id()))?;
+                                (better_table((best.1, best.2), mine) == std::cmp::Ordering::Greater).then(|| {
+                                    let me = f.my_seat();
+                                    let buyin = f.roster().seats().iter().find(|e| Some(e.seat) == me).map_or(0, |e| e.buyin);
+                                    (f.table_id(), buyin, f.password().map(|p| p.to_vec()), best, mine.0)
                                 })
-                                .and_then(|(old, buyin, password)| t.continues_heard.values().next().cloned().map(|c| (old, buyin, password, c)));
-                            if let Some((old, buyin, password, c)) = follow {
-                                t.join_asked = Some(JoinAsked { key: c.table_key, buyin, seat: None, password });
-                                follow_the_continuation!(t, old, c);
+                            });
+                            if let Some((old, buyin, password, (key, players, rank), held)) = follow {
+                                t.join_asked = Some(JoinAsked { key, buyin, seat: None, password });
+                                let why = format!(
+                                    "this table's seats are elsewhere: the lobby offers seat {rank}'s table of the same game with {players} seated against {held} here; this founder goes on there as a seat (D-062)"
+                                );
+                                go_on_at!(t, old, key, why);
+                            }
+                        }
+                        // `D-062`: and a seat asking for a table its game goes on at reads
+                        // the lobby the same way: the best table offered is the one it
+                        // asks for; none offered for `LOOK_LIMIT`, it founds the game's
+                        // continuation itself, from its origin -- a seat that followed a
+                        // word to a table since withdrawn asked for it every half minute
+                        // for ever (the owner's founder, 2026-09-16 20:37 UTC).
+                        if reconvene_due && t.table.is_none() {
+                            if let (Some(key), Some(o)) = (t.rejoin_key, t.origin.as_ref()) {
+                                let my_key = app_key.verifying_key().to_bytes();
+                                let best = best_of_origin(&state.lobby, o, super::node::now_unix_ms(), &t.avoided, None);
+                                match best {
+                                    Some((k, players, rank)) if k != key => {
+                                        t.unoffered_since = None;
+                                        if let Some(a) = t.join_asked.as_mut() {
+                                            a.key = k;
+                                        }
+                                        t.rejoin_key = Some(k);
+                                        t.rejoin_at = Some(tokio::time::Instant::now());
+                                        let _ = events
+                                            .send(NodeEvent::Warning(format!(
+                                                "the table asked for is not where this seat's game goes on: the lobby offers seat {rank}'s table with {players} seated; asking there (D-062)"
+                                            )))
+                                            .await;
+                                    }
+                                    Some(_) => t.unoffered_since = None,
+                                    None if state.lobby.get(&key).is_some() => t.unoffered_since = None,
+                                    None => {
+                                        // `S1-HB`: a table gone from the lobby whose founder still
+                                        // answers the lobby's question, without it, has started or
+                                        // was closed without this seat: the game went on, and there
+                                        // is no continuation of it to found.
+                                        let founder_answers = t
+                                            .joined_ad
+                                            .as_ref()
+                                            .and_then(|ad| answers.get(&ad.founder_peer_id))
+                                            .is_some_and(|(_, at)| super::node::now_unix_ms().saturating_sub(*at) < FOUNDER_ANSWER_FRESH_MS);
+                                        if founder_answers {
+                                            if let Some(k) = t.rejoin_key.take() {
+                                                t.rejoin_at = None;
+                                                t.lost_key = Some(k);
+                                            }
+                                            t.origin = None;
+                                            let why = "the table asked for is gone from the lobby while its founder still answers there: it started, or was closed, without this seat (S1-HB)".to_string();
+                                            let _ = events.send(NodeEvent::Warning(why.clone())).await;
+                                            let _ = events.send(NodeEvent::TableLost { why }).await;
+                                            continue;
+                                        }
+                                        let since = *t.unoffered_since.get_or_insert_with(tokio::time::Instant::now);
+                                        if since.elapsed() >= LOOK_LIMIT && o.seats.contains_key(&my_key) {
+                                            let (old, ad) = (o.table_id, o.template.clone());
+                                            let topic = joinrpc::table_topic(&old);
+                                            let _ = subscribe_scored(&mut swarm, &topic);
+                                            t.table_topic = Some(topic);
+                                            let _ = events
+                                                .send(NodeEvent::Warning(
+                                                    "no table of this seat's game is offered any more: this client founds the game's continuation (D-062)".into(),
+                                                ))
+                                                .await;
+                                            found_the_continuation!(t, old, 0, ad);
+                                        }
+                                    }
+                                }
                             }
                         }
                         // `S1-DV`, the other side: a joiner whose founder left the
@@ -8114,6 +8511,30 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                 .my_seat()
                                 .and_then(|s| t.seat_since.get(&s))
                                 .is_some_and(|since| since.elapsed() >= GROUP_JOIN_GRACE);
+                            // `S1-GS`: the group's readings of the founder are not taken
+                            // while this client's own Tox connection is down or came back
+                            // within `QUIET_LIMIT_S` -- the far client of the owner's table
+                            // founded a continuation of a healthy table when its own
+                            // connection flapped (2026-09-16 20:35 UTC) -- nor while the
+                            // founder answers the lobby's question naming this table,
+                            // which is a founder alive with the group's line in trouble,
+                            // for `FOUNDER_TOX_DEAD_S`; past that the table cannot form
+                            // and the seats go on.
+                            let founder_alive = answers.get(f.founder_peer_id()).is_some_and(|(named, at)| {
+                                named.contains(&f.table_id()) && super::node::now_unix_ms().saturating_sub(*at) < FOUNDER_ANSWER_FRESH_MS
+                            });
+                            let stuck_long = founder_line.and_then(|k| t.tox_sink.quiet_line(&k)).is_some_and(|q| q >= FOUNDER_TOX_DEAD_S)
+                                || (never_in
+                                    && f
+                                        .my_seat()
+                                        .and_then(|s| t.seat_since.get(&s))
+                                        .is_some_and(|since| since.elapsed().as_secs() >= FOUNDER_TOX_DEAD_S));
+                            let own_line = own_line_suspect(t);
+                            let (quiet, never_in, by_ping) = if own_line || (founder_alive && !stuck_long) {
+                                (false, false, false)
+                            } else {
+                                (quiet, never_in, by_ping)
+                            };
                             // `D-044`: the founder's own word over the lobby's question
                             // (D-040): an answer from it, made after this table's advert,
                             // that does not name the table. The founder is in the lobby
@@ -8527,6 +8948,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         if let Some(seat) = t.table.as_ref().and_then(|f| f.roster().seat_of(&app)) {
+                            // `S1-GX`: a member timed out of this client's copy of the
+                            // group; two within a minute are this client's own line.
+                            if !quit {
+                                t.group_timeouts.retain(|at| at.elapsed() < OWN_LINE_WINDOW);
+                                t.group_timeouts.push(tokio::time::Instant::now());
+                            }
                             let _ = events.send(NodeEvent::SeatLeft { seat, quit, removed: false }).await;
                             let _ = events
                                 .send(NodeEvent::SeatLink { seat, rtt_ms: None, group: false, quiet_s: None, away: false })
@@ -8975,11 +9402,12 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     // back in the group after that is forgotten here, and so is a word
                     // whose client never left the group within `LEFT_WORD_GROUP_GRACE`:
                     // a later silence of that seat is its line's, and keeps its clock.
-                    let gone_by_word: Vec<u8> = match t.table.as_ref() {
+                    let (gone_by_word, leave_words): (Vec<u8>, Vec<(u8, Vec<u8>)>) = match t.table.as_ref() {
                         Some(f) => {
                             let sink = &t.tox_sink;
                             let mut gone = Vec::new();
-                            t.left_by_word.retain(|seat, (said, out_seen)| {
+                            let mut words = Vec::new();
+                            t.left_by_word.retain(|seat, (said, out_seen, word)| {
                                 // Present: in the group, and heard there within
                                 // `DEAF_QUIET_S` -- a client that said it left and went
                                 // quiet is gone before the library times it out of the
@@ -8996,17 +9424,22 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                     (false, _) => {
                                         *out_seen = true;
                                         gone.push(*seat);
+                                        words.push((*seat, word.clone()));
                                         true
                                     }
                                     (true, true) => false,
                                     (true, false) => said.elapsed() < LEFT_WORD_GROUP_GRACE,
                                 }
                             });
-                            gone
+                            (gone, words)
                         }
-                        None => Vec::new(),
+                        None => (Vec::new(), Vec::new()),
                     };
+                    // `S1-HA`: and the seats gone from the table's group, for the
+                    // round a gone voter cannot close.
+                    let gone_from_group: Vec<u8> = t.table.as_ref().map(|f| seats_unheard(f, &t.tox_sink)).unwrap_or_default();
                     let Some(h) = t.hand.as_mut() else { continue };
+                    h.note_gone_from_group(&gone_from_group);
 
                     // **Ask before accusing.** `S1-BK`: the stage budget is 30 s
                     // and the carrier's blind repair ladder puts its attempts in
@@ -9065,7 +9498,11 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                             .is_some_and(|(at, rtt)| rtt.is_some() && at.elapsed() < std::time::Duration::from_secs(15)))
                             })
                             .collect();
-                        if !back.is_empty() {
+                        // `S1-HD`: said by one seat -- the lowest the hand does not wait
+                        // on and the group holds -- and not by every seat: ten copies of
+                        // sixty frames each was what a seat back from a cut had to fetch
+                        // from every peer's array before it could act (`churn144601-10`).
+                        if !back.is_empty() && i_say_the_hand_again(h, &gone_from_group) {
                             t.hand_said_again_ms = now;
                             let hid = h.hand_id();
                             let mut frames = 0usize;
@@ -9133,6 +9570,8 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     let flooders: Vec<u8> = t.flooders.keys().copied().collect();
                     h.note_flooders(&flooders);
                     h.note_gone_by_their_word(&gone_by_word);
+                    // `D-063`: and their words, for the certificate that names them.
+                    h.note_leave_words(&leave_words);
                     // `S1-FM`: the table's first hand gives a seat a minute more to
                     // join the table's group before anybody votes it out.
                     let held = h.first_hand_opening_held(now, 0);
@@ -10922,8 +11361,54 @@ fn flap_wait(ends: &[tokio::time::Instant], now: tokio::time::Instant) -> Option
 
 /// `S1-GL`: how many seats of the roster left by their player's own signed word
 /// (`S1-GK`) and are out of the table's group now.
+/// `D-062`: the rank of a table among those a seat's game goes on at: the origin
+/// itself is 0, a table founded by a key of the origin's rosters is that key's seat
+/// there, and any other table -- another founder, or another game, name or gate
+/// (`S1-GH`) -- is none of them.
+fn origin_rank(origin: &Origin, key: &[u8; 32], ad: &TableAd) -> Option<u8> {
+    let same_game = super::advert::table_params_hash(ad) == super::advert::table_params_hash(&origin.template)
+        && ad.table_name == origin.template.table_name
+        && ad.password_required == origin.template.password_required;
+    if !same_game {
+        return None;
+    }
+    if *key == origin.table_id {
+        return (!origin.dead && ad.founder_app_key == origin.founder_key).then_some(0);
+    }
+    if ad.founder_app_key == origin.founder_key {
+        return None;
+    }
+    origin.seats.get(&ad.founder_app_key).copied()
+}
+
+/// `D-062`: which of two tables of one game its seats meet at, as `(players,
+/// rank)`: the one with more players; among equals the origin, then the lowest
+/// seat's. `Greater` when the first is the one.
+fn better_table(a: (u8, u8), b: (u8, u8)) -> std::cmp::Ordering {
+    a.0.cmp(&b.0).then(b.1.cmp(&a.1))
+}
+
+/// `D-062`: the best table of a seat's game the lobby offers now -- heard within
+/// `OFFER_FRESH_MS`, joinable, not full, not one that refused this client, not
+/// `but` -- as its key, its players and its rank.
+fn best_of_origin(
+    lobby: &super::lobby::LobbyStore,
+    origin: &Origin,
+    now_ms: u64,
+    avoided: &std::collections::HashMap<[u8; 32], tokio::time::Instant>,
+    but: Option<[u8; 32]>,
+) -> Option<([u8; 32], u8, u8)> {
+    lobby
+        .tables()
+        .filter(|l| Some(*l.key) != but && !l.held.unjoinable && !avoided.contains_key(l.key))
+        .filter(|l| now_ms.saturating_sub(l.held.received_at_ms) < OFFER_FRESH_MS)
+        .filter(|l| l.held.ad.players >= 1 && l.held.ad.players < l.held.ad.max_players)
+        .filter_map(|l| origin_rank(origin, l.key, &l.held.ad).map(|r| (*l.key, l.held.ad.players, r)))
+        .max_by(|a, b| better_table((a.1, a.2), (b.1, b.2)).then(b.0.cmp(&a.0)))
+}
+
 fn gone_by_their_word(
-    left: &std::collections::BTreeMap<u8, (tokio::time::Instant, bool)>,
+    left: &std::collections::BTreeMap<u8, (tokio::time::Instant, bool, Vec<u8>)>,
     f: &Formation,
     tox: &super::toxsink::TableSink,
 ) -> u64 {
@@ -10936,6 +11421,35 @@ fn gone_by_their_word(
         })
         .count();
     u64::try_from(gone).unwrap_or(u64::MAX)
+}
+
+/// `S1-GX`: how long two members' timeouts of this client's group copy count as
+/// this client's own line.
+const OWN_LINE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `S1-GS`, `S1-GX`: whether this client's own line is the likelier reading of a
+/// silence, before the table is set: the library says offline, once a seat was on
+/// the line here; or said so within `QUIET_LIMIT_S`; or two members or more of
+/// the table's group timed out of this client's copy of it within
+/// `OWN_LINE_WINDOW` -- what one line going away looks like from inside, before
+/// the library's verdict, which lags a cut by 45-90 s. While it holds, a joiner
+/// reads nothing of its founder's silence and a founder judges no seat.
+fn own_line_suspect(t: &TableRun) -> bool {
+    (t.ever_on_line && t.tox_sink.is_on_tox() && t.tox_sink.tox_connection() == 0)
+        || t.tox_down_at.is_some_and(|at| at.elapsed().as_secs() < QUIET_LIMIT_S)
+        || t.group_timeouts.iter().filter(|at| at.elapsed() < OWN_LINE_WINDOW).count() >= 2
+}
+
+/// `S1-HD`: whether this client is the seat that re-says a hand's frames to a
+/// seat back on the line (`D-033`): the lowest seat dealt in that the hand does
+/// not wait on and the group holds. One copy, and the carrier's own asking for
+/// what is missing fills any gap in it; every seat saying the whole hand put
+/// ten times sixty frames into a returning seat's arrays (`churn144601-10`:
+/// the founder, back after 45 s, asked for two hundred messages from each of
+/// nine peers and reached its turn minutes later).
+fn i_say_the_hand_again(h: &crate::table::hand::Hand, gone: &[u8]) -> bool {
+    let waiting = h.waiting_for();
+    h.dealt_in().iter().copied().filter(|s| !waiting.contains(s) && !gone.contains(s)).min() == Some(h.my_seat())
 }
 
 /// `S1-GL`: whether the table's group, as `(seen, want)`, holds every other seat
@@ -16481,6 +16995,71 @@ mod a_joiner_before_the_first_hand {
         assert!(!in_hearing_trouble(0, 0, false), "silence alone is the founder's other readings'");
     }
 
+    /// `D-062`: the seats of one game meet at the table with most players, then
+    /// the origin, then the lowest seat's.
+    #[test]
+    fn the_seats_of_a_game_meet_where_most_of_them_are_then_at_the_lowest_seats() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        assert_eq!(better_table((3, 5), (2, 0)), Greater, "more players win over the origin");
+        assert_eq!(better_table((2, 0), (2, 3)), Greater, "the origin among equals");
+        assert_eq!(better_table((2, 1), (2, 3)), Greater, "the lower seat among equals");
+        assert_eq!(better_table((2, 3), (2, 1)), Less);
+        assert_eq!(better_table((1, 4), (1, 4)), Equal);
+        // A lone table is taken only from a higher seat: the lower seat founds.
+        assert_eq!(better_table((1, 2), (1, 4)), Greater, "seat 4 goes to seat 2's lone table");
+        assert_eq!(better_table((1, 4), (1, 2)), Less, "seat 2 founds its own rather than go to seat 4's");
+    }
+
+    /// `D-062`: only the origin itself and tables its rosters' keys founded, of
+    /// the same game, name and gate (`S1-GH`), rank at all.
+    #[test]
+    fn only_a_table_of_the_origins_game_by_a_seat_of_its_roster_ranks() {
+        let now = 1_700_000_000_000;
+        let t0 = TableAd::sng(6, "Table".into(), [1u8; 32], vec![1], now);
+        let mut origin = Origin {
+            table_id: [10u8; 32],
+            founder_key: [1u8; 32],
+            seats: [([1u8; 32], 0), ([2u8; 32], 1), ([3u8; 32], 2)].into_iter().collect(),
+            template: t0.clone(),
+            dead: false,
+        };
+        assert_eq!(origin_rank(&origin, &[10u8; 32], &t0), Some(0), "the origin itself");
+        origin.dead = true;
+        assert_eq!(origin_rank(&origin, &[10u8; 32], &t0), None, "the origin whose founder left it, `S1-GY`");
+        origin.dead = false;
+        let c2 = TableAd::sng(6, "Table".into(), [3u8; 32], vec![3], now);
+        assert_eq!(origin_rank(&origin, &[30u8; 32], &c2), Some(2), "seat 2's continuation");
+        let c1 = TableAd::sng(6, "Table".into(), [2u8; 32], vec![2], now);
+        assert_eq!(origin_rank(&origin, &[20u8; 32], &c1), Some(1), "seat 1's continuation");
+        let stranger = TableAd::sng(6, "Table".into(), [9u8; 32], vec![9], now);
+        assert_eq!(origin_rank(&origin, &[90u8; 32], &stranger), None, "a stranger's table of the same name");
+        let other_game = TableAd::sng(5, "Table".into(), [3u8; 32], vec![3], now);
+        assert_eq!(origin_rank(&origin, &[31u8; 32], &other_game), None, "seat 2's table of another game");
+        let renamed = TableAd::sng(6, "Other".into(), [3u8; 32], vec![3], now);
+        assert_eq!(origin_rank(&origin, &[32u8; 32], &renamed), None, "seat 2's table of another name");
+        let founders_other = TableAd::sng(6, "Table".into(), [1u8; 32], vec![1], now);
+        assert_eq!(origin_rank(&origin, &[11u8; 32], &founders_other), None, "the origin's founder's other table");
+    }
+
+    /// `S1-GX`: a founder whose own line was cut gave every seat back once its
+    /// group copy had timed them out (`churn130206-6`): two members or more
+    /// timing out of the group within a minute is this client's line, as is
+    /// the library's verdict, and neither is a reading about any seat.
+    #[test]
+    fn two_members_timing_out_together_are_this_clients_own_line() {
+        let dir = std::env::temp_dir();
+        let mut t = TableRun::new(0, &dir, None, super::super::toxsink::TableSink::none());
+        assert!(!own_line_suspect(&t), "nothing read: no line of anybody's");
+        let now = tokio::time::Instant::now();
+        t.group_timeouts.push(now);
+        assert!(!own_line_suspect(&t), "one member gone is that member's");
+        t.group_timeouts.push(now);
+        assert!(own_line_suspect(&t), "two together are this client's line");
+        t.group_timeouts.clear();
+        t.tox_down_at = Some(now);
+        assert!(own_line_suspect(&t), "the library said offline a moment ago");
+    }
+
     /// `S1-GR`: a key seated again at once after one end of its seat, and later and
     /// later after each further end in the window -- and ends long past count for
     /// nothing.
@@ -16709,6 +17288,12 @@ mod back_at_the_table {
             "resuming",
             "resume_since_ms",
             "resume_last_peer_ms",
+            // `D-062`: the origin outlives a continuation and goes with the
+            // player's own leave; the tables that refused this client, and the
+            // client's own line, are no table's.
+            "origin",
+            "avoided",
+            "tox_down_at",
         ];
         let src = include_str!("run.rs");
         let start = src.find("\nstruct TableRun {\n").expect("the struct");

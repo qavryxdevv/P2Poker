@@ -941,6 +941,14 @@ pub struct TimeoutCert {
     /// nothing from the receiver's store to be checkable.
     #[n(1)]
     pub votes: Vec<Vec<u8>>,
+    /// `D-063`: for every seat named whose player left the table by its own
+    /// signed word (`TABLE_LEAVE`, §7.10), that word -- a complete
+    /// `SignedEvent` -- ascending by seat; empty when none did. A seat so
+    /// named counts for nothing against the floor: its own word is its
+    /// consent, and the seats left need no majority to remove a player that
+    /// said it left.
+    #[n(2)]
+    pub resignations: Vec<Vec<u8>>,
 }
 
 /// The street code `PROTOCOL.md` §4.7 defines: **the number of board cards**.

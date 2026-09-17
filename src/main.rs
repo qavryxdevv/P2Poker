@@ -908,10 +908,14 @@ fn headless(player: Player, run: Run, mut join: Option<String>) {
                             last_any_ask.map(|t| t.elapsed()),
                         );
                         if seen || connected.is_some() || retry {
+                            // `D-062`: of several tables of that name -- a table and
+                            // its continuations -- the one with most players, as a
+                            // player reading the lobby would take.
                             let found = state
                                 .lobby
                                 .tables()
-                                .find(|l| &l.held.ad.table_name == want)
+                                .filter(|l| &l.held.ad.table_name == want)
+                                .max_by_key(|l| (l.held.ad.players, std::cmp::Reverse(*l.key)))
                                 .map(|l| {
                                     (
                                         *l.key,

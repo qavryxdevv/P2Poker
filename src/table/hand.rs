@@ -990,6 +990,8 @@ struct VerifiedCert {
     /// D-036: the votes it carries -- voter, what the vote says, its bytes --
     /// so a receiver that lacks one holds it from here.
     votes: Vec<(SeatIdx, TimeoutVote, Vec<u8>)>,
+    /// `D-063`: the words of the players that left, by seat, checked.
+    resignations: Vec<(SeatIdx, Vec<u8>)>,
     raw: Vec<u8>,
 }
 
@@ -1210,9 +1212,11 @@ pub const TIMEOUT_VOTE_CAP: usize = 128;
 /// D-036: a certificate names every seat quiet at one stage and carries a
 /// vote from every seat outside the set about each of them -- at its widest
 /// four named by six, twenty-four whole signed votes, 12 459 B as measured
-/// by `tests/timeout_certificate_at_a_full_table.rs`. Under `FRAME_CAP` with
-/// the envelope beside it.
-pub const TIMEOUT_CERT_CAP: usize = 13_312;
+/// by `tests/timeout_certificate_at_a_full_table.rs`. `D-063`: with the seats
+/// that resigned needing no majority, five named by five is twenty-five votes
+/// and five signed words beside them. Under `FRAME_CAP` with the envelope
+/// beside it.
+pub const TIMEOUT_CERT_CAP: usize = 15_360;
 
 pub use crate::protocol::constants::MAX_CONSECUTIVE_AUTO_ACTIONS;
 
@@ -1689,6 +1693,21 @@ pub struct Hand {
     /// ([`Hand::note_gone_by_their_word`]). Voted about at once: nobody waits
     /// out the clock of a player who said it is gone.
     gone_by_word: BTreeSet<SeatIdx>,
+    /// `D-063`: the signed words of the players that left this table, by
+    /// seat -- the node's, checked here ([`Hand::note_leave_words`]), and
+    /// those a peer's certificate carried. A seat named with its word counts
+    /// for nothing against the floor, and a certificate this client seals
+    /// carries the words it holds for the seats it names.
+    leave_words: BTreeMap<SeatIdx, Vec<u8>>,
+    /// `D-063`: the seats a certificate named with their own word -- out of
+    /// the table for good, not absent.
+    resigned: BTreeSet<SeatIdx>,
+    /// `S1-HA`: the seats the node reads as gone from the table's group -- out
+    /// of it, or silent there for `QUIET_LIMIT_S` -- as of the last tick. A
+    /// voter among them cannot complete the vote round this client is party
+    /// to, so no certificate is reachable in this hand and the local abort
+    /// waits for none.
+    gone_from_group: BTreeSet<SeatIdx>,
     /// `D-051`: the seats this client has voted about at the stage now open,
     /// whatever the cause -- one vote about one seat at one stage, so a
     /// cause is fixed with the first.
@@ -2215,6 +2234,9 @@ impl Hand {
                 words: BTreeMap::new(),
                 flooders: BTreeSet::new(),
                 gone_by_word: BTreeSet::new(),
+                leave_words: BTreeMap::new(),
+                resigned: BTreeSet::new(),
+                gone_from_group: BTreeSet::new(),
                 voted_about: BTreeSet::new(),
                 flood_named: BTreeSet::new(),
                 settled_pots: Vec::new(),
@@ -6232,7 +6254,9 @@ impl Hand {
         // stage that has spent the hand's entire budget would have its backstop
         // deferred by a vote round — and that budget is the one deadline the
         // protocol makes unconditional.
+        // `S1-HA`: no air for a round a voter gone from the group cannot close.
         if self.certificate_possible()
+            && !self.a_voter_is_gone()
             && !(self.long_past_stage(now_ms)
                 && (!self.crypto_stage() || self.round_has_had_air(now_ms)))
         {
@@ -6251,7 +6275,7 @@ impl Hand {
             .into_iter()
             .filter(|s| *s != self.open.my_seat && self.mine.dealt_in.contains(s))
             .collect();
-        !quiet.is_empty() && Self::admissible(self.voters_of(&quiet).len(), quiet.len())
+        !quiet.is_empty() && self.admissible_for(self.voters_of(&quiet).len(), &quiet)
     }
 
     /// D-036: how many votes a subject needs, for the tally's denominator --
@@ -6275,6 +6299,24 @@ impl Hand {
         voters >= 2 && voters > named
     }
 
+    /// `D-063`: the floor with the resigned excepted. A seat named with its
+    /// player's own signed leave counts for nothing against it -- its word is
+    /// its consent, and no fork can hold a seat that said it left -- so the
+    /// floor is asked of the quiet alone, and a certificate naming only seats
+    /// that resigned needs one voter (the owner, 2026-09-17: a table whose
+    /// players leave must not stand for ever).
+    fn floor_holds(voters: usize, named: usize, resigned: usize) -> bool {
+        let quiet = named.saturating_sub(resigned.min(named));
+        voters >= 1 && (quiet == 0 || Self::admissible(voters, quiet))
+    }
+
+    /// `D-063`: the floor for a set this client would seal, with the words it
+    /// holds.
+    fn admissible_for(&self, voters: usize, named: &[SeatIdx]) -> bool {
+        let resigned = named.iter().filter(|s| self.leave_words.contains_key(s)).count();
+        Self::floor_holds(voters, named.len(), resigned)
+    }
+
     /// The floor, told to the player once per hand when it is what holds
     /// the hand: the seats that stopped are half the table or more, so no
     /// certificate can remove them: a betting stage waits until the hand's
@@ -6295,6 +6337,15 @@ impl Hand {
             return;
         }
         let voters = self.voters_of(&quiet).len();
+        // `D-063`: the seats that resigned are removed whatever the floor says;
+        // the note is about the quiet, and only while the floor holds.
+        if self.admissible_for(voters, &quiet) {
+            return;
+        }
+        let quiet: Vec<SeatIdx> = quiet.into_iter().filter(|s| !self.leave_words.contains_key(s)).collect();
+        if quiet.is_empty() {
+            return;
+        }
         let waited_s = now_ms.saturating_sub(self.stage_at_ms) / 1_000;
         self.floor_said = true;
         self.cert_note.push(format!(
@@ -6346,7 +6397,7 @@ impl Hand {
         }
         let named: Vec<SeatIdx> = set.iter().copied().collect();
         let voters = self.voters_of(&named);
-        if !Self::admissible(voters.len(), set.len()) {
+        if !self.admissible_for(voters.len(), &named) {
             return None;
         }
         let first = &about[set.iter().next()?].0;
@@ -7015,9 +7066,16 @@ impl Hand {
                 votes.push(held.get(voter).cloned().ok_or(Failed::NothingFurther)?);
             }
         }
+        // `D-063`: and the words of the players that left, for the seats named.
+        let resignations: Vec<Vec<u8>> = subject
+            .subject_seats
+            .iter()
+            .filter_map(|s| self.leave_words.get(s).cloned())
+            .collect();
         let body = TimeoutCert {
             subject_digest: subject.digest(),
             votes,
+            resignations,
         };
         self.say_at(EventType::TimeoutCert, &body, TIMEOUT_CERT_CAP, key, now_ms)
     }
@@ -7365,6 +7423,32 @@ impl Hand {
         }
         let emitter = self.seat_of(&opened.sender)?;
 
+        // `D-063`: the words of the players that left, each the seat's own
+        // signed leave for this table, one per seat, every one a seat named.
+        if body.resignations.len() > usize::from(crate::protocol::constants::MAX_SEATS) {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "no more resignations than seats",
+            });
+        }
+        let mut resignations: Vec<(SeatIdx, Vec<u8>)> = Vec::new();
+        for word in &body.resignations {
+            let (who, _) = crate::net::tabletalk::verify_leave_word(word, &self.open.table_id).map_err(|_| {
+                Failed::Elsewhere {
+                    seat: emitter,
+                    what: "every resignation were the seat's own signed leave for this table",
+                }
+            })?;
+            let seat = self.seat_of(&who)?;
+            if resignations.iter().any(|(s, _)| *s == seat) {
+                return Err(Failed::Elsewhere {
+                    seat: emitter,
+                    what: "one resignation per seat",
+                });
+            }
+            resignations.push((seat, word.clone()));
+        }
+
         let mut stage: Option<CertSubject> = None;
         let mut per_subject: BTreeMap<SeatIdx, BTreeSet<SeatIdx>> = BTreeMap::new();
         // `D-051`: the cause every vote about a seat carries, one per seat.
@@ -7525,11 +7609,18 @@ impl Hand {
         }
         // D-036's floor: two voters at least, and more voters than seats
         // named -- a group short of a majority of the live seats can
-        // complete nothing about the rest.
-        if !Self::admissible(voters.len(), subject.subject_seats.len()) {
+        // complete nothing about the rest. `D-063`: the seats that resigned,
+        // named with their word, count for nothing against it.
+        if resignations.iter().any(|(s, _)| !subject.subject_seats.contains(s)) {
             return Err(Failed::Elsewhere {
                 seat: emitter,
-                what: "at least two voters, and more voters than seats named",
+                what: "every resignation named a seat the certificate names",
+            });
+        }
+        if !Self::floor_holds(voters.len(), subject.subject_seats.len(), resignations.len()) {
+            return Err(Failed::Elsewhere {
+                seat: emitter,
+                what: "at least two voters, and more voters than seats named that did not resign",
             });
         }
         if !voters.contains(&emitter) {
@@ -7542,6 +7633,7 @@ impl Hand {
             subject,
             voters,
             votes,
+            resignations,
             raw: raw.to_vec(),
         })
     }
@@ -7596,6 +7688,10 @@ impl Hand {
         // `D-047`: the word, kept by the seats it names.
         for seat in &subject.subject_seats {
             self.words.insert(*seat, raw.to_vec());
+            // `D-063`: named with its own word: out for good, not absent.
+            if self.leave_words.contains_key(seat) {
+                self.resigned.insert(*seat);
+            }
         }
         self.certs.insert(
             event_hash,
@@ -7686,7 +7782,7 @@ impl Hand {
         // no group short of a majority of the live seats completes a
         // certificate about the rest.
         if self.mine.dealt_in.len() < 3
-            || !Self::admissible(c.voters.len(), c.subject.subject_seats.len())
+            || !Self::floor_holds(c.voters.len(), c.subject.subject_seats.len(), c.resignations.len())
         {
             return Ok(Vec::new());
         }
@@ -7731,6 +7827,11 @@ impl Hand {
         // case can complete and its copy can join the stage.
         for (voter, v, raw) in &c.votes {
             self.take_vote(v.subject_digest(), *voter, raw.clone(), *v);
+        }
+        // `D-063`: and the words it carries, so this client's own copy carries
+        // them too and its floor reads the same.
+        for (seat, word) in &c.resignations {
+            self.leave_words.entry(*seat).or_insert_with(|| word.clone());
         }
 
         // The roster half, wherever this client happens to stand — and it
@@ -9900,7 +10001,9 @@ impl Hand {
             let came_back = self.open.returns.get(usize::from(*seat)).copied().unwrap_or(0);
             // `D-051`: or certified with the flood cause by every voter.
             let flooded = self.flood_named.contains(seat);
-            if (came_back >= crate::protocol::constants::MAX_RETURNS || flooded) && !out.contains(seat) {
+            // `D-063`: or named with its player's own word that it left.
+            let resigned = self.resigned.contains(seat);
+            if (came_back >= crate::protocol::constants::MAX_RETURNS || flooded || resigned) && !out.contains(seat) {
                 out.push(*seat);
             }
         }
@@ -9941,6 +10044,46 @@ impl Hand {
     /// for again.
     pub fn note_gone_by_their_word(&mut self, seats: &[SeatIdx]) {
         self.gone_by_word = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
+    }
+
+    /// `D-063`: the signed words of the players that left, as the node holds
+    /// them -- the whole set each time; kept only where the word is the seat's
+    /// own for this table, checked here as a certificate's reader checks it.
+    /// A word a peer's certificate carried stays.
+    pub fn note_leave_words(&mut self, words: &[(SeatIdx, Vec<u8>)]) {
+        for (seat, word) in words {
+            if *seat == self.open.my_seat || self.leave_words.contains_key(seat) {
+                continue;
+            }
+            let Ok((who, _)) = crate::net::tabletalk::verify_leave_word(word, &self.open.table_id) else {
+                continue;
+            };
+            if self.open.seats.iter().any(|(s, k, _)| s == seat && *k == who) {
+                self.leave_words.insert(*seat, word.clone());
+            }
+        }
+    }
+
+    /// `S1-HA`: the seats out of the table's group, or silent there for
+    /// `QUIET_LIMIT_S`, as the node reads them now -- the whole set each time.
+    pub fn note_gone_from_group(&mut self, seats: &[SeatIdx]) {
+        self.gone_from_group = seats.iter().copied().filter(|s| *s != self.open.my_seat).collect();
+    }
+
+    /// `S1-HA`: whether a voter of the certificate this hand waits on is gone
+    /// from the table's group. A vote round needs every voter's vote; a voter
+    /// that acted at the stage and then lost its line is quiet at no stage and
+    /// so is named by nobody, and the round stood until the hand's budget ran
+    /// out -- one hand of six seats lasted 62 s and the next 92 s after the
+    /// founder and a far seat were cut together (`churn134826-6`). The hand
+    /// ends at the deadline instead, and the next hand names both.
+    fn a_voter_is_gone(&self) -> bool {
+        let quiet: Vec<SeatIdx> = self
+            .waiting_for()
+            .into_iter()
+            .filter(|s| *s != self.open.my_seat && self.mine.dealt_in.contains(s))
+            .collect();
+        !quiet.is_empty() && self.voters_of(&quiet).iter().any(|v| self.gone_from_group.contains(v))
     }
 
     pub fn note_flooders(&mut self, seats: &[SeatIdx]) {
@@ -15836,6 +15979,117 @@ mod tests {
         again[0].note_gone_by_their_word(&[3, 4]);
         again[0].note_gone_by_their_word(&[]);
         assert!(bytes_of_sends(again[0].vote_on_timeouts(&keys[0], early, 0).unwrap()).is_empty());
+    }
+
+    /// `D-063`: two of three players leave by their own signed word: the seat
+    /// left certifies them out alone -- their words are their consent, and the
+    /// floor asks nothing of it -- the hand ends, both are out for good, and the
+    /// next hand opens with the one seat. Without the words the floor holds.
+    #[test]
+    fn the_seats_that_left_by_their_own_word_are_certified_out_without_the_floor() {
+        let keys: Vec<SigningKey> = (0..3u8).map(|s| key(10 + s)).collect();
+        let (mut a, _) = Hand::open(opening_n(3, 0), &keys[0], NOW, 30_000).unwrap();
+        assert_eq!(a.waiting_for(), vec![1, 2]);
+        let table = a.open.table_id;
+        let w1 = crate::net::tabletalk::leave_word(&keys[1], &table, NOW).unwrap();
+        let w2 = crate::net::tabletalk::leave_word(&keys[2], &table, NOW).unwrap();
+        a.note_gone_by_their_word(&[1, 2]);
+        assert!(
+            a.vote_on_timeouts(&keys[0], NOW + 1_000, 0).unwrap().is_empty(),
+            "one voter cannot name two quiet seats: the floor"
+        );
+        a.note_leave_words(&[(1, w1), (2, w2)]);
+        let out = bytes_of_sends(a.vote_on_timeouts(&keys[0], NOW + 1_000, 0).unwrap());
+        assert!(out.len() >= 3, "two votes and the certificate, at least: {}", out.len());
+        assert!(a.aborted().is_some(), "the hand ended by the certificate");
+        assert!(!a.took_part(1) && !a.took_part(2), "both leave the roster");
+        assert_eq!(a.out_for_good(), vec![1, 2], "resigned: out for good, not absent");
+        assert!(a.next_hand().is_none(), "one seat left: the tournament is over, and there is no next hand");
+    }
+
+    /// `D-063`: at five seats with two present, one quiet seat and two that
+    /// resigned are certified together by the two -- the floor counts the
+    /// quiet one alone -- and the copy each seals carries the words, which the
+    /// other checks as it checks the votes; one genesis without the three.
+    #[test]
+    fn a_resignation_lets_two_voters_certify_the_rest() {
+        let keys: Vec<SigningKey> = (0..5u8).map(|s| key(10 + s)).collect();
+        let (mut a, from_a) = Hand::open(opening_n(5, 0), &keys[0], NOW, 30_000).unwrap();
+        let (mut b, from_b) = Hand::open(opening_n(5, 1), &keys[1], NOW, 30_000).unwrap();
+        let _ = deliver(&mut b, &from_a, &keys[1]);
+        let _ = deliver(&mut a, &from_b, &keys[0]);
+        let table = a.open.table_id;
+        let w3 = crate::net::tabletalk::leave_word(&keys[3], &table, NOW).unwrap();
+        let w4 = crate::net::tabletalk::leave_word(&keys[4], &table, NOW).unwrap();
+        for h in [&mut a, &mut b] {
+            h.note_gone_by_their_word(&[3, 4]);
+            h.note_leave_words(&[(3, w3.clone()), (4, w4.clone())]);
+        }
+        let t1 = NOW + 30_000;
+        let va = bytes_of_sends(a.vote_on_timeouts(&keys[0], t1, 0).unwrap());
+        assert_eq!(va.len(), 3, "seat 0 votes about the quiet seat and both that left");
+        let vb = bytes_of_sends(b.vote_on_timeouts(&keys[1], t1, 0).unwrap());
+        assert_eq!(vb.len(), 3);
+        let mut cert_a = Vec::new();
+        for v in &vb {
+            for x in bytes_of_sends(a.on_event(v, &keys[0], t1 + 100).unwrap()) {
+                cert_a = x;
+            }
+        }
+        assert!(!cert_a.is_empty(), "seat 0 seals: two voters, one quiet seat and two resigned");
+        let mut cert_b = Vec::new();
+        for v in &va {
+            for x in bytes_of_sends(b.on_event(v, &keys[1], t1 + 100).unwrap()) {
+                cert_b = x;
+            }
+        }
+        assert!(!cert_b.is_empty());
+        b.on_event(&cert_a, &keys[1], t1 + 200).expect("seat 0's copy, its words checked, holds at seat 1");
+        a.on_event(&cert_b, &keys[0], t1 + 200).expect("seat 1's copy holds at seat 0");
+        for h in [&a, &b] {
+            assert!(!h.took_part(2) && !h.took_part(3) && !h.took_part(4));
+            assert_eq!(h.out_for_good(), vec![3, 4], "the two that resigned are out for good; the quiet one is absent");
+        }
+        let na = a.next_hand().expect("a successor");
+        let nb = b.next_hand().expect("a successor");
+        assert_eq!(na.required, vec![0, 1]);
+        assert_eq!(na.genesis, nb.genesis, "one GENESIS(k+1)");
+    }
+
+    /// `D-063`: a word that is not the seat's own -- another key's, or for
+    /// another table -- is no resignation, and the floor holds.
+    #[test]
+    fn a_word_that_is_not_the_seats_own_is_no_resignation() {
+        let keys: Vec<SigningKey> = (0..3u8).map(|s| key(10 + s)).collect();
+        let (mut a, _) = Hand::open(opening_n(3, 0), &keys[0], NOW, 30_000).unwrap();
+        let table = a.open.table_id;
+        let forged = crate::net::tabletalk::leave_word(&key(99), &table, NOW).unwrap();
+        let elsewhere = crate::net::tabletalk::leave_word(&keys[2], &[8u8; 32], NOW).unwrap();
+        a.note_gone_by_their_word(&[1, 2]);
+        a.note_leave_words(&[(1, forged), (2, elsewhere)]);
+        assert!(
+            a.vote_on_timeouts(&keys[0], NOW + 1_000, 0).unwrap().is_empty(),
+            "neither word is the seat's own for this table: the floor holds"
+        );
+    }
+
+    /// `S1-HA`: with a voter of the open round gone from the table's group the
+    /// hand may be given up at the stage's deadline; with the voters all in
+    /// the group it waits for the round's air, as before; and a quiet seat gone
+    /// from the group is no voter and changes nothing.
+    #[test]
+    fn a_voter_gone_from_the_group_ends_the_hand_at_the_deadline() {
+        let (mut hands, keys) = three_present_two_quiet();
+        let t1 = NOW + 30_000;
+        let out = hands[0].vote_on_timeouts(&keys[0], t1, 0).unwrap();
+        assert_eq!(out.len(), 2, "seat 0 votes about both quiet seats");
+        assert!(!hands[0].may_abandon(t1 + 1_000), "every voter in the group: the round gets its air");
+        hands[0].note_gone_from_group(&[3]);
+        assert!(!hands[0].may_abandon(t1 + 1_000), "a quiet seat gone is no voter");
+        hands[0].note_gone_from_group(&[1]);
+        assert!(hands[0].may_abandon(t1 + 1_000), "voter 1 gone from the group: no certificate can close, the deadline ends it");
+        hands[0].note_gone_from_group(&[]);
+        assert!(!hands[0].may_abandon(t1 + 1_000), "back in the group: the air again");
     }
 
     /// `D-051`: seats every voter's client cut off for flooding the table's

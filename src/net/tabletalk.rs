@@ -391,6 +391,23 @@ pub fn receive_leave(
     if !limits.carried(carrier, now_ms, bytes.len() as u64) {
         return Err(NotHeard::TooMuchCarried);
     }
+    let (who, said_ms) = verify_leave_word(bytes, table_id)?;
+    if said_ms.abs_diff(now_ms) > CLOCK_SLACK_MS {
+        return Err(NotHeard::Stale);
+    }
+    let seat = seat_of(&who).ok_or(NotHeard::NotASeat)?;
+    Ok((seat, who, said_ms))
+}
+
+/// `D-063`: a seat's word that its player left, on its own -- the type, the
+/// signature, the table and the reason; the key that said it and when. What a
+/// certificate that carries the word checks it by (`PROTOCOL.md` §4.8): no
+/// carrier, no clock -- the word may be minutes old by then -- and no roster,
+/// which the certificate's own reader holds.
+pub fn verify_leave_word(bytes: &[u8], table_id: &[u8; 32]) -> Result<([u8; 32], u64), NotHeard> {
+    if bytes.len() > LOBBY_MSG_MAX {
+        return Err(NotHeard::TooLong("the message is over the cap"));
+    }
     let signed: SignedEvent =
         from_canonical(bytes, LOBBY_MSG_MAX).map_err(|_| NotHeard::Malformed("not a signed event"))?;
     let envelope: EventBody = from_canonical(&signed.body, LOBBY_MSG_MAX)
@@ -400,11 +417,7 @@ pub fn receive_leave(
     if kind != EventType::TableLeave {
         return Err(NotHeard::Malformed("not a table leave"));
     }
-    if envelope.emitted_at_unix_ms.abs_diff(now_ms) > CLOCK_SLACK_MS {
-        return Err(NotHeard::Stale);
-    }
     let who = envelope.sender_public_key;
-    let seat = seat_of(&who).ok_or(NotHeard::NotASeat)?;
     verify(&who, &signed).map_err(|_| NotHeard::Forged)?;
     let body: LeaveBody = from_canonical(&envelope.payload, LOBBY_CHAT_MAX)
         .map_err(|_| NotHeard::Malformed("not a table leave"))?;
@@ -414,7 +427,7 @@ pub fn receive_leave(
     if body.reason != LEAVE_BY_THE_PLAYER {
         return Err(NotHeard::Malformed("a leave reason this client does not know"));
     }
-    Ok((seat, who, envelope.emitted_at_unix_ms))
+    Ok((who, envelope.emitted_at_unix_ms))
 }
 
 fn plain(s: &str) -> Result<(), crate::net::plaintext::NotPlain> {

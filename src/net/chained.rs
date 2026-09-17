@@ -303,6 +303,14 @@ pub fn peek(bytes: &[u8], cap: usize) -> Result<(EventType, u64, u64), WireError
     Ok((kind, envelope.hand_id, envelope.sequence))
 }
 
+/// The key an event claims to be signed by -- read, not checked, like
+/// [`peek`]: use it to route, never to decide.
+pub fn sender_of(bytes: &[u8], cap: usize) -> Option<[u8; 32]> {
+    let signed: SignedEvent = from_canonical(bytes, cap).ok()?;
+    let envelope: EventBody = from_canonical(&signed.body, cap).ok()?;
+    Some(envelope.sender_public_key)
+}
+
 /// The payload of an opened event, decoded under its own cap.
 pub fn payload<'a, T: Decode<'a, ()> + Encode<()>>(
     o: &'a Opened,
