@@ -6626,7 +6626,10 @@ fits by construction: `128 × 1 536 = 196 608` B plus array and envelope overhea
 > connected, subscribed and grafted to it. So the question is not for a newly
 > joined client alone. **A client asks every poker peer** -- one whose `identify`
 > carries this protocol's version -- the moment it is recognised and again every
-> `AD_REBROADCAST_MS` while it is connected. **A founder answers with the advert it
+> `AD_REBROADCAST_MS` while it is connected; a client whose search (§7.13) runs
+> asks the peers subscribed to its queue topics every ten seconds besides, at most
+> sixteen a round, since a table another searcher founds is what its search waits
+> for. **A founder answers with the advert it
 > offers right now** (its own open table; a table that has dealt is not offered,
 > §7.3); any client may add adverts it holds, up to `SNAPSHOT_MAX_ADS`. The asker
 > takes every advert through §7.2's checklist as if it had come over gossip. **An

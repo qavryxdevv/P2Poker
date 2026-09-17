@@ -1719,6 +1719,9 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
     > = std::collections::HashMap::new();
     let mut snapshot_answered: std::collections::HashMap<libp2p::PeerId, tokio::time::Instant> =
         std::collections::HashMap::new();
+    // `S1-HN`: whether any answer to this client's own lobby question has
+    // arrived since its start; a search founds nothing before one has.
+    let mut lobby_answered = false;
 
     // When each lobby provider was last dialled, so a record for a client that
     // is long gone is not dialled every minute for ever.
@@ -3381,6 +3384,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
         std::collections::HashMap::new();
     const SEARCH_ASK_AGAIN: std::time::Duration = std::time::Duration::from_secs(15);
     const SEARCH_ASKS_MAX: u32 = 4;
+    // `S1-HQ`: while a search runs, the lobbies of the peers subscribed to
+    // this client's queue topics -- the searchers, and the founders of search
+    // tables among them -- are asked every `SEARCH_LOBBY_ASK`, not only every
+    // `AD_REBROADCAST_MS` with everybody else's: a table founded by a
+    // searcher reached the others up to 30 s late, and a higher key whose own
+    // founding was due meanwhile founded a second one. At most
+    // `SEARCH_LOBBY_ASKS_MAX` peers a round; the answerer's own meter
+    // (`snapshot_answered`) bounds what a round costs it.
+    const SEARCH_LOBBY_ASK: std::time::Duration = std::time::Duration::from_secs(10);
+    const SEARCH_LOBBY_ASKS_MAX: usize = 16;
+    let mut search_lobby_asked = std::time::Instant::now();
     // `D-064`: this client's word on the queue topic -- on the whole queue and on
     // the slice its own key names at every depth, as an advert is said (`S1-EX`).
     macro_rules! say_search_presence {
@@ -4090,6 +4104,17 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                                         continue;
                                     }
                                 };
+                                if !lobby_answered {
+                                    // `S1-HN`: the first answer to this client's own
+                                    // question; the search's lobby gate opens here.
+                                    lobby_answered = true;
+                                    let _ = events
+                                        .send(NodeEvent::Warning(format!(
+                                            "lobby: the first answer, from {peer}: {} table(s)",
+                                            adverts.len()
+                                        )))
+                                        .await;
+                                }
                                 // `D-047`: the table's word about this client's own seat,
                                 // verified from the certificate's bytes against the roster --
                                 // not the answerer's authority. Said once; a headless client
@@ -11071,16 +11096,39 @@ pub async fn run(cfg: Run) -> Result<(), Box<dyn std::error::Error>> {
                     public: verdict_due.then_some(state.is_public()),
                     relay: have_reservation,
                     on_line_s: poker_line_since.map(|at| at.elapsed().as_secs()),
+                    lobby_answered,
                 };
                 let steps = mm.tick(now_i, now_ms, &candidates, &slots, &net, &state.queue, &my_app_key);
                 do_search_steps!(steps);
-                // `D-064`: seats still asked for, whose founder is on the line now.
+                // `S1-HQ`: the searchers' lobbies, asked every `SEARCH_LOBBY_ASK`.
+                if search_lobby_asked.elapsed() >= SEARCH_LOBBY_ASK {
+                    search_lobby_asked = std::time::Instant::now();
+                    let hashes: Vec<gossipsub::TopicHash> = state
+                        .listening
+                        .queue_topics()
+                        .iter()
+                        .map(|name| gossipsub::IdentTopic::new(name.clone()).hash())
+                        .collect();
+                    let peers: Vec<libp2p::PeerId> = swarm
+                        .behaviour()
+                        .gossipsub
+                        .all_peers()
+                        .filter(|(_, subs)| subs.iter().any(|s| hashes.contains(*s)))
+                        .map(|(p, _)| *p)
+                        .filter(|p| poker_peers.contains(p) && swarm.is_connected(p))
+                        .take(SEARCH_LOBBY_ASKS_MAX)
+                        .collect();
+                    for p in peers {
+                        ask_lobby!(p);
+                    }
+                }
+                // `D-064`: seats still asked for are asked again every
+                // `SEARCH_ASK_AGAIN`, whether or not the founder is on the line
+                // (`S1-HO`: a request re-dials a founder the first dial did not
+                // reach; waiting for it to connect on its own lost the whole of
+                // the founder's patience).
                 search_asks.retain(|k, _| mm.is_reserved(k));
-                let again: Vec<[u8; 32]> = search_asks
-                    .iter()
-                    .filter(|(_, (p, _, _))| swarm.is_connected(p))
-                    .map(|(k, _)| *k)
-                    .collect();
+                let again: Vec<[u8; 32]> = search_asks.keys().copied().collect();
                 for k in again {
                     ask_search_seat_again!(k);
                 }
